@@ -273,7 +273,7 @@ impl TdsValueSerializer {
     }
 
     #[inline(always)]
-    async fn serialize_int<'a, 'b>(
+    pub(crate) async fn serialize_int<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
         value: i32,
         ctx: &TdsTypeContext,
@@ -309,7 +309,7 @@ impl TdsValueSerializer {
     }
 
     #[inline(always)]
-    async fn serialize_bigint<'a, 'b>(
+    pub(crate) async fn serialize_bigint<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
         value: i64,
         ctx: &TdsTypeContext,
@@ -386,7 +386,7 @@ impl TdsValueSerializer {
     }
 
     #[inline(always)]
-    async fn serialize_float<'a, 'b>(
+    pub(crate) async fn serialize_float<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
         value: f64,
         ctx: &TdsTypeContext,
@@ -424,7 +424,7 @@ impl TdsValueSerializer {
     }
 
     #[inline(always)]
-    async fn serialize_decimal<'a, 'b>(
+    pub(crate) async fn serialize_decimal<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
         value: &crate::datatypes::decoder::DecimalParts,
         ctx: &TdsTypeContext,
@@ -1600,7 +1600,7 @@ impl TdsValueSerializer {
     /// Helper to serialize a UTF-8 string as UTF-16LE for NVARCHAR/NCHAR types.
     ///
     /// This is used when the SqlString is not already UTF-16 encoded.
-    async fn serialize_string_utf16<'a, 'b>(
+    pub(crate) async fn serialize_string_utf16<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
         utf8_str: &str,
         ctx: &TdsTypeContext,
@@ -1608,10 +1608,14 @@ impl TdsValueSerializer {
     where
         'b: 'a,
     {
-        // Encode to UTF-16LE
-        let utf16_data: Vec<u16> = utf8_str.encode_utf16().collect();
-        let char_count = utf16_data.len();
-        let byte_len = char_count * 2;
+        // Encode to UTF-16LE bytes directly
+        let mut utf16_bytes = Vec::with_capacity(utf8_str.len() * 2);
+        let mut char_count = 0usize;
+        for code_unit in utf8_str.encode_utf16() {
+            utf16_bytes.extend_from_slice(&code_unit.to_le_bytes());
+            char_count += 1;
+        }
+        let byte_len = utf16_bytes.len();
 
         // Check schema constraints
         let schema_char_count = ctx.max_size;
@@ -1624,36 +1628,20 @@ impl TdsValueSerializer {
 
         // Serialize based on type classification
         if ctx.is_plp {
-            // PLP types (NVARCHAR(MAX)): Use PLP encoding
             writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
             writer.write_u32_async(byte_len as u32).await?;
-
-            // Write UTF-16LE data
-            for code_unit in &utf16_data {
-                writer.write_u16_async(*code_unit).await?;
-            }
-
+            writer.write_async(&utf16_bytes).await?;
             writer.write_u32_async(PLP_TERMINATOR).await?;
         } else if ctx.is_fixed_length {
-            // Fixed-length types (NCHAR(n)): Write exactly n characters with padding
-            // Write actual data
-            for code_unit in &utf16_data {
-                writer.write_u16_async(*code_unit).await?;
-            }
-
-            // Pad with UTF-16 space (0x0020)
+            writer.write_async(&utf16_bytes).await?;
             let padding_chars = schema_char_count.saturating_sub(char_count);
             for _ in 0..padding_chars {
                 writer.write_u16_async(0x0020).await?;
             }
         } else {
-            // Variable-length types (NVARCHAR(n)): Write character count + data
-            writer.write_u16_async(char_count as u16).await?;
-
-            // Write UTF-16LE data
-            for code_unit in &utf16_data {
-                writer.write_u16_async(*code_unit).await?;
-            }
+            // Variable-length NVARCHAR(n): byte count prefix + data
+            writer.write_u16_async(byte_len as u16).await?;
+            writer.write_async(&utf16_bytes).await?;
         }
 
         Ok(())

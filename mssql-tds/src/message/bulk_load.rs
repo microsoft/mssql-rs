@@ -14,7 +14,7 @@ use crate::datatypes::column_values::ColumnValues;
 use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::datatypes::tds_value_serializer::{TdsTypeContext, TdsValueSerializer};
 use crate::error::Error;
-use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
+use crate::io::packet_writer::{PacketWriter, TdsPacketWriter, TdsPacketWriterUnchecked};
 use crate::token::tokens::SqlCollation;
 use tracing::{debug, trace};
 
@@ -228,6 +228,40 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         self.packet_writer
     }
 
+    /// Write an i32 value directly for a column, bypassing ColumnValues dispatch.
+    pub async fn write_int32(&mut self, column_index: usize, value: i32) -> TdsResult<()> {
+        let ctx = &self.column_contexts[column_index];
+        TdsValueSerializer::serialize_int(self.packet_writer, value, ctx).await
+    }
+
+    /// Write an i64 value directly for a column, bypassing ColumnValues dispatch.
+    pub async fn write_int64(&mut self, column_index: usize, value: i64) -> TdsResult<()> {
+        let ctx = &self.column_contexts[column_index];
+        TdsValueSerializer::serialize_bigint(self.packet_writer, value, ctx).await
+    }
+
+    /// Write an f64 value directly for a column, bypassing ColumnValues dispatch.
+    pub async fn write_float64(&mut self, column_index: usize, value: f64) -> TdsResult<()> {
+        let ctx = &self.column_contexts[column_index];
+        TdsValueSerializer::serialize_float(self.packet_writer, value, ctx).await
+    }
+
+    /// Write a UTF-8 string as NVARCHAR, bypassing ColumnValues/SqlString.
+    pub async fn write_nvarchar_str(&mut self, column_index: usize, value: &str) -> TdsResult<()> {
+        let ctx = &self.column_contexts[column_index];
+        TdsValueSerializer::serialize_string_utf16(self.packet_writer, value, ctx).await
+    }
+
+    /// Write a decimal value directly from parts, bypassing ColumnValues dispatch.
+    pub async fn write_decimal(
+        &mut self,
+        column_index: usize,
+        value: &crate::datatypes::decoder::DecimalParts,
+    ) -> TdsResult<()> {
+        let ctx = &self.column_contexts[column_index];
+        TdsValueSerializer::serialize_decimal(self.packet_writer, value, ctx).await
+    }
+
     /// Write pre-serialized TDS wire format bytes directly to the packet.
     ///
     /// This is a convenience method for writing raw TDS bytes that have been
@@ -248,6 +282,59 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// Returns an error if network transmission fails.
     pub async fn write_raw_bytes(&mut self, bytes: &[u8]) -> TdsResult<()> {
         self.packet_writer.write_async(bytes).await
+    }
+
+    /// Check if `byte_count` bytes fit in the current packet buffer.
+    pub fn has_space(&self, byte_count: usize) -> bool {
+        self.packet_writer.has_space(byte_count)
+    }
+
+    /// Write bytes directly into the packet buffer without overflow checks.
+    /// Caller **must** call [`has_space`] first or [`flush_if_needed`] after.
+    pub fn write_bytes_unchecked(&mut self, bytes: &[u8]) {
+        self.packet_writer.write_unchecked(bytes);
+    }
+
+    /// Write a single byte directly into the packet buffer.
+    pub fn write_byte_unchecked(&mut self, b: u8) {
+        self.packet_writer.write_byte_unchecked(b);
+    }
+
+    /// Write a little-endian i32 directly into the packet buffer.
+    pub fn write_i32_unchecked(&mut self, v: i32) {
+        self.packet_writer.write_i32_unchecked(v);
+    }
+
+    /// Write a little-endian i64 directly into the packet buffer.
+    pub fn write_i64_unchecked(&mut self, v: i64) {
+        self.packet_writer.write_i64_unchecked(v);
+    }
+
+    /// Write a little-endian u16 directly into the packet buffer.
+    pub fn write_u16_unchecked(&mut self, v: u16) {
+        self.packet_writer.write_u16_unchecked(v);
+    }
+
+    /// Write a little-endian f64 directly into the packet buffer.
+    pub fn write_f64_unchecked(&mut self, v: f64) {
+        self.packet_writer.write_f64_unchecked(v);
+    }
+
+    /// Flush the packet buffer to the network if it has overflowed.
+    /// Call after a batch of unchecked writes.
+    pub async fn flush_if_needed(&mut self) -> TdsResult<()> {
+        self.packet_writer.check_overflow().await
+    }
+
+    /// Current write position in the packet buffer. Use with
+    /// [`write_u16_at_position`] to patch a length prefix after writing data.
+    pub fn unchecked_position(&self) -> usize {
+        self.packet_writer.unchecked_position()
+    }
+
+    /// Patch a u16 at a previously recorded buffer position.
+    pub fn write_u16_at_position(&mut self, pos: usize, value: u16) {
+        self.packet_writer.write_u16_at_position(pos, value);
     }
 
     /// Begin a new row (for zero-copy bulk load).

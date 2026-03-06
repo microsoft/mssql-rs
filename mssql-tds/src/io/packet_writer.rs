@@ -45,6 +45,12 @@ pub(crate) trait TdsPacketWriterUnchecked {
     /// If false: caller should use async write APIs
     fn has_space(&self, bytes: usize) -> bool;
 
+    /// Current write position in the packet buffer (relative to payload start).
+    fn unchecked_position(&self) -> usize;
+
+    /// Patch a u16 at a previously recorded position.
+    fn write_u16_at_position(&mut self, pos: usize, value: u16);
+
     /// Manually check and handle overflow after a batch of unchecked writes
     async fn check_overflow(&mut self) -> TdsResult<()>;
 }
@@ -531,6 +537,18 @@ impl TdsPacketWriterUnchecked for PacketWriter<'_> {
         // Check if there's space left in the current packet
         let current_pos = self.position() as usize;
         current_pos + bytes_count <= self.max_payload_size
+    }
+
+    fn unchecked_position(&self) -> usize {
+        self.payload_cursor.position() as usize
+    }
+
+    fn write_u16_at_position(&mut self, pos: usize, value: u16) {
+        let saved = self.payload_cursor.position();
+        self.payload_cursor.set_position(pos as u64);
+        let _ =
+            WriteBytesExt::write_u16::<byteorder::LittleEndian>(&mut self.payload_cursor, value);
+        self.payload_cursor.set_position(saved);
     }
 
     async fn check_overflow(&mut self) -> TdsResult<()> {
