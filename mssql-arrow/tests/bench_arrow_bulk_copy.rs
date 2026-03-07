@@ -495,7 +495,7 @@ const TRUNCATE_MATERIALIZED: &str = "TRUNCATE TABLE #ArrowBenchMaterialized";
 const TRUNCATE_STREAMING: &str = "TRUNCATE TABLE #ArrowBenchStreaming";
 const TRUNCATE_ARROW_BULK_COPY: &str = "TRUNCATE TABLE #ArrowBenchArrowBulkCopy";
 
-const NUM_ROWS: usize = 100_000;
+const NUM_ROWS: usize = 1_000_000;
 const NUM_ITERATIONS: usize = 10;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
