@@ -1,9 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#[cfg(test)]
-// Not public API — experimental Arrow integration retained for testing only.
-mod arrow_writer;
 pub mod bulk_copy_metadata;
 pub mod column_values;
 pub mod decoder;

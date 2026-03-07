@@ -6,14 +6,16 @@
 //!
 //! Run with:
 //!   DB_HOST=localhost DB_USERNAME=sa TRUST_SERVER_CERTIFICATE=true \
-//!     cargo nextest run -p mssql-tds --test bench_arrow_bulk_copy -- --ignored
+//!     cargo nextest run -p mssql-arrow --test bench_arrow_bulk_copy -- --ignored
 
 mod common;
 
 use arrow_array::builder::{
     Decimal128Builder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
 };
-use arrow_array::{Decimal128Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    Decimal128Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use common::{begin_connection, build_tcp_datasource};
@@ -115,7 +117,11 @@ fn tds_nvarchar(buf: &mut Vec<u8>, s: &str) {
 fn tds_decimal_p18(buf: &mut Vec<u8>, val: i128) {
     // Precision 18 → 8 value bytes. Total length = 1 (sign) + 8 (value) = 9.
     buf.push(9);
-    let (sign, abs) = if val >= 0 { (1u8, val as u128) } else { (0u8, (-val) as u128) };
+    let (sign, abs) = if val >= 0 {
+        (1u8, val as u128)
+    } else {
+        (0u8, (-val) as u128)
+    };
     buf.push(sign);
     buf.extend_from_slice(&(abs as u64).to_le_bytes());
 }
@@ -126,16 +132,34 @@ fn tds_decimal_p18(buf: &mut Vec<u8>, val: i128) {
 /// then assembles per-row byte slices via offset tracking.
 fn pre_serialize_arrow_to_tds(batch: &RecordBatch) -> Vec<Vec<u8>> {
     let num_rows = batch.num_rows();
-    let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-    let amounts = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-    let prices = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-    let names = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-    let totals = batch.column(4).as_any().downcast_ref::<Decimal128Array>().unwrap();
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let amounts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let prices = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let names = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let totals = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
 
     // Estimate ~80 bytes per row: 5 + 9 + 9 + ~44 (20-char NVARCHAR) + 11
-    let mut rows: Vec<Vec<u8>> = (0..num_rows)
-        .map(|_| Vec::with_capacity(80))
-        .collect();
+    let mut rows: Vec<Vec<u8>> = (0..num_rows).map(|_| Vec::with_capacity(80)).collect();
 
     // Column 0: INT — tight loop over i32 values buffer
     for (row, buf) in rows.iter_mut().enumerate() {
@@ -288,7 +312,11 @@ fn stream_nvarchar(writer: &mut StreamingBulkLoadWriter<'_>, s: &str) {
 #[inline(always)]
 fn stream_decimal_p18(writer: &mut StreamingBulkLoadWriter<'_>, val: i128) {
     writer.write_byte_unchecked(9); // len = 1 (sign) + 8 (value)
-    let (sign, abs) = if val >= 0 { (1u8, val as u128) } else { (0u8, (-val) as u128) };
+    let (sign, abs) = if val >= 0 {
+        (1u8, val as u128)
+    } else {
+        (0u8, (-val) as u128)
+    };
     writer.write_byte_unchecked(sign);
     writer.write_i64_unchecked(abs as i64);
 }
@@ -350,11 +378,31 @@ impl BulkLoadRow for &StreamingRow<'_> {
 
 fn materialize_batch(batch: &RecordBatch) -> Vec<MaterializedRow> {
     let num_rows = batch.num_rows();
-    let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-    let amounts = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-    let prices = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-    let names = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-    let totals = batch.column(4).as_any().downcast_ref::<Decimal128Array>().unwrap();
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let amounts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let prices = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let names = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let totals = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
 
     (0..num_rows)
         .map(|row| {
@@ -411,6 +459,7 @@ const CREATE_TABLE: &str = "
     IF OBJECT_ID('tempdb..#ArrowBenchDirect') IS NOT NULL DROP TABLE #ArrowBenchDirect;
     IF OBJECT_ID('tempdb..#ArrowBenchMaterialized') IS NOT NULL DROP TABLE #ArrowBenchMaterialized;
     IF OBJECT_ID('tempdb..#ArrowBenchStreaming') IS NOT NULL DROP TABLE #ArrowBenchStreaming;
+    IF OBJECT_ID('tempdb..#ArrowBenchArrowBulkCopy') IS NOT NULL DROP TABLE #ArrowBenchArrowBulkCopy;
     CREATE TABLE #ArrowBenchDirect (
         id INT NOT NULL,
         amount BIGINT NOT NULL,
@@ -432,11 +481,19 @@ const CREATE_TABLE: &str = "
         name NVARCHAR(200) NOT NULL,
         total DECIMAL(18,2) NOT NULL
     );
+    CREATE TABLE #ArrowBenchArrowBulkCopy (
+        id INT NOT NULL,
+        amount BIGINT NOT NULL,
+        price FLOAT NOT NULL,
+        name NVARCHAR(200) NOT NULL,
+        total DECIMAL(18,2) NOT NULL
+    );
 ";
 
 const TRUNCATE_DIRECT: &str = "TRUNCATE TABLE #ArrowBenchDirect";
 const TRUNCATE_MATERIALIZED: &str = "TRUNCATE TABLE #ArrowBenchMaterialized";
 const TRUNCATE_STREAMING: &str = "TRUNCATE TABLE #ArrowBenchStreaming";
+const TRUNCATE_ARROW_BULK_COPY: &str = "TRUNCATE TABLE #ArrowBenchArrowBulkCopy";
 
 const NUM_ROWS: usize = 100_000;
 const NUM_ITERATIONS: usize = 10;
@@ -459,7 +516,7 @@ async fn bench_arrow_bulk_copy_to_sql_server() {
     println!("\n============================================================");
     println!("Arrow Bulk Copy Benchmark — {NUM_ROWS} rows × {NUM_ITERATIONS} iterations");
     println!("Schema: INT, BIGINT, FLOAT, NVARCHAR(200), DECIMAL(18,2)");
-    println!("Paths: A=pre-serialized, B=materialized, C=streaming");
+    println!("Paths: A=pre-serialized, B=materialized, C=streaming, D=ArrowBulkCopy");
     println!("============================================================\n");
 
     // ── Path A: Arrow-direct (pre-serialized TDS bytes) ────────────────
@@ -538,11 +595,31 @@ async fn bench_arrow_bulk_copy_to_sql_server() {
 
     // ── Path C: Arrow-streaming — write directly to packet buffer ──────
     let mut streaming_times = Vec::with_capacity(NUM_ITERATIONS);
-    let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-    let amounts = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-    let prices = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-    let names = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-    let totals = batch.column(4).as_any().downcast_ref::<Decimal128Array>().unwrap();
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let amounts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let prices = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let names = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let totals = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
 
     for iter in 0..NUM_ITERATIONS {
         if iter > 0 {
@@ -576,6 +653,38 @@ async fn bench_arrow_bulk_copy_to_sql_server() {
         streaming_times.push(elapsed);
         println!(
             "  [streaming]    iter {}: {:>8.2} ms  ({:.1} Krows/s)",
+            iter + 1,
+            elapsed.as_secs_f64() * 1000.0,
+            NUM_ROWS as f64 / elapsed.as_secs_f64() / 1000.0,
+        );
+    }
+
+    // ── Path D: ArrowBulkCopy — high-level API ─────────────────────────
+    let mut arrow_bulk_copy_times = Vec::with_capacity(NUM_ITERATIONS);
+
+    for iter in 0..NUM_ITERATIONS {
+        if iter > 0 {
+            client
+                .execute(TRUNCATE_ARROW_BULK_COPY.to_string(), None, None)
+                .await
+                .unwrap();
+            client.close_query().await.unwrap();
+        }
+
+        let start = Instant::now();
+        {
+            let mut arrow_bc =
+                mssql_arrow::ArrowBulkCopy::new(&mut client, "#ArrowBenchArrowBulkCopy");
+            arrow_bc = arrow_bc.batch_size(NUM_ROWS);
+            arrow_bc
+                .write_batch(&batch)
+                .await
+                .expect("ArrowBulkCopy bulk copy failed");
+        }
+        let elapsed = start.elapsed();
+        arrow_bulk_copy_times.push(elapsed);
+        println!(
+            "  [arrow_bulk]   iter {}: {:>8.2} ms  ({:.1} Krows/s)",
             iter + 1,
             elapsed.as_secs_f64() * 1000.0,
             NUM_ROWS as f64 / elapsed.as_secs_f64() / 1000.0,
@@ -616,13 +725,32 @@ async fn bench_arrow_bulk_copy_to_sql_server() {
     let count = common::get_scalar_value(&mut client).await.unwrap();
     assert_eq!(count, Some(ColumnValues::Int(NUM_ROWS as i32)));
 
+    client
+        .execute(
+            "SELECT COUNT(*) FROM #ArrowBenchArrowBulkCopy".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let count = common::get_scalar_value(&mut client).await.unwrap();
+    assert_eq!(count, Some(ColumnValues::Int(NUM_ROWS as i32)));
+
     // ── Summary ─────────────────────────────────────────────────────────
     let avg_direct =
         direct_times.iter().map(|d| d.as_secs_f64()).sum::<f64>() / NUM_ITERATIONS as f64;
-    let avg_materialized =
-        materialized_times.iter().map(|d| d.as_secs_f64()).sum::<f64>() / NUM_ITERATIONS as f64;
+    let avg_materialized = materialized_times
+        .iter()
+        .map(|d| d.as_secs_f64())
+        .sum::<f64>()
+        / NUM_ITERATIONS as f64;
     let avg_streaming =
         streaming_times.iter().map(|d| d.as_secs_f64()).sum::<f64>() / NUM_ITERATIONS as f64;
+    let avg_arrow_bulk_copy = arrow_bulk_copy_times
+        .iter()
+        .map(|d| d.as_secs_f64())
+        .sum::<f64>()
+        / NUM_ITERATIONS as f64;
 
     // Skip first iteration (cold) for warmed-up averages
     let warm_direct = direct_times[1..]
@@ -640,11 +768,18 @@ async fn bench_arrow_bulk_copy_to_sql_server() {
         .map(|d| d.as_secs_f64())
         .sum::<f64>()
         / (NUM_ITERATIONS - 1) as f64;
+    let warm_arrow_bulk_copy = arrow_bulk_copy_times[1..]
+        .iter()
+        .map(|d| d.as_secs_f64())
+        .sum::<f64>()
+        / (NUM_ITERATIONS - 1) as f64;
 
     let speedup_direct = avg_materialized / avg_direct;
     let speedup_streaming = avg_materialized / avg_streaming;
+    let speedup_arrow_bulk_copy = avg_materialized / avg_arrow_bulk_copy;
     let warm_speedup_direct = warm_materialized / warm_direct;
     let warm_speedup_streaming = warm_materialized / warm_streaming;
+    let warm_speedup_arrow_bulk_copy = warm_materialized / warm_arrow_bulk_copy;
 
     println!("\n------------------------------------------------------------");
     println!("RESULTS ({NUM_ROWS} rows, {NUM_ITERATIONS} iterations)");
@@ -664,8 +799,14 @@ async fn bench_arrow_bulk_copy_to_sql_server() {
         avg_materialized * 1000.0,
         NUM_ROWS as f64 / avg_materialized / 1000.0,
     );
+    println!(
+        "  ArrowBulkCopy (avg):      {:>8.2} ms  ({:.1} Krows/s)",
+        avg_arrow_bulk_copy * 1000.0,
+        NUM_ROWS as f64 / avg_arrow_bulk_copy / 1000.0,
+    );
     println!("  Speedup pre-serial (all): {speedup_direct:.2}×");
     println!("  Speedup streaming (all):  {speedup_streaming:.2}×");
+    println!("  Speedup arrow_bulk (all): {speedup_arrow_bulk_copy:.2}×");
     println!(
         "  Pre-serialized (warm):    {:>8.2} ms  ({:.1} Krows/s)",
         warm_direct * 1000.0,
@@ -681,7 +822,13 @@ async fn bench_arrow_bulk_copy_to_sql_server() {
         warm_materialized * 1000.0,
         NUM_ROWS as f64 / warm_materialized / 1000.0,
     );
+    println!(
+        "  ArrowBulkCopy (warm):     {:>8.2} ms  ({:.1} Krows/s)",
+        warm_arrow_bulk_copy * 1000.0,
+        NUM_ROWS as f64 / warm_arrow_bulk_copy / 1000.0,
+    );
     println!("  Speedup pre-serial (warm):{warm_speedup_direct:.2}×");
     println!("  Speedup streaming (warm): {warm_speedup_streaming:.2}×");
+    println!("  Speedup arrow_bulk (warm):{warm_speedup_arrow_bulk_copy:.2}×");
     println!("------------------------------------------------------------\n");
 }

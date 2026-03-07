@@ -125,7 +125,11 @@ fn write_tds_decimal128(buf: &mut Vec<u8>, val: i128, precision: u8) {
     let total_len = 1 + value_bytes; // sign + value
     buf.push(total_len as u8);
 
-    let (sign, abs) = if val >= 0 { (1u8, val as u128) } else { (0u8, (-val) as u128) };
+    let (sign, abs) = if val >= 0 {
+        (1u8, val as u128)
+    } else {
+        (0u8, (-val) as u128)
+    };
     buf.push(sign);
 
     let bytes = abs.to_le_bytes();
@@ -141,11 +145,31 @@ fn write_tds_decimal128(buf: &mut Vec<u8>, val: i128, precision: u8) {
 
 fn serialize_arrow_direct(batch: &RecordBatch, buf: &mut Vec<u8>) {
     let num_rows = batch.num_rows();
-    let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-    let amounts = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-    let prices = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-    let names = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-    let totals = batch.column(4).as_any().downcast_ref::<Decimal128Array>().unwrap();
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let amounts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let prices = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let names = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let totals = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
 
     for row in 0..num_rows {
         buf.push(0xD1); // ROW token
@@ -168,11 +192,31 @@ fn serialize_arrow_direct(batch: &RecordBatch, buf: &mut Vec<u8>) {
 /// Extract one row from Arrow RecordBatch into Vec<ColumnValues>.
 #[inline(always)]
 fn arrow_row_to_column_values(batch: &RecordBatch, row: usize) -> Vec<ColumnValues> {
-    let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-    let amounts = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-    let prices = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-    let names = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-    let totals = batch.column(4).as_any().downcast_ref::<Decimal128Array>().unwrap();
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let amounts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let prices = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let names = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let totals = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
 
     let name_str = names.value(row);
     let mut utf16_bytes = Vec::with_capacity(name_str.len() * 2);
@@ -258,11 +302,31 @@ fn serialize_arrow_via_column_values(batch: &RecordBatch, buf: &mut Vec<u8>) {
 
 fn serialize_arrow_direct_preencoded(batch: &RecordBatch, buf: &mut Vec<u8>) {
     let num_rows = batch.num_rows();
-    let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-    let amounts = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-    let prices = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-    let names = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-    let totals = batch.column(4).as_any().downcast_ref::<Decimal128Array>().unwrap();
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let amounts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let prices = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let names = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let totals = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
 
     // Pre-encode all strings to UTF-16LE
     let encoded_names: Vec<Vec<u8>> = (0..num_rows)

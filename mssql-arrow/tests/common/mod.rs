@@ -6,9 +6,10 @@ use std::sync::Once;
 
 use dotenv::dotenv;
 use mssql_tds::connection::client_context::ClientContext;
-use mssql_tds::connection::tds_client::TdsClient;
+use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
+use mssql_tds::datatypes::column_values::ColumnValues;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -84,4 +85,26 @@ pub async fn create_client(datasource: &str) -> TdsResult<TdsClient> {
 #[allow(dead_code)]
 pub async fn begin_connection(datasource: &str) -> TdsClient {
     create_client(datasource).await.unwrap()
+}
+
+#[allow(dead_code)]
+pub async fn get_scalar_value(client: &mut TdsClient) -> TdsResult<Option<ColumnValues>> {
+    let mut result = None;
+
+    loop {
+        if let Some(resultset) = client.get_current_resultset()
+            && let Some(row) = resultset.next_row().await?
+            && !row.is_empty()
+        {
+            result = Some(row[0].clone());
+            break;
+        }
+
+        if !client.move_to_next().await? {
+            break;
+        }
+    }
+
+    client.close_query().await?;
+    Ok(result)
 }

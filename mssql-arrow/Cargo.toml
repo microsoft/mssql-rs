@@ -16,7 +16,12 @@ thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["full"] }
 uuid = "1.19.0"
 
+[[bench]]
+name = "arrow_tds_bench"
+harness = false
+
 [dev-dependencies]
+criterion = "0.5"
 dotenv = "0.15"
 ctor = "0.4"
 tokio = { version = "1.48.0", features = ["full"] }
