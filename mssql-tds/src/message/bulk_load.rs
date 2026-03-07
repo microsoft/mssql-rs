@@ -228,40 +228,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         self.packet_writer
     }
 
-    /// Write an i32 value directly for a column, bypassing ColumnValues dispatch.
-    pub async fn write_int32(&mut self, column_index: usize, value: i32) -> TdsResult<()> {
-        let ctx = &self.column_contexts[column_index];
-        TdsValueSerializer::serialize_int(self.packet_writer, value, ctx).await
-    }
-
-    /// Write an i64 value directly for a column, bypassing ColumnValues dispatch.
-    pub async fn write_int64(&mut self, column_index: usize, value: i64) -> TdsResult<()> {
-        let ctx = &self.column_contexts[column_index];
-        TdsValueSerializer::serialize_bigint(self.packet_writer, value, ctx).await
-    }
-
-    /// Write an f64 value directly for a column, bypassing ColumnValues dispatch.
-    pub async fn write_float64(&mut self, column_index: usize, value: f64) -> TdsResult<()> {
-        let ctx = &self.column_contexts[column_index];
-        TdsValueSerializer::serialize_float(self.packet_writer, value, ctx).await
-    }
-
-    /// Write a UTF-8 string as NVARCHAR, bypassing ColumnValues/SqlString.
-    pub async fn write_nvarchar_str(&mut self, column_index: usize, value: &str) -> TdsResult<()> {
-        let ctx = &self.column_contexts[column_index];
-        TdsValueSerializer::serialize_string_utf16(self.packet_writer, value, ctx).await
-    }
-
-    /// Write a decimal value directly from parts, bypassing ColumnValues dispatch.
-    pub async fn write_decimal(
-        &mut self,
-        column_index: usize,
-        value: &crate::datatypes::decoder::DecimalParts,
-    ) -> TdsResult<()> {
-        let ctx = &self.column_contexts[column_index];
-        TdsValueSerializer::serialize_decimal(self.packet_writer, value, ctx).await
-    }
-
     /// Write pre-serialized TDS wire format bytes directly to the packet.
     ///
     /// This is a convenience method for writing raw TDS bytes that have been
