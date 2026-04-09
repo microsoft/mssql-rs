@@ -73,3 +73,95 @@ impl Feature for JsonFeature {
         Box::new(*self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_feature_identifier() {
+        let feature = JsonFeature::default();
+        assert_eq!(feature.feature_identifier(), FeatureExtension::Json);
+    }
+
+    #[test]
+    fn test_is_requested() {
+        let feature = JsonFeature::default();
+        assert!(feature.is_requested());
+    }
+
+    #[test]
+    fn test_data_length() {
+        let feature = JsonFeature::default();
+        // 1 (feature id) + 4 (length) + 1 (version)
+        assert_eq!(feature.data_length(), 6);
+    }
+
+    #[test]
+    fn test_acknowledged() {
+        let mut feature = JsonFeature::default();
+        assert!(!feature.is_acknowledged());
+        feature.set_acknowledged(true);
+        assert!(feature.is_acknowledged());
+    }
+
+    #[test]
+    fn test_deserialize_valid_version() {
+        let mut feature = JsonFeature::default();
+        feature.deserialize(&[JsonFeature::VERSION]).unwrap();
+    }
+
+    #[test]
+    fn test_deserialize_version_zero() {
+        let mut feature = JsonFeature::default();
+        feature.deserialize(&[0u8]).unwrap();
+    }
+
+    #[test]
+    fn test_deserialize_unsupported_version() {
+        let mut feature = JsonFeature::default();
+        let result = feature.deserialize(&[2u8]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported JSON feature version")
+        );
+    }
+
+    #[test]
+    fn test_deserialize_invalid_length() {
+        let mut feature = JsonFeature::default();
+        let result = feature.deserialize(&[1u8, 0u8]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid data length")
+        );
+    }
+
+    #[test]
+    fn test_deserialize_empty() {
+        let mut feature = JsonFeature::default();
+        let result = feature.deserialize(&[]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid data length")
+        );
+    }
+
+    #[test]
+    fn test_clone_box() {
+        let mut feature = JsonFeature::default();
+        feature.set_acknowledged(true);
+        let cloned = feature.clone_box();
+        assert!(cloned.is_acknowledged());
+        assert_eq!(cloned.feature_identifier(), FeatureExtension::Json);
+    }
+}

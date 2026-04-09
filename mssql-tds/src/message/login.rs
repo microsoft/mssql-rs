@@ -1224,3 +1224,375 @@ impl ClientContext {
         length
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Version;
+    use crate::message::features::jsonfeature::JsonFeature;
+    use crate::message::features::vectorfeature::VectorFeature;
+    use crate::token::fed_auth_info::{FedAuthInfoToken, SspiToken};
+    use crate::token::login_ack::{LoginAckToken, SqlInterfaceType};
+    use crate::token::tokens::{
+        EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, ErrorToken, SqlCollation,
+    };
+
+    // ── FeatureExtension::as_u8 ──
+
+    #[test]
+    fn feature_extension_as_u8_all_variants() {
+        assert_eq!(FeatureExtension::SRecovery.as_u8(), 0x01);
+        assert_eq!(FeatureExtension::FedAuth.as_u8(), 0x02);
+        assert_eq!(FeatureExtension::AlwaysEncrypted.as_u8(), 0x04);
+        assert_eq!(FeatureExtension::GlobalTransactions.as_u8(), 0x05);
+        assert_eq!(FeatureExtension::AzureSqlSupport.as_u8(), 0x08);
+        assert_eq!(FeatureExtension::DataClassification.as_u8(), 0x09);
+        assert_eq!(FeatureExtension::Utf8Support.as_u8(), 0x0A);
+        assert_eq!(FeatureExtension::SqlDnsCaching.as_u8(), 0x0B);
+        assert_eq!(FeatureExtension::Json.as_u8(), 0x0D);
+        assert_eq!(FeatureExtension::Vector.as_u8(), 0x0E);
+        assert_eq!(FeatureExtension::Terminator.as_u8(), 0xFF);
+        assert_eq!(FeatureExtension::Unknown(0xAB).as_u8(), 0xAB);
+    }
+
+    // ── FeatureExtension::from(u8) ──
+
+    #[test]
+    fn feature_extension_from_u8_known_values() {
+        assert_eq!(FeatureExtension::from(0x01), FeatureExtension::SRecovery);
+        assert_eq!(FeatureExtension::from(0x02), FeatureExtension::FedAuth);
+        assert_eq!(
+            FeatureExtension::from(0x04),
+            FeatureExtension::AlwaysEncrypted
+        );
+        assert_eq!(
+            FeatureExtension::from(0x05),
+            FeatureExtension::GlobalTransactions
+        );
+        assert_eq!(
+            FeatureExtension::from(0x08),
+            FeatureExtension::AzureSqlSupport
+        );
+        assert_eq!(
+            FeatureExtension::from(0x09),
+            FeatureExtension::DataClassification
+        );
+        assert_eq!(FeatureExtension::from(0x0A), FeatureExtension::Utf8Support);
+        assert_eq!(
+            FeatureExtension::from(0x0B),
+            FeatureExtension::SqlDnsCaching
+        );
+        assert_eq!(FeatureExtension::from(0x0D), FeatureExtension::Json);
+        assert_eq!(FeatureExtension::from(0x0E), FeatureExtension::Vector);
+        assert_eq!(FeatureExtension::from(0xFF), FeatureExtension::Terminator);
+    }
+
+    #[test]
+    fn feature_extension_from_u8_unknown() {
+        assert_eq!(
+            FeatureExtension::from(0x42),
+            FeatureExtension::Unknown(0x42)
+        );
+    }
+
+    #[test]
+    fn feature_extension_roundtrip() {
+        for val in [
+            0x01u8, 0x02, 0x04, 0x05, 0x08, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0xFF, 0x42,
+        ] {
+            assert_eq!(FeatureExtension::from(val).as_u8(), val);
+        }
+    }
+
+    // ── Helper to build a FeaturesRequest with Json + Vector ──
+
+    fn make_features_request() -> FeaturesRequest {
+        let mut features: HashMap<FeatureExtension, Box<dyn Feature>> = HashMap::new();
+        features.insert(FeatureExtension::Json, Box::new(JsonFeature::default()));
+        features.insert(FeatureExtension::Vector, Box::new(VectorFeature::default()));
+        FeaturesRequest { features }
+    }
+
+    // ── FeaturesRequest::features() ──
+
+    #[test]
+    fn features_request_features_returns_all() {
+        let req = make_features_request();
+        assert_eq!(req.features().len(), 2);
+    }
+
+    // ── FeaturesRequest::is_acknowledged ──
+
+    #[test]
+    fn features_request_is_acknowledged_returns_none_for_unacknowledged() {
+        let req = make_features_request();
+        assert!(req.is_acknowledged(FeatureExtension::Json).is_none());
+    }
+
+    #[test]
+    fn features_request_is_acknowledged_returns_some_after_ack() {
+        let mut req = make_features_request();
+        req.set_acknowledged(FeatureExtension::Json, &[1]).unwrap();
+        assert!(req.is_acknowledged(FeatureExtension::Json).is_some());
+    }
+
+    #[test]
+    fn features_request_is_acknowledged_returns_none_for_missing() {
+        let req = make_features_request();
+        assert!(req.is_acknowledged(FeatureExtension::SRecovery).is_none());
+    }
+
+    // ── FeaturesRequest::set_acknowledged ──
+
+    #[test]
+    fn features_request_set_acknowledged_missing_feature_ok() {
+        let mut req = make_features_request();
+        assert!(
+            req.set_acknowledged(FeatureExtension::SRecovery, &[])
+                .is_ok()
+        );
+    }
+
+    // ── FeaturesRequest::get_requested_features / get_acknowledged_features ──
+
+    #[test]
+    fn features_request_get_requested_features() {
+        let req = make_features_request();
+        let requested = req.get_requested_features();
+        assert_eq!(requested.len(), 2);
+    }
+
+    #[test]
+    fn features_request_get_acknowledged_features_initially_empty() {
+        let req = make_features_request();
+        assert!(req.get_acknowledged_features().is_empty());
+    }
+
+    #[test]
+    fn features_request_get_acknowledged_features_after_ack() {
+        let mut req = make_features_request();
+        req.set_acknowledged(FeatureExtension::Json, &[1]).unwrap();
+        assert_eq!(req.get_acknowledged_features().len(), 1);
+    }
+
+    // ── LoginResponseModel::capture_change_property ──
+
+    fn make_response_model() -> LoginResponseModel {
+        LoginResponseModel::new(make_features_request())
+    }
+
+    fn env_token(
+        sub_type: EnvChangeTokenSubType,
+        change_type: EnvChangeContainer,
+    ) -> EnvChangeToken {
+        EnvChangeToken {
+            sub_type,
+            change_type,
+        }
+    }
+
+    #[test]
+    fn capture_change_property_database() {
+        let mut model = make_response_model();
+        let token = env_token(
+            EnvChangeTokenSubType::Database,
+            ("".to_string(), "master".to_string()).into(),
+        );
+        model.capture_change_property(token).unwrap();
+        assert_eq!(model.change_properties.database.as_deref(), Some("master"));
+    }
+
+    #[test]
+    fn capture_change_property_language() {
+        let mut model = make_response_model();
+        let token = env_token(
+            EnvChangeTokenSubType::Language,
+            ("".to_string(), "us_english".to_string()).into(),
+        );
+        model.capture_change_property(token).unwrap();
+        assert_eq!(
+            model.change_properties.language.as_deref(),
+            Some("us_english")
+        );
+    }
+
+    #[test]
+    fn capture_change_property_character_set() {
+        let mut model = make_response_model();
+        let token = env_token(
+            EnvChangeTokenSubType::CharacterSet,
+            ("".to_string(), "iso_1".to_string()).into(),
+        );
+        model.capture_change_property(token).unwrap();
+        assert_eq!(model.change_properties.char_set.as_deref(), Some("iso_1"));
+    }
+
+    #[test]
+    fn capture_change_property_string_unknown_subtype_errors() {
+        let mut model = make_response_model();
+        let token = env_token(
+            EnvChangeTokenSubType::UserInstanceName,
+            ("val".to_string(), "".to_string()).into(),
+        );
+        let err = model.capture_change_property(token).unwrap_err();
+        assert!(err.to_string().contains("Protocol Error"));
+    }
+
+    #[test]
+    fn capture_change_property_packet_size() {
+        let mut model = make_response_model();
+        let token = env_token(EnvChangeTokenSubType::PacketSize, (4096u32, 8192u32).into());
+        model.capture_change_property(token).unwrap();
+        assert_eq!(model.change_properties.packet_size, 8192);
+    }
+
+    #[test]
+    fn capture_change_property_uint32_unknown_subtype_errors() {
+        let mut model = make_response_model();
+        let token = env_token(EnvChangeTokenSubType::BeginTransaction, (1u32, 0u32).into());
+        let err = model.capture_change_property(token).unwrap_err();
+        assert!(err.to_string().contains("Protocol Error"));
+    }
+
+    #[test]
+    fn capture_change_property_routing_returns_redirection() {
+        let mut model = make_response_model();
+        let routing = RoutingInfo {
+            protocol: 0,
+            server: "redirect.sql.net".to_string(),
+            port: 11000,
+        };
+        let token = env_token(EnvChangeTokenSubType::Routing, (None, Some(routing)).into());
+        let err = model.capture_change_property(token).unwrap_err();
+        assert!(err.to_string().contains("redirect.sql.net"));
+        assert!(model.change_properties.routing_information.is_some());
+    }
+
+    #[test]
+    fn capture_change_property_bytes_type_errors() {
+        let mut model = make_response_model();
+        let token = env_token(
+            EnvChangeTokenSubType::BeginTransaction,
+            (vec![1u8, 2], vec![3u8, 4]).into(),
+        );
+        let err = model.capture_change_property(token).unwrap_err();
+        assert!(err.to_string().contains("Protocol Error"));
+    }
+
+    #[test]
+    fn capture_change_property_collation() {
+        let mut model = make_response_model();
+        let token = env_token(
+            EnvChangeTokenSubType::SqlCollation,
+            EnvChangeContainer::from((None::<SqlCollation>, None::<SqlCollation>)),
+        );
+        model.capture_change_property(token).unwrap();
+        assert!(model.change_properties.database_collation.is_none());
+    }
+
+    // ── LoginResponseModel::get_status ──
+
+    #[test]
+    fn get_status_rerouting() {
+        let mut model = make_response_model();
+        model.change_properties.routing_information = Some(RoutingInfo {
+            protocol: 0,
+            server: "s".to_string(),
+            port: 1433,
+        });
+        assert_eq!(model.get_status(), LoginResponseStatus::Rerouting);
+    }
+
+    #[test]
+    fn get_status_success() {
+        let mut model = make_response_model();
+        model.success_token = Some(LoginAckToken {
+            interface_type: SqlInterfaceType::TSql,
+            tds_version: TdsVersion::V7_4,
+            prog_name: "SQL".to_string(),
+            prog_version: Version {
+                major: 1,
+                minor: 0,
+                build: 0,
+                revision: 0,
+            },
+        });
+        assert_eq!(model.get_status(), LoginResponseStatus::Success);
+    }
+
+    #[test]
+    fn get_status_error() {
+        let mut model = make_response_model();
+        model.tds_error = Some(TdsError::new(ErrorToken {
+            number: 1,
+            state: 0,
+            severity: 16,
+            message: "err".to_string(),
+            server_name: "".to_string(),
+            proc_name: "".to_string(),
+            line_number: 0,
+        }));
+        assert_eq!(model.get_status(), LoginResponseStatus::Error);
+    }
+
+    #[test]
+    fn get_status_waiting_for_fed_auth() {
+        let mut model = make_response_model();
+        model.fed_auth_info = Some(FedAuthInfoToken {
+            spn: "spn".to_string(),
+            sts_url: "https://sts".to_string(),
+        });
+        assert_eq!(model.get_status(), LoginResponseStatus::WaitingForFedAuth);
+    }
+
+    #[test]
+    fn get_status_waiting_for_sspi() {
+        let mut model = make_response_model();
+        model.sspi_token = Some(SspiToken {
+            data: vec![0x01, 0x02],
+        });
+        assert_eq!(model.get_status(), LoginResponseStatus::WaitingForSspi);
+    }
+
+    #[test]
+    fn get_status_fallback_error() {
+        let model = make_response_model();
+        assert_eq!(model.get_status(), LoginResponseStatus::Error);
+    }
+
+    // ── LoginResponseStatus discriminants ──
+
+    #[test]
+    fn login_response_status_discriminants() {
+        assert_eq!(LoginResponseStatus::NoResponse as u8, 0x00);
+        assert_eq!(LoginResponseStatus::Success as u8, 0x01);
+        assert_eq!(LoginResponseStatus::Error as u8, 0x02);
+        assert_eq!(LoginResponseStatus::WaitingForFedAuth as u8, 0x03);
+        assert_eq!(LoginResponseStatus::Rerouting as u8, 0x04);
+        assert_eq!(LoginResponseStatus::WaitingForSspi as u8, 0x05);
+    }
+
+    // ── get_status priority: routing > success > error > fedauth > sspi ──
+
+    #[test]
+    fn get_status_rerouting_takes_precedence_over_success() {
+        let mut model = make_response_model();
+        model.change_properties.routing_information = Some(RoutingInfo {
+            protocol: 0,
+            server: "s".to_string(),
+            port: 1433,
+        });
+        model.success_token = Some(LoginAckToken {
+            interface_type: SqlInterfaceType::TSql,
+            tds_version: TdsVersion::V7_4,
+            prog_name: "SQL".to_string(),
+            prog_version: Version {
+                major: 1,
+                minor: 0,
+                build: 0,
+                revision: 0,
+            },
+        });
+        assert_eq!(model.get_status(), LoginResponseStatus::Rerouting);
+    }
+}

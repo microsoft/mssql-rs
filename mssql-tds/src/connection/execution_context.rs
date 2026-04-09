@@ -393,4 +393,98 @@ mod tests {
     fn test_already_executing_error_constant() {
         assert!(ALREADY_EXECUTING_ERROR.contains("open batch"));
     }
+
+    // --- Type mismatch error tests ---
+
+    #[test]
+    fn test_transaction_with_non_uint64_container() {
+        let mut ctx = ExecutionContext::new();
+        for sub_type in [
+            EnvChangeTokenSubType::BeginTransaction,
+            EnvChangeTokenSubType::CommitTransaction,
+            EnvChangeTokenSubType::RollbackTransaction,
+            EnvChangeTokenSubType::EnlistDtcTransaction,
+            EnvChangeTokenSubType::DefectTransaction,
+        ] {
+            let token = EnvChangeToken {
+                sub_type,
+                change_type: EnvChangeContainer::from(("a".to_string(), "b".to_string())),
+            };
+            let err = ctx.capture_change_property(&token).unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::ProtocolError(ref msg) if msg.contains("UInt64")),
+                "Expected ProtocolError for {sub_type:?}, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_database_with_non_string_container() {
+        let mut ctx = ExecutionContext::new();
+        let token = EnvChangeToken {
+            sub_type: EnvChangeTokenSubType::Database,
+            change_type: EnvChangeContainer::from((0_u64, 1_u64)),
+        };
+        let err = ctx.capture_change_property(&token).unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::ProtocolError(ref msg) if msg.contains("String"))
+        );
+    }
+
+    #[test]
+    fn test_language_with_non_string_container() {
+        let mut ctx = ExecutionContext::new();
+        let token = EnvChangeToken {
+            sub_type: EnvChangeTokenSubType::Language,
+            change_type: EnvChangeContainer::from((0_u64, 1_u64)),
+        };
+        let err = ctx.capture_change_property(&token).unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::ProtocolError(ref msg) if msg.contains("String"))
+        );
+    }
+
+    #[test]
+    fn test_sql_collation_with_non_collation_container() {
+        let mut ctx = ExecutionContext::new();
+        let token = EnvChangeToken {
+            sub_type: EnvChangeTokenSubType::SqlCollation,
+            change_type: EnvChangeContainer::from(("a".to_string(), "b".to_string())),
+        };
+        let err = ctx.capture_change_property(&token).unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::ProtocolError(ref msg) if msg.contains("Collation"))
+        );
+    }
+
+    // --- Unimplemented feature tests ---
+
+    #[test]
+    fn test_unimplemented_env_change_subtypes() {
+        let mut ctx = ExecutionContext::new();
+        let dummy = EnvChangeContainer::from((0_u64, 0_u64));
+        let unimplemented_subtypes = [
+            EnvChangeTokenSubType::CharacterSet,
+            EnvChangeTokenSubType::UnicodeDataSortingLocalId,
+            EnvChangeTokenSubType::UnicodeDataSortingComparisonFlags,
+            EnvChangeTokenSubType::DatabaseMirroringPartner,
+            EnvChangeTokenSubType::PromoteTransaction,
+            EnvChangeTokenSubType::TransactionManagerAddress,
+            EnvChangeTokenSubType::TransactionEnded,
+            EnvChangeTokenSubType::ResetConnection,
+            EnvChangeTokenSubType::UserInstanceName,
+            EnvChangeTokenSubType::Routing,
+        ];
+        for sub_type in unimplemented_subtypes {
+            let token = EnvChangeToken {
+                sub_type,
+                change_type: dummy.clone(),
+            };
+            let err = ctx.capture_change_property(&token).unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::UnimplementedFeature { .. }),
+                "Expected UnimplementedFeature for {sub_type:?}, got: {err:?}"
+            );
+        }
+    }
 }

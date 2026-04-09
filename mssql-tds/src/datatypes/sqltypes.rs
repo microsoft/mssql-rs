@@ -1086,3 +1086,363 @@ mod json_tests {
         assert_eq!(test_cursor.get_u64_le(), PLP_NULL);
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use crate::datatypes::{
+        column_values::{
+            ColumnValues, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlMoney, SqlSmallDateTime,
+            SqlSmallMoney, SqlTime,
+        },
+        decoder::DecimalParts,
+        sqldatatypes::{FixedLengthTypes, TdsDataType},
+        sqltypes::{SqlType, get_time_length_from_scale},
+    };
+    use crate::token::tokens::SqlCollation;
+
+    fn default_collation() -> SqlCollation {
+        SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        }
+    }
+
+    // -- get_time_length_from_scale --
+
+    #[test]
+    fn time_length_scale_0_to_2() {
+        for s in 0..=2 {
+            assert_eq!(get_time_length_from_scale(s).unwrap(), 3);
+        }
+    }
+
+    #[test]
+    fn time_length_scale_3_4() {
+        assert_eq!(get_time_length_from_scale(3).unwrap(), 4);
+        assert_eq!(get_time_length_from_scale(4).unwrap(), 4);
+    }
+
+    #[test]
+    fn time_length_scale_5_to_7() {
+        for s in 5..=7 {
+            assert_eq!(get_time_length_from_scale(s).unwrap(), 5);
+        }
+    }
+
+    #[test]
+    fn time_length_invalid_scale() {
+        assert!(get_time_length_from_scale(8).is_err());
+        assert!(get_time_length_from_scale(255).is_err());
+    }
+
+    // -- TryFrom<&SqlType> for FixedLengthTypes --
+
+    #[test]
+    fn fixed_length_valid_conversions() {
+        let cases: Vec<(SqlType, FixedLengthTypes)> = vec![
+            (SqlType::Bit(None), FixedLengthTypes::Int1),
+            (SqlType::TinyInt(None), FixedLengthTypes::Int1),
+            (SqlType::SmallInt(None), FixedLengthTypes::Int2),
+            (SqlType::Int(None), FixedLengthTypes::Int4),
+            (SqlType::BigInt(None), FixedLengthTypes::Int8),
+            (SqlType::Real(None), FixedLengthTypes::Flt4),
+            (SqlType::Float(None), FixedLengthTypes::Flt8),
+        ];
+        for (sql_type, expected) in cases {
+            assert_eq!(FixedLengthTypes::try_from(&sql_type).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn fixed_length_invalid_conversion() {
+        let non_fixed = SqlType::NVarchar(None, 100);
+        assert!(FixedLengthTypes::try_from(&non_fixed).is_err());
+    }
+
+    // -- get_nullable_type --
+
+    #[test]
+    fn nullable_type_numeric() {
+        let dp = DecimalParts {
+            is_positive: true,
+            scale: 2,
+            precision: 10,
+            int_parts: vec![100],
+        };
+        assert_eq!(
+            SqlType::Numeric(Some(dp)).get_nullable_type(),
+            TdsDataType::NumericN
+        );
+    }
+
+    #[test]
+    fn nullable_type_char_nchar() {
+        assert_eq!(
+            SqlType::Char(None, 10).get_nullable_type(),
+            TdsDataType::BigChar
+        );
+        assert_eq!(
+            SqlType::NChar(None, 10).get_nullable_type(),
+            TdsDataType::NChar
+        );
+    }
+
+    #[test]
+    fn nullable_type_text_ntext() {
+        assert_eq!(SqlType::Text(None).get_nullable_type(), TdsDataType::Text);
+        assert_eq!(SqlType::NText(None).get_nullable_type(), TdsDataType::NText);
+    }
+
+    #[test]
+    fn nullable_type_time_datetime2_smalldatetime() {
+        assert_eq!(SqlType::Time(None).get_nullable_type(), TdsDataType::TimeN);
+        assert_eq!(
+            SqlType::DateTime2(None).get_nullable_type(),
+            TdsDataType::DateTime2N
+        );
+        assert_eq!(
+            SqlType::SmallDateTime(None).get_nullable_type(),
+            TdsDataType::DateTimeN
+        );
+    }
+
+    // -- get_fixed_length_size --
+
+    #[test]
+    fn fixed_length_sizes() {
+        assert_eq!(SqlType::Bit(None).get_fixed_length_size(), 1);
+        assert_eq!(SqlType::TinyInt(None).get_fixed_length_size(), 1);
+        assert_eq!(SqlType::SmallInt(None).get_fixed_length_size(), 2);
+        assert_eq!(SqlType::Int(None).get_fixed_length_size(), 4);
+        assert_eq!(SqlType::BigInt(None).get_fixed_length_size(), 8);
+        assert_eq!(SqlType::Real(None).get_fixed_length_size(), 4);
+        assert_eq!(SqlType::Float(None).get_fixed_length_size(), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "SqlType is not a fixed length type")]
+    fn fixed_length_size_non_fixed_panics() {
+        SqlType::NVarchar(None, 50).get_fixed_length_size();
+    }
+
+    // -- to_column_value_and_context: null branches --
+
+    #[test]
+    fn to_cv_smallint_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::SmallInt(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.max_size, 2);
+        assert!(ctx.is_nullable);
+    }
+
+    #[test]
+    fn to_cv_numeric_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::Numeric(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.max_size, 17);
+        assert_eq!(ctx.precision, Some(38));
+        assert_eq!(ctx.scale, Some(0));
+    }
+
+    #[test]
+    fn to_cv_numeric_some() {
+        let col = &default_collation();
+        let dp = DecimalParts {
+            is_positive: true,
+            scale: 4,
+            precision: 18,
+            int_parts: vec![42],
+        };
+        let (cv, _) = SqlType::Numeric(Some(dp.clone())).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Numeric(dp));
+    }
+
+    #[test]
+    fn to_cv_date_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::Date(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.max_size, 0);
+    }
+
+    #[test]
+    fn to_cv_time_null() {
+        let col = &default_collation();
+        let (cv, _) = SqlType::Time(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+    }
+
+    #[test]
+    fn to_cv_smalldatetime_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::SmallDateTime(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.max_size, 4);
+    }
+
+    #[test]
+    fn to_cv_datetime2_null() {
+        let col = &default_collation();
+        let (cv, _) = SqlType::DateTime2(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+    }
+
+    #[test]
+    fn to_cv_datetimeoffset_null() {
+        let col = &default_collation();
+        let (cv, _) = SqlType::DateTimeOffset(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+    }
+
+    #[test]
+    fn to_cv_money_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::Money(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.max_size, 8);
+    }
+
+    #[test]
+    fn to_cv_smallmoney_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::SmallMoney(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.max_size, 4);
+    }
+
+    #[test]
+    fn to_cv_char_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::Char(None, 50).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.max_size, 50);
+        assert_eq!(ctx.tds_type, TdsDataType::BigChar as u8);
+        assert!(ctx.collation.is_some());
+    }
+
+    #[test]
+    fn to_cv_char_exceeds_max() {
+        let col = &default_collation();
+        let (_, ctx) = SqlType::Char(None, 9000).to_column_value_and_context(col);
+        assert_eq!(ctx.max_size, 65535);
+    }
+
+    #[test]
+    fn to_cv_nchar_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::NChar(None, 100).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.tds_type, TdsDataType::NChar as u8);
+        assert_eq!(ctx.max_size, 100);
+    }
+
+    #[test]
+    fn to_cv_nchar_exceeds_max() {
+        let col = &default_collation();
+        let (_, ctx) = SqlType::NChar(None, 5000).to_column_value_and_context(col);
+        assert_eq!(ctx.max_size, (65535 / 2) as usize);
+    }
+
+    #[test]
+    fn to_cv_text_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::Text(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.max_size, usize::MAX);
+        assert_eq!(ctx.tds_type, TdsDataType::Text as u8);
+    }
+
+    #[test]
+    fn to_cv_ntext_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::NText(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.max_size, usize::MAX);
+        assert_eq!(ctx.tds_type, TdsDataType::NText as u8);
+    }
+
+    #[test]
+    fn to_cv_date_some() {
+        let col = &default_collation();
+        let d = SqlDate::create(100).unwrap();
+        let (cv, _) = SqlType::Date(Some(d.clone())).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Date(d));
+    }
+
+    #[test]
+    fn to_cv_time_some() {
+        let col = &default_collation();
+        let t = SqlTime {
+            time_nanoseconds: 1_000_000,
+            scale: 3,
+        };
+        let (cv, _) = SqlType::Time(Some(t.clone())).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Time(t));
+    }
+
+    #[test]
+    fn to_cv_smalldatetime_some() {
+        let col = &default_collation();
+        let sdt = SqlSmallDateTime {
+            days: 100,
+            time: 60,
+        };
+        let (cv, ctx) = SqlType::SmallDateTime(Some(sdt.clone())).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::SmallDateTime(sdt));
+        assert_eq!(ctx.max_size, 4);
+    }
+
+    #[test]
+    fn to_cv_datetime2_some() {
+        let col = &default_collation();
+        let dt2 = SqlDateTime2 {
+            days: 100,
+            time: SqlTime {
+                time_nanoseconds: 0,
+                scale: 7,
+            },
+        };
+        let (cv, _) = SqlType::DateTime2(Some(dt2.clone())).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::DateTime2(dt2));
+    }
+
+    #[test]
+    fn to_cv_datetimeoffset_some() {
+        let col = &default_collation();
+        let dto = SqlDateTimeOffset {
+            datetime2: SqlDateTime2 {
+                days: 100,
+                time: SqlTime {
+                    time_nanoseconds: 0,
+                    scale: 7,
+                },
+            },
+            offset: -300,
+        };
+        let (cv, _) = SqlType::DateTimeOffset(Some(dto.clone())).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::DateTimeOffset(dto));
+    }
+
+    #[test]
+    fn to_cv_money_some() {
+        let col = &default_collation();
+        let m = SqlMoney {
+            lsb_part: 100,
+            msb_part: 0,
+        };
+        let (cv, _) = SqlType::Money(Some(m.clone())).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Money(m));
+    }
+
+    #[test]
+    fn to_cv_smallmoney_some() {
+        let col = &default_collation();
+        let sm = SqlSmallMoney { int_val: 50 };
+        let (cv, _) = SqlType::SmallMoney(Some(sm.clone())).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::SmallMoney(sm));
+    }
+}

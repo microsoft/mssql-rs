@@ -470,9 +470,11 @@ impl MockTdsServer {
         let local_addr = listener.local_addr()?;
 
         let tls_acceptor = identity.map(|id| {
-            let acceptor = native_tls::TlsAcceptor::builder(id)
-                .build()
-                .expect("Failed to build TLS acceptor");
+            let mut builder = native_tls::TlsAcceptor::builder(id);
+            if strict_mode {
+                builder.accept_alpn(&[mssql_tds::core::TDS_8_ALPN_PROTOCOL]);
+            }
+            let acceptor = builder.build().expect("Failed to build TLS acceptor");
             TlsAcceptor::from(acceptor)
         });
 

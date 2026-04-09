@@ -2432,6 +2432,1262 @@ impl TdsValueSerializer {
 }
 
 #[cfg(test)]
+mod serializer_tests {
+    use crate::datatypes::column_values::{
+        ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
+        SqlSmallDateTime, SqlSmallMoney, SqlTime,
+    };
+    use crate::datatypes::decoder::DecimalParts;
+    use crate::datatypes::tds_value_serializer::{
+        PLP_NULL, PLP_UNKNOWN_LEN, TdsTypeContext, TdsValueSerializer, VARNULL,
+    };
+    use crate::io::packet_writer::tests::MockNetworkWriter;
+    use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
+    use crate::message::messages::PacketType;
+    use futures::executor::block_on;
+
+    fn nullable_ctx(tds_type: u8) -> TdsTypeContext {
+        TdsTypeContext {
+            tds_type,
+            max_size: 0,
+            is_plp: false,
+            is_fixed_length: false,
+            precision: None,
+            scale: None,
+            collation: None,
+            is_nullable: true,
+        }
+    }
+
+    fn payload(writer: &PacketWriter) -> Vec<u8> {
+        writer.get_payload().into_inner()[8..].to_vec()
+    }
+
+    // ── serialize_null ──
+
+    #[test]
+    fn null_intn() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x26); // INTN
+        block_on(TdsValueSerializer::serialize_null(&mut w, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn null_fltn() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6D); // FLTN
+        block_on(TdsValueSerializer::serialize_null(&mut w, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn null_bitn() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x68); // BITN
+        block_on(TdsValueSerializer::serialize_null(&mut w, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn null_guid() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x24); // GUID
+        block_on(TdsValueSerializer::serialize_null(&mut w, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn null_daten() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x28); // DateN
+        block_on(TdsValueSerializer::serialize_null(&mut w, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn null_timen() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x29); // TimeN
+        block_on(TdsValueSerializer::serialize_null(&mut w, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn null_datetime2n() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x2A); // DateTime2N
+        block_on(TdsValueSerializer::serialize_null(&mut w, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn null_datetimeoffsetn() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x2B); // DateTimeOffsetN
+        block_on(TdsValueSerializer::serialize_null(&mut w, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn null_text_legacy() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x23); // TEXT
+        block_on(TdsValueSerializer::serialize_null(&mut w, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn null_plp() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0xE7); // NVARCHAR
+        ctx.is_plp = true;
+        block_on(TdsValueSerializer::serialize_null(&mut w, &ctx)).unwrap();
+        assert_eq!(payload(&w), PLP_NULL.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn null_varlength() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0xE7); // NVARCHAR non-PLP
+        block_on(TdsValueSerializer::serialize_null(&mut w, &ctx)).unwrap();
+        assert_eq!(payload(&w), VARNULL.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn null_fixed_bit_returns_error() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x32); // Fixed BIT
+        let res = block_on(TdsValueSerializer::serialize_null(&mut w, &ctx));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn null_fixed_int4_returns_error() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x38); // INT4 fixed
+        ctx.is_plp = false;
+        let res = block_on(TdsValueSerializer::serialize_null(&mut w, &ctx));
+        assert!(res.is_err());
+    }
+
+    // ── serialize_bit ──
+
+    #[test]
+    fn bit_true_nullable() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x68); // BITN
+        let val = ColumnValues::Bit(true);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x01, 0x01]); // length=1, value=1
+    }
+
+    #[test]
+    fn bit_false_nullable() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x68); // BITN
+        let val = ColumnValues::Bit(false);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x01, 0x00]); // length=1, value=0
+    }
+
+    #[test]
+    fn bit_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x68); // BITN
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]); // NULL
+    }
+
+    // ── serialize_tinyint ──
+
+    #[test]
+    fn tinyint_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x26); // INTN
+        let val = ColumnValues::TinyInt(42);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x01, 42]); // length=1, value=42
+    }
+
+    #[test]
+    fn tinyint_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x26);
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    // ── serialize_smallint ──
+
+    #[test]
+    fn smallint_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x26); // INTN
+        let val = ColumnValues::SmallInt(256);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        // length=2, value=256 LE = [0x00, 0x01]
+        assert_eq!(payload(&w), vec![0x02, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn smallint_negative() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x26);
+        let val = ColumnValues::SmallInt(-1);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x02, 0xFF, 0xFF]);
+    }
+
+    // ── serialize_int ──
+
+    #[test]
+    fn int_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x26);
+        let val = ColumnValues::Int(0x01020304);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x04, 0x04, 0x03, 0x02, 0x01]);
+    }
+
+    #[test]
+    fn int_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x26);
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    // ── serialize_bigint ──
+
+    #[test]
+    fn bigint_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x26);
+        let val = ColumnValues::BigInt(1);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let mut expected = vec![0x08]; // length=8
+        expected.extend_from_slice(&1i64.to_le_bytes());
+        assert_eq!(payload(&w), expected);
+    }
+
+    #[test]
+    fn bigint_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x26);
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    // ── serialize_real ──
+
+    #[test]
+    fn real_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6D); // FLTN
+        let val = ColumnValues::Real(1.5f32);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let mut expected = vec![0x04]; // length=4
+        expected.extend_from_slice(&(1.5f32.to_bits() as i32).to_le_bytes());
+        assert_eq!(payload(&w), expected);
+    }
+
+    #[test]
+    fn real_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6D);
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    // ── serialize_float ──
+
+    #[test]
+    fn float_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6D); // FLTN
+        let val = ColumnValues::Float(1.25f64);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let mut expected = vec![0x08]; // length=8
+        expected.extend_from_slice(&1.25f64.to_le_bytes());
+        assert_eq!(payload(&w), expected);
+    }
+
+    #[test]
+    fn float_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6D);
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    // ── serialize_smallmoney ──
+
+    #[test]
+    fn smallmoney_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6E); // MONEYN
+        let val = ColumnValues::SmallMoney(SqlSmallMoney { int_val: 1234567 });
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let mut expected = vec![0x04]; // length=4
+        expected.extend_from_slice(&1234567i32.to_le_bytes());
+        assert_eq!(payload(&w), expected);
+    }
+
+    #[test]
+    fn smallmoney_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6E);
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    // ── serialize_money ──
+
+    #[test]
+    fn money_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6E); // MONEYN
+        let val = ColumnValues::Money(SqlMoney {
+            msb_part: 0x01,
+            lsb_part: 0x02,
+        });
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let mut expected = vec![0x08]; // length=8
+        expected.extend_from_slice(&0x01i32.to_le_bytes()); // MSB first
+        expected.extend_from_slice(&0x02i32.to_le_bytes()); // LSB second
+        assert_eq!(payload(&w), expected);
+    }
+
+    #[test]
+    fn money_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6E);
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    // ── serialize_date ──
+
+    #[test]
+    fn date_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x28); // DateN
+        let date = SqlDate::create(100).unwrap();
+        let val = ColumnValues::Date(date);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        // length=3, days=100 LE 3 bytes: [100, 0, 0]
+        assert_eq!(payload(&w), vec![0x03, 100, 0, 0]);
+    }
+
+    #[test]
+    fn date_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x28);
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    // ── serialize_time ──
+
+    #[test]
+    fn time_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x29); // TimeN
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn time_value_scale0() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x29);
+        // 1 second = 10_000_000 in 100ns units; scale 0 → divide by 10^7 → 1
+        let val = ColumnValues::Time(SqlTime {
+            time_nanoseconds: 10_000_000,
+            scale: 0,
+        });
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        // scale 0 → time_length=3, length byte=3, time_value=1 LE 3 bytes
+        assert_eq!(payload(&w), vec![0x03, 0x01, 0x00, 0x00]);
+    }
+
+    // ── serialize_datetime ──
+
+    #[test]
+    fn datetime_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6F); // DateTimeN
+        let val = ColumnValues::DateTime(SqlDateTime {
+            days: 10,
+            time: 300,
+        });
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let mut expected = vec![0x08]; // length=8
+        expected.extend_from_slice(&10i32.to_le_bytes());
+        expected.extend_from_slice(&300u32.to_le_bytes());
+        assert_eq!(payload(&w), expected);
+    }
+
+    #[test]
+    fn datetime_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6F);
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    // ── serialize_smalldatetime ──
+
+    #[test]
+    fn smalldatetime_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6F); // DateTimeN
+        let val = ColumnValues::SmallDateTime(SqlSmallDateTime { days: 5, time: 60 });
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let mut expected = vec![0x04]; // length=4
+        expected.extend_from_slice(&5u16.to_le_bytes());
+        expected.extend_from_slice(&60u16.to_le_bytes());
+        assert_eq!(payload(&w), expected);
+    }
+
+    #[test]
+    fn smalldatetime_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6F);
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    // ── serialize_datetime2 ──
+
+    #[test]
+    fn datetime2_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x2A); // DateTime2N
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn datetime2_value_scale0() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x2A);
+        let val = ColumnValues::DateTime2(SqlDateTime2 {
+            days: 1,
+            time: SqlTime {
+                time_nanoseconds: 0,
+                scale: 0,
+            },
+        });
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        // scale 0 → time_length=3, total_value_length=6, length byte=6
+        // time=0 as 3 bytes [0,0,0], days=1 as 3 bytes LE [1,0,0]
+        assert_eq!(payload(&w), vec![0x06, 0, 0, 0, 1, 0, 0]);
+    }
+
+    // ── serialize_datetimeoffset ──
+
+    #[test]
+    fn datetimeoffset_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x2B); // DateTimeOffsetN
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn datetimeoffset_value_scale0() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x2B);
+        let val = ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+            datetime2: SqlDateTime2 {
+                days: 1,
+                time: SqlTime {
+                    time_nanoseconds: 0,
+                    scale: 0,
+                },
+            },
+            offset: 60, // +1 hour
+        });
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        // scale 0 → time_length=3, total=3+3+2=8, length byte=8
+        // time=0 [0,0,0], days=1 [1,0,0], offset=60 LE [60,0]
+        assert_eq!(payload(&w), vec![0x08, 0, 0, 0, 1, 0, 0, 60, 0]);
+    }
+
+    // ── serialize_uuid ──
+
+    #[test]
+    fn uuid_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x24); // GUID
+        let uuid = uuid::Uuid::nil();
+        let val = ColumnValues::Uuid(uuid);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        assert_eq!(p[0], 16); // length=16
+        assert_eq!(&p[1..], &[0u8; 16]); // nil UUID → all zeros
+    }
+
+    #[test]
+    fn uuid_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x24);
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn uuid_specific_value() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x24);
+        let uuid = uuid::Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap();
+        let val = ColumnValues::Uuid(uuid);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        assert_eq!(p[0], 16);
+        assert_eq!(&p[1..], uuid.to_bytes_le().as_slice());
+    }
+
+    // ── serialize_decimal ──
+
+    #[test]
+    fn decimal_value_precision5() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x6A); // DecimalN
+        ctx.precision = Some(5);
+        ctx.scale = Some(2);
+        let val = ColumnValues::Decimal(DecimalParts {
+            is_positive: true,
+            scale: 2,
+            precision: 5,
+            int_parts: vec![12345],
+        });
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        // precision 5 → value_bytes=4, total_length=5
+        // [5, 1(positive), 12345 as i32 LE]
+        let mut expected = vec![0x05, 0x01];
+        expected.extend_from_slice(&12345i32.to_le_bytes());
+        assert_eq!(payload(&w), expected);
+    }
+
+    #[test]
+    fn decimal_negative() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x6A);
+        ctx.precision = Some(9);
+        let val = ColumnValues::Decimal(DecimalParts {
+            is_positive: false,
+            scale: 0,
+            precision: 9,
+            int_parts: vec![100],
+        });
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let mut expected = vec![0x05, 0x00]; // length=5, sign=0 (negative)
+        expected.extend_from_slice(&100i32.to_le_bytes());
+        assert_eq!(payload(&w), expected);
+    }
+
+    #[test]
+    fn decimal_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x6A);
+        let val = ColumnValues::Null;
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        assert_eq!(payload(&w), vec![0x00]);
+    }
+
+    #[test]
+    fn decimal_precision18() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x6A);
+        ctx.precision = Some(18);
+        let val = ColumnValues::Decimal(DecimalParts {
+            is_positive: true,
+            scale: 0,
+            precision: 18,
+            int_parts: vec![1, 2],
+        });
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        // precision 18 → value_bytes=8, total=9
+        let mut expected = vec![0x09, 0x01]; // length=9, sign=positive
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.extend_from_slice(&2i32.to_le_bytes());
+        assert_eq!(payload(&w), expected);
+    }
+
+    // ── Helper for small-buffer tests ──
+
+    fn collect_finalized(mock: &MockNetworkWriter) -> Vec<u8> {
+        let mut result = Vec::new();
+        let data = &mock.data;
+        let mut offset = 0;
+        while offset + 8 <= data.len() {
+            let pkt_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+            if pkt_len < 8 || offset + pkt_len > data.len() {
+                break;
+            }
+            result.extend_from_slice(&data[offset + 8..offset + pkt_len]);
+            offset += pkt_len;
+        }
+        result
+    }
+
+    // ── Small-buffer variants (exercises has_space() == false async paths) ──
+    //
+    // Packet sizes chosen so has_space() returns false at position 0,
+    // but individual write_*_async calls don't overflow by more than payload:
+    //   bit/tinyint: 9 (payload=1)
+    //   smallint: 10 (payload=2)
+    //   int/real/smalldatetime/smallmoney/date/time: 12 (payload=4)
+    //   bigint/float/datetime/money/datetime2/datetimeoffset: 16 (payload=8)
+    //   uuid: 24 (payload=16)
+
+    #[test]
+    fn bit_true_small_buffer() {
+        let mut mock = MockNetworkWriter::new(9);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let val = ColumnValues::Bit(true);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &val,
+            &nullable_ctx(0x68),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        assert_eq!(collect_finalized(&mock), vec![0x01, 0x01]);
+    }
+
+    #[test]
+    fn tinyint_value_small_buffer() {
+        let mut mock = MockNetworkWriter::new(9);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::TinyInt(42),
+            &nullable_ctx(0x26),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        assert_eq!(collect_finalized(&mock), vec![0x01, 42]);
+    }
+
+    #[test]
+    fn smallint_value_small_buffer() {
+        let mut mock = MockNetworkWriter::new(10);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::SmallInt(256),
+            &nullable_ctx(0x26),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        assert_eq!(collect_finalized(&mock), vec![0x02, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn int_value_small_buffer() {
+        let mut mock = MockNetworkWriter::new(12);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Int(0x01020304),
+            &nullable_ctx(0x26),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        assert_eq!(collect_finalized(&mock), vec![0x04, 0x04, 0x03, 0x02, 0x01]);
+    }
+
+    #[test]
+    fn bigint_value_small_buffer() {
+        let mut mock = MockNetworkWriter::new(16);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::BigInt(1),
+            &nullable_ctx(0x26),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        let mut expected = vec![0x08];
+        expected.extend_from_slice(&1i64.to_le_bytes());
+        assert_eq!(collect_finalized(&mock), expected);
+    }
+
+    #[test]
+    fn real_value_small_buffer() {
+        let mut mock = MockNetworkWriter::new(12);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Real(1.5f32),
+            &nullable_ctx(0x6D),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        let mut expected = vec![0x04];
+        expected.extend_from_slice(&(1.5f32.to_bits() as i32).to_le_bytes());
+        assert_eq!(collect_finalized(&mock), expected);
+    }
+
+    #[test]
+    fn date_value_small_buffer() {
+        let mut mock = MockNetworkWriter::new(12);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let date = SqlDate::create(100).unwrap();
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Date(date),
+            &nullable_ctx(0x28),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        assert_eq!(collect_finalized(&mock), vec![0x03, 100, 0, 0]);
+    }
+
+    #[test]
+    fn time_value_scale0_small_buffer() {
+        let mut mock = MockNetworkWriter::new(12);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Time(SqlTime {
+                time_nanoseconds: 10_000_000,
+                scale: 0,
+            }),
+            &nullable_ctx(0x29),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        assert_eq!(collect_finalized(&mock), vec![0x03, 0x01, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn datetime2_value_scale0_small_buffer() {
+        let mut mock = MockNetworkWriter::new(16);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::DateTime2(SqlDateTime2 {
+                days: 1,
+                time: SqlTime {
+                    time_nanoseconds: 0,
+                    scale: 0,
+                },
+            }),
+            &nullable_ctx(0x2A),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        assert_eq!(collect_finalized(&mock), vec![0x06, 0, 0, 0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn datetimeoffset_value_scale0_small_buffer() {
+        let mut mock = MockNetworkWriter::new(16);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 1,
+                    time: SqlTime {
+                        time_nanoseconds: 0,
+                        scale: 0,
+                    },
+                },
+                offset: 60,
+            }),
+            &nullable_ctx(0x2B),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        assert_eq!(
+            collect_finalized(&mock),
+            vec![0x08, 0, 0, 0, 1, 0, 0, 60, 0]
+        );
+    }
+
+    #[test]
+    fn smalldatetime_value_small_buffer() {
+        let mut mock = MockNetworkWriter::new(12);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::SmallDateTime(SqlSmallDateTime { days: 5, time: 60 }),
+            &nullable_ctx(0x6F),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        let mut expected = vec![0x04];
+        expected.extend_from_slice(&5u16.to_le_bytes());
+        expected.extend_from_slice(&60u16.to_le_bytes());
+        assert_eq!(collect_finalized(&mock), expected);
+    }
+
+    #[test]
+    fn datetime_value_small_buffer() {
+        let mut mock = MockNetworkWriter::new(16);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::DateTime(SqlDateTime {
+                days: 10,
+                time: 300,
+            }),
+            &nullable_ctx(0x6F),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        let mut expected = vec![0x08];
+        expected.extend_from_slice(&10i32.to_le_bytes());
+        expected.extend_from_slice(&300u32.to_le_bytes());
+        assert_eq!(collect_finalized(&mock), expected);
+    }
+
+    #[test]
+    fn smallmoney_value_small_buffer() {
+        let mut mock = MockNetworkWriter::new(12);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::SmallMoney(SqlSmallMoney { int_val: 1234567 }),
+            &nullable_ctx(0x6E),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        let mut expected = vec![0x04];
+        expected.extend_from_slice(&1234567i32.to_le_bytes());
+        assert_eq!(collect_finalized(&mock), expected);
+    }
+
+    #[test]
+    fn money_value_small_buffer() {
+        let mut mock = MockNetworkWriter::new(16);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Money(SqlMoney {
+                msb_part: 0x01,
+                lsb_part: 0x02,
+            }),
+            &nullable_ctx(0x6E),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        let mut expected = vec![0x08];
+        expected.extend_from_slice(&0x01i32.to_le_bytes());
+        expected.extend_from_slice(&0x02i32.to_le_bytes());
+        assert_eq!(collect_finalized(&mock), expected);
+    }
+
+    #[test]
+    fn uuid_value_small_buffer() {
+        let mut mock = MockNetworkWriter::new(24);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let uuid = uuid::Uuid::nil();
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Uuid(uuid),
+            &nullable_ctx(0x24),
+        ))
+        .unwrap();
+        block_on(w.finalize()).unwrap();
+        drop(w);
+        let p = collect_finalized(&mock);
+        assert_eq!(p[0], 16);
+        assert_eq!(&p[1..], &[0u8; 16]);
+    }
+
+    // ── String/binary serialization ──
+
+    #[test]
+    fn string_nvarchar_short() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0xE7);
+        ctx.max_size = 100;
+        let val = ColumnValues::String(crate::datatypes::sql_string::SqlString::from_utf8_string(
+            "Hi".to_string(),
+        ));
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        assert_eq!(&p[0..2], &4u16.to_le_bytes());
+        let utf16: Vec<u8> = "Hi".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        assert_eq!(&p[2..], &utf16[..]);
+    }
+
+    #[test]
+    fn string_nvarchar_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0xE7);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Null,
+            &ctx,
+        ))
+        .unwrap();
+        assert_eq!(payload(&w), VARNULL.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn string_nvarchar_plp() {
+        let mut mock = MockNetworkWriter::new(128);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0xE7);
+        ctx.is_plp = true;
+        let val = ColumnValues::String(crate::datatypes::sql_string::SqlString::from_utf8_string(
+            "AB".to_string(),
+        ));
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        let utf16: Vec<u8> = "AB".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&PLP_UNKNOWN_LEN.to_le_bytes());
+        expected.extend_from_slice(&(utf16.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&utf16);
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn string_varchar_short() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0xA7);
+        ctx.max_size = 100;
+        let val = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            b"Hi".to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        assert_eq!(&p[0..2], &2u16.to_le_bytes());
+        assert_eq!(&p[2..], b"Hi");
+    }
+
+    #[test]
+    fn bytes_varbinary_short() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0xAD);
+        ctx.max_size = 100;
+        let val = ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        assert_eq!(&p[0..2], &4u16.to_le_bytes());
+        assert_eq!(&p[2..], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn bytes_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0xAD);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Null,
+            &ctx,
+        ))
+        .unwrap();
+        assert_eq!(payload(&w), VARNULL.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn bytes_plp() {
+        let mut mock = MockNetworkWriter::new(128);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0xA5);
+        ctx.is_plp = true;
+        let data = vec![0x01, 0x02, 0x03];
+        let val = ColumnValues::Bytes(data.clone());
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&PLP_UNKNOWN_LEN.to_le_bytes());
+        expected.extend_from_slice(&3u32.to_le_bytes());
+        expected.extend_from_slice(&data);
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn bytes_image() {
+        let mut mock = MockNetworkWriter::new(128);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x22);
+        ctx.max_size = 2_147_483_647;
+        let data = vec![0xCA, 0xFE];
+        let val = ColumnValues::Bytes(data.clone());
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        assert_eq!(p[0], 0x10);
+        assert_eq!(&p[1..17], &[0xFF; 16]);
+        assert_eq!(&p[17..25], &[0xFF; 8]);
+        assert_eq!(&p[25..29], &2u32.to_le_bytes());
+        assert_eq!(&p[29..31], &data[..]);
+    }
+
+    // ── JSON and XML ──
+
+    #[test]
+    fn json_value() {
+        use crate::datatypes::sql_json::SqlJson;
+        let mut mock = MockNetworkWriter::new(128);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0xF4);
+        ctx.is_plp = true;
+        let json = SqlJson::new(b"{\"a\":1}".to_vec());
+        let val = ColumnValues::Json(json);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        let utf16: Vec<u8> = "{\"a\":1}"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&PLP_UNKNOWN_LEN.to_le_bytes());
+        expected.extend_from_slice(&(utf16.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&utf16);
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn xml_value() {
+        let mut mock = MockNetworkWriter::new(128);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0xF1);
+        ctx.is_plp = true;
+        let xml = crate::datatypes::column_values::SqlXml::from("<r/>".to_string());
+        let xml_bytes = xml.bytes.clone();
+        let val = ColumnValues::Xml(xml);
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        let data_len = xml_bytes.len() + 2; // +2 for BOM
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&PLP_UNKNOWN_LEN.to_le_bytes());
+        expected.extend_from_slice(&(data_len as u32).to_le_bytes());
+        expected.push(0xFF);
+        expected.push(0xFE);
+        expected.extend_from_slice(&xml_bytes);
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn xml_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0xF1);
+        ctx.is_plp = true;
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Null,
+            &ctx,
+        ))
+        .unwrap();
+        assert_eq!(payload(&w), PLP_NULL.to_le_bytes().to_vec());
+    }
+
+    // ── Decimal precision ranges ──
+
+    #[test]
+    fn decimal_precision15() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x6A);
+        ctx.precision = Some(15);
+        ctx.scale = Some(0);
+        let val = ColumnValues::Decimal(DecimalParts {
+            is_positive: true,
+            scale: 0,
+            precision: 15,
+            int_parts: vec![1, 2],
+        });
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let mut expected = vec![0x09, 0x01]; // length=9, sign=positive
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.extend_from_slice(&2i32.to_le_bytes());
+        assert_eq!(payload(&w), expected);
+    }
+
+    #[test]
+    fn decimal_precision25() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x6A);
+        ctx.precision = Some(25);
+        ctx.scale = Some(0);
+        let val = ColumnValues::Decimal(DecimalParts {
+            is_positive: false,
+            scale: 0,
+            precision: 25,
+            int_parts: vec![1, 2, 3],
+        });
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let mut expected = vec![0x0D, 0x00]; // length=13, sign=negative
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.extend_from_slice(&2i32.to_le_bytes());
+        expected.extend_from_slice(&3i32.to_le_bytes());
+        assert_eq!(payload(&w), expected);
+    }
+
+    #[test]
+    fn decimal_precision_invalid() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x6A);
+        ctx.precision = Some(39);
+        let val = ColumnValues::Decimal(DecimalParts {
+            is_positive: true,
+            scale: 0,
+            precision: 39,
+            int_parts: vec![1],
+        });
+        assert!(block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).is_err());
+    }
+
+    // ── serialize_as_variant ──
+
+    #[test]
+    fn variant_null() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x62);
+        ctx.max_size = 8016;
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Null,
+            &ctx,
+        ))
+        .unwrap();
+        assert_eq!(payload(&w), 0u32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn variant_int() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x62);
+        ctx.max_size = 8016;
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Int(42),
+            &ctx,
+        ))
+        .unwrap();
+        let p = payload(&w);
+        // total_length = 2 + 0(prop) + 4(data) = 6
+        assert_eq!(&p[0..4], &6u32.to_le_bytes());
+        assert_eq!(p[4], 0x38); // INT4
+        assert_eq!(p[5], 0x00); // prop_len = 0
+        assert_eq!(&p[6..10], &42i32.to_le_bytes());
+    }
+
+    #[test]
+    fn variant_string_nvarchar() {
+        let mut mock = MockNetworkWriter::new(128);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x62);
+        ctx.max_size = 8016;
+        let val = ColumnValues::String(crate::datatypes::sql_string::SqlString::from_utf8_string(
+            "Hi".to_string(),
+        ));
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        // "Hi" UTF-16LE = 4 bytes. total_length = 2 + 7(prop) + 4(data) = 13
+        assert_eq!(&p[0..4], &13u32.to_le_bytes());
+        assert_eq!(p[4], 0xE7); // NVARCHAR
+        assert_eq!(p[5], 0x07); // prop_len = 7
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::datatypes::lcid_encoding::lcid_to_encoding;
 

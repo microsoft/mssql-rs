@@ -9,6 +9,9 @@ use tokio_util::sync::CancellationToken;
 /// Alias for `Result<T, crate::error::Error>` used throughout the crate.
 pub type TdsResult<T> = Result<T, Error>;
 
+/// ALPN protocol identifier for TDS 8.0 connections.
+pub const TDS_8_ALPN_PROTOCOL: &str = "tds/8.0";
+
 /// Cooperative cancellation handle backed by a [`CancellationToken`].
 ///
 /// Pass to [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client)

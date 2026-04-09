@@ -284,6 +284,17 @@ mod tests {
     }
 
     #[test]
+    fn test_error_display_acquire_credentials_failed() {
+        let err = SecurityError::AcquireCredentialsFailed {
+            code: 0x8009030E,
+            message: "No creds".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("8009030E"));
+        assert!(msg.contains("No creds"));
+    }
+
+    #[test]
     fn test_error_display_no_credentials() {
         let err = SecurityError::NoCredentials;
         let msg = err.to_string();
@@ -306,5 +317,66 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("80090303"));
         assert!(msg.contains("Target unknown"));
+    }
+
+    #[test]
+    fn test_error_display_invalid_token() {
+        let err = SecurityError::InvalidToken;
+        assert!(err.to_string().contains("Invalid security token"));
+    }
+
+    #[test]
+    fn test_error_display_target_unknown() {
+        let err = SecurityError::TargetUnknown("MSSQLSvc/host:1433".to_string());
+        assert!(err.to_string().contains("MSSQLSvc/host:1433"));
+    }
+
+    #[test]
+    fn test_error_display_timeout() {
+        let err = SecurityError::Timeout;
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn test_error_display_credentials_expired() {
+        let err = SecurityError::CredentialsExpired;
+        assert!(err.to_string().contains("expired"));
+    }
+
+    #[test]
+    fn test_error_display_authentication_denied() {
+        let err = SecurityError::AuthenticationDenied("bad password".to_string());
+        assert!(err.to_string().contains("bad password"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_error_display_gssapi_error() {
+        let err = SecurityError::GssapiError {
+            major: 0x000D0000,
+            minor: 0x96C73A05,
+            message: "Failure".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("GSSAPI"));
+        assert!(msg.contains("Failure"));
+    }
+
+    #[test]
+    fn test_error_display_not_supported() {
+        let err = SecurityError::NotSupported("no GSSAPI".to_string());
+        assert!(err.to_string().contains("no GSSAPI"));
+    }
+
+    #[test]
+    fn test_error_display_internal_error() {
+        let err = SecurityError::InternalError("unexpected state".to_string());
+        assert!(err.to_string().contains("unexpected state"));
+    }
+
+    #[test]
+    fn test_security_error_is_std_error() {
+        let err = SecurityError::Timeout;
+        let _: &dyn std::error::Error = &err;
     }
 }

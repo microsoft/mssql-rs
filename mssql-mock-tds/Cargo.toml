@@ -18,6 +18,7 @@ default = []
 vendored-openssl = ["openssl/vendored"]
 
 [dependencies]
+mssql-tds = { path = "../mssql-tds", default-features = false }
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-util = { version = "0.7.17", features = ["full"] }
 bytes = "1.11.0"
@@ -25,7 +26,7 @@ byteorder = "1.5.0"
 tracing = { version = "0.1.43", features = ["log"] }
 thiserror = "2.0.17"
 futures = "0.3.31"
-native-tls = "0.2.14"
+native-tls = { version = "0.2.18", features = ["alpn-accept"] }
 tokio-native-tls = "0.3.1"
 
 # CLI dependencies

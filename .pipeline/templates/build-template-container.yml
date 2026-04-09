@@ -48,6 +48,33 @@ steps:
     installAzCli: false
     installDocker: true
 
+- script: |
+    set -euo pipefail
+    WORK_DISK="$(Agent.WorkFolder)"
+    DOCKER_DATA_ROOT="$WORK_DISK/.docker-data"
+    CONTAINERD_ROOT="$WORK_DISK/.containerd-data"
+    echo "Relocating Docker + containerd storage to $WORK_DISK (larger disk)"
+
+    sudo systemctl stop docker docker.socket containerd || true
+
+    # Relocate Docker data-root
+    sudo mkdir -p "$DOCKER_DATA_ROOT" /etc/docker
+    echo "{\"data-root\": \"$DOCKER_DATA_ROOT\"}" | sudo tee /etc/docker/daemon.json
+
+    # Relocate containerd root (images are stored here, not in Docker data-root)
+    sudo mkdir -p "$CONTAINERD_ROOT" /etc/containerd
+    sudo containerd config default \
+      | sed -E "s|root = ['\"]?/var/lib/containerd['\"]?|root = '$CONTAINERD_ROOT'|" \
+      | sudo tee /etc/containerd/config.toml > /dev/null
+
+    sudo systemctl start containerd
+    sudo systemctl start docker
+
+    echo "Docker data-root: $(docker info --format '{{.DockerRootDir}}')"
+    echo "Containerd root:  $(sudo containerd config dump | grep -m1 -E '^\s*root\s*=' || true)"
+    df -h "$WORK_DISK"
+  displayName: Relocate Docker storage to work folder disk
+
 - template: azure-cli-login-template.yml
 
 - task: AzureCLI@2

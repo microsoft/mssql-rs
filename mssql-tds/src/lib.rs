@@ -70,6 +70,7 @@
 //!   ([`connection_provider::tds_connection_provider::TdsConnectionProvider`]).
 //! - [`core`] — Shared types: [`core::TdsResult`], [`core::EncryptionOptions`],
 //!   [`core::CancelHandle`].
+//! - [`cursor`] — Cursor types, bitflags, and response structs for `sp_cursor*` RPCs.
 //! - [`datatypes`] — SQL Server data types and column value representations.
 //! - [`error`] — Error definitions.
 //! - [`message`] — TDS message types (prelogin, login7, etc.).
@@ -80,6 +81,8 @@ pub mod connection;
 pub mod connection_provider;
 /// Shared types: result aliases, encryption settings, and cancellation.
 pub mod core;
+/// Cursor types and response structures for TDS cursor RPCs.
+pub mod cursor;
 pub mod datatypes;
 /// Error definitions for TDS operations.
 pub mod error;

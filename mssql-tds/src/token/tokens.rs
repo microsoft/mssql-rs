@@ -1215,3 +1215,281 @@ impl<T> EnvChangeTokenValuePairs<T> {
         &self.new_value
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    // ── TokenType::try_from ──
+
+    #[test]
+    fn token_type_try_from_all_valid() {
+        let cases: &[(u8, TokenType)] = &[
+            (0x88, TokenType::AltMetadata),
+            (0xD3, TokenType::AltRow),
+            (0x81, TokenType::ColMetadata),
+            (0xA5, TokenType::ColInfo),
+            (0xFD, TokenType::Done),
+            (0xFE, TokenType::DoneProc),
+            (0xFF, TokenType::DoneInProc),
+            (0xE3, TokenType::EnvChange),
+            (0xAA, TokenType::Error),
+            (0xAE, TokenType::FeatureExtAck),
+            (0xEE, TokenType::FedAuthInfo),
+            (0xAB, TokenType::Info),
+            (0xAD, TokenType::LoginAck),
+            (0xD2, TokenType::NbcRow),
+            (0x78, TokenType::Offset),
+            (0xA9, TokenType::Order),
+            (0x79, TokenType::ReturnStatus),
+            (0xAC, TokenType::ReturnValue),
+            (0xD1, TokenType::Row),
+            (0xED, TokenType::SSPI),
+            (0xA4, TokenType::TabName),
+        ];
+        for &(byte, ref expected) in cases {
+            assert_eq!(&TokenType::try_from(byte).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn token_type_try_from_invalid() {
+        assert!(TokenType::try_from(0x00).is_err());
+        assert!(TokenType::try_from(0x42).is_err());
+    }
+
+    // ── SqlCollation accessors ──
+
+    #[test]
+    fn sql_collation_accessors() {
+        // info layout: bits 0-19 = lcid, bits 20-27 = comparison_style, bits 28-31 = version
+        // lcid=0xABCDE, comparison_style=0x37, version=0x2
+        // info = 0x2_37_ABCDE
+        let col = SqlCollation {
+            info: 0x237A_BCDE,
+            lcid_language_id: 0xABCDE_i32,
+            col_flags: 0x37,
+            sort_id: 0x42,
+        };
+        assert_eq!(col.lcid_language_id(), 0xABCDE_i32);
+        assert_eq!(col.comparison_style(), 0x37);
+        assert_eq!(col.sort_id(), 0x42);
+        assert_eq!(col.version(), 0x2);
+    }
+
+    #[test]
+    fn sql_collation_flag_bits() {
+        let make = |flags: u8| SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: flags,
+            sort_id: 0,
+        };
+
+        assert!(make(0x01).ignore_case());
+        assert!(!make(0x00).ignore_case());
+
+        assert!(make(0x02).ignore_accent());
+        assert!(!make(0x00).ignore_accent());
+
+        assert!(make(0x04).ignore_kana());
+        assert!(!make(0x00).ignore_kana());
+
+        assert!(make(0x08).ignore_width());
+        assert!(!make(0x00).ignore_width());
+
+        assert!(make(0x10).binary());
+        assert!(!make(0x00).binary());
+
+        assert!(make(0x20).binary2());
+        assert!(!make(0x00).binary2());
+
+        assert!(make(0x40).utf8());
+        assert!(!make(0x00).utf8());
+    }
+
+    #[test]
+    fn sql_collation_display() {
+        let col = SqlCollation {
+            info: 0x0400_0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0x40,
+            sort_id: 52,
+        };
+        let s = format!("{col}");
+        assert!(s.contains("INFO:"));
+        assert!(s.contains("IsUtf8: true"));
+    }
+
+    #[test]
+    fn sql_collation_debug() {
+        let col = SqlCollation {
+            info: 0x0400_0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0x01,
+            sort_id: 0,
+        };
+        let s = format!("{col:?}");
+        assert!(s.contains("IgnoreCase: true"));
+    }
+
+    // ── EnvChangeContainer Debug (uncovered variants) ──
+
+    #[test]
+    fn env_change_container_debug_routing() {
+        let routing = RoutingInfo {
+            protocol: 0,
+            port: 1433,
+            server: "host.example.com".into(),
+        };
+        let container: EnvChangeContainer = (Some(routing), None).into();
+        let dbg = format!("{container:?}");
+        assert!(dbg.starts_with("RoutingType:"));
+    }
+
+    #[test]
+    fn env_change_container_debug_bytes() {
+        let container: EnvChangeContainer = (vec![1u8, 2, 3], vec![4u8, 5]).into();
+        let dbg = format!("{container:?}");
+        assert!(dbg.starts_with("ByteType:"));
+    }
+
+    #[test]
+    fn env_change_container_debug_u64() {
+        let container: EnvChangeContainer = (100u64, 200u64).into();
+        let dbg = format!("{container:?}");
+        assert!(dbg.starts_with("UInt64"));
+    }
+
+    #[test]
+    fn env_change_container_debug_string() {
+        let container: EnvChangeContainer = ("old".to_string(), "new".to_string()).into();
+        let dbg = format!("{container:?}");
+        assert!(dbg.starts_with("String:"));
+    }
+
+    #[test]
+    fn env_change_container_debug_u32() {
+        let container: EnvChangeContainer = (4096u32, 8192u32).into();
+        let dbg = format!("{container:?}");
+        assert!(dbg.starts_with("UInt32:"));
+    }
+
+    #[test]
+    fn env_change_container_debug_sql_collation() {
+        let col = SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let container: EnvChangeContainer = (Some(col), None).into();
+        let dbg = format!("{container:?}");
+        assert!(dbg.starts_with("SqlCollation:"));
+    }
+
+    // ── DoneStatus bitflags ──
+
+    #[test]
+    fn done_status_from_u16_and_flags() {
+        let status = DoneStatus::from(0x0001);
+        assert!(status.contains(DoneStatus::MORE));
+
+        let status = DoneStatus::from(0x0002);
+        assert!(status.contains(DoneStatus::ERROR));
+
+        let status = DoneStatus::from(0x0004);
+        assert!(status.contains(DoneStatus::IN_XACT));
+
+        let status = DoneStatus::from(0x0010);
+        assert!(status.contains(DoneStatus::COUNT));
+
+        let status = DoneStatus::from(0x0020);
+        assert!(status.contains(DoneStatus::ATTN));
+
+        let status = DoneStatus::from(0x0100);
+        assert!(status.contains(DoneStatus::SERVER_ERROR));
+
+        // Combined flags
+        let status = DoneStatus::from(0x0013);
+        assert!(status.contains(DoneStatus::MORE));
+        assert!(status.contains(DoneStatus::ERROR));
+        assert!(status.contains(DoneStatus::COUNT));
+
+        // Truncation of unknown bits
+        let status = DoneStatus::from(0xFFFF);
+        assert!(status.contains(DoneStatus::MORE | DoneStatus::ERROR | DoneStatus::SERVER_ERROR));
+    }
+
+    #[test]
+    fn done_token_helpers() {
+        let token = DoneToken {
+            status: DoneStatus::MORE | DoneStatus::ERROR,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        };
+        assert!(token.has_more());
+        assert!(token.has_error());
+
+        let token2 = DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::None,
+            row_count: 0,
+        };
+        assert!(!token2.has_more());
+        assert!(!token2.has_error());
+    }
+
+    // ── CurrentCommand::try_from ──
+
+    #[test]
+    fn current_command_try_from_all_known() {
+        let cases: &[(u16, CurrentCommand)] = &[
+            (0xc1, CurrentCommand::Select),
+            (0xc3, CurrentCommand::Insert),
+            (0xc4, CurrentCommand::Delete),
+            (0xc5, CurrentCommand::Update),
+            (0xd2, CurrentCommand::Abort),
+            (0xd4, CurrentCommand::BeginXact),
+            (0xd5, CurrentCommand::EndXact),
+            (0xf0, CurrentCommand::BulkInsert),
+            (0x20, CurrentCommand::OpenCursor),
+            (0x117, CurrentCommand::Merge),
+        ];
+        for &(val, expected) in cases {
+            assert_eq!(CurrentCommand::try_from(val).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn current_command_try_from_unknown_maps_to_none() {
+        assert_eq!(
+            CurrentCommand::try_from(0x00).unwrap(),
+            CurrentCommand::None
+        );
+        assert_eq!(
+            CurrentCommand::try_from(0x9999).unwrap(),
+            CurrentCommand::None
+        );
+    }
+
+    // ── EnvChangeContainer equality ──
+
+    #[test]
+    fn env_change_container_eq() {
+        let a: EnvChangeContainer = (1u64, 2u64).into();
+        let b: EnvChangeContainer = (1u64, 2u64).into();
+        let c: EnvChangeContainer = (1u64, 3u64).into();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // ── EnvChangeTokenValuePairs accessors ──
+
+    #[test]
+    fn env_change_value_pairs_accessors() {
+        let pair = EnvChangeTokenValuePairs::new("old".to_string(), "new".to_string());
+        assert_eq!(pair.old_value(), "old");
+        assert_eq!(pair.new_value(), "new");
+    }
+}

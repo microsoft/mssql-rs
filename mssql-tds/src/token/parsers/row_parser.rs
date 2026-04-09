@@ -149,3 +149,149 @@ impl<D: SqlTypeDecode + Default + Send + Sync, P: TdsPacketReader + Send + Sync>
         Ok(Tokens::from(RowToken::new(all_values)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::datatypes::sqldatatypes::{
+        FixedLengthTypes, TdsDataType, TypeInfo, TypeInfoVariant,
+    };
+    use crate::io::token_stream::ParserContext;
+    use crate::query::metadata::ColumnMetadata;
+    use crate::token::parsers::common::test_utils::MockReader;
+    use crate::token::tokens::ColMetadataToken;
+
+    #[derive(Default)]
+    struct MockDecoder;
+
+    #[async_trait]
+    impl SqlTypeDecode for MockDecoder {
+        async fn decode<T>(
+            &self,
+            _reader: &mut T,
+            _metadata: &ColumnMetadata,
+        ) -> TdsResult<ColumnValues>
+        where
+            T: TdsPacketReader + Send + Sync,
+        {
+            Ok(ColumnValues::Int(42))
+        }
+    }
+
+    fn make_int_column(name: &str) -> ColumnMetadata {
+        ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: TypeInfo {
+                tds_type: TdsDataType::Int4,
+                length: 4,
+                type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+            },
+            data_type: TdsDataType::Int4,
+            column_name: name.to_string(),
+            multi_part_name: None,
+        }
+    }
+
+    fn make_context(columns: Vec<ColumnMetadata>) -> ParserContext {
+        ParserContext::ColumnMetadata(Arc::new(ColMetadataToken {
+            column_count: columns.len() as u16,
+            columns,
+        }))
+    }
+
+    #[tokio::test]
+    async fn test_parse_no_metadata_context() {
+        let parser = RowTokenParser::<MockDecoder>::default();
+        let mut reader = MockReader::new(vec![]);
+        let context = ParserContext::None(());
+        let result = parser.parse(&mut reader, &context).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Expected ColumnMetadata in context")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_single_column() {
+        let parser = RowTokenParser::<MockDecoder>::default();
+        let mut reader = MockReader::new(vec![]);
+        let context = make_context(vec![make_int_column("id")]);
+
+        let result = parser.parse(&mut reader, &context).await.unwrap();
+        match result {
+            Tokens::Row(row) => {
+                assert_eq!(row.all_values.len(), 1);
+                assert_eq!(row.all_values[0], ColumnValues::Int(42));
+            }
+            _ => panic!("Expected Row token"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_multiple_columns() {
+        let parser = RowTokenParser::<MockDecoder>::default();
+        let mut reader = MockReader::new(vec![]);
+        let context = make_context(vec![
+            make_int_column("a"),
+            make_int_column("b"),
+            make_int_column("c"),
+        ]);
+
+        let result = parser.parse(&mut reader, &context).await.unwrap();
+        match result {
+            Tokens::Row(row) => assert_eq!(row.all_values.len(), 3),
+            _ => panic!("Expected Row token"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_zero_columns() {
+        let parser = RowTokenParser::<MockDecoder>::default();
+        let mut reader = MockReader::new(vec![]);
+        let context = make_context(vec![]);
+
+        let result = parser.parse(&mut reader, &context).await.unwrap();
+        match result {
+            Tokens::Row(row) => assert!(row.all_values.is_empty()),
+            _ => panic!("Expected Row token"),
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingDecoder;
+
+    #[async_trait]
+    impl SqlTypeDecode for FailingDecoder {
+        async fn decode<T>(
+            &self,
+            _reader: &mut T,
+            _metadata: &ColumnMetadata,
+        ) -> TdsResult<ColumnValues>
+        where
+            T: TdsPacketReader + Send + Sync,
+        {
+            Err(crate::error::Error::ProtocolError(
+                "decode failure".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_decoder_error_propagates() {
+        let parser = RowTokenParser::<FailingDecoder>::default();
+        let mut reader = MockReader::new(vec![]);
+        let context = make_context(vec![make_int_column("a")]);
+
+        let result = parser.parse(&mut reader, &context).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("decode failure"));
+    }
+}
