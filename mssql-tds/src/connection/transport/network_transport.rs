@@ -504,11 +504,8 @@ impl NetworkReader for NetworkTransport {
 #[async_trait]
 impl NetworkWriter for NetworkTransport {
     async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
-        self.stream
-            .as_mut()
-            .expect("Stream not available")
-            .write_all(data)
-            .await?;
+        let stream = self.stream.as_mut().expect("Stream not available");
+        stream.write_all(data).await?;
         Ok(())
     }
 

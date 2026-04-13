@@ -1307,4 +1307,106 @@ mod tests {
             panic!("Expected ConnectTcp action");
         }
     }
+
+    #[test]
+    fn empty_datasource_returns_error() {
+        assert!(ParsedDataSource::parse("", false).is_err());
+        assert!(ParsedDataSource::parse("   ", false).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_default_instance() {
+        let parsed = ParsedDataSource::parse("np:\\\\myserver\\pipe\\sql\\query", false).unwrap();
+        assert_eq!(parsed.protocol_name, "np");
+        assert_eq!(parsed.server_name, "myserver");
+        assert!(parsed.instance_name.is_empty());
+        assert!(parsed.standard_instance_name);
+        assert!(!parsed.can_use_cache);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_named_instance() {
+        let parsed =
+            ParsedDataSource::parse("np:\\\\myserver\\pipe\\mssql$inst1\\sql\\query", false)
+                .unwrap();
+        assert_eq!(parsed.protocol_name, "np");
+        assert_eq!(parsed.server_name, "myserver");
+        assert_eq!(parsed.instance_name, "inst1");
+        assert!(parsed.standard_instance_name);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_custom_path() {
+        let parsed = ParsedDataSource::parse("np:\\\\myserver\\pipe\\custom\\path", false).unwrap();
+        assert_eq!(parsed.protocol_name, "np");
+        assert_eq!(parsed.instance_name, "pipecustom\\path");
+        assert!(!parsed.standard_instance_name);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_dot_server_becomes_localhost() {
+        let parsed = ParsedDataSource::parse("np:\\\\.\\pipe\\sql\\query", false).unwrap();
+        assert_eq!(parsed.server_name, "localhost");
+        assert_eq!(parsed.original_server_name, ".");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_invalid_path() {
+        assert!(ParsedDataSource::parse("np:\\\\server", false).is_err());
+    }
+
+    #[test]
+    fn port_on_non_tcp_protocol_is_error() {
+        // On non-Windows, np: itself is unsupported. Use admin: instead.
+        assert!(ParsedDataSource::parse("admin:myserver,1433", false).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parallel_connect_incompatible_protocols() {
+        assert!(ParsedDataSource::parse("np:\\\\srv\\pipe\\sql\\query", true).is_err());
+        assert!(ParsedDataSource::parse("admin:myserver", true).is_err());
+    }
+
+    #[test]
+    fn parallel_connect_defaults_to_tcp() {
+        let parsed = ParsedDataSource::parse("myserver", true).unwrap();
+        assert_eq!(parsed.protocol_name, "tcp");
+        assert!(!parsed.can_use_cache);
+    }
+
+    #[test]
+    fn admin_protocol_disables_cache() {
+        let parsed = ParsedDataSource::parse("admin:myserver", false).unwrap();
+        assert_eq!(parsed.protocol_name, "admin");
+        assert!(!parsed.can_use_cache);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lpc_with_instance_disables_cache() {
+        let parsed = ParsedDataSource::parse("lpc:localhost\\myinst", false).unwrap();
+        assert_eq!(parsed.protocol_name, "lpc");
+        assert!(!parsed.can_use_cache);
+    }
+
+    #[test]
+    fn ipv6_address_not_treated_as_protocol() {
+        let parsed = ParsedDataSource::parse("::1", false).unwrap();
+        assert!(parsed.protocol_name.is_empty() || parsed.protocol_name == "tcp");
+        assert!(parsed.server_name.contains("::1"));
+    }
+
+    #[test]
+    fn default_parsed_datasource() {
+        let ds = ParsedDataSource::default();
+        assert!(ds.server_name.is_empty());
+        assert!(ds.protocol_name.is_empty());
+        assert!(ds.can_use_cache);
+    }
 }

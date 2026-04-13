@@ -369,9 +369,11 @@ impl TdsClient {
 
         // Handle error during row streaming
         if let Some(original_error) = row_write_error {
-            // Send attention packet to cancel the bulk load operation gracefully
+            // Send attention packet to cancel the bulk load operation gracefully.
             // This tells SQL Server to abort the current operation and resets the
             // TDS protocol state so the connection can be reused.
+            // The stream is always in a clean state here because writes are never
+            // dropped mid-flight (issue #513).
             let attention_timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
             let _ = self.send_attention_with_timeout(attention_timeout).await;
             // Clear the open batch flag since we've cancelled the operation

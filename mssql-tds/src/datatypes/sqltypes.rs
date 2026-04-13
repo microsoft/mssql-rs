@@ -1445,4 +1445,176 @@ mod coverage_tests {
         let (cv, _) = SqlType::SmallMoney(Some(sm.clone())).to_column_value_and_context(col);
         assert_eq!(cv, ColumnValues::SmallMoney(sm));
     }
+
+    #[test]
+    fn to_cv_nvarchar_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::NVarchar(None, 100).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.tds_type, TdsDataType::NVarChar as u8);
+        assert!(!ctx.is_plp);
+        assert!(ctx.collation.is_some());
+    }
+
+    #[test]
+    fn to_cv_nvarchar_some() {
+        use crate::datatypes::sql_string::SqlString;
+        let col = &default_collation();
+        let val = SqlString::from_utf8_string("hello".to_string());
+        let (cv, ctx) = SqlType::NVarchar(Some(val.clone()), 100).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::String(val));
+        assert_eq!(ctx.max_size, 100);
+    }
+
+    #[test]
+    fn to_cv_nvarchar_exceeds_max_becomes_plp() {
+        let col = &default_collation();
+        let (_, ctx) = SqlType::NVarchar(None, 5000).to_column_value_and_context(col);
+        assert!(ctx.is_plp);
+        assert_eq!(ctx.max_size, usize::MAX);
+    }
+
+    #[test]
+    fn to_cv_nvarcharmax_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::NVarcharMax(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert!(ctx.is_plp);
+        assert_eq!(ctx.max_size, usize::MAX);
+    }
+
+    #[test]
+    fn to_cv_nvarcharmax_some() {
+        use crate::datatypes::sql_string::SqlString;
+        let col = &default_collation();
+        let val = SqlString::from_utf8_string("test".to_string());
+        let (cv, _) = SqlType::NVarcharMax(Some(val.clone())).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::String(val));
+    }
+
+    #[test]
+    fn to_cv_varchar_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::Varchar(None, 200).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.tds_type, TdsDataType::BigVarChar as u8);
+        assert!(!ctx.is_plp);
+    }
+
+    #[test]
+    fn to_cv_varchar_exceeds_max_becomes_plp() {
+        let col = &default_collation();
+        let (_, ctx) = SqlType::Varchar(None, 9000).to_column_value_and_context(col);
+        assert!(ctx.is_plp);
+    }
+
+    #[test]
+    fn to_cv_varcharmax_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::VarcharMax(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert!(ctx.is_plp);
+    }
+
+    #[test]
+    fn to_cv_varcharmax_some() {
+        use crate::datatypes::sql_string::SqlString;
+        let col = &default_collation();
+        let val = SqlString::from_utf8_string("hello".to_string());
+        let (cv, _) = SqlType::VarcharMax(Some(val.clone())).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::String(val));
+    }
+
+    #[test]
+    fn to_cv_text_some() {
+        use crate::datatypes::sql_string::SqlString;
+        let col = &default_collation();
+        let val = SqlString::from_utf8_string("text data".to_string());
+        let (cv, _) = SqlType::Text(Some(val.clone())).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::String(val));
+    }
+
+    #[test]
+    fn to_cv_ntext_some() {
+        use crate::datatypes::sql_string::SqlString;
+        let col = &default_collation();
+        let val = SqlString::from_utf8_string("ntext data".to_string());
+        let (cv, _) = SqlType::NText(Some(val.clone())).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::String(val));
+    }
+
+    #[test]
+    fn to_cv_binary_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::Binary(None, 16).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.max_size, 16);
+    }
+
+    #[test]
+    fn to_cv_binary_some() {
+        let col = &default_collation();
+        let data = vec![1, 2, 3];
+        let (cv, _) = SqlType::Binary(Some(data.clone()), 16).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Bytes(data));
+    }
+
+    #[test]
+    fn to_cv_varbinary_null() {
+        let col = &default_collation();
+        let (cv, _) = SqlType::VarBinary(None, 100).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+    }
+
+    #[test]
+    fn to_cv_varbinarymax_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::VarBinaryMax(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert!(ctx.is_plp);
+    }
+
+    #[test]
+    fn to_cv_xml_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::Xml(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert!(ctx.is_plp);
+    }
+
+    #[test]
+    fn to_cv_json_null() {
+        let col = &default_collation();
+        let (cv, ctx) = SqlType::Json(None).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert!(ctx.is_plp);
+    }
+
+    #[test]
+    fn to_cv_vector_null() {
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+        let col = &default_collation();
+        let (cv, ctx) =
+            SqlType::Vector(None, 3, VectorBaseType::Float32).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::Null);
+        assert_eq!(ctx.max_size, 8 + 3 * 4); // header + 3 floats
+    }
+
+    #[test]
+    fn to_cv_char_some() {
+        use crate::datatypes::sql_string::SqlString;
+        let col = &default_collation();
+        let val = SqlString::from_utf8_string("hi".to_string());
+        let (cv, _) = SqlType::Char(Some(val.clone()), 10).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::String(val));
+    }
+
+    #[test]
+    fn to_cv_nchar_some() {
+        use crate::datatypes::sql_string::SqlString;
+        let col = &default_collation();
+        let val = SqlString::from_utf8_string("hello".to_string());
+        let (cv, _) = SqlType::NChar(Some(val.clone()), 50).to_column_value_and_context(col);
+        assert_eq!(cv, ColumnValues::String(val));
+    }
 }
