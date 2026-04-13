@@ -5,12 +5,15 @@
 mod common;
 
 mod bulk_copy_integration_tests {
-    use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
+    use crate::common::{begin_connection, build_tcp_datasource, get_scalar_value, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
     use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
     use mssql_tds::core::TdsResult;
-    use mssql_tds::datatypes::column_values::ColumnValues;
+    use mssql_tds::datatypes::column_values::{
+        ColumnValues, SqlDateTime2, SqlDateTimeOffset, SqlMoney, SqlTime,
+    };
+    use mssql_tds::datatypes::sql_string::SqlString;
 
     #[ctor::ctor]
     fn init() {
@@ -2361,5 +2364,405 @@ mod bulk_copy_integration_tests {
             "Control test passed: Without fire_triggers, trigger was not executed (marker count: {})",
             marker_count
         );
+    }
+
+    // -- Bulk copy tests for diverse column types --
+
+    #[derive(Debug, Clone)]
+    struct DiverseRow {
+        id: i32,
+        nvarchar_val: String,
+        int_val: i32,
+        datetime2_val: SqlDateTime2,
+        varbinary_val: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl BulkLoadRow for DiverseRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            writer
+                .write_column_value(*column_index, &ColumnValues::Int(self.id))
+                .await?;
+            *column_index += 1;
+            writer
+                .write_column_value(
+                    *column_index,
+                    &ColumnValues::String(SqlString::from_utf8_string(self.nvarchar_val.clone())),
+                )
+                .await?;
+            *column_index += 1;
+            writer
+                .write_column_value(*column_index, &ColumnValues::Int(self.int_val))
+                .await?;
+            *column_index += 1;
+            writer
+                .write_column_value(
+                    *column_index,
+                    &ColumnValues::DateTime2(self.datetime2_val.clone()),
+                )
+                .await?;
+            *column_index += 1;
+            writer
+                .write_column_value(
+                    *column_index,
+                    &ColumnValues::Bytes(self.varbinary_val.clone()),
+                )
+                .await?;
+            *column_index += 1;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl BulkLoadRow for &DiverseRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            (*self as &DiverseRow)
+                .write_to_packet(writer, column_index)
+                .await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bulk_copy_diverse_types() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        client.execute(
+            "CREATE TABLE #BulkDiverse (id INT NOT NULL, nvarchar_val NVARCHAR(200), int_val INT, datetime2_val DATETIME2(3), varbinary_val VARBINARY(100))".to_string(),
+            None, None,
+        ).await.unwrap();
+        client.close_query().await.unwrap();
+
+        let rows: Vec<DiverseRow> = (0..5)
+            .map(|i| DiverseRow {
+                id: i,
+                nvarchar_val: format!("row_{i}"),
+                int_val: i * 100,
+                datetime2_val: SqlDateTime2 {
+                    days: 738_000 + i as u32,
+                    time: SqlTime {
+                        time_nanoseconds: (i as u64 + 1) * 1_000_000_000,
+                        scale: 3,
+                    },
+                },
+                varbinary_val: vec![i as u8; 10],
+            })
+            .collect();
+
+        {
+            let mut bulk_copy = BulkCopy::new(&mut client, "#BulkDiverse");
+            bulk_copy.write_to_server_zerocopy(&rows).await.unwrap();
+        }
+
+        client
+            .execute("SELECT COUNT(*) FROM #BulkDiverse".to_string(), None, None)
+            .await
+            .unwrap();
+        let count = get_scalar_value(&mut client).await.unwrap();
+        match count {
+            Some(ColumnValues::Int(n)) => assert_eq!(n, 5),
+            other => panic!("Expected Int(5), got {other:?}"),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct NullableRow {
+        id: i32,
+        nvarchar_max_val: Option<String>,
+        varbinary_max_val: Option<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl BulkLoadRow for NullableRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            writer
+                .write_column_value(*column_index, &ColumnValues::Int(self.id))
+                .await?;
+            *column_index += 1;
+            let nv = match &self.nvarchar_max_val {
+                Some(s) => ColumnValues::String(SqlString::from_utf8_string(s.clone())),
+                None => ColumnValues::Null,
+            };
+            writer.write_column_value(*column_index, &nv).await?;
+            *column_index += 1;
+            let vb = match &self.varbinary_max_val {
+                Some(b) => ColumnValues::Bytes(b.clone()),
+                None => ColumnValues::Null,
+            };
+            writer.write_column_value(*column_index, &vb).await?;
+            *column_index += 1;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl BulkLoadRow for &NullableRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            (*self as &NullableRow)
+                .write_to_packet(writer, column_index)
+                .await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bulk_copy_nullable_max_types() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        client.execute(
+            "CREATE TABLE #BulkNullable (id INT NOT NULL, nvarchar_max_val NVARCHAR(MAX), varbinary_max_val VARBINARY(MAX))".to_string(),
+            None, None,
+        ).await.unwrap();
+        client.close_query().await.unwrap();
+
+        let rows = vec![
+            NullableRow {
+                id: 1,
+                nvarchar_max_val: Some("hello".to_string()),
+                varbinary_max_val: Some(vec![0xDE, 0xAD]),
+            },
+            NullableRow {
+                id: 2,
+                nvarchar_max_val: None,
+                varbinary_max_val: None,
+            },
+            NullableRow {
+                id: 3,
+                nvarchar_max_val: Some("X".repeat(10_000)),
+                varbinary_max_val: Some(vec![0xFF; 10_000]),
+            },
+        ];
+
+        {
+            let mut bulk_copy = BulkCopy::new(&mut client, "#BulkNullable");
+            bulk_copy.write_to_server_zerocopy(&rows).await.unwrap();
+        }
+
+        client
+            .execute("SELECT COUNT(*) FROM #BulkNullable".to_string(), None, None)
+            .await
+            .unwrap();
+        let count = get_scalar_value(&mut client).await.unwrap();
+        match count {
+            Some(ColumnValues::Int(n)) => assert_eq!(n, 3),
+            other => panic!("Expected Int(3), got {other:?}"),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TimeScaleRow {
+        id: i32,
+        time_val: SqlTime,
+        dto_val: SqlDateTimeOffset,
+    }
+
+    #[async_trait]
+    impl BulkLoadRow for TimeScaleRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            writer
+                .write_column_value(*column_index, &ColumnValues::Int(self.id))
+                .await?;
+            *column_index += 1;
+            writer
+                .write_column_value(*column_index, &ColumnValues::Time(self.time_val.clone()))
+                .await?;
+            *column_index += 1;
+            writer
+                .write_column_value(
+                    *column_index,
+                    &ColumnValues::DateTimeOffset(self.dto_val.clone()),
+                )
+                .await?;
+            *column_index += 1;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl BulkLoadRow for &TimeScaleRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            (*self as &TimeScaleRow)
+                .write_to_packet(writer, column_index)
+                .await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Bulk copy time scale metadata mismatch - needs investigation"]
+    async fn test_bulk_copy_time_and_datetimeoffset() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        client.execute(
+            "CREATE TABLE #BulkTime (id INT NOT NULL, time_val TIME(4), dto_val DATETIMEOFFSET(2))".to_string(),
+            None, None,
+        ).await.unwrap();
+        client.close_query().await.unwrap();
+
+        let rows = vec![
+            TimeScaleRow {
+                id: 1,
+                time_val: SqlTime {
+                    time_nanoseconds: 3_600_000_000_000,
+                    scale: 4,
+                },
+                dto_val: SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 738_000,
+                        time: SqlTime {
+                            time_nanoseconds: 0,
+                            scale: 2,
+                        },
+                    },
+                    offset: 330,
+                },
+            },
+            TimeScaleRow {
+                id: 2,
+                time_val: SqlTime {
+                    time_nanoseconds: 0,
+                    scale: 4,
+                },
+                dto_val: SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 738_100,
+                        time: SqlTime {
+                            time_nanoseconds: 5_000_000_000,
+                            scale: 2,
+                        },
+                    },
+                    offset: -480,
+                },
+            },
+        ];
+
+        {
+            let mut bulk_copy = BulkCopy::new(&mut client, "#BulkTime");
+            bulk_copy.write_to_server_zerocopy(&rows).await.unwrap();
+        }
+
+        client
+            .execute("SELECT COUNT(*) FROM #BulkTime".to_string(), None, None)
+            .await
+            .unwrap();
+        let count = get_scalar_value(&mut client).await.unwrap();
+        match count {
+            Some(ColumnValues::Int(n)) => assert_eq!(n, 2),
+            other => panic!("Expected Int(2), got {other:?}"),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct MoneyRow {
+        id: i32,
+        bigint_val: i64,
+        money_val: SqlMoney,
+    }
+
+    #[async_trait]
+    impl BulkLoadRow for MoneyRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            writer
+                .write_column_value(*column_index, &ColumnValues::Int(self.id))
+                .await?;
+            *column_index += 1;
+            writer
+                .write_column_value(*column_index, &ColumnValues::BigInt(self.bigint_val))
+                .await?;
+            *column_index += 1;
+            writer
+                .write_column_value(*column_index, &ColumnValues::Money(self.money_val.clone()))
+                .await?;
+            *column_index += 1;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl BulkLoadRow for &MoneyRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            (*self as &MoneyRow)
+                .write_to_packet(writer, column_index)
+                .await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bulk_copy_bigint_and_money() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        client
+            .execute(
+                "CREATE TABLE #BulkMoney (id INT NOT NULL, bigint_val BIGINT, money_val MONEY)"
+                    .to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        client.close_query().await.unwrap();
+
+        let rows = vec![
+            MoneyRow {
+                id: 1,
+                bigint_val: i64::MAX,
+                money_val: SqlMoney {
+                    lsb_part: 100_000,
+                    msb_part: 0,
+                },
+            },
+            MoneyRow {
+                id: 2,
+                bigint_val: i64::MIN,
+                money_val: SqlMoney {
+                    lsb_part: -50_000,
+                    msb_part: -1,
+                },
+            },
+        ];
+
+        {
+            let mut bulk_copy = BulkCopy::new(&mut client, "#BulkMoney");
+            bulk_copy.write_to_server_zerocopy(&rows).await.unwrap();
+        }
+
+        client
+            .execute("SELECT COUNT(*) FROM #BulkMoney".to_string(), None, None)
+            .await
+            .unwrap();
+        let count = get_scalar_value(&mut client).await.unwrap();
+        match count {
+            Some(ColumnValues::Int(n)) => assert_eq!(n, 2),
+            other => panic!("Expected Int(2), got {other:?}"),
+        }
     }
 }

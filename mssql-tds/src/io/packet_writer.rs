@@ -9,8 +9,7 @@ use crate::message::messages::{PacketStatusFlags, PacketType};
 use async_trait::async_trait;
 use byteorder::{BigEndian, WriteBytesExt};
 use std::io::Cursor;
-use std::time::{Duration, Instant};
-use tokio::time::timeout;
+use std::time::Instant;
 use tracing::event;
 
 /// Optimized batch write operations with manual overflow control.
@@ -209,28 +208,27 @@ impl<'a> PacketWriter<'a> {
         );
         let data_slice = &self.payload_cursor.get_ref().as_slice()[..packet_length];
 
-        // Calculate the timeout based on the start time of this request and the max timeout.
+        // Send the packet data. The write must complete fully — dropping a
+        // write future mid-flight leaves the TLS stream (especially SChannel
+        // on Windows) in an inconsistent internal state, which causes the
+        // next write to panic (issue #513). The timeout is checked *after*
+        // the write finishes so that the stream always remains in a clean
+        // state and attention packets can be sent safely on timeout.
         let send_data_fut = CancelHandle::run_until_cancelled(
             self.cancel_handle.as_ref(),
             self.network_writer.send(data_slice),
         );
 
-        if self.max_timeout_sec.is_none() {
-            send_data_fut.await?;
-        } else {
+        send_data_fut.await?;
+
+        // Check timeout after the write completes.
+        if let Some(max_timeout) = self.max_timeout_sec {
             let elapsed = self.start_time.elapsed().as_secs();
-            if elapsed > self.max_timeout_sec.unwrap() as u64 {
+            if elapsed > max_timeout as u64 {
                 return Err(TimeoutError(TimeoutErrorType::String(
                     "Timeout expired".to_string(),
                 )));
-            };
-            let current_timeout = self.max_timeout_sec.unwrap() as u64 - elapsed;
-            match timeout(Duration::from_secs(current_timeout), send_data_fut).await {
-                Ok(result) => result?,
-                Err(elapsed) => {
-                    return Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed)));
-                }
-            };
+            }
         }
 
         event!(

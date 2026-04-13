@@ -24,6 +24,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from mssql_python.auth import _credential_cache
+
+
+@pytest.fixture(autouse=True)
+def _clear_credential_cache():
+    """Ensure each test starts with an empty credential cache."""
+    _credential_cache.clear()
+    yield
+    _credential_cache.clear()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -117,21 +127,21 @@ class TestAADAuthGetToken:
 
 
 class TestAADAuthFreshTokenPerCall:
-    """Each call to get_raw_token must produce a fresh credential + token."""
+    """Each call to get_raw_token must call get_token on the cached credential."""
 
     def test_two_calls_get_separate_tokens(self):
-        """Simulate token rotation: first call → FAKE_JWT, second → FAKE_JWT_2."""
+        """Simulate token refresh: same credential returns different tokens on successive calls."""
         from mssql_python.auth import AADAuth
 
-        call_count = {"n": 0}
-        tokens = [FAKE_JWT, FAKE_JWT_2]
+        token_a = MagicMock()
+        token_a.token = FAKE_JWT
+        token_b = MagicMock()
+        token_b.token = FAKE_JWT_2
 
-        def rotating_factory(*a, **kw):
-            cred = _make_credential_mock(tokens[call_count["n"]])
-            call_count["n"] += 1
-            return cred
+        mock_cred = MagicMock()
+        mock_cred.get_token.side_effect = [token_a, token_b]
 
-        cls_mock = MagicMock(side_effect=rotating_factory)
+        cls_mock = MagicMock(return_value=mock_cred)
         cls_mock.__name__ = "DefaultAzureCredential"
         with patch("azure.identity.DefaultAzureCredential", cls_mock):
             t1 = AADAuth.get_raw_token("default")
@@ -139,7 +149,7 @@ class TestAADAuthFreshTokenPerCall:
 
         assert t1 == FAKE_JWT
         assert t2 == FAKE_JWT_2
-        assert call_count["n"] == 2, "Expected two separate credential instantiations"
+        assert mock_cred.get_token.call_count == 2
 
 
 class TestAADAuthErrors:

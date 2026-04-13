@@ -141,6 +141,73 @@ impl Version {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sql_server_version_from_known_values() {
+        assert_eq!(
+            SQLServerVersion::from(0),
+            SQLServerVersion::SqlServerNotsupported
+        );
+        assert_eq!(SQLServerVersion::from(8), SQLServerVersion::SqlServer2000);
+        assert_eq!(SQLServerVersion::from(9), SQLServerVersion::SqlServer2005);
+        assert_eq!(SQLServerVersion::from(10), SQLServerVersion::SqlServer2008);
+        assert_eq!(SQLServerVersion::from(11), SQLServerVersion::SqlServer2012);
+        assert_eq!(SQLServerVersion::from(12), SQLServerVersion::SqlServer2014);
+        assert_eq!(SQLServerVersion::from(13), SQLServerVersion::SqlServer2016);
+        assert_eq!(SQLServerVersion::from(14), SQLServerVersion::SqlServer2017);
+        assert_eq!(SQLServerVersion::from(15), SQLServerVersion::SqlServer2019);
+        assert_eq!(SQLServerVersion::from(16), SQLServerVersion::SqlServer2022);
+        assert_eq!(
+            SQLServerVersion::from(17),
+            SQLServerVersion::SqlServer2022lus
+        );
+    }
+
+    #[test]
+    fn sql_server_version_from_unknown_defaults_to_not_supported() {
+        assert_eq!(
+            SQLServerVersion::from(1),
+            SQLServerVersion::SqlServerNotsupported
+        );
+        assert_eq!(
+            SQLServerVersion::from(7),
+            SQLServerVersion::SqlServerNotsupported
+        );
+        assert_eq!(
+            SQLServerVersion::from(18),
+            SQLServerVersion::SqlServerNotsupported
+        );
+        assert_eq!(
+            SQLServerVersion::from(255),
+            SQLServerVersion::SqlServerNotsupported
+        );
+    }
+
+    #[test]
+    fn cancel_handle_default() {
+        let handle = CancelHandle::default();
+        assert!(!handle.cancel_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn run_until_cancelled_none_handle() {
+        let result: TdsResult<i32> =
+            CancelHandle::run_until_cancelled(None, async { Ok(42) }).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn run_until_cancelled_with_handle_completes() {
+        let handle = CancelHandle::new();
+        let result: TdsResult<i32> =
+            CancelHandle::run_until_cancelled(Some(&handle), async { Ok(99) }).await;
+        assert_eq!(result.unwrap(), 99);
+    }
+}
+
 /// TLS and encryption settings for a TDS connection.
 #[derive(Clone, PartialEq, Debug)]
 pub struct EncryptionOptions {

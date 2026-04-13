@@ -1170,4 +1170,259 @@ mod tests {
         let transport = action.to_transport_context(&ctx);
         assert!(transport.is_none());
     }
+
+    #[test]
+    fn describe_all_action_types() {
+        let check = ConnectionAction::CheckCache {
+            cache_key: "k".to_string(),
+        };
+        assert!(check.describe().contains("cache"));
+
+        let ssrp = ConnectionAction::QuerySsrp {
+            server: "s".to_string(),
+            instance: "i".to_string(),
+            result_slot: ResultSlot::ResolvedPort,
+        };
+        assert!(ssrp.describe().contains("SQL Browser"));
+
+        let update = ConnectionAction::UpdateCache {
+            cache_key: "k".to_string(),
+            port: 1433,
+        };
+        assert!(update.describe().contains("Update cache"));
+
+        let slot = ConnectionAction::ConnectTcpFromSlot {
+            host: "h".to_string(),
+            port_slot: ResultSlot::ResolvedPort,
+            timeout_ms: 100,
+        };
+        assert!(slot.describe().contains("TCP"));
+
+        let pipe = ConnectionAction::ConnectNamedPipe {
+            pipe_path: "p".to_string(),
+            timeout_ms: 100,
+        };
+        assert!(pipe.describe().contains("Named Pipe"));
+
+        let pipe_slot = ConnectionAction::ConnectNamedPipeFromSlot {
+            path_slot: ResultSlot::ResolvedPipePath,
+            timeout_ms: 100,
+        };
+        assert!(pipe_slot.describe().contains("Named Pipe"));
+
+        let dac = ConnectionAction::ConnectDac {
+            host: "h".to_string(),
+            timeout_ms: 100,
+        };
+        assert!(dac.describe().contains("DAC"));
+
+        let seq = ConnectionAction::TrySequence {
+            actions: vec![],
+            fail_fast: true,
+        };
+        assert!(seq.describe().contains("sequence"));
+
+        let par = ConnectionAction::TryParallel {
+            actions: vec![],
+            min_successes: 1,
+        };
+        assert!(par.describe().contains("parallel"));
+    }
+
+    #[test]
+    fn execution_context_record_and_get_attempts() {
+        let mut ctx = ExecutionContext::new();
+        ctx.record_attempt("action1".to_string(), Ok("success".to_string()));
+        ctx.record_attempt("action2".to_string(), Err("failed".to_string()));
+        assert_eq!(ctx.attempts().len(), 2);
+    }
+
+    #[test]
+    fn execution_context_get_port_returns_none_for_missing_slot() {
+        let ctx = ExecutionContext::new();
+        assert!(ctx.get_port(ResultSlot::ResolvedPort).is_none());
+    }
+
+    #[test]
+    fn execution_context_get_port_returns_none_for_wrong_outcome() {
+        let mut ctx = ExecutionContext::new();
+        ctx.store_outcome(ActionOutcome::CacheMiss);
+        assert!(ctx.get_port(ResultSlot::ResolvedPort).is_none());
+    }
+
+    #[test]
+    fn chain_describe_includes_metadata() {
+        let metadata = ConnectionMetadata {
+            source_string: "tcp:myserver,1433".to_string(),
+            server_name: "myserver".to_string(),
+            instance_name: "inst".to_string(),
+            explicit_protocol: true,
+            timeout_ms: 5000,
+        };
+        let mut builder = ConnectionActionChainBuilder::new(metadata);
+        builder.add_connect_tcp("myserver", 1433);
+        let chain = builder.build();
+        let desc = chain.describe();
+        assert!(desc.contains("myserver"));
+        assert!(desc.contains("inst"));
+        assert!(desc.contains("Explicit protocol: true"));
+    }
+
+    #[test]
+    fn chain_display_trait() {
+        let metadata = ConnectionMetadata {
+            source_string: "srv".to_string(),
+            server_name: "srv".to_string(),
+            instance_name: String::new(),
+            explicit_protocol: false,
+            timeout_ms: 5000,
+        };
+        let mut builder = ConnectionActionChainBuilder::new(metadata);
+        builder.add_connect_tcp("srv", 1433);
+        let chain = builder.build();
+        let display = format!("{chain}");
+        assert!(display.contains("srv"));
+    }
+
+    #[test]
+    fn chain_is_empty() {
+        let metadata = ConnectionMetadata {
+            source_string: "srv".to_string(),
+            server_name: "srv".to_string(),
+            instance_name: String::new(),
+            explicit_protocol: false,
+            timeout_ms: 5000,
+        };
+        let builder = ConnectionActionChainBuilder::new(metadata);
+        let chain = builder.build();
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn to_transport_context_tcp_from_slot_with_context() {
+        use crate::connection::client_context::TransportContext;
+
+        let mut ctx = ExecutionContext::new();
+        ctx.store_outcome(ActionOutcome::SsrpResolved { port: 54321 });
+
+        let action = ConnectionAction::ConnectTcpFromSlot {
+            host: "myserver".to_string(),
+            port_slot: ResultSlot::ResolvedPort,
+            timeout_ms: 15000,
+        };
+        let transport = action.to_transport_context(&ctx);
+        assert!(matches!(
+            transport,
+            Some(TransportContext::Tcp { port: 54321, .. })
+        ));
+    }
+
+    #[test]
+    fn to_transport_context_tcp_from_slot_no_context() {
+        let ctx = ExecutionContext::new();
+        let action = ConnectionAction::ConnectTcpFromSlot {
+            host: "myserver".to_string(),
+            port_slot: ResultSlot::ResolvedPort,
+            timeout_ms: 15000,
+        };
+        assert!(action.to_transport_context(&ctx).is_none());
+    }
+
+    #[test]
+    fn to_transport_context_dac() {
+        use crate::connection::client_context::TransportContext;
+
+        let ctx = ExecutionContext::new();
+        let action = ConnectionAction::ConnectDac {
+            host: "myserver".to_string(),
+            timeout_ms: 15000,
+        };
+        let transport = action.to_transport_context(&ctx);
+        assert!(matches!(
+            transport,
+            Some(TransportContext::Tcp { port: 1434, .. })
+        ));
+    }
+
+    #[test]
+    fn to_transport_context_non_connection_actions() {
+        let ctx = ExecutionContext::new();
+        let actions = vec![
+            ConnectionAction::QuerySsrp {
+                server: "s".to_string(),
+                instance: "i".to_string(),
+                result_slot: ResultSlot::ResolvedPort,
+            },
+            ConnectionAction::UpdateCache {
+                cache_key: "k".to_string(),
+                port: 1433,
+            },
+            ConnectionAction::TrySequence {
+                actions: vec![],
+                fail_fast: true,
+            },
+            ConnectionAction::TryParallel {
+                actions: vec![],
+                min_successes: 1,
+            },
+        ];
+        for action in &actions {
+            assert!(action.to_transport_context(&ctx).is_none());
+        }
+    }
+
+    #[test]
+    fn resolve_transport_contexts_nested_sequence() {
+        let metadata = ConnectionMetadata {
+            source_string: "srv".to_string(),
+            server_name: "srv".to_string(),
+            instance_name: String::new(),
+            explicit_protocol: false,
+            timeout_ms: 5000,
+        };
+        let chain = ConnectionActionChain::new(
+            vec![ConnectionAction::TrySequence {
+                actions: vec![ConnectionAction::ConnectTcp {
+                    host: "srv".to_string(),
+                    port: 1433,
+                    timeout_ms: 5000,
+                }],
+                fail_fast: false,
+            }],
+            metadata,
+        );
+        let transports = chain.resolve_transport_contexts();
+        assert_eq!(transports.len(), 1);
+    }
+
+    #[test]
+    fn resolve_transport_contexts_parallel() {
+        let metadata = ConnectionMetadata {
+            source_string: "srv".to_string(),
+            server_name: "srv".to_string(),
+            instance_name: String::new(),
+            explicit_protocol: false,
+            timeout_ms: 5000,
+        };
+        let chain = ConnectionActionChain::new(
+            vec![ConnectionAction::TryParallel {
+                actions: vec![
+                    ConnectionAction::ConnectTcp {
+                        host: "srv1".to_string(),
+                        port: 1433,
+                        timeout_ms: 5000,
+                    },
+                    ConnectionAction::ConnectTcp {
+                        host: "srv2".to_string(),
+                        port: 1433,
+                        timeout_ms: 5000,
+                    },
+                ],
+                min_successes: 1,
+            }],
+            metadata,
+        );
+        let transports = chain.resolve_transport_contexts();
+        assert_eq!(transports.len(), 2);
+    }
 }

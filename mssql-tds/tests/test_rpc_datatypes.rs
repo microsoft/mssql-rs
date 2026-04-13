@@ -10,9 +10,11 @@ mod rpc_datatypes {
     use crate::common::{
         begin_connection, build_tcp_datasource, create_client, get_first_row, init_tracing,
     };
+    use mssql_tds::connection::tds_client::TdsClient;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::{
-        SqlDate, SqlDateTime, SqlDateTime2, SqlMoney, SqlSmallMoney, SqlTime,
+        SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney, SqlSmallDateTime,
+        SqlSmallMoney, SqlTime,
     };
     use mssql_tds::datatypes::decoder::DecimalParts;
     use mssql_tds::datatypes::sql_string::SqlString;
@@ -426,5 +428,319 @@ mod rpc_datatypes {
         }
 
         Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // Helper: execute sp_executesql with typed params, return first row
+    // ---------------------------------------------------------------
+    async fn roundtrip_params(
+        client: &mut TdsClient,
+        params: Vec<(&str, SqlType)>,
+    ) -> TdsResult<Vec<ColumnValues>> {
+        let mut select = String::from("SELECT ");
+        for (i, (name, _)) in params.iter().enumerate() {
+            if i > 0 {
+                select.push_str(", ");
+            }
+            select.push_str(&format!("@{name} AS [{name}]"));
+        }
+
+        let rpc_params: Vec<RpcParameter> = params
+            .into_iter()
+            .map(|(name, val)| RpcParameter::new(Some(format!("@{name}")), StatusFlags::NONE, val))
+            .collect();
+
+        client
+            .execute_sp_executesql(select, rpc_params, None, None)
+            .await?;
+        let (_meta, row) = get_first_row(client).await?;
+        Ok(row)
+    }
+
+    #[tokio::test]
+    async fn time_all_scales() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        for scale in 0u8..=7 {
+            let params = vec![(
+                "t",
+                SqlType::Time(Some(SqlTime {
+                    time_nanoseconds: 1_234_567_890,
+                    scale,
+                })),
+            )];
+            let row = roundtrip_params(&mut client, params).await.unwrap();
+            match &row[0] {
+                ColumnValues::Time(t) => assert_eq!(t.scale, scale, "scale {scale} mismatch"),
+                other => panic!("Expected Time, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn datetime2_all_scales() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        for scale in 0u8..=7 {
+            let params = vec![(
+                "dt2",
+                SqlType::DateTime2(Some(SqlDateTime2 {
+                    days: 738_000,
+                    time: SqlTime {
+                        time_nanoseconds: 5_000_000_000,
+                        scale,
+                    },
+                })),
+            )];
+            let row = roundtrip_params(&mut client, params).await.unwrap();
+            match &row[0] {
+                ColumnValues::DateTime2(dt2) => {
+                    assert_eq!(dt2.time.scale, scale, "scale {scale} mismatch");
+                    assert_eq!(dt2.days, 738_000);
+                }
+                other => panic!("Expected DateTime2, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn datetimeoffset_all_scales() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        for scale in 0u8..=7 {
+            let params = vec![(
+                "dto",
+                SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 738_000,
+                        time: SqlTime {
+                            time_nanoseconds: 1_000_000_000,
+                            scale,
+                        },
+                    },
+                    offset: -300,
+                })),
+            )];
+            let row = roundtrip_params(&mut client, params).await.unwrap();
+            match &row[0] {
+                ColumnValues::DateTimeOffset(dto) => {
+                    assert_eq!(dto.datetime2.time.scale, scale, "scale {scale} mismatch");
+                    assert_eq!(dto.offset, -300);
+                }
+                other => panic!("Expected DateTimeOffset, got {other:?}"),
+            }
+        }
+    }
+
+    // TEXT/NTEXT RPC serialization is not yet fully implemented in the TDS
+    // protocol layer; the server rejects the stream. These tests are kept as
+    // ignored placeholders so they can be enabled once TEXT/NTEXT support lands.
+
+    #[tokio::test]
+    #[ignore = "TEXT RPC serialization not yet implemented"]
+    async fn text_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let val = SqlString::from_utf8_string("Hello text world".to_string());
+        let row = roundtrip_params(&mut client, vec![("t", SqlType::Text(Some(val)))])
+            .await
+            .unwrap();
+        match &row[0] {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "Hello text world"),
+            other => panic!("Expected String from TEXT, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "NTEXT RPC serialization not yet implemented"]
+    async fn ntext_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let val = SqlString::from_utf8_string("Hello ntext 日本語".to_string());
+        let row = roundtrip_params(&mut client, vec![("t", SqlType::NText(Some(val)))])
+            .await
+            .unwrap();
+        match &row[0] {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "Hello ntext 日本語"),
+            other => panic!("Expected String from NTEXT, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "TEXT NULL RPC serialization not yet implemented"]
+    async fn text_null_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let row = roundtrip_params(&mut client, vec![("t", SqlType::Text(None))])
+            .await
+            .unwrap();
+        assert_eq!(row[0], ColumnValues::Null);
+    }
+
+    #[tokio::test]
+    #[ignore = "NTEXT NULL RPC serialization not yet implemented"]
+    async fn ntext_null_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let row = roundtrip_params(&mut client, vec![("t", SqlType::NText(None))])
+            .await
+            .unwrap();
+        assert_eq!(row[0], ColumnValues::Null);
+    }
+
+    #[tokio::test]
+    async fn nvarcharmax_large_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let large = "A".repeat(10_000);
+        let val = SqlString::from_utf8_string(large.clone());
+        let row = roundtrip_params(&mut client, vec![("v", SqlType::NVarcharMax(Some(val)))])
+            .await
+            .unwrap();
+        match &row[0] {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), large),
+            other => panic!("Expected String, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn varcharmax_large_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let large = "B".repeat(10_000);
+        let val = SqlString::from_utf8_string(large.clone());
+        let row = roundtrip_params(&mut client, vec![("v", SqlType::VarcharMax(Some(val)))])
+            .await
+            .unwrap();
+        match &row[0] {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), large),
+            other => panic!("Expected String, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn varbinarymax_large_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let data: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+        let row = roundtrip_params(
+            &mut client,
+            vec![("v", SqlType::VarBinaryMax(Some(data.clone())))],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::Bytes(b) => assert_eq!(b, &data),
+            other => panic!("Expected Bytes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "CHAR/NCHAR get_meta_type_name not yet implemented"]
+    async fn char_nchar_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let char_val = SqlString::from_utf8_string("ABC".to_string());
+        let nchar_val = SqlString::from_utf8_string("XYZ".to_string());
+        let row = roundtrip_params(
+            &mut client,
+            vec![
+                ("c", SqlType::Char(Some(char_val), 10)),
+                ("n", SqlType::NChar(Some(nchar_val), 10)),
+            ],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::String(s) => assert!(s.to_utf8_string().starts_with("ABC")),
+            other => panic!("Expected String from CHAR, got {other:?}"),
+        }
+        match &row[1] {
+            ColumnValues::String(s) => assert!(s.to_utf8_string().starts_with("XYZ")),
+            other => panic!("Expected String from NCHAR, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn varchar_overflow_to_plp() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let val = SqlString::from_utf8_string("test".to_string());
+        let row = roundtrip_params(&mut client, vec![("v", SqlType::Varchar(Some(val), 9000))])
+            .await
+            .unwrap();
+        match &row[0] {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "test"),
+            other => panic!("Expected String, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nvarchar_overflow_to_plp() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let val = SqlString::from_utf8_string("test".to_string());
+        let row = roundtrip_params(&mut client, vec![("v", SqlType::NVarchar(Some(val), 5000))])
+            .await
+            .unwrap();
+        match &row[0] {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "test"),
+            other => panic!("Expected String, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn smalldatetime_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let row = roundtrip_params(
+            &mut client,
+            vec![(
+                "sdt",
+                SqlType::SmallDateTime(Some(SqlSmallDateTime {
+                    days: 44000u16,
+                    time: 720u16,
+                })),
+            )],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::SmallDateTime(sdt) => {
+                assert_eq!(sdt.days, 44000u16);
+                assert_eq!(sdt.time, 720u16);
+            }
+            other => panic!("Expected SmallDateTime, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn date_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let d = SqlDate::create(738_000).unwrap();
+        let row = roundtrip_params(&mut client, vec![("d", SqlType::Date(Some(d)))])
+            .await
+            .unwrap();
+        match &row[0] {
+            ColumnValues::Date(d) => assert_eq!(d.get_days(), 738_000),
+            other => panic!("Expected Date, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn money_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let row = roundtrip_params(
+            &mut client,
+            vec![
+                (
+                    "m",
+                    SqlType::Money(Some(SqlMoney {
+                        lsb_part: 100_000,
+                        msb_part: 0,
+                    })),
+                ),
+                (
+                    "sm",
+                    SqlType::SmallMoney(Some(SqlSmallMoney { int_val: 50_000 })),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::Money(m) => assert_eq!(m.lsb_part, 100_000),
+            other => panic!("Expected Money, got {other:?}"),
+        }
+        match &row[1] {
+            ColumnValues::SmallMoney(sm) => assert_eq!(sm.int_val, 50_000),
+            other => panic!("Expected SmallMoney, got {other:?}"),
+        }
     }
 }
