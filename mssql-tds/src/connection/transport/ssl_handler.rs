@@ -175,7 +175,10 @@ impl SslHandler {
             Ok(mut stream) => {
                 // If ServerCertificate is specified, perform certificate validation
                 if let Some(cert_path) = &self.encryption_options.server_certificate {
-                    info!("Validating server certificate using: {}", cert_path);
+                    info!(
+                        "Validating server certificate using: {}",
+                        cert_path.display()
+                    );
 
                     // Get the server's certificate from the TLS stream
                     let peer_cert = stream
@@ -827,7 +830,7 @@ mod tests {
     #[test]
     fn server_certificate_enables_pinning_mode() {
         let mut opts = default_options();
-        opts.server_certificate = Some("cert.pem".to_string());
+        opts.server_certificate = Some("cert.pem".into());
         let config =
             SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::Mandatory);
         assert!(config.accept_invalid_certs);
@@ -837,7 +840,7 @@ mod tests {
     #[test]
     fn server_certificate_takes_precedence_over_login_only() {
         let mut opts = default_options();
-        opts.server_certificate = Some("cert.pem".to_string());
+        opts.server_certificate = Some("cert.pem".into());
         let config =
             SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::LoginOnly);
         assert!(config.accept_invalid_certs);

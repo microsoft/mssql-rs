@@ -492,7 +492,7 @@ mod mock_server_tests {
             mode: EncryptionSetting::PreferOff, // Use PreferOff since mock server doesn't support TLS
             trust_server_certificate: true,
             host_name_in_cert: None,
-            server_certificate: Some("/nonexistent/path/certificate.cer".to_string()),
+            server_certificate: Some("/nonexistent/path/certificate.cer".into()),
         };
 
         // Attempt to connect - should succeed since encryption is off
@@ -557,7 +557,7 @@ mod mock_server_tests {
             mode: EncryptionSetting::Required,
             trust_server_certificate: true, // This should be ignored
             host_name_in_cert: None,
-            server_certificate: Some(cert_path.to_str().unwrap().to_string()),
+            server_certificate: Some(cert_path.clone()),
         };
 
         // Attempt to connect - ServerCertificate should take precedence
@@ -628,7 +628,7 @@ mod mock_server_tests {
             mode: EncryptionSetting::PreferOff, // Use PreferOff since mock server doesn't support TLS
             trust_server_certificate: true,
             host_name_in_cert: Some("custom.hostname.com".to_string()),
-            server_certificate: Some(cert_path.to_str().unwrap().to_string()),
+            server_certificate: Some(cert_path.clone()),
         };
 
         // Attempt to connect - with PreferOff, may succeed but both options set is unusual
@@ -791,7 +791,7 @@ mod mock_server_tests {
                 mode: EncryptionSetting::Strict, // TDS 8.0 - direct TLS
                 trust_server_certificate: false,
                 host_name_in_cert: None,
-                server_certificate: Some("tests/test_certificates/valid_cert.pem".to_string()),
+                server_certificate: Some("tests/test_certificates/valid_cert.pem".into()),
             };
 
             let provider = TdsConnectionProvider {};
@@ -835,7 +835,7 @@ mod mock_server_tests {
                 mode: EncryptionSetting::Strict,
                 trust_server_certificate: false,
                 host_name_in_cert: None,
-                server_certificate: Some("tests/test_certificates/valid_cert.pem".to_string()),
+                server_certificate: Some("tests/test_certificates/valid_cert.pem".into()),
             };
 
             let provider = TdsConnectionProvider {};

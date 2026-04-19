@@ -24,19 +24,19 @@ use tracing::{debug, info};
 /// # Returns
 /// * `Ok(Vec<u8>)` - DER-encoded certificate data
 /// * `Err(Error)` - File not found, IO error, or invalid format
-pub fn load_certificate_from_file(path: &str) -> TdsResult<Vec<u8>> {
-    debug!("Loading certificate from file: {}", path);
+pub fn load_certificate_from_file(path: &Path) -> TdsResult<Vec<u8>> {
+    debug!("Loading certificate from file: {}", path.display());
 
     // Check if file exists
-    if !Path::new(path).exists() {
+    if !path.exists() {
         return Err(Error::CertificateNotFound {
-            path: path.to_string(),
+            path: path.to_path_buf(),
         });
     }
 
     // Read certificate file
     let cert_data = fs::read(path).map_err(|e| Error::CertificateFileIoError {
-        path: path.to_string(),
+        path: path.to_path_buf(),
         error: e.to_string(),
     })?;
 
@@ -48,19 +48,19 @@ pub fn load_certificate_from_file(path: &str) -> TdsResult<Vec<u8>> {
             Certificate::from_der(&cert_data)
         })
         .map_err(|_| Error::InvalidCertificateFormat {
-            path: path.to_string(),
+            path: path.to_path_buf(),
         })?;
 
     // Convert to DER format for binary comparison
     let der_data = certificate
         .to_der()
         .map_err(|_| Error::InvalidCertificateFormat {
-            path: path.to_string(),
+            path: path.to_path_buf(),
         })?;
 
     info!(
         "Successfully loaded certificate from: {} ({} bytes)",
-        path,
+        path.display(),
         der_data.len()
     );
     Ok(der_data)
@@ -134,8 +134,11 @@ pub fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
 /// # Returns
 /// * `Ok(())` - Certificates match and server cert is valid
 /// * `Err(Error)` - Validation failed
-pub fn validate_server_certificate(user_cert_path: &str, server_cert_der: &[u8]) -> TdsResult<()> {
-    info!("Validating server certificate against: {}", user_cert_path);
+pub fn validate_server_certificate(user_cert_path: &Path, server_cert_der: &[u8]) -> TdsResult<()> {
+    info!(
+        "Validating server certificate against: {}",
+        user_cert_path.display()
+    );
 
     // Step 1: Load user-provided certificate
     let user_cert_der = load_certificate_from_file(user_cert_path)?;
@@ -186,11 +189,12 @@ mod tests {
 
     #[test]
     fn test_load_certificate_file_not_found() {
-        let result = load_certificate_from_file("/nonexistent/path/cert.cer");
+        let p = Path::new("/nonexistent/path/cert.cer");
+        let result = load_certificate_from_file(p);
         assert!(result.is_err());
         match result {
             Err(Error::CertificateNotFound { path }) => {
-                assert!(path.contains("nonexistent"));
+                assert!(path == p);
             }
             _ => panic!("Expected CertificateNotFound error"),
         }
@@ -199,7 +203,7 @@ mod tests {
     #[test]
     fn test_load_certificate_from_pem() {
         // Path relative to the crate root
-        let cert_path = "tests/test_certificates/valid_cert.pem";
+        let cert_path = Path::new("tests/test_certificates/valid_cert.pem");
         let result = load_certificate_from_file(cert_path);
 
         match result {
@@ -219,7 +223,7 @@ mod tests {
     #[test]
     fn test_load_certificate_from_der() {
         // Path relative to the crate root
-        let cert_path = "tests/test_certificates/valid_cert.der";
+        let cert_path = Path::new("tests/test_certificates/valid_cert.der");
         let result = load_certificate_from_file(cert_path);
 
         match result {
@@ -239,13 +243,13 @@ mod tests {
     #[test]
     fn test_load_certificate_invalid_format() {
         // Path relative to the crate root
-        let cert_path = "tests/test_certificates/invalid_format.txt";
+        let cert_path = Path::new("tests/test_certificates/invalid_format.txt");
         let result = load_certificate_from_file(cert_path);
 
         assert!(result.is_err(), "Should fail to load invalid certificate");
         match result {
             Err(Error::InvalidCertificateFormat { path, .. }) => {
-                assert!(path.contains("invalid_format.txt"));
+                assert!(path == cert_path);
             }
             Err(e) => panic!("Expected InvalidCertificateFormat error, got: {:?}", e),
             Ok(_) => panic!("Should not succeed loading invalid certificate"),
@@ -255,8 +259,8 @@ mod tests {
     #[test]
     fn test_pem_and_der_certificates_produce_same_der() {
         // Both PEM and DER files contain the same certificate
-        let pem_path = "tests/test_certificates/valid_cert.pem";
-        let der_path = "tests/test_certificates/valid_cert.der";
+        let pem_path = Path::new("tests/test_certificates/valid_cert.pem");
+        let der_path = Path::new("tests/test_certificates/valid_cert.der");
 
         let pem_result = load_certificate_from_file(pem_path);
         let der_result = load_certificate_from_file(der_path);
@@ -283,7 +287,7 @@ mod tests {
     #[test]
     fn test_is_certificate_expired_valid() {
         // Our test certificate is valid for 10 years (3650 days)
-        let cert_path = "tests/test_certificates/valid_cert.pem";
+        let cert_path = Path::new("tests/test_certificates/valid_cert.pem");
         let der_bytes =
             load_certificate_from_file(cert_path).expect("Failed to load test certificate");
 
