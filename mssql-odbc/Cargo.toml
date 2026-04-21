@@ -1,0 +1,15 @@
+[package]
+name = "mssql-odbc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "msodbcsql18"
+crate-type = ["cdylib"]
+
+[dependencies]
+mssql-tds = { path = "../mssql-tds" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[build-dependencies]
