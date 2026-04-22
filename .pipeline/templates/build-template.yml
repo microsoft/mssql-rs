@@ -137,6 +137,13 @@ steps:
 
   - ${{ if eq(parameters.osType, 'Linux') }}:
     - bash: |
+        echo "Running mssql-py-core Rust unit tests..."
+        cd mssql-py-core && cargo test --frozen -- --show-output
+      displayName: Run Rust unit tests (mssql-py-core)
+      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
+  - ${{ if eq(parameters.osType, 'Linux') }}:
+    - bash: |
         echo "Running Python tests for mssql-py-core..."
         ./dev/test-python.sh
       displayName: Run Python Tests (mssql-py-core)

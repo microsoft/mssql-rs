@@ -866,4 +866,61 @@ mod mock_server_tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_user_agent_interception() -> Result<(), Box<dyn std::error::Error>> {
+        init_tracing();
+
+        let server_addr = "127.0.0.1:0";
+        let server = MockTdsServer::new(server_addr).await?;
+        let bound_addr = server.local_addr();
+        let connection_store = server.connection_store();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let datasource = format!("tcp:{},{}", bound_addr.ip(), bound_addr.port());
+        let mut context = ClientContext::default();
+        context.user_name = "sa".to_string();
+        context.password = generate_test_password();
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+
+        let provider = TdsConnectionProvider {};
+        let mut client = provider.create_client(context, &datasource, None).await?;
+
+        client.close_connection().await?;
+        drop(client);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let store = connection_store.lock().await;
+        let conn_info = store
+            .all()
+            .values()
+            .next()
+            .expect("Should have at least one connection");
+
+        let returned_agent = conn_info.received_user_agent().unwrap_or_default();
+        println!("Intercepted User Agent: {}", returned_agent);
+        assert!(
+            returned_agent.contains("MS-TDS"),
+            "Expected formatted MS-TDS, got {}",
+            returned_agent
+        );
+
+        // Cleanup
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
 }

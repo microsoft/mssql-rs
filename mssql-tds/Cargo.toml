@@ -51,7 +51,7 @@ dns-lookup = "2.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["namedpipeapi", "winerror", "winbase"] }
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Registry"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Wdk_System_SystemServices"] }
 
 [target.'cfg(unix)'.dependencies]
 # For runtime GSSAPI library detection using dlopen/dlsym

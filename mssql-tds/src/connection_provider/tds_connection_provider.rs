@@ -6,7 +6,9 @@ use tokio::time::timeout;
 use tracing::{debug, info};
 
 use crate::connection::client_context::{ClientContext, TransportContext};
-use crate::connection::connection_actions::ConnectionActionChain;
+use crate::connection::connection_actions::{
+    ActionOutcome, ConnectionAction, ConnectionActionChain, ExecutionContext,
+};
 use crate::connection::tds_client::TdsClient;
 use crate::connection::transport::network_transport;
 use crate::connection::transport::tds_transport::TdsTransport;
@@ -17,7 +19,7 @@ use crate::error::Error::{OperationCancelledError, TimeoutError};
 use crate::error::{Error, TimeoutErrorType};
 use crate::handler::handler_factory::HandlerFactory;
 use crate::io::token_stream::GenericTokenParserRegistry;
-// use crate::ssrp;  // TODO: Enable when SSRP implementation is added
+use crate::ssrp;
 
 #[cfg(fuzzing)]
 use crate::io::token_stream::TdsTokenStreamReader;
@@ -134,13 +136,10 @@ impl TdsConnectionProvider {
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<TdsClient> {
         CancelHandle::run_until_cancelled(cancel_handle, async move {
-            // Check if SSRP is required
+            // Resolve SSRP (SQL Browser) if the action chain requires it
+            let mut exec_context = ExecutionContext::new();
             if action_chain.requires_ssrp() {
-                debug!("Action chain requires SSRP query");
-                return Err(Error::ProtocolError(
-                    "Named instance connection requires SSRP (SQL Server Browser), which is not yet implemented. \
-                     Please use explicit protocol with port: tcp:server,1433".to_string()
-                ));
+                Self::resolve_ssrp(&action_chain, &mut exec_context).await?;
             }
 
             // Check if LocalDB resolution is required (Windows only)
@@ -167,12 +166,12 @@ impl TdsConnectionProvider {
 
                     (vec![(TransportContext::NamedPipe { pipe_name: pipe_path }, modified_context.connect_timeout as u64 * 1000)], modified_context)
                 } else {
-                    (action_chain.resolve_transport_contexts(), context.clone())
+                    (action_chain.resolve_transport_contexts_with_context(&exec_context), context.clone())
                 }
             };
 
             #[cfg(not(windows))]
-            let (transport_contexts, context) = (action_chain.resolve_transport_contexts(), context.clone());
+            let (transport_contexts, context) = (action_chain.resolve_transport_contexts_with_context(&exec_context), context.clone());
 
             if transport_contexts.is_empty() {
                 return Err(Error::ProtocolError(
@@ -264,6 +263,60 @@ impl TdsConnectionProvider {
             }))
         })
         .await
+    }
+
+    /// Query SQL Browser (SSRP) to resolve the TCP port for a named instance.
+    async fn resolve_ssrp(
+        action_chain: &ConnectionActionChain,
+        exec_context: &mut ExecutionContext,
+    ) -> TdsResult<()> {
+        let (server, instance) = action_chain
+            .actions()
+            .iter()
+            .find_map(|a| match a {
+                ConnectionAction::QuerySsrp {
+                    server, instance, ..
+                } => Some((server.clone(), instance.clone())),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                Error::ProtocolError(
+                    "Action chain requires SSRP but contains no QuerySsrp action".to_string(),
+                )
+            })?;
+
+        debug!(server = %server, instance = %instance, "Executing SSRP query");
+
+        let instance_info = ssrp::get_instance_info(&server, &instance)
+            .await
+            .map_err(|e| {
+                Error::ConnectionError(format!(
+                    "Error Locating Server/Instance Specified [{}\\{}]. \
+                     Ensure the instance name is correct and SQL Server Browser \
+                     service is running on the host. ({})",
+                    server, instance, e
+                ))
+            })?;
+
+        let transports = ssrp::build_transport_list(instance_info, &server, &instance);
+
+        let tcp_port = transports
+            .iter()
+            .find_map(|t| match t {
+                TransportContext::Tcp { port, .. } => Some(*port),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                Error::ConnectionError(format!(
+                    "SQL Browser returned instance information for '{}' \
+                     but no TCP endpoint was available.",
+                    instance
+                ))
+            })?;
+
+        debug!(tcp_port, "SSRP resolved instance port");
+        exec_context.store_outcome(ActionOutcome::SsrpResolved { port: tcp_port });
+        Ok(())
     }
 
     /// Creates a new connection from the given transport context.

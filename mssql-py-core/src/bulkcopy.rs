@@ -1230,17 +1230,12 @@ impl PythonRowAdapter {
         }
 
         // Default to DATETIME format
-        // Calculate time in 1/300th seconds
-        let total_ms = (hour as u64) * 3_600_000
-            + (minute as u64) * 60_000
-            + (second as u64) * 1_000
-            + (microsecond as u64) / 1_000;
-
-        let time_ticks = ((total_ms * 300) / 1000) as u32;
+        let (final_days, time_ticks) =
+            crate::types::datetime_to_ticks(days, hour, minute, second, microsecond)?;
 
         Ok(ColumnValues::DateTime(
             mssql_tds::datatypes::column_values::SqlDateTime {
-                days,
+                days: final_days,
                 time: time_ticks,
             },
         ))
