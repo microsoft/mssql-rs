@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 
 use super::features::fedauth::FedAuthFeature;
+use super::features::useragent::UserAgentFeature;
 use super::features::utf8::Utf8Feature;
 use super::features::vectorfeature::VectorFeature;
 use crate::core::TdsResult;
@@ -58,6 +59,7 @@ pub(crate) enum FeatureExtension {
     SqlDnsCaching,
     Json,
     Vector,
+    UserAgent,
     Terminator,
     Unknown(u8),
 }
@@ -75,6 +77,7 @@ impl FeatureExtension {
             FeatureExtension::SqlDnsCaching => 0x0B,
             FeatureExtension::Json => 0x0D,
             FeatureExtension::Vector => 0x0E,
+            FeatureExtension::UserAgent => 0x10,
             FeatureExtension::Terminator => 0xFF,
             FeatureExtension::Unknown(value) => value,
         }
@@ -94,6 +97,7 @@ impl From<u8> for FeatureExtension {
             0x0B => FeatureExtension::SqlDnsCaching,
             0x0D => FeatureExtension::Json,
             0x0E => FeatureExtension::Vector,
+            0x10 => FeatureExtension::UserAgent,
             0xFF => FeatureExtension::Terminator,
             _ => FeatureExtension::Unknown(value),
         }
@@ -141,6 +145,7 @@ impl FeaturesRequest {
         access_token: Option<String>,
         prelogin_fedauth_response: bool,
         vector_version: VectorVersion,
+        user_agent_feature: UserAgentFeature,
     ) -> Self {
         let mut features: HashMap<FeatureExtension, Box<dyn Feature>> = HashMap::new();
         features.insert(
@@ -150,6 +155,7 @@ impl FeaturesRequest {
 
         features.insert(FeatureExtension::Json, Box::new(JsonFeature::default()));
 
+        features.insert(FeatureExtension::UserAgent, Box::new(user_agent_feature));
         if let Some(vector_feature) = Option::<VectorFeature>::from(vector_version) {
             features.insert(FeatureExtension::Vector, Box::new(vector_feature));
         }
@@ -251,6 +257,7 @@ impl From<(&ClientContext, bool)> for FeaturesRequest {
             context.access_token.clone(),
             context_and_prelogin_fedauth_flag.1,
             context.vector_version,
+            UserAgentFeature::new(context),
         )
     }
 }
@@ -894,8 +901,21 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
 
     /// Serializes the Feature extension data for each of the requested features.
     async fn write_feature_extension_data(&mut self) -> TdsResult<()> {
+        // According to useragent specifications, it should be sent first.
+        // By pulling it out of the HashMap explicitly, we guarantee order.
+        if let Some(user_agent) = self
+            .features_request
+            .features
+            .get(&FeatureExtension::UserAgent)
+            .filter(|f| f.is_requested())
+        {
+            user_agent.serialize(self.payload_writer).await?;
+        }
+
         for feature in self.features_request.get_requested_features() {
-            feature.serialize(self.payload_writer).await?;
+            if feature.feature_identifier() != FeatureExtension::UserAgent {
+                feature.serialize(self.payload_writer).await?;
+            }
         }
         // Write the terminator
         self.payload_writer.write_byte_async(0xff).await?;

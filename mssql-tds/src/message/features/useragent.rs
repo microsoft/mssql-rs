@@ -2,13 +2,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use async_trait::async_trait;
 use std::sync::OnceLock;
 
 use crate::connection::client_context::ClientContext;
+use crate::core::TdsResult;
+use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
+use crate::message::login::{Feature, FeatureExtension};
 
 const UNKNOWN_VAL: &str = "Unknown";
 const FORMAT_VERSION: &str = "1";
-const DEFAULT_DRIVER_NAME: &str = "MS-RUST";
+const DEFAULT_DRIVER_NAME: &str = "MS-TDS";
 
 // Field length limits following MS driver standards
 const MAX_ARCH_LEN: usize = 10;
@@ -50,7 +54,8 @@ fn get_os_type_from_name(os_name: &str) -> &'static str {
         "macos" => "macOS",
         "freebsd" => "FreeBSD",
         "android" => "Android",
-        "ios" => "iOS",
+        // The specification strictly limits OS types to Windows, Linux, macOS, FreeBSD, Android, and Unknown.
+        // Any unsupported OS, such as iOS, must explicitly fallback to "Unknown".
         _ => UNKNOWN_VAL,
     }
 }
@@ -116,20 +121,36 @@ impl UserAgentFeature {
         let env_info = SYSTEM_ENV_CACHE.get_or_init(SystemEnvironmentInfo::detect);
 
         let driver_name = {
-            let name = if context.library_name.is_empty() {
-                DEFAULT_DRIVER_NAME
-            } else {
-                &context.library_name
-            };
-            sanitize_field(name, MAX_DRIVER_NAME_LEN)
+            let name = &context.user_agent.library_name;
+            // Fallback to default if an FFI caller explicitly set an empty string
+            sanitize_field(
+                if name.is_empty() {
+                    DEFAULT_DRIVER_NAME
+                } else {
+                    name
+                },
+                MAX_DRIVER_NAME_LEN,
+            )
         };
 
-        let driver_version =
-            sanitize_field(&context.driver_version.to_string(), MAX_DRIVER_VER_LEN);
+        let driver_version = {
+            let ver = &context.user_agent.driver_version;
+            let base_ver = context.driver_version.to_string();
+            // Fallback to default if an FFI caller explicitly set an empty string
+            sanitize_field(
+                if ver.is_empty() { &base_ver } else { ver },
+                MAX_DRIVER_VER_LEN,
+            )
+        };
 
-        let runtime_details = match &context.runtime_details {
-            Some(v) if !v.is_empty() => sanitize_field(v, MAX_RUNTIME_LEN),
-            _ => env_info.fallback_runtime.clone(),
+        let runtime_details = {
+            let v = &context.user_agent.runtime;
+            // Fallback to default if an FFI caller explicitly set an empty string or "Unknown"
+            if v.is_empty() || v == UNKNOWN_VAL {
+                env_info.fallback_runtime.clone()
+            } else {
+                sanitize_field(v, MAX_RUNTIME_LEN)
+            }
         };
 
         // Format is strictly: {Format Version}|{Driver Name}|{Driver Version}|{Architecture}|{OS Type}|{OS Details}|{Runtime Identifier}
@@ -149,6 +170,51 @@ impl UserAgentFeature {
         // Because 152 <= 255 (the SQL Server limit) and `sanitize_field` strips out all '|'
         // from the inputs, we are guaranteed to never truncate delimiters or exceed limits.
         UserAgentFeature { payload }
+    }
+}
+
+#[async_trait]
+impl Feature for UserAgentFeature {
+    fn feature_identifier(&self) -> FeatureExtension {
+        FeatureExtension::UserAgent
+    }
+
+    fn is_requested(&self) -> bool {
+        true
+    }
+
+    fn data_length(&self) -> i32 {
+        // Each UTF-16 character is 2 bytes, so multiply the u16 count by 2 to get the total byte length
+        let utf16_len = self.payload.encode_utf16().count() * 2;
+        // 1 byte for feature identifier, 4 bytes for length, utf16_len bytes for payload
+        (size_of::<u8>() + size_of::<i32>() + utf16_len) as i32
+    }
+
+    async fn serialize(&self, packet_writer: &mut PacketWriter) -> TdsResult<()> {
+        // Each UTF-16 character is 2 bytes, so multiply the u16 count by 2 to get the total byte length
+        let utf16_len = self.payload.encode_utf16().count() * 2;
+        packet_writer
+            .write_byte_async(self.feature_identifier().as_u8())
+            .await?;
+        packet_writer.write_i32_async(utf16_len as i32).await?;
+        packet_writer
+            .write_string_unicode_async(&self.payload)
+            .await?;
+        Ok(())
+    }
+
+    fn deserialize(&mut self, _data: &[u8]) -> TdsResult<()> {
+        Ok(())
+    }
+
+    fn is_acknowledged(&self) -> bool {
+        false
+    }
+
+    fn set_acknowledged(&mut self, _acknowledged: bool) {}
+
+    fn clone_box(&self) -> Box<dyn Feature> {
+        Box::new(self.clone())
     }
 }
 
@@ -237,7 +303,8 @@ mod tests {
         assert_eq!(get_os_type_from_name("macos"), "macOS");
         assert_eq!(get_os_type_from_name("freebsd"), "FreeBSD");
         assert_eq!(get_os_type_from_name("android"), "Android");
-        assert_eq!(get_os_type_from_name("ios"), "iOS");
+        // iOS is intentionally mapped to Unknown as per strict spec constraints
+        assert_eq!(get_os_type_from_name("ios"), "Unknown");
         assert_eq!(get_os_type_from_name("solaris"), "Unknown");
     }
 
@@ -254,7 +321,7 @@ mod tests {
         );
 
         assert_eq!(parts[0], "1");
-        assert_eq!(parts[1], "mssql-tds");
+        assert_eq!(parts[1], "MS-TDS");
 
         // Assert that at least some known environment values appeared.
         assert!(!parts[3].is_empty()); // Arch
@@ -266,12 +333,13 @@ mod tests {
     fn test_user_agent_builder_custom_ffi() {
         let mut context = ClientContext::with_data_source("tcp:test");
         context.library_name = "mssql-python".to_string();
-        context.set_runtime_details("CPython 3.12.3".to_string());
+        context.user_agent.set_library_name("MS-PYTHON".to_string());
+        context.user_agent.set_runtime("CPython 3.12.3".to_string());
 
         let feature = UserAgentFeature::new(&context);
         let parts: Vec<&str> = feature.payload.split('|').collect();
 
-        assert_eq!(parts[1], "mssql-python"); // Driver Name correctly mapped
+        assert_eq!(parts[1], "MS-PYTHON"); // Driver Name overrides library_name
         assert_eq!(parts[6], "CPython 3.12.3"); // Dynamic FFI runtime mapped
     }
 
@@ -318,5 +386,18 @@ mod tests {
         let os_details = get_os_details();
         assert!(!os_details.is_empty());
         assert_ne!(os_details, UNKNOWN_VAL);
+    }
+
+    #[test]
+    fn test_useragent_feature_methods() {
+        let context = ClientContext::with_data_source("tcp:test");
+        let mut feature = UserAgentFeature::new(&context);
+
+        // Should acknowledge by default based on boolean flag
+        assert!(!feature.is_acknowledged());
+
+        // deserialize is a no-op for UserAgent
+        let buf = bytes::BytesMut::new();
+        assert!(feature.deserialize(&buf).is_ok());
     }
 }

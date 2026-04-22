@@ -19,6 +19,8 @@ use mssql_tds::{
     message::login_options::ApplicationIntent,
 };
 
+const DEFAULT_LIBRARY_NAME: &str = "MS-PYTHON";
+
 /// Python Connection class for Core TDS backend
 #[pyclass]
 pub struct PyCoreConnection {
@@ -453,7 +455,20 @@ impl PyCoreConnection {
         // Set library_name to "mssql-python" for Python driver
         context.library_name = "mssql-python".to_string();
 
-        // Use the module-level driver version (set once by mssql-python at import time)
+        // Exclusively override the driver name for the User-Agent payload
+        context
+            .user_agent
+            .set_library_name(DEFAULT_LIBRARY_NAME.to_string());
+
+        if let Some(raw_version) = crate::get_raw_driver_version() {
+            context.user_agent.set_driver_version(raw_version);
+        }
+
+        if let Some(global_details) = crate::RUNTIME_DETAILS.get() {
+            context.user_agent.set_runtime(global_details.clone());
+        }
+
+        // Fetch driver version natively using module-level configuration or Cargo fallback
         context.driver_version = crate::get_driver_version();
 
         Ok(context)

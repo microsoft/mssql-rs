@@ -248,15 +248,52 @@ pub struct ClientContext {
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
     pub vector_version: VectorVersion,
-    /// Custom runtime details typically injected by FFI wrappers (e.g., Python, Node.js).
-    pub(crate) runtime_details: Option<String>,
+    /// UserAgent telemetry payload components.
+    pub user_agent: UserAgent,
+}
+
+const DEFAULT_LIBRARY_NAME: &str = "MS-TDS";
+const UNKNOWN_RUNTIME: &str = "Unknown";
+
+/// A grouping of telemetry-specific fields.
+#[derive(Clone, Debug)]
+pub struct UserAgent {
+    /// Custom library name for User-Agent payload (e.g., `MS-PYTHON`).
+    pub library_name: String,
+    /// Custom driver version string for User-Agent payload (e.g., `1.2.3rc1`).
+    pub driver_version: String,
+    /// Custom runtime details (e.g. `CPython 3.12.3`).
+    pub runtime: String,
+}
+
+impl Default for UserAgent {
+    fn default() -> Self {
+        Self {
+            library_name: DEFAULT_LIBRARY_NAME.to_string(),
+            driver_version: env!("CARGO_PKG_VERSION").to_string(),
+            runtime: UNKNOWN_RUNTIME.to_string(),
+        }
+    }
+}
+
+impl UserAgent {
+    /// Sets the custom library name for the User-Agent payload.
+    pub fn set_library_name(&mut self, name: String) {
+        self.library_name = name;
+    }
+
+    /// Sets the custom driver version for the User-Agent payload.
+    pub fn set_driver_version(&mut self, version: String) {
+        self.driver_version = version;
+    }
+
+    /// Sets the custom runtime details for the User-Agent payload.
+    pub fn set_runtime(&mut self, runtime: String) {
+        self.runtime = runtime;
+    }
 }
 
 impl ClientContext {
-    /// Injects custom runtime details (such as the specific FFI wrapper environment).
-    pub fn set_runtime_details(&mut self, details: String) {
-        self.runtime_details = Some(details);
-    }
     /// Creates a new ClientContext with the specified data source.
     /// The data source is mandatory for establishing a connection.
     ///
@@ -286,7 +323,7 @@ impl ClientContext {
             failover_partner: "".to_string(),
             ipaddress_preference: IPAddressPreference::UsePlatformDefault,
             language: "us_english".to_string(),
-            library_name: "mssql-tds".to_string(),
+            library_name: "MS-TDS".to_string(),
             driver_version: DriverVersion::from_cargo_version(),
             auth_method_map: HashMap::new(),
             mars_enabled: false,
@@ -308,7 +345,7 @@ impl ClientContext {
                 instance_name: None,
             },
             vector_version: VectorVersion::V1,
-            runtime_details: None,
+            user_agent: UserAgent::default(),
         }
     }
 
@@ -340,7 +377,7 @@ impl ClientContext {
             failover_partner: "".to_string(),
             ipaddress_preference: IPAddressPreference::UsePlatformDefault,
             language: "us_english".to_string(),
-            library_name: "mssql-tds".to_string(),
+            library_name: "MS-TDS".to_string(),
             driver_version: DriverVersion::from_cargo_version(),
             auth_method_map: HashMap::new(),
             mars_enabled: false,
@@ -362,7 +399,7 @@ impl ClientContext {
                 instance_name: None,
             },
             vector_version: VectorVersion::V1,
-            runtime_details: None,
+            user_agent: UserAgent::default(),
         }
     }
 
@@ -592,7 +629,7 @@ impl Clone for ClientContext {
             access_token: self.access_token.clone(),
             transport_context: self.transport_context.clone(),
             vector_version: self.vector_version,
-            runtime_details: self.runtime_details.clone(),
+            user_agent: self.user_agent.clone(),
         }
     }
 }
@@ -1470,7 +1507,7 @@ mod tests {
     #[test]
     fn test_default_library_name() {
         let ctx = ClientContext::new();
-        assert_eq!(ctx.library_name, "mssql-tds");
+        assert_eq!(ctx.library_name, "MS-TDS");
     }
 
     #[test]
@@ -1482,5 +1519,26 @@ mod tests {
         let err = result.err().unwrap().to_string();
         assert!(err.contains("ActiveDirectoryIntegrated"));
         assert!(err.contains("not supported"));
+    }
+
+    #[test]
+    fn test_user_agent_default() {
+        let ua = UserAgent::default();
+        assert_eq!(ua.driver_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(ua.library_name, "MS-TDS");
+    }
+
+    #[test]
+    fn test_client_context_user_agent_setters() {
+        let mut ctx = ClientContext::new();
+
+        ctx.user_agent.set_library_name("AnotherLib".to_string());
+        assert_eq!(ctx.user_agent.library_name, "AnotherLib");
+
+        ctx.user_agent.set_driver_version("7.8.9".to_string());
+        assert_eq!(ctx.user_agent.driver_version, "7.8.9");
+
+        ctx.user_agent.set_runtime("1.80.0".to_string());
+        assert_eq!(ctx.user_agent.runtime, "1.80.0");
     }
 }
