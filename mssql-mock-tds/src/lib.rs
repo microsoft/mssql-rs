@@ -26,7 +26,7 @@ pub mod tds_tls_wrapper;
 pub mod tls_helper;
 
 pub use query_response::{
-    ColumnDefinition, ColumnValue, QueryRegistry, QueryResponse, Row, SqlDataType,
+    ColumnDefinition, ColumnValue, InfoMessage, QueryRegistry, QueryResponse, Row, SqlDataType,
 };
 pub use server::{ConnectionInfo, ConnectionStore, MockTdsServer, RedirectionConfig};
 pub use tds_tls_wrapper::TdsTlsWrapper;
