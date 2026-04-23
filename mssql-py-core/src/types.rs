@@ -395,20 +395,11 @@ fn py_to_column_value_internal(
         }
 
         // Default to DATETIME format
-        // Calculate time in 1/300th seconds (SQL Server DATETIME precision ~3.33ms)
-        // Total milliseconds = hour*3600000 + minute*60000 + second*1000 + microsecond/1000
-        let total_ms = (hour as u64) * 3_600_000
-            + (minute as u64) * 60_000
-            + (second as u64) * 1_000
-            + (microsecond as u64) / 1_000;
-
-        // Convert to 1/300th seconds
-        // SQL Server rounds to nearest multiple of 3.33ms
-        let time_ticks = ((total_ms * 300) / 1000) as u32;
+        let (final_days, time_ticks) = datetime_to_ticks(days, hour, minute, second, microsecond)?;
 
         return Ok(ColumnValues::DateTime(
             mssql_tds::datatypes::column_values::SqlDateTime {
-                days,
+                days: final_days,
                 time: time_ticks,
             },
         ));
@@ -562,6 +553,69 @@ fn py_to_column_value_internal(
     )))
 }
 
+/// Ticks-per-day for SQL Server DATETIME (300 ticks/sec × 86400 sec/day).
+const DATETIME_TICKS_PER_DAY: u64 = 25_920_000;
+
+/// Convert time components to SQL Server DATETIME days + 1/300s ticks.
+///
+/// Rounds to the nearest tick (matching SqlClient's `SqlDateTime` behavior)
+/// and normalizes midnight carry into the next day.
+pub(crate) fn datetime_to_ticks(
+    days: i32,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    microsecond: u32,
+) -> TdsResult<(i32, u32)> {
+    let total_us = (hour as u64) * 3_600_000_000
+        + (minute as u64) * 60_000_000
+        + (second as u64) * 1_000_000
+        + (microsecond as u64);
+
+    // Round to nearest 1/300s tick (+ 500_000 implements round-half-up in integer math)
+    let mut time_ticks = ((total_us * 300 + 500_000) / 1_000_000) as u32;
+    let mut final_days = days;
+
+    // Normalize midnight carry (rounding can push 23:59:59.998334+ to next day)
+    if time_ticks as u64 >= DATETIME_TICKS_PER_DAY {
+        final_days += (time_ticks as u64 / DATETIME_TICKS_PER_DAY) as i32;
+        time_ticks = (time_ticks as u64 % DATETIME_TICKS_PER_DAY) as u32;
+    }
+
+    // DATETIME range: 1753-01-01 (days = -53690) to 9999-12-31 (days = 2958463)
+    if !(-53690..=2958463).contains(&final_days) {
+        return Err(Error::UsageError(format!(
+            "DATETIME value out of range after rounding (days={final_days}). \
+             Valid range: 1753-01-01 to 9999-12-31."
+        )));
+    }
+
+    Ok((final_days, time_ticks))
+}
+
+/// Convert SQL Server DATETIME 1/300s ticks to (hour, minute, second, microsecond).
+///
+/// Rounds to the nearest representable Python microsecond.
+/// Clamps out-of-range ticks to 23:59:59.999999 to prevent silent `as u8` truncation
+/// on malformed wire data.
+pub(crate) fn ticks_to_time_components(time_ticks: u32) -> (u8, u8, u8, u32) {
+    // Max valid ticks = 25_919_999 (23:59:59 + 299/300 s).
+    // Clamp to prevent u8 overflow from corrupt data.
+    let clamped = (time_ticks as u64).min(DATETIME_TICKS_PER_DAY - 1);
+
+    // Round to nearest microsecond (+ 150 implements round-half-up for /300)
+    let total_us = (clamped * 1_000_000 + 150) / 300;
+
+    let hour = (total_us / 3_600_000_000) as u8;
+    let remainder = total_us % 3_600_000_000;
+    let minute = (remainder / 60_000_000) as u8;
+    let remainder = remainder % 60_000_000;
+    let second = (remainder / 1_000_000) as u8;
+    let microsecond = (remainder % 1_000_000) as u32;
+
+    (hour, minute, second, microsecond)
+}
+
 /// Validate that the converted ColumnValues type matches the target SQL type.
 ///
 /// This function ensures type safety by verifying that the result of py_to_column_value()
@@ -659,4 +713,115 @@ fn validate_type_compatibility(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datetime_to_ticks_rounds_up() {
+        // 123ms = 0.123s → 0.123 * 300 = 36.9 ticks → rounds to 37
+        let (days, ticks) = datetime_to_ticks(0, 0, 0, 0, 123_000).unwrap();
+        assert_eq!(days, 0);
+        assert_eq!(ticks, 37); // 37/300 = 0.12333...s matches SQL .1233333
+    }
+
+    #[test]
+    fn datetime_to_ticks_rounds_down() {
+        // 1666µs → 1666 * 300 / 1_000_000 = 0.4998 → rounds to 0
+        let (_, ticks) = datetime_to_ticks(0, 0, 0, 0, 1_666).unwrap();
+        assert_eq!(ticks, 0);
+    }
+
+    #[test]
+    fn datetime_to_ticks_rounds_at_boundary() {
+        // 1667µs → 1667 * 300 + 500_000 = 1_000_100 → / 1_000_000 = 1
+        let (_, ticks) = datetime_to_ticks(0, 0, 0, 0, 1_667).unwrap();
+        assert_eq!(ticks, 1);
+    }
+
+    #[test]
+    fn datetime_to_ticks_half_tick_rounds_up() {
+        // 5000µs = exactly 1.5 ticks → rounds to 2
+        let (_, ticks) = datetime_to_ticks(0, 0, 0, 0, 5_000).unwrap();
+        assert_eq!(ticks, 2);
+    }
+
+    #[test]
+    fn datetime_to_ticks_full_second() {
+        // 0µs at second boundary → exactly 300 ticks per second
+        let (_, ticks) = datetime_to_ticks(0, 0, 0, 1, 0).unwrap();
+        assert_eq!(ticks, 300);
+    }
+
+    #[test]
+    fn datetime_to_ticks_midnight_carry() {
+        // 23:59:59.999999 → rounds past midnight, should increment day
+        let (days, ticks) = datetime_to_ticks(100, 23, 59, 59, 999_999).unwrap();
+        assert_eq!(days, 101);
+        assert_eq!(ticks, 0);
+    }
+
+    #[test]
+    fn datetime_to_ticks_max_date_overflow() {
+        // 9999-12-31 23:59:59.999999 → carry pushes to day 2958464, out of range
+        let result = datetime_to_ticks(2958463, 23, 59, 59, 999_999);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn datetime_to_ticks_no_carry_before_threshold() {
+        // 23:59:59.996666 → ticks = 25_919_999, no carry
+        let (days, ticks) = datetime_to_ticks(100, 23, 59, 59, 996_666).unwrap();
+        assert_eq!(days, 100);
+        assert_eq!(ticks, 25_919_999);
+    }
+
+    #[test]
+    fn ticks_to_time_preserves_sub_ms() {
+        // Tick 37 = 37/300 s = 0.12333...s = 123333.33µs → rounds to 123333µs
+        let (h, m, s, us) = ticks_to_time_components(37);
+        assert_eq!((h, m, s), (0, 0, 0));
+        assert_eq!(us, 123_333);
+    }
+
+    #[test]
+    fn ticks_to_time_zero() {
+        let (h, m, s, us) = ticks_to_time_components(0);
+        assert_eq!((h, m, s, us), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn ticks_to_time_full_day() {
+        // 25_919_999 ticks = 23:59:59.996666...
+        let (h, m, s, us) = ticks_to_time_components(25_919_999);
+        assert_eq!(h, 23);
+        assert_eq!(m, 59);
+        assert_eq!(s, 59);
+        // 25_919_999 * 1_000_000 + 150 / 300 = 86_399_996_667µs total
+        // remainder after 23:59:59 = 996_667µs
+        assert_eq!(us, 996_667);
+    }
+
+    #[test]
+    fn ticks_to_time_clamps_overflow() {
+        // Out-of-range ticks should clamp to 23:59:59 instead of wrapping u8
+        let (h, m, s, _) = ticks_to_time_components(u32::MAX);
+        assert_eq!(h, 23);
+        assert_eq!(m, 59);
+        assert_eq!(s, 59);
+    }
+
+    #[test]
+    fn roundtrip_encode_decode_preserves_value() {
+        // Encode 123000µs → tick 37 → decode → 123333µs
+        // Sub-ms precision is gained on decode because one tick spans ~3333µs
+        let (_, ticks) = datetime_to_ticks(0, 16, 33, 33, 123_000).unwrap();
+        assert_eq!(ticks, 17_883_937);
+
+        let (h, m, s, us) = ticks_to_time_components(ticks);
+        assert_eq!((h, m, s), (16, 33, 33));
+        assert_eq!(us, 123_333);
+    }
 }

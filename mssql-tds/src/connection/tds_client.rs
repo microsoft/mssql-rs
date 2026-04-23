@@ -42,6 +42,7 @@ use crate::{
     core::{CancelHandle, TdsResult},
     query::metadata::ColumnMetadata,
 };
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Active TDS connection to a SQL Server instance.
@@ -55,7 +56,7 @@ pub struct TdsClient {
     pub(crate) execution_context: ExecutionContext,
 
     // pub(crate) batch_result: Option<BatchResult<'static>>,
-    pub(crate) current_metadata: Option<ColMetadataToken>,
+    pub(crate) current_metadata: Option<Arc<ColMetadataToken>>,
     count_map: HashMap<CurrentCommand, u64>,
 
     return_values: Vec<ReturnValue>,
@@ -97,7 +98,7 @@ impl TdsClient {
     }
 
     pub(crate) fn get_current_metadata(&self) -> Option<&ColMetadataToken> {
-        self.current_metadata.as_ref()
+        self.current_metadata.as_deref()
     }
 
     /// Converts an `Option<u32>` timeout (where `Some(0)` means infinite) to `Option<Duration>`.
@@ -368,9 +369,11 @@ impl TdsClient {
 
         // Handle error during row streaming
         if let Some(original_error) = row_write_error {
-            // Send attention packet to cancel the bulk load operation gracefully
+            // Send attention packet to cancel the bulk load operation gracefully.
             // This tells SQL Server to abort the current operation and resets the
             // TDS protocol state so the connection can be reused.
+            // The stream is always in a clean state here because writes are never
+            // dropped mid-flight (issue #513).
             let attention_timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
             let _ = self.send_attention_with_timeout(attention_timeout).await;
             // Clear the open batch flag since we've cancelled the operation
@@ -893,9 +896,11 @@ impl TdsClient {
     }
 
     #[instrument(skip(self), level = "debug", name = "move_to_column_metadata")]
-    pub(crate) async fn move_to_column_metadata(&mut self) -> TdsResult<Option<ColMetadataToken>> {
+    pub(crate) async fn move_to_column_metadata(
+        &mut self,
+    ) -> TdsResult<Option<Arc<ColMetadataToken>>> {
         let parser_context = ParserContext::None(());
-        let mut col_metadata: Option<ColMetadataToken> = None;
+        let mut col_metadata: Option<Arc<ColMetadataToken>> = None;
         let mut loop_count = 0u32;
 
         loop {
@@ -922,7 +927,7 @@ impl TdsClient {
             match token {
                 Tokens::ColMetadata(md) => {
                     info!(?md);
-                    col_metadata = Some(md);
+                    col_metadata = Some(Arc::new(md));
                     self.current_result_set_has_been_read_till_end = false;
                     break;
                 }
@@ -1041,7 +1046,8 @@ impl TdsClient {
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
             ));
         }
-        let parser_context = ParserContext::ColumnMetadata(self.current_metadata.clone().unwrap());
+        let parser_context =
+            ParserContext::ColumnMetadata(Arc::clone(self.current_metadata.as_ref().unwrap()));
         loop {
             let start = Instant::now();
             let result = self

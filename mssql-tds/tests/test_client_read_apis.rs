@@ -673,4 +673,178 @@ mod client_based_iterators {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn decode_diverse_server_types() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "SELECT
+            CAST(1 AS TINYINT) AS ti,
+            CAST(2 AS SMALLINT) AS si,
+            CAST(100 AS BIGINT) AS bi,
+            CAST(3.14 AS REAL) AS r,
+            CAST(2.718 AS FLOAT) AS f,
+            CAST(1 AS BIT) AS b,
+            CAST('2024-01-15' AS DATE) AS d,
+            CAST('12:30:45.1234' AS TIME(4)) AS t4,
+            CAST('2024-01-15 12:30:45.12' AS DATETIME2(2)) AS dt2,
+            CAST('2024-01-15 12:30:45.1 +05:30' AS DATETIMEOFFSET(1)) AS dto1,
+            CAST('2024-01-15 12:30:00' AS SMALLDATETIME) AS sdt,
+            CAST(99.95 AS SMALLMONEY) AS sm,
+            CAST(12345.6789 AS MONEY) AS m,
+            CAST(0xDEAD AS VARBINARY(10)) AS vb,
+            CAST(NEWID() AS UNIQUEIDENTIFIER) AS uid"
+            .to_string();
+
+        client.execute(query, None, None).await?;
+        if let Some(resultset) = client.get_current_resultset() {
+            let row = resultset.next_row().await?.expect("expected a row");
+            assert_eq!(row.len(), 15);
+
+            use mssql_tds::datatypes::column_values::ColumnValues;
+            assert!(matches!(row[0], ColumnValues::TinyInt(1)));
+            assert!(matches!(row[1], ColumnValues::SmallInt(2)));
+            assert!(matches!(row[2], ColumnValues::BigInt(100)));
+            assert!(matches!(row[3], ColumnValues::Real(_)));
+            assert!(matches!(row[4], ColumnValues::Float(_)));
+            assert!(matches!(row[5], ColumnValues::Bit(true)));
+            assert!(matches!(row[6], ColumnValues::Date(_)));
+            assert!(matches!(row[7], ColumnValues::Time(_)));
+            assert!(matches!(row[8], ColumnValues::DateTime2(_)));
+            assert!(matches!(row[9], ColumnValues::DateTimeOffset(_)));
+            assert!(matches!(row[10], ColumnValues::SmallDateTime(_)));
+            assert!(matches!(row[11], ColumnValues::SmallMoney(_)));
+            assert!(matches!(row[12], ColumnValues::Money(_)));
+            assert!(matches!(row[13], ColumnValues::Bytes(_)));
+            assert!(matches!(row[14], ColumnValues::Uuid(_)));
+
+            if let ColumnValues::Time(t) = &row[7] {
+                assert_eq!(t.scale, 4);
+            }
+            if let ColumnValues::DateTime2(dt2) = &row[8] {
+                assert_eq!(dt2.time.scale, 2);
+            }
+            if let ColumnValues::DateTimeOffset(dto) = &row[9] {
+                assert_eq!(dto.datetime2.time.scale, 1);
+                assert_eq!(dto.offset, 330);
+            }
+        }
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decode_string_types_with_collation() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "SELECT
+            CAST('hello' AS VARCHAR(50)) AS vc,
+            CAST(N'world' AS NVARCHAR(50)) AS nvc,
+            CAST('fixed' AS CHAR(10)) AS c,
+            CAST(N'fixed' AS NCHAR(10)) AS nc"
+            .to_string();
+
+        client.execute(query, None, None).await?;
+        if let Some(resultset) = client.get_current_resultset() {
+            let meta = resultset.get_metadata().clone();
+            let row = resultset.next_row().await?.expect("expected a row");
+            assert_eq!(row.len(), 4);
+            for col in &row {
+                assert!(matches!(
+                    col,
+                    mssql_tds::datatypes::column_values::ColumnValues::String(_)
+                ));
+            }
+            for m in &meta {
+                if m.column_name == "vc" || m.column_name == "nvc" {
+                    assert!(
+                        m.get_collation().is_some(),
+                        "collation missing for {}",
+                        m.column_name
+                    );
+                }
+            }
+        }
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decode_decimal_precision_scale() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "SELECT
+            CAST(123.456 AS DECIMAL(10,3)) AS d1,
+            CAST(99999.99 AS NUMERIC(18,2)) AS n1,
+            CAST(0.000001 AS DECIMAL(38,6)) AS d2"
+            .to_string();
+
+        client.execute(query, None, None).await?;
+        if let Some(resultset) = client.get_current_resultset() {
+            let row = resultset.next_row().await?.expect("expected a row");
+            assert_eq!(row.len(), 3);
+            for col in &row {
+                use mssql_tds::datatypes::column_values::ColumnValues;
+                assert!(
+                    matches!(col, ColumnValues::Decimal(_) | ColumnValues::Numeric(_)),
+                    "Expected Decimal/Numeric, got {col:?}"
+                );
+            }
+        }
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decode_plp_types() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let large = "Z".repeat(20_000);
+        let query = format!(
+            "SELECT
+            CAST('{large}' AS NVARCHAR(MAX)) AS nvm,
+            CAST('{large}' AS VARCHAR(MAX)) AS vm,
+            CAST(0xDEADBEEF AS VARBINARY(MAX)) AS vbm,
+            CAST('<r>1</r>' AS XML) AS x"
+        );
+
+        client.execute(query, None, None).await?;
+        if let Some(resultset) = client.get_current_resultset() {
+            let row = resultset.next_row().await?.expect("expected a row");
+            assert_eq!(row.len(), 4);
+            use mssql_tds::datatypes::column_values::ColumnValues;
+            match &row[0] {
+                ColumnValues::String(s) => assert_eq!(s.to_utf8_string().len(), 20_000),
+                other => panic!("Expected String for nvarchar(max), got {other:?}"),
+            }
+            match &row[1] {
+                ColumnValues::String(s) => assert_eq!(s.to_utf8_string().len(), 20_000),
+                other => panic!("Expected String for varchar(max), got {other:?}"),
+            }
+            assert!(matches!(row[2], ColumnValues::Bytes(_)));
+            assert!(matches!(row[3], ColumnValues::Xml(_)));
+        }
+        client.close_query().await?;
+        Ok(())
+    }
 }

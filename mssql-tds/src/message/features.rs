@@ -3,5 +3,6 @@
 
 pub mod fedauth;
 pub mod jsonfeature;
+pub mod useragent;
 pub mod utf8;
 pub mod vectorfeature;

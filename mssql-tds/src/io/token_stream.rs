@@ -17,6 +17,7 @@ use crate::token::tokens::{ColMetadataToken, TokenType, Tokens};
 use async_trait::async_trait;
 use core::convert::From;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
 
@@ -101,7 +102,7 @@ where
 #[derive(Debug)]
 #[cfg(not(fuzzing))]
 pub(crate) enum ParserContext {
-    ColumnMetadata(ColMetadataToken),
+    ColumnMetadata(Arc<ColMetadataToken>),
     None(()),
 }
 
@@ -109,7 +110,7 @@ pub(crate) enum ParserContext {
 #[cfg(fuzzing)]
 #[allow(private_interfaces)]
 pub enum ParserContext {
-    ColumnMetadata(ColMetadataToken),
+    ColumnMetadata(Arc<ColMetadataToken>),
     None(()),
 }
 

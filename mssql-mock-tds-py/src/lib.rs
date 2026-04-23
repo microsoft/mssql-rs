@@ -65,15 +65,19 @@ pub struct PyConnectionInfo {
     /// Whether the client authenticated successfully
     #[pyo3(get)]
     pub authenticated: bool,
+    /// User Agent sent by the client
+    #[pyo3(get)]
+    pub user_agent: Option<String>,
 }
 
 #[pymethods]
 impl PyConnectionInfo {
     fn __repr__(&self) -> String {
         format!(
-            "ConnectionInfo(addr='{}', authenticated={}, has_token={})",
+            "ConnectionInfo(addr='{}', authenticated={}, user_agent='{:?}', has_token={})",
             self.addr,
             self.authenticated,
+            self.user_agent,
             self.access_token.is_some()
         )
     }
@@ -239,6 +243,7 @@ impl PyMockTdsServer {
                     addr: info.addr.to_string(),
                     access_token: info.received_token_as_string(),
                     authenticated: info.authenticated,
+                    user_agent: info.user_agent.clone(),
                 })
                 .collect()
         }))

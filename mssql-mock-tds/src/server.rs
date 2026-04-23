@@ -53,6 +53,8 @@ pub struct ConnectionProcessor {
     is_authenticated: bool,
     /// Access token received during FedAuth authentication (if any)
     received_token: Option<Vec<u8>>,
+    /// User Agent received during authentication (if any)
+    pub user_agent: Option<String>,
     /// Reference to the shared query registry
     query_registry: Arc<Mutex<QueryRegistry>>,
     /// Packet buffer for this connection
@@ -68,6 +70,7 @@ impl ConnectionProcessor {
             addr,
             is_authenticated: false,
             received_token: None,
+            user_agent: None,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
             redirection: None,
@@ -84,6 +87,7 @@ impl ConnectionProcessor {
             addr,
             is_authenticated: false,
             received_token: None,
+            user_agent: None,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
             redirection,
@@ -166,6 +170,7 @@ impl ConnectionProcessor {
                 // Parse Login7 packet body (skip header) for authentication info
                 let packet_body = &packet_data[PACKET_HEADER_SIZE..];
                 let auth_info = parse_login7_auth(packet_body);
+                self.user_agent = auth_info.user_agent.clone();
 
                 // Log the server name sent by client (important for verifying redirection behavior)
                 if let Some(ref server_name) = auth_info.server_name {
@@ -329,6 +334,8 @@ pub struct ConnectionInfo {
     pub received_token: Option<Vec<u8>>,
     /// Whether the client authenticated successfully
     pub authenticated: bool,
+    /// User Agent received during authentication (if any)
+    pub user_agent: Option<String>,
 }
 
 impl ConnectionInfo {
@@ -346,6 +353,10 @@ impl ConnectionInfo {
             }
         })
     }
+    /// Get the user agent received during authentication
+    pub fn received_user_agent(&self) -> Option<String> {
+        self.user_agent.clone()
+    }
 }
 
 impl ConnectionStore {
@@ -361,6 +372,7 @@ impl ConnectionStore {
             addr: processor.addr(),
             received_token: processor.received_token().map(|t| t.to_vec()),
             authenticated: processor.is_authenticated(),
+            user_agent: processor.user_agent.clone(),
         };
         self.connections.insert(processor.addr(), info);
     }
@@ -470,9 +482,11 @@ impl MockTdsServer {
         let local_addr = listener.local_addr()?;
 
         let tls_acceptor = identity.map(|id| {
-            let acceptor = native_tls::TlsAcceptor::builder(id)
-                .build()
-                .expect("Failed to build TLS acceptor");
+            let mut builder = native_tls::TlsAcceptor::builder(id);
+            if strict_mode {
+                builder.accept_alpn(&[mssql_tds::core::TDS_8_ALPN_PROTOCOL]);
+            }
+            let acceptor = builder.build().expect("Failed to build TLS acceptor");
             TlsAcceptor::from(acceptor)
         });
 
@@ -1005,6 +1019,8 @@ async fn handle_connection(
 
                 PacketType::Login7 => {
                     debug!("Handling Login7");
+                    let packet_body = &packet_data[PACKET_HEADER_SIZE..];
+                    let _auth_info = parse_login7_auth(packet_body);
                     is_authenticated = true;
 
                     // Build response with LoginAck + EnvChange + Done

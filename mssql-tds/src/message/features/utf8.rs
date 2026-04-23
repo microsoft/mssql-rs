@@ -58,3 +58,50 @@ impl Feature for Utf8Feature {
         Box::new(*self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf8_feature_defaults() {
+        let f = Utf8Feature::default();
+        assert!(!f.is_acknowledged());
+        assert!(f.is_requested());
+        assert_eq!(f.data_length(), (size_of::<u8>() + size_of::<i32>()) as i32);
+    }
+
+    #[test]
+    fn utf8_feature_deserialize_valid() {
+        let mut f = Utf8Feature::default();
+        assert!(f.deserialize(&[0x01]).is_ok());
+    }
+
+    #[test]
+    fn utf8_feature_deserialize_invalid_length() {
+        let mut f = Utf8Feature::default();
+        assert!(f.deserialize(&[]).is_err());
+        assert!(f.deserialize(&[0x01, 0x02]).is_err());
+    }
+
+    #[test]
+    fn utf8_feature_acknowledged() {
+        let mut f = Utf8Feature::default();
+        assert!(!f.is_acknowledged());
+        f.set_acknowledged(true);
+        assert!(f.is_acknowledged());
+    }
+
+    #[test]
+    fn utf8_feature_identifier() {
+        let f = Utf8Feature::default();
+        assert_eq!(f.feature_identifier(), FeatureExtension::Utf8Support);
+    }
+
+    #[test]
+    fn utf8_feature_clone_box() {
+        let f = Utf8Feature::default();
+        let cloned = f.clone_box();
+        assert_eq!(cloned.feature_identifier(), FeatureExtension::Utf8Support);
+    }
+}

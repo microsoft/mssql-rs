@@ -58,3 +58,29 @@ impl Request for SqlBatch {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_has_empty_command() {
+        let batch = SqlBatch::default();
+        assert!(batch.sql_command.is_empty());
+        assert_eq!(batch.headers.len(), 1);
+    }
+
+    #[test]
+    fn test_new_with_non_transaction_context() {
+        let ctx = ExecutionContext::new();
+        let batch = SqlBatch::new("SELECT 1".to_string(), &ctx);
+        assert_eq!(batch.sql_command, "SELECT 1");
+        assert_eq!(batch.headers.len(), 1);
+    }
+
+    #[test]
+    fn test_packet_type() {
+        let batch = SqlBatch::default();
+        assert_eq!(batch.packet_type() as u8, PacketType::SqlBatch as u8);
+    }
+}

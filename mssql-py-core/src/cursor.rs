@@ -592,17 +592,8 @@ impl PyCoreCursor {
                             date_obj.getattr("day").and_then(|v| v.extract::<u8>()),
                         ) {
                             // Convert time ticks (1/300th seconds) to time components
-                            // dt.time is in units of 1/300 second
-                            let total_ms = ((dt.time as u64) * 1000) / 300;
-
-                            let hour = (total_ms / 3_600_000) as u8;
-                            let remainder = total_ms % 3_600_000;
-
-                            let minute = (remainder / 60_000) as u8;
-                            let remainder = remainder % 60_000;
-
-                            let second = (remainder / 1_000) as u8;
-                            let microsecond = ((remainder % 1_000) * 1_000) as u32;
+                            let (hour, minute, second, microsecond) =
+                                crate::types::ticks_to_time_components(dt.time);
 
                             if let Ok(datetime_obj) = datetime_class.call1((
                                 year,

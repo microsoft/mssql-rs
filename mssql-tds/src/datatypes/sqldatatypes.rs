@@ -1155,4 +1155,176 @@ mod tests {
             size_of::<u16>()
         );
     }
+
+    #[test]
+    fn vector_layout_format_try_from_valid() {
+        assert_eq!(
+            VectorLayoutFormat::try_from(0xA9).unwrap(),
+            VectorLayoutFormat::V1
+        );
+    }
+
+    #[test]
+    fn vector_layout_format_try_from_invalid() {
+        assert!(VectorLayoutFormat::try_from(0x00).is_err());
+        assert!(VectorLayoutFormat::try_from(0xFF).is_err());
+    }
+
+    #[test]
+    fn vector_layout_version_try_from_valid() {
+        assert_eq!(
+            VectorLayoutVersion::try_from(0x01).unwrap(),
+            VectorLayoutVersion::V1
+        );
+    }
+
+    #[test]
+    fn vector_layout_version_try_from_invalid() {
+        assert!(VectorLayoutVersion::try_from(0x00).is_err());
+        assert!(VectorLayoutVersion::try_from(0x02).is_err());
+    }
+
+    #[test]
+    fn vector_base_type_try_from_valid() {
+        let bt = VectorBaseType::try_from(0x00).unwrap();
+        assert_eq!(bt, VectorBaseType::Float32);
+        assert_eq!(bt.element_size_bytes(), 4);
+    }
+
+    #[test]
+    fn vector_base_type_try_from_invalid() {
+        assert!(VectorBaseType::try_from(0x01).is_err());
+        assert!(VectorBaseType::try_from(0xFF).is_err());
+    }
+
+    #[test]
+    fn tds_data_type_try_from_all_valid() {
+        let expected: Vec<(u8, TdsDataType)> = vec![
+            (0x1F, TdsDataType::Void),
+            (0x22, TdsDataType::Image),
+            (0x23, TdsDataType::Text),
+            (0x24, TdsDataType::Guid),
+            (0x25, TdsDataType::VarBinary),
+            (0x26, TdsDataType::IntN),
+            (0x27, TdsDataType::VarChar),
+            (0x28, TdsDataType::DateN),
+            (0x29, TdsDataType::TimeN),
+            (0x2A, TdsDataType::DateTime2N),
+            (0x2B, TdsDataType::DateTimeOffsetN),
+            (0x2D, TdsDataType::Binary),
+            (0x2F, TdsDataType::Char),
+            (0x30, TdsDataType::Int1),
+            (0x32, TdsDataType::Bit),
+            (0x34, TdsDataType::Int2),
+            (0x37, TdsDataType::Decimal),
+            (0x38, TdsDataType::Int4),
+            (0x3A, TdsDataType::DateTim4),
+            (0x3B, TdsDataType::Flt4),
+            (0x3C, TdsDataType::Money),
+            (0x3D, TdsDataType::DateTime),
+            (0x3E, TdsDataType::Flt8),
+            (0x3F, TdsDataType::Numeric),
+            (0x62, TdsDataType::SsVariant),
+            (0x63, TdsDataType::NText),
+            (0x68, TdsDataType::BitN),
+            (0x6A, TdsDataType::DecimalN),
+            (0x6C, TdsDataType::NumericN),
+            (0x6D, TdsDataType::FltN),
+            (0x6E, TdsDataType::MoneyN),
+            (0x6F, TdsDataType::DateTimeN),
+            (0x7A, TdsDataType::Money4),
+            (0x7F, TdsDataType::Int8),
+            (0xA5, TdsDataType::BigVarBinary),
+            (0xA7, TdsDataType::BigVarChar),
+            (0xAD, TdsDataType::BigBinary),
+            (0xAF, TdsDataType::BigChar),
+            (0xE7, TdsDataType::NVarChar),
+            (0xEF, TdsDataType::NChar),
+            (0xF0, TdsDataType::Udt),
+            (0xF1, TdsDataType::Xml),
+            (0xF4, TdsDataType::Json),
+            (0xF5, TdsDataType::Vector),
+        ];
+        for (byte, expected_type) in expected {
+            assert_eq!(
+                TdsDataType::try_from(byte).unwrap(),
+                expected_type,
+                "byte 0x{byte:02X}"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_length_types_get_len_byte_count_all_categories() {
+        // USHORTLEN_TYPE = 2 bytes
+        assert_eq!(VariableLengthTypes::BigBinary.get_len_byte_count(), 2);
+        assert_eq!(VariableLengthTypes::BigChar.get_len_byte_count(), 2);
+
+        // BYTELEN_TYPE = 1 byte
+        assert_eq!(VariableLengthTypes::BitN.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::DecimalN.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::NumericN.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::FltN.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::MoneyN.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::DateTimeN.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::DateTime2N.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::DateTimeOffsetN.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::Char.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::VarChar.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::Binary.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::VarBinary.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::Decimal.get_len_byte_count(), 1);
+        assert_eq!(VariableLengthTypes::Numeric.get_len_byte_count(), 1);
+
+        // LONGLEN_TYPE = 4 bytes
+        assert_eq!(VariableLengthTypes::Image.get_len_byte_count(), 4);
+        assert_eq!(VariableLengthTypes::NText.get_len_byte_count(), 4);
+        assert_eq!(VariableLengthTypes::SsVariant.get_len_byte_count(), 4);
+        assert_eq!(VariableLengthTypes::Text.get_len_byte_count(), 4);
+    }
+
+    #[test]
+    fn variable_length_types_try_from_all() {
+        let cases: Vec<(TdsDataType, VariableLengthTypes)> = vec![
+            (TdsDataType::Guid, VariableLengthTypes::Guid),
+            (TdsDataType::IntN, VariableLengthTypes::IntN),
+            (TdsDataType::BitN, VariableLengthTypes::BitN),
+            (TdsDataType::Decimal, VariableLengthTypes::Decimal),
+            (TdsDataType::Numeric, VariableLengthTypes::Numeric),
+            (TdsDataType::DecimalN, VariableLengthTypes::DecimalN),
+            (TdsDataType::NumericN, VariableLengthTypes::NumericN),
+            (TdsDataType::FltN, VariableLengthTypes::FltN),
+            (TdsDataType::MoneyN, VariableLengthTypes::MoneyN),
+            (TdsDataType::DateTimeN, VariableLengthTypes::DateTimeN),
+            (TdsDataType::DateN, VariableLengthTypes::DateN),
+            (TdsDataType::TimeN, VariableLengthTypes::TimeN),
+            (TdsDataType::DateTime2N, VariableLengthTypes::DateTime2N),
+            (
+                TdsDataType::DateTimeOffsetN,
+                VariableLengthTypes::DateTimeOffsetN,
+            ),
+            (TdsDataType::Char, VariableLengthTypes::Char),
+            (TdsDataType::VarChar, VariableLengthTypes::VarChar),
+            (TdsDataType::Binary, VariableLengthTypes::Binary),
+            (TdsDataType::VarBinary, VariableLengthTypes::VarBinary),
+            (TdsDataType::BigVarBinary, VariableLengthTypes::BigVarBinary),
+            (TdsDataType::BigVarChar, VariableLengthTypes::BigVarChar),
+            (TdsDataType::BigBinary, VariableLengthTypes::BigBinary),
+            (TdsDataType::BigChar, VariableLengthTypes::BigChar),
+            (TdsDataType::NVarChar, VariableLengthTypes::NVarChar),
+            (TdsDataType::NChar, VariableLengthTypes::NChar),
+            (TdsDataType::Text, VariableLengthTypes::Text),
+            (TdsDataType::Image, VariableLengthTypes::Image),
+            (TdsDataType::NText, VariableLengthTypes::NText),
+            (TdsDataType::SsVariant, VariableLengthTypes::SsVariant),
+            (TdsDataType::Vector, VariableLengthTypes::Vector),
+        ];
+        for (tds_type, expected) in cases {
+            assert_eq!(
+                VariableLengthTypes::try_from(tds_type).unwrap(),
+                expected,
+                "{tds_type:?}"
+            );
+        }
+    }
 }

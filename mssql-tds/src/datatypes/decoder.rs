@@ -3205,5 +3205,419 @@ mod test {
             let val = assert_decode_equivalence(buf, &md).await;
             assert!(matches!(val, ColumnValues::Decimal(_)));
         }
+
+        // ── helpers for new tests ──────────────────────────────────────
+
+        fn precision_scale_metadata(
+            data_type: TdsDataType,
+            length: usize,
+            precision: u8,
+            scale: u8,
+        ) -> ColumnMetadata {
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type,
+                type_info: TypeInfo {
+                    tds_type: data_type,
+                    length,
+                    type_info_variant: TypeInfoVariant::VarLenPrecisionScale(
+                        VariableLengthTypes::try_from(data_type)
+                            .unwrap_or(VariableLengthTypes::DecimalN),
+                        length,
+                        precision,
+                        scale,
+                    ),
+                },
+                column_name: String::new(),
+                multi_part_name: None,
+            }
+        }
+
+        fn scale_metadata(data_type: TdsDataType, length: usize, scale: u8) -> ColumnMetadata {
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type,
+                type_info: TypeInfo {
+                    tds_type: data_type,
+                    length,
+                    type_info_variant: TypeInfoVariant::VarLenScale(
+                        VariableLengthTypes::try_from(data_type)
+                            .unwrap_or(VariableLengthTypes::TimeN),
+                        scale,
+                    ),
+                },
+                column_name: String::new(),
+                multi_part_name: None,
+            }
+        }
+
+        fn ssvariant_metadata() -> ColumnMetadata {
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::SsVariant,
+                type_info: TypeInfo {
+                    tds_type: TdsDataType::SsVariant,
+                    length: 8009,
+                    type_info_variant: TypeInfoVariant::VarLen(
+                        VariableLengthTypes::SsVariant,
+                        8009,
+                    ),
+                },
+                column_name: String::new(),
+                multi_part_name: None,
+            }
+        }
+
+        async fn assert_decode_err(bytes: Vec<u8>, metadata: &ColumnMetadata) {
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(bytes);
+            assert!(decoder.decode(&mut reader, metadata).await.is_err());
+        }
+
+        // ── SQL_VARIANT tests ──────────────────────────────────────────
+
+        #[tokio::test]
+        async fn ssvariant_length_underflow() {
+            let md = ssvariant_metadata();
+            let mut buf = Vec::new();
+            // length=1, so checked_sub(2) on remaining after base_type+prop fails
+            LittleEndian::write_u32(&mut [0u8; 4], 1);
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.push(TdsDataType::Int4 as u8); // base_type
+            buf.push(0); // prop_bytes
+            assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn ssvariant_unexpected_prop_bytes() {
+            let md = ssvariant_metadata();
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&10u32.to_le_bytes()); // length=10
+            buf.push(TdsDataType::Int4 as u8); // base_type
+            buf.push(5); // prop_bytes=5 (invalid)
+            assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn ssvariant_zero_prop_unexpected_type() {
+            let md = ssvariant_metadata();
+            let mut buf = Vec::new();
+            // IntN is variable-length, not fixed-length, so FixedLengthTypes::try_from fails.
+            // Then it falls through to the match on Guid/DateN, and IntN doesn't match → error.
+            buf.extend_from_slice(&6u32.to_le_bytes()); // length=6 (2 header + 0 props + 4 data)
+            buf.push(TdsDataType::IntN as u8); // base_type
+            buf.push(0); // prop_bytes=0
+            // provide 4 bytes of data that will never be read
+            buf.extend_from_slice(&[0; 4]);
+            assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn ssvariant_one_prop_unexpected_type() {
+            let md = ssvariant_metadata();
+            let mut buf = Vec::new();
+            // Guid has 0 prop bytes, not 1 → error in decode_one_byte_variant
+            buf.extend_from_slice(&20u32.to_le_bytes()); // length
+            buf.push(TdsDataType::Guid as u8); // base_type
+            buf.push(1); // prop_bytes=1
+            buf.push(0); // scale byte (prop data)
+            buf.extend_from_slice(&[0; 16]); // data
+            assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn ssvariant_two_prop_unexpected_type() {
+            let md = ssvariant_metadata();
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&6u32.to_le_bytes()); // length
+            buf.push(TdsDataType::IntN as u8); // not binary/decimal → error
+            buf.push(2); // prop_bytes=2
+            buf.extend_from_slice(&[0; 4]); // prop data + value data
+            assert_decode_err(buf, &md).await;
+        }
+
+        // ── Decimal error paths ────────────────────────────────────────
+
+        #[tokio::test]
+        async fn decimal_wrong_type_info_variant() {
+            // Use VarLen instead of VarLenPrecisionScale
+            let md = varlen_metadata(TdsDataType::DecimalN, 9);
+            // length byte = 5, sign = 1, one i32 part
+            let mut buf = vec![5u8, 1u8];
+            buf.extend_from_slice(&42i32.to_le_bytes());
+            assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn decimal_large_valid() {
+            let md = precision_scale_metadata(TdsDataType::DecimalN, 17, 38, 0);
+            // length=17 → (17-1)>>2 = 4 int parts, which is well under the 64 limit
+            let mut buf = vec![17u8, 1u8]; // length=17, sign=positive
+            for _ in 0..4 {
+                buf.extend_from_slice(&1i32.to_le_bytes());
+            }
+            let val = assert_decode_equivalence(buf, &md).await;
+            assert!(matches!(val, ColumnValues::Decimal(_)));
+        }
+
+        // ── Time scale branches ────────────────────────────────────────
+
+        #[tokio::test]
+        async fn time_scale_0() {
+            let md = scale_metadata(TdsDataType::TimeN, 3, 0);
+            // length=3 → read_uint24 → value=1 (1 second in scale-0 units)
+            // time_nanoseconds = 1 * 10_000_000
+            let mut buf = vec![3u8]; // length byte
+            buf.extend_from_slice(&[1, 0, 0]); // uint24 = 1
+            let val = assert_decode_equivalence(buf, &md).await;
+            match val {
+                ColumnValues::Time(t) => {
+                    assert_eq!(t.time_nanoseconds, 10_000_000);
+                    assert_eq!(t.scale, 0);
+                }
+                _ => panic!("expected Time"),
+            }
+        }
+
+        #[tokio::test]
+        async fn time_scale_1() {
+            let md = scale_metadata(TdsDataType::TimeN, 3, 1);
+            let mut buf = vec![3u8];
+            buf.extend_from_slice(&[1, 0, 0]);
+            let val = assert_decode_equivalence(buf, &md).await;
+            match val {
+                ColumnValues::Time(t) => {
+                    assert_eq!(t.time_nanoseconds, 1_000_000);
+                    assert_eq!(t.scale, 1);
+                }
+                _ => panic!("expected Time"),
+            }
+        }
+
+        #[tokio::test]
+        async fn time_scale_2() {
+            let md = scale_metadata(TdsDataType::TimeN, 3, 2);
+            let mut buf = vec![3u8];
+            buf.extend_from_slice(&[1, 0, 0]);
+            let val = assert_decode_equivalence(buf, &md).await;
+            match val {
+                ColumnValues::Time(t) => {
+                    assert_eq!(t.time_nanoseconds, 100_000);
+                    assert_eq!(t.scale, 2);
+                }
+                _ => panic!("expected Time"),
+            }
+        }
+
+        #[tokio::test]
+        async fn time_scale_4() {
+            let md = scale_metadata(TdsDataType::TimeN, 4, 4);
+            let mut buf = vec![4u8];
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            let val = assert_decode_equivalence(buf, &md).await;
+            match val {
+                ColumnValues::Time(t) => {
+                    assert_eq!(t.time_nanoseconds, 1_000);
+                    assert_eq!(t.scale, 4);
+                }
+                _ => panic!("expected Time"),
+            }
+        }
+
+        #[tokio::test]
+        async fn time_scale_5() {
+            let md = scale_metadata(TdsDataType::TimeN, 5, 5);
+            let mut buf = vec![5u8];
+            buf.extend_from_slice(&[1, 0, 0, 0, 0]); // uint40 = 1
+            let val = assert_decode_equivalence(buf, &md).await;
+            match val {
+                ColumnValues::Time(t) => {
+                    assert_eq!(t.time_nanoseconds, 100);
+                    assert_eq!(t.scale, 5);
+                }
+                _ => panic!("expected Time"),
+            }
+        }
+
+        #[tokio::test]
+        async fn time_scale_6() {
+            let md = scale_metadata(TdsDataType::TimeN, 5, 6);
+            let mut buf = vec![5u8];
+            buf.extend_from_slice(&[1, 0, 0, 0, 0]);
+            let val = assert_decode_equivalence(buf, &md).await;
+            match val {
+                ColumnValues::Time(t) => {
+                    assert_eq!(t.time_nanoseconds, 10);
+                    assert_eq!(t.scale, 6);
+                }
+                _ => panic!("expected Time"),
+            }
+        }
+
+        // ── DateTime2 / DateTimeOffset error paths ─────────────────────
+
+        #[tokio::test]
+        async fn datetime2_byte_len_underflow() {
+            let md = scale_metadata(TdsDataType::DateTime2N, 2, 7);
+            // length=2 → byte_len < 3 → checked_sub error
+            let buf = vec![2u8, 0, 0];
+            assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn datetimeoffset_byte_len_underflow() {
+            let md = scale_metadata(TdsDataType::DateTimeOffsetN, 1, 7);
+            // length=1 → byte_len < 2 → checked_sub error in read_datetime_offset
+            let buf = vec![1u8, 0];
+            assert_decode_err(buf, &md).await;
+        }
+
+        // ── IntN unusual lengths ───────────────────────────────────────
+
+        #[tokio::test]
+        async fn intn_tinyint() {
+            let md = varlen_metadata(TdsDataType::IntN, 1);
+            let val = assert_decode_equivalence(vec![1u8, 42u8], &md).await;
+            assert_eq!(val, ColumnValues::TinyInt(42));
+        }
+
+        #[tokio::test]
+        async fn intn_smallint() {
+            let md = varlen_metadata(TdsDataType::IntN, 2);
+            let mut buf = vec![2u8];
+            buf.extend_from_slice(&(-100i16).to_le_bytes());
+            let val = assert_decode_equivalence(buf, &md).await;
+            assert_eq!(val, ColumnValues::SmallInt(-100));
+        }
+
+        #[tokio::test]
+        async fn intn_invalid_length() {
+            let md = varlen_metadata(TdsDataType::IntN, 4);
+            let buf = vec![3u8, 0, 0, 0]; // byte_len=3 → invalid
+            assert_decode_err(buf, &md).await;
+        }
+
+        // ── GUID error paths ──────────────────────────────────────────
+
+        #[tokio::test]
+        async fn guid_invalid_length() {
+            let md = varlen_metadata(TdsDataType::Guid, 16);
+            // length=5 (not 0 or 16) → error
+            let mut buf = vec![5u8];
+            buf.extend_from_slice(&[0; 5]);
+            assert_decode_err(buf, &md).await;
+        }
+
+        // ── FltN paths ────────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn fltn_f64() {
+            let md = varlen_metadata(TdsDataType::FltN, 8);
+            let mut buf = vec![8u8];
+            buf.extend_from_slice(&99.5f64.to_le_bytes());
+            let val = assert_decode_equivalence(buf, &md).await;
+            assert_eq!(val, ColumnValues::Float(99.5));
+        }
+
+        // ── MoneyN paths ──────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn moneyn_smallmoney() {
+            let md = varlen_metadata(TdsDataType::MoneyN, 8);
+            let mut buf = vec![4u8];
+            buf.extend_from_slice(&10000i32.to_le_bytes());
+            let val = assert_decode_equivalence(buf, &md).await;
+            assert!(matches!(val, ColumnValues::SmallMoney(_)));
+        }
+
+        #[tokio::test]
+        async fn moneyn_money() {
+            let md = varlen_metadata(TdsDataType::MoneyN, 8);
+            let mut buf = vec![8u8];
+            buf.extend_from_slice(&0i32.to_le_bytes()); // msb
+            buf.extend_from_slice(&10000i32.to_le_bytes()); // lsb
+            let val = assert_decode_equivalence(buf, &md).await;
+            assert!(matches!(val, ColumnValues::Money(_)));
+        }
+
+        #[tokio::test]
+        async fn moneyn_invalid_length() {
+            let md = varlen_metadata(TdsDataType::MoneyN, 8);
+            let buf = vec![3u8, 0, 0, 0];
+            assert_decode_err(buf, &md).await;
+        }
+
+        // ── DateTimeN paths ───────────────────────────────────────────
+
+        #[tokio::test]
+        async fn datetimen_smalldatetime() {
+            let md = varlen_metadata(TdsDataType::DateTimeN, 8);
+            let mut buf = vec![4u8];
+            buf.extend_from_slice(&1000u16.to_le_bytes()); // days
+            buf.extend_from_slice(&60u16.to_le_bytes()); // minutes
+            let val = assert_decode_equivalence(buf, &md).await;
+            assert!(matches!(
+                val,
+                ColumnValues::SmallDateTime(SqlSmallDateTime {
+                    days: 1000,
+                    time: 60
+                })
+            ));
+        }
+
+        #[tokio::test]
+        async fn datetimen_datetime() {
+            let md = varlen_metadata(TdsDataType::DateTimeN, 8);
+            let mut buf = vec![8u8];
+            buf.extend_from_slice(&43000i32.to_le_bytes()); // days
+            buf.extend_from_slice(&100u32.to_le_bytes()); // ticks
+            let val = assert_decode_equivalence(buf, &md).await;
+            assert!(matches!(
+                val,
+                ColumnValues::DateTime(SqlDateTime {
+                    days: 43000,
+                    time: 100
+                })
+            ));
+        }
+
+        // ── BigBinary empty ────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn bigbinary_empty() {
+            let md = varlen_metadata(TdsDataType::BigBinary, 100);
+            let val = assert_decode_equivalence(vec![0x00, 0x00], &md).await;
+            assert_eq!(val, ColumnValues::Bytes(vec![]));
+        }
+
+        // ── DateTime2N valid decode ───────────────────────────────────
+
+        #[tokio::test]
+        async fn datetime2n_value() {
+            let md = scale_metadata(TdsDataType::DateTime2N, 8, 7);
+            // length=8 → time_byte_len=5, date=3 bytes
+            let mut buf = vec![8u8];
+            buf.extend_from_slice(&[0, 0, 0, 0, 0]); // time (uint40 = 0)
+            buf.extend_from_slice(&[1, 0, 0]); // date (uint24 = 1)
+            let val = assert_decode_equivalence(buf, &md).await;
+            assert!(matches!(val, ColumnValues::DateTime2(_)));
+        }
+
+        // ── DateTimeOffsetN valid decode ──────────────────────────────
+
+        #[tokio::test]
+        async fn datetimeoffsetn_value() {
+            let md = scale_metadata(TdsDataType::DateTimeOffsetN, 10, 7);
+            // length=10 → datetime2_byte_len=8, offset=2 bytes
+            let mut buf = vec![10u8];
+            buf.extend_from_slice(&[0, 0, 0, 0, 0]); // time (uint40)
+            buf.extend_from_slice(&[1, 0, 0]); // date (uint24)
+            buf.extend_from_slice(&60i16.to_le_bytes()); // offset minutes
+            let val = assert_decode_equivalence(buf, &md).await;
+            assert!(matches!(val, ColumnValues::DateTimeOffset(_)));
+        }
     }
 }

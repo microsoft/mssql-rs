@@ -319,7 +319,7 @@ mod no_protocol_resolution {
     }
 
     // =========================================================================
-    // Error Cases - SSRP Not Implemented
+    // Error Cases - SSRP (SQL Browser Unreachable)
     // =========================================================================
 
     #[tokio::test]
@@ -330,19 +330,24 @@ mod no_protocol_resolution {
         // Use DB_HOST from environment (works in CI with sql1)
         let host = env::var("DB_HOST").unwrap_or_else(|_| "localhost".to_string());
 
-        // Test that instance name without port returns proper error
-        // This requires SSRP (SQL Server Browser) which is not yet implemented
+        // Instance name without port triggers SSRP. With no SQL Browser running
+        // on the default port, the connection should fail with a descriptive error.
         let datasource = format!("{}\\SQLEXPRESS", host);
         let result = create_client_from_datasource(&datasource).await;
 
-        // Should fail with SSRP not implemented error
-        assert!(result.is_err(), "Should fail without SSRP implementation");
+        // Should fail — either SQL Browser timeout or connection refused
+        assert!(
+            result.is_err(),
+            "Should fail when SQL Browser is unreachable"
+        );
 
         let err = result.unwrap_err();
         let err_msg = err.to_string().to_lowercase();
         assert!(
-            err_msg.contains("ssrp") || err_msg.contains("browser") || err_msg.contains("instance"),
-            "Error should mention SSRP/Browser/Instance requirement: {}",
+            err_msg.contains("browser")
+                || err_msg.contains("instance")
+                || err_msg.contains("locating"),
+            "Error should mention Browser/Instance/Locating: {}",
             err
         );
 
@@ -359,10 +364,10 @@ mod no_protocol_resolution {
         let datasource = r"tcp:localhost\SQLEXPRESS";
         let result = create_client_from_datasource(datasource).await;
 
-        // Should fail because instance name requires SSRP
+        // Should fail because no SQL Browser is running
         assert!(
             result.is_err(),
-            "Should fail for named instance without SSRP"
+            "Should fail for named instance without SQL Browser"
         );
 
         Ok(())

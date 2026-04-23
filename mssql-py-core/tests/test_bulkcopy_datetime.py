@@ -4,6 +4,7 @@
 """Bulk copy tests for DATETIME data type."""
 import pytest
 import datetime
+import struct
 import mssql_py_core
 
 
@@ -645,3 +646,148 @@ def test_cursor_bulkcopy_datetime_mixed_data_types(client_context):
     # Cleanup
     cursor.execute(f"DROP TABLE {table_name}")
     conn.close()
+
+
+@pytest.mark.integration
+def test_cursor_bulkcopy_datetime_tick_rounding(client_context):
+    """Verify bulk copy rounds datetime to the nearest 1/300s tick.
+
+    Regression test for https://github.com/microsoft/mssql-python/issues/516:
+    bulk copy was truncating instead of rounding, producing values one tick
+    lower than expected.
+    """
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "#BulkCopyDateTimeTickRounding"
+    cursor.execute(f"CREATE TABLE {table_name} (id INT, dt DATETIME)")
+
+    # Test values chosen at tick boundaries:
+    #   tick = round(microsecond * 300 / 1_000_000)
+    #   One SQL datetime tick = 1/300 s ≈ 3333.33 µs
+    data = [
+        # 123000 µs → 36.9 ticks → rounds to 37 → stored as .1233333
+        (1, datetime.datetime(2025, 5, 16, 16, 33, 33, 123000)),
+        # 1666 µs → 0.4998 ticks → rounds to 0
+        (2, datetime.datetime(2025, 1, 1, 0, 0, 0, 1666)),
+        # 1667 µs → 0.5001 ticks → rounds to 1
+        (3, datetime.datetime(2025, 1, 1, 0, 0, 0, 1667)),
+        # 5000 µs → exactly 1.5 ticks → rounds to 2
+        (4, datetime.datetime(2025, 1, 1, 0, 0, 0, 5000)),
+        # 0 µs → exact zero
+        (5, datetime.datetime(2025, 6, 15, 12, 0, 0, 0)),
+    ]
+
+    result = cursor.bulkcopy(
+        table_name,
+        iter(data),
+        batch_size=1000,
+        timeout=30,
+        column_mappings=[(0, "id"), (1, "dt")],
+    )
+    assert result["rows_copied"] == len(data)
+
+    # Read back the raw tick values via CONVERT(varbinary) and validate
+    cursor.execute(
+        f"SELECT id, CONVERT(varbinary(8), dt) FROM {table_name} ORDER BY id"
+    )
+    rows = cursor.fetchall()
+
+    for row_id, raw_bytes in rows:
+        _days, ticks = struct.unpack(">iI", raw_bytes)
+        if row_id == 1:
+            assert ticks == 17_883_937, f"Row 1: expected tick 17883937, got {ticks}"
+        elif row_id == 2:
+            frac_ticks = ticks % 300
+            assert frac_ticks == 0, f"Row 2: expected 0 fractional ticks, got {frac_ticks}"
+        elif row_id == 3:
+            frac_ticks = ticks % 300
+            assert frac_ticks == 1, f"Row 3: expected 1 fractional tick, got {frac_ticks}"
+        elif row_id == 4:
+            frac_ticks = ticks % 300
+            assert frac_ticks == 2, f"Row 4: expected 2 fractional ticks, got {frac_ticks}"
+        elif row_id == 5:
+            assert ticks % 300 == 0, f"Row 5: expected 0 fractional ticks"
+
+    conn.close()
+
+
+@pytest.mark.integration
+def test_cursor_bulkcopy_datetime_matches_execute(client_context):
+    """Verify bulk copy and execute produce the same stored datetime value."""
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    bc_table = "#BulkCopyDateTimeMatchBC"
+    ex_table = "#BulkCopyDateTimeMatchEX"
+    for t in [bc_table, ex_table]:
+        cursor.execute(f"CREATE TABLE {t} (dt DATETIME)")
+
+    value = datetime.datetime(2025, 5, 16, 16, 33, 33, 123000)
+
+    # Insert via bulk copy
+    cursor.bulkcopy(bc_table, iter([(value,)]), batch_size=1, timeout=30)
+
+    # Insert via execute (SQL Server handles rounding server-side)
+    cursor.execute(
+        f"INSERT INTO {ex_table} (dt) VALUES (CONVERT(datetime, '{value.strftime('%Y-%m-%d %H:%M:%S')}.{value.microsecond // 1000:03d}', 121))"
+    )
+
+    # Compare raw binary representations
+    cursor.execute(f"SELECT CONVERT(varbinary(8), dt) FROM {bc_table}")
+    bc_raw = cursor.fetchone()[0]
+    cursor.fetchall()
+
+    cursor.execute(f"SELECT CONVERT(varbinary(8), dt) FROM {ex_table}")
+    ex_raw = cursor.fetchone()[0]
+    cursor.fetchall()
+
+    assert bc_raw == ex_raw, (
+        f"Bulk copy and execute produced different datetime values: "
+        f"bulk_copy={bc_raw.hex()}, execute={ex_raw.hex()}"
+    )
+
+    conn.close()
+
+
+@pytest.mark.integration
+def test_cursor_bulkcopy_datetime_matches_mssql_python(client_context):
+    """Verify mssql_py_core bulk copy matches mssql_python parameterized execute."""
+    mssql_python = pytest.importorskip("mssql_python")
+
+    conn_core = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn_core.cursor()
+
+    value = datetime.datetime(2025, 5, 16, 16, 33, 33, 123000)
+
+    # Insert via mssql_py_core bulk copy
+    cursor.execute("CREATE TABLE #CoreDriverCmp (dt DATETIME)")
+    cursor.bulkcopy("#CoreDriverCmp", iter([(value,)]), batch_size=1, timeout=30)
+    cursor.execute("SELECT CONVERT(varbinary(8), dt) FROM #CoreDriverCmp")
+    core_raw = cursor.fetchone()[0]
+    cursor.fetchall()
+    conn_core.close()
+
+    # Insert via mssql_python parameterized execute
+    server = client_context.get("server", "localhost")
+    password = client_context.get("password", "")
+    username = client_context.get("user_name", "sa")
+    conn_str = (
+        f"Server={server};Database=master;UID={username};PWD={password};"
+        f"TrustServerCertificate=yes;Encrypt=Optional"
+    )
+    with mssql_python.connect(conn_str) as conn_py:
+        with conn_py.cursor() as cur_py:
+            cur_py.execute("CREATE TABLE #PyDriverCmp (dt DATETIME)")
+            cur_py.execute(
+                "INSERT INTO #PyDriverCmp (dt) VALUES (?)", (value,)
+            )
+        conn_py.commit()
+        with conn_py.cursor() as cur_py:
+            cur_py.execute("SELECT CONVERT(varbinary(8), dt) FROM #PyDriverCmp")
+            py_raw = cur_py.fetchone()[0]
+
+    assert core_raw == py_raw, (
+        f"mssql_py_core and mssql_python produced different datetime values: "
+        f"core={core_raw.hex()}, python={py_raw.hex()}"
+    )

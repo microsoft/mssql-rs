@@ -1006,6 +1006,486 @@ mod tests {
         let meta2 = BulkCopyColumnMetadata::new("varchar_col", SqlDbType::VarChar, 0xA7);
         assert!(!meta2.is_long());
     }
+
+    #[test]
+    fn system_type_id_conversion_all_types() {
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(48)).unwrap(),
+            SqlDbType::TinyInt
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(52)).unwrap(),
+            SqlDbType::SmallInt
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(56)).unwrap(),
+            SqlDbType::Int
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(127)).unwrap(),
+            SqlDbType::BigInt
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(106)).unwrap(),
+            SqlDbType::Decimal
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(108)).unwrap(),
+            SqlDbType::Numeric
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(122)).unwrap(),
+            SqlDbType::SmallMoney
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(60)).unwrap(),
+            SqlDbType::Money
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(104)).unwrap(),
+            SqlDbType::Bit
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(59)).unwrap(),
+            SqlDbType::Real
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(62)).unwrap(),
+            SqlDbType::Float
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(40)).unwrap(),
+            SqlDbType::Date
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(41)).unwrap(),
+            SqlDbType::Time
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(42)).unwrap(),
+            SqlDbType::DateTime2
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(43)).unwrap(),
+            SqlDbType::DateTimeOffset
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(58)).unwrap(),
+            SqlDbType::SmallDateTime
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(61)).unwrap(),
+            SqlDbType::DateTime
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(167)).unwrap(),
+            SqlDbType::VarChar
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(175)).unwrap(),
+            SqlDbType::Char
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(35)).unwrap(),
+            SqlDbType::Text
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(231)).unwrap(),
+            SqlDbType::NVarChar
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(239)).unwrap(),
+            SqlDbType::NChar
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(99)).unwrap(),
+            SqlDbType::NText
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(165)).unwrap(),
+            SqlDbType::VarBinary
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(173)).unwrap(),
+            SqlDbType::Binary
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(34)).unwrap(),
+            SqlDbType::Image
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(36)).unwrap(),
+            SqlDbType::UniqueIdentifier
+        );
+        assert_eq!(
+            SqlDbType::try_from(SystemTypeId(241)).unwrap(),
+            SqlDbType::Xml
+        );
+    }
+
+    #[test]
+    fn system_type_id_unsupported() {
+        assert!(SqlDbType::try_from(SystemTypeId(0)).is_err());
+        assert!(SqlDbType::try_from(SystemTypeId(255)).is_err());
+    }
+
+    #[test]
+    fn to_tds_type_all_variants() {
+        assert_eq!(SqlDbType::TinyInt.to_tds_type(), 0x26);
+        assert_eq!(SqlDbType::SmallInt.to_tds_type(), 0x26);
+        assert_eq!(SqlDbType::Int.to_tds_type(), 0x26);
+        assert_eq!(SqlDbType::BigInt.to_tds_type(), 0x26);
+        assert_eq!(SqlDbType::Bit.to_tds_type(), 0x68);
+        assert_eq!(SqlDbType::Real.to_tds_type(), 0x6D);
+        assert_eq!(SqlDbType::Float.to_tds_type(), 0x6D);
+        assert_eq!(SqlDbType::Decimal.to_tds_type(), 0x6A);
+        assert_eq!(SqlDbType::Numeric.to_tds_type(), 0x6C);
+        assert_eq!(SqlDbType::Money.to_tds_type(), 0x6E);
+        assert_eq!(SqlDbType::SmallMoney.to_tds_type(), 0x6E);
+        assert_eq!(SqlDbType::Date.to_tds_type(), 0x28);
+        assert_eq!(SqlDbType::Time.to_tds_type(), 0x29);
+        assert_eq!(SqlDbType::DateTime.to_tds_type(), 0x6F);
+        assert_eq!(SqlDbType::DateTime2.to_tds_type(), 0x2A);
+        assert_eq!(SqlDbType::DateTimeOffset.to_tds_type(), 0x2B);
+        assert_eq!(SqlDbType::SmallDateTime.to_tds_type(), 0x6F);
+        assert_eq!(SqlDbType::Char.to_tds_type(), 0xAF);
+        assert_eq!(SqlDbType::VarChar.to_tds_type(), 0xA7);
+        assert_eq!(SqlDbType::Text.to_tds_type(), 0x23);
+        assert_eq!(SqlDbType::NChar.to_tds_type(), 0xEF);
+        assert_eq!(SqlDbType::NVarChar.to_tds_type(), 0xE7);
+        assert_eq!(SqlDbType::NText.to_tds_type(), 0x63);
+        assert_eq!(SqlDbType::Binary.to_tds_type(), 0xAD);
+        assert_eq!(SqlDbType::VarBinary.to_tds_type(), 0xA5);
+        assert_eq!(SqlDbType::Image.to_tds_type(), 0x22);
+        assert_eq!(SqlDbType::UniqueIdentifier.to_tds_type(), 0x24);
+        assert_eq!(SqlDbType::Xml.to_tds_type(), 0xF1);
+        assert_eq!(SqlDbType::Json.to_tds_type(), 0xF4);
+        assert_eq!(SqlDbType::Variant.to_tds_type(), 0x62);
+        assert_eq!(SqlDbType::Udt.to_tds_type(), 0xF0);
+        assert_eq!(SqlDbType::Vector.to_tds_type(), 0xF5);
+    }
+
+    #[test]
+    fn to_bulk_copy_tds_type_xml_json_override() {
+        assert_eq!(SqlDbType::Xml.to_bulk_copy_tds_type(), 0xE7);
+        assert_eq!(SqlDbType::Json.to_bulk_copy_tds_type(), 0xE7);
+        assert_eq!(
+            SqlDbType::Int.to_bulk_copy_tds_type(),
+            SqlDbType::Int.to_tds_type()
+        );
+    }
+
+    #[test]
+    fn builder_with_collation_name() {
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::VarChar, 0xA7)
+            .with_collation_name("SQL_Latin1_General_CP1_CI_AS");
+        assert_eq!(meta.collation_name.unwrap(), "SQL_Latin1_General_CP1_CI_AS");
+    }
+
+    #[test]
+    fn builder_with_encoding() {
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::VarChar, 0xA7)
+            .with_encoding(EncodingType::Utf8);
+        assert!(meta.encoding.is_some());
+    }
+
+    #[test]
+    fn builder_with_identity() {
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::Int, 0x26).with_identity(true);
+        assert!(meta.is_identity);
+    }
+
+    #[test]
+    fn builder_with_encrypted() {
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::Int, 0x26).with_encrypted(true);
+        assert!(meta.is_encrypted);
+    }
+
+    #[test]
+    fn builder_with_table_name() {
+        let meta =
+            BulkCopyColumnMetadata::new("c", SqlDbType::Text, 0x23).with_table_name("dbo.my_table");
+        assert_eq!(meta.table_name.unwrap(), "dbo.my_table");
+    }
+
+    #[test]
+    fn builder_with_scale() {
+        let meta = BulkCopyColumnMetadata::new("t", SqlDbType::Time, 0x29).with_scale(7);
+        assert_eq!(meta.scale, 7);
+    }
+
+    #[test]
+    fn get_sql_type_definition_basic_types() {
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::Int, 0x26)
+                .get_sql_type_definition()
+                .unwrap(),
+            "int"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::BigInt, 0x26)
+                .get_sql_type_definition()
+                .unwrap(),
+            "bigint"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::SmallInt, 0x26)
+                .get_sql_type_definition()
+                .unwrap(),
+            "smallint"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::TinyInt, 0x26)
+                .get_sql_type_definition()
+                .unwrap(),
+            "tinyint"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::Bit, 0x68)
+                .get_sql_type_definition()
+                .unwrap(),
+            "bit"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::Float, 0x6D)
+                .get_sql_type_definition()
+                .unwrap(),
+            "float"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::Real, 0x6D)
+                .get_sql_type_definition()
+                .unwrap(),
+            "real"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::Money, 0x6E)
+                .get_sql_type_definition()
+                .unwrap(),
+            "money"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::SmallMoney, 0x6E)
+                .get_sql_type_definition()
+                .unwrap(),
+            "smallmoney"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::UniqueIdentifier, 0x24)
+                .get_sql_type_definition()
+                .unwrap(),
+            "uniqueidentifier"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::DateTime, 0x6F)
+                .get_sql_type_definition()
+                .unwrap(),
+            "datetime"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::SmallDateTime, 0x6F)
+                .get_sql_type_definition()
+                .unwrap(),
+            "smalldatetime"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::Date, 0x28)
+                .get_sql_type_definition()
+                .unwrap(),
+            "date"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::Text, 0x23)
+                .get_sql_type_definition()
+                .unwrap(),
+            "text"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::NText, 0x63)
+                .get_sql_type_definition()
+                .unwrap(),
+            "ntext"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::Image, 0x22)
+                .get_sql_type_definition()
+                .unwrap(),
+            "image"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::Xml, 0xF1)
+                .get_sql_type_definition()
+                .unwrap(),
+            "xml"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::Variant, 0x62)
+                .get_sql_type_definition()
+                .unwrap(),
+            "sql_variant"
+        );
+        assert_eq!(
+            BulkCopyColumnMetadata::new("c", SqlDbType::Json, 0xF4)
+                .get_sql_type_definition()
+                .unwrap(),
+            "nvarchar(max)"
+        );
+    }
+
+    #[test]
+    fn get_sql_type_definition_parameterized() {
+        let meta =
+            BulkCopyColumnMetadata::new("c", SqlDbType::Decimal, 0x6A).with_precision_scale(18, 4);
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "decimal(18, 4)");
+
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::Time, 0x29).with_scale(3);
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "time(3)");
+
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::DateTime2, 0x2A).with_scale(7);
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "datetime2(7)");
+
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::DateTimeOffset, 0x2B).with_scale(0);
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "datetimeoffset(0)");
+    }
+
+    #[test]
+    fn get_sql_type_definition_string_types() {
+        // NVARCHAR with byte-length 200 → char count 100
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::NVarChar, 0xE7)
+            .with_length(200, TypeLength::Variable(200));
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "nvarchar(100)");
+
+        // NVARCHAR(MAX)
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::NVarChar, 0xE7)
+            .with_length(-1, TypeLength::Plp);
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "nvarchar(max)");
+
+        // NCHAR with byte-length 40 → char count 20
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::NChar, 0xEF)
+            .with_length(40, TypeLength::Variable(40));
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "nchar(20)");
+
+        // VARCHAR
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::VarChar, 0xA7)
+            .with_length(50, TypeLength::Variable(50));
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "varchar(50)");
+
+        // VARCHAR(MAX)
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::VarChar, 0xA7)
+            .with_length(-1, TypeLength::Plp);
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "varchar(max)");
+
+        // CHAR
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::Char, 0xAF)
+            .with_length(10, TypeLength::Fixed(10));
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "char(10)");
+
+        // VARBINARY
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::VarBinary, 0xA5)
+            .with_length(100, TypeLength::Variable(100));
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "varbinary(100)");
+
+        // VARBINARY(MAX)
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::VarBinary, 0xA5)
+            .with_length(-1, TypeLength::Plp);
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "varbinary(max)");
+
+        // BINARY
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::Binary, 0xAD)
+            .with_length(16, TypeLength::Fixed(16));
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "binary(16)");
+
+        // UDT
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::Udt, 0xF0)
+            .with_length(256, TypeLength::Variable(256));
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "varbinary(256)");
+    }
+
+    #[test]
+    fn vector_dimensions_valid() {
+        use crate::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
+        // Float32 (scale=0), element_size=4, 3 dimensions: header(8) + 3*4 = 20
+        let meta = BulkCopyColumnMetadata::new("v", SqlDbType::Vector, 0xF5)
+            .with_length(
+                (VECTOR_HEADER_SIZE + 3 * 4) as i32,
+                TypeLength::Variable((VECTOR_HEADER_SIZE + 3 * 4) as i32),
+            )
+            .with_scale(0);
+        assert_eq!(meta.vector_dimensions().unwrap(), 3);
+    }
+
+    #[test]
+    fn vector_dimensions_not_vector_type() {
+        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::Int, 0x26);
+        assert!(meta.vector_dimensions().is_err());
+    }
+
+    #[test]
+    fn vector_dimensions_too_small_length() {
+        let meta = BulkCopyColumnMetadata::new("v", SqlDbType::Vector, 0xF5)
+            .with_length(2, TypeLength::Variable(2))
+            .with_scale(0);
+        assert!(meta.vector_dimensions().is_err());
+    }
+
+    #[test]
+    fn vector_dimensions_not_divisible() {
+        use crate::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
+        // Float32 (scale=0), element_size=4, payload=5 (not divisible by 4)
+        let meta = BulkCopyColumnMetadata::new("v", SqlDbType::Vector, 0xF5)
+            .with_length(
+                (VECTOR_HEADER_SIZE + 5) as i32,
+                TypeLength::Variable((VECTOR_HEADER_SIZE + 5) as i32),
+            )
+            .with_scale(0);
+        assert!(meta.vector_dimensions().is_err());
+    }
+
+    #[test]
+    fn vector_sql_type_definition() {
+        use crate::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
+        let meta = BulkCopyColumnMetadata::new("v", SqlDbType::Vector, 0xF5)
+            .with_length(
+                (VECTOR_HEADER_SIZE + 3 * 4) as i32,
+                TypeLength::Variable((VECTOR_HEADER_SIZE + 3 * 4) as i32),
+            )
+            .with_scale(0);
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "vector(3)");
+    }
+
+    #[test]
+    fn encoding_type_latin1_non_latin() {
+        let enc = EncodingType::Latin1;
+        let bytes = enc.encode("日本語");
+        assert!(bytes.iter().all(|&b| b == b'?'));
+    }
+
+    #[test]
+    fn encoding_type_codepage() {
+        let enc = EncodingType::CodePage(1252);
+        let bytes = enc.encode("Hello");
+        assert_eq!(bytes, b"Hello");
+        assert_eq!(enc.byte_length("Hello"), 5);
+    }
+
+    #[test]
+    fn encoding_type_unicode() {
+        assert!(matches!(EncodingType::unicode(), EncodingType::Utf16Le));
+    }
+
+    #[test]
+    fn encoding_type_default_ansi() {
+        assert!(matches!(EncodingType::default_ansi(), EncodingType::Utf8));
+    }
+
+    #[test]
+    fn default_metadata() {
+        let meta = BulkCopyColumnMetadata::default();
+        assert_eq!(meta.sql_type, SqlDbType::Int);
+        assert_eq!(meta.tds_type, 0x38);
+        assert!(meta.is_nullable);
+        assert!(!meta.is_identity);
+    }
 }
 
 // Include additional unit tests from separate test file

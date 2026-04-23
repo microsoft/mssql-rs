@@ -279,6 +279,39 @@ class TestMockServerFedAuth:
             # Verify cleared
             assert server.connection_count() == 0
 
+    def test_user_agent_format(self, mock_server_port):
+        """Test that MS-PYTHON is correctly sent as the driver name in the user agent."""
+        import mssql_py_core
+        import time
+
+        server = mssql_mock_tds_py.PyMockTdsServer(port=mock_server_port, tls=True)
+
+        with server:
+            client_context = {
+                "server": server.sql_address,
+                "database": "master",
+                "encryption": "Optional",
+                "trust_server_certificate": True,
+            }
+
+            conn = mssql_py_core.PyCoreConnection(client_context)
+            conn.close()
+
+            time.sleep(0.1)
+
+            connections = server.get_connections()
+            assert len(connections) >= 1, "Should have at least one connection" 
+            
+            # User Agent Format: 1|DriverName|DriverVersion|Arch|OS|OSDetails|Runtime
+            user_agent = connections[0].user_agent
+            assert user_agent is not None, "A user agent must be presented to the SQL Server"
+            
+            # The library_name statically defined in connection.rs must be the second field
+            parts = user_agent.split("|")
+            assert len(parts) == 7, "User agent must match strict Microsoft format"
+            print(f"\n\n---> CAPTURED USER-AGENT STRING:\n{user_agent}\n")
+            assert parts[1] == "MS-PYTHON", f"Expected MS-PYTHON but got {parts[1]}"
+            assert parts[6].startswith("Python "), f"Expected Python globally cached runtime details, but got {parts[6]}"
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
