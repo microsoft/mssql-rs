@@ -15,6 +15,7 @@ pub mod client_context;
 pub(crate) mod connection_actions;
 pub(crate) mod datasource_parser;
 pub(crate) mod execution_context;
+pub(crate) mod instance_cache;
 pub(crate) mod metadata_retriever;
 /// ODBC-style authentication keyword transform.
 pub mod odbc_authentication_transformer;

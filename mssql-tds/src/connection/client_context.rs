@@ -221,6 +221,9 @@ pub struct ClientContext {
     pub mars_enabled: bool,
     /// Enable multi-subnet failover for AlwaysOn availability groups.
     pub multi_subnet_failover: bool,
+    /// Timeout in milliseconds for SQL Browser (SSRP) instance resolution.
+    /// Defaults to 1000ms.
+    pub ssrp_timeout_ms: u64,
     /// New password to set (separate from `change_password` flow).
     pub new_password: String,
     /// TDS packet size in bytes. Valid range: 512–32768.
@@ -328,6 +331,7 @@ impl ClientContext {
             auth_method_map: HashMap::new(),
             mars_enabled: false,
             multi_subnet_failover: false,
+            ssrp_timeout_ms: crate::ssrp::DEFAULT_SSRP_TIMEOUT_MS,
             new_password: "".to_string(),
             packet_size: 8000,
             password: "".to_string(),
@@ -382,6 +386,7 @@ impl ClientContext {
             auth_method_map: HashMap::new(),
             mars_enabled: false,
             multi_subnet_failover: false,
+            ssrp_timeout_ms: crate::ssrp::DEFAULT_SSRP_TIMEOUT_MS,
             new_password: "".to_string(),
             packet_size: 8000,
             password: "".to_string(),
@@ -616,6 +621,7 @@ impl Clone for ClientContext {
             auth_method_map: self.clone_auth_method_map(),
             mars_enabled: self.mars_enabled,
             multi_subnet_failover: self.multi_subnet_failover,
+            ssrp_timeout_ms: self.ssrp_timeout_ms,
             new_password: self.new_password.clone(),
             packet_size: self.packet_size,
             password: self.password.clone(),

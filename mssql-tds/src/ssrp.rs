@@ -38,9 +38,6 @@ const CLNT_UCAST_INST: u8 = 0x04;
 /// Response marker byte from SQL Browser.
 const SVR_RESP: u8 = 0x05;
 
-/// Request type: query for Dedicated Admin Connection port.
-const CLNT_UCAST_DAC: u8 = 0x0F;
-
 /// Default timeout for SSRP queries (matches msodbcsql DEFAULT_SSRPGETINFO_TIMEOUT).
 pub const DEFAULT_SSRP_TIMEOUT_MS: u64 = 1000;
 
@@ -82,11 +79,6 @@ pub(crate) struct SsrpResponse {
     pub protocols: Vec<SsrpInstanceInfo>,
 }
 
-/// Query SQL Server Browser for instance information using the default port and timeout.
-pub async fn get_instance_info(server: &str, instance: &str) -> TdsResult<Vec<SsrpInstanceInfo>> {
-    get_instance_info_ext(server, instance, SSRP_PORT, DEFAULT_SSRP_TIMEOUT_MS).await
-}
-
 /// Query SQL Server Browser with explicit port and timeout.
 ///
 /// Exposed as `pub(crate)` so tests can point at a mock browser on a non-standard port.
@@ -98,19 +90,6 @@ pub(crate) async fn get_instance_info_ext(
 ) -> TdsResult<Vec<SsrpInstanceInfo>> {
     let response = query_browser(server, instance, ssrp_port, timeout_ms).await?;
     Ok(response.protocols)
-}
-
-/// Query SQL Server Browser for Dedicated Admin Connection (DAC) port.
-///
-/// Sends CLNT_UCAST_DAC (0x0F) and parses the 6-byte response.
-#[allow(dead_code)]
-pub async fn get_admin_port(_server: &str, _instance: &str) -> TdsResult<u16> {
-    // DAC port resolution will be implemented in a future PR.
-    Err(Error::ProtocolError(
-        "SSRP DAC port resolution is not yet implemented. \
-         Please specify an explicit port for admin connections."
-            .to_string(),
-    ))
 }
 
 /// Convert SSRP instance info into an ordered list of [`TransportContext`] variants.
@@ -150,19 +129,6 @@ pub(crate) fn build_instance_request(instance: &str) -> Vec<u8> {
     buf.push(CLNT_UCAST_INST);
     buf.extend_from_slice(instance.as_bytes());
     buf.push(0x00); // null terminator
-    buf
-}
-
-/// Build a CLNT_UCAST_DAC request packet.
-///
-/// Format: `[0x0F][0x01][ASCII instance name][0x00]`
-#[allow(dead_code)]
-pub(crate) fn build_dac_request(instance: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(instance.len() + 3);
-    buf.push(CLNT_UCAST_DAC);
-    buf.push(0x01); // protocol version
-    buf.extend_from_slice(instance.as_bytes());
-    buf.push(0x00);
     buf
 }
 
@@ -468,15 +434,6 @@ mod tests {
         assert_eq!(*pkt.last().unwrap(), 0x00);
     }
 
-    #[test]
-    fn test_build_dac_request() {
-        let pkt = build_dac_request("MYINST");
-        assert_eq!(pkt[0], CLNT_UCAST_DAC);
-        assert_eq!(pkt[1], 0x01);
-        assert_eq!(&pkt[2..pkt.len() - 1], b"MYINST");
-        assert_eq!(*pkt.last().unwrap(), 0x00);
-    }
-
     // -- Response parsing --------------------------------------------------
 
     fn make_response(payload: &str) -> Vec<u8> {
@@ -561,20 +518,6 @@ mod tests {
 
         let transports = build_transport_list(info, "localhost", "INST1");
         assert_eq!(transports.len(), 2);
-    }
-
-    // -- DAC stub ----------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_get_admin_port_not_implemented() {
-        let result = get_admin_port("localhost", "MSSQLSERVER").await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("not yet implemented")
-        );
     }
 
     // -- Live UDP round-trip against a localhost mock -----------------------

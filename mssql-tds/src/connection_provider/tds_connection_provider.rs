@@ -9,6 +9,7 @@ use crate::connection::client_context::{ClientContext, TransportContext};
 use crate::connection::connection_actions::{
     ActionOutcome, ConnectionAction, ConnectionActionChain, ExecutionContext,
 };
+use crate::connection::instance_cache::InstanceCache;
 use crate::connection::tds_client::TdsClient;
 use crate::connection::transport::network_transport;
 use crate::connection::transport::tds_transport::TdsTransport;
@@ -96,17 +97,11 @@ impl TdsConnectionProvider {
         // Validate the ClientContext before attempting connection
         context.validate()?;
 
-        // Validate MultiSubnetFailover constraints
-        if context.multi_subnet_failover {
-            // MultiSubnetFailover cannot be used with database mirroring (failover_partner)
-            if !context.failover_partner.is_empty() {
-                return Err(Error::UsageError(
-                    "MultiSubnetFailover cannot be used with FailoverPartner (database mirroring). \
-                     These features are mutually exclusive. Remove one of the options."
-                        .to_string(),
-                ));
-            }
-        }
+        validate_multi_subnet_failover(
+            context.multi_subnet_failover,
+            &context.failover_partner,
+            parsed.needs_ssrp(),
+        )?;
 
         // Get connection timeout
         let timeout_ms = if context.connect_timeout > 0 {
@@ -136,10 +131,99 @@ impl TdsConnectionProvider {
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<TdsClient> {
         CancelHandle::run_until_cancelled(cancel_handle, async move {
-            // Resolve SSRP (SQL Browser) if the action chain requires it
+            // Resolve SSRP (SQL Browser) if the action chain requires it.
+            // Check the instance cache first to avoid a redundant UDP round-trip.
             let mut exec_context = ExecutionContext::new();
+            let mut cache_key: Option<(String, String)> = None;
+
+            // Try Shared Memory before SSRP for local named instances (Windows only).
+            // SM doesn't need instance resolution — it uses the name directly.
+            // If SM succeeds, we skip SSRP entirely. This matches ODBC/SNI behavior.
+            #[cfg(windows)]
+            if action_chain.requires_ssrp()
+                && let Some(sm_transport) = action_chain.first_shared_memory_transport()
+            {
+                debug!("Trying Shared Memory before SSRP");
+                let timeout_duration = match context.connect_timeout {
+                    1.. => Some(Duration::from_secs(context.connect_timeout.into())),
+                    _ => None,
+                };
+                let connect_future =
+                    Self::connect_with_transport_context(context, &sm_transport);
+                let sm_result = match timeout_duration.as_ref() {
+                    Some(duration) => match timeout(*duration, connect_future).await {
+                        Ok(result) => result,
+                        Err(_) => Err(TimeoutError(TimeoutErrorType::String(
+                            "Timeout while connecting via Shared Memory".to_string(),
+                        ))),
+                    },
+                    None => connect_future.await,
+                };
+                match sm_result {
+                    Ok((transport, negotiated_settings, execution_context)) => {
+                        debug!("Shared Memory connection succeeded, skipping SSRP");
+                        return Ok(TdsClient::new(
+                            transport,
+                            negotiated_settings,
+                            execution_context,
+                        ));
+                    }
+                    Err(err) => {
+                        debug!("Shared Memory failed ({}), falling through to SSRP", err);
+                    }
+                }
+            }
+
             if action_chain.requires_ssrp() {
-                Self::resolve_ssrp(&action_chain, &mut exec_context).await?;
+                // Derive cache key from the QuerySsrp action
+                let (server, instance) = action_chain
+                    .actions()
+                    .iter()
+                    .find_map(|a| match a {
+                        ConnectionAction::QuerySsrp {
+                            server, instance, ..
+                        } => Some((server.as_str(), instance.as_str())),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        Error::ImplementationError(
+                            "requires_ssrp() returned true but no QuerySsrp action found"
+                                .to_string(),
+                        )
+                    })?;
+
+                if action_chain.uses_cache() {
+                    if let Some(cached) = InstanceCache::global().get(server, instance)? {
+                        debug!(?cached, server, instance, "SSRP cache hit");
+                        exec_context.store_outcome(ActionOutcome::CacheHit {
+                            protocol: crate::connection::datasource_parser::ProtocolType::Tcp,
+                            port: cached.port,
+                            pipe_path: cached.pipe_path,
+                        });
+                    } else {
+                        debug!(server, instance, "SSRP cache miss");
+                        Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms).await?;
+                        cache_key = Some((server.to_string(), instance.to_string()));
+                    }
+                } else {
+                    Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms).await?;
+                }
+            }
+
+            // Update instance cache after a successful SSRP resolution
+            if let Some((server, instance)) = &cache_key {
+                use crate::connection::connection_actions::ResultSlot;
+
+                let port = exec_context.get_port(ResultSlot::ResolvedPort);
+                #[cfg(windows)]
+                let pipe_path = exec_context.get_pipe_path(ResultSlot::ResolvedPipePath);
+                #[cfg(not(windows))]
+                let pipe_path: Option<String> = None;
+
+                if port.is_some() || pipe_path.is_some() {
+                    debug!(?port, ?pipe_path, server = %server, instance = %instance, "Caching SSRP result");
+                    InstanceCache::global().insert(server, instance, port, pipe_path)?;
+                }
             }
 
             // Check if LocalDB resolution is required (Windows only)
@@ -265,10 +349,11 @@ impl TdsConnectionProvider {
         .await
     }
 
-    /// Query SQL Browser (SSRP) to resolve the TCP port for a named instance.
+    /// Query SQL Browser (SSRP) to resolve the TCP port or named pipe path for a named instance.
     async fn resolve_ssrp(
         action_chain: &ConnectionActionChain,
         exec_context: &mut ExecutionContext,
+        ssrp_timeout_ms: u64,
     ) -> TdsResult<()> {
         let (server, instance) = action_chain
             .actions()
@@ -285,37 +370,72 @@ impl TdsConnectionProvider {
                 )
             })?;
 
-        debug!(server = %server, instance = %instance, "Executing SSRP query");
+        let timeout_ms = if ssrp_timeout_ms == 0 {
+            ssrp::DEFAULT_SSRP_TIMEOUT_MS
+        } else {
+            ssrp_timeout_ms
+        };
+        debug!(server = %server, instance = %instance, timeout_ms, "Executing SSRP query");
 
-        let instance_info = ssrp::get_instance_info(&server, &instance)
-            .await
-            .map_err(|e| {
-                Error::ConnectionError(format!(
-                    "Error Locating Server/Instance Specified [{}\\{}]. \
+        let instance_info =
+            ssrp::get_instance_info_ext(&server, &instance, ssrp::SSRP_PORT, timeout_ms)
+                .await
+                .map_err(|e| {
+                    Error::ConnectionError(format!(
+                        "Error Locating Server/Instance Specified [{}\\{}]. \
                      Ensure the instance name is correct and SQL Server Browser \
                      service is running on the host. ({})",
-                    server, instance, e
-                ))
-            })?;
+                        server, instance, e
+                    ))
+                })?;
 
         let transports = ssrp::build_transport_list(instance_info, &server, &instance);
 
-        let tcp_port = transports
-            .iter()
-            .find_map(|t| match t {
-                TransportContext::Tcp { port, .. } => Some(*port),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                Error::ConnectionError(format!(
-                    "SQL Browser returned instance information for '{}' \
-                     but no TCP endpoint was available.",
-                    instance
-                ))
-            })?;
+        // Extract TCP port if available
+        let tcp_port = transports.iter().find_map(|t| match t {
+            TransportContext::Tcp { port, .. } => Some(*port),
+            _ => None,
+        });
 
-        debug!(tcp_port, "SSRP resolved instance port");
-        exec_context.store_outcome(ActionOutcome::SsrpResolved { port: tcp_port });
+        // Extract named pipe path if available (Windows only)
+        #[cfg(windows)]
+        let pipe_path = transports.iter().find_map(|t| match t {
+            TransportContext::NamedPipe { pipe_name } => Some(pipe_name.clone()),
+            _ => None,
+        });
+
+        if tcp_port.is_none() {
+            #[cfg(windows)]
+            if pipe_path.is_none() {
+                return Err(Error::ConnectionError(format!(
+                    "SQL Browser returned instance information for '{}' \
+                     but no TCP or Named Pipe endpoint was available.",
+                    instance
+                )));
+            }
+
+            #[cfg(not(windows))]
+            return Err(Error::ConnectionError(format!(
+                "SQL Browser returned instance information for '{}' \
+                 but no TCP endpoint was available.",
+                instance
+            )));
+        }
+
+        if let Some(port) = tcp_port {
+            debug!(port, "SSRP resolved TCP port");
+            exec_context.store_outcome(ActionOutcome::SsrpResolved { port });
+        }
+
+        #[cfg(windows)]
+        if let Some(pipe) = pipe_path {
+            // Normalize for local connections: \\COMPUTERNAME\pipe\... → \\.\pipe\...
+            // This avoids SMB round-trips and "Access is denied" errors.
+            let pipe = crate::connection::transport::named_pipes::localize_pipe_path(&pipe);
+            debug!(pipe = %pipe, "SSRP resolved named pipe path");
+            exec_context.store_outcome(ActionOutcome::SsrpResolvedPipe { pipe_path: pipe });
+        }
+
         Ok(())
     }
 
@@ -420,5 +540,65 @@ impl TdsConnectionProvider {
                 Err(err)
             }
         }
+    }
+}
+
+/// Validate MultiSubnetFailover constraints.
+///
+/// MSF is incompatible with database mirroring (failover partner) and with
+/// named instances that require SSRP resolution (no explicit port).
+fn validate_multi_subnet_failover(
+    multi_subnet_failover: bool,
+    failover_partner: &str,
+    needs_ssrp: bool,
+) -> TdsResult<()> {
+    if !multi_subnet_failover {
+        return Ok(());
+    }
+
+    if !failover_partner.is_empty() {
+        return Err(Error::UsageError(
+            "MultiSubnetFailover cannot be used with FailoverPartner (database mirroring). \
+             These features are mutually exclusive. Remove one of the options."
+                .to_string(),
+        ));
+    }
+
+    if needs_ssrp {
+        return Err(Error::UsageError(
+            "MultiSubnetFailover cannot be used with a named instance \
+             without an explicit port. Specify a port (e.g. server\\instance,1433) \
+             or remove MultiSubnetFailover."
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msf_disabled_always_ok() {
+        assert!(validate_multi_subnet_failover(false, "partner", true).is_ok());
+    }
+
+    #[test]
+    fn msf_with_failover_partner_rejected() {
+        let err = validate_multi_subnet_failover(true, "partner", false).unwrap_err();
+        assert!(err.to_string().contains("FailoverPartner"));
+    }
+
+    #[test]
+    fn msf_with_ssrp_rejected() {
+        let err = validate_multi_subnet_failover(true, "", true).unwrap_err();
+        assert!(err.to_string().contains("named instance"));
+    }
+
+    #[test]
+    fn msf_with_explicit_port_ok() {
+        assert!(validate_multi_subnet_failover(true, "", false).is_ok());
     }
 }

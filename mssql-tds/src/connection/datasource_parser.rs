@@ -637,6 +637,36 @@ impl ParsedDataSource {
             || Self::is_computer_name(&self.original_server_name)
     }
 
+    /// Server component for Named Pipe UNC paths.
+    ///
+    /// Local connections use `\\.` (the Windows local device path) so that
+    /// the pipe open goes through the local IPC namespace instead of SMB.
+    /// Remote connections keep the original server name.
+    fn pipe_server(&self) -> &str {
+        if self.is_local() {
+            "."
+        } else {
+            &self.server_name
+        }
+    }
+
+    /// Build the default Named Pipe path for this data source.
+    ///
+    /// Uses the standard SQL Server pipe naming convention:
+    /// - Default / "default" instance → `\\<server>\pipe\sql\query`
+    /// - Named instance → `\\<server>\pipe\MSSQL$<instance>\sql\query`
+    fn default_pipe_path(&self) -> String {
+        let server = self.pipe_server();
+        if self.instance_name.is_empty() || self.instance_name.eq_ignore_ascii_case("default") {
+            format!("\\\\{}\\pipe\\sql\\query", server)
+        } else {
+            format!(
+                "\\\\{}\\pipe\\MSSQL${}\\sql\\query",
+                server, self.instance_name
+            )
+        }
+    }
+
     /// Check if SSRP (SQL Server Resolution Protocol) is needed
     ///
     /// SSRP is used when:
@@ -652,9 +682,10 @@ impl ParsedDataSource {
         // 1. Instance name is specified, AND
         // 2. No explicit port is provided (protocol_parameter is empty or not a valid port)
         //
-        // Note: Even with tcp: prefix, if no port is given, SSRP is required.
-        // This matches ODBC/SNI behavior where instance name is only ignored
-        // when a port (comma) is explicitly specified.
+        // Note: Even with tcp: or np: prefix, if no port/pipe is given, SSRP is
+        // required to resolve the instance. The protocol prefix acts as a filter
+        // on which resolved endpoint to use (TCP only, NP only, or both).
+        // This matches ODBC/SNI behavior.
         !self.instance_name.is_empty() && self.protocol_parameter.is_empty()
     }
 
@@ -722,6 +753,15 @@ impl ParsedDataSource {
 
         // Step 3: Handle SSRP query if needed
         if self.needs_ssrp() {
+            // For local connections with no protocol prefix, try Shared Memory
+            // before SSRP. SM doesn't need instance resolution — it uses the
+            // instance name directly. If SM succeeds the executor skips SSRP.
+            // This matches ODBC/SNI behavior (SQL BU DT bug 286397).
+            #[cfg(windows)]
+            if self.protocol_name.is_empty() && self.is_local() {
+                builder.add_connect_shared_memory(&self.instance_name);
+            }
+
             builder.add_ssrp_query(&self.server_name, &self.instance_name);
 
             // After SSRP, update cache if allowed
@@ -730,8 +770,36 @@ impl ParsedDataSource {
                 builder.add_update_cache(&self.alias, 0); // 0 is placeholder
             }
 
-            // Connect using resolved port
-            builder.add_connect_tcp_from_slot(&self.server_name, ResultSlot::ResolvedPort);
+            // The protocol prefix filters which SSRP-resolved endpoints to try.
+            // This matches ODBC/SNI: the protocol list acts as a filter on the
+            // SSRP response — only the requested protocol's info is used.
+            match self.protocol_name.as_str() {
+                "np" => {
+                    // np: prefix — attempt Named Pipe from SSRP result, then
+                    // fall back to the standard pipe path if SQL Browser didn't
+                    // return a named-pipe endpoint.
+                    #[cfg(windows)]
+                    {
+                        builder.add_connect_named_pipe_from_slot(ResultSlot::ResolvedPipePath);
+                        builder.add_connect_named_pipe(&self.default_pipe_path());
+                    }
+                }
+                "tcp" | "" => {
+                    // tcp: prefix or no prefix — attempt TCP from SSRP result
+                    builder.add_connect_tcp_from_slot(&self.server_name, ResultSlot::ResolvedPort);
+
+                    // No prefix: also fall back to NP if SQL Browser returned one
+                    #[cfg(windows)]
+                    if self.protocol_name.is_empty() {
+                        builder.add_connect_named_pipe_from_slot(ResultSlot::ResolvedPipePath);
+                    }
+                }
+                _ => {
+                    // Other protocols (lpc, admin) don't use SSRP this way
+                    builder.add_connect_tcp_from_slot(&self.server_name, ResultSlot::ResolvedPort);
+                }
+            }
+
             return builder.build();
         }
 
@@ -745,17 +813,8 @@ impl ParsedDataSource {
                 ProtocolType::NamedPipe => {
                     let pipe = if !self.protocol_parameter.is_empty() {
                         self.protocol_parameter.clone()
-                    } else if !self.instance_name.is_empty() {
-                        if self.instance_name.to_lowercase() == "default" {
-                            format!("\\\\{}\\pipe\\sql\\query", self.server_name)
-                        } else {
-                            format!(
-                                "\\\\{}\\pipe\\MSSQL${}\\sql\\query",
-                                self.server_name, self.instance_name
-                            )
-                        }
                     } else {
-                        format!("\\\\{}\\pipe\\sql\\query", self.server_name)
+                        self.default_pipe_path()
                     };
                     builder.add_connect_named_pipe(&pipe);
                 }
@@ -1131,6 +1190,10 @@ mod tests {
         let chain = parsed.to_connection_actions(15000);
 
         // Should have: CheckCache -> QuerySsrp -> UpdateCache -> ConnectTcpFromSlot
+        // On Windows, also: ConnectNamedPipeFromSlot (NP fallback from SSRP)
+        #[cfg(windows)]
+        assert_eq!(chain.len(), 5);
+        #[cfg(not(windows))]
         assert_eq!(chain.len(), 4);
         let actions = chain.actions();
 
@@ -1141,6 +1204,11 @@ mod tests {
         assert!(matches!(
             actions[3],
             ConnectionAction::ConnectTcpFromSlot { .. }
+        ));
+        #[cfg(windows)]
+        assert!(matches!(
+            actions[4],
+            ConnectionAction::ConnectNamedPipeFromSlot { .. }
         ));
 
         // Verify metadata
@@ -1178,6 +1246,63 @@ mod tests {
         assert!(matches!(
             actions[0],
             crate::connection::connection_actions::ConnectionAction::ConnectNamedPipe { .. }
+        ));
+
+        let metadata = chain.metadata();
+        assert!(metadata.explicit_protocol);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_action_chain_np_prefix_with_instance() {
+        // np: prefix with instance name does SSRP but only tries Named Pipe.
+        // A fallback ConnectNamedPipe with the default pipe path is added in
+        // case SQL Browser doesn't return a named-pipe endpoint.
+        let parsed = ParsedDataSource::parse("np:localhost\\mssqlserver01", false).unwrap();
+        assert!(parsed.needs_ssrp());
+
+        let chain = parsed.to_connection_actions(15000);
+
+        // CheckCache -> QuerySsrp -> UpdateCache -> ConnectNamedPipeFromSlot -> ConnectNamedPipe
+        assert_eq!(chain.len(), 5);
+        let actions = chain.actions();
+
+        use crate::connection::connection_actions::ConnectionAction;
+        assert!(matches!(actions[0], ConnectionAction::CheckCache { .. }));
+        assert!(matches!(actions[1], ConnectionAction::QuerySsrp { .. }));
+        assert!(matches!(actions[2], ConnectionAction::UpdateCache { .. }));
+        assert!(matches!(
+            actions[3],
+            ConnectionAction::ConnectNamedPipeFromSlot { .. }
+        ));
+        assert!(matches!(
+            actions[4],
+            ConnectionAction::ConnectNamedPipe { .. }
+        ));
+
+        let metadata = chain.metadata();
+        assert!(metadata.explicit_protocol);
+    }
+
+    #[test]
+    fn test_action_chain_tcp_prefix_with_instance() {
+        // tcp: prefix with instance name does SSRP but only tries TCP
+        let parsed = ParsedDataSource::parse("tcp:localhost\\mssqlserver01", false).unwrap();
+        assert!(parsed.needs_ssrp());
+
+        let chain = parsed.to_connection_actions(15000);
+
+        // CheckCache -> QuerySsrp -> UpdateCache -> ConnectTcpFromSlot
+        assert_eq!(chain.len(), 4);
+        let actions = chain.actions();
+
+        use crate::connection::connection_actions::ConnectionAction;
+        assert!(matches!(actions[0], ConnectionAction::CheckCache { .. }));
+        assert!(matches!(actions[1], ConnectionAction::QuerySsrp { .. }));
+        assert!(matches!(actions[2], ConnectionAction::UpdateCache { .. }));
+        assert!(matches!(
+            actions[3],
+            ConnectionAction::ConnectTcpFromSlot { .. }
         ));
 
         let metadata = chain.metadata();
@@ -1285,6 +1410,60 @@ mod tests {
             actions[1],
             ConnectionAction::ConnectSharedMemory { .. }
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_action_chain_local_instance_sm_before_ssrp() {
+        // Local named instance with no prefix: SM is tried before SSRP
+        // This matches ODBC/SNI behavior (SQL BU DT bug 286397).
+        let parsed = ParsedDataSource::parse("localhost\\SQLEXPRESS", false).unwrap();
+        assert!(parsed.needs_ssrp());
+        assert!(parsed.is_local());
+
+        let chain = parsed.to_connection_actions(15000);
+
+        // CheckCache -> ConnectSharedMemory -> QuerySsrp -> UpdateCache
+        //   -> ConnectTcpFromSlot -> ConnectNamedPipeFromSlot
+        assert_eq!(chain.len(), 6);
+        let actions = chain.actions();
+
+        use crate::connection::connection_actions::ConnectionAction;
+        assert!(matches!(actions[0], ConnectionAction::CheckCache { .. }));
+        assert!(
+            matches!(actions[1], ConnectionAction::ConnectSharedMemory { .. }),
+            "SM should appear before SSRP for local named instances"
+        );
+        assert!(matches!(actions[2], ConnectionAction::QuerySsrp { .. }));
+        assert!(matches!(actions[3], ConnectionAction::UpdateCache { .. }));
+        assert!(matches!(
+            actions[4],
+            ConnectionAction::ConnectTcpFromSlot { .. }
+        ));
+        assert!(matches!(
+            actions[5],
+            ConnectionAction::ConnectNamedPipeFromSlot { .. }
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_action_chain_remote_instance_no_sm() {
+        // Remote named instance: SM should NOT be present
+        let parsed = ParsedDataSource::parse("remoteserver\\SQLEXPRESS", false).unwrap();
+        assert!(parsed.needs_ssrp());
+        assert!(!parsed.is_local());
+
+        let chain = parsed.to_connection_actions(15000);
+        let actions = chain.actions();
+
+        use crate::connection::connection_actions::ConnectionAction;
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ConnectionAction::ConnectSharedMemory { .. })),
+            "SM should not appear for remote instances"
+        );
     }
 
     #[test]
@@ -1408,5 +1587,48 @@ mod tests {
         assert!(ds.server_name.is_empty());
         assert!(ds.protocol_name.is_empty());
         assert!(ds.can_use_cache);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn pipe_server_remote_returns_server_name() {
+        // Exercises the else branch of pipe_server() via default_pipe_path()
+        // where the server is remote (not local).
+        let parsed = ParsedDataSource::parse("np:remoteserver\\MYINST", false).unwrap();
+        let chain = parsed.to_connection_actions(15000);
+
+        use crate::connection::connection_actions::ConnectionAction;
+        let has_remote_pipe = chain.actions().iter().any(|a| match a {
+            ConnectionAction::ConnectNamedPipe { pipe_path, .. } => {
+                pipe_path.contains("remoteserver")
+            }
+            _ => false,
+        });
+        assert!(
+            has_remote_pipe,
+            "Expected fallback pipe path with remote server name"
+        );
+    }
+
+    #[test]
+    fn ssrp_wildcard_protocol_arm() {
+        // Exercises the `_ =>` match arm in the SSRP protocol section of
+        // to_connection_actions. The "admin" protocol with a named instance
+        // (no port) requires SSRP and falls through to the wildcard arm.
+        let parsed = ParsedDataSource::parse("admin:myserver\\INST", false).unwrap();
+        assert!(parsed.needs_ssrp());
+
+        let chain = parsed.to_connection_actions(15000);
+        use crate::connection::connection_actions::ConnectionAction;
+
+        assert!(chain.requires_ssrp());
+        let has_tcp_from_slot = chain
+            .actions()
+            .iter()
+            .any(|a| matches!(a, ConnectionAction::ConnectTcpFromSlot { .. }));
+        assert!(
+            has_tcp_from_slot,
+            "Wildcard SSRP arm should add ConnectTcpFromSlot"
+        );
     }
 }
