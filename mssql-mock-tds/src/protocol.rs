@@ -614,6 +614,54 @@ pub fn build_done_token(row_count: u64) -> BytesMut {
     token_data
 }
 
+/// Build an INFO token (0xAB) matching the TDS wire format.
+///
+/// Wire layout (all integers little-endian):
+///   0xAB | u16 length | u32 number | u8 state | u8 severity
+///   | US_VARCHAR message | B_VARCHAR server_name | B_VARCHAR proc_name | u32 line_number
+///
+/// US_VARCHAR: u16 char-count prefix + UTF-16LE data
+/// B_VARCHAR:  u8  char-count prefix + UTF-16LE data
+pub fn build_info_token(info: &crate::query_response::InfoMessage) -> BytesMut {
+    let mut buf = BytesMut::new();
+
+    buf.put_u8(TokenType::Info as u8);
+
+    let msg_units: Vec<u16> = info.message.encode_utf16().collect();
+    let srv_units: Vec<u16> = info.server_name.encode_utf16().collect();
+    let proc_units: Vec<u16> = info.proc_name.encode_utf16().collect();
+
+    // token_len covers everything after the 2-byte length field
+    let token_len: u16 = 4 + 1 + 1 // number, state, severity
+        + 2 + (msg_units.len() * 2) as u16  // US_VARCHAR
+        + 1 + (srv_units.len() * 2) as u16  // B_VARCHAR
+        + 1 + (proc_units.len() * 2) as u16 // B_VARCHAR
+        + 4; // line_number
+    buf.put_u16_le(token_len);
+
+    buf.put_u32_le(info.number);
+    buf.put_u8(info.state);
+    buf.put_u8(info.severity);
+
+    buf.put_u16_le(msg_units.len() as u16);
+    for u in &msg_units {
+        buf.put_u16_le(*u);
+    }
+
+    buf.put_u8(srv_units.len() as u8);
+    for u in &srv_units {
+        buf.put_u16_le(*u);
+    }
+
+    buf.put_u8(proc_units.len() as u8);
+    for u in &proc_units {
+        buf.put_u16_le(*u);
+    }
+
+    buf.put_u32_le(info.line_number);
+    buf
+}
+
 /// Build a query result from a QueryResponse
 pub fn build_query_result(response: &crate::query_response::QueryResponse) -> BytesMut {
     let mut result = BytesMut::new();
@@ -642,6 +690,11 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
         for ch in col.name.encode_utf16() {
             result.put_u16_le(ch);
         }
+    }
+
+    // Inject Info tokens between ColMetadata and Rows (Fabric DW behavior)
+    for info in &response.info_tokens {
+        result.extend_from_slice(&build_info_token(info));
     }
 
     // Serialize each row
