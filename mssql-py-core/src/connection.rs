@@ -4,7 +4,7 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
@@ -252,7 +252,7 @@ impl PyCoreConnection {
         // ServerCertificate - path to the server certificate file for validation
         let server_certificate = dict
             .get_item("server_certificate")?
-            .and_then(|v| v.extract::<String>().ok());
+            .and_then(|v| v.extract::<PathBuf>().ok());
 
         let encryption_options = EncryptionOptions {
             mode: encryption_mode,
