@@ -175,10 +175,7 @@ impl SslHandler {
             Ok(mut stream) => {
                 // If ServerCertificate is specified, perform certificate validation
                 if let Some(cert_path) = &self.encryption_options.server_certificate {
-                    info!(
-                        "Validating server certificate using: {}",
-                        cert_path.display()
-                    );
+                    info!("Validating server certificate using: {cert_path:?}",);
 
                     // Get the server's certificate from the TLS stream
                     let peer_cert = stream

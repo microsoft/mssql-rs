@@ -25,7 +25,7 @@ use tracing::{debug, info};
 /// * `Ok(Vec<u8>)` - DER-encoded certificate data
 /// * `Err(Error)` - File not found, IO error, or invalid format
 pub fn load_certificate_from_file(path: &Path) -> TdsResult<Vec<u8>> {
-    debug!("Loading certificate from file: {}", path.display());
+    debug!("Loading certificate from file: {path:?}");
 
     // Check if file exists
     if !path.exists() {
@@ -59,8 +59,7 @@ pub fn load_certificate_from_file(path: &Path) -> TdsResult<Vec<u8>> {
         })?;
 
     info!(
-        "Successfully loaded certificate from: {} ({} bytes)",
-        path.display(),
+        "Successfully loaded certificate from: {path:?} ({} bytes)",
         der_data.len()
     );
     Ok(der_data)
@@ -135,10 +134,7 @@ pub fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
 /// * `Ok(())` - Certificates match and server cert is valid
 /// * `Err(Error)` - Validation failed
 pub fn validate_server_certificate(user_cert_path: &Path, server_cert_der: &[u8]) -> TdsResult<()> {
-    info!(
-        "Validating server certificate against: {}",
-        user_cert_path.display()
-    );
+    info!("Validating server certificate against: {user_cert_path:?}");
 
     // Step 1: Load user-provided certificate
     let user_cert_der = load_certificate_from_file(user_cert_path)?;
