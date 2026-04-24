@@ -50,7 +50,7 @@ Before submitting changes, run the full check suite:
 
 ```bash
 ./scripts/bfmt.sh  or scripts/bfmt.ps1     # Format check
-./scripts/bclippy.sh    # Lint (warnings are errors)
+./scripts/bclippy.sh    # Lint (warnings are errors), for windows scripts/bclippy.ps1
 cargo btest      # Test with cargo-nextest
 ```
 
