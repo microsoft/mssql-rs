@@ -194,7 +194,7 @@ mod tests {
         assert!(result.is_err());
         match result {
             Err(Error::CertificateNotFound { path }) => {
-                assert!(path == p);
+                assert_eq!(path, p);
             }
             _ => panic!("Expected CertificateNotFound error"),
         }
@@ -249,7 +249,7 @@ mod tests {
         assert!(result.is_err(), "Should fail to load invalid certificate");
         match result {
             Err(Error::InvalidCertificateFormat { path, .. }) => {
-                assert!(path == cert_path);
+                assert_eq!(path, cert_path);
             }
             Err(e) => panic!("Expected InvalidCertificateFormat error, got: {:?}", e),
             Ok(_) => panic!("Should not succeed loading invalid certificate"),
