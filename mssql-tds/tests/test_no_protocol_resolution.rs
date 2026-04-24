@@ -529,4 +529,103 @@ mod no_protocol_resolution {
 
         Ok(())
     }
+
+    /// MultiSubnetFailover + named instance (without explicit port) must be rejected.
+    #[tokio::test]
+    async fn test_msf_with_named_instance_rejected() {
+        init_tracing();
+
+        let mut ctx = ClientContext::default();
+        ctx.user_name = "sa".to_string();
+        ctx.password = "pw".to_string();
+        ctx.multi_subnet_failover = true;
+
+        let provider = TdsConnectionProvider {};
+        let err = provider
+            .create_client(ctx, "myserver\\SQLEXPRESS", None)
+            .await
+            .expect_err("should reject MSF + named instance");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MultiSubnetFailover") && msg.contains("named instance"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// MultiSubnetFailover + instance with explicit port should succeed (no SSRP needed).
+    #[tokio::test]
+    async fn test_msf_with_instance_and_explicit_port_allowed() {
+        init_tracing();
+
+        let mut ctx = ClientContext::default();
+        ctx.user_name = "sa".to_string();
+        ctx.password = "pw".to_string();
+        ctx.multi_subnet_failover = true;
+
+        let provider = TdsConnectionProvider {};
+        // This should NOT produce a UsageError — the explicit port means no SSRP.
+        // It will fail with a ConnectionRefused, which is fine for this test.
+        let result = provider
+            .create_client(ctx, "myserver\\SQLEXPRESS,14330", None)
+            .await;
+
+        if let Err(e) = result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("MultiSubnetFailover"),
+                "should not reject MSF when port is explicit: {msg}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // SSRP Named Instance Resolution (requires SQL Browser + named instance)
+    // =========================================================================
+
+    /// Connect to a named instance via SSRP and verify the correct instance is reached.
+    ///
+    /// Uses `DB_INSTANCE` env var as the datasource (e.g. `localhost\SQLDEV`).
+    /// Defaults to `localhost\SQLDEV` when unset.
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_ssrp_named_instance_resolution() -> TdsResult<()> {
+        init_tracing();
+        dotenv().ok();
+
+        let datasource =
+            env::var("DB_INSTANCE").unwrap_or_else(|_| r"localhost\SQLDEV".to_string());
+        let instance = datasource
+            .split('\\')
+            .nth(1)
+            .expect("DB_INSTANCE must contain a backslash (e.g. localhost\\SQLDEV)");
+
+        // Use Encryption=On + trust cert — this test validates SSRP, not TLS.
+        let mut client =
+            create_client_with_trust_cert(&datasource, EncryptionSetting::On, true).await?;
+
+        let query = "SELECT @@SERVICENAME AS svc";
+        client.execute(query.to_string(), None, None).await?;
+
+        let mut service_name = String::new();
+        loop {
+            if let Some(rs) = client.get_current_resultset()
+                && let Some(row) = rs.next_row().await?
+                && let mssql_tds::datatypes::column_values::ColumnValues::String(s) = &row[0]
+            {
+                service_name = s.to_utf8_string();
+            }
+            if !client.move_to_next().await? {
+                break;
+            }
+        }
+        client.close_query().await?;
+
+        assert!(
+            service_name.eq_ignore_ascii_case(instance),
+            "Expected instance {instance}, got: {service_name}"
+        );
+
+        Ok(())
+    }
 }

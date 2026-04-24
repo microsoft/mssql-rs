@@ -121,6 +121,7 @@ steps:
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
       RUST_BACKTRACE: full
+      SSPI_TEST: '1'
 
   - task: PublishTestResults@2
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
