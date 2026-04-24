@@ -49,8 +49,8 @@ cargo build
 Before submitting changes, run the full check suite:
 
 ```bash
-cargo bfmt       # Format check
-cargo bclippy    # Lint (warnings are errors)
+./scripts/bfmt.sh       # Format check
+./scripts/bclippy.sh    # Lint (warnings are errors)
 cargo btest      # Test with cargo-nextest
 ```
 
