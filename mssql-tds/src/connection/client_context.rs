@@ -685,34 +685,20 @@ pub enum TransportContext {
 impl TransportContext {
     /// Create a TCP TransportContext from a routing token.
     ///
-    /// The routing token may contain "host\instance" format from SQL Server redirection.
-    /// This method uses the datasource parser to extract host, instance, and port.
-    ///
-    /// # Arguments
-    /// * `host` - The host string from the routing token (e.g., "myserver" or "myserver\SQLEXPRESS")
-    /// * `port` - The TCP port from the routing token
-    ///
-    /// # Returns
-    /// A TCP TransportContext with the network hostname and optional instance name
+    /// Routing tokens can legitimately contain both `host\instance` and a port,
+    /// so this method splits on `\` directly instead of going through
+    /// `ParsedDataSource::parse` (which drops the instance when a port is present).
     pub fn from_routing_token(host: String, port: u16) -> Self {
-        // Format as "host,port" or "host\instance,port" and parse using datasource parser
-        let datasource = format!("{},{}", host, port);
-
-        // Use the datasource parser to extract server and instance names
-        // If parsing fails, fall back to using the host as-is
-        let (network_host, instance_name) = match ParsedDataSource::parse(&datasource, false) {
-            Ok(parsed) => {
-                let instance = if parsed.instance_name.is_empty() {
+        let (network_host, instance_name) = match host.split_once('\\') {
+            Some((host_part, instance)) => {
+                let instance = if instance.is_empty() {
                     None
                 } else {
-                    Some(parsed.instance_name)
+                    Some(instance.to_string())
                 };
-                (parsed.server_name, instance)
+                (host_part.to_string(), instance)
             }
-            Err(_) => {
-                // Fallback: use host directly without instance
-                (host, None)
-            }
+            None => (host, None),
         };
 
         TransportContext::Tcp {
@@ -1546,5 +1532,51 @@ mod tests {
 
         ctx.user_agent.set_runtime("1.80.0".to_string());
         assert_eq!(ctx.user_agent.runtime, "1.80.0");
+    }
+
+    #[test]
+    fn from_routing_token_host_only() {
+        let ctx =
+            TransportContext::from_routing_token("myhost.database.windows.net".to_string(), 1433);
+        match &ctx {
+            TransportContext::Tcp {
+                host,
+                port,
+                instance_name,
+            } => {
+                assert_eq!(host, "myhost.database.windows.net");
+                assert_eq!(*port, 1433);
+                assert!(instance_name.is_none());
+            }
+            _ => panic!("Expected Tcp variant"),
+        }
+        assert_eq!(
+            ctx.get_login_server_name(),
+            "myhost.database.windows.net,1433"
+        );
+    }
+
+    #[test]
+    fn from_routing_token_with_instance() {
+        let ctx = TransportContext::from_routing_token(
+            "myhost.pbidedicated.windows.net\\INSTANCE-dw".to_string(),
+            1433,
+        );
+        match &ctx {
+            TransportContext::Tcp {
+                host,
+                port,
+                instance_name,
+            } => {
+                assert_eq!(host, "myhost.pbidedicated.windows.net");
+                assert_eq!(*port, 1433);
+                assert_eq!(instance_name.as_deref(), Some("INSTANCE-dw"));
+            }
+            _ => panic!("Expected Tcp variant"),
+        }
+        assert_eq!(
+            ctx.get_login_server_name(),
+            "myhost.pbidedicated.windows.net\\INSTANCE-dw,1433"
+        );
     }
 }

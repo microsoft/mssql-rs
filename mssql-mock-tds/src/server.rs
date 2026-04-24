@@ -55,6 +55,8 @@ pub struct ConnectionProcessor {
     received_token: Option<Vec<u8>>,
     /// User Agent received during authentication (if any)
     pub user_agent: Option<String>,
+    /// ServerName received in the Login7 packet
+    received_server_name: Option<String>,
     /// Reference to the shared query registry
     query_registry: Arc<Mutex<QueryRegistry>>,
     /// Packet buffer for this connection
@@ -71,6 +73,7 @@ impl ConnectionProcessor {
             is_authenticated: false,
             received_token: None,
             user_agent: None,
+            received_server_name: None,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
             redirection: None,
@@ -88,6 +91,7 @@ impl ConnectionProcessor {
             is_authenticated: false,
             received_token: None,
             user_agent: None,
+            received_server_name: None,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
             redirection,
@@ -107,6 +111,11 @@ impl ConnectionProcessor {
     /// Get the received access token (raw bytes)
     pub fn received_token(&self) -> Option<&[u8]> {
         self.received_token.as_deref()
+    }
+
+    /// Get the ServerName received in the Login7 packet
+    pub fn received_server_name(&self) -> Option<&str> {
+        self.received_server_name.as_deref()
     }
 
     /// Get the received access token as a UTF-16LE decoded string
@@ -175,12 +184,15 @@ impl ConnectionProcessor {
                 // Log the server name sent by client (important for verifying redirection behavior)
                 if let Some(ref server_name) = auth_info.server_name {
                     info!(
-                        "Login7 from {}: client sent ServerName='{}'",
+                        "Login7 from {}: client sent ServerName={:?}",
                         self.addr, server_name
                     );
                 } else {
                     info!("Login7 from {}: no ServerName in packet", self.addr);
                 }
+
+                // Store the server name for test verification
+                self.received_server_name = auth_info.server_name.clone();
 
                 // FedAuth is always supported - check if client used it
                 if auth_info.has_fedauth {
@@ -336,6 +348,8 @@ pub struct ConnectionInfo {
     pub authenticated: bool,
     /// User Agent received during authentication (if any)
     pub user_agent: Option<String>,
+    /// ServerName received in the Login7 packet
+    pub received_server_name: Option<String>,
 }
 
 impl ConnectionInfo {
@@ -373,6 +387,7 @@ impl ConnectionStore {
             received_token: processor.received_token().map(|t| t.to_vec()),
             authenticated: processor.is_authenticated(),
             user_agent: processor.user_agent.clone(),
+            received_server_name: processor.received_server_name().map(|s| s.to_string()),
         };
         self.connections.insert(processor.addr(), info);
     }
