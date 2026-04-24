@@ -21,6 +21,51 @@ use winapi::um::winbase::{PIPE_READMODE_BYTE, PIPE_WAIT};
 /// Timeout for Named Pipe connection attempts (matching ODBC's NP_OPEN_TIMEOUT)
 pub(crate) const NAMED_PIPE_OPEN_TIMEOUT_MS: u32 = 5000;
 
+// Well-known local-host identifiers for pipe-path rewriting.
+const LOCAL_LOCALHOST: &str = "localhost";
+const LOCAL_IPV4_LOOPBACK: &str = "127.0.0.1";
+const LOCAL_IPV6_LOOPBACK: &str = "::1";
+
+/// Rewrite the server component of a UNC pipe path to `.` when it refers to
+/// the local machine.
+///
+/// SQL Browser returns paths like `\\COMPUTERNAME\pipe\MSSQL$INST\sql\query`.
+/// Opening `\\COMPUTERNAME\pipe\...` goes through SMB (network auth), which
+/// often fails with "Access is denied" even on the local machine. Using
+/// `\\.\pipe\...` connects through the local IPC namespace instead, matching
+/// ODBC/SNI behavior.
+pub(crate) fn localize_pipe_path(pipe: &str) -> String {
+    // Must start with \\
+    if !pipe.starts_with("\\\\") {
+        return pipe.to_string();
+    }
+    let after_prefix = &pipe[2..];
+    let sep = match after_prefix.find('\\') {
+        Some(pos) => pos,
+        None => return pipe.to_string(),
+    };
+    let server_part = &after_prefix[..sep];
+
+    // Already local
+    if server_part == "." {
+        return pipe.to_string();
+    }
+
+    let is_local = server_part.eq_ignore_ascii_case(LOCAL_LOCALHOST)
+        || server_part == LOCAL_IPV4_LOOPBACK
+        || server_part == LOCAL_IPV6_LOOPBACK
+        || hostname::get()
+            .ok()
+            .and_then(|n| n.into_string().ok())
+            .is_some_and(|name| server_part.eq_ignore_ascii_case(&name));
+
+    if is_local {
+        format!("\\\\.{}", &after_prefix[sep..])
+    } else {
+        pipe.to_string()
+    }
+}
+
 /// Opens a named pipe with retry logic to handle ERROR_PIPE_BUSY (231).
 ///
 /// When all instances of a named pipe are busy, Windows returns ERROR_PIPE_BUSY.
@@ -177,5 +222,78 @@ impl Stream for NamedPipeClient {
         } else {
             info!("Named Pipe switched to Byte mode for streaming reads");
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localize_already_local_dot() {
+        let path = r"\\.\pipe\sql\query";
+        assert_eq!(localize_pipe_path(path), path);
+    }
+
+    #[test]
+    fn localize_localhost() {
+        assert_eq!(
+            localize_pipe_path(r"\\localhost\pipe\sql\query"),
+            r"\\.\pipe\sql\query"
+        );
+    }
+
+    #[test]
+    fn localize_localhost_case_insensitive() {
+        assert_eq!(
+            localize_pipe_path(r"\\LOCALHOST\pipe\sql\query"),
+            r"\\.\pipe\sql\query"
+        );
+    }
+
+    #[test]
+    fn localize_ipv4_loopback() {
+        assert_eq!(
+            localize_pipe_path(r"\\127.0.0.1\pipe\sql\query"),
+            r"\\.\pipe\sql\query"
+        );
+    }
+
+    #[test]
+    fn localize_ipv6_loopback() {
+        assert_eq!(
+            localize_pipe_path(r"\\::1\pipe\sql\query"),
+            r"\\.\pipe\sql\query"
+        );
+    }
+
+    #[test]
+    fn localize_hostname_match() {
+        let hostname = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .expect("hostname required");
+        let input = format!(r"\\{}\pipe\sql\query", hostname);
+        assert_eq!(localize_pipe_path(&input), r"\\.\pipe\sql\query");
+    }
+
+    #[test]
+    fn localize_remote_server_unchanged() {
+        let path = r"\\remoteserver\pipe\sql\query";
+        assert_eq!(localize_pipe_path(path), path);
+    }
+
+    #[test]
+    fn localize_no_prefix_unchanged() {
+        assert_eq!(localize_pipe_path("sql\\query"), "sql\\query");
+    }
+
+    #[test]
+    fn localize_single_backslash_unchanged() {
+        assert_eq!(localize_pipe_path(r"\pipe"), r"\pipe");
+    }
+
+    #[test]
+    fn localize_no_separator_after_prefix() {
+        assert_eq!(localize_pipe_path(r"\\server"), r"\\server");
     }
 }

@@ -9,6 +9,13 @@
 /// SQL Server service class for SPN.
 const SQL_SERVICE_CLASS: &str = "MSSQLSvc";
 
+// Well-known loopback identifiers used by `is_loopback_address`.
+const LOOPBACK_LOCALHOST: &str = "localhost";
+const LOOPBACK_IPV4: &str = "127.0.0.1";
+const LOOPBACK_IPV6: &str = "::1";
+const LOOPBACK_IPV6_BRACKETED: &str = "[::1]";
+const LOOPBACK_DOT: &str = ".";
+
 /// Generates a Service Principal Name (SPN) for SQL Server.
 ///
 /// The SPN format is: `MSSQLSvc/<hostname>:<port_or_instance>`
@@ -52,13 +59,25 @@ pub fn make_spn(server: &str, instance: Option<&str>, port: u16) -> String {
 /// Determines if a hostname is likely a loopback address.
 ///
 /// This is used on Windows to determine if an empty SPN retry
-/// should be attempted for NTLM fallback.
+/// should be attempted for NTLM fallback. Also matches the local
+/// computer name, since connections to the machine's own hostname
+/// are effectively loopback (e.g. SSRP-resolved named pipes return
+/// the machine name even when the user specified "localhost").
 pub fn is_loopback_address(hostname: &str) -> bool {
     let hostname_lower = hostname.to_lowercase();
     matches!(
         hostname_lower.as_str(),
-        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "."
+        LOOPBACK_LOCALHOST | LOOPBACK_IPV4 | LOOPBACK_IPV6 | LOOPBACK_IPV6_BRACKETED | LOOPBACK_DOT
     ) || hostname_lower.starts_with("127.")
+        || is_local_computer_name(hostname)
+}
+
+/// Checks if the given hostname matches the local computer name.
+fn is_local_computer_name(hostname: &str) -> bool {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .is_some_and(|name| name.eq_ignore_ascii_case(hostname))
 }
 
 /// Checks if a string looks like an IP address (v4 or v6).
@@ -291,10 +310,29 @@ mod tests {
     }
 
     #[test]
+    fn test_is_loopback_computer_name() {
+        // The local computer name should be treated as loopback
+        if let Ok(name) = hostname::get().and_then(|h| {
+            h.into_string()
+                .map_err(|_| std::io::Error::other("non-utf8"))
+        }) {
+            assert!(
+                is_loopback_address(&name),
+                "local computer name '{}' should be loopback",
+                name
+            );
+            assert!(
+                is_loopback_address(&name.to_uppercase()),
+                "case-insensitive match"
+            );
+        }
+    }
+
+    #[test]
     fn test_is_not_loopback() {
         assert!(!is_loopback_address("server.contoso.com"));
         assert!(!is_loopback_address("192.168.1.1"));
-        assert!(!is_loopback_address("myserver"));
+        assert!(!is_loopback_address("definitely-not-this-machine-name-xyz"));
     }
 
     // ========================

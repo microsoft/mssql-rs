@@ -133,17 +133,56 @@ impl Row {
     }
 }
 
+/// An informational message injected into the result stream.
+///
+/// Fabric DW injects these between ColMetadata and Row tokens with tracing
+/// metadata (Statement ID, Query hash, Distributed request ID).
+#[derive(Debug, Clone)]
+pub struct InfoMessage {
+    pub number: u32,
+    pub state: u8,
+    pub severity: u8,
+    pub message: String,
+    pub server_name: String,
+    pub proc_name: String,
+    pub line_number: u32,
+}
+
+impl InfoMessage {
+    pub fn new(number: u32, severity: u8, message: impl Into<String>) -> Self {
+        Self {
+            number,
+            state: 1,
+            severity,
+            message: message.into(),
+            server_name: String::new(),
+            proc_name: String::new(),
+            line_number: 0,
+        }
+    }
+}
+
 /// A complete query response definition
 #[derive(Debug, Clone)]
 pub struct QueryResponse {
     pub columns: Vec<ColumnDefinition>,
     pub rows: Vec<Row>,
+    pub info_tokens: Vec<InfoMessage>,
 }
 
 impl QueryResponse {
     /// Create a new query response
     pub fn new(columns: Vec<ColumnDefinition>, rows: Vec<Row>) -> Self {
-        Self { columns, rows }
+        Self {
+            columns,
+            rows,
+            info_tokens: Vec::new(),
+        }
+    }
+
+    pub fn with_info_tokens(mut self, info_tokens: Vec<InfoMessage>) -> Self {
+        self.info_tokens = info_tokens;
+        self
     }
 
     /// Helper to create a response for SELECT 1
@@ -151,6 +190,7 @@ impl QueryResponse {
         Self {
             columns: vec![ColumnDefinition::new("", SqlDataType::Int)],
             rows: vec![Row::new(vec![ColumnValue::Int(1)])],
+            info_tokens: Vec::new(),
         }
     }
 
@@ -167,6 +207,7 @@ impl QueryResponse {
                 ColumnValue::Int(2),
                 ColumnValue::Int(3),
             ])],
+            info_tokens: Vec::new(),
         }
     }
 }

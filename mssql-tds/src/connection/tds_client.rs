@@ -1118,6 +1118,10 @@ impl TdsClient {
                                 .to_string(),
                         ));
                     }
+                    Tokens::Info(info_token) => {
+                        info!(?info_token);
+                        continue;
+                    }
                     _ => {
                         return Err(crate::error::Error::ProtocolError(format!(
                             "Unexpected token while finding the next row: {token:?}"
