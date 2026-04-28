@@ -15,12 +15,15 @@ steps:
 - ${{ if eq(parameters.osType, 'Windows') }}:
   - pwsh: .pipeline/scripts/apply-ci-cargo-config.ps1
     displayName: Apply CI cargo configuration
+    condition: ne(variables['Build.Reason'], 'PullRequest')
 
 - ${{ if ne(parameters.osType, 'Windows') }}:
   - script: bash .pipeline/scripts/apply-ci-cargo-config.sh
     displayName: Apply CI cargo configuration
+    condition: ne(variables['Build.Reason'], 'PullRequest')
 
 - task: CargoAuthenticate@0
   inputs:
     configFile: '.cargo/config.toml'
   displayName: Authenticate cargo registries
+  condition: ne(variables['Build.Reason'], 'PullRequest')
