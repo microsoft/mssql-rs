@@ -8,6 +8,10 @@ parameters:
   - MacOS
 
 steps:
+- template: generate-sql-password-template.yml
+  parameters:
+    osType: ${{ parameters.buildTarget }}
+
 - ${{ if eq(parameters.buildTarget, 'Windows') }}:
   - task: PowerShell@2
     displayName: 'Generate Certificate for TLS encryption '
