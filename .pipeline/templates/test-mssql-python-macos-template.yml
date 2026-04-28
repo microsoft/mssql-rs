@@ -3,6 +3,11 @@
 # via Colima (no TLS certs) and runs pytest with TrustServerCertificate=yes.
 
 steps:
+# ── 0. Generate per-job SQL_PASSWORD ─────────────────────────────────────────
+- template: generate-sql-password-template.yml
+  parameters:
+    osType: MacOS
+
 # ── 1. Python & Cargo setup ──────────────────────────────────────────────────
 - task: UsePythonVersion@0
   inputs:

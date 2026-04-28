@@ -37,6 +37,10 @@ parameters:
   default: ''
 
 steps:
+- template: generate-sql-password-template.yml
+  parameters:
+    osType: Linux
+
 - task: DockerInstaller@0
   inputs:
     dockerVersion: '29.0.0'
