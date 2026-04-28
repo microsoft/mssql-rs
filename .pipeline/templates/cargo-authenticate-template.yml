@@ -26,3 +26,4 @@ steps:
   inputs:
     configFile: '.cargo/config.toml'
   displayName: Authenticate cargo registries
+  condition: ne(variables['Build.Reason'], 'PullRequest')
