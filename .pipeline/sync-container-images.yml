@@ -118,7 +118,7 @@ stages:
     steps:
     - checkout: none
     - task: AzureCLI@2
-      displayName: 'Import manylinux x64'
+      displayName: 'Import manylinux_2_34 x64'
       inputs:
         azureSubscription: 'Magnitude Test'
         scriptType: 'bash'
@@ -131,7 +131,7 @@ stages:
             --force
       retryCountOnTaskFailure: 3
     - task: AzureCLI@2
-      displayName: 'Import manylinux arm64'
+      displayName: 'Import manylinux_2_34 arm64'
       inputs:
         azureSubscription: 'Magnitude Test'
         scriptType: 'bash'
@@ -141,6 +141,32 @@ stages:
             --name $(ACR_NAME) \
             --source quay.io/pypa/manylinux_2_34_aarch64:latest \
             --image import/python-build/manylinux_2_34_aarch64:latest \
+            --force
+      retryCountOnTaskFailure: 3
+    - task: AzureCLI@2
+      displayName: 'Import manylinux_2_28 x64'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az acr import \
+            --name $(ACR_NAME) \
+            --source quay.io/pypa/manylinux_2_28_x86_64:latest \
+            --image import/python-build/manylinux_2_28_x86_64:latest \
+            --force
+      retryCountOnTaskFailure: 3
+    - task: AzureCLI@2
+      displayName: 'Import manylinux_2_28 arm64'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az acr import \
+            --name $(ACR_NAME) \
+            --source quay.io/pypa/manylinux_2_28_aarch64:latest \
+            --image import/python-build/manylinux_2_28_aarch64:latest \
             --force
       retryCountOnTaskFailure: 3
 
@@ -821,7 +847,7 @@ stages:
           echo "======================================================"
           echo "Vanilla PyPA Base Images:"
           echo "======================================================"
-          for image in import/python-build/manylinux_2_34_x86_64 import/python-build/manylinux_2_34_aarch64 import/python-build/musllinux_1_2_x86_64 import/python-build/musllinux_1_2_aarch64; do
+          for image in import/python-build/manylinux_2_34_x86_64 import/python-build/manylinux_2_34_aarch64 import/python-build/manylinux_2_28_x86_64 import/python-build/manylinux_2_28_aarch64 import/python-build/musllinux_1_2_x86_64 import/python-build/musllinux_1_2_aarch64; do
             echo ""
             echo "==> $image"
             az acr repository show-tags --name $(ACR_NAME) --repository $image --output table --orderby time_desc --top 3 || echo "  (not found)"
@@ -871,10 +897,12 @@ stages:
         echo ""
         echo "Available images in ACR:"
         echo "  Vanilla PyPA base images:"
-        echo "    - $(ACR_REGISTRY)/python-build/manylinux_2_34_x86_64:latest"
-        echo "    - $(ACR_REGISTRY)/python-build/manylinux_2_34_aarch64:latest"
-        echo "    - $(ACR_REGISTRY)/python-build/musllinux_1_2_x86_64:latest"
-        echo "    - $(ACR_REGISTRY)/python-build/musllinux_1_2_aarch64:latest"
+        echo "    - $(ACR_REGISTRY)/import/python-build/manylinux_2_34_x86_64:latest"
+        echo "    - $(ACR_REGISTRY)/import/python-build/manylinux_2_34_aarch64:latest"
+        echo "    - $(ACR_REGISTRY)/import/python-build/manylinux_2_28_x86_64:latest"
+        echo "    - $(ACR_REGISTRY)/import/python-build/manylinux_2_28_aarch64:latest"
+        echo "    - $(ACR_REGISTRY)/import/python-build/musllinux_1_2_x86_64:latest"
+        echo "    - $(ACR_REGISTRY)/import/python-build/musllinux_1_2_aarch64:latest"
         echo ""
         echo "  Custom images with Rust (RECOMMENDED FOR CI/CD):"
         echo "    - $(ACR_REGISTRY)/python-build/manylinux_2_34_x86_64_rust:latest"
