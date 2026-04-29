@@ -114,6 +114,14 @@ impl Stream for ExtractableStream {
             stream.tls_handshake_completed();
         }
     }
+
+    fn is_connection_dead(&self) -> bool {
+        if let Some(ref stream) = *self.inner.lock().unwrap() {
+            stream.is_connection_dead()
+        } else {
+            true
+        }
+    }
 }
 
 #[cfg(test)]

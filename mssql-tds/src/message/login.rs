@@ -14,13 +14,15 @@ use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
 use crate::token::fed_auth_info::{FedAuthInfoToken, SspiToken};
 use crate::token::login_ack::LoginAckToken;
 use crate::token::tokens::{
-    EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, SqlCollation, Token, Tokens,
+    EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, SessionStateToken, SqlCollation,
+    Token, Tokens,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
 use super::features::fedauth::FedAuthFeature;
+use super::features::session_recovery::SessionRecoveryFeature;
 use super::features::useragent::UserAgentFeature;
 use super::features::utf8::Utf8Feature;
 use super::features::vectorfeature::VectorFeature;
@@ -249,16 +251,59 @@ impl FeaturesRequest {
     }
 }
 
+use crate::connection::session_recovery::SessionRecoveryData;
+
 impl From<(&ClientContext, bool)> for FeaturesRequest {
     fn from(context_and_prelogin_fedauth_flag: (&ClientContext, bool)) -> Self {
         let context = context_and_prelogin_fedauth_flag.0;
-        FeaturesRequest::build(
+        let mut request = FeaturesRequest::build(
             context.tds_authentication_method.clone(),
             context.access_token.clone(),
             context_and_prelogin_fedauth_flag.1,
             context.vector_version,
             UserAgentFeature::new(context),
-        )
+        );
+
+        if context.connect_retry_count > 0 {
+            request.features.insert(
+                FeatureExtension::SRecovery,
+                Box::new(SessionRecoveryFeature::new(context.connect_retry_count)),
+            );
+        }
+
+        request
+    }
+}
+
+impl FeaturesRequest {
+    /// Builds a FeaturesRequest with optional recovery data for session reconnection.
+    /// When `recovery_data` is provided, the session recovery feature will carry
+    /// the reconnection state in the LOGIN7 packet.
+    pub(crate) fn from_context_with_recovery(
+        context: &ClientContext,
+        prelogin_fedauth_response: bool,
+        recovery_data: Option<&SessionRecoveryData>,
+    ) -> Self {
+        let mut request = FeaturesRequest::build(
+            context.tds_authentication_method.clone(),
+            context.access_token.clone(),
+            prelogin_fedauth_response,
+            context.vector_version,
+            UserAgentFeature::new(context),
+        );
+
+        if context.connect_retry_count > 0 {
+            let feature = if let Some(recovery_data) = recovery_data {
+                SessionRecoveryFeature::from(Box::new(recovery_data.clone()))
+            } else {
+                SessionRecoveryFeature::new(context.connect_retry_count)
+            };
+            request
+                .features
+                .insert(FeatureExtension::SRecovery, Box::new(feature));
+        }
+
+        request
     }
 }
 
@@ -295,6 +340,7 @@ impl LoginRequestModel<'_> {
         context: &'a ClientContext,
         pre_login_fedauth_response: bool,
         transport_context: &'b TransportContext,
+        recovery_data: Option<&SessionRecoveryData>,
     ) -> LoginRequestModel<'b>
     where
         'a: 'b,
@@ -305,7 +351,11 @@ impl LoginRequestModel<'_> {
             option_flags3: context.into(),
             type_flags: context.into(),
             tds_version: context.tds_version(),
-            features_request: (context, pre_login_fedauth_response).into(),
+            features_request: FeaturesRequest::from_context_with_recovery(
+                context,
+                pre_login_fedauth_response,
+                recovery_data,
+            ),
             user_input: context,
             transport_context,
             client_prog_ver: context.encode_driver_version(),
@@ -324,11 +374,17 @@ impl LoginRequestModel<'_> {
         pre_login_fedauth_response: bool,
         transport_context: &'b TransportContext,
         sspi_token: Vec<u8>,
+        recovery_data: Option<&SessionRecoveryData>,
     ) -> LoginRequestModel<'b>
     where
         'a: 'b,
     {
-        let mut model = Self::from_context(context, pre_login_fedauth_response, transport_context);
+        let mut model = Self::from_context(
+            context,
+            pre_login_fedauth_response,
+            transport_context,
+            recovery_data,
+        );
         model.sspi_token = Some(sspi_token);
         model
     }
@@ -342,6 +398,8 @@ pub(crate) struct LoginResponseModel {
     pub fed_auth_info: Option<FedAuthInfoToken>,
     /// SSPI challenge token from server for integrated authentication
     pub sspi_token: Option<SspiToken>,
+    /// Session state tokens received during login, for transfer to RecoveryContext.
+    pub session_state_tokens: Vec<SessionStateToken>,
 }
 
 #[repr(u8)]
@@ -367,6 +425,7 @@ impl LoginResponseModel {
             success_token: None,
             fed_auth_info: None,
             sspi_token: None,
+            session_state_tokens: Vec::new(),
         }
     }
 
@@ -619,6 +678,13 @@ impl LoginResponse {
                                 "Received {:?} during login response parsing.",
                                 token_type
                             );
+                        }
+                        Tokens::SessionState(session_state) => {
+                            event!(
+                                Level::INFO,
+                                "Received SessionState token during login response parsing."
+                            );
+                            response_model.session_state_tokens.push(session_state);
                         }
                         Tokens::Sspi(sspi_token) => {
                             event!(

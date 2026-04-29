@@ -2,26 +2,33 @@
 // Licensed under the MIT License.
 
 use crate::connection::client_context::{ClientContext, TransportContext};
-use crate::core::{EncryptionSetting, NegotiatedEncryptionSetting, TdsResult};
+use crate::connection::session_recovery::SessionRecoveryData;
+use crate::core::{EncryptionSetting, NegotiatedEncryptionSetting, TdsResult, Version};
 use crate::error::Error;
 use crate::handler::sspi_handler::SspiAuthHandler;
 use crate::io::packet_reader::TdsPacketReader;
 use crate::io::reader_writer::NetworkReaderWriter;
 use crate::io::token_stream::TdsTokenStreamReader;
 use crate::message::login::{
-    EnvChangeProperties, Feature, FeaturesRequest, FedAuthTokenRequest, LoginRequest,
-    LoginRequestModel, LoginResponse, LoginResponseModel, LoginResponseStatus, SspiRequest,
+    EnvChangeProperties, Feature, FeatureExtension, FeaturesRequest, FedAuthTokenRequest,
+    LoginRequest, LoginRequestModel, LoginResponse, LoginResponseModel, LoginResponseStatus,
+    SspiRequest,
 };
+use crate::message::login_options::TdsVersion;
 use crate::message::messages::Request;
 use crate::message::prelogin::{
     EncryptionType, PreloginRequest, PreloginRequestModel, PreloginResponse,
 };
+use crate::token::login_ack::LoginAckToken;
 use crate::token::tokens::SqlCollation;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 pub(crate) struct HandlerFactory {
     pub(crate) context: ClientContext,
+    /// Recovery data for session reconnection, passed separately from ClientContext
+    /// since it is internal-only state not meant for library consumers.
+    pub(crate) recovery_data: Option<Box<SessionRecoveryData>>,
 }
 
 impl HandlerFactory {
@@ -70,6 +77,7 @@ impl HandlerFactory {
             &self.context,
             prelogin_fedauth_supported,
             transport_context,
+            self.recovery_data.as_deref(),
         )
     }
 
@@ -89,6 +97,10 @@ pub(crate) struct NegotiatedSettings {
     pub database: String,
     #[allow(dead_code)] // populated during login, consumed by future env-change tracking
     pub char_set: Option<String>,
+    /// TDS version from LoginAckToken, captured for session recovery validation.
+    pub login_ack_tds_version: Option<TdsVersion>,
+    /// Server program version from LoginAckToken, captured for session recovery validation.
+    pub login_ack_server_version: Option<Version>,
 }
 
 impl NegotiatedSettings {
@@ -98,6 +110,8 @@ impl NegotiatedSettings {
         language: String,
         database: String,
         char_set: Option<String>,
+        login_ack_tds_version: Option<TdsVersion>,
+        login_ack_server_version: Option<Version>,
     ) -> Self {
         NegotiatedSettings {
             session_settings,
@@ -105,7 +119,17 @@ impl NegotiatedSettings {
             language,
             database,
             char_set,
+            login_ack_tds_version,
+            login_ack_server_version,
         }
+    }
+
+    /// Check if session recovery was acknowledged by the server in FEATUREEXTACK.
+    pub(crate) fn is_session_recovery_acknowledged(&self) -> bool {
+        self.session_settings
+            .supported_features
+            .iter()
+            .any(|f| f.feature_identifier() == FeatureExtension::SRecovery && f.is_acknowledged())
     }
 }
 
@@ -115,9 +139,9 @@ pub(crate) struct SessionSettings {
     pub packet_size: u32,
     #[allow(dead_code)] // populated during login, consumed by future session introspection
     pub user_name: String,
-    supported_features: Vec<Box<dyn Feature>>,
+    pub(crate) supported_features: Vec<Box<dyn Feature>>,
     #[allow(dead_code)] // populated during login, consumed by future MARS support
-    mars_enabled: bool,
+    pub(crate) mars_enabled: bool,
     #[allow(dead_code)] // populated during login, consumed by future auth flow
     pub pre_login_has_fedauth_supported: bool,
     #[allow(dead_code)] // populated during login, consumed by future encryption tracking
@@ -146,8 +170,8 @@ impl SessionSettings {
     }
 }
 
-// Helper function for fuzzing to create test settings
-#[cfg(fuzzing)]
+// Helper function for fuzzing and tests to create test settings
+#[cfg(any(fuzzing, test))]
 pub(crate) fn create_test_negotiated_settings_internal() -> NegotiatedSettings {
     let session_settings = SessionSettings {
         packet_size: 4096,
@@ -169,6 +193,8 @@ pub(crate) fn create_test_negotiated_settings_internal() -> NegotiatedSettings {
         language: "us_english".to_string(),
         database: "master".to_string(),
         char_set: None,
+        login_ack_tds_version: None,
+        login_ack_server_version: None,
     }
 }
 
@@ -260,12 +286,19 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
             }
         };
 
+        let (login_ack_tds_version, login_ack_server_version) = match &login_result.login_ack {
+            Some(ack) => (Some(ack.tds_version), Some(ack.prog_version)),
+            None => (None, None),
+        };
+
         Ok(NegotiatedSettings::new(
             session_settings,
             database_collation,
             "".to_string(),
             database,
             change_props.char_set.clone(),
+            login_ack_tds_version,
+            login_ack_server_version,
         ))
     }
 
@@ -378,6 +411,7 @@ struct LoginResult {
     supported_features: Vec<Box<dyn Feature>>,
     change_properties: EnvChangeProperties,
     status: LoginResponseStatus,
+    login_ack: Option<LoginAckToken>,
 }
 
 pub struct LoginHandler<'a> {
@@ -501,6 +535,7 @@ impl LoginHandler<'_> {
             supported_features: vec![],
             change_properties: login_response.change_properties,
             status: response_status,
+            login_ack: login_response.success_token,
         })
     }
 
@@ -548,6 +583,7 @@ impl LoginHandler<'_> {
                     self.prelogin_fedauth_supported,
                     transport_context,
                     token,
+                    self.factory.recovery_data.as_deref(),
                 ),
             }
         } else {

@@ -269,6 +269,11 @@ impl Stream for TlsStream<Box<dyn Stream>> {
         // So we need get_mut() three times to reach the underlying Box<dyn Stream>
         self.get_mut().get_mut().get_mut().tls_handshake_completed();
     }
+
+    fn is_connection_dead(&self) -> bool {
+        // Navigate through the TLS wrapper chain using get_ref() to reach the underlying stream
+        self.get_ref().get_ref().get_ref().is_connection_dead()
+    }
 }
 
 struct ActiveWriteState {
@@ -649,6 +654,10 @@ impl<S: Stream> Stream for TlsOverTdsStream<S> {
         self.has_completed_tls_handshake = true;
         self.wrapped_stream.tls_handshake_completed();
     }
+
+    fn is_connection_dead(&self) -> bool {
+        self.wrapped_stream.is_connection_dead()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -661,6 +670,10 @@ impl Stream for BufferedTdsStream {
     fn tls_handshake_completed(&mut self) {
         self.is_executing_tls_handshake = false;
         self.tls_over_tds_stream.tls_handshake_completed();
+    }
+
+    fn is_connection_dead(&self) -> bool {
+        self.tls_over_tds_stream.is_connection_dead()
     }
 }
 

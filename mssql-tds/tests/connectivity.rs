@@ -293,4 +293,286 @@ mod connectivity {
             unreachable!("Expected a int value");
         }
     }
+
+    // ── Session Recovery Integration Tests ────────────────────────
+    //
+    // These tests require a live SQL Server with DB_HOST, DB_USERNAME,
+    // and SQL_PASSWORD env vars set. They are excluded from CI by the
+    // `not (test(connectivity))` nextest filter.
+
+    mod session_recovery {
+        use crate::common::{build_tcp_datasource, create_context, get_scalar_value, init_tracing};
+        use mssql_tds::connection::tds_client::ResultSet;
+        use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+        use mssql_tds::datatypes::column_values::ColumnValues;
+
+        #[ctor::ctor]
+        fn init() {
+            init_tracing();
+        }
+
+        /// Helper: get the current SPID (session ID) for a connection.
+        async fn get_spid(
+            client: &mut mssql_tds::connection::tds_client::TdsClient,
+        ) -> Result<i16, Box<dyn std::error::Error>> {
+            client
+                .execute("SELECT @@SPID".to_string(), None, None)
+                .await?;
+            let value = get_scalar_value(client).await?;
+            match value {
+                Some(ColumnValues::SmallInt(spid)) => Ok(spid),
+                other => Err(format!("Expected SmallInt for @@SPID, got {:?}", other).into()),
+            }
+        }
+
+        /// Helper: execute a query and drain all results.
+        async fn exec_and_drain(
+            client: &mut mssql_tds::connection::tds_client::TdsClient,
+            query: &str,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            client.execute(query.to_string(), None, None).await?;
+            while client.next_row().await?.is_some() {}
+            client.close_query().await?;
+            Ok(())
+        }
+
+        /// Helper: execute a query and return a single string scalar.
+        async fn get_string_scalar(
+            client: &mut mssql_tds::connection::tds_client::TdsClient,
+            query: &str,
+        ) -> Result<String, Box<dyn std::error::Error>> {
+            client.execute(query.to_string(), None, None).await?;
+            let value = get_scalar_value(client).await?;
+            match value {
+                Some(ColumnValues::String(s)) => Ok(s.to_string()),
+                other => Err(format!("Expected String, got {:?}", other).into()),
+            }
+        }
+
+        // ── Feature Negotiation ───────────────────────────────────────
+
+        /// Verify that session recovery is negotiated when connect_retry_count > 0
+        /// (the default). The server must acknowledge feature 0x01 in FEATUREEXTACK.
+        #[tokio::test]
+        async fn feature_negotiation_enabled_by_default() -> Result<(), Box<dyn std::error::Error>>
+        {
+            let context = create_context();
+            // connect_retry_count defaults to 1, which enables session recovery
+            assert!(context.connect_retry_count > 0);
+
+            let provider = TdsConnectionProvider {};
+            let client = provider
+                .create_client(context, &build_tcp_datasource(), None)
+                .await?;
+
+            assert!(
+                client.is_session_recovery_enabled(),
+                "Server should acknowledge session recovery feature"
+            );
+            assert_eq!(client.connection_recovery_count(), 0);
+            Ok(())
+        }
+
+        /// Verify that session recovery is NOT negotiated when connect_retry_count == 0.
+        #[tokio::test]
+        async fn feature_negotiation_disabled_when_retry_zero()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut context = create_context();
+            context.connect_retry_count = 0;
+
+            let provider = TdsConnectionProvider {};
+            let client = provider
+                .create_client(context, &build_tcp_datasource(), None)
+                .await?;
+
+            assert!(
+                !client.is_session_recovery_enabled(),
+                "Session recovery should not be negotiated when connect_retry_count == 0"
+            );
+            Ok(())
+        }
+
+        // ── Session State Accumulation ────────────────────────────────
+
+        /// Verify that after USE [database], the connection still works (session
+        /// state is tracked internally).
+        #[tokio::test]
+        async fn session_state_tracked_after_use_database() -> Result<(), Box<dyn std::error::Error>>
+        {
+            let provider = TdsConnectionProvider {};
+            let mut client = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+
+            // Switch database — generates ENVCHANGE + potentially SESSIONSTATE tokens
+            exec_and_drain(&mut client, "USE [tempdb]").await?;
+
+            let db = get_string_scalar(&mut client, "SELECT DB_NAME()").await?;
+            assert_eq!(db, "tempdb");
+
+            exec_and_drain(&mut client, "USE [master]").await?;
+            let db = get_string_scalar(&mut client, "SELECT DB_NAME()").await?;
+            assert_eq!(db, "master");
+
+            Ok(())
+        }
+
+        // ── Reconnection After KILL ─────────────────────────────
+
+        /// Kill the connection's SPID from a second connection, then verify that
+        /// the next command transparently reconnects and succeeds.
+        #[tokio::test]
+        async fn transparent_reconnect_after_kill() -> Result<(), Box<dyn std::error::Error>> {
+            let provider = TdsConnectionProvider {};
+            let mut client = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+
+            assert!(client.is_session_recovery_enabled());
+
+            let original_spid = get_spid(&mut client).await?;
+
+            let mut killer = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            exec_and_drain(&mut killer, &format!("KILL {}", original_spid)).await?;
+
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let new_spid = get_spid(&mut client).await?;
+
+            assert_ne!(
+                original_spid, new_spid,
+                "SPID should change after reconnection (was {}, now {})",
+                original_spid, new_spid
+            );
+            assert_eq!(
+                client.connection_recovery_count(),
+                1,
+                "Recovery count should be 1 after one reconnection"
+            );
+
+            Ok(())
+        }
+
+        /// Verify that session state (database context) is restored after reconnection.
+        #[tokio::test]
+        async fn session_state_restored_after_reconnect() -> Result<(), Box<dyn std::error::Error>>
+        {
+            let provider = TdsConnectionProvider {};
+            let mut client = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+
+            exec_and_drain(&mut client, "USE [tempdb]").await?;
+            let db_before = get_string_scalar(&mut client, "SELECT DB_NAME()").await?;
+            assert_eq!(db_before, "tempdb");
+
+            let original_spid = get_spid(&mut client).await?;
+            let mut killer = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            exec_and_drain(&mut killer, &format!("KILL {}", original_spid)).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let db_after = get_string_scalar(&mut client, "SELECT DB_NAME()").await?;
+            assert_eq!(
+                db_after, "tempdb",
+                "Database context should be restored to tempdb after reconnection"
+            );
+            assert_eq!(client.connection_recovery_count(), 1);
+
+            Ok(())
+        }
+
+        /// Verify that multiple successive recoveries work and the count increments.
+        #[tokio::test]
+        async fn multiple_recoveries_increment_count() -> Result<(), Box<dyn std::error::Error>> {
+            let provider = TdsConnectionProvider {};
+            let mut client = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+
+            for expected_count in 1..=2u32 {
+                let spid = get_spid(&mut client).await?;
+
+                let mut killer = provider
+                    .create_client(create_context(), &build_tcp_datasource(), None)
+                    .await?;
+                exec_and_drain(&mut killer, &format!("KILL {}", spid)).await?;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                exec_and_drain(&mut client, "SELECT 1").await?;
+                assert_eq!(client.connection_recovery_count(), expected_count);
+            }
+
+            Ok(())
+        }
+
+        // ── Recovery Blocked by Transaction ───────────────────────────
+
+        /// When a transaction is active and the connection is killed, recovery
+        /// should fail because is_recovery_possible() returns false.
+        #[tokio::test]
+        async fn recovery_blocked_during_transaction() -> Result<(), Box<dyn std::error::Error>> {
+            use mssql_tds::message::transaction_management::TransactionIsolationLevel;
+
+            let provider = TdsConnectionProvider {};
+            let mut client = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+
+            client
+                .begin_transaction(TransactionIsolationLevel::ReadCommitted, None)
+                .await?;
+
+            let spid = get_spid(&mut client).await?;
+
+            let mut killer = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            exec_and_drain(&mut killer, &format!("KILL {}", spid)).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let result = client.execute("SELECT 1".to_string(), None, None).await;
+            assert!(
+                result.is_err(),
+                "Should fail when connection is dead and transaction is active"
+            );
+
+            Ok(())
+        }
+
+        // ── Connection Open Retry ────────────────────────────────────
+
+        /// Verify that connection to an unreachable host eventually fails with
+        /// a timeout error (not instant), confirming retry logic runs.
+        #[tokio::test]
+        async fn connection_open_retry_with_unreachable_host()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut context = create_context();
+            context.connect_retry_count = 1;
+            context.connect_retry_interval = 1;
+            context.connect_timeout = 5;
+
+            let provider = TdsConnectionProvider {};
+            let start = std::time::Instant::now();
+            let result = provider
+                .create_client(context, "tcp:192.0.2.1,1433", None)
+                .await;
+            let elapsed = start.elapsed();
+
+            assert!(
+                result.is_err(),
+                "Connection to unreachable host should fail"
+            );
+            assert!(
+                elapsed.as_secs() >= 1,
+                "Should have retried at least once (elapsed: {:?})",
+                elapsed
+            );
+
+            Ok(())
+        }
+    }
 }

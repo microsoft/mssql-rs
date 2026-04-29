@@ -11,7 +11,8 @@ use crate::token::parsers::{
     ColMetadataTokenParser, DoneInProcTokenParser, DoneProcTokenParser, DoneTokenParser,
     EnvChangeTokenParser, ErrorTokenParser, FeatureExtAckTokenParser, FedAuthInfoTokenParser,
     InfoTokenParser, LoginAckTokenParser, NbcRowTokenParser, OrderTokenParser,
-    ReturnStatusTokenParser, ReturnValueTokenParser, RowTokenParser, SspiTokenParser,
+    ReturnStatusTokenParser, ReturnValueTokenParser, RowTokenParser, SessionStateTokenParser,
+    SspiTokenParser,
 };
 use crate::token::tokens::{ColMetadataToken, TokenType, Tokens};
 use async_trait::async_trait;
@@ -162,6 +163,7 @@ pub(crate) async fn dispatch_token<R: TdsPacketReader + Send + Sync>(
         TokenParsers::ReturnStatus(parser) => parser.parse(reader, context).await,
         TokenParsers::NbcRow(parser) => parser.parse(reader, context).await,
         TokenParsers::ReturnValue(parser) => parser.parse(reader, context).await,
+        TokenParsers::SessionState(parser) => parser.parse(reader, context).await,
         TokenParsers::Sspi(parser) => parser.parse(reader, context).await,
     }
 }
@@ -404,6 +406,10 @@ impl Default for GenericTokenParserRegistry {
             TokenParsers::from(ReturnValueTokenParser::default()),
         );
         internal_registry.insert(TokenType::SSPI, TokenParsers::from(SspiTokenParser));
+        internal_registry.insert(
+            TokenType::SessionState,
+            TokenParsers::from(SessionStateTokenParser),
+        );
         Self {
             parsers: internal_registry,
         }
@@ -433,6 +439,7 @@ pub enum TokenParsers {
     ReturnStatus(ReturnStatusTokenParser),
     NbcRow(NbcRowTokenParser<GenericDecoder>),
     ReturnValue(ReturnValueTokenParser<GenericDecoder>),
+    SessionState(SessionStateTokenParser),
     Sspi(SspiTokenParser),
 }
 
@@ -464,6 +471,7 @@ impl_from_token_parser!(
     ReturnStatusTokenParser => ReturnStatus,
     NbcRowTokenParser<GenericDecoder> => NbcRow,
     ReturnValueTokenParser<GenericDecoder> => ReturnValue,
+    SessionStateTokenParser => SessionState,
     SspiTokenParser => Sspi
 );
 
@@ -501,6 +509,7 @@ mod tests {
         assert!(registry.get_parser(&TokenType::ReturnStatus).is_some());
         assert!(registry.get_parser(&TokenType::NbcRow).is_some());
         assert!(registry.get_parser(&TokenType::ReturnValue).is_some());
+        assert!(registry.get_parser(&TokenType::SessionState).is_some());
     }
 
     #[test]
