@@ -18,8 +18,8 @@ gssapi = []
 integrated-auth = ["sspi", "gssapi"]
 
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(feature, values("sspi", "gssapi", "integrated-auth"))'] }
+[lints]
+workspace = true
 
 [dependencies]
 async-trait = "0.1.89"
