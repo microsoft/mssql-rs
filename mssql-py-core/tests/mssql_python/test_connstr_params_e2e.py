@@ -203,6 +203,15 @@ class TestParamForwardingSpy:
         cur.close()
         conn.close()
 
+    def test_connect_retry_forwarded(self):
+        conn = _connect(_base_connstr(ConnectRetryCount=3, ConnectRetryInterval=5))
+        cur = conn.cursor()
+        ctx = _capture_pycore_context(cur)
+        assert ctx["connect_retry_count"] == 3
+        assert ctx["connect_retry_interval"] == 5
+        cur.close()
+        conn.close()
+
     def test_host_name_in_certificate_forwarded(self):
         conn = _connect(_base_connstr(HostNameInCertificate="*.database.windows.net"))
         cur = conn.cursor()
@@ -690,6 +699,17 @@ class TestParamForwardingLive:
         """multi_subnet_failover='Yes' → connection still succeeds."""
         import mssql_py_core
         ctx = self._pycore_ctx(multi_subnet_failover="Yes")
+        conn = mssql_py_core.PyCoreConnection(ctx)
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        assert cur.fetchone()[0] == 1
+        cur.close()
+        conn.close()
+
+    def test_connect_retry_does_not_break_connection(self):
+        """connect_retry_count and interval → connection still succeeds."""
+        import mssql_py_core
+        ctx = self._pycore_ctx(connect_retry_count=3, connect_retry_interval=5)
         conn = mssql_py_core.PyCoreConnection(ctx)
         cur = conn.cursor()
         cur.execute("SELECT 1")
