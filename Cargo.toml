@@ -28,9 +28,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(feature, v
 # assertions_on_result_states = "warn"
 
 # Don't Do Bad Async Stuff - prevent deadlocks and concurrency bugs
-# await_holding_lock = "warn"
-# await_holding_refcell_ref = "warn"
-# large_futures = "warn"
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+large_futures = "warn"
 
 # Don't Do Unsafe Things with Memory
 # mem_forget = "warn"
