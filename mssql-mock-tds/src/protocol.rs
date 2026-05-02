@@ -916,7 +916,8 @@ mod tests {
         buf.put_u8(1); // Packet ID
         buf.put_u8(0); // Window
 
-        let header = PacketHeader::parse(&mut buf).unwrap();
+        let header = PacketHeader::parse(&mut buf)
+            .expect("packet header parsing should succeed for a valid test packet");
         assert_eq!(header.packet_type, PacketType::SqlBatch);
         assert!(header.status.is_end_of_message());
         assert_eq!(header.length, 100);
@@ -993,7 +994,12 @@ mod tests {
         payload.put_u8(FEATURE_EXT_TERMINATOR); // 0xFF
 
         let result = parse_login7_auth(&payload);
-        assert_eq!(result.user_agent.unwrap(), "TestAgent");
+        assert_eq!(
+            result
+                .user_agent
+                .expect("user agent should be parsed from the feature extension"),
+            "TestAgent"
+        );
     }
 
     #[test]

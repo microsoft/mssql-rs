@@ -496,14 +496,17 @@ impl MockTdsServer {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
 
-        let tls_acceptor = identity.map(|id| {
-            let mut builder = native_tls::TlsAcceptor::builder(id);
-            if strict_mode {
-                builder.accept_alpn(&[mssql_tds::core::TDS_8_ALPN_PROTOCOL]);
-            }
-            let acceptor = builder.build().expect("Failed to build TLS acceptor");
-            TlsAcceptor::from(acceptor)
-        });
+        let tls_acceptor = identity
+            .map(|id| {
+                let mut builder = native_tls::TlsAcceptor::builder(id);
+                if strict_mode {
+                    builder.accept_alpn(&[mssql_tds::core::TDS_8_ALPN_PROTOCOL]);
+                }
+                builder.build().map(TlsAcceptor::from).map_err(|error| {
+                    std::io::Error::other(format!("Failed to build TLS acceptor: {}", error))
+                })
+            })
+            .transpose()?;
 
         let has_tls = tls_acceptor.is_some();
         if strict_mode {
@@ -695,17 +698,19 @@ async fn handle_connection_with_tls(
             let tds_wrapper = TdsTlsWrapper::new(prelogin_socket);
 
             // Perform TLS handshake over the TDS-wrapped stream
-            let tls_stream = tls_acceptor
-                .unwrap()
-                .accept(tds_wrapper)
-                .await
-                .map_err(|e| {
-                    error!("TLS handshake failed: {}", e);
-                    ProtocolError::Io(std::io::Error::other(format!(
-                        "TLS handshake failed: {}",
-                        e
-                    )))
-                })?;
+            let tls_acceptor = tls_acceptor.ok_or_else(|| {
+                ProtocolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "TLS encryption was negotiated without a TLS acceptor",
+                ))
+            })?;
+            let tls_stream = tls_acceptor.accept(tds_wrapper).await.map_err(|e| {
+                error!("TLS handshake failed: {}", e);
+                ProtocolError::Io(std::io::Error::other(format!(
+                    "TLS handshake failed: {}",
+                    e
+                )))
+            })?;
 
             info!("TLS handshake successful for {}", addr);
             handle_encrypted_tds_wrapped_connection(
@@ -1149,7 +1154,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_creation() {
-        let server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+        let server = MockTdsServer::new("127.0.0.1:0")
+            .await
+            .expect("mock server should bind to an ephemeral localhost port");
         let addr = server.local_addr();
         assert!(addr.port() > 0);
     }

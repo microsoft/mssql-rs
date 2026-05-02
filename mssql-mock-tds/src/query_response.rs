@@ -304,7 +304,9 @@ mod tests {
                 vec![Row::new(vec![ColumnValue::NVarChar("test".to_string())])],
             ),
         );
-        let resp = registry.get("SELECT 'test'").unwrap();
+        let resp = registry
+            .get("SELECT 'test'")
+            .expect("registered query response should be available");
         assert_eq!(resp.columns.len(), 1);
         assert_eq!(resp.rows.len(), 1);
     }
