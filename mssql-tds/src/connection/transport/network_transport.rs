@@ -276,11 +276,16 @@ async fn create_base_stream_sequential(
     }
 
     // We don't have a valid TCP stream, so we need to return the last error.
-    if tcp_stream.is_none() {
-        return Err(crate::error::Error::from(last_error.unwrap()));
+    if let Some(stream) = tcp_stream {
+        Ok(Box::new(stream))
+    } else {
+        Err(crate::error::Error::from(last_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("Failed to connect to {host}:{port}"),
+            )
+        })))
     }
-
-    Ok(Box::new(tcp_stream.unwrap()))
 }
 
 /// Creates a TCP stream using parallel connection mode (MultiSubnetFailover).
@@ -541,8 +546,8 @@ impl NetworkWriter for NetworkTransport {
     }
 
     fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
-        assert!(self.encryption.is_some());
-        self.encryption.unwrap()
+        self.encryption
+            .unwrap_or(NegotiatedEncryptionSetting::NoEncryption)
     }
 }
 
@@ -670,12 +675,18 @@ impl NetworkTransport {
             )
         })?;
 
-        let base_stream = handle.extract().ok_or_else(|| {
-            error!("Failed to extract underlying stream - was disable_ssl called twice?");
-            crate::error::Error::ImplementationError(
-                "Cannot disable TLS: underlying stream was already extracted".to_string(),
-            )
-        })?;
+        let base_stream = handle
+            .extract()
+            .map_err(|e| {
+                error!("Failed to lock extractable stream: {e}");
+                crate::error::Error::ImplementationError(format!("Cannot disable TLS: {e}"))
+            })?
+            .ok_or_else(|| {
+                error!("Failed to extract underlying stream - was disable_ssl called twice?");
+                crate::error::Error::ImplementationError(
+                    "Cannot disable TLS: underlying stream was already extracted".to_string(),
+                )
+            })?;
 
         info!("Successfully disabled TLS, reverting to unencrypted stream");
         self.stream = Some(base_stream);

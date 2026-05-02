@@ -39,10 +39,16 @@ static CONNECTOR_CACHE: std::sync::LazyLock<
     RwLock<HashMap<TlsValidationConfig, NativeTlsConnector>>,
 > = std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
-fn get_or_build_connector(
-    validation: &TlsValidationConfig,
-) -> Result<NativeTlsConnector, native_tls::Error> {
-    if let Some(connector) = CONNECTOR_CACHE.read().unwrap().get(validation) {
+fn get_or_build_connector(validation: &TlsValidationConfig) -> TdsResult<NativeTlsConnector> {
+    if let Some(connector) = CONNECTOR_CACHE
+        .read()
+        .map_err(|_| {
+            crate::error::Error::ImplementationError(
+                "TLS connector cache read lock poisoned".to_string(),
+            )
+        })?
+        .get(validation)
+    {
         return Ok(connector.clone());
     }
 
@@ -60,7 +66,11 @@ fn get_or_build_connector(
 
     CONNECTOR_CACHE
         .write()
-        .unwrap()
+        .map_err(|_| {
+            crate::error::Error::ImplementationError(
+                "TLS connector cache write lock poisoned".to_string(),
+            )
+        })?
         .insert(validation.clone(), connector.clone());
     Ok(connector)
 }
@@ -420,7 +430,14 @@ impl<S: Stream> AsyncRead for TlsOverTdsStream<S> {
             self.read_requested(cx, buf)
         } else {
             // Read a new packet, starting with the header.
-            let mut packet_header_receive_bytes = self.packet_header_receive_bytes.take().unwrap();
+            let mut packet_header_receive_bytes = match self.packet_header_receive_bytes.take() {
+                Some(packet_header_receive_bytes) => packet_header_receive_bytes,
+                None => {
+                    return Poll::Ready(Err(std::io::Error::other(
+                        "TLS packet header buffer missing",
+                    )));
+                }
+            };
             let external_res = loop {
                 // This might be a continuation of reading the header. An earlier loop iteration may have only
                 // partially retrieved the header. This function also may have returned pending.
@@ -532,8 +549,21 @@ impl<S: Stream> AsyncWrite for TlsOverTdsStream<S> {
             }
 
             let payload_len = bufs.iter().map(|b| b.len()).sum::<usize>();
-            let mut write_state = self.write_state.take().unwrap();
-            let mut packet_write_buffer = self.packet_write_buffer.take().unwrap();
+            let mut write_state = match self.write_state.take() {
+                Some(write_state) => write_state,
+                None => {
+                    return Poll::Ready(Err(std::io::Error::other("TLS write state missing")));
+                }
+            };
+            let mut packet_write_buffer = match self.packet_write_buffer.take() {
+                Some(packet_write_buffer) => packet_write_buffer,
+                None => {
+                    self.write_state = Some(write_state);
+                    return Poll::Ready(Err(std::io::Error::other(
+                        "TLS packet write buffer missing",
+                    )));
+                }
+            };
             let external_res = loop {
                 // The supplied buffer needs to be wrapped in TDS packets and may need to be split
                 // across multiple packets (so multiple writes).
