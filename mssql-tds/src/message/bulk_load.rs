@@ -282,7 +282,11 @@ impl<'a> StreamingBulkLoadWriter<'a> {
             );
         } else {
             // Subsequent rows: validate against first row's column count
-            let expected_count = self.first_row_column_count.unwrap();
+            let expected_count = self.first_row_column_count.ok_or_else(|| {
+                Error::ImplementationError(
+                    "First row column count is missing after initial row write".to_string(),
+                )
+            })?;
             if column_index != expected_count {
                 return Err(Error::UsageError(format!(
                     "Row {} has {} columns, but first row had {} columns. All rows must have the same number of columns as the first row.",

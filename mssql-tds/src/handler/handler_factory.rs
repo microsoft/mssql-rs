@@ -349,14 +349,13 @@ impl PreloginHandler<'_> {
         let response = PreloginResponse {};
 
         let response_model = &response.deserialize(reader_writer).await?;
-        if request_model.mars_enabled && !response_model.mars_enabled.unwrap_or(false) {
+        if request_model.mars_enabled && !response_model.mars_enabled {
             return Err(Error::ProtocolError(
                 "Server does not support MARS (Multiple Active Result Sets)".to_string(),
             ));
         }
 
-        if !response_model.dbinstance_valid.unwrap() {
-            // Non-fatal behaviour.
+        if !response_model.dbinstance_valid {
             warn!("Database instance validation failed");
         }
 
@@ -607,8 +606,7 @@ impl LoginHandler<'_> {
         let response_model = response
             .deserialize(reader_writer, requested_features)
             .await?;
-        if response_model.tds_error.is_some() {
-            let tds_error = response_model.tds_error.unwrap();
+        if let Some(tds_error) = response_model.tds_error.as_ref() {
             Err(Error::from_sql_error(crate::error::SqlErrorInfo {
                 message: tds_error.get_message(),
                 state: tds_error.error_token.state,

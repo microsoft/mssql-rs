@@ -486,9 +486,14 @@ impl LoginResponseModel {
             },
             EnvChangeContainer::RoutingType(routing_change) => {
                 self.change_properties.routing_information = routing_change.new_value().clone();
+                let routing_info = routing_change.new_value().as_ref().ok_or_else(|| {
+                    crate::error::Error::ProtocolError(
+                        "Routing env change did not include a redirection target".to_string(),
+                    )
+                })?;
                 Err(crate::error::Error::Redirection {
-                    host: routing_change.new_value().as_ref().unwrap().server.clone(),
-                    port: routing_change.new_value().as_ref().unwrap().port,
+                    host: routing_info.server.clone(),
+                    port: routing_info.port,
                 })
             }
             _ => {

@@ -152,8 +152,8 @@ impl PreloginRequestModel {
 pub struct PreloginResponseModel {
     pub encryption: EncryptionType,
     pub federated_auth_supported: bool,
-    pub dbinstance_valid: Option<bool>,
-    pub mars_enabled: Option<bool>,
+    pub dbinstance_valid: bool,
+    pub mars_enabled: bool,
     pub server_version: Version,
     pub sql_server_version: SQLServerVersion,
 }
@@ -164,8 +164,8 @@ impl PreloginResponseModel {
             server_version: Version::new(0, 0, 0, 0),
             sql_server_version: SQLServerVersion::SqlServerNotsupported,
             encryption: EncryptionType::Off,
-            dbinstance_valid: Option::from(false),
-            mars_enabled: Option::from(false),
+            dbinstance_valid: false,
+            mars_enabled: false,
             federated_auth_supported: false,
         }
     }
@@ -242,10 +242,10 @@ impl PreloginResponse {
                     // encryption type.
                 }
                 OptionType::InstOpt => {
-                    result.dbinstance_valid = Option::from(packet_reader.read_byte().await? == 0);
+                    result.dbinstance_valid = packet_reader.read_byte().await? == 0;
                 }
                 OptionType::Mars => {
-                    result.mars_enabled = Option::from(packet_reader.read_byte().await? == 1);
+                    result.mars_enabled = packet_reader.read_byte().await? == 1;
                 }
                 OptionType::FedAuthRequired => {
                     result.federated_auth_supported = packet_reader.read_byte().await? == 1;
@@ -545,7 +545,7 @@ pub(crate) mod tests {
         let response_model = block_on(response.deserialize(&mut mocked_packet_reader)).unwrap();
 
         // Compare the guid, which is auto-generated.
-        assert_eq!(response_model.mars_enabled, Option::from(true));
+        assert!(response_model.mars_enabled);
         assert_eq!(
             response_model.sql_server_version,
             SQLServerVersion::SqlServer2019

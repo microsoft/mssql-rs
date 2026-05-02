@@ -21,15 +21,21 @@ use crate::security::{SecurityContext, SecurityError, SspiAuthToken};
 ///
 /// // Single-round authentication
 /// let mut ctx = MockSecurityContext::single_round(vec![1, 2, 3, 4]);
-/// let token = ctx.generate_token(None).unwrap();
+/// let token = ctx
+///     .generate_token(None)
+///     .expect("single-round mock should yield a token");
 /// assert_eq!(token.data, vec![1, 2, 3, 4]);
 /// assert!(token.is_complete);
 ///
 /// // Multi-round authentication
 /// let mut ctx = MockSecurityContext::multi_round(vec![1, 2], vec![3, 4]);
-/// let initial = ctx.generate_token(None).unwrap();
+/// let initial = ctx
+///     .generate_token(None)
+///     .expect("first mock round should yield a token");
 /// assert!(!initial.is_complete);
-/// let response = ctx.generate_token(Some(&[5, 6])).unwrap();
+/// let response = ctx
+///     .generate_token(Some(&[5, 6]))
+///     .expect("second mock round should yield a token");
 /// assert!(response.is_complete);
 /// ```
 #[derive(Debug, Clone)]
@@ -236,7 +242,9 @@ mod tests {
         assert!(!ctx.is_complete());
         assert_eq!(ctx.current_round(), 0);
 
-        let token = ctx.generate_token(None).unwrap();
+        let token = ctx
+            .generate_token(None)
+            .expect("single-round mock should yield a token");
         assert_eq!(token.data, vec![1, 2, 3, 4]);
         assert!(token.is_complete);
         assert!(ctx.is_complete());
@@ -248,13 +256,17 @@ mod tests {
         let mut ctx = MockSecurityContext::multi_round(vec![1, 2], vec![3, 4]);
 
         // First round
-        let initial = ctx.generate_token(None).unwrap();
+        let initial = ctx
+            .generate_token(None)
+            .expect("first multi-round token should be generated");
         assert_eq!(initial.data, vec![1, 2]);
         assert!(!initial.is_complete);
         assert!(!ctx.is_complete());
 
         // Second round with server challenge
-        let response = ctx.generate_token(Some(&[5, 6, 7])).unwrap();
+        let response = ctx
+            .generate_token(Some(&[5, 6, 7]))
+            .expect("second multi-round token should be generated");
         assert_eq!(response.data, vec![3, 4]);
         assert!(response.is_complete);
         assert!(ctx.is_complete());
@@ -268,13 +280,19 @@ mod tests {
         );
 
         // Three rounds
-        let t1 = ctx.generate_token(None).unwrap();
+        let t1 = ctx
+            .generate_token(None)
+            .expect("first custom-round token should be generated");
         assert!(!t1.is_complete);
 
-        let t2 = ctx.generate_token(Some(&[])).unwrap();
+        let t2 = ctx
+            .generate_token(Some(&[]))
+            .expect("second custom-round token should be generated");
         assert!(!t2.is_complete);
 
-        let t3 = ctx.generate_token(Some(&[])).unwrap();
+        let t3 = ctx
+            .generate_token(Some(&[]))
+            .expect("third custom-round token should be generated");
         assert!(t3.is_complete);
     }
 
@@ -304,11 +322,15 @@ mod tests {
 
         assert_eq!(ctx.package_name(), "NTLM");
 
-        let negotiate = ctx.generate_token(None).unwrap();
+        let negotiate = ctx
+            .generate_token(None)
+            .expect("NTLM mock should generate a negotiate token");
         assert!(negotiate.data.starts_with(b"NTLMSSP"));
         assert!(!negotiate.is_complete);
 
-        let authenticate = ctx.generate_token(Some(&[0xAA, 0xBB])).unwrap();
+        let authenticate = ctx
+            .generate_token(Some(&[0xAA, 0xBB]))
+            .expect("NTLM mock should generate an authenticate token");
         assert!(authenticate.data.starts_with(b"NTLMSSP"));
         assert!(authenticate.is_complete);
     }
@@ -319,7 +341,9 @@ mod tests {
 
         assert_eq!(ctx.package_name(), "Kerberos");
 
-        let token = ctx.generate_token(None).unwrap();
+        let token = ctx
+            .generate_token(None)
+            .expect("single-round mock should yield a token");
         assert!(token.is_complete);
     }
 
@@ -329,7 +353,8 @@ mod tests {
             .with_expected_challenges(vec![vec![0xAA, 0xBB]]);
 
         // First round - no challenge expected
-        ctx.generate_token(None).unwrap();
+        ctx.generate_token(None)
+            .expect("first expected-challenge round should generate a token");
 
         // Second round - wrong challenge should fail
         let result = ctx.generate_token(Some(&[0xCC, 0xDD]));
@@ -341,7 +366,8 @@ mod tests {
         let mut ctx = MockSecurityContext::multi_round(vec![1], vec![2])
             .with_expected_challenges(vec![vec![0xAA, 0xBB]]);
 
-        ctx.generate_token(None).unwrap();
+        ctx.generate_token(None)
+            .expect("first expected-challenge round should generate a token");
 
         // Correct challenge
         let result = ctx.generate_token(Some(&[0xAA, 0xBB]));
