@@ -8,6 +8,10 @@ parameters:
   - MacOS
 
 steps:
+- template: generate-sql-password-template.yml
+  parameters:
+    osType: ${{ parameters.buildTarget }}
+
 - ${{ if eq(parameters.buildTarget, 'Windows') }}:
   - task: PowerShell@2
     displayName: 'Generate Certificate for TLS encryption '
@@ -31,6 +35,19 @@ steps:
         Restart-Service -Name 'MSSQLSERVER' -Force
         sqlcmd -Q "ALTER SERVER ROLE sysadmin ADD MEMBER testuser;"
         sqlcmd -S localhost,1433 -U sa -P $(SQL_PASSWORD) -Q "SELECT @@VERSION"
+
+        # Setup the same logins on the SQLDEV named instance (used by SSRP tests)
+        $svc = Get-Service -Name 'MSSQL$SQLDEV' -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Running') {
+          echo "Configuring logins on SQLDEV instance..."
+          sqlcmd -S "localhost\SQLDEV" -C -Q "EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'LoginMode', REG_DWORD, 2"
+          sqlcmd -S "localhost\SQLDEV" -C -Q "ALTER LOGIN sa ENABLE; ALTER LOGIN sa WITH CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN sa WITH PASSWORD = '$(SQL_PASSWORD)'; IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'testuser') CREATE LOGIN testuser WITH PASSWORD = '$(SQL_PASSWORD)', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER SERVER ROLE sysadmin ADD MEMBER testuser;"
+          Restart-Service -Name 'MSSQL$SQLDEV' -Force
+          sqlcmd -S "localhost\SQLDEV" -C -U sa -P "$(SQL_PASSWORD)" -Q "SELECT @@VERSION"
+          echo "SQLDEV instance configured."
+        } else {
+          echo "SQLDEV instance not found or not running — skipping."
+        }
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
 

@@ -866,4 +866,153 @@ mod mock_server_tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_user_agent_interception() -> Result<(), Box<dyn std::error::Error>> {
+        init_tracing();
+
+        let server_addr = "127.0.0.1:0";
+        let server = MockTdsServer::new(server_addr).await?;
+        let bound_addr = server.local_addr();
+        let connection_store = server.connection_store();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let datasource = format!("tcp:{},{}", bound_addr.ip(), bound_addr.port());
+        let mut context = ClientContext::default();
+        context.user_name = "sa".to_string();
+        context.password = generate_test_password();
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+
+        let provider = TdsConnectionProvider {};
+        let mut client = provider.create_client(context, &datasource, None).await?;
+
+        client.close_connection().await?;
+        drop(client);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let store = connection_store.lock().await;
+        let conn_info = store
+            .all()
+            .values()
+            .next()
+            .expect("Should have at least one connection");
+
+        let returned_agent = conn_info.received_user_agent().unwrap_or_default();
+        println!("Intercepted User Agent: {}", returned_agent);
+        assert!(
+            returned_agent.contains("MS-TDS"),
+            "Expected formatted MS-TDS, got {}",
+            returned_agent
+        );
+
+        // Cleanup
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
+
+    /// Regression test for GitHub issue #24: Fabric DW injects Info tokens
+    /// (severity 0) between ColMetadata and Row tokens. next_row() must skip
+    /// them and continue iterating rows.
+    #[tokio::test]
+    async fn test_info_token_in_row_stream_is_skipped() -> Result<(), Box<dyn std::error::Error>> {
+        use mssql_mock_tds::{
+            ColumnDefinition, ColumnValue, InfoMessage, QueryResponse, Row, SqlDataType,
+        };
+
+        init_tracing();
+
+        let server = MockTdsServer::new("127.0.0.1:0").await?;
+        let server_addr = server.local_addr();
+
+        // Simulate Fabric DW: inject Info tokens between ColMetadata and Row
+        let registry = server.query_registry();
+        {
+            let mut reg = registry.lock().await;
+            let response = QueryResponse::new(
+                vec![
+                    ColumnDefinition::new("l_orderkey", SqlDataType::BigInt),
+                    ColumnDefinition::new("l_quantity", SqlDataType::Int),
+                ],
+                vec![
+                    Row::new(vec![ColumnValue::BigInt(1), ColumnValue::Int(25)]),
+                    Row::new(vec![ColumnValue::BigInt(2), ColumnValue::Int(50)]),
+                ],
+            )
+            .with_info_tokens(vec![InfoMessage::new(
+                15806,
+                0,
+                "Statement ID: {2C39FC51-0000-0000-0000-000000000000} \
+                 | Query hash: 0x808236332799EDF3 \
+                 | Distributed request ID: {00000000-0000-0000-0000-000000000000}",
+            )]);
+            reg.register(
+                "SELECT TOP 3 l_orderkey, l_quantity FROM [tcph].[lineitem]",
+                response,
+            );
+        }
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+        let mut context = ClientContext::default();
+        context.user_name = "sa".to_string();
+        context.password = generate_test_password();
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+
+        let provider = TdsConnectionProvider {};
+        let mut client = provider.create_client(context, &datasource, None).await?;
+
+        client
+            .execute(
+                "SELECT TOP 3 l_orderkey, l_quantity FROM [tcph].[lineitem]".to_string(),
+                None,
+                None,
+            )
+            .await?;
+
+        let mut row_count = 0;
+        if let Some(resultset) = client.get_current_resultset() {
+            while let Some(row) = resultset.next_row().await? {
+                row_count += 1;
+                assert_eq!(row.len(), 2, "Expected 2 columns");
+            }
+        }
+        assert_eq!(
+            row_count, 2,
+            "Expected to read both rows past the Info token"
+        );
+
+        client.close_query().await?;
+        client.close_connection().await?;
+
+        // Cleanup
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
 }

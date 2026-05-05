@@ -237,8 +237,9 @@ else
         mssql-mock-tds \
         | docker exec -i "$CONTAINER_NAME" tar -xf - -C /workspace
     
-    # Create simplified workspace Cargo.toml
-    docker exec "$CONTAINER_NAME" bash -c 'cat > /workspace/Cargo.toml << "EOF"
+    # Create simplified workspace Cargo.toml (excludes mssql-js which isn't copied).
+    # Must include [workspace.lints] since member crates use lints.workspace = true.
+    docker exec -i "$CONTAINER_NAME" bash -c "cat > /workspace/Cargo.toml" << 'OUTER_EOF'
 [workspace]
 members = [
     "mssql-tds",
@@ -246,7 +247,10 @@ members = [
     "mssql-mock-tds",
 ]
 resolver = "2"
-EOF'
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(feature, values("sspi", "gssapi", "integrated-auth"))'] }
+OUTER_EOF
     
     echo "✓ Source code copied"
     

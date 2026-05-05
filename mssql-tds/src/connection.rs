@@ -15,12 +15,14 @@ pub mod client_context;
 pub(crate) mod connection_actions;
 pub(crate) mod datasource_parser;
 pub(crate) mod execution_context;
+pub(crate) mod instance_cache;
 pub(crate) mod metadata_retriever;
 /// ODBC-style authentication keyword transform.
 pub mod odbc_authentication_transformer;
 /// ODBC-style authentication keyword validation.
 pub mod odbc_authentication_validator;
 pub(crate) mod odbc_supported_auth_keywords;
+pub(crate) mod session_recovery;
 /// Primary client type and result set traits.
 pub mod tds_client;
 /// Transport layer (TCP, Named Pipes, Shared Memory).

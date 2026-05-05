@@ -14,7 +14,7 @@ pub mod bulk_load;
 /// RPC parameter types and status flags.
 pub mod parameters;
 
-mod features;
+pub(crate) mod features;
 pub(crate) mod headers;
 pub(crate) mod rpc;
 

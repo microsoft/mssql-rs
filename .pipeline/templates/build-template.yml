@@ -36,26 +36,41 @@ parameters:
   type: boolean
   default: true
 
+- name: enableRustBuild
+  displayName: Enable standalone Rust Debug/Release build steps
+  type: boolean
+  default: true
+
+- name: enableClippy
+  displayName: Enable Rust Clippy lint step
+  type: boolean
+  default: true
+
 steps:
+- template: generate-sql-password-template.yml
+  parameters:
+    osType: ${{ parameters.osType }}
+
 - script: cargo fetch
   displayName: Fetch Crates
 
-- script: |
-    cargo build --frozen 2>&1
-  displayName: Rust Debug Build
-  condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
+- ${{ if eq(parameters.enableRustBuild, true) }}:
+  - script: |
+      cargo build --frozen 2>&1
+    displayName: Rust Debug Build
+    condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
 
-- script: |
-    cargo build --frozen --release 2>&1
-  displayName: Rust Release Build
-  condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
+  - script: |
+      cargo build --frozen --release 2>&1
+    displayName: Rust Release Build
+    condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
 
-- ${{ if eq(parameters.osType, 'Windows') }}:
+- ${{ if and(eq(parameters.enableClippy, true), eq(parameters.osType, 'Windows')) }}:
   - pwsh: ./scripts/bclippy.ps1
     displayName: Rust Clippy Lint (workspace + mssql-py-core)
     condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
 
-- ${{ if ne(parameters.osType, 'Windows') }}:
+- ${{ if and(eq(parameters.enableClippy, true), ne(parameters.osType, 'Windows')) }}:
   - script: ./scripts/bclippy.sh
     displayName: Rust Clippy Lint (workspace + mssql-py-core)
     condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
@@ -121,6 +136,7 @@ steps:
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
       RUST_BACKTRACE: full
+      SSPI_TEST: '1'
 
   - task: PublishTestResults@2
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
@@ -159,25 +175,26 @@ steps:
         summaryFileLocation: "$(Build.SourcesDirectory)/target/lcov.info"
         pathToSources: "$(Build.SourcesDirectory)"
 
-- task: CopyFiles@2
-  displayName: Copy Rust Debug Build
-  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'),  or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')))
-  inputs:
-    SourceFolder: '$(CARGO_TARGET_DIR)/debug'
-    Contents: |
-      *
-      !.cargo-lock
-    TargetFolder: '$(Build.ArtifactStagingDirectory)/debug'
+- ${{ if eq(parameters.enableRustBuild, true) }}:
+  - task: CopyFiles@2
+    displayName: Copy Rust Debug Build
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'),  or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')))
+    inputs:
+      SourceFolder: '$(CARGO_TARGET_DIR)/debug'
+      Contents: |
+        *
+        !.cargo-lock
+      TargetFolder: '$(Build.ArtifactStagingDirectory)/debug'
 
-- task: CopyFiles@2
-  displayName: Copy Rust Release Build
-  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), or( eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')))
-  inputs:
-    SourceFolder: '$(CARGO_TARGET_DIR)/release'
-    Contents: |
-      *
-      !.cargo-lock
-    TargetFolder: '$(Build.ArtifactStagingDirectory)/release'
+  - task: CopyFiles@2
+    displayName: Copy Rust Release Build
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), or( eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')))
+    inputs:
+      SourceFolder: '$(CARGO_TARGET_DIR)/release'
+      Contents: |
+        *
+        !.cargo-lock
+      TargetFolder: '$(Build.ArtifactStagingDirectory)/release'
 
 - ${{ if eq(parameters.enableJsBuild, true) }}:
   - bash: |

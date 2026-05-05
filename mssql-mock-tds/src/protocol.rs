@@ -158,6 +158,7 @@ pub enum TokenType {
 
 /// FedAuth feature extension ID
 pub const FEATURE_EXT_FEDAUTH: u8 = 0x02;
+pub const FEATURE_EXT_USER_AGENT: u8 = 0x10;
 /// FedAuth terminator
 pub const FEATURE_EXT_TERMINATOR: u8 = 0xFF;
 
@@ -172,6 +173,8 @@ pub struct Login7AuthInfo {
     pub fedauth_library: u8,
     /// Server name from Login7 packet (the data source string sent by client)
     pub server_name: Option<String>,
+    /// User Agent string from Login7 packet (if present)
+    pub user_agent: Option<String>,
 }
 
 /// Parse Login7 packet to extract FedAuth feature extension with access token
@@ -322,7 +325,23 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
                     }
                 }
             }
-            break;
+        } else if feature_id == FEATURE_EXT_USER_AGENT && i + 5 + feat_len <= data.len() {
+            let feat_data = &data[i + 5..i + 5 + feat_len];
+            if feat_data.len().is_multiple_of(2) {
+                let u16_chars: Vec<u16> = feat_data
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect();
+                if let Ok(user_agent) = String::from_utf16(&u16_chars) {
+                    debug!("Parsed UserAgent from Login7 (len: {})", user_agent.len());
+                    auth_info.user_agent = Some(user_agent);
+                }
+            } else {
+                debug!(
+                    "Skipping UserAgent FeatureExtension due to odd data length: {}",
+                    feat_len
+                );
+            }
         }
 
         // Skip to next feature entry
@@ -595,6 +614,54 @@ pub fn build_done_token(row_count: u64) -> BytesMut {
     token_data
 }
 
+/// Build an INFO token (0xAB) matching the TDS wire format.
+///
+/// Wire layout (all integers little-endian):
+///   0xAB | u16 length | u32 number | u8 state | u8 severity
+///   | US_VARCHAR message | B_VARCHAR server_name | B_VARCHAR proc_name | u32 line_number
+///
+/// US_VARCHAR: u16 char-count prefix + UTF-16LE data
+/// B_VARCHAR:  u8  char-count prefix + UTF-16LE data
+pub fn build_info_token(info: &crate::query_response::InfoMessage) -> BytesMut {
+    let mut buf = BytesMut::new();
+
+    buf.put_u8(TokenType::Info as u8);
+
+    let msg_units: Vec<u16> = info.message.encode_utf16().collect();
+    let srv_units: Vec<u16> = info.server_name.encode_utf16().collect();
+    let proc_units: Vec<u16> = info.proc_name.encode_utf16().collect();
+
+    // token_len covers everything after the 2-byte length field
+    let token_len: u16 = 4 + 1 + 1 // number, state, severity
+        + 2 + (msg_units.len() * 2) as u16  // US_VARCHAR
+        + 1 + (srv_units.len() * 2) as u16  // B_VARCHAR
+        + 1 + (proc_units.len() * 2) as u16 // B_VARCHAR
+        + 4; // line_number
+    buf.put_u16_le(token_len);
+
+    buf.put_u32_le(info.number);
+    buf.put_u8(info.state);
+    buf.put_u8(info.severity);
+
+    buf.put_u16_le(msg_units.len() as u16);
+    for u in &msg_units {
+        buf.put_u16_le(*u);
+    }
+
+    buf.put_u8(srv_units.len() as u8);
+    for u in &srv_units {
+        buf.put_u16_le(*u);
+    }
+
+    buf.put_u8(proc_units.len() as u8);
+    for u in &proc_units {
+        buf.put_u16_le(*u);
+    }
+
+    buf.put_u32_le(info.line_number);
+    buf
+}
+
 /// Build a query result from a QueryResponse
 pub fn build_query_result(response: &crate::query_response::QueryResponse) -> BytesMut {
     let mut result = BytesMut::new();
@@ -607,8 +674,15 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
     for col in &response.columns {
         result.put_u32_le(0); // UserType
         result.put_u16_le(0x0000); // Flags: not nullable, no special flags
-        result.put_u8(col.data_type.tds_type_code()); // Type code
-        result.put_u8(col.data_type.max_length()); // Max length
+        result.put_u8(col.data_type.tds_type_code());
+        if col.data_type == crate::query_response::SqlDataType::NVarChar {
+            // Required to support string responses (e.g., @@USERAGENT).
+            // TDS ColMetadata mandates a 5-byte collation suffix for variable-length types.
+            result.put_u16_le(8000); // NVARCHAR(4000) max byte capacity
+            result.put_slice(&[0x09, 0x04, 0xD0, 0x00, 0x34]); // SQL_Latin1_General_CP1_CI_AS
+        } else {
+            result.put_u8(col.data_type.max_length());
+        }
 
         // Column name (UTF-16LE)
         let name_len = col.name.chars().count() as u8;
@@ -616,6 +690,11 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
         for ch in col.name.encode_utf16() {
             result.put_u16_le(ch);
         }
+    }
+
+    // Inject Info tokens between ColMetadata and Rows (Fabric DW behavior)
+    for info in &response.info_tokens {
+        result.extend_from_slice(&build_info_token(info));
     }
 
     // Serialize each row
@@ -837,7 +916,8 @@ mod tests {
         buf.put_u8(1); // Packet ID
         buf.put_u8(0); // Window
 
-        let header = PacketHeader::parse(&mut buf).unwrap();
+        let header = PacketHeader::parse(&mut buf)
+            .expect("packet header parsing should succeed for a valid test packet");
         assert_eq!(header.packet_type, PacketType::SqlBatch);
         assert!(header.status.is_end_of_message());
         assert_eq!(header.length, 100);
@@ -882,5 +962,64 @@ mod tests {
 
         // After header, should have EnvChange token (0xE3)
         assert_eq!(response[PACKET_HEADER_SIZE], TokenType::EnvChange as u8);
+    }
+
+    #[test]
+    fn test_parse_login7_user_agent() {
+        let user_agent = "TestAgent";
+        let utf16_bytes: Vec<u8> = user_agent
+            .encode_utf16()
+            .flat_map(|ch| ch.to_le_bytes().into_iter())
+            .collect();
+
+        let mut payload = BytesMut::zeroed(100);
+
+        // OptionFlags3 at byte 27: set FeatureExt bit (0x10)
+        payload[27] = 0x10;
+
+        // FeatureExt table entry at bytes 56-57 (points to offset 60)
+        payload[56] = 60;
+        payload[57] = 0;
+
+        // DWORD at byte 60 pointing to the actual feature data at byte 64
+        payload[60..64].copy_from_slice(&64u32.to_le_bytes());
+
+        // Truncate the buffer at 64 so we can append the feature bytes directly
+        payload.truncate(64);
+
+        // Append UserAgent feature
+        payload.put_u8(FEATURE_EXT_USER_AGENT); // 0x10
+        payload.put_u32_le(utf16_bytes.len() as u32);
+        payload.put_slice(&utf16_bytes);
+        payload.put_u8(FEATURE_EXT_TERMINATOR); // 0xFF
+
+        let result = parse_login7_auth(&payload);
+        assert_eq!(
+            result
+                .user_agent
+                .expect("user agent should be parsed from the feature extension"),
+            "TestAgent"
+        );
+    }
+
+    #[test]
+    fn test_parse_login7_odd_length_user_agent() {
+        let mut payload = BytesMut::zeroed(100);
+        payload[27] = 0x10; // OptionFlags3 (FeatureExt bit)
+        payload[56] = 60; // Option offset
+        payload[57] = 0;
+        payload[60..64].copy_from_slice(&64u32.to_le_bytes()); // Feature offset
+        payload.truncate(64);
+
+        // FeatureId (1 byte) = 2 (UserAgent)
+        // FeatureDataLen (4 bytes) = 5 (odd length)
+        // FeatureData (5 bytes) = [1, 2, 3, 4, 5]
+        payload.put_u8(FEATURE_EXT_USER_AGENT); // 2
+        payload.put_u32_le(5);
+        payload.put_slice(&[1, 2, 3, 4, 5]);
+        payload.put_u8(FEATURE_EXT_TERMINATOR); // 0xFF
+
+        let result = parse_login7_auth(&payload);
+        assert_eq!(result.user_agent, None);
     }
 }

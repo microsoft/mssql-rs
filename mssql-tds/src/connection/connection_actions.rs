@@ -180,11 +180,17 @@ pub enum ActionResult {
 #[derive(Debug, Clone)]
 pub enum ActionOutcome {
     /// Cache hit with connection details
-    CacheHit { protocol: ProtocolType, port: u16 },
+    CacheHit {
+        protocol: ProtocolType,
+        port: Option<u16>,
+        pipe_path: Option<String>,
+    },
     /// Cache miss
     CacheMiss,
     /// SSRP resolved port
     SsrpResolved { port: u16 },
+    /// SSRP resolved named pipe path (when TCP is not available)
+    SsrpResolvedPipe { pipe_path: String },
     /// LocalDB resolved to pipe path
     #[cfg(windows)]
     LocalDbResolved { pipe_path: String },
@@ -215,12 +221,24 @@ impl ExecutionContext {
             ActionOutcome::SsrpResolved { .. } => {
                 self.slots.insert(ResultSlot::ResolvedPort, outcome);
             }
+            ActionOutcome::SsrpResolvedPipe { .. } => {
+                self.slots.insert(ResultSlot::ResolvedPipePath, outcome);
+            }
             #[cfg(windows)]
             ActionOutcome::LocalDbResolved { .. } => {
                 self.slots.insert(ResultSlot::ResolvedPipePath, outcome);
             }
-            ActionOutcome::CacheHit { .. } => {
-                self.slots.insert(ResultSlot::CachedConnectionInfo, outcome);
+            ActionOutcome::CacheHit {
+                port, pipe_path, ..
+            } => {
+                self.slots
+                    .insert(ResultSlot::CachedConnectionInfo, outcome.clone());
+                if port.is_some() {
+                    self.slots.insert(ResultSlot::ResolvedPort, outcome.clone());
+                }
+                if pipe_path.is_some() {
+                    self.slots.insert(ResultSlot::ResolvedPipePath, outcome);
+                }
             }
             _ => {}
         }
@@ -235,7 +253,7 @@ impl ExecutionContext {
     pub fn get_port(&self, slot: ResultSlot) -> Option<u16> {
         match self.get_outcome(slot)? {
             ActionOutcome::SsrpResolved { port } => Some(*port),
-            ActionOutcome::CacheHit { port, .. } => Some(*port),
+            ActionOutcome::CacheHit { port, .. } => *port,
             _ => None,
         }
     }
@@ -244,7 +262,9 @@ impl ExecutionContext {
     #[cfg(windows)]
     pub fn get_pipe_path(&self, slot: ResultSlot) -> Option<String> {
         match self.get_outcome(slot)? {
+            ActionOutcome::SsrpResolvedPipe { pipe_path } => Some(pipe_path.clone()),
             ActionOutcome::LocalDbResolved { pipe_path } => Some(pipe_path.clone()),
+            ActionOutcome::CacheHit { pipe_path, .. } => pipe_path.clone(),
             _ => None,
         }
     }
@@ -419,6 +439,19 @@ impl ConnectionActionChain {
             }
         }
         None
+    }
+
+    /// Return the first Shared Memory transport in the chain, if any.
+    #[cfg(windows)]
+    pub fn first_shared_memory_transport(&self) -> Option<super::client_context::TransportContext> {
+        self.actions.iter().find_map(|a| match a {
+            ConnectionAction::ConnectSharedMemory { instance_name, .. } => {
+                Some(super::client_context::TransportContext::SharedMemory {
+                    instance_name: instance_name.clone(),
+                })
+            }
+            _ => None,
+        })
     }
 
     /// Check if the action chain uses caching
@@ -696,7 +729,8 @@ impl ConnectionActionChainBuilder {
 #[derive(Debug, Clone)]
 pub struct CachedConnectionInfo {
     pub protocol: ProtocolType,
-    pub port: u16,
+    pub port: Option<u16>,
+    pub pipe_path: Option<String>,
 }
 
 /// Response from SSRP (SQL Server Browser) query
@@ -762,6 +796,7 @@ pub trait ConnectionExecutor {
                     Ok(ActionResult::Success(ActionOutcome::CacheHit {
                         protocol: cached.protocol,
                         port: cached.port,
+                        pipe_path: cached.pipe_path,
                     }))
                 } else {
                     Ok(ActionResult::Success(ActionOutcome::CacheMiss))
@@ -793,7 +828,8 @@ pub trait ConnectionExecutor {
 
                 let info = CachedConnectionInfo {
                     protocol: ProtocolType::Tcp,
-                    port: actual_port,
+                    port: Some(actual_port),
+                    pipe_path: None,
                 };
                 match self.update_cache(cache_key, info).await {
                     Ok(_) => Ok(ActionResult::Success(ActionOutcome::CacheUpdated)),
@@ -988,7 +1024,8 @@ mod tests {
         // Cache hit
         ctx.store_outcome(ActionOutcome::CacheHit {
             protocol: ProtocolType::Tcp,
-            port: 1433,
+            port: Some(1433),
+            pipe_path: None,
         });
         assert_eq!(ctx.get_port(ResultSlot::CachedConnectionInfo), Some(1433));
     }
@@ -1424,5 +1461,99 @@ mod tests {
         );
         let transports = chain.resolve_transport_contexts();
         assert_eq!(transports.len(), 2);
+    }
+
+    #[test]
+    fn store_outcome_cache_hit_port_and_pipe() {
+        let mut ctx = ExecutionContext::new();
+        ctx.store_outcome(ActionOutcome::CacheHit {
+            protocol: ProtocolType::Tcp,
+            port: Some(5000),
+            pipe_path: Some(r"\\.\pipe\sql\query".to_string()),
+        });
+        assert_eq!(ctx.get_port(ResultSlot::CachedConnectionInfo), Some(5000));
+        assert_eq!(ctx.get_port(ResultSlot::ResolvedPort), Some(5000));
+        assert!(ctx.get_outcome(ResultSlot::ResolvedPipePath).is_some());
+    }
+
+    #[test]
+    fn store_outcome_cache_hit_port_only() {
+        let mut ctx = ExecutionContext::new();
+        ctx.store_outcome(ActionOutcome::CacheHit {
+            protocol: ProtocolType::Tcp,
+            port: Some(1433),
+            pipe_path: None,
+        });
+        assert_eq!(ctx.get_port(ResultSlot::ResolvedPort), Some(1433));
+        assert!(ctx.get_outcome(ResultSlot::ResolvedPipePath).is_none());
+    }
+
+    #[test]
+    fn store_outcome_cache_hit_pipe_only() {
+        let mut ctx = ExecutionContext::new();
+        ctx.store_outcome(ActionOutcome::CacheHit {
+            protocol: ProtocolType::Tcp,
+            port: None,
+            pipe_path: Some(r"\\.\pipe\sql\query".to_string()),
+        });
+        assert!(ctx.get_port(ResultSlot::ResolvedPort).is_none());
+        assert!(ctx.get_outcome(ResultSlot::ResolvedPipePath).is_some());
+    }
+
+    #[test]
+    fn store_outcome_noop_does_not_store() {
+        let mut ctx = ExecutionContext::new();
+        ctx.store_outcome(ActionOutcome::NoOp);
+        assert!(ctx.get_outcome(ResultSlot::ResolvedPort).is_none());
+        assert!(ctx.get_outcome(ResultSlot::CachedConnectionInfo).is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn get_pipe_path_from_ssrp_resolved_pipe() {
+        let mut ctx = ExecutionContext::new();
+        ctx.store_outcome(ActionOutcome::SsrpResolvedPipe {
+            pipe_path: r"\\.\pipe\MSSQL$INST\sql\query".to_string(),
+        });
+        assert_eq!(
+            ctx.get_pipe_path(ResultSlot::ResolvedPipePath),
+            Some(r"\\.\pipe\MSSQL$INST\sql\query".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn get_pipe_path_from_cache_hit() {
+        let mut ctx = ExecutionContext::new();
+        ctx.store_outcome(ActionOutcome::CacheHit {
+            protocol: ProtocolType::Tcp,
+            port: Some(1433),
+            pipe_path: Some(r"\\.\pipe\sql\query".to_string()),
+        });
+        assert_eq!(
+            ctx.get_pipe_path(ResultSlot::ResolvedPipePath),
+            Some(r"\\.\pipe\sql\query".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn get_pipe_path_from_localdb_resolved() {
+        let mut ctx = ExecutionContext::new();
+        ctx.store_outcome(ActionOutcome::LocalDbResolved {
+            pipe_path: r"\\.\pipe\LOCALDB#abc\tsql\query".to_string(),
+        });
+        assert_eq!(
+            ctx.get_pipe_path(ResultSlot::ResolvedPipePath),
+            Some(r"\\.\pipe\LOCALDB#abc\tsql\query".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn get_pipe_path_returns_none_for_tcp_slot() {
+        let mut ctx = ExecutionContext::new();
+        ctx.store_outcome(ActionOutcome::SsrpResolved { port: 1433 });
+        assert!(ctx.get_pipe_path(ResultSlot::ResolvedPort).is_none());
     }
 }

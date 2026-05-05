@@ -39,6 +39,7 @@ pub(crate) enum TokenType {
     ReturnStatus = 0x79,
     ReturnValue = 0xAC,
     Row = 0xD1,
+    SessionState = 0xE4,
     SSPI = 0xED,
     TabName = 0xA4,
 }
@@ -67,6 +68,7 @@ impl TryFrom<u8> for TokenType {
             0x79 => Ok(TokenType::ReturnStatus),
             0xAC => Ok(TokenType::ReturnValue),
             0xD1 => Ok(TokenType::Row),
+            0xE4 => Ok(TokenType::SessionState),
             0xED => Ok(TokenType::SSPI),
             0xA4 => Ok(TokenType::TabName),
             _ => Err(crate::error::Error::ProtocolError(format!(
@@ -93,6 +95,7 @@ pub(crate) enum Tokens {
     LoginAck(LoginAckToken),
     FeatureExtAck(FeatureExtAckToken),
     FedAuthInfo(FedAuthInfoToken),
+    SessionState(SessionStateToken),
     Sspi(SspiToken),
     Row(RowToken),
     ColMetadata(ColMetadataToken),
@@ -115,6 +118,7 @@ pub enum Tokens {
     LoginAck(LoginAckToken),
     FeatureExtAck(FeatureExtAckToken),
     FedAuthInfo(FedAuthInfoToken),
+    SessionState(SessionStateToken),
     Sspi(SspiToken),
     Row(RowToken),
     ColMetadata(ColMetadataToken),
@@ -145,6 +149,7 @@ impl_from_token!(ColMetadataToken, ColMetadata);
 impl_from_token!(OrderToken, Order);
 impl_from_token!(ReturnStatusToken, ReturnStatus);
 impl_from_token!(ReturnValueToken, ReturnValue);
+impl_from_token!(SessionStateToken, SessionState);
 
 impl Token for Tokens {
     fn token_type(&self) -> TokenType {
@@ -164,6 +169,7 @@ impl Token for Tokens {
             Tokens::Order(token) => token.token_type(),
             Tokens::ReturnStatus(token) => token.token_type(),
             Tokens::ReturnValue(token) => token.token_type(),
+            Tokens::SessionState(token) => token.token_type(),
         }
     }
 }
@@ -261,6 +267,32 @@ impl Token for EnvChangeToken {
 impl Token for FeatureExtAckToken {
     fn token_type(&self) -> TokenType {
         TokenType::FeatureExtAck
+    }
+}
+
+/// A single state entry within a SESSIONSTATE token.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionStateEntry {
+    pub state_id: u8,
+    pub recoverable: bool,
+    pub data: Vec<u8>,
+}
+
+/// Parsed SESSIONSTATE token (0xE4) — session state changes for recovery.
+#[derive(Debug)]
+pub(crate) struct SessionStateToken {
+    /// Sequence number for ordering state updates. `u32::MAX` signals master disable.
+    pub sequence_number: u32,
+    /// Status byte — bit 0 is the recoverable flag.
+    #[allow(dead_code)] // Parsed from the wire; reserved for future use
+    pub status: u8,
+    /// Individual state entries contained in this token.
+    pub states: Vec<SessionStateEntry>,
+}
+
+impl Token for SessionStateToken {
+    fn token_type(&self) -> TokenType {
+        TokenType::SessionState
     }
 }
 

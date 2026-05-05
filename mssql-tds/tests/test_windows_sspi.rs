@@ -20,6 +20,7 @@ use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMeth
 use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
+use mssql_tds::datatypes::column_values::ColumnValues;
 
 /// Test Windows SSPI token generation
 #[test]
@@ -73,7 +74,6 @@ fn test_windows_sspi_generate_initial_token() {
 ///
 /// Set SSPI_TEST=1 to enable this test.
 #[tokio::test]
-#[ignore = "Requires local SQL Server with Windows Auth - set SSPI_TEST=1 to run"]
 async fn test_windows_integrated_auth_connection() -> TdsResult<()> {
     if env::var("SSPI_TEST").is_err() {
         println!("Skipping SSPI integration test - set SSPI_TEST=1 to enable");
@@ -134,7 +134,6 @@ async fn test_windows_integrated_auth_connection() -> TdsResult<()> {
 /// (matching ODBC behavior).
 /// Set SSPI_TEST=1 to enable this test.
 #[tokio::test]
-#[ignore = "Requires LocalDB instance - set SSPI_TEST=1 to run"]
 async fn test_localdb_integrated_auth_connection() -> TdsResult<()> {
     if env::var("SSPI_TEST").is_err() {
         println!("Skipping LocalDB integration test - set SSPI_TEST=1 to enable");
@@ -200,6 +199,255 @@ async fn test_localdb_integrated_auth_connection() -> TdsResult<()> {
 
     connection.close_query().await?;
     println!("✓ LocalDB test completed successfully!");
+
+    Ok(())
+}
+
+/// Connect to a named instance via SSRP where only Named Pipes is enabled.
+///
+/// Exercises the SSRP fallback to Named Pipe transport when SQL Browser returns
+/// no TCP endpoint. Set SSPI_TEST=1 and SSPI_NAMED_INSTANCE to enable.
+#[tokio::test]
+async fn test_ssrp_named_pipe_integrated_auth() -> TdsResult<()> {
+    if env::var("SSPI_TEST").is_err() {
+        return Ok(());
+    }
+
+    common::init_tracing();
+
+    let datasource = env::var("DB_INSTANCE").unwrap_or_else(|_| r"localhost\SQLDEV".to_string());
+
+    let mut context = ClientContext::default();
+    context.database = "master".to_string();
+    context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
+    context.encryption_options = EncryptionOptions {
+        mode: EncryptionSetting::On,
+        trust_server_certificate: true,
+        host_name_in_cert: None,
+        server_certificate: None,
+    };
+
+    let provider = TdsConnectionProvider {};
+    let mut client = provider.create_client(context, &datasource, None).await?;
+
+    client
+        .execute(
+            "SELECT net_transport FROM sys.dm_exec_connections WHERE session_id = @@SPID"
+                .to_string(),
+            None,
+            None,
+        )
+        .await?;
+
+    let mut transport = String::new();
+    if let Some(rs) = client.get_current_resultset()
+        && let Some(row) = rs.next_row().await?
+        && let ColumnValues::String(s) = &row[0]
+    {
+        transport = s.to_string();
+    }
+    client.close_query().await?;
+
+    assert!(
+        !transport.is_empty(),
+        "Expected net_transport from dm_exec_connections"
+    );
+    println!("✓ SSRP named pipe test passed for {datasource} (transport: {transport})");
+
+    Ok(())
+}
+
+/// Helper: connect with SSPI and return the net_transport reported by SQL Server.
+async fn connect_and_get_transport(datasource: &str) -> TdsResult<String> {
+    let mut context = ClientContext::default();
+    context.database = "master".to_string();
+    context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
+    context.encryption_options = EncryptionOptions {
+        mode: EncryptionSetting::On,
+        trust_server_certificate: true,
+        host_name_in_cert: None,
+        server_certificate: None,
+    };
+
+    let provider = TdsConnectionProvider {};
+    let mut client = provider.create_client(context, datasource, None).await?;
+
+    client
+        .execute(
+            "SELECT net_transport FROM sys.dm_exec_connections WHERE session_id = @@SPID"
+                .to_string(),
+            None,
+            None,
+        )
+        .await?;
+
+    let mut transport = String::new();
+    if let Some(rs) = client.get_current_resultset()
+        && let Some(row) = rs.next_row().await?
+        && let ColumnValues::String(s) = &row[0]
+    {
+        transport = s.to_string();
+    }
+    client.close_query().await?;
+
+    assert!(
+        !transport.is_empty(),
+        "Expected net_transport from dm_exec_connections for {datasource}"
+    );
+    Ok(transport)
+}
+
+/// Verify that a tcp:-prefixed named instance connects over TCP.
+#[tokio::test]
+async fn test_tcp_prefix_uses_tcp_transport() -> TdsResult<()> {
+    if env::var("SSPI_TEST").is_err() {
+        return Ok(());
+    }
+    common::init_tracing();
+
+    let instance = env::var("DB_INSTANCE").unwrap_or_else(|_| r"localhost\SQLDEV".to_string());
+    let datasource = format!("tcp:{instance}");
+
+    let transport = connect_and_get_transport(&datasource).await?;
+    assert_eq!(
+        transport, "TCP",
+        "tcp: prefix should use TCP transport, got {transport}"
+    );
+    println!("✓ tcp: prefix test passed for {datasource} (transport: {transport})");
+    Ok(())
+}
+
+/// Verify that an np:-prefixed named instance connects over Named Pipes.
+#[tokio::test]
+async fn test_np_prefix_uses_named_pipe_transport() -> TdsResult<()> {
+    if env::var("SSPI_TEST").is_err() {
+        return Ok(());
+    }
+    common::init_tracing();
+
+    let instance = env::var("DB_INSTANCE").unwrap_or_else(|_| r"localhost\SQLDEV".to_string());
+    let datasource = format!("np:{instance}");
+
+    let transport = connect_and_get_transport(&datasource).await?;
+    assert_eq!(
+        transport, "Named pipe",
+        "np: prefix should use Named pipe transport, got {transport}"
+    );
+    println!("✓ np: prefix test passed for {datasource} (transport: {transport})");
+    Ok(())
+}
+
+/// Connect to localhost with SSPI, run SELECT 1, and validate the result.
+///
+/// Set SSPI_TEST=1 to enable this test.
+#[tokio::test]
+async fn test_sspi_localhost_select_one() -> TdsResult<()> {
+    if env::var("SSPI_TEST").is_err() {
+        return Ok(());
+    }
+
+    common::init_tracing();
+
+    let mut context = ClientContext::default();
+    context.database = "master".to_string();
+    context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
+    context.encryption_options = EncryptionOptions {
+        mode: EncryptionSetting::PreferOff,
+        trust_server_certificate: true,
+        host_name_in_cert: None,
+        server_certificate: None,
+    };
+
+    let provider = TdsConnectionProvider {};
+    let mut client = provider
+        .create_client(context, "tcp:localhost,1433", None)
+        .await?;
+
+    client
+        .execute("SELECT 1 AS val".to_string(), None, None)
+        .await?;
+
+    let mut got_result = false;
+    if let Some(rs) = client.get_current_resultset()
+        && let Some(row) = rs.next_row().await?
+    {
+        assert_eq!(
+            row[0],
+            ColumnValues::Int(1),
+            "Expected SELECT 1 to return 1"
+        );
+        got_result = true;
+    }
+    client.close_query().await?;
+
+    assert!(got_result, "Expected exactly one row from SELECT 1");
+
+    Ok(())
+}
+
+/// Connect to a named instance via SSRP with SSPI and run SELECT 1.
+///
+/// Uses `localhost\<instance>` (no `tcp:` prefix) which exercises the SSRP path:
+/// datasource parser → SQL Browser resolution → SSPI with loopback detection.
+///
+/// Set SSPI_TEST=1 to enable. Optionally set SSPI_NAMED_INSTANCE (default: sqldev).
+#[tokio::test]
+async fn test_sspi_named_instance_select_one() -> TdsResult<()> {
+    if env::var("SSPI_TEST").is_err() {
+        return Ok(());
+    }
+
+    common::init_tracing();
+
+    let instance = env::var("SSPI_NAMED_INSTANCE").unwrap_or_else(|_| "sqldev".to_string());
+    let datasource = format!(r"localhost\{instance}");
+
+    let mut context = ClientContext::default();
+    context.database = "master".to_string();
+    context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
+    context.encryption_options = EncryptionOptions {
+        mode: EncryptionSetting::PreferOff,
+        trust_server_certificate: true,
+        host_name_in_cert: None,
+        server_certificate: None,
+    };
+
+    let provider = TdsConnectionProvider {};
+    let mut client = provider.create_client(context, &datasource, None).await?;
+
+    client
+        .execute("SELECT @@SERVICENAME AS svc".to_string(), None, None)
+        .await?;
+
+    if let Some(rs) = client.get_current_resultset()
+        && let Some(row) = rs.next_row().await?
+    {
+        let svc = format!("{:?}", row.first());
+        assert!(
+            svc.to_uppercase().contains(&instance.to_uppercase()),
+            "Expected instance {instance}, got: {svc}"
+        );
+    }
+    client.close_query().await?;
+
+    client
+        .execute("SELECT 1 AS val".to_string(), None, None)
+        .await?;
+
+    let mut got_result = false;
+    if let Some(rs) = client.get_current_resultset()
+        && let Some(row) = rs.next_row().await?
+    {
+        assert_eq!(
+            row[0],
+            ColumnValues::Int(1),
+            "Expected SELECT 1 to return 1"
+        );
+        got_result = true;
+    }
+    client.close_query().await?;
+
+    assert!(got_result, "Expected exactly one row from SELECT 1");
 
     Ok(())
 }

@@ -17,6 +17,8 @@ pub enum SqlDataType {
     Int,
     /// BigInt - 8 byte integer
     BigInt,
+    /// NVarChar - UTF16 string
+    NVarChar,
 }
 
 impl SqlDataType {
@@ -27,6 +29,7 @@ impl SqlDataType {
             SqlDataType::SmallInt => 0x26, // IntN with length 2
             SqlDataType::Int => 0x26,      // IntN with length 4
             SqlDataType::BigInt => 0x26,   // IntN with length 8
+            SqlDataType::NVarChar => 0xE7, // NVarCharType
         }
     }
 
@@ -37,6 +40,7 @@ impl SqlDataType {
             SqlDataType::SmallInt => 2,
             SqlDataType::Int => 4,
             SqlDataType::BigInt => 8,
+            SqlDataType::NVarChar => 255, // Handled specially
         }
     }
 }
@@ -48,6 +52,7 @@ pub enum ColumnValue {
     SmallInt(i16),
     Int(i32),
     BigInt(i64),
+    NVarChar(String),
     Null,
 }
 
@@ -59,6 +64,7 @@ impl ColumnValue {
             ColumnValue::SmallInt(_) => SqlDataType::SmallInt,
             ColumnValue::Int(_) => SqlDataType::Int,
             ColumnValue::BigInt(_) => SqlDataType::BigInt,
+            ColumnValue::NVarChar(_) => SqlDataType::NVarChar,
             ColumnValue::Null => SqlDataType::Int, // Default to Int for NULL
         }
     }
@@ -81,6 +87,14 @@ impl ColumnValue {
             ColumnValue::BigInt(v) => {
                 buf.put_u8(8); // Length indicator
                 buf.put_i64_le(*v);
+            }
+            ColumnValue::NVarChar(v) => {
+                let utf16_bytes: Vec<u8> = v
+                    .encode_utf16()
+                    .flat_map(|ch| ch.to_le_bytes().into_iter())
+                    .collect();
+                buf.put_u16_le(utf16_bytes.len() as u16);
+                buf.put_slice(&utf16_bytes);
             }
             ColumnValue::Null => {
                 buf.put_u8(0); // Length 0 means NULL for IntN
@@ -119,17 +133,56 @@ impl Row {
     }
 }
 
+/// An informational message injected into the result stream.
+///
+/// Fabric DW injects these between ColMetadata and Row tokens with tracing
+/// metadata (Statement ID, Query hash, Distributed request ID).
+#[derive(Debug, Clone)]
+pub struct InfoMessage {
+    pub number: u32,
+    pub state: u8,
+    pub severity: u8,
+    pub message: String,
+    pub server_name: String,
+    pub proc_name: String,
+    pub line_number: u32,
+}
+
+impl InfoMessage {
+    pub fn new(number: u32, severity: u8, message: impl Into<String>) -> Self {
+        Self {
+            number,
+            state: 1,
+            severity,
+            message: message.into(),
+            server_name: String::new(),
+            proc_name: String::new(),
+            line_number: 0,
+        }
+    }
+}
+
 /// A complete query response definition
 #[derive(Debug, Clone)]
 pub struct QueryResponse {
     pub columns: Vec<ColumnDefinition>,
     pub rows: Vec<Row>,
+    pub info_tokens: Vec<InfoMessage>,
 }
 
 impl QueryResponse {
     /// Create a new query response
     pub fn new(columns: Vec<ColumnDefinition>, rows: Vec<Row>) -> Self {
-        Self { columns, rows }
+        Self {
+            columns,
+            rows,
+            info_tokens: Vec::new(),
+        }
+    }
+
+    pub fn with_info_tokens(mut self, info_tokens: Vec<InfoMessage>) -> Self {
+        self.info_tokens = info_tokens;
+        self
     }
 
     /// Helper to create a response for SELECT 1
@@ -137,6 +190,7 @@ impl QueryResponse {
         Self {
             columns: vec![ColumnDefinition::new("", SqlDataType::Int)],
             rows: vec![Row::new(vec![ColumnValue::Int(1)])],
+            info_tokens: Vec::new(),
         }
     }
 
@@ -153,6 +207,7 @@ impl QueryResponse {
                 ColumnValue::Int(2),
                 ColumnValue::Int(3),
             ])],
+            info_tokens: Vec::new(),
         }
     }
 }
@@ -194,5 +249,65 @@ impl QueryRegistry {
 impl Default for QueryRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sql_data_types() {
+        assert_eq!(SqlDataType::TinyInt.tds_type_code(), 0x26);
+        assert_eq!(SqlDataType::SmallInt.tds_type_code(), 0x26);
+        assert_eq!(SqlDataType::Int.tds_type_code(), 0x26);
+        assert_eq!(SqlDataType::BigInt.tds_type_code(), 0x26);
+        assert_eq!(SqlDataType::NVarChar.tds_type_code(), 0xE7);
+
+        assert_eq!(SqlDataType::TinyInt.max_length(), 1);
+        assert_eq!(SqlDataType::SmallInt.max_length(), 2);
+        assert_eq!(SqlDataType::Int.max_length(), 4);
+        assert_eq!(SqlDataType::BigInt.max_length(), 8);
+        assert_eq!(SqlDataType::NVarChar.max_length(), 255);
+    }
+
+    #[test]
+    fn test_column_value_write() {
+        let mut buf = bytes::BytesMut::new();
+
+        let null_val = ColumnValue::Null;
+        assert_eq!(null_val.data_type(), SqlDataType::Int);
+        null_val.write_to_buffer(&mut buf);
+        assert_eq!(&buf[..], &[0]);
+        buf.clear();
+
+        let nvarchar_val = ColumnValue::NVarChar("test".to_string());
+        assert_eq!(nvarchar_val.data_type(), SqlDataType::NVarChar);
+        nvarchar_val.write_to_buffer(&mut buf);
+        // length is 4 u16 chars => 8 bytes, so 0x08 0x00 is the length followed by the utf16 LE bytes
+        assert_eq!(&buf[0..2], &[8, 0]);
+        buf.clear();
+
+        let int_val = ColumnValue::Int(1);
+        assert_eq!(int_val.data_type(), SqlDataType::Int);
+        int_val.write_to_buffer(&mut buf);
+        assert_eq!(&buf[..], &[4, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_select_nvarchar_type() {
+        let mut registry = QueryRegistry::new();
+        registry.register(
+            "SELECT 'test'",
+            QueryResponse::new(
+                vec![ColumnDefinition::new("", SqlDataType::NVarChar)],
+                vec![Row::new(vec![ColumnValue::NVarChar("test".to_string())])],
+            ),
+        );
+        let resp = registry
+            .get("SELECT 'test'")
+            .expect("registered query response should be available");
+        assert_eq!(resp.columns.len(), 1);
+        assert_eq!(resp.rows.len(), 1);
     }
 }

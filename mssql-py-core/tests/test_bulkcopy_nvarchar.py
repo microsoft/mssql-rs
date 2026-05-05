@@ -523,6 +523,48 @@ def test_cursor_bulkcopy_nvarchar_empty_strings(client_context):
 
 
 @pytest.mark.integration
+def test_cursor_bulkcopy_nvarchar_max_empty_strings(client_context):
+    """Regression test for microsoft/mssql-python#547.
+
+    Empty strings into NVARCHAR(MAX)/VARCHAR(MAX) columns must not desync the
+    PLP stream. A zero-length PLP chunk header IS the PLP terminator per
+    MS-TDS, so writing chunk_len=0 plus a separate terminator caused SQL error
+    4804 ("premature end of message").
+    """
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "#BulkCopyEmptyStringNVarcharMax"
+    cursor.execute(
+        f"CREATE TABLE {table_name} ("
+        f"id INT, body NVARCHAR(MAX) NULL, "
+        f"body_v VARCHAR(MAX) NULL, flag BIT NOT NULL)"
+    )
+
+    data = [
+        (1, "hello", "hello", True),
+        (2, "", "", True),
+        (3, "world", "world", False),
+        (4, None, None, True),
+    ]
+
+    result = cursor.bulkcopy(table_name, iter(data), batch_size=1000, timeout=30)
+
+    assert result is not None
+    assert result["rows_copied"] == 4
+    assert result["batch_count"] == 1
+
+    cursor.execute(f"SELECT id, body, body_v, flag FROM {table_name} ORDER BY id")
+    rows = cursor.fetchall()
+    assert rows[0] == (1, "hello", "hello", True)
+    assert rows[1] == (2, "", "", True)
+    assert rows[2] == (3, "world", "world", False)
+    assert rows[3] == (4, None, None, True)
+
+    conn.close()
+
+
+@pytest.mark.integration
 def test_cursor_bulkcopy_nvarchar_mixed_types(client_context):
     """Test cursor bulkcopy with mixed data types converting to NVARCHAR columns.
 

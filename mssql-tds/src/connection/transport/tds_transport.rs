@@ -51,4 +51,8 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// * `Ok(false)` - Attention sent but timeout expired waiting for ACK
     /// * `Err(_)` - Error sending attention or reading response
     async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool>;
+
+    /// Check whether the underlying connection is dead via a non-blocking socket poll.
+    /// Returns `true` if the connection is known to be dead, `false` if alive or unknown.
+    fn is_connection_dead(&self) -> bool;
 }

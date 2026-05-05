@@ -5,6 +5,8 @@ use std::collections::HashMap;
 
 use crate::connection::bulk_copy::{BulkCopyOptions, BulkLoadRow, ResolvedColumnMapping};
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
+use crate::connection::client_context::ClientContext;
+use crate::connection::session_recovery::RecoveryContext;
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
@@ -33,7 +35,7 @@ use crate::{
     handler::handler_factory::NegotiatedSettings,
     io::token_stream::{ParserContext, RowReadResult},
     message::{batch::SqlBatch, messages::Request},
-    token::tokens::{ColMetadataToken, CurrentCommand, Tokens},
+    token::tokens::{ColMetadataToken, CurrentCommand, EnvChangeTokenSubType, Tokens},
 };
 use async_trait::async_trait;
 use tracing::{debug, error, info, instrument};
@@ -54,6 +56,7 @@ pub struct TdsClient {
     pub(crate) transport: Box<dyn TdsTransport>,
     pub(crate) negotiated_settings: NegotiatedSettings,
     pub(crate) execution_context: ExecutionContext,
+    pub(crate) recovery_context: Box<RecoveryContext>,
 
     // pub(crate) batch_result: Option<BatchResult<'static>>,
     pub(crate) current_metadata: Option<Arc<ColMetadataToken>>,
@@ -77,11 +80,24 @@ impl TdsClient {
         transport: Box<dyn TdsTransport>,
         negotiated_settings: NegotiatedSettings,
         execution_context: ExecutionContext,
+        client_context: ClientContext,
     ) -> Self {
+        let mut recovery_context = RecoveryContext::new();
+        recovery_context.initialize(
+            client_context,
+            negotiated_settings.login_ack_tds_version,
+            negotiated_settings.login_ack_server_version,
+            negotiated_settings
+                .session_settings
+                .negotiated_encryption_settings,
+            negotiated_settings.session_settings.mars_enabled,
+        );
+
         Self {
             transport,
             negotiated_settings,
             execution_context,
+            recovery_context: Box::new(recovery_context),
             current_metadata: None,
             count_map: HashMap::new(),
             return_values: Vec::new(),
@@ -90,6 +106,155 @@ impl TdsClient {
             cancel_handle: None,
             empty_metadata: Vec::new(),
         }
+    }
+
+    /// Attempt to reconnect a dead connection by replaying session state.
+    ///
+    /// The overall reconnection is bounded by `timeout`. Each individual
+    /// TCP/TDS handshake attempt uses the original `connect_timeout`. Before
+    /// each retry sleep, we verify enough time remains for the interval.
+    #[instrument(skip(self), level = "info")]
+    pub(crate) async fn reconnect(
+        &mut self,
+        timeout: Duration,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
+        use crate::connection_provider::tds_connection_provider::TdsConnectionProvider;
+        use crate::error::Error;
+
+        // Gate: session must be recoverable
+        if !self
+            .recovery_context
+            .is_recovery_possible(&self.execution_context)
+        {
+            return Err(Error::SessionNotRecoverable(
+                "Session state does not allow recovery".to_string(),
+            ));
+        }
+
+        let client_context = match self.recovery_context.client_context.as_ref() {
+            Some(ctx) => ctx.clone(),
+            None => {
+                return Err(Error::SessionNotRecoverable(
+                    "No client context available for reconnection".to_string(),
+                ));
+            }
+        };
+
+        // Snapshot session state for the reconnection LOGIN7
+        let snapshot = self.recovery_context.session_state_table.snapshot(
+            Some(&self.negotiated_settings.database),
+            Some(&self.negotiated_settings.language),
+            Some(self.negotiated_settings.database_collation),
+        );
+
+        // Close the dead transport (best-effort)
+        let _ = self.transport.close_transport().await;
+
+        let deadline = Instant::now() + timeout;
+        let connect_retry_count = client_context.connect_retry_count;
+        let connect_retry_interval =
+            Duration::from_secs(client_context.connect_retry_interval as u64);
+        let transport_context = client_context.transport_context.clone();
+
+        let mut last_error: Option<Error> = None;
+
+        for attempt in 0..=connect_retry_count {
+            // Wait before retry (not before first attempt)
+            if attempt > 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining < connect_retry_interval {
+                    info!(
+                        attempt,
+                        "Not enough time for retry interval, aborting reconnection"
+                    );
+                    break;
+                }
+                // Cancellable sleep — if the caller cancels, abort immediately
+                // rather than blocking until the interval expires (matches ODBC's
+                // recoveryCancelledEvent.Wait() interruptible sleep).
+                CancelHandle::run_until_cancelled(cancel_handle, async {
+                    tokio::time::sleep(connect_retry_interval).await;
+                    Ok(())
+                })
+                .await?;
+            }
+
+            // Check deadline
+            if Instant::now() >= deadline {
+                info!("Reconnection deadline exceeded");
+                break;
+            }
+
+            // Inject recovery data into the client context clone
+            let mut reconnect_ctx = client_context.clone();
+
+            // Cap the per-attempt connect timeout to the remaining reconnect budget
+            let remaining_secs =
+                deadline.saturating_duration_since(Instant::now()).as_secs() as u32;
+            reconnect_ctx.connect_timeout = reconnect_ctx.connect_timeout.min(remaining_secs);
+
+            info!(attempt, "Attempting reconnection");
+            let connect_result = CancelHandle::run_until_cancelled(
+                cancel_handle,
+                TdsConnectionProvider::connect_with_transport_context(
+                    &reconnect_ctx,
+                    &transport_context,
+                    Some(Box::new((*snapshot).clone())),
+                ),
+            )
+            .await;
+            match connect_result {
+                Ok((new_transport, new_settings, new_exec_ctx)) => {
+                    // Validate reconnection properties match original
+                    if let Err(validation_err) =
+                        self.recovery_context.validate_reconnection(&new_settings)
+                    {
+                        // Close the new transport — it's unusable
+                        let mut transport = new_transport;
+                        let _ = transport.close_transport().await;
+                        info!(error = %validation_err, "Reconnection validation failed");
+                        return Err(validation_err);
+                    }
+
+                    // Replace connection state
+                    self.transport = new_transport;
+                    self.negotiated_settings = new_settings;
+                    self.execution_context = new_exec_ctx;
+
+                    // Reset per-request state
+                    self.current_metadata = None;
+                    self.count_map.clear();
+                    self.return_values.clear();
+                    self.current_result_set_has_been_read_till_end = false;
+                    self.remaining_request_timeout = None;
+                    self.cancel_handle = None;
+
+                    // Reset session state table for the new session
+                    self.recovery_context.session_state_table.reset();
+
+                    self.recovery_context.recovery_count += 1;
+                    info!(
+                        recovery_count = self.recovery_context.recovery_count,
+                        "Reconnection successful"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    info!(attempt, error = %e, "Reconnection attempt failed");
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // All attempts exhausted
+        let message = last_error
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "Deadline exceeded".to_string());
+        Err(Error::SessionRecoveryFailed {
+            attempts: connect_retry_count + 1,
+            message,
+        })
     }
 
     /// Returns the database collation negotiated during login.
@@ -127,6 +292,96 @@ impl TdsClient {
         });
     }
 
+    /// Pre-execution check: detect a dead connection and attempt session recovery.
+    ///
+    /// Called at the top of every method that sends a TDS request (SQL batch,
+    /// RPC, bulk load, `BEGIN TRANSACTION`). If session recovery was negotiated
+    /// and the underlying TCP socket is dead, this will attempt `reconnect()`.
+    ///
+    /// Returns the time spent reconnecting so callers can deduct it from the
+    /// command timeout. When no reconnection is needed, returns `Duration::ZERO`.
+    ///
+    /// The command timeout (`timeout_sec`) is used as the overall budget for
+    /// recovery + execution, matching ODBC's `CheckOrRecoverConnection` which
+    /// deducts recovery time from the remaining command timeout via
+    /// `timer.GetTimeoutLeft()`. This ensures applications can set reliable
+    /// SLAs — a 30-second command timeout means at most 30 seconds total,
+    /// regardless of whether a reconnect occurred.
+    ///
+    /// Methods that operate within an active transaction (`COMMIT`, `ROLLBACK`,
+    /// `SAVE`) intentionally skip this — `is_recovery_possible()` returns
+    /// `false` when a transaction is active, matching SqlClient's
+    /// `RestoreBrokenConnection` flag behavior.
+    async fn check_and_reconnect(
+        &mut self,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Duration> {
+        // Only attempt recovery when session recovery was negotiated and
+        // the server supports retry (connect_retry_count > 0).
+        if !self.recovery_context.session_recovery_negotiated {
+            return Ok(Duration::ZERO);
+        }
+        let connect_retry_count = self
+            .recovery_context
+            .client_context
+            .as_ref()
+            .map_or(0, |ctx| ctx.connect_retry_count);
+        if connect_retry_count == 0 {
+            return Ok(Duration::ZERO);
+        }
+
+        // Non-blocking poll — returns immediately.
+        if !self.transport.is_connection_dead() {
+            return Ok(Duration::ZERO);
+        }
+
+        // Connection is dead. Check if recovery is possible.
+        if !self
+            .recovery_context
+            .is_recovery_possible(&self.execution_context)
+        {
+            return Err(crate::error::Error::ConnectionClosed(
+                "Connection is dead and session state does not allow recovery".to_string(),
+            ));
+        }
+
+        // Use the command timeout as the reconnection budget. If no command
+        // timeout is set, fall back to connect_timeout so reconnection is
+        // still bounded.
+        let reconnect_timeout = match timeout_sec {
+            Some(t) if t > 0 => Duration::from_secs(t as u64),
+            _ => {
+                let connect_timeout = self
+                    .recovery_context
+                    .client_context
+                    .as_ref()
+                    .map_or(15, |ctx| ctx.connect_timeout);
+                Duration::from_secs(connect_timeout as u64)
+            }
+        };
+
+        let start = Instant::now();
+        self.reconnect(reconnect_timeout, cancel_handle).await?;
+        Ok(start.elapsed())
+    }
+
+    /// Subtracts `elapsed` from `timeout_sec`, returning the remaining seconds.
+    /// Returns `Some(0)` (immediate timeout) if recovery consumed the entire budget.
+    /// Passes through `None` (no timeout) unchanged.
+    /// Rounds up to avoid exceeding the caller's timeout budget on sub-second elapsed times.
+    fn deduct_timeout(timeout_sec: Option<u32>, elapsed: Duration) -> Option<u32> {
+        timeout_sec.map(|t| {
+            let elapsed_secs = u32::try_from(
+                elapsed
+                    .as_secs()
+                    .saturating_add(if elapsed.subsec_nanos() > 0 { 1 } else { 0 }),
+            )
+            .unwrap_or(u32::MAX);
+            t.saturating_sub(elapsed_secs)
+        })
+    }
+
     /// Sends a SQL batch to the server for execution.
     ///
     /// Wraps the SQL text in a TDS `SQL_BATCH` message. After this call returns,
@@ -155,6 +410,9 @@ impl TdsClient {
                 ALREADY_EXECUTING_ERROR.to_string(),
             ));
         };
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -204,6 +462,9 @@ impl TdsClient {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -307,6 +568,9 @@ impl TdsClient {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -442,8 +706,16 @@ impl TdsClient {
                 }
                 Tokens::EnvChange(env_change) => {
                     info!(?env_change);
+                    if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                        self.recovery_context.session_state_table.reset();
+                    }
                     self.execution_context
                         .capture_change_property(&env_change)?;
+                    continue;
+                }
+                Tokens::SessionState(session_state) => {
+                    self.recovery_context
+                        .process_session_state(&session_state)?;
                     continue;
                 }
                 _ => {
@@ -514,6 +786,9 @@ impl TdsClient {
             ));
         };
 
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
@@ -568,6 +843,9 @@ impl TdsClient {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -659,6 +937,9 @@ impl TdsClient {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
@@ -712,6 +993,9 @@ impl TdsClient {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -791,6 +1075,9 @@ impl TdsClient {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -878,7 +1165,14 @@ impl TdsClient {
                     collected_errors.push(SqlErrorInfo::from(&error_token));
                 }
                 Tokens::EnvChange(t1) => {
+                    if t1.sub_type == EnvChangeTokenSubType::ResetConnection {
+                        self.recovery_context.session_state_table.reset();
+                    }
                     self.execution_context.capture_change_property(&t1)?;
+                }
+                Tokens::SessionState(session_state) => {
+                    self.recovery_context
+                        .process_session_state(&session_state)?;
                 }
                 Tokens::ReturnValue(return_value_token) => {
                     let return_value = return_value_token.into();
@@ -980,8 +1274,15 @@ impl TdsClient {
                 }
                 Tokens::EnvChange(env_change) => {
                     info!(?env_change);
+                    if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                        self.recovery_context.session_state_table.reset();
+                    }
                     self.execution_context
                         .capture_change_property(&env_change)?;
+                }
+                Tokens::SessionState(session_state) => {
+                    self.recovery_context
+                        .process_session_state(&session_state)?;
                 }
                 Tokens::ReturnValue(return_value_token) => {
                     let return_value = return_value_token.into();
@@ -1094,8 +1395,16 @@ impl TdsClient {
                     }
                     Tokens::EnvChange(env_change) => {
                         info!(?env_change);
+                        if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                            self.recovery_context.session_state_table.reset();
+                        }
                         self.execution_context
                             .capture_change_property(&env_change)?;
+                        continue;
+                    }
+                    Tokens::SessionState(session_state) => {
+                        self.recovery_context
+                            .process_session_state(&session_state)?;
                         continue;
                     }
                     Tokens::ReturnValue(return_value_token) => {
@@ -1117,6 +1426,10 @@ impl TdsClient {
                              you may need to call move_to_next() to advance to the next result set."
                                 .to_string(),
                         ));
+                    }
+                    Tokens::Info(info_token) => {
+                        info!(?info_token);
+                        continue;
                     }
                     _ => {
                         return Err(crate::error::Error::ProtocolError(format!(
@@ -1216,6 +1529,27 @@ impl TdsClient {
         self.execution_context.has_active_transaction()
     }
 
+    /// Returns whether session recovery (idle connection resiliency) was
+    /// negotiated with the server during login.
+    ///
+    /// When `true`, the driver will transparently attempt to reconnect and
+    /// restore session state if a dead connection is detected before executing
+    /// a command — provided the session is in a recoverable state (no open
+    /// transactions, etc.).
+    pub fn is_session_recovery_enabled(&self) -> bool {
+        self.recovery_context.session_recovery_negotiated
+    }
+
+    /// Returns the number of times this connection has been successfully
+    /// recovered after detecting a dead connection.
+    ///
+    /// The count is incremented each time [`reconnect()`] completes
+    /// successfully, including session-state restoration and server-property
+    /// validation.
+    pub fn connection_recovery_count(&self) -> u32 {
+        self.recovery_context.recovery_count
+    }
+
     /// Begin a new transaction with the given isolation level and optional name.
     ///
     /// Fails if a batch is currently executing. Use [`has_active_transaction`](Self::has_active_transaction)
@@ -1231,6 +1565,10 @@ impl TdsClient {
                 "Cannot begin transaction while another batch is executing.".to_string(),
             ));
         }
+
+        // begin_transaction has no command timeout — use connect_timeout as fallback.
+        let _reconnect_elapsed = self.check_and_reconnect(None, None).await?;
+
         let transaction_params = TransactionManagementType::Begin(CreateTxnParams {
             level: isolation_level,
             name,
@@ -1408,8 +1746,16 @@ impl TdsClient {
                 }
                 Tokens::EnvChange(env_change) => {
                     info!(?env_change);
+                    if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                        self.recovery_context.session_state_table.reset();
+                    }
                     self.execution_context
                         .capture_change_property(&env_change)?;
+                    continue;
+                }
+                Tokens::SessionState(session_state) => {
+                    self.recovery_context
+                        .process_session_state(&session_state)?;
                     continue;
                 }
                 _ => {
@@ -1555,6 +1901,119 @@ pub trait ResultSetClient<T = TdsClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::client_context::ClientContext;
+    use crate::connection::transport::network_transport::TransportSslHandler;
+    use crate::connection::transport::tds_transport::TdsTransport;
+    use crate::core::{CancelHandle, TdsResult};
+    use crate::datatypes::row_writer::RowWriter;
+    use crate::io::reader_writer::{NetworkReader, NetworkWriter};
+    use crate::io::token_stream::{ParserContext, RowReadResult, TdsTokenStreamReader};
+    use crate::token::tokens::Tokens;
+    use async_trait::async_trait;
+
+    // ── Minimal mock transport for reconnect() unit tests ──
+
+    #[derive(Debug)]
+    struct TestTransport {
+        closed: bool,
+    }
+
+    impl TestTransport {
+        fn new() -> Self {
+            Self { closed: false }
+        }
+    }
+
+    #[async_trait]
+    impl TdsTokenStreamReader for TestTransport {
+        async fn receive_token(
+            &mut self,
+            _context: &ParserContext,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+        ) -> TdsResult<Tokens> {
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+
+        async fn receive_row_into(
+            &mut self,
+            _context: &ParserContext,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+            _writer: &mut (dyn RowWriter + Send),
+        ) -> TdsResult<RowReadResult> {
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl TransportSslHandler for TestTransport {
+        async fn enable_ssl(&mut self) -> TdsResult<()> {
+            Ok(())
+        }
+        async fn disable_ssl(&mut self) -> TdsResult<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl NetworkWriter for TestTransport {
+        async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
+            Ok(())
+        }
+        fn packet_size(&self) -> u32 {
+            4096
+        }
+        fn get_encryption_setting(&self) -> crate::core::NegotiatedEncryptionSetting {
+            crate::core::NegotiatedEncryptionSetting::NoEncryption
+        }
+    }
+
+    #[async_trait]
+    impl NetworkReader for TestTransport {
+        async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
+            buffer.fill(0);
+            Ok(0)
+        }
+        fn packet_size(&self) -> u32 {
+            4096
+        }
+    }
+
+    #[async_trait]
+    impl TdsTransport for TestTransport {
+        fn as_writer(&mut self) -> &mut dyn NetworkWriter {
+            self
+        }
+        fn reset_reader(&mut self) {}
+        fn packet_size(&self) -> u32 {
+            4096
+        }
+        async fn close_transport(&mut self) -> TdsResult<()> {
+            self.closed = true;
+            Ok(())
+        }
+        async fn send_attention_with_timeout(&mut self, _timeout: Duration) -> TdsResult<bool> {
+            Ok(false)
+        }
+        fn is_connection_dead(&self) -> bool {
+            true
+        }
+    }
+
+    fn create_test_client() -> TdsClient {
+        let transport = Box::new(TestTransport::new());
+        let negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let execution_context = crate::connection::execution_context::ExecutionContext::new();
+        let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            client_context,
+        )
+    }
 
     #[test]
     fn timeout_to_duration_none_yields_none() {
@@ -1572,5 +2031,237 @@ mod tests {
             TdsClient::timeout_to_duration(Some(30)),
             Some(Duration::from_secs(30))
         );
+    }
+
+    // ── Reconnection orchestration tests ──
+
+    #[tokio::test]
+    async fn reconnect_fails_when_not_negotiated() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = false;
+
+        let result = client.reconnect(Duration::from_secs(10), None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Session not recoverable"),
+            "Expected SessionNotRecoverable, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_fails_when_no_client_context() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        client.recovery_context.client_context = None;
+
+        let result = client.reconnect(Duration::from_secs(10), None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("No client context"),
+            "Expected no client context error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_fails_when_transaction_active() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        client.execution_context.set_transaction_descriptor(999);
+
+        let result = client.reconnect(Duration::from_secs(10), None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Session not recoverable"),
+            "Expected SessionNotRecoverable, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_fails_when_batch_open() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        client.execution_context.set_has_open_batch(true);
+
+        let result = client.reconnect(Duration::from_secs(10), None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Session not recoverable"),
+            "Expected SessionNotRecoverable, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_fails_with_zero_timeout() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+
+        // Zero-duration timeout → deadline immediately exceeded
+        let result = client.reconnect(Duration::ZERO, None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Session recovery failed"),
+            "Expected SessionRecoveryFailed, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_returns_session_recovery_failed_on_connection_failure() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        // Use a very short timeout — connect will fail (no server) and exhaust attempts
+        // connect_retry_count defaults to 1, connect_retry_interval defaults to 10
+        // With a 1-second timeout the first attempt fails and no time for retry
+        let result = client.reconnect(Duration::from_secs(1), None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // Should be SessionRecoveryFailed (not SessionNotRecoverable)
+        assert!(
+            err.to_string().contains("Session recovery failed")
+                || err.to_string().contains("attempt"),
+            "Expected SessionRecoveryFailed, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_increments_recovery_count_tracking() {
+        // Verify initial state
+        let client = create_test_client();
+        assert_eq!(client.recovery_context.recovery_count, 0);
+    }
+
+    // ── Pre-execution dead connection check tests ──
+
+    #[tokio::test]
+    async fn check_and_reconnect_skips_when_not_negotiated() {
+        let mut client = create_test_client();
+        // session_recovery_negotiated is false by default
+        assert!(!client.recovery_context.session_recovery_negotiated);
+
+        // Should return Ok(Duration::ZERO) even though transport is "dead"
+        let elapsed = client.check_and_reconnect(Some(5), None).await.unwrap();
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn check_and_reconnect_skips_when_retry_count_zero() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        if let Some(ref mut ctx) = client.recovery_context.client_context {
+            ctx.connect_retry_count = 0;
+        }
+
+        // Should skip even with dead transport because retry count is 0
+        let elapsed = client.check_and_reconnect(Some(5), None).await.unwrap();
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn check_and_reconnect_returns_error_when_dead_and_not_recoverable() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        // Make it not recoverable by starting a transaction
+        client.execution_context.set_transaction_descriptor(42);
+
+        let result = client.check_and_reconnect(Some(5), None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Connection is dead"),
+            "Expected ConnectionClosed, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_and_reconnect_attempts_reconnect_when_dead_and_recoverable() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        // Transport (TestTransport) returns is_connection_dead() = true,
+        // recovery is possible (no txn, no open batch, negotiated=true).
+        // reconnect() will fail because TestTransport can't actually connect,
+        // but it should be *attempted* — we'll get SessionRecoveryFailed.
+        let result = client.check_and_reconnect(Some(1), None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Session recovery failed"),
+            "Expected reconnect attempt resulting in SessionRecoveryFailed, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_and_reconnect_skips_when_no_client_context() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        client.recovery_context.client_context = None;
+
+        // connect_retry_count defaults to 0 when no client context → skip
+        let elapsed = client.check_and_reconnect(Some(5), None).await.unwrap();
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    // ── deduct_timeout tests ──
+
+    #[test]
+    fn deduct_timeout_subtracts_elapsed() {
+        let result = TdsClient::deduct_timeout(Some(30), Duration::from_secs(12));
+        assert_eq!(result, Some(18));
+    }
+
+    #[test]
+    fn deduct_timeout_saturates_at_zero() {
+        let result = TdsClient::deduct_timeout(Some(5), Duration::from_secs(10));
+        assert_eq!(result, Some(0));
+    }
+
+    #[test]
+    fn deduct_timeout_passes_through_none() {
+        let result = TdsClient::deduct_timeout(None, Duration::from_secs(10));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn deduct_timeout_zero_elapsed() {
+        let result = TdsClient::deduct_timeout(Some(30), Duration::ZERO);
+        assert_eq!(result, Some(30));
+    }
+
+    #[test]
+    fn deduct_timeout_rounds_up_sub_second() {
+        // 1.9 seconds elapsed should round up to 2 seconds deducted
+        let result = TdsClient::deduct_timeout(Some(30), Duration::from_millis(1900));
+        assert_eq!(result, Some(28));
+    }
+
+    // Public Recovery API ──────────────────────────────────────
+
+    #[test]
+    fn is_session_recovery_enabled_returns_false_by_default() {
+        let client = create_test_client();
+        assert!(!client.is_session_recovery_enabled());
+    }
+
+    #[test]
+    fn is_session_recovery_enabled_returns_true_when_negotiated() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        assert!(client.is_session_recovery_enabled());
+    }
+
+    #[test]
+    fn connection_recovery_count_starts_at_zero() {
+        let client = create_test_client();
+        assert_eq!(client.connection_recovery_count(), 0);
+    }
+
+    #[test]
+    fn connection_recovery_count_reflects_recovery_count() {
+        let mut client = create_test_client();
+        client.recovery_context.recovery_count = 3;
+        assert_eq!(client.connection_recovery_count(), 3);
     }
 }

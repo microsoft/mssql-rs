@@ -53,6 +53,10 @@ pub struct ConnectionProcessor {
     is_authenticated: bool,
     /// Access token received during FedAuth authentication (if any)
     received_token: Option<Vec<u8>>,
+    /// User Agent received during authentication (if any)
+    pub user_agent: Option<String>,
+    /// ServerName received in the Login7 packet
+    received_server_name: Option<String>,
     /// Reference to the shared query registry
     query_registry: Arc<Mutex<QueryRegistry>>,
     /// Packet buffer for this connection
@@ -68,6 +72,8 @@ impl ConnectionProcessor {
             addr,
             is_authenticated: false,
             received_token: None,
+            user_agent: None,
+            received_server_name: None,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
             redirection: None,
@@ -84,6 +90,8 @@ impl ConnectionProcessor {
             addr,
             is_authenticated: false,
             received_token: None,
+            user_agent: None,
+            received_server_name: None,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
             redirection,
@@ -103,6 +111,11 @@ impl ConnectionProcessor {
     /// Get the received access token (raw bytes)
     pub fn received_token(&self) -> Option<&[u8]> {
         self.received_token.as_deref()
+    }
+
+    /// Get the ServerName received in the Login7 packet
+    pub fn received_server_name(&self) -> Option<&str> {
+        self.received_server_name.as_deref()
     }
 
     /// Get the received access token as a UTF-16LE decoded string
@@ -166,16 +179,20 @@ impl ConnectionProcessor {
                 // Parse Login7 packet body (skip header) for authentication info
                 let packet_body = &packet_data[PACKET_HEADER_SIZE..];
                 let auth_info = parse_login7_auth(packet_body);
+                self.user_agent = auth_info.user_agent.clone();
 
                 // Log the server name sent by client (important for verifying redirection behavior)
                 if let Some(ref server_name) = auth_info.server_name {
                     info!(
-                        "Login7 from {}: client sent ServerName='{}'",
+                        "Login7 from {}: client sent ServerName={:?}",
                         self.addr, server_name
                     );
                 } else {
                     info!("Login7 from {}: no ServerName in packet", self.addr);
                 }
+
+                // Store the server name for test verification
+                self.received_server_name = auth_info.server_name.clone();
 
                 // FedAuth is always supported - check if client used it
                 if auth_info.has_fedauth {
@@ -329,6 +346,10 @@ pub struct ConnectionInfo {
     pub received_token: Option<Vec<u8>>,
     /// Whether the client authenticated successfully
     pub authenticated: bool,
+    /// User Agent received during authentication (if any)
+    pub user_agent: Option<String>,
+    /// ServerName received in the Login7 packet
+    pub received_server_name: Option<String>,
 }
 
 impl ConnectionInfo {
@@ -346,6 +367,10 @@ impl ConnectionInfo {
             }
         })
     }
+    /// Get the user agent received during authentication
+    pub fn received_user_agent(&self) -> Option<String> {
+        self.user_agent.clone()
+    }
 }
 
 impl ConnectionStore {
@@ -361,6 +386,8 @@ impl ConnectionStore {
             addr: processor.addr(),
             received_token: processor.received_token().map(|t| t.to_vec()),
             authenticated: processor.is_authenticated(),
+            user_agent: processor.user_agent.clone(),
+            received_server_name: processor.received_server_name().map(|s| s.to_string()),
         };
         self.connections.insert(processor.addr(), info);
     }
@@ -469,14 +496,17 @@ impl MockTdsServer {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
 
-        let tls_acceptor = identity.map(|id| {
-            let mut builder = native_tls::TlsAcceptor::builder(id);
-            if strict_mode {
-                builder.accept_alpn(&[mssql_tds::core::TDS_8_ALPN_PROTOCOL]);
-            }
-            let acceptor = builder.build().expect("Failed to build TLS acceptor");
-            TlsAcceptor::from(acceptor)
-        });
+        let tls_acceptor = identity
+            .map(|id| {
+                let mut builder = native_tls::TlsAcceptor::builder(id);
+                if strict_mode {
+                    builder.accept_alpn(&[mssql_tds::core::TDS_8_ALPN_PROTOCOL]);
+                }
+                builder.build().map(TlsAcceptor::from).map_err(|error| {
+                    std::io::Error::other(format!("Failed to build TLS acceptor: {}", error))
+                })
+            })
+            .transpose()?;
 
         let has_tls = tls_acceptor.is_some();
         if strict_mode {
@@ -668,17 +698,19 @@ async fn handle_connection_with_tls(
             let tds_wrapper = TdsTlsWrapper::new(prelogin_socket);
 
             // Perform TLS handshake over the TDS-wrapped stream
-            let tls_stream = tls_acceptor
-                .unwrap()
-                .accept(tds_wrapper)
-                .await
-                .map_err(|e| {
-                    error!("TLS handshake failed: {}", e);
-                    ProtocolError::Io(std::io::Error::other(format!(
-                        "TLS handshake failed: {}",
-                        e
-                    )))
-                })?;
+            let tls_acceptor = tls_acceptor.ok_or_else(|| {
+                ProtocolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "TLS encryption was negotiated without a TLS acceptor",
+                ))
+            })?;
+            let tls_stream = tls_acceptor.accept(tds_wrapper).await.map_err(|e| {
+                error!("TLS handshake failed: {}", e);
+                ProtocolError::Io(std::io::Error::other(format!(
+                    "TLS handshake failed: {}",
+                    e
+                )))
+            })?;
 
             info!("TLS handshake successful for {}", addr);
             handle_encrypted_tds_wrapped_connection(
@@ -1007,6 +1039,8 @@ async fn handle_connection(
 
                 PacketType::Login7 => {
                     debug!("Handling Login7");
+                    let packet_body = &packet_data[PACKET_HEADER_SIZE..];
+                    let _auth_info = parse_login7_auth(packet_body);
                     is_authenticated = true;
 
                     // Build response with LoginAck + EnvChange + Done
@@ -1120,7 +1154,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_creation() {
-        let server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+        let server = MockTdsServer::new("127.0.0.1:0")
+            .await
+            .expect("mock server should bind to an ephemeral localhost port");
         let addr = server.local_addr();
         assert!(addr.port() > 0);
     }

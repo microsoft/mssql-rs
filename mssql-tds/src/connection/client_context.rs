@@ -221,6 +221,9 @@ pub struct ClientContext {
     pub mars_enabled: bool,
     /// Enable multi-subnet failover for AlwaysOn availability groups.
     pub multi_subnet_failover: bool,
+    /// Timeout in milliseconds for SQL Browser (SSRP) instance resolution.
+    /// Defaults to 1000ms.
+    pub ssrp_timeout_ms: u64,
     /// New password to set (separate from `change_password` flow).
     pub new_password: String,
     /// TDS packet size in bytes. Valid range: 512–32768.
@@ -248,6 +251,49 @@ pub struct ClientContext {
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
     pub vector_version: VectorVersion,
+    /// UserAgent telemetry payload components.
+    pub user_agent: UserAgent,
+}
+
+const DEFAULT_LIBRARY_NAME: &str = "MS-TDS";
+const UNKNOWN_RUNTIME: &str = "Unknown";
+
+/// A grouping of telemetry-specific fields.
+#[derive(Clone, Debug)]
+pub struct UserAgent {
+    /// Custom library name for User-Agent payload (e.g., `MS-PYTHON`).
+    pub library_name: String,
+    /// Custom driver version string for User-Agent payload (e.g., `1.2.3rc1`).
+    pub driver_version: String,
+    /// Custom runtime details (e.g. `CPython 3.12.3`).
+    pub runtime: String,
+}
+
+impl Default for UserAgent {
+    fn default() -> Self {
+        Self {
+            library_name: DEFAULT_LIBRARY_NAME.to_string(),
+            driver_version: env!("CARGO_PKG_VERSION").to_string(),
+            runtime: UNKNOWN_RUNTIME.to_string(),
+        }
+    }
+}
+
+impl UserAgent {
+    /// Sets the custom library name for the User-Agent payload.
+    pub fn set_library_name(&mut self, name: String) {
+        self.library_name = name;
+    }
+
+    /// Sets the custom driver version for the User-Agent payload.
+    pub fn set_driver_version(&mut self, version: String) {
+        self.driver_version = version;
+    }
+
+    /// Sets the custom runtime details for the User-Agent payload.
+    pub fn set_runtime(&mut self, runtime: String) {
+        self.runtime = runtime;
+    }
 }
 
 impl ClientContext {
@@ -267,7 +313,7 @@ impl ClientContext {
             application_name: "TDSX Rust Client".to_string(),
             attach_db_file: "".to_string(),
             change_password: "".to_string(),
-            connect_retry_count: 0,
+            connect_retry_count: 1,
             connect_retry_interval: 10,
             connect_timeout: 15,
             database: "".to_string(),
@@ -280,11 +326,12 @@ impl ClientContext {
             failover_partner: "".to_string(),
             ipaddress_preference: IPAddressPreference::UsePlatformDefault,
             language: "us_english".to_string(),
-            library_name: "mssql-tds".to_string(),
+            library_name: "MS-TDS".to_string(),
             driver_version: DriverVersion::from_cargo_version(),
             auth_method_map: HashMap::new(),
             mars_enabled: false,
             multi_subnet_failover: false,
+            ssrp_timeout_ms: crate::ssrp::DEFAULT_SSRP_TIMEOUT_MS,
             new_password: "".to_string(),
             packet_size: 8000,
             password: "".to_string(),
@@ -302,6 +349,7 @@ impl ClientContext {
                 instance_name: None,
             },
             vector_version: VectorVersion::V1,
+            user_agent: UserAgent::default(),
         }
     }
 
@@ -320,7 +368,7 @@ impl ClientContext {
             application_name: "TDSX Rust Client".to_string(),
             attach_db_file: "".to_string(),
             change_password: "".to_string(),
-            connect_retry_count: 0,
+            connect_retry_count: 1,
             connect_retry_interval: 10,
             connect_timeout: 15,
             database: "".to_string(),
@@ -333,11 +381,12 @@ impl ClientContext {
             failover_partner: "".to_string(),
             ipaddress_preference: IPAddressPreference::UsePlatformDefault,
             language: "us_english".to_string(),
-            library_name: "mssql-tds".to_string(),
+            library_name: "MS-TDS".to_string(),
             driver_version: DriverVersion::from_cargo_version(),
             auth_method_map: HashMap::new(),
             mars_enabled: false,
             multi_subnet_failover: false,
+            ssrp_timeout_ms: crate::ssrp::DEFAULT_SSRP_TIMEOUT_MS,
             new_password: "".to_string(),
             packet_size: 8000,
             password: "".to_string(),
@@ -355,6 +404,7 @@ impl ClientContext {
                 instance_name: None,
             },
             vector_version: VectorVersion::V1,
+            user_agent: UserAgent::default(),
         }
     }
 
@@ -571,6 +621,7 @@ impl Clone for ClientContext {
             auth_method_map: self.clone_auth_method_map(),
             mars_enabled: self.mars_enabled,
             multi_subnet_failover: self.multi_subnet_failover,
+            ssrp_timeout_ms: self.ssrp_timeout_ms,
             new_password: self.new_password.clone(),
             packet_size: self.packet_size,
             password: self.password.clone(),
@@ -584,6 +635,7 @@ impl Clone for ClientContext {
             access_token: self.access_token.clone(),
             transport_context: self.transport_context.clone(),
             vector_version: self.vector_version,
+            user_agent: self.user_agent.clone(),
         }
     }
 }
@@ -633,34 +685,20 @@ pub enum TransportContext {
 impl TransportContext {
     /// Create a TCP TransportContext from a routing token.
     ///
-    /// The routing token may contain "host\instance" format from SQL Server redirection.
-    /// This method uses the datasource parser to extract host, instance, and port.
-    ///
-    /// # Arguments
-    /// * `host` - The host string from the routing token (e.g., "myserver" or "myserver\SQLEXPRESS")
-    /// * `port` - The TCP port from the routing token
-    ///
-    /// # Returns
-    /// A TCP TransportContext with the network hostname and optional instance name
+    /// Routing tokens can legitimately contain both `host\instance` and a port,
+    /// so this method splits on `\` directly instead of going through
+    /// `ParsedDataSource::parse` (which drops the instance when a port is present).
     pub fn from_routing_token(host: String, port: u16) -> Self {
-        // Format as "host,port" or "host\instance,port" and parse using datasource parser
-        let datasource = format!("{},{}", host, port);
-
-        // Use the datasource parser to extract server and instance names
-        // If parsing fails, fall back to using the host as-is
-        let (network_host, instance_name) = match ParsedDataSource::parse(&datasource, false) {
-            Ok(parsed) => {
-                let instance = if parsed.instance_name.is_empty() {
+        let (network_host, instance_name) = match host.split_once('\\') {
+            Some((host_part, instance)) => {
+                let instance = if instance.is_empty() {
                     None
                 } else {
-                    Some(parsed.instance_name)
+                    Some(instance.to_string())
                 };
-                (parsed.server_name, instance)
+                (host_part.to_string(), instance)
             }
-            Err(_) => {
-                // Fallback: use host directly without instance
-                (host, None)
-            }
+            None => (host, None),
         };
 
         TransportContext::Tcp {
@@ -1461,7 +1499,7 @@ mod tests {
     #[test]
     fn test_default_library_name() {
         let ctx = ClientContext::new();
-        assert_eq!(ctx.library_name, "mssql-tds");
+        assert_eq!(ctx.library_name, "MS-TDS");
     }
 
     #[test]
@@ -1473,5 +1511,72 @@ mod tests {
         let err = result.err().unwrap().to_string();
         assert!(err.contains("ActiveDirectoryIntegrated"));
         assert!(err.contains("not supported"));
+    }
+
+    #[test]
+    fn test_user_agent_default() {
+        let ua = UserAgent::default();
+        assert_eq!(ua.driver_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(ua.library_name, "MS-TDS");
+    }
+
+    #[test]
+    fn test_client_context_user_agent_setters() {
+        let mut ctx = ClientContext::new();
+
+        ctx.user_agent.set_library_name("AnotherLib".to_string());
+        assert_eq!(ctx.user_agent.library_name, "AnotherLib");
+
+        ctx.user_agent.set_driver_version("7.8.9".to_string());
+        assert_eq!(ctx.user_agent.driver_version, "7.8.9");
+
+        ctx.user_agent.set_runtime("1.80.0".to_string());
+        assert_eq!(ctx.user_agent.runtime, "1.80.0");
+    }
+
+    #[test]
+    fn from_routing_token_host_only() {
+        let ctx =
+            TransportContext::from_routing_token("myhost.database.windows.net".to_string(), 1433);
+        match &ctx {
+            TransportContext::Tcp {
+                host,
+                port,
+                instance_name,
+            } => {
+                assert_eq!(host, "myhost.database.windows.net");
+                assert_eq!(*port, 1433);
+                assert!(instance_name.is_none());
+            }
+            _ => panic!("Expected Tcp variant"),
+        }
+        assert_eq!(
+            ctx.get_login_server_name(),
+            "myhost.database.windows.net,1433"
+        );
+    }
+
+    #[test]
+    fn from_routing_token_with_instance() {
+        let ctx = TransportContext::from_routing_token(
+            "myhost.pbidedicated.windows.net\\INSTANCE-dw".to_string(),
+            1433,
+        );
+        match &ctx {
+            TransportContext::Tcp {
+                host,
+                port,
+                instance_name,
+            } => {
+                assert_eq!(host, "myhost.pbidedicated.windows.net");
+                assert_eq!(*port, 1433);
+                assert_eq!(instance_name.as_deref(), Some("INSTANCE-dw"));
+            }
+            _ => panic!("Expected Tcp variant"),
+        }
+        assert_eq!(
+            ctx.get_login_server_name(),
+            "myhost.pbidedicated.windows.net\\INSTANCE-dw,1433"
+        );
     }
 }

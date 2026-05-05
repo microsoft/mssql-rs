@@ -19,6 +19,8 @@ use mssql_tds::{
     message::login_options::ApplicationIntent,
 };
 
+const DEFAULT_LIBRARY_NAME: &str = "MS-PYTHON";
+
 /// Python Connection class for Core TDS backend
 #[pyclass]
 pub struct PyCoreConnection {
@@ -295,7 +297,6 @@ impl PyCoreConnection {
 
         // Connection retry settings
         // Defaults: 1 retry attempt, 10 seconds between retries per SQL Server defaults
-        // Note: These are not yet implemented internally - emit warnings if non-default values are used
         let connect_retry_count = dict
             .get_item("connect_retry_count")?
             .and_then(|v| v.extract::<u32>().ok())
@@ -305,16 +306,6 @@ impl PyCoreConnection {
             .get_item("connect_retry_interval")?
             .and_then(|v| v.extract::<u32>().ok())
             .unwrap_or(10);
-
-        // Emit warnings if connection retry settings are explicitly set (not using defaults)
-        // These parameters are accepted but not yet functional
-        if dict.get_item("connect_retry_count")?.is_some() {
-            crate::utils::emit_unimplemented_warning(dict.py(), "connect_retry_count");
-        }
-
-        if dict.get_item("connect_retry_interval")?.is_some() {
-            crate::utils::emit_unimplemented_warning(dict.py(), "connect_retry_interval");
-        }
 
         // IpAddressPreference - controls IPv4 vs IPv6 preference for DNS resolution
         // Values: "IPv4First", "IPv6First", "UsePlatformDefault" (default)
@@ -453,7 +444,20 @@ impl PyCoreConnection {
         // Set library_name to "mssql-python" for Python driver
         context.library_name = "mssql-python".to_string();
 
-        // Use the module-level driver version (set once by mssql-python at import time)
+        // Exclusively override the driver name for the User-Agent payload
+        context
+            .user_agent
+            .set_library_name(DEFAULT_LIBRARY_NAME.to_string());
+
+        if let Some(raw_version) = crate::get_raw_driver_version() {
+            context.user_agent.set_driver_version(raw_version);
+        }
+
+        if let Some(global_details) = crate::RUNTIME_DETAILS.get() {
+            context.user_agent.set_runtime(global_details.clone());
+        }
+
+        // Fetch driver version natively using module-level configuration or Cargo fallback
         context.driver_version = crate::get_driver_version();
 
         Ok(context)

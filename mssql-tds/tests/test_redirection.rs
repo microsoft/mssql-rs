@@ -299,4 +299,81 @@ mod redirection_tests {
             let _ = handle.await;
         }
     }
+
+    /// Test that routing tokens with host\instance format preserve the instance name
+    /// in the redirected LOGIN7 server_name field.
+    ///
+    /// This reproduces the Fabric DW redirect scenario where the gateway sends a
+    /// routing token with server="host\INSTANCE-dw" and port=1433. The client must
+    /// send "host\INSTANCE-dw,1433" as the LOGIN7 server_name to the destination,
+    /// not just "host,1433".
+    #[tokio::test]
+    async fn test_redirect_preserves_instance_name() {
+        use mssql_mock_tds::MockTdsServer;
+        use tokio::sync::oneshot;
+
+        // Create destination server (no redirection)
+        let destination_server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+        let destination_port = destination_server.local_addr().port();
+        let dest_store = destination_server.connection_store();
+
+        // Gateway redirects with host\instance format (simulating Fabric DW)
+        let redirect_host = "127.0.0.1\\INSTANCE-dw";
+        let gateway_server =
+            MockTdsServer::new_with_redirection("127.0.0.1:0", redirect_host, destination_port)
+                .await
+                .unwrap();
+        let gateway_port = gateway_server.local_addr().port();
+
+        // Start both servers
+        let (dest_shutdown_tx, dest_shutdown_rx) = oneshot::channel();
+        let (gw_shutdown_tx, gw_shutdown_rx) = oneshot::channel();
+
+        let dest_handle = tokio::spawn(async move {
+            let _ = destination_server.run_with_shutdown(dest_shutdown_rx).await;
+        });
+        let gw_handle = tokio::spawn(async move {
+            let _ = gateway_server.run_with_shutdown(gw_shutdown_rx).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Connect through gateway
+        let context = create_test_context();
+        let provider = TdsConnectionProvider {};
+        let datasource = format!("127.0.0.1,{}", gateway_port);
+
+        let result = provider.create_client(context, &datasource, None).await;
+        assert!(
+            result.is_ok(),
+            "Expected redirect with instance to succeed, got: {:?}",
+            result.err()
+        );
+
+        // Drop the client so the destination server's connection handler
+        // finishes and stores the ConnectionInfo.
+        drop(result);
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Verify the LOGIN7 server_name sent to the destination includes the instance
+        let store = dest_store.lock().await;
+        let connections: Vec<_> = store.all().values().collect();
+        assert_eq!(
+            connections.len(),
+            1,
+            "Expected exactly one connection to destination"
+        );
+
+        let expected_server_name = format!("127.0.0.1\\INSTANCE-dw,{}", destination_port);
+        assert_eq!(
+            connections[0].received_server_name.as_deref(),
+            Some(expected_server_name.as_str()),
+            "LOGIN7 server_name should include instance from routing token"
+        );
+
+        let _ = dest_shutdown_tx.send(());
+        let _ = gw_shutdown_tx.send(());
+        let _ = dest_handle.await;
+        let _ = gw_handle.await;
+    }
 }

@@ -121,13 +121,17 @@ impl FedAuthFeature {
     /// The payload length is calculated based on the presence of an access token.
     /// If an access token is present, the length includes the size of the token.
     /// If no access token is present, the length is 2.
-    fn get_payload_length(&self) -> i32 {
+    fn get_payload_length(&self) -> TdsResult<i32> {
         let len = if let Some(bytes) = &self.access_token_bytes {
             1 + size_of::<i32>() + bytes.len()
         } else {
             2
         };
-        len.try_into().unwrap()
+        i32::try_from(len).map_err(|_| {
+            crate::error::Error::ProtocolError(format!(
+                "FedAuth payload length {len} exceeds i32 range"
+            ))
+        })
     }
 }
 
@@ -138,7 +142,9 @@ impl Feature for FedAuthFeature {
     }
 
     fn data_length(&self) -> i32 {
-        let data_length = self.get_payload_length();
+        // get_payload_length only fails if token > 2GB, which cannot happen in practice
+        #[allow(clippy::unwrap_used)]
+        let data_length = self.get_payload_length().unwrap();
         let base_length = size_of::<u8>() + size_of::<i32>();
         data_length + base_length as i32
     }
@@ -153,7 +159,7 @@ impl Feature for FedAuthFeature {
             .write_byte_async(self.feature_identifier().as_u8())
             .await?;
         packet_writer
-            .write_i32_async(self.get_payload_length())
+            .write_i32_async(self.get_payload_length()?)
             .await?;
 
         packet_writer.write_byte_async(self.get_options()).await?;
