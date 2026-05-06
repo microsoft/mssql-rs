@@ -11,7 +11,7 @@ Rust implementation of the TDS (Tabular Data Stream) protocol for SQL Server. Ca
 | `mssql-tds-cli` | Interactive CLI client | 2024 |
 | `mssql-mock-tds` | Mock TDS server for testing | 2024 |
 | `mssql-py-core` | Python bindings (PyO3/maturin) — **excluded from workspace** | 2021 |
-| `mssql-odbc` | ODBC driver (msodbcsql18) | 2024 |
+| `mssql-odbc` | ODBC driver (msodbcsql18) | 2026 |
 
 ## Build / Test / Lint
 
@@ -89,7 +89,7 @@ Every `.rs` file must start with:
 
 - **JS:** `#[napi]` attributes, `Arc<Mutex<TdsClient>>` for thread safety
 - **Python:** `#[pymodule]`, `#[pyclass]` via PyO3
-- **ODBC:** `#[unsafe(no_mangle)] pub extern "C"` functions, cdylib producing msodbcsql18 shared library
+- **ODBC:** `#[unsafe(no_mangle)] pub extern "C"` functions
 
 ## Git Conventions
 

@@ -11,5 +11,6 @@ crate-type = ["cdylib"]
 [dependencies]
 mssql-tds = { path = "../mssql-tds" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+tracing = { version = "0.1.43", features = ["log"] }
 
 [build-dependencies]
