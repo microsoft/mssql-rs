@@ -21,5 +21,8 @@ uuid = { version = "1.19.0", features = ["v4", "fast-rng", "macro-diagnostics"] 
 tracing-appender = "0.2.4"
 once_cell = "1.21"
 
+[lints]
+workspace = true
+
 [build-dependencies]
 napi-build = "2.3.1"

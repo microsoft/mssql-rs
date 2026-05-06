@@ -4,29 +4,7 @@
 // Utility functions for the PyO3 bindings
 
 use mssql_tds::error::{BulkCopyError, Error as TdsError};
-use pyo3::Python;
 use pyo3::prelude::*;
-
-/// Emit a Python warning for unimplemented features.
-///
-/// Use this when a parameter is accepted for compatibility but not yet functional.
-/// The warning is silently ignored if the Python warnings module cannot be imported.
-///
-/// # Arguments
-/// * `py` - The Python GIL token
-/// * `param_name` - Name of the parameter that's not implemented
-pub fn emit_unimplemented_warning(py: Python<'_>, param_name: &str) {
-    if let Ok(warnings) = py.import("warnings") {
-        let message = format!(
-            "The '{}' parameter is not yet supported and will be ignored",
-            param_name
-        );
-        let _ = warnings.call_method1(
-            "warn",
-            (message, py.get_type::<pyo3::exceptions::PyUserWarning>()),
-        );
-    }
-}
 
 /// Convert error types from mssql-tds to Python exceptions
 /// This will be used when implementing actual Core TDS connection logic

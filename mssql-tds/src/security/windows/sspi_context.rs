@@ -9,10 +9,10 @@ use std::ptr;
 
 use super::sspi_ffi::{
     CompleteAuthToken, CredHandle, CtxtHandle, DeleteSecurityContext, FreeCredentialsHandle,
-    InitializeSecurityContextW, PVOID, SEC_E_NO_CREDENTIALS, SEC_E_OK, SEC_E_TARGET_UNKNOWN,
-    SECBUFFER_CHANNEL_BINDINGS, SECBUFFER_TOKEN, SECBUFFER_VERSION, SECURITY_STATUS,
-    STANDARD_CONTEXT_REQ, SecBuffer, SecBufferDesc, TimeStamp, acquire_credentials,
-    get_sspi_error_message, is_success_status, needs_complete, needs_continue, to_wide_string,
+    InitializeSecurityContextW, PVOID, SEC_E_NO_CREDENTIALS, SEC_E_OK, SECBUFFER_CHANNEL_BINDINGS,
+    SECBUFFER_TOKEN, SECBUFFER_VERSION, SECURITY_STATUS, STANDARD_CONTEXT_REQ, SecBuffer,
+    SecBufferDesc, TimeStamp, acquire_credentials, get_sspi_error_message, is_success_status,
+    needs_complete, needs_continue, to_wide_string,
 };
 use crate::security::{
     IntegratedAuthConfig, SecurityContext, SecurityError, SecurityPackage, SspiAuthToken,
@@ -298,28 +298,36 @@ impl SecurityContext for WindowsSspiContext {
                     is_complete: self.is_complete,
                 })
             }
+            // SEC_E_NO_CREDENTIALS is mapped to the dedicated NoCredentials variant
+            // BEFORE the loopback retry arm. If the user has no usable credentials,
+            // retrying with an empty SPN will fail the same way and would propagate
+            // a generic InitContextFailed instead of the specific NoCredentials error
+            // callers depend on. ODBC's loopback retry also skips this code for the
+            // same reason — there is nothing to renegotiate without credentials.
             Err(SecurityError::InitContextFailed { code, .. })
-                if code == SEC_E_TARGET_UNKNOWN as u32
-                    && self.is_loopback
-                    && !self.tried_empty_spn =>
+                if code == SEC_E_NO_CREDENTIALS as u32 =>
             {
-                // Retry with empty SPN for loopback connections (NTLM fallback)
+                Err(SecurityError::NoCredentials)
+            }
+            Err(ref e) if self.is_loopback && !self.tried_empty_spn => {
+                // Loopback retry: matches ODBC behavior — on any SSPI failure for
+                // a loopback connection (other than NoCredentials, handled above),
+                // retry once with an empty SPN. This lets Negotiate fall back to
+                // NTLM. Crucially, we keep the existing context handle so SSPI can
+                // renegotiate within the same session.
                 tracing::debug!(
-                    "SPN '{}' failed for loopback connection, retrying with empty SPN",
-                    self.spn
+                    spn = %self.spn,
+                    error = %e,
+                    has_ctx = self.ctx_handle.is_some(),
+                    has_server_token = server_token.is_some(),
+                    "Loopback SPN retry: retrying with empty SPN"
                 );
                 self.tried_empty_spn = true;
                 self.spn = String::new();
 
-                // Reset context for retry
-                if let Some(ref mut ctx) = self.ctx_handle {
-                    unsafe {
-                        DeleteSecurityContext(&mut ctx.0);
-                    }
-                    self.ctx_handle = None;
-                }
+                // Do NOT reset the context handle — SSPI needs the existing
+                // Negotiate state to fall back to NTLM (matches ODBC's goto Retry).
 
-                // Retry with empty SPN
                 let (token, status) = self.generate_token_impl(server_token, "")?;
                 if !needs_continue(status) {
                     self.is_complete = true;
@@ -329,11 +337,6 @@ impl SecurityContext for WindowsSspiContext {
                     data: token,
                     is_complete: self.is_complete,
                 })
-            }
-            Err(SecurityError::InitContextFailed { code, .. })
-                if code == SEC_E_NO_CREDENTIALS as u32 =>
-            {
-                Err(SecurityError::NoCredentials)
             }
             Err(e) => Err(e),
         }

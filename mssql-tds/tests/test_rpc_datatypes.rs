@@ -595,6 +595,83 @@ mod rpc_datatypes {
         }
     }
 
+    /// Regression test for microsoft/mssql-python#547 (RPC / sp_executesql path).
+    ///
+    /// An empty NVARCHAR(MAX) RPC parameter previously desynced the PLP
+    /// stream because the serializer wrote a zero-length chunk header (which
+    /// IS the PLP terminator per MS-TDS) plus an explicit terminator,
+    /// causing the server to misparse the next column.
+    #[tokio::test]
+    async fn nvarcharmax_empty_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let val = SqlString::from_utf8_string(String::new());
+        let row = roundtrip_params(&mut client, vec![("v", SqlType::NVarcharMax(Some(val)))])
+            .await
+            .unwrap();
+        match &row[0] {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), ""),
+            other => panic!("Expected String, got {other:?}"),
+        }
+    }
+
+    /// Regression test for microsoft/mssql-python#547 (VARCHAR(MAX) variant).
+    #[tokio::test]
+    async fn varcharmax_empty_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let val = SqlString::from_utf8_string(String::new());
+        let row = roundtrip_params(&mut client, vec![("v", SqlType::VarcharMax(Some(val)))])
+            .await
+            .unwrap();
+        match &row[0] {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), ""),
+            other => panic!("Expected String, got {other:?}"),
+        }
+    }
+
+    /// Regression test for microsoft/mssql-python#547 (VARBINARY(MAX) variant).
+    #[tokio::test]
+    async fn varbinarymax_empty_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let row = roundtrip_params(
+            &mut client,
+            vec![("v", SqlType::VarBinaryMax(Some(Vec::new())))],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::Bytes(b) => assert!(b.is_empty()),
+            other => panic!("Expected Bytes, got {other:?}"),
+        }
+    }
+
+    /// Regression test for microsoft/mssql-python#547: ensure an empty MAX
+    /// parameter that precedes a subsequent parameter does not corrupt the
+    /// stream alignment for the next value.
+    #[tokio::test]
+    async fn empty_nvarcharmax_followed_by_int_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let row = roundtrip_params(
+            &mut client,
+            vec![
+                (
+                    "s",
+                    SqlType::NVarcharMax(Some(SqlString::from_utf8_string(String::new()))),
+                ),
+                ("i", SqlType::Int(Some(42))),
+            ],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), ""),
+            other => panic!("Expected String, got {other:?}"),
+        }
+        match &row[1] {
+            ColumnValues::Int(i) => assert_eq!(*i, 42),
+            other => panic!("Expected Int, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn varcharmax_large_roundtrip() {
         let mut client = begin_connection(&build_tcp_datasource()).await;

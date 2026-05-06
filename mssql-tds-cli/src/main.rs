@@ -161,10 +161,7 @@ pub async fn main_cli() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut context = ClientContext::default();
     context.user_name = "sa".to_string();
-    context.password = std::fs::read_to_string("/tmp/password")
-        .expect("Failed to read password file")
-        .trim()
-        .to_string();
+    context.password = std::fs::read_to_string("/tmp/password")?.trim().to_string();
     context.database = "master".to_string();
     context.encryption_options = EncryptionOptions {
         mode: EncryptionSetting::On,
@@ -200,9 +197,10 @@ pub async fn main_cli() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
 
-                session
+                let session = session
                     .as_mut()
-                    .unwrap()
+                    .map_err(|error| Error::other(format!("No active session: {error}")))?;
+                session
                     .submit_sql_batch(trimmed_command.to_string())
                     .await?;
             }

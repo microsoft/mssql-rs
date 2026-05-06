@@ -68,6 +68,11 @@ impl ExecutionContext {
         self.has_open_result_set = has_open_result_set;
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_transaction_descriptor(&mut self, descriptor: u64) {
+        self.transaction_descriptor = descriptor;
+    }
+
     pub(crate) fn capture_change_property(
         &mut self,
         change_token: &EnvChangeToken,

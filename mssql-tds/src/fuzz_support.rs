@@ -562,6 +562,10 @@ impl TdsTransport for MockTransport {
     ) -> TdsResult<bool> {
         Ok(true)
     }
+
+    fn is_connection_dead(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -712,10 +716,13 @@ pub fn create_fuzz_tds_client(
     let mock_transport = MockTransport::new(packet_reader, packet_size);
     let negotiated_settings = create_test_negotiated_settings();
     let execution_context = create_test_execution_context();
+    let client_context =
+        crate::connection::client_context::ClientContext::with_data_source("tcp:localhost,1433");
 
     TdsClient::new(
         Box::new(mock_transport),
         negotiated_settings,
         execution_context,
+        client_context,
     )
 }

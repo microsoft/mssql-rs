@@ -336,3 +336,118 @@ async fn test_np_prefix_uses_named_pipe_transport() -> TdsResult<()> {
     println!("✓ np: prefix test passed for {datasource} (transport: {transport})");
     Ok(())
 }
+
+/// Connect to localhost with SSPI, run SELECT 1, and validate the result.
+///
+/// Set SSPI_TEST=1 to enable this test.
+#[tokio::test]
+async fn test_sspi_localhost_select_one() -> TdsResult<()> {
+    if env::var("SSPI_TEST").is_err() {
+        return Ok(());
+    }
+
+    common::init_tracing();
+
+    let mut context = ClientContext::default();
+    context.database = "master".to_string();
+    context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
+    context.encryption_options = EncryptionOptions {
+        mode: EncryptionSetting::PreferOff,
+        trust_server_certificate: true,
+        host_name_in_cert: None,
+        server_certificate: None,
+    };
+
+    let provider = TdsConnectionProvider {};
+    let mut client = provider
+        .create_client(context, "tcp:localhost,1433", None)
+        .await?;
+
+    client
+        .execute("SELECT 1 AS val".to_string(), None, None)
+        .await?;
+
+    let mut got_result = false;
+    if let Some(rs) = client.get_current_resultset()
+        && let Some(row) = rs.next_row().await?
+    {
+        assert_eq!(
+            row[0],
+            ColumnValues::Int(1),
+            "Expected SELECT 1 to return 1"
+        );
+        got_result = true;
+    }
+    client.close_query().await?;
+
+    assert!(got_result, "Expected exactly one row from SELECT 1");
+
+    Ok(())
+}
+
+/// Connect to a named instance via SSRP with SSPI and run SELECT 1.
+///
+/// Uses `localhost\<instance>` (no `tcp:` prefix) which exercises the SSRP path:
+/// datasource parser → SQL Browser resolution → SSPI with loopback detection.
+///
+/// Set SSPI_TEST=1 to enable. Optionally set SSPI_NAMED_INSTANCE (default: sqldev).
+#[tokio::test]
+async fn test_sspi_named_instance_select_one() -> TdsResult<()> {
+    if env::var("SSPI_TEST").is_err() {
+        return Ok(());
+    }
+
+    common::init_tracing();
+
+    let instance = env::var("SSPI_NAMED_INSTANCE").unwrap_or_else(|_| "sqldev".to_string());
+    let datasource = format!(r"localhost\{instance}");
+
+    let mut context = ClientContext::default();
+    context.database = "master".to_string();
+    context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
+    context.encryption_options = EncryptionOptions {
+        mode: EncryptionSetting::PreferOff,
+        trust_server_certificate: true,
+        host_name_in_cert: None,
+        server_certificate: None,
+    };
+
+    let provider = TdsConnectionProvider {};
+    let mut client = provider.create_client(context, &datasource, None).await?;
+
+    client
+        .execute("SELECT @@SERVICENAME AS svc".to_string(), None, None)
+        .await?;
+
+    if let Some(rs) = client.get_current_resultset()
+        && let Some(row) = rs.next_row().await?
+    {
+        let svc = format!("{:?}", row.first());
+        assert!(
+            svc.to_uppercase().contains(&instance.to_uppercase()),
+            "Expected instance {instance}, got: {svc}"
+        );
+    }
+    client.close_query().await?;
+
+    client
+        .execute("SELECT 1 AS val".to_string(), None, None)
+        .await?;
+
+    let mut got_result = false;
+    if let Some(rs) = client.get_current_resultset()
+        && let Some(row) = rs.next_row().await?
+    {
+        assert_eq!(
+            row[0],
+            ColumnValues::Int(1),
+            "Expected SELECT 1 to return 1"
+        );
+        got_result = true;
+    }
+    client.close_query().await?;
+
+    assert!(got_result, "Expected exactly one row from SELECT 1");
+
+    Ok(())
+}

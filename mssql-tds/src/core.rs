@@ -117,7 +117,7 @@ impl From<u8> for SQLServerVersion {
 }
 
 /// Four-part server version reported during the TDS pre-login handshake.
-#[derive(PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Version {
     /// Major version number.
     pub major: u8,
