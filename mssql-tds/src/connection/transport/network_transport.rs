@@ -276,11 +276,16 @@ async fn create_base_stream_sequential(
     }
 
     // We don't have a valid TCP stream, so we need to return the last error.
-    if tcp_stream.is_none() {
-        return Err(crate::error::Error::from(last_error.unwrap()));
+    if let Some(stream) = tcp_stream {
+        Ok(Box::new(stream))
+    } else {
+        Err(crate::error::Error::from(last_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("Failed to connect to {host}:{port}"),
+            )
+        })))
     }
-
-    Ok(Box::new(tcp_stream.unwrap()))
 }
 
 /// Creates a TCP stream using parallel connection mode (MultiSubnetFailover).
@@ -426,6 +431,11 @@ pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + Sync {
     fn tls_handshake_starting(&mut self);
     /// Called after TLS handshake completes.
     fn tls_handshake_completed(&mut self);
+    /// Check whether the underlying connection is dead via a non-blocking socket poll.
+    /// Returns `true` if the connection is known to be dead, `false` if alive or unknown.
+    fn is_connection_dead(&self) -> bool {
+        false
+    }
 }
 
 impl Stream for TcpStream {
@@ -436,6 +446,24 @@ impl Stream for TcpStream {
     fn tls_handshake_completed(&mut self) {
         // No-op for plain TCP streams
     }
+
+    fn is_connection_dead(&self) -> bool {
+        // Non-blocking socket poll to detect a dead connection.
+        // try_read will consume a byte if data is available, but this is safe because
+        // is_connection_dead() is only called on idle connections (before sending a new
+        // command, when no TDS response data is expected on the socket).
+        // WouldBlock means the socket is alive (no data available, connection still open).
+        // Ok(0) means EOF (server closed connection). Any other error means broken.
+        // Ok(n > 0) means unexpected data — treat connection as alive; the data loss is
+        // not an issue because the connection state is already invalid if unsolicited data
+        // arrives.
+        match self.try_read(&mut [0u8; 1]) {
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => false,
+            Ok(0) => true,
+            Err(_) => true,
+            Ok(_) => false,
+        }
+    }
 }
 
 impl Stream for Box<dyn Stream> {
@@ -445,6 +473,10 @@ impl Stream for Box<dyn Stream> {
 
     fn tls_handshake_completed(&mut self) {
         (**self).tls_handshake_completed();
+    }
+
+    fn is_connection_dead(&self) -> bool {
+        (**self).is_connection_dead()
     }
 }
 
@@ -514,8 +546,8 @@ impl NetworkWriter for NetworkTransport {
     }
 
     fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
-        assert!(self.encryption.is_some());
-        self.encryption.unwrap()
+        self.encryption
+            .unwrap_or(NegotiatedEncryptionSetting::NoEncryption)
     }
 }
 
@@ -643,12 +675,18 @@ impl NetworkTransport {
             )
         })?;
 
-        let base_stream = handle.extract().ok_or_else(|| {
-            error!("Failed to extract underlying stream - was disable_ssl called twice?");
-            crate::error::Error::ImplementationError(
-                "Cannot disable TLS: underlying stream was already extracted".to_string(),
-            )
-        })?;
+        let base_stream = handle
+            .extract()
+            .map_err(|e| {
+                error!("Failed to lock extractable stream: {e}");
+                crate::error::Error::ImplementationError(format!("Cannot disable TLS: {e}"))
+            })?
+            .ok_or_else(|| {
+                error!("Failed to extract underlying stream - was disable_ssl called twice?");
+                crate::error::Error::ImplementationError(
+                    "Cannot disable TLS: underlying stream was already extracted".to_string(),
+                )
+            })?;
 
         info!("Successfully disabled TLS, reverting to unencrypted stream");
         self.stream = Some(base_stream);
@@ -1342,6 +1380,13 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
 
         // Wait for ACK with timeout using the shared helper
         self.wait_for_attention_ack(Some(attention_timeout)).await
+    }
+
+    fn is_connection_dead(&self) -> bool {
+        match &self.stream {
+            Some(stream) => stream.is_connection_dead(),
+            None => true,
+        }
     }
 }
 
@@ -2109,6 +2154,134 @@ pub(crate) mod tests {
             let result = transport.get_new_tds_packet().await;
             assert!(result.is_ok(), "Valid packet should succeed");
             assert_eq!(result.unwrap(), total_len as usize);
+        }
+    }
+
+    mod is_connection_dead_tests {
+        use super::*;
+        use crate::connection::transport::tds_transport::TdsTransport;
+        use tokio::net::TcpListener;
+
+        #[tokio::test]
+        async fn tcp_stream_alive_returns_false() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = TcpStream::connect(addr).await.unwrap();
+            let _server = listener.accept().await.unwrap();
+
+            assert!(!client.is_connection_dead());
+        }
+
+        #[tokio::test]
+        async fn tcp_stream_server_closed_returns_true() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = TcpStream::connect(addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+
+            // Close the server side
+            drop(server);
+
+            // Give the OS a moment to propagate the TCP FIN
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            assert!(client.is_connection_dead());
+        }
+
+        #[tokio::test]
+        async fn network_transport_no_stream_returns_true() {
+            let ssl_handler = SslHandler {
+                server_host_name: "test".to_string(),
+                encryption_options: EncryptionOptions::new(),
+            };
+
+            let mut transport = NetworkTransport::new(
+                Box::new(tokio::io::duplex(64).0),
+                ssl_handler,
+                4096,
+                EncryptionSetting::Strict,
+                false,
+            );
+
+            // Remove the stream to simulate a closed transport
+            transport.stream = None;
+
+            assert!(transport.is_connection_dead());
+        }
+
+        #[tokio::test]
+        async fn network_transport_alive_tcp_returns_false() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = TcpStream::connect(addr).await.unwrap();
+            let _server = listener.accept().await.unwrap();
+
+            let ssl_handler = SslHandler {
+                server_host_name: "test".to_string(),
+                encryption_options: EncryptionOptions::new(),
+            };
+
+            let transport = NetworkTransport::new(
+                Box::new(client),
+                ssl_handler,
+                4096,
+                EncryptionSetting::Strict,
+                false,
+            );
+
+            assert!(!transport.is_connection_dead());
+        }
+
+        #[tokio::test]
+        async fn network_transport_dead_tcp_returns_true() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = TcpStream::connect(addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+
+            let ssl_handler = SslHandler {
+                server_host_name: "test".to_string(),
+                encryption_options: EncryptionOptions::new(),
+            };
+
+            let transport = NetworkTransport::new(
+                Box::new(client),
+                ssl_handler,
+                4096,
+                EncryptionSetting::Strict,
+                false,
+            );
+
+            drop(server);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            assert!(transport.is_connection_dead());
+        }
+
+        #[tokio::test]
+        async fn duplex_stream_uses_default_false() {
+            // DuplexStream doesn't override is_connection_dead, so it returns false (default)
+            let (client_side, _server_side) = duplex(64);
+            assert!(!client_side.is_connection_dead());
+        }
+
+        #[tokio::test]
+        async fn box_dyn_stream_delegates_to_inner() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = TcpStream::connect(addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+
+            let boxed: Box<dyn Stream> = Box::new(client);
+
+            // Alive
+            assert!(!boxed.is_connection_dead());
+
+            drop(server);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Dead
+            assert!(boxed.is_connection_dead());
         }
     }
 }

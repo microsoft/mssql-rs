@@ -36,9 +36,12 @@ impl ExtractableStreamHandle {
 
     /// Extract the underlying stream, consuming it from the wrapper.
     /// This should be called after the TLS stream has been dropped or forgotten.
-    /// Returns None if the stream was already extracted.
-    pub(crate) fn extract(&self) -> Option<Box<dyn Stream>> {
-        self.inner.lock().unwrap().take()
+    /// Returns an error if the mutex is poisoned, or Ok(None) if the stream was already extracted.
+    pub(crate) fn extract(&self) -> Result<Option<Box<dyn Stream>>, std::io::Error> {
+        match self.inner.lock() {
+            Ok(mut guard) => Ok(guard.take()),
+            Err(_) => Err(std::io::Error::other("Extractable stream mutex poisoned")),
+        }
     }
 }
 
@@ -54,7 +57,14 @@ impl AsyncRead for ExtractableStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "Extractable stream mutex poisoned",
+                )));
+            }
+        };
         if let Some(ref mut stream) = *guard {
             Pin::new(stream.as_mut()).poll_read(cx, buf)
         } else {
@@ -72,7 +82,14 @@ impl AsyncWrite for ExtractableStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "Extractable stream mutex poisoned",
+                )));
+            }
+        };
         if let Some(ref mut stream) = *guard {
             Pin::new(stream.as_mut()).poll_write(cx, buf)
         } else {
@@ -84,7 +101,14 @@ impl AsyncWrite for ExtractableStream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "Extractable stream mutex poisoned",
+                )));
+            }
+        };
         if let Some(ref mut stream) = *guard {
             Pin::new(stream.as_mut()).poll_flush(cx)
         } else {
@@ -93,7 +117,14 @@ impl AsyncWrite for ExtractableStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "Extractable stream mutex poisoned",
+                )));
+            }
+        };
         if let Some(ref mut stream) = *guard {
             Pin::new(stream.as_mut()).poll_shutdown(cx)
         } else {
@@ -104,15 +135,27 @@ impl AsyncWrite for ExtractableStream {
 
 impl Stream for ExtractableStream {
     fn tls_handshake_starting(&mut self) {
-        if let Some(ref mut stream) = *self.inner.lock().unwrap() {
+        if let Ok(mut guard) = self.inner.lock()
+            && let Some(ref mut stream) = *guard
+        {
             stream.tls_handshake_starting();
         }
     }
 
     fn tls_handshake_completed(&mut self) {
-        if let Some(ref mut stream) = *self.inner.lock().unwrap() {
+        if let Ok(mut guard) = self.inner.lock()
+            && let Some(ref mut stream) = *guard
+        {
             stream.tls_handshake_completed();
         }
+    }
+
+    fn is_connection_dead(&self) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|stream| stream.is_connection_dead()))
+            .unwrap_or(true)
     }
 }
 
@@ -211,7 +254,7 @@ mod tests {
         assert_eq!(&buf, response);
 
         // Handle should still have stream (not extracted yet)
-        assert!(handle.extract().is_some());
+        assert!(handle.extract().unwrap().is_some());
     }
 
     #[tokio::test]
@@ -220,11 +263,11 @@ mod tests {
         let (handle, _extractable) = ExtractableStreamHandle::new(Box::new(mock_stream));
 
         // First extraction should succeed
-        let extracted = handle.extract();
+        let extracted = handle.extract().unwrap();
         assert!(extracted.is_some());
 
         // Second extraction should return None
-        let extracted_again = handle.extract();
+        let extracted_again = handle.extract().unwrap();
         assert!(extracted_again.is_none());
     }
 
@@ -234,7 +277,7 @@ mod tests {
         let (handle, mut extractable) = ExtractableStreamHandle::new(Box::new(mock_stream));
 
         // Extract the stream
-        let _extracted = handle.extract();
+        let _extracted = handle.extract().unwrap();
 
         // Read should fail with NotConnected error
         let mut buf = vec![0u8; 10];
@@ -249,7 +292,7 @@ mod tests {
         let (handle, mut extractable) = ExtractableStreamHandle::new(Box::new(mock_stream));
 
         // Extract the stream
-        let _extracted = handle.extract();
+        let _extracted = handle.extract().unwrap();
 
         // Write should fail with NotConnected error
         let result = extractable.write(b"data").await;
@@ -263,7 +306,7 @@ mod tests {
         let (handle, mut extractable) = ExtractableStreamHandle::new(Box::new(mock_stream));
 
         // Extract the stream
-        let _extracted = handle.extract();
+        let _extracted = handle.extract().unwrap();
 
         // Flush should succeed (no-op when extracted)
         let result = extractable.flush().await;
@@ -276,7 +319,7 @@ mod tests {
         let (handle, mut extractable) = ExtractableStreamHandle::new(Box::new(mock_stream));
 
         // Extract the stream
-        let _extracted = handle.extract();
+        let _extracted = handle.extract().unwrap();
 
         // Shutdown should succeed (no-op when extracted)
         let result = extractable.shutdown().await;
@@ -313,7 +356,7 @@ mod tests {
         let (handle, mut extractable) = ExtractableStreamHandle::new(Box::new(mock_stream));
 
         // Extract the stream
-        let _extracted = handle.extract();
+        let _extracted = handle.extract().unwrap();
 
         // Callbacks should be no-ops (not panic)
         extractable.tls_handshake_starting();
@@ -331,11 +374,11 @@ mod tests {
         let handle2 = handle1.clone();
 
         // Extract using first handle
-        let extracted = handle1.extract();
+        let extracted = handle1.extract().unwrap();
         assert!(extracted.is_some());
 
         // Second handle should see the stream as already extracted
-        let extracted_again = handle2.extract();
+        let extracted_again = handle2.extract().unwrap();
         assert!(extracted_again.is_none());
     }
 }

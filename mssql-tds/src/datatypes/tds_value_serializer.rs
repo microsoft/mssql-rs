@@ -1197,11 +1197,16 @@ impl TdsValueSerializer {
             // This matches .NET SqlBulkCopy behavior
             writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
 
-            // Write chunk length (4 bytes)
-            writer.write_u32_async(data_len as u32).await?;
+            // For empty data, skip the chunk entirely: a 4-byte zero-length chunk header
+            // IS the PLP terminator per MS-TDS, so writing chunk_len=0 followed by an extra
+            // terminator desyncs the stream (server reports "premature end of message").
+            if data_len > 0 {
+                // Write chunk length (4 bytes)
+                writer.write_u32_async(data_len as u32).await?;
 
-            // Write actual data
-            writer.write_async(value).await?;
+                // Write actual data
+                writer.write_async(value).await?;
+            }
 
             // Write terminator (4 bytes of 0x00)
             writer.write_u32_async(PLP_TERMINATOR).await?;
@@ -1255,12 +1260,15 @@ impl TdsValueSerializer {
         // Write PLP_UNKNOWN_LEN (0xFFFFFFFFFFFFFFFE)
         writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
 
-        // Write chunk length (4 bytes)
-        writer.write_u32_async(byte_len as u32).await?;
+        // Skip empty chunk: chunk_len=0 IS the PLP terminator (see MS-TDS).
+        if byte_len > 0 {
+            // Write chunk length (4 bytes)
+            writer.write_u32_async(byte_len as u32).await?;
 
-        // Write UTF-16LE encoded data
-        for code_unit in utf16_data {
-            writer.write_u16_async(code_unit).await?;
+            // Write UTF-16LE encoded data
+            for code_unit in utf16_data {
+                writer.write_u16_async(code_unit).await?;
+            }
         }
 
         // Write terminator (4 bytes of 0x00)
@@ -1299,17 +1307,20 @@ impl TdsValueSerializer {
             data.len() + 2
         };
 
-        // Write chunk length (4 bytes)
-        writer.write_u32_async(data_len as u32).await?;
+        // Skip empty chunk: chunk_len=0 IS the PLP terminator (see MS-TDS).
+        if data_len > 0 {
+            // Write chunk length (4 bytes)
+            writer.write_u32_async(data_len as u32).await?;
 
-        // Write BOM if not present (UTF-16LE: 0xFF 0xFE)
-        if !value.has_bom() {
-            writer.write_byte_async(0xFF).await?;
-            writer.write_byte_async(0xFE).await?;
+            // Write BOM if not present (UTF-16LE: 0xFF 0xFE)
+            if !value.has_bom() {
+                writer.write_byte_async(0xFF).await?;
+                writer.write_byte_async(0xFE).await?;
+            }
+
+            // Write XML data
+            writer.write_async(data).await?;
         }
-
-        // Write XML data
-        writer.write_async(data).await?;
 
         // Write PLP terminator (4 bytes)
         writer.write_u32_async(PLP_TERMINATOR).await?;
@@ -1546,11 +1557,17 @@ impl TdsValueSerializer {
             // Write PLP_UNKNOWN_LEN (0xFFFFFFFFFFFFFFFE) to indicate total length is unknown
             writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
 
-            // Write chunk byte length (4 bytes)
-            writer.write_u32_async(data_len as u32).await?;
+            // For empty strings, skip the chunk entirely: a 4-byte zero-length chunk header
+            // IS the PLP terminator per MS-TDS, so writing chunk_len=0 followed by an extra
+            // terminator desyncs the stream (server reports "premature end of message",
+            // SQL error 4804). This matches the bug observed in microsoft/mssql-python#547.
+            if data_len > 0 {
+                // Write chunk byte length (4 bytes)
+                writer.write_u32_async(data_len as u32).await?;
 
-            // Write actual data
-            writer.write_async(utf16_bytes).await?;
+                // Write actual data
+                writer.write_async(utf16_bytes).await?;
+            }
 
             // Write terminator (4 bytes of 0x00)
             writer.write_u32_async(PLP_TERMINATOR).await?;
@@ -1630,11 +1647,15 @@ impl TdsValueSerializer {
         if ctx.is_plp {
             // PLP types (NVARCHAR(MAX)): Use PLP encoding
             writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
-            writer.write_u32_async(byte_len as u32).await?;
 
-            // Write UTF-16LE data
-            for code_unit in &utf16_data {
-                writer.write_u16_async(*code_unit).await?;
+            // Skip empty chunk: chunk_len=0 IS the PLP terminator (see MS-TDS).
+            if byte_len > 0 {
+                writer.write_u32_async(byte_len as u32).await?;
+
+                // Write UTF-16LE data
+                for code_unit in &utf16_data {
+                    writer.write_u16_async(*code_unit).await?;
+                }
             }
 
             writer.write_u32_async(PLP_TERMINATOR).await?;
@@ -1748,8 +1769,13 @@ impl TdsValueSerializer {
         } else if ctx.is_plp {
             // PLP types (VARCHAR(MAX)): Use PLP encoding
             writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
-            writer.write_u32_async(char_count as u32).await?;
-            writer.write_async(single_byte_data).await?;
+
+            // Skip empty chunk: chunk_len=0 IS the PLP terminator (see MS-TDS).
+            if char_count > 0 {
+                writer.write_u32_async(char_count as u32).await?;
+                writer.write_async(single_byte_data).await?;
+            }
+
             writer.write_u32_async(PLP_TERMINATOR).await?;
         } else if ctx.is_fixed_length {
             // Fixed-length CHAR(n): Write exactly n bytes with padding
@@ -2439,7 +2465,7 @@ mod serializer_tests {
     };
     use crate::datatypes::decoder::DecimalParts;
     use crate::datatypes::tds_value_serializer::{
-        PLP_NULL, PLP_UNKNOWN_LEN, TdsTypeContext, TdsValueSerializer, VARNULL,
+        PLP_NULL, PLP_TERMINATOR, PLP_UNKNOWN_LEN, TdsTypeContext, TdsValueSerializer, VARNULL,
     };
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
@@ -3431,6 +3457,65 @@ mod serializer_tests {
         expected.extend_from_slice(&(utf16.len() as u32).to_le_bytes());
         expected.extend_from_slice(&utf16);
         expected.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(p, expected);
+    }
+
+    /// Regression test for microsoft/mssql-python#547.
+    ///
+    /// An empty NVARCHAR(MAX) value must be serialized as PLP_UNKNOWN_LEN
+    /// followed only by the PLP_TERMINATOR. Writing an extra zero-length
+    /// chunk header (chunk_len=0) before the terminator desyncs the TDS
+    /// stream because a zero-length chunk IS the terminator per MS-TDS,
+    /// causing SQL error 4804 ("premature end of message").
+    #[test]
+    fn string_nvarchar_plp_empty_omits_chunk_header() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0xE7);
+        ctx.is_plp = true;
+        let val = ColumnValues::String(crate::datatypes::sql_string::SqlString::from_utf8_string(
+            String::new(),
+        ));
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&PLP_UNKNOWN_LEN.to_le_bytes());
+        expected.extend_from_slice(&PLP_TERMINATOR.to_le_bytes()); // PLP terminator only
+        assert_eq!(p, expected);
+    }
+
+    /// Regression test for microsoft/mssql-python#547 (VARCHAR(MAX) variant).
+    #[test]
+    fn string_varchar_plp_empty_omits_chunk_header() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0xA7);
+        ctx.is_plp = true;
+        let val = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            Vec::new(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&PLP_UNKNOWN_LEN.to_le_bytes());
+        expected.extend_from_slice(&PLP_TERMINATOR.to_le_bytes());
+        assert_eq!(p, expected);
+    }
+
+    /// Regression test for microsoft/mssql-python#547 (VARBINARY(MAX) variant).
+    #[test]
+    fn bytes_varbinary_plp_empty_omits_chunk_header() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0xA5);
+        ctx.is_plp = true;
+        let val = ColumnValues::Bytes(Vec::new());
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&PLP_UNKNOWN_LEN.to_le_bytes());
+        expected.extend_from_slice(&PLP_TERMINATOR.to_le_bytes());
         assert_eq!(p, expected);
     }
 

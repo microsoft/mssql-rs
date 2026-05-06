@@ -5,6 +5,9 @@ edition = "2024"
 description = "Mock TDS server library and CLI for testing SQL Server clients"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [lib]
 name = "mssql_mock_tds"
 path = "src/lib.rs"

@@ -133,21 +133,14 @@ steps:
         set -e
         update-ca-certificates
         source ~/.cargo/env
-        
-        # Install Python 3.12 via deadsnakes PPA
-        apt-get update
-        apt-get install -y software-properties-common
-        add-apt-repository -y ppa:deadsnakes/ppa
-        apt-get update
-        apt-get install -y python3.12 python3.12-venv python3.12-dev
-        
-        # Create Python 3.12 venv and install deps
-        python3.12 -m venv /tmp/py312-venv
-        source /tmp/py312-venv/bin/activate
+
+        # Use the build image'"'"'s pre-installed Python 3.10 (mssql-python requires >=3.10).
+        # No PPA install — avoids dependency on Launchpad availability.
+        python3 -m venv /tmp/py-venv
+        source /tmp/py-venv/bin/activate
         pip install --upgrade pip -q
         pip install maturin pytest pytest-asyncio python-dotenv patchelf pybind11 wheel setuptools -q
-        
-        # Run the test script
+
         ./dev/test-python.sh --mssql-python
       '
   displayName: Build bindings and run mssql-python tests
@@ -168,45 +161,39 @@ steps:
       $BUILD_IMAGE \
       bash -c '
         set -e
-        
-        # Install Python 3.12
-        apt-get update
-        apt-get install -y software-properties-common
-        add-apt-repository -y ppa:deadsnakes/ppa
-        apt-get update
-        apt-get install -y python3.12 python3.12-venv
-        
-        # Setup Python 3.12 venv
-        python3.12 -m venv /tmp/wheel-venv
+
+        # Use the build image'"'"'s pre-installed Python 3.10 (mssql-python requires >=3.10).
+        # No PPA install — avoids dependency on Launchpad availability.
+        python3 -m venv /tmp/wheel-venv
         source /tmp/wheel-venv/bin/activate
         pip install --upgrade pip -q
         pip install wheel setuptools -q
-        
+
         # Verify both .so files exist (from test-python.sh)
         echo "Verifying bindings from test step..."
         ls -la mssql_python/*.so
-        
+
         # Create combined artifact folder
         mkdir -p /workspace/mssql-python-artifacts
-        
+
         # Copy mssql_py_core.so standalone for plug-n-play
         cp mssql_python/mssql_py_core*.so /workspace/mssql-python-artifacts/
-        
+
         # Extract mssql_py_core from NuGet (sets up mssql_py_core/ directory
         # with __init__.py and native extension required by setup.py validation)
         bash eng/scripts/install-mssql-py-core.sh
-        
+
         # Overwrite with freshly built .so from test step
         cp mssql_python/mssql_py_core*.so mssql_py_core/
-        
+
         # Build mssql-python wheel
         echo "Building mssql-python wheel..."
         rm -rf dist/ build/ *.egg-info
         python setup.py bdist_wheel
-        
+
         # Copy wheel to artifact folder
         cp dist/*.whl /workspace/mssql-python-artifacts/
-        
+
         echo "Artifacts:"
         ls -la /workspace/mssql-python-artifacts/
       '

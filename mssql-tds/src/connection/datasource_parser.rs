@@ -444,10 +444,14 @@ impl ParsedDataSource {
             || Self::is_computer_name(normalized_server);
 
         if is_local {
-            // For TCP and admin protocols, keep "localhost" as-is
-            // This preserves TLS certificate hostname validation behavior
-            // Named Pipes and Shared Memory may need the actual computer name
-            if result.protocol_name == "admin" || result.protocol_name == "tcp" {
+            // For TCP, admin, and SSRP-bound connections, keep "localhost" as-is.
+            // This preserves TLS certificate hostname validation and loopback
+            // detection for SSPI (empty-SPN NTLM fallback).
+            // Named Pipes and Shared Memory may need the actual computer name.
+            if result.protocol_name == "admin"
+                || result.protocol_name == "tcp"
+                || !result.instance_name.is_empty()
+            {
                 result.server_name = "localhost".to_string();
             } else {
                 // For np, lpc, or unspecified protocols, resolve to actual computer name

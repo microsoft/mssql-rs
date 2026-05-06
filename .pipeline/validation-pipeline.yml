@@ -218,6 +218,8 @@ stages:
           osType: MacOS
           buildType: ${{ parameters.buildType }}
           testFilter: -E 'not (test(connectivity))'
+          enableRustBuild: false
+          enableClippy: false
 
 # Kerberos tests for PRs (fast - 2 distros: ubuntu22 + alpine318)
 - stage: Kerberos_Test_PR

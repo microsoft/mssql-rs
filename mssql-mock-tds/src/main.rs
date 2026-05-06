@@ -226,8 +226,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Received Ctrl+C, shutting down...");
         println!("\nShutting down...");
         // Take the sender out of the Option, send once
-        if let Some(tx) = shutdown_tx_clone.lock().unwrap().take() {
-            let _ = tx.send(());
+        match shutdown_tx_clone.lock() {
+            Ok(mut shutdown_tx) => {
+                if let Some(tx) = shutdown_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+            Err(error) => error!("Failed to acquire shutdown signal mutex: {}", error),
         }
     })?;
 

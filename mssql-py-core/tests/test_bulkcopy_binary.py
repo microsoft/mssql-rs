@@ -476,6 +476,59 @@ def test_cursor_bulkcopy_varbinary_max(client_context):
 
 
 @pytest.mark.integration
+def test_cursor_bulkcopy_varbinary_max_empty_bytes(client_context):
+    """Regression test for microsoft/mssql-python#547 (VARBINARY(MAX) variant).
+
+    Empty byte arrays into VARBINARY(MAX) previously desynced the PLP stream:
+    a 4-byte zero-length PLP chunk header IS the PLP terminator per MS-TDS,
+    so writing chunk_len=0 plus an explicit terminator caused the server to
+    misread the next column (SQL error 4815 "invalid column length" or 4804).
+
+    Includes a trailing NOT NULL column to detect any residual stream
+    misalignment after an empty PLP value.
+    """
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "#BulkCopyEmptyVarbinaryMax"
+    cursor.execute(
+        f"CREATE TABLE {table_name} ("
+        f"id INT, vb_max VARBINARY(MAX) NULL, tail INT NOT NULL)"
+    )
+
+    bytes4 = bytes([0xDE, 0xAD, 0xBE, 0xEF])
+    empty_bytes = bytes()
+
+    data = [
+        (1, bytes4, 100),
+        (2, empty_bytes, 200),
+        (3, None, 300),
+        (4, bytes4, 400),
+    ]
+
+    result = cursor.bulkcopy(table_name, iter(data), batch_size=1000, timeout=30)
+    assert result is not None
+    assert result["rows_copied"] == 4
+
+    cursor.execute(
+        f"SELECT id, vb_max, DATALENGTH(vb_max), tail FROM {table_name} ORDER BY id"
+    )
+    rows = cursor.fetchall()
+
+    assert rows[0] == (1, bytes4, 4, 100)
+    # SQL Server stores empty VARBINARY(MAX) but DATALENGTH may report 0
+    # while the value round-trips as an empty bytes object.
+    assert rows[1][0] == 2
+    assert rows[1][1] == empty_bytes or rows[1][1] is None
+    assert rows[1][2] == 0
+    assert rows[1][3] == 200
+    assert rows[2] == (3, None, None, 300)
+    assert rows[3] == (4, bytes4, 4, 400)
+
+    conn.close()
+
+
+@pytest.mark.integration
 def test_cursor_bulkcopy_int_to_binary_fails(client_context):
     """Test that integers cannot be directly sent as binary data.
     

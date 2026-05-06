@@ -216,6 +216,23 @@ pub enum Error {
     /// Authentication / security subsystem error.
     #[error("Security error: {0}")]
     Security(#[from] SecurityError),
+
+    /// All reconnection attempts exhausted.
+    #[error("Session recovery failed after {attempts} attempt(s): {message}")]
+    SessionRecoveryFailed {
+        /// Number of reconnection attempts made.
+        attempts: u32,
+        /// Description of the final failure.
+        message: String,
+    },
+
+    /// Session state prevents reconnection (transactions, unrecoverable state).
+    #[error("Session not recoverable: {0}")]
+    SessionNotRecoverable(String),
+
+    /// Reconnected server properties don't match original.
+    #[error("Reconnection validation failed: {0}")]
+    ReconnectionValidationFailed(String),
 }
 
 /// Helper for `SqlServerError` display formatting.
@@ -235,6 +252,34 @@ impl SqlServerError {
     }
 }
 
+/// SQL Server error numbers that indicate a transient condition during
+/// connection open. These are server-reported errors where retrying the
+/// connection may succeed.
+///
+/// This list is the intersection of the transient error sets used by
+/// SqlClient (`s_defaultTransientErrors` in `SqlConfigurableRetryFactory.cs`)
+/// and JDBC (`TransientError` enum in `SQLServerError.java`).
+///
+/// Transport-level transient errors (JDBC codes 64, 10053, 10054) are already
+/// covered by [`Error::Io`] and [`Error::ConnectionClosed`] variants.
+const TRANSIENT_SQL_ERROR_NUMBERS: &[u32] = &[
+    233,   // Connection closed by remote host / no process on other end of pipe
+    4060,  // Cannot open database requested by the login
+    4221,  // Login to read-secondary failed (HADR transition timeout)
+    10928, // Resource limit reached (Azure SQL)
+    10929, // Resource minimum guarantee exceeded (Azure SQL)
+    40143, // Service error processing request
+    40197, // Service error during upgrades/failover (may embed 40020/40143/40166/40540)
+    40501, // Service busy — retry after 10 seconds
+    40540, // Service error processing request
+    40613, // Database not currently available
+    42108, // SQL pool paused (Synapse)
+    42109, // SQL pool warming up (Synapse)
+    49918, // Not enough resources to process request
+    49919, // Too many create/update operations in progress
+    49920, // Too many operations in progress for subscription
+];
+
 impl Error {
     /// Create a `SqlServerError` from a single `SqlErrorInfo`.
     pub fn from_sql_error(error: SqlErrorInfo) -> Self {
@@ -246,6 +291,33 @@ impl Error {
     /// Create a `SqlServerError` from multiple `SqlErrorInfo`s.
     pub fn from_sql_errors(errors: Vec<SqlErrorInfo>) -> Self {
         Error::SqlServerError { errors }
+    }
+
+    /// Whether this error is transient for connection open retry purposes.
+    ///
+    /// Transient errors warrant retrying the entire connection sequence.
+    /// Permanent errors (auth failures, TLS config, protocol violations)
+    /// should not be retried.
+    ///
+    /// For transport-level failures (`Io`, `ConnectionError`, `TimeoutError`,
+    /// `ConnectionClosed`), all instances are considered transient.
+    ///
+    /// For server-reported errors (`SqlServerError`), only specific error
+    /// numbers known to be transient trigger a retry. See
+    /// [`TRANSIENT_SQL_ERROR_NUMBERS`] for the full list.
+    pub(crate) fn is_transient_connect_error(&self) -> bool {
+        match self {
+            Error::Io(_)
+            | Error::ConnectionError(_)
+            | Error::TimeoutError(_)
+            | Error::ConnectionClosed(_) => true,
+
+            Error::SqlServerError { errors } => errors
+                .iter()
+                .any(|e| TRANSIENT_SQL_ERROR_NUMBERS.contains(&e.number)),
+
+            _ => false,
+        }
     }
 }
 
@@ -419,5 +491,118 @@ mod tests {
         let error = Error::ProtocolError("Test".to_string());
         let debug_str = format!("{error:?}");
         assert!(debug_str.contains("ProtocolError"));
+    }
+
+    // ── Transient error classification tests ──
+
+    #[test]
+    fn io_error_is_transient() {
+        let err = Error::Io(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
+        assert!(err.is_transient_connect_error());
+    }
+
+    #[test]
+    fn connection_error_is_transient() {
+        let err = Error::ConnectionError("failed to connect".to_string());
+        assert!(err.is_transient_connect_error());
+    }
+
+    #[test]
+    fn timeout_error_is_transient() {
+        let err = Error::TimeoutError(TimeoutErrorType::String("timed out".to_string()));
+        assert!(err.is_transient_connect_error());
+    }
+
+    #[test]
+    fn connection_closed_is_transient() {
+        let err = Error::ConnectionClosed("reset by peer".to_string());
+        assert!(err.is_transient_connect_error());
+    }
+
+    #[test]
+    fn permanent_sql_server_error_is_not_transient() {
+        // 18456 = Login failed — permanent, should not retry
+        let err = Error::from_sql_error(SqlErrorInfo {
+            message: "Login failed".to_string(),
+            state: 1,
+            class: 14,
+            number: 18456,
+            server_name: None,
+            proc_name: None,
+            line_number: None,
+        });
+        assert!(!err.is_transient_connect_error());
+    }
+
+    #[test]
+    fn transient_sql_server_errors_are_retried() {
+        for &code in &[
+            233, 4060, 4221, 10928, 10929, 40143, 40197, 40501, 40540, 40613, 42108, 42109, 49918,
+            49919, 49920,
+        ] {
+            let err = Error::from_sql_error(SqlErrorInfo {
+                message: "transient".to_string(),
+                state: 1,
+                class: 16,
+                number: code,
+                server_name: None,
+                proc_name: None,
+                line_number: None,
+            });
+            assert!(
+                err.is_transient_connect_error(),
+                "SQL error {code} should be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_sql_errors_transient_if_any_match() {
+        // If any error in the batch is transient, the whole error is transient
+        let err = Error::from_sql_errors(vec![
+            SqlErrorInfo {
+                message: "Login failed".to_string(),
+                state: 1,
+                class: 14,
+                number: 18456,
+                server_name: None,
+                proc_name: None,
+                line_number: None,
+            },
+            SqlErrorInfo {
+                message: "Service busy".to_string(),
+                state: 1,
+                class: 16,
+                number: 40501,
+                server_name: None,
+                proc_name: None,
+                line_number: None,
+            },
+        ]);
+        assert!(err.is_transient_connect_error());
+    }
+
+    #[test]
+    fn protocol_error_is_not_transient() {
+        let err = Error::ProtocolError("bad packet".to_string());
+        assert!(!err.is_transient_connect_error());
+    }
+
+    #[test]
+    fn operation_cancelled_is_not_transient() {
+        let err = Error::OperationCancelledError("cancelled".to_string());
+        assert!(!err.is_transient_connect_error());
+    }
+
+    #[test]
+    fn usage_error_is_not_transient() {
+        let err = Error::UsageError("bad param".to_string());
+        assert!(!err.is_transient_connect_error());
+    }
+
+    #[test]
+    fn security_error_is_not_transient() {
+        let err = Error::Security(SecurityError::NotSupported("SSPI".to_string()));
+        assert!(!err.is_transient_connect_error());
     }
 }
