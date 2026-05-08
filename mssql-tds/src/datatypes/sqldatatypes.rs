@@ -299,6 +299,9 @@ impl TryFrom<u8> for VectorLayoutVersion {
 pub enum VectorBaseType {
     /// 32-bit floating point (0x00)
     Float32 = 0x00,
+    /// 16-bit (half-precision) floating point (0x01).
+    /// Requires server-side Vector feature version >= 2.
+    Float16 = 0x01,
 }
 
 impl VectorBaseType {
@@ -306,6 +309,17 @@ impl VectorBaseType {
     pub const fn element_size_bytes(self) -> usize {
         match self {
             VectorBaseType::Float32 => 4,
+            VectorBaseType::Float16 => 2,
+        }
+    }
+
+    /// Returns the maximum number of dimensions a single vector value of this
+    /// base type can hold (constrained by [`VECTOR_MAX_SIZE`]).
+    pub const fn max_dimensions(self) -> u16 {
+        // (VECTOR_MAX_SIZE - VECTOR_HEADER_SIZE) / element_size_bytes
+        match self {
+            VectorBaseType::Float32 => 1998,
+            VectorBaseType::Float16 => 3996,
         }
     }
 }
@@ -316,6 +330,7 @@ impl TryFrom<u8> for VectorBaseType {
     fn try_from(value: u8) -> TdsResult<Self> {
         match value {
             0x00 => Ok(VectorBaseType::Float32),
+            0x01 => Ok(VectorBaseType::Float16),
             _ => Err(Error::ProtocolError(format!(
                 "Unsupported Vector base type: 0x{:02X}",
                 value
@@ -324,7 +339,8 @@ impl TryFrom<u8> for VectorBaseType {
     }
 }
 
-/// Maximum number of dimensions in a TDS vector.
+/// Maximum number of dimensions in a TDS vector for the float32 base type.
+/// For other base types use [`VectorBaseType::max_dimensions`].
 pub(crate) const VECTOR_MAX_DIMENSIONS: u16 = 1998;
 /// Size of the vector header in bytes.
 pub const VECTOR_HEADER_SIZE: usize = 8;

@@ -66,6 +66,44 @@ mod vector_integration_tests {
         }
     }
 
+    /// Test basic vector16 deserialization with a simple 3-dimensional float16 vector
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_vector16_basic_deserialization() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        let query = "SELECT CAST('[1.0, 2.0, 3.0]' AS VECTOR(3, float16)) AS VectorColumn";
+
+        client.execute(query.to_string(), None, None).await.unwrap();
+
+        if let Some(resultset) = client.get_current_resultset() {
+            let columns = resultset.get_metadata();
+            assert_eq!(columns.len(), 1);
+            assert_eq!(columns[0].column_name, "VectorColumn");
+
+            let mut row_count = 0;
+            while let Some(row) = resultset.next_row().await.unwrap() {
+                row_count += 1;
+                assert_eq!(row.len(), 1);
+
+                match &row[0] {
+                    ColumnValues::Vector(vector) => {
+                        assert_eq!(vector.dimension_count(), 3);
+                        assert_eq!(vector.base_type(), VectorBaseType::Float16);
+                        let values = vector.as_f32().expect("Float16 should decode to f32");
+                        assert_eq!(values.len(), 3);
+                        assert!((values[0] - 1.0).abs() < 0.001);
+                        assert!((values[1] - 2.0).abs() < 0.001);
+                        assert!((values[2] - 3.0).abs() < 0.001);
+                    }
+                    _ => panic!("Expected Vector column value, got: {:?}", row[0]),
+                }
+            }
+            assert_eq!(row_count, 1, "Expected 1 row");
+        } else {
+            panic!("Expected a result set");
+        }
+    }
+
     /// Test vector column metadata via get_metadata(): type, length, scale, flags
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_vector_metadata_fields() {

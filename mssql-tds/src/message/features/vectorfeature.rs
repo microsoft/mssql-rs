@@ -19,7 +19,8 @@ impl VectorFeature {
     /// The maximum Vector feature version supported by this library.
     /// This represents the highest version this TDS client can negotiate with the server.
     /// Version 1 supports single-precision float (float32) dimension type.
-    pub const VERSION: u8 = 1;
+    /// Version 2 adds half-precision float (float16) dimension type.
+    pub const VERSION: u8 = 2;
 
     /// Creates a new VectorFeature instance with the specified client version.
     pub fn new(client_version: u8) -> Self {
@@ -51,6 +52,7 @@ impl From<VectorVersion> for Option<VectorFeature> {
         match version {
             VectorVersion::Off => None,
             VectorVersion::V1 => Some(VectorFeature::new(1)),
+            VectorVersion::V2 => Some(VectorFeature::new(2)),
         }
     }
 }
@@ -148,7 +150,7 @@ mod tests {
     #[test]
     fn test_deserialize_invalid_version() {
         let mut feature = VectorFeature::default();
-        let data = vec![2u8]; // Server supports version 2
+        let data = vec![3u8]; // Server claims a version greater than client supports
         let result = feature.deserialize(&data);
         assert!(result.is_err());
         assert!(
@@ -157,6 +159,15 @@ mod tests {
                 .to_string()
                 .contains("exceeds client requested version")
         );
+    }
+
+    #[test]
+    fn test_deserialize_v2_acknowledged() {
+        let mut feature = VectorFeature::default();
+        feature.set_acknowledged(true);
+        feature.deserialize(&[2u8]).unwrap();
+        assert!(feature.is_acknowledged());
+        assert_eq!(feature.negotiated_version(), 2);
     }
 
     #[test]

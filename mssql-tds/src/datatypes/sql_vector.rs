@@ -3,17 +3,20 @@
 
 use crate::core::TdsResult;
 use crate::datatypes::sqldatatypes::{
-    VECTOR_HEADER_SIZE, VECTOR_MAX_DIMENSIONS, VECTOR_MAX_SIZE, VectorBaseType, VectorLayoutFormat,
-    VectorLayoutVersion,
+    VECTOR_HEADER_SIZE, VECTOR_MAX_SIZE, VectorBaseType, VectorLayoutFormat, VectorLayoutVersion,
 };
 use crate::error::Error;
 
 /// Enum representing the typed data stored in a SqlVector.
-/// In future, this enum will be extended to support additional base types
-/// such as Float16, Int32, etc.
+///
+/// Note: this is the *decoded* representation. The wire-level base type is
+/// preserved on [`SqlVector::base_type`]. For example, a `Float16` vector
+/// arrives over the wire as 16-bit IEEE 754 half-precision values but is
+/// decoded into `Float32` for ergonomic access (JS / Python lack first-class
+/// f16 support). Use [`SqlVector::base_type`] to inspect the original type.
 #[derive(Debug, PartialEq, Clone)]
 pub enum VectorData {
-    /// Single-precision float vector.
+    /// Single-precision (32-bit) float vector.
     Float32(Vec<f32>),
 }
 
@@ -70,6 +73,16 @@ impl SqlVector {
                     .collect();
                 VectorData::Float32(f32_values)
             }
+            VectorBaseType::Float16 => {
+                // Decode 16-bit IEEE 754 halves into f32. Storing as f32 keeps
+                // FFI surfaces (JS / Python) simple since neither has first-class
+                // f16 support.
+                let f32_values: Vec<f32> = raw_bytes
+                    .chunks_exact(2)
+                    .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                    .collect();
+                VectorData::Float32(f32_values)
+            }
         };
 
         let vector = Self {
@@ -81,7 +94,9 @@ impl SqlVector {
     }
 
     /// Returns a reference to the dimension values as a float slice.
-    /// Returns None if the vector is not Float32 type.
+    ///
+    /// Float16 vectors are decoded to f32 at deserialization time, so this
+    /// always returns `Some` for vectors received from the server.
     pub fn as_f32(&self) -> Option<&[f32]> {
         match &self.data {
             VectorData::Float32(v) => Some(v),
@@ -102,13 +117,14 @@ impl SqlVector {
         self.base_type
     }
 
-    /// Returns the total size in bytes (header + dimension values).
-    /// Used during serialization (Phase 3).
+    /// Returns the total size in bytes (header + dimension values) on the wire.
+    /// Used during serialization (Phase 3). Sized by the base type, not the
+    /// decoded storage.
     pub(crate) fn total_size(&self) -> usize {
-        let element_bytes = match &self.data {
-            VectorData::Float32(v) => v.len() * size_of::<f32>(),
+        let element_count = match &self.data {
+            VectorData::Float32(v) => v.len(),
         };
-        VECTOR_HEADER_SIZE + element_bytes
+        VECTOR_HEADER_SIZE + element_count * self.base_type.element_size_bytes()
     }
 
     /// Validates the vector dimensions (count and total size).
@@ -123,10 +139,11 @@ impl SqlVector {
             ));
         }
 
-        if dimension_count > VECTOR_MAX_DIMENSIONS as usize {
+        let max_dimensions = self.base_type.max_dimensions();
+        if dimension_count > max_dimensions as usize {
             return Err(Error::ProtocolError(format!(
-                "Vector dimension count {} exceeds maximum of {}",
-                dimension_count, VECTOR_MAX_DIMENSIONS
+                "Vector dimension count {} exceeds maximum of {} for base type {:?}",
+                dimension_count, max_dimensions, self.base_type
             )));
         }
 
@@ -158,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_validate_too_many_dimensions() {
-        let values = vec![0.0f32; (VECTOR_MAX_DIMENSIONS + 1) as usize];
+        let values = vec![0.0f32; (VectorBaseType::Float32.max_dimensions() + 1) as usize];
         let result = SqlVector::try_from_f32(values);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
@@ -225,5 +242,38 @@ mod tests {
         let values = vec![1.0, 2.0, 3.0];
         let vector = SqlVector::try_from_f32(values).unwrap();
         assert_eq!(vector.base_type(), VectorBaseType::Float32);
+    }
+
+    #[test]
+    fn test_from_raw_float16() {
+        // 1.0, 2.0, 3.0 encoded as IEEE 754 half-precision (little-endian).
+        let raw_bytes = vec![0x00, 0x3C, 0x00, 0x40, 0x00, 0x42];
+        let vector = SqlVector::try_from_raw(
+            VectorLayoutFormat::V1 as u8,
+            VectorLayoutVersion::V1 as u8,
+            VectorBaseType::Float16 as u8,
+            raw_bytes,
+        )
+        .unwrap();
+        assert_eq!(vector.base_type(), VectorBaseType::Float16);
+        assert_eq!(vector.dimension_count(), 3);
+        let values = vector.as_f32().unwrap();
+        assert!((values[0] - 1.0).abs() < 1e-3);
+        assert!((values[1] - 2.0).abs() < 1e-3);
+        assert!((values[2] - 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_total_size_float16_uses_wire_size() {
+        // 4 dims of Float16 => 8 wire bytes + 8-byte header = 16
+        let raw_bytes = vec![0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44];
+        let vector = SqlVector::try_from_raw(
+            VectorLayoutFormat::V1 as u8,
+            VectorLayoutVersion::V1 as u8,
+            VectorBaseType::Float16 as u8,
+            raw_bytes,
+        )
+        .unwrap();
+        assert_eq!(vector.total_size(), VECTOR_HEADER_SIZE + 4 * 2);
     }
 }
