@@ -8,8 +8,10 @@
 # Support:        https://aka.ms/onebranchsup                                   #
 #################################################################################
 
+# CI trigger only on development. Main-branch coverage comes from the
+# Official pipeline (on merge) and the nightly schedule below; no need to
+# also fire NonOfficial on every merge to main.
 trigger:
-- main
 - development
 
 pr:
