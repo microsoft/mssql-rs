@@ -2578,9 +2578,7 @@ mod test {
         use super::*;
         use crate::datatypes::{
             sql_vector::SqlVector,
-            sqldatatypes::{
-                VECTOR_MAX_DIMENSIONS, VectorBaseType, VectorLayoutFormat, VectorLayoutVersion,
-            },
+            sqldatatypes::{VectorBaseType, VectorLayoutFormat, VectorLayoutVersion},
         };
 
         #[test]
@@ -2603,9 +2601,10 @@ mod test {
 
         #[test]
         fn test_vector_max_dimensions() {
-            let dimensions: Vec<f32> = (0..VECTOR_MAX_DIMENSIONS).map(|i| i as f32).collect();
+            let max_dim = VectorBaseType::Float32.max_dimensions();
+            let dimensions: Vec<f32> = (0..max_dim).map(|i| i as f32).collect();
             let vector = SqlVector::try_from_f32(dimensions).unwrap();
-            assert_eq!(vector.dimension_count(), VECTOR_MAX_DIMENSIONS);
+            assert_eq!(vector.dimension_count(), max_dim);
         }
 
         #[test]
@@ -2701,7 +2700,8 @@ mod test {
 
         #[test]
         fn test_vector_too_many_dimensions() {
-            let dimensions: Vec<f32> = (0..(VECTOR_MAX_DIMENSIONS + 1)).map(|i| i as f32).collect();
+            let max_dim = VectorBaseType::Float32.max_dimensions();
+            let dimensions: Vec<f32> = (0..(max_dim + 1)).map(|i| i as f32).collect();
             let result = SqlVector::try_from_f32(dimensions);
             assert!(result.is_err());
             assert!(result.unwrap_err().to_string().contains("exceeds maximum"));

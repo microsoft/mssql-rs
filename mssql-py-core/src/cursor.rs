@@ -550,6 +550,9 @@ impl PyCoreCursor {
                             return list.into_any();
                         }
                     }
+                    VectorBaseType::Float16 => {
+                        // Let it fall through to the string conversion below
+                    }
                 }
                 // Fallback to string if conversion fails
                 format!("{:?}", v)
