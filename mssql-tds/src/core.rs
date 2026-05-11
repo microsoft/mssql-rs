@@ -4,6 +4,7 @@
 use crate::error::Error;
 use crate::error::Error::OperationCancelledError;
 use std::future::Future;
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 /// Alias for `Result<T, crate::error::Error>` used throughout the crate.
@@ -220,7 +221,7 @@ pub struct EncryptionOptions {
     /// Path to a DER or PEM encoded X.509 certificate file for certificate pinning.
     /// When specified, the driver performs an exact binary match between the provided
     /// certificate and the server's certificate, bypassing standard CA chain validation.
-    pub server_certificate: Option<String>,
+    pub server_certificate: Option<PathBuf>,
 }
 
 impl EncryptionOptions {
