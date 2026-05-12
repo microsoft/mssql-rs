@@ -15,9 +15,13 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
+use crate::arrow_bulkcopy::{ArrowBatchRowAdapter, ColumnPlan, build_column_plans};
 use crate::bulkcopy::PythonRowAdapter;
 use crate::python_logger_adapter::scoped_tracing_bridge;
 use crate::utils::convert_tds_error;
+use arrow::array::{RecordBatch, StructArray};
+use arrow::datatypes::{Schema, SchemaRef};
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
 
 /// Python Cursor class for Core TDS backend
 #[pyclass]
@@ -489,6 +493,161 @@ impl PyCoreCursor {
         };
         py_result.set_item("rows_per_second", rows_per_second)?;
 
+        Ok(py_result.into())
+    }
+
+    /// Arrow-input bulk copy. Accepts any of:
+    ///   * `pyarrow.Table` / `pyarrow.RecordBatch` / `pyarrow.RecordBatchReader`
+    ///   * an iterable of `pyarrow.RecordBatch`
+    ///   * any object exposing the Arrow PyCapsule stream interface
+    ///     (`__arrow_c_stream__`).
+    ///
+    /// Returns the same `dict` shape as `bulkcopy`. Errors mirror `bulkcopy`'s.
+    #[pyo3(signature = (table_name, source, batch_size=0, timeout=30, column_mappings=None, keep_identity=false, check_constraints=false, table_lock=false, keep_nulls=false, fire_triggers=false, use_internal_transaction=false, python_logger=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn bulkcopy_arrow(
+        &mut self,
+        py: Python,
+        table_name: String,
+        source: &Bound<'_, PyAny>,
+        batch_size: usize,
+        timeout: u64,
+        column_mappings: Option<&Bound<'_, PyAny>>,
+        keep_identity: bool,
+        check_constraints: bool,
+        table_lock: bool,
+        keep_nulls: bool,
+        fire_triggers: bool,
+        use_internal_transaction: bool,
+        python_logger: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyDict>> {
+        let _guard = python_logger
+            .map(|logger| scoped_tracing_bridge(Arc::new(logger.clone().unbind()), file!()));
+
+        info!(
+            "bulkcopy_arrow: Starting Arrow bulkcopy to table: {}",
+            table_name
+        );
+
+        let options = BulkCopyOptions {
+            batch_size,
+            timeout: Duration::from_secs(timeout),
+            column_mappings: Self::parse_column_mappings(column_mappings)?,
+            keep_identity,
+            check_constraints,
+            table_lock,
+            keep_nulls,
+            fire_triggers,
+            use_internal_transaction,
+        };
+
+        let reader = Self::resolve_arrow_reader(source)?;
+        let schema = read_schema_from_capsule(&reader)?;
+        let auto_generate_mappings = options.column_mappings.is_empty();
+
+        let tds_client = self.tds_client.clone();
+        let runtime_handle = self.runtime_handle.clone();
+
+        let result = runtime_handle.block_on(async {
+            let mut client = tds_client.lock().await;
+
+            let mut bulk_copy = BulkCopy::new(&mut client, table_name)
+                .batch_size(options.batch_size)
+                .timeout(options.timeout)
+                .check_constraints(options.check_constraints)
+                .fire_triggers(options.fire_triggers)
+                .keep_identity(options.keep_identity)
+                .keep_nulls(options.keep_nulls)
+                .table_lock(options.table_lock)
+                .use_internal_transaction(options.use_internal_transaction);
+
+            let destination_metadata =
+                bulk_copy
+                    .retrieve_destination_metadata()
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "bulkcopy_arrow: Failed to retrieve destination metadata: {}",
+                            e
+                        );
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to retrieve destination metadata: {}",
+                            e
+                        ))
+                    })?;
+
+            let mappings = if auto_generate_mappings {
+                let n = std::cmp::min(schema.fields().len(), destination_metadata.len());
+                (0..n)
+                    .map(|i| ColumnMapping::ByOrdinal {
+                        source: i,
+                        destination: destination_metadata[i].column_name.clone(),
+                    })
+                    .collect()
+            } else {
+                options.column_mappings
+            };
+
+            for mapping in mappings {
+                let tds_mapping = match mapping {
+                    ColumnMapping::ByName {
+                        source,
+                        destination,
+                    } => TdsColumnMapping {
+                        source: ColumnMappingSource::Name(source),
+                        destination,
+                    },
+                    ColumnMapping::ByOrdinal {
+                        source,
+                        destination,
+                    } => TdsColumnMapping {
+                        source: ColumnMappingSource::Ordinal(source),
+                        destination,
+                    },
+                };
+                bulk_copy = bulk_copy.add_column_mapping(tds_mapping);
+            }
+
+            let resolved_mappings = bulk_copy.get_resolved_mappings().await.map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to resolve column mappings: {}",
+                    e
+                ))
+            })?;
+
+            let plans = build_column_plans(&schema, &destination_metadata, &resolved_mappings)
+                .map_err(convert_tds_error)?;
+            let plans_arc = Arc::new(plans);
+            let dest_arc = Arc::new(destination_metadata);
+
+            let row_iter = ArrowRowIter::new(reader, plans_arc, dest_arc);
+
+            let bulk_result = bulk_copy
+                .write_to_server_zerocopy(row_iter)
+                .await
+                .map_err(|e| {
+                    error!("bulkcopy_arrow: write_to_server_zerocopy failed: {}", e);
+                    convert_tds_error(e)
+                })?;
+
+            Ok::<_, PyErr>(bulk_result)
+        })?;
+
+        let py_result = PyDict::new(py);
+        py_result.set_item("rows_copied", result.rows_affected)?;
+        let batch_count = if options.batch_size > 0 {
+            result.rows_affected.div_ceil(options.batch_size as u64)
+        } else {
+            1
+        };
+        py_result.set_item("batch_count", batch_count)?;
+        py_result.set_item("elapsed_time", result.elapsed.as_secs_f64())?;
+        let rows_per_second = if result.elapsed.as_secs_f64() > 0.0 {
+            result.rows_affected as f64 / result.elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        py_result.set_item("rows_per_second", rows_per_second)?;
         Ok(py_result.into())
     }
 }
@@ -1009,6 +1168,216 @@ impl PyCoreCursor {
             has_resultset: false,
         }
     }
+
+    /// Coerce a Python source object into a `pyarrow.RecordBatchReader`.
+    ///
+    /// Accepted shapes (in priority order):
+    ///   * an object exposing `__arrow_c_stream__` — wrapped via
+    ///     `pyarrow.RecordBatchReader.from_stream` (pyarrow ≥ 14).
+    ///   * `pyarrow.RecordBatchReader` — used as-is.
+    ///   * `pyarrow.Table` — wrapped via `Table.to_reader()`.
+    ///   * `pyarrow.RecordBatch` — wrapped as a single-batch reader.
+    ///   * an iterable yielding `pyarrow.RecordBatch` — stitched through
+    ///     `RecordBatchReader.from_batches(schema, iter)` after peeking the
+    ///     first batch for schema.
+    fn resolve_arrow_reader(source: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        use pyo3::exceptions::{PyImportError, PyTypeError};
+        let py = source.py();
+
+        let pyarrow = py.import("pyarrow").map_err(|e| {
+            PyImportError::new_err(format!("pyarrow is required for bulkcopy_arrow: {}", e))
+        })?;
+        let rbr_cls = pyarrow.getattr("RecordBatchReader")?;
+
+        if source.hasattr("__arrow_c_stream__")? && rbr_cls.hasattr("from_stream")? {
+            // Covers pyarrow.Table, pandas.DataFrame (≥2.2), polars.DataFrame,
+            // duckdb results, and anything else implementing the C-stream PCI.
+            let reader = rbr_cls.call_method1("from_stream", (source,))?;
+            return Ok(reader.unbind());
+        }
+
+        if source.is_instance(&rbr_cls)? {
+            return Ok(source.clone().unbind());
+        }
+
+        let table_cls = pyarrow.getattr("Table")?;
+        if source.is_instance(&table_cls)? {
+            let reader = source.call_method0("to_reader")?;
+            return Ok(reader.unbind());
+        }
+
+        let batch_cls = pyarrow.getattr("RecordBatch")?;
+        if source.is_instance(&batch_cls)? {
+            let schema = source.getattr("schema")?;
+            let batches = pyo3::types::PyList::new(py, [source])?;
+            let reader = rbr_cls.call_method1("from_batches", (schema, batches))?;
+            return Ok(reader.unbind());
+        }
+
+        // Last-resort: arbitrary iterable. Peek the first batch to learn the
+        // schema, then chain it back with the rest via from_batches.
+        if let Ok(iter) = source.try_iter() {
+            let mut iter = iter;
+            let peeked = if let Some(item) = iter.by_ref().next() {
+                let item = item?;
+                if !item.is_instance(&batch_cls)? {
+                    return Err(PyTypeError::new_err(
+                        "iterable must yield pyarrow.RecordBatch instances",
+                    ));
+                }
+                Some(item.unbind())
+            } else {
+                None
+            };
+            let Some(first) = peeked else {
+                return Err(PyTypeError::new_err(
+                    "Arrow source iterable is empty; cannot infer schema",
+                ));
+            };
+            let first_bound = first.bind(py);
+            let schema = first_bound.getattr("schema")?;
+
+            // Stitch first batch back in front of the remaining iterator
+            // using `itertools.chain` from Python (no intermediate list).
+            let itertools = py.import("itertools")?;
+            let chain = itertools.getattr("chain")?;
+            let one_list = pyo3::types::PyList::new(py, [first_bound])?;
+            let chained = chain.call1((one_list, iter))?;
+            let reader = rbr_cls.call_method1("from_batches", (schema, chained))?;
+            return Ok(reader.unbind());
+        }
+
+        Err(PyTypeError::new_err(
+            "source must be a pyarrow.Table / RecordBatch / RecordBatchReader, an \
+             iterable of RecordBatch, or implement __arrow_c_stream__",
+        ))
+    }
+}
+
+/// Read the Arrow schema from a `pyarrow.RecordBatchReader` via the C data
+/// interface. We pre-allocate an empty `FFI_ArrowSchema` and let pyarrow
+/// fill it with `Schema._export_to_c`.
+fn read_schema_from_capsule(reader: &Py<PyAny>) -> PyResult<SchemaRef> {
+    Python::attach(|py| {
+        let bound = reader.bind(py);
+        let schema_obj = bound.getattr("schema")?;
+        let mut ffi_schema = FFI_ArrowSchema::empty();
+        let ptr_int = (&mut ffi_schema as *mut FFI_ArrowSchema) as usize;
+        schema_obj.call_method1("_export_to_c", (ptr_int,))?;
+        let schema = Schema::try_from(&ffi_schema).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Failed to import Arrow schema via C data interface: {e}"
+            ))
+        })?;
+        Ok(Arc::new(schema))
+    })
+}
+
+/// Iterator over the Arrow source, yielding one [`ArrowBatchRowAdapter`] per
+/// row. Pulls a fresh `RecordBatch` from the Python reader whenever the
+/// current batch is exhausted; the per-batch import is the only Python touch
+/// inside the write loop.
+struct ArrowRowIter {
+    reader: Py<PyAny>,
+    plans: Arc<Vec<ColumnPlan>>,
+    dest_metadata: Arc<Vec<mssql_tds::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata>>,
+    current: Option<Arc<RecordBatch>>,
+    row_idx: usize,
+    finished: bool,
+}
+
+impl ArrowRowIter {
+    fn new(
+        reader: Py<PyAny>,
+        plans: Arc<Vec<ColumnPlan>>,
+        dest_metadata: Arc<Vec<mssql_tds::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata>>,
+    ) -> Self {
+        Self {
+            reader,
+            plans,
+            dest_metadata,
+            current: None,
+            row_idx: 0,
+            finished: false,
+        }
+    }
+
+    /// Pull the next non-empty `RecordBatch` from the Python reader. Returns
+    /// `Ok(false)` when the reader is exhausted.
+    fn pump_next_batch(&mut self) -> Result<bool, String> {
+        loop {
+            if self.finished {
+                return Ok(false);
+            }
+            let next = Python::attach(|py| -> PyResult<Option<Arc<RecordBatch>>> {
+                let bound = self.reader.bind(py);
+                let res = bound.call_method0("read_next_batch");
+                match res {
+                    Ok(batch_obj) => Ok(Some(import_record_batch_from_pyarrow(&batch_obj)?)),
+                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            })
+            .map_err(|e| format!("Failed to read next Arrow batch: {e}"))?;
+
+            match next {
+                None => {
+                    self.finished = true;
+                    return Ok(false);
+                }
+                Some(batch) if batch.num_rows() == 0 => continue,
+                Some(batch) => {
+                    self.current = Some(batch);
+                    self.row_idx = 0;
+                    return Ok(true);
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for ArrowRowIter {
+    type Item = ArrowBatchRowAdapter;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(batch) = self.current.as_ref()
+                && self.row_idx < batch.num_rows()
+            {
+                let adapter = ArrowBatchRowAdapter {
+                    batch: Arc::clone(batch),
+                    row_idx: self.row_idx,
+                    plans: Arc::clone(&self.plans),
+                    dest_metadata: Arc::clone(&self.dest_metadata),
+                };
+                self.row_idx += 1;
+                return Some(adapter);
+            }
+            match self.pump_next_batch() {
+                Ok(true) => continue,
+                Ok(false) => return None,
+                Err(e) => {
+                    error!("ArrowRowIter::next: {}", e);
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Import a single `pyarrow.RecordBatch` into an arrow-rs `RecordBatch` via
+/// the C data interface. Avoids any Python-side serialization.
+fn import_record_batch_from_pyarrow(batch_obj: &Bound<'_, PyAny>) -> PyResult<Arc<RecordBatch>> {
+    let mut ffi_array = FFI_ArrowArray::empty();
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    let array_ptr_int = (&mut ffi_array as *mut FFI_ArrowArray) as usize;
+    let schema_ptr_int = (&mut ffi_schema as *mut FFI_ArrowSchema) as usize;
+    batch_obj.call_method1("_export_to_c", (array_ptr_int, schema_ptr_int))?;
+
+    let data = unsafe { from_ffi(ffi_array, &ffi_schema) }
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))?;
+    let struct_array = StructArray::from(data);
+    Ok(Arc::new(RecordBatch::from(struct_array)))
 }
 
 /// Bulk copy options parsed from Python kwargs
