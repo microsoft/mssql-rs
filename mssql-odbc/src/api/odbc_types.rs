@@ -28,3 +28,6 @@ pub const SQL_HANDLE_ENV: SqlSmallInt = 1;
 pub const SQL_HANDLE_DBC: SqlSmallInt = 2;
 pub const SQL_HANDLE_STMT: SqlSmallInt = 3;
 pub const SQL_HANDLE_DESC: SqlSmallInt = 4;
+// Internal handle type used by Driver Manager for connection pool awareness.
+// Applications should not use this directly.
+pub const SQL_HANDLE_DBC_INFO_TOKEN: SqlSmallInt = 6;

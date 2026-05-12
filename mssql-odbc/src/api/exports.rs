@@ -27,3 +27,13 @@ pub unsafe extern "C" fn SQLAllocHandle(
 ) -> SqlReturn {
     unsafe { super::alloc_handle::sql_alloc_handle(handle_type, input_handle, output_handle) }
 }
+
+/// See [`free_handle::sql_free_handle`] for full safety requirements.
+///
+/// # Safety
+/// Called from C via the ODBC Driver Manager. `handle` must have been
+/// allocated by `SQLAllocHandle` and not already freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLFreeHandle(handle_type: SqlSmallInt, handle: SqlHandle) -> SqlReturn {
+    unsafe { super::free_handle::sql_free_handle(handle_type, handle) }
+}

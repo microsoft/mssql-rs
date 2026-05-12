@@ -11,7 +11,9 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
     SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
 };
-use crate::handles::{EnvHandle, handle_to_raw};
+use crate::handles::{
+    DbcHandle, EnvHandle, HandleType, free_handle, handle_from_raw, handle_to_raw,
+};
 
 /// Allocates an environment, connection, statement, or descriptor handle.
 ///
@@ -45,7 +47,8 @@ pub(crate) unsafe fn sql_alloc_handle(
 
         match handle_type {
             SQL_HANDLE_ENV => unsafe { alloc_env(input_handle, output_handle) },
-            SQL_HANDLE_DBC | SQL_HANDLE_STMT | SQL_HANDLE_DESC => {
+            SQL_HANDLE_DBC => unsafe { alloc_dbc(input_handle, output_handle) },
+            SQL_HANDLE_STMT | SQL_HANDLE_DESC => {
                 error!(
                     handle_type,
                     "SQLAllocHandle: handle type not yet implemented"
@@ -91,11 +94,58 @@ unsafe fn alloc_env(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
     SQL_SUCCESS
 }
 
+/// Allocates a connection handle under a parent environment.
+///
+/// Mirrors msodbcsql's `ExportImp::SQLAllocConnect`:
+/// 1. Validate that input_handle is a valid ENV handle.
+/// 2. Heap-allocate a `DbcHandle` with a back-pointer to the parent ENV.
+/// 3. Write the opaque pointer to `*output_handle`.
+///
+/// # Safety
+/// `output_handle` must be a valid, aligned, writable pointer (validated by caller).
+/// `input_handle` must be a live `EnvHandle` created by `alloc_env`.
+unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> SqlReturn {
+    if input_handle.is_null() {
+        error!("SQLAllocHandle(DBC): input_handle (ENV) must not be null");
+        return SQL_INVALID_HANDLE;
+    }
+
+    // Validate that the parent handle is actually an ENV.
+    let env = unsafe { handle_from_raw::<EnvHandle>(input_handle) };
+    if env.header.object_type != HandleType::Env {
+        error!(
+            ?input_handle,
+            "SQLAllocHandle(DBC): input_handle is not an ENV handle"
+        );
+        return SQL_INVALID_HANDLE;
+    }
+
+    // TODO: Check that env ODBC version is set (not Unset). Return SQL_ERROR with
+    // HY010 "Function sequence error" if not. Deferred to SQLSetEnvAttr PR.
+
+    let dbc = Box::new(DbcHandle::new(input_handle));
+    let raw = handle_to_raw(dbc);
+
+    // Register the new DBC with the parent ENV.
+    let Ok(mut state) = env.inner.lock() else {
+        error!("SQLAllocHandle(DBC): env mutex poisoned — freeing DBC");
+        unsafe { free_handle::<DbcHandle>(raw) };
+        return SQL_ERROR;
+    };
+    state.connections.push(raw);
+
+    unsafe { output_handle.write(raw) };
+
+    debug!(?raw, ?input_handle, "Allocated DBC handle");
+    SQL_SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use std::ptr;
 
     use super::*;
+    use crate::api::free_handle::sql_free_handle;
     use crate::handles::{HandleType, free_handle};
 
     #[test]
@@ -137,17 +187,71 @@ mod tests {
     }
 
     #[test]
-    fn alloc_dbc_returns_error_not_yet_implemented() {
+    fn alloc_dbc_returns_success_with_valid_env() {
         let mut env_handle: SqlHandle = ptr::null_mut();
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env_handle) };
         assert_eq!(ret, SQL_SUCCESS);
 
         let mut dbc_handle: SqlHandle = ptr::null_mut();
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env_handle, &mut dbc_handle) };
-        assert_eq!(ret, SQL_ERROR);
-        assert!(dbc_handle.is_null());
+        assert_eq!(ret, SQL_SUCCESS);
+        assert!(!dbc_handle.is_null());
 
-        unsafe { free_handle::<EnvHandle>(env_handle) };
+        let dbc = unsafe { &*(dbc_handle as *const DbcHandle) };
+        assert_eq!(dbc.header.object_type, HandleType::Dbc);
+        assert_eq!(dbc.parent_env, env_handle);
+
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc_handle) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env_handle) };
+    }
+
+    #[test]
+    fn alloc_dbc_with_null_env_returns_invalid_handle() {
+        let mut dbc_handle: SqlHandle = ptr::null_mut();
+        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, SQL_NULL_HANDLE, &mut dbc_handle) };
+        assert_eq!(ret, SQL_INVALID_HANDLE);
+        assert!(dbc_handle.is_null());
+    }
+
+    #[test]
+    fn alloc_dbc_default_state_is_disconnected() {
+        use crate::handles::dbc::ConnectionState;
+
+        let mut env_handle: SqlHandle = ptr::null_mut();
+        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env_handle) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let mut dbc_handle: SqlHandle = ptr::null_mut();
+        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env_handle, &mut dbc_handle) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let dbc = unsafe { &*(dbc_handle as *const DbcHandle) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.connection_state, ConnectionState::Disconnected);
+        drop(state);
+
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc_handle) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env_handle) };
+    }
+
+    #[test]
+    fn alloc_multiple_dbcs_on_same_env() {
+        let mut env_handle: SqlHandle = ptr::null_mut();
+        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env_handle) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let mut dbc1: SqlHandle = ptr::null_mut();
+        let mut dbc2: SqlHandle = ptr::null_mut();
+        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env_handle, &mut dbc1) };
+        assert_eq!(ret, SQL_SUCCESS);
+        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env_handle, &mut dbc2) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        assert_ne!(dbc1, dbc2);
+
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc2) };
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc1) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env_handle) };
     }
 
     #[test]

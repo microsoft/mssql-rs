@@ -1,8 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+pub(crate) mod dbc;
 mod env;
 
+pub(crate) use dbc::DbcHandle;
 pub(crate) use env::EnvHandle;
 #[cfg(test)]
 pub(crate) use env::OdbcVersion;

@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::ffi::c_void;
 use std::sync::Mutex;
 
 use super::{HandleHeader, HandleType, HasHeader};
@@ -38,8 +39,9 @@ pub(crate) struct EnvState {
     pub(crate) odbc_version: OdbcVersion,
     #[allow(dead_code)]
     pub(crate) output_nts: bool,
-    // TODO: connections — Vec<*mut c_void> or similar to track child DBCs,
-    // mirroring msodbcsql's `lppllpdbc`. Needed for cascade-free on SQLFreeHandle(ENV).
+    /// Active child DBC handles, mirroring msodbcsql's `lppllpdbc`.
+    /// SQLFreeHandle(ENV) checks this is empty before freeing.
+    pub(crate) connections: Vec<*mut c_void>,
 }
 
 impl EnvHandle {
@@ -51,6 +53,7 @@ impl EnvHandle {
             inner: Mutex::new(EnvState {
                 odbc_version: OdbcVersion::Unset,
                 output_nts: true, // SQL_ATTR_OUTPUT_NTS defaults to SQL_TRUE
+                connections: Vec::new(),
             }),
         }
     }

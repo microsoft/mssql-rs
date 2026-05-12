@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 mod alloc_handle;
+mod free_handle;
 pub(crate) mod odbc_types;
 
 // Exported ODBC entry points — the driver's public API surface.
