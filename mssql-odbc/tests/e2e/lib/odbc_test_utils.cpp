@@ -19,7 +19,7 @@ std::string ODBCTestUtils::GetDiagState(SQLSMALLINT handleType,
                                  msg,
                                  static_cast<SQLSMALLINT>(sizeof(msg) / sizeof(SQLTCHAR)),
                                  &msgLen);
-    if (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+    if (SQL_SUCCEEDED(rc)) {
         return ToNarrow(SqlTString(state));
     }
     return "";

@@ -32,26 +32,76 @@ tests/e2e/
 │   ├── smoke_test.cpp          # Smoke tests (alloc, connect, query)
 │   └── alloc_env_test.cpp      # SQLAllocHandle(ENV) variations
 ├── third_party/                # Reserved for git submodule (unused — using FetchContent)
-├── run_e2e.sh                  # One-command build + test runner
+├── run_e2e.sh                  # Build + test runner (Linux / macOS)
+├── run_e2e.ps1                 # Build + test runner (Windows, requires admin)
 └── README.md                   # This file
 ```
 
 ## Quick Start
+
+### Linux / macOS
 
 ```bash
 # From mssql-odbc/tests/e2e/
 ./run_e2e.sh
 ```
 
-This script:
-1. Builds the Rust cdylib (`cargo build` from `mssql-odbc/`)
-2. Registers the driver via a temporary `odbcinst.ini` + `ODBCSYSINI`
-3. Configures and builds the gtest executables via CMake
-4. Runs all tests via CTest
+### Windows (requires Administrator)
+
+```powershell
+# From mssql-odbc\tests\e2e\
+.\run_e2e.ps1
+```
+
+Both scripts:
+1. Build the Rust cdylib (`cargo build` from `mssql-odbc/`)
+2. Register the driver with the platform's ODBC Driver Manager
+3. Configure and build the gtest executables via CMake
+4. Run all tests via CTest
+5. Clean up the driver registration on exit (even on failure)
+
+## Driver Registration
+
+The test fixture does **not** register the driver — that is handled externally
+by the run scripts or by manual setup. This matches how the C++ msodbcsql LTM
+infrastructure works (`runtests.c`).
+
+### How the scripts register the driver
+
+- **Linux / macOS (`run_e2e.sh`)**: Creates a temp directory with an
+  `odbcinst.ini` file and sets `ODBCSYSINI` to point at it. The env var is
+  scoped to the script process, so the parent shell is never affected. A
+  `trap cleanup EXIT` ensures the temp directory is removed even on failure.
+
+- **Windows (`run_e2e.ps1`)**: Writes `Driver` and `Setup` values under
+  `HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server`. The
+  original values are saved beforehand and restored in a `try/finally` block,
+  so an existing production driver installation is not permanently overwritten.
+
+### Manual registration (without the scripts)
+
+If you prefer not to use the scripts, register the driver yourself:
+
+- **Linux / macOS**: Either add an entry to `/etc/odbcinst.ini`, or create
+  your own `odbcinst.ini` in any directory and set `ODBCSYSINI` env var to that
+  directory before running the tests.
+
+- **Windows**: Add the following registry values (requires Administrator):
+  ```
+  HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server
+      Driver = <path to msodbcsql18.dll>
+      Setup  = <path to msodbcsql18.dll>
+
+  HKLM\Software\ODBC\ODBCINST.INI\ODBC Drivers
+      ODBC Driver 18 for SQL Server = Installed
+  ```
 
 ## Manual Build
 
 ### Linux
+
+Register the driver first (see [Driver Registration](#driver-registration)),
+then:
 
 ```bash
 cd mssql-odbc && cargo build
@@ -62,6 +112,9 @@ cd build && ctest --output-on-failure
 ```
 
 ### Windows (VS 2022)
+
+Register the driver first (see [Driver Registration](#driver-registration)),
+then:
 
 ```cmd
 cd mssql-odbc && cargo build
@@ -118,11 +171,6 @@ cmake --build build && ctest --test-dir build --output-on-failure
 
 ## How It Works
 
-The `run_e2e.sh` script registers the built `libmsodbcsql18.so` as an ODBC
-driver by writing a temporary `odbcinst.ini` and setting `ODBCSYSINI` to point
-at it. This lets unixODBC's Driver Manager load our Rust driver without
-system-wide installation.
-
 Each test calls standard ODBC C APIs (`SQLAllocHandle`, `SQLDriverConnect`,
-etc.) through the Driver Manager, which `dlopen`s our shared library — the
-same code path a real C/C++ application uses.
+etc.) through the Driver Manager, which loads our shared library — the same
+code path a real application uses.

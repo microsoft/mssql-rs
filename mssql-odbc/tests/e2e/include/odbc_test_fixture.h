@@ -35,7 +35,7 @@ using SqlTString = std::basic_string<SQLTCHAR>;
 #define ASSERT_SQL_OK(rc, handle_type, handle)                                 \
     do {                                                                       \
         SQLRETURN _rc = (rc);                                                  \
-        ASSERT_TRUE(_rc == SQL_SUCCESS || _rc == SQL_SUCCESS_WITH_INFO)        \
+        ASSERT_TRUE(SQL_SUCCEEDED(_rc))        \
             << "ODBC call failed with rc=" << _rc                              \
             << "  error=" << ODBCTestUtils::GetDiagMessage(                    \
                    handle_type, handle);                                       \
@@ -44,7 +44,7 @@ using SqlTString = std::basic_string<SQLTCHAR>;
 #define EXPECT_SQL_OK(rc, handle_type, handle)                                 \
     do {                                                                       \
         SQLRETURN _rc = (rc);                                                  \
-        EXPECT_TRUE(_rc == SQL_SUCCESS || _rc == SQL_SUCCESS_WITH_INFO)        \
+        EXPECT_TRUE(SQL_SUCCEEDED(_rc))        \
             << "ODBC call failed with rc=" << _rc                              \
             << "  error=" << ODBCTestUtils::GetDiagMessage(                    \
                    handle_type, handle);                                       \
@@ -156,13 +156,6 @@ protected:
     SQLHDBC  dbc_  = SQL_NULL_HDBC;
     SQLHSTMT stmt_ = SQL_NULL_HSTMT;
 
-    // --- Suite-level driver registration ------------------------------------
-    // If ODBCSYSINI is not already set (i.e. not running via run_e2e.sh),
-    // creates a temp odbcinst.ini pointing at MSODBCSQL18_DRIVER_PATH
-    // so the ODBC Driver Manager can find our driver.
-    static void SetUpTestSuite();
-    static void TearDownTestSuite();
-
     // --- Lifecycle ----------------------------------------------------------
     void SetUp() override;
     void TearDown() override;
@@ -198,7 +191,4 @@ protected:
 private:
     std::vector<SQLHSTMT> extra_stmts_;
     std::chrono::steady_clock::time_point test_start_;
-
-    // Suite-level state for driver registration.
-    static std::string s_tmp_ini_dir_;
 };

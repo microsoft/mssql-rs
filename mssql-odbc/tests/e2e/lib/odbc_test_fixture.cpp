@@ -4,93 +4,7 @@
 #include "odbc_test_fixture.h"
 #include <iostream>
 #include <iomanip>
-#include <fstream>
 #include <cstdlib>
-#include <cstdio>
-
-#ifndef _WIN32
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
-// ---------------------------------------------------------------------------
-// Static member
-// ---------------------------------------------------------------------------
-std::string ODBCTest::s_tmp_ini_dir_;
-
-// ---------------------------------------------------------------------------
-// Suite-level driver registration
-// ---------------------------------------------------------------------------
-
-void ODBCTest::SetUpTestSuite() {
-    // If the environment already has ODBCSYSINI (e.g. from run_e2e.sh),
-    // don't overwrite it.
-    const char* existing = std::getenv("ODBCSYSINI");
-    if (existing && existing[0]) {
-        return;
-    }
-
-#ifdef MSODBCSQL18_DRIVER_PATH
-    const char* driver_path = MSODBCSQL18_DRIVER_PATH;
-#else
-    // If the compile definition wasn't provided, skip registration.
-    return;
-#endif
-
-    // Create a temporary directory for the odbcinst.ini.
-#ifdef _WIN32
-    char tmpdir[MAX_PATH];
-    GetTempPathA(MAX_PATH, tmpdir);
-    std::string dir = std::string(tmpdir) + "odbc_gtest_" + std::to_string(GetCurrentProcessId());
-    CreateDirectoryA(dir.c_str(), nullptr);
-#else
-    char tmpl[] = "/tmp/odbc_gtest_XXXXXX";
-    char* dir_ptr = mkdtemp(tmpl);
-    if (!dir_ptr) {
-        std::cerr << "SetUpTestSuite: mkdtemp failed" << std::endl;
-        return;
-    }
-    std::string dir(dir_ptr);
-#endif
-
-    // Write the odbcinst.ini.
-    std::string ini_path = dir + "/odbcinst.ini";
-    std::ofstream ofs(ini_path);
-    if (!ofs) {
-        std::cerr << "SetUpTestSuite: cannot write " << ini_path << std::endl;
-        return;
-    }
-    ofs << "[ODBC Driver 18 for SQL Server]\n"
-        << "Description=Microsoft ODBC Driver 18 for SQL Server (Rust)\n"
-        << "Driver=" << driver_path << "\n"
-        << "UsageCount=1\n";
-    ofs.close();
-
-    // Point the Driver Manager at our temp directory.
-#ifdef _WIN32
-    _putenv_s("ODBCSYSINI", dir.c_str());
-#else
-    setenv("ODBCSYSINI", dir.c_str(), 1);
-#endif
-
-    s_tmp_ini_dir_ = dir;
-    std::cout << "[  DRIVER ] Registered via " << ini_path << std::endl;
-}
-
-void ODBCTest::TearDownTestSuite() {
-    if (s_tmp_ini_dir_.empty()) {
-        return;
-    }
-    // Remove the temp odbcinst.ini and directory.
-    std::string ini_path = s_tmp_ini_dir_ + "/odbcinst.ini";
-    std::remove(ini_path.c_str());
-#ifdef _WIN32
-    RemoveDirectoryA(s_tmp_ini_dir_.c_str());
-#else
-    rmdir(s_tmp_ini_dir_.c_str());
-#endif
-    s_tmp_ini_dir_.clear();
-}
 
 // ---------------------------------------------------------------------------
 // SetUp / TearDown
@@ -101,7 +15,7 @@ void ODBCTest::SetUp() {
 
     // Allocate environment handle
     SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env_);
-    ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO)
+    ASSERT_TRUE(SQL_SUCCEEDED(rc))
         << "SQLAllocHandle(ENV) failed, rc=" << rc;
 
     // Request ODBC 3.x behavior

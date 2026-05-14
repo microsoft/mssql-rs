@@ -76,27 +76,6 @@ target_link_libraries(odbc_test_lib PUBLIC
 )
 
 # ---------------------------------------------------------------------------
-# Driver path for self-contained test registration
-# ---------------------------------------------------------------------------
-# When MSODBCSQL18_DRIVER_PATH is set, ODBCTest::SetUpTestSuite() will
-# create a temporary odbcinst.ini so tests can run without run_e2e.sh.
-if(NOT DEFINED MSODBCSQL18_DRIVER_PATH)
-    if(WIN32)
-        set(MSODBCSQL18_DRIVER_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../target/debug/msodbcsql18.dll")
-    elseif(APPLE)
-        set(MSODBCSQL18_DRIVER_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../target/debug/libmsodbcsql18.dylib")
-    else()
-        set(MSODBCSQL18_DRIVER_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../target/debug/libmsodbcsql18.so")
-    endif()
-endif()
-# Resolve to absolute so the path works regardless of cwd at runtime.
-get_filename_component(MSODBCSQL18_DRIVER_PATH "${MSODBCSQL18_DRIVER_PATH}" ABSOLUTE)
-message(STATUS "MSODBCSQL18_DRIVER_PATH=${MSODBCSQL18_DRIVER_PATH}")
-target_compile_definitions(odbc_test_lib PUBLIC
-    MSODBCSQL18_DRIVER_PATH="${MSODBCSQL18_DRIVER_PATH}"
-)
-
-# ---------------------------------------------------------------------------
 # Helper function: add a test executable under tests/
 # Usage:  add_odbc_test(smoke_test tests/smoke_test.cpp)
 # ---------------------------------------------------------------------------
@@ -111,5 +90,7 @@ endfunction()
 # ---------------------------------------------------------------------------
 enable_testing()
 
-add_odbc_test(smoke_test      tests/smoke_test.cpp)
-add_odbc_test(alloc_env_test  tests/alloc_env_test.cpp)
+add_odbc_test(smoke_test       tests/smoke_test.cpp)
+add_odbc_test(alloc_env_test   tests/alloc_env_test.cpp)
+add_odbc_test(alloc_dbc_test   tests/alloc_dbc_test.cpp)
+add_odbc_test(free_handle_test tests/free_handle_test.cpp)

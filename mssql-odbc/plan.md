@@ -45,8 +45,11 @@ mssql-odbc/
 │   ├── api/               # ODBC API layer
 │   │   ├── exports.rs     # All #[unsafe(no_mangle)] pub extern "C" symbols (driver export manifest)
 │   │   ├── alloc_handle.rs # SQLAllocHandle implementation
+│   │   ├── free_handle.rs  # SQLFreeHandle implementation
 │   │   └── odbc_types.rs  # ODBC C type aliases (SqlHandle, SqlReturn, etc.) and constants
 │   ├── handles/           # Env, Connection, Statement, Descriptor handles
+│   │   ├── env.rs         # EnvHandle, EnvState, OdbcVersion
+│   │   └── dbc.rs         # DbcHandle, DbcState, ConnectionState
 │   ├── state/             # State machines, HY010 enforcement (planned)
 │   ├── types/             # SQL_C_* ↔ SQL_* type conversions (planned)
 │   ├── catalog/           # SQLTables, SQLColumns, etc. (planned)
