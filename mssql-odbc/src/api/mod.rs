@@ -3,6 +3,7 @@
 
 mod alloc_handle;
 mod free_handle;
+mod set_env_attr;
 pub(crate) mod odbc_types;
 
 // Exported ODBC entry points — the driver's public API surface.

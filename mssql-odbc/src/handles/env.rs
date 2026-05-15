@@ -12,6 +12,7 @@ use super::{HandleHeader, HandleType, HasHeader};
 pub(crate) enum OdbcVersion {
     /// Not yet set — calls requiring a version will fail with HY010.
     Unset = 0,
+    Odbc2 = 2,
     Odbc3 = 3,
     Odbc3_80 = 380,
 }

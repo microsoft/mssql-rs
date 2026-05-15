@@ -7,8 +7,10 @@
 use std::ffi::c_void;
 
 pub type SqlSmallInt = i16;
+pub type SqlInteger = i32;
 pub type SqlReturn = SqlSmallInt;
 pub type SqlHandle = *mut c_void;
+pub type SqlPointer = *mut c_void;
 
 // Return codes
 pub const SQL_SUCCESS: SqlReturn = 0;
@@ -31,3 +33,18 @@ pub const SQL_HANDLE_DESC: SqlSmallInt = 4;
 // Internal handle type used by Driver Manager for connection pool awareness.
 // Applications should not use this directly.
 pub const SQL_HANDLE_DBC_INFO_TOKEN: SqlSmallInt = 6;
+
+// Environment attribute identifiers (SQLSetEnvAttr / SQLGetEnvAttr).
+pub const SQL_ATTR_ODBC_VERSION: SqlInteger = 200;
+pub const SQL_ATTR_CONNECTION_POOLING: SqlInteger = 201;
+pub const SQL_ATTR_CP_MATCH: SqlInteger = 202;
+pub const SQL_ATTR_OUTPUT_NTS: SqlInteger = 10001;
+
+// SQL_ATTR_ODBC_VERSION values.
+pub const SQL_OV_ODBC2: u32 = 2;
+pub const SQL_OV_ODBC3: u32 = 3;
+pub const SQL_OV_ODBC3_80: u32 = 380;
+
+// Boolean attribute values.
+pub const SQL_TRUE: u32 = 1;
+pub const SQL_FALSE: u32 = 0;
