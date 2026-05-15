@@ -1,5 +1,6 @@
-trigger: 
-- main
+# CI trigger only on development. Main-branch builds are produced by the
+# Official pipeline (OneBranch/OfficialPythonWheelsBuild.yml) on merge.
+trigger:
 - development
 
 parameters:

@@ -3,6 +3,8 @@
 
 pub mod bulk_copy_errors;
 
+use std::path::PathBuf;
+
 pub use bulk_copy_errors::{BulkCopyAttentionTimeoutError, BulkCopyError, BulkCopyTimeoutError};
 
 use crate::security::SecurityError;
@@ -170,7 +172,7 @@ pub enum Error {
     )]
     CertificateNotFound {
         /// File path that was looked up.
-        path: String,
+        path: PathBuf,
     },
 
     /// Certificate file is present but cannot be parsed.
@@ -179,7 +181,7 @@ pub enum Error {
     )]
     InvalidCertificateFormat {
         /// File path with the invalid certificate.
-        path: String,
+        path: PathBuf,
     },
 
     /// Server certificate has passed its validity period.
@@ -200,7 +202,7 @@ pub enum Error {
     )]
     CertificateFileIoError {
         /// File path that could not be read.
-        path: String,
+        path: PathBuf,
         /// Underlying I/O error message.
         error: String,
     },

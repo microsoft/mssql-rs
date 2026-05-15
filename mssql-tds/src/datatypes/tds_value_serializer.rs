@@ -1718,6 +1718,9 @@ impl TdsValueSerializer {
                     writer.write_i32_async((*f).to_bits() as i32).await?;
                 }
             }
+            VectorData::Float16(_) => {
+                todo!("Phase 2: Float16 serialization");
+            }
         }
 
         Ok(())

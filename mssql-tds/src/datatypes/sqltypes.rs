@@ -16,8 +16,8 @@ use crate::{
         decoder::DecimalParts,
         sql_string::SqlString,
         sqldatatypes::{
-            FixedLengthTypes, TdsDataType, VECTOR_HEADER_SIZE, VECTOR_MAX_DIMENSIONS,
-            VectorBaseType, VectorLayoutFormat, VectorLayoutVersion,
+            FixedLengthTypes, TdsDataType, VECTOR_HEADER_SIZE, VectorBaseType, VectorLayoutFormat,
+            VectorLayoutVersion,
         },
     },
     error::Error,
@@ -875,10 +875,11 @@ impl SqlType {
             SqlType::Vector(sql_vector, dimensions, base_type) => {
                 packet_writer.write_byte_async(nullable_type as u8).await?;
 
-                if *dimensions > VECTOR_MAX_DIMENSIONS {
+                let max_dim = base_type.max_dimensions();
+                if *dimensions > max_dim {
                     return Err(Error::UsageError(format!(
-                        "Vector dimensions {} exceeds maximum supported dimensions {}",
-                        dimensions, VECTOR_MAX_DIMENSIONS
+                        "Vector dimensions {} exceeds maximum supported dimensions {} for base type {:?}",
+                        dimensions, max_dim, base_type
                     )));
                 }
 
