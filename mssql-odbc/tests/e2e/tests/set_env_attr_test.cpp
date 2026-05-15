@@ -22,7 +22,7 @@ protected:
     void SetUp() override {
         SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv_);
         ASSERT_SQL_OK(rc, SQL_HANDLE_ENV, henv_);
-        ASSERT_NE(henv_, SQL_NULL_HENV);
+        ASSERT_NE(henv_, nullptr);
     }
 
     void TearDown() override {
@@ -113,7 +113,7 @@ TEST_F(SetEnvAttrTest, SetVersionThenAllocDbc) {
     SQLHDBC hdbc = SQL_NULL_HDBC;
     SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, henv_, &hdbc);
     EXPECT_SQL_OK(rc, SQL_HANDLE_ENV, henv_);
-    EXPECT_NE(SQL_NULL_HDBC, hdbc);
+    EXPECT_NE(hdbc, nullptr);
 
     if (hdbc != SQL_NULL_HDBC) {
         SQLFreeHandle(SQL_HANDLE_DBC, hdbc);

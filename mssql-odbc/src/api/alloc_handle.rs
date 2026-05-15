@@ -120,6 +120,10 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
     // a DBC. msodbcsql asserts this; we return SQL_ERROR per the no-panic guideline.
     // TODO: surface HY010 "Function sequence error" once SQLGetDiagRec lands.
     {
+        // Mutex can only be poisoned if a prior thread panicked while holding
+        // the env lock. Unreachable in current code (locked regions are trivial
+        // field reads/writes), but we bail with SQL_ERROR instead of unwrapping
+        // — a panic across the FFI boundary into a C caller is UB.
         let Ok(state) = env.inner.lock() else {
             error!("SQLAllocHandle(DBC): env mutex poisoned");
             return SQL_ERROR;
@@ -198,9 +202,7 @@ mod tests {
 
     use super::*;
     use crate::api::free_handle::sql_free_handle;
-    use crate::api::odbc_types::{
-        SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80,
-    };
+    use crate::api::odbc_types::{SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80};
     use crate::api::set_env_attr::sql_set_env_attr;
     use crate::handles::{HandleType, free_handle};
 

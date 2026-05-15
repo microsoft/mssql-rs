@@ -36,7 +36,9 @@ pub(crate) unsafe fn sql_set_env_attr(
 ) -> SqlReturn {
     debug!(
         ?environment_handle,
-        attribute, ?value_ptr, "SQLSetEnvAttr called"
+        attribute,
+        ?value_ptr,
+        "SQLSetEnvAttr called"
     );
 
     let result = panic::catch_unwind(|| {
@@ -241,8 +243,14 @@ mod tests {
         // ODBC apps may call SQLSetEnvAttr multiple times before allocating a
         // DBC; the last write wins.
         let env = alloc_env();
-        assert_eq!(set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC2), SQL_SUCCESS);
-        assert_eq!(set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80), SQL_SUCCESS);
+        assert_eq!(
+            set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC2),
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80),
+            SQL_SUCCESS
+        );
         let env_ref = unsafe { &*(env as *const EnvHandle) };
         assert_eq!(
             env_ref.inner.lock().unwrap().odbc_version,

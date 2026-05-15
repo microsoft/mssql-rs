@@ -18,6 +18,7 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $OdbcCrateDir = Resolve-Path (Join-Path $ScriptDir "..\..")
+$WorkspaceDir = Resolve-Path (Join-Path $OdbcCrateDir "..")
 $BuildType   = if ($Release) { "release" } else { "debug" }
 
 $DriverRegKey  = "HKLM:\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server"
@@ -87,7 +88,7 @@ try {
     }
     Pop-Location
 
-    $DriverPath = Join-Path $OdbcCrateDir "target\$BuildType\msodbcsql18.dll"
+    $DriverPath = Join-Path $WorkspaceDir "target\$BuildType\msodbcsql18.dll"
     if (-not (Test-Path $DriverPath)) {
         Write-Error "Driver not found at $DriverPath"
     }
