@@ -17,9 +17,8 @@ use std::panic;
 use tracing::{debug, error, trace};
 
 use crate::api::odbc_types::{
-    SQL_ATTR_CONNECTION_POOLING, SQL_ATTR_CP_MATCH, SQL_ATTR_ODBC_VERSION, SQL_ATTR_OUTPUT_NTS,
-    SQL_ERROR, SQL_FALSE, SQL_INVALID_HANDLE, SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80,
-    SQL_SUCCESS, SQL_TRUE, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_ATTR_ODBC_VERSION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_OV_ODBC2, SQL_OV_ODBC3,
+    SQL_OV_ODBC3_80, SQL_SUCCESS, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::handles::{EnvHandle, HandleType, OdbcVersion, handle_from_raw};
 
@@ -59,8 +58,9 @@ pub(crate) unsafe fn sql_set_env_attr(
         }
 
         // msodbcsql: `CMPCSAutoBlock csEnv(&lpEnv->csEnv);` — RAII lock on the
-        // env's critical section (no-op on Windows where the DM serializes).
-        // We hold a `MutexGuard` instead; it is released at scope exit.
+        // env's critical section, serializing concurrent SQLSetEnvAttr /
+        // SQLAllocHandle(DBC) calls on the same HENV. We hold a `MutexGuard`
+        // instead; it is released at scope exit.
         let Ok(mut state) = env.inner.lock() else {
             error!("SQLSetEnvAttr: env mutex poisoned");
             return SQL_ERROR;
@@ -100,29 +100,6 @@ pub(crate) unsafe fn sql_set_env_attr(
                     SQL_ERROR
                 }
             },
-            SQL_ATTR_OUTPUT_NTS => match value {
-                SQL_TRUE => {
-                    state.output_nts = true;
-                    SQL_SUCCESS
-                }
-                SQL_FALSE => {
-                    error!("SQLSetEnvAttr: OUTPUT_NTS=SQL_FALSE not supported");
-                    // TODO: SQLSTATE HYC00 (optional feature not implemented).
-                    SQL_ERROR
-                }
-                _ => {
-                    error!(value, "SQLSetEnvAttr: invalid OUTPUT_NTS value");
-                    // TODO: SQLSTATE HY024.
-                    SQL_ERROR
-                }
-            },
-            SQL_ATTR_CONNECTION_POOLING | SQL_ATTR_CP_MATCH => {
-                // Process-wide pooling attributes are owned by the Driver
-                // Manager; msodbcsql accepts and discards (the values land in
-                // `dwOptionsE[]` but the driver never reads them). Mirror it.
-                debug!(attribute, value, "SQLSetEnvAttr: pooling attribute accepted");
-                SQL_SUCCESS
-            }
             _ => {
                 // msodbcsql equivalent: index out of `NUMELEM(dwOptionsE)`
                 // range, `SETRC_SERR_GOTO(retcode, RetExit)`.
@@ -219,22 +196,6 @@ mod tests {
     }
 
     #[test]
-    fn set_output_nts_true_success() {
-        let env = alloc_env();
-        let ret = set_attr(env, SQL_ATTR_OUTPUT_NTS, SQL_TRUE);
-        assert_eq!(ret, SQL_SUCCESS);
-        free_env(env);
-    }
-
-    #[test]
-    fn set_output_nts_false_rejected() {
-        let env = alloc_env();
-        let ret = set_attr(env, SQL_ATTR_OUTPUT_NTS, SQL_FALSE);
-        assert_eq!(ret, SQL_ERROR);
-        free_env(env);
-    }
-
-    #[test]
     fn set_env_attr_null_handle_invalid() {
         let ret = unsafe {
             sql_set_env_attr(
@@ -276,22 +237,6 @@ mod tests {
     }
 
     #[test]
-    fn set_env_attr_connection_pooling_silently_accepted() {
-        let env = alloc_env();
-        let ret = set_attr(env, SQL_ATTR_CONNECTION_POOLING, 0);
-        assert_eq!(ret, SQL_SUCCESS);
-        free_env(env);
-    }
-
-    #[test]
-    fn set_env_attr_cp_match_silently_accepted() {
-        let env = alloc_env();
-        let ret = set_attr(env, SQL_ATTR_CP_MATCH, 0);
-        assert_eq!(ret, SQL_SUCCESS);
-        free_env(env);
-    }
-
-    #[test]
     fn set_odbc_version_overwrites_previous() {
         // ODBC apps may call SQLSetEnvAttr multiple times before allocating a
         // DBC; the last write wins.
@@ -320,33 +265,6 @@ mod tests {
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc3_80
         );
-        free_env(env);
-    }
-
-    #[test]
-    fn set_independent_attributes_both_persist() {
-        // Distinct attributes write to distinct fields; neither stomps the other.
-        let env = alloc_env();
-        assert_eq!(
-            set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3),
-            SQL_SUCCESS
-        );
-        assert_eq!(set_attr(env, SQL_ATTR_OUTPUT_NTS, SQL_TRUE), SQL_SUCCESS);
-        let env_ref = unsafe { &*(env as *const EnvHandle) };
-        let state = env_ref.inner.lock().unwrap();
-        assert_eq!(state.odbc_version, OdbcVersion::Odbc3);
-        assert!(state.output_nts);
-        drop(state);
-        free_env(env);
-    }
-
-    #[test]
-    fn set_output_nts_invalid_value_rejected() {
-        // OUTPUT_NTS accepts only SQL_TRUE (1) or SQL_FALSE (0); anything else
-        // is HY024 territory.
-        let env = alloc_env();
-        let ret = set_attr(env, SQL_ATTR_OUTPUT_NTS, 42);
-        assert_eq!(ret, SQL_ERROR);
         free_env(env);
     }
 

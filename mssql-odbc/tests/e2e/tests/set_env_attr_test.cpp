@@ -6,13 +6,10 @@
 //   2. SetGetOdbcVersion3       - round-trip SQL_OV_ODBC3
 //   3. SetGetOdbcVersion2       - round-trip SQL_OV_ODBC2
 //   4. SetOdbcVersionInvalid    - bogus version value -> SQL_ERROR
-//   5. SetOutputNtsTrue         - SQL_TRUE accepted
-//   6. SetOutputNtsFalseRejected- SQL_FALSE rejected (we don't support it)
-//   7. SetUnknownAttribute      - unknown attribute -> error
-//   8. SetVersionOverwrites     - subsequent SQLSetEnvAttr replaces prior value
-//   9. SetVersionAfterDbcAlloc  - DM behavior: set may be rejected post-alloc
-//                                 (DM-enforced; we just verify no crash)
-//  10. SetEnvAttrNullHandle     - DM rejects null henv before reaching driver
+//   5. SetUnknownAttribute      - unknown attribute -> error
+//   6. SetVersionOverwrites     - subsequent SQLSetEnvAttr replaces prior value
+//   7. SetVersionThenAllocDbc   - happy path exercising the AllocHandle gate
+//   8. SetEnvAttrNullHandle     - DM rejects null henv before reaching driver
 
 #include "odbc_test_fixture.h"
 
@@ -87,28 +84,7 @@ TEST_F(SetEnvAttrTest, SetOdbcVersionInvalid) {
 }
 
 // -------------------------------------------------------------------
-// Variation 5 - SQL_ATTR_OUTPUT_NTS = SQL_TRUE accepted
-// (Driver only supports null-terminated string output.)
-// -------------------------------------------------------------------
-TEST_F(SetEnvAttrTest, SetOutputNtsTrue) {
-    SQLRETURN rc = SQLSetEnvAttr(henv_, SQL_ATTR_OUTPUT_NTS,
-                                 reinterpret_cast<SQLPOINTER>(SQL_TRUE), 0);
-    EXPECT_SQL_OK(rc, SQL_HANDLE_ENV, henv_);
-}
-
-// -------------------------------------------------------------------
-// Variation 6 - SQL_ATTR_OUTPUT_NTS = SQL_FALSE rejected
-// Driver returns SQL_ERROR; future work: SQLSTATE HYC00.
-// -------------------------------------------------------------------
-TEST_F(SetEnvAttrTest, SetOutputNtsFalseRejected) {
-    SQLRETURN rc = SQLSetEnvAttr(henv_, SQL_ATTR_OUTPUT_NTS,
-                                 reinterpret_cast<SQLPOINTER>(SQL_FALSE), 0);
-    EXPECT_NE(SQL_SUCCESS, rc);
-    EXPECT_NE(SQL_SUCCESS_WITH_INFO, rc);
-}
-
-// -------------------------------------------------------------------
-// Variation 7 - unknown attribute id
+// Variation 5 - unknown attribute id
 // Future work: SQLSTATE HY092 (invalid attribute identifier).
 // -------------------------------------------------------------------
 TEST_F(SetEnvAttrTest, SetUnknownAttribute) {
@@ -119,7 +95,7 @@ TEST_F(SetEnvAttrTest, SetUnknownAttribute) {
 }
 
 // -------------------------------------------------------------------
-// Variation 8 - last write wins
+// Variation 6 - last write wins
 // -------------------------------------------------------------------
 TEST_F(SetEnvAttrTest, SetVersionOverwrites) {
     EXPECT_SQL_OK(SetVersion(SQL_OV_ODBC2), SQL_HANDLE_ENV, henv_);
@@ -128,7 +104,7 @@ TEST_F(SetEnvAttrTest, SetVersionOverwrites) {
 }
 
 // -------------------------------------------------------------------
-// Variation 9 - allocating a DBC after setting the version should work
+// Variation 7 - allocating a DBC after setting the version should work
 // (this is the documented happy path: SetEnvAttr THEN AllocHandle(DBC)).
 // -------------------------------------------------------------------
 TEST_F(SetEnvAttrTest, SetVersionThenAllocDbc) {
@@ -145,7 +121,7 @@ TEST_F(SetEnvAttrTest, SetVersionThenAllocDbc) {
 }
 
 // -------------------------------------------------------------------
-// Variation 10 - null henv
+// Variation 8 - null henv
 // The Driver Manager intercepts null henv and returns SQL_INVALID_HANDLE
 // before the driver is consulted.
 // -------------------------------------------------------------------
