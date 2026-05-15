@@ -47,10 +47,7 @@ fn get_trace_log_path() -> Option<PathBuf> {
 
         // Security check: warn about insecure paths but allow them
         if is_insecure_path(&path) {
-            eprintln!(
-                "[mssql-js] WARNING: Insecure log directory detected: '{}'",
-                path.display()
-            );
+            eprintln!("[mssql-js] WARNING: Insecure log directory detected: {path:?}",);
             eprintln!("[mssql-js] WARNING: Logs may contain sensitive data (queries, data etc).");
             eprintln!(
                 "[mssql-js] WARNING: Logging to /tmp, /var/tmp, or system temp directories is not recommended."
@@ -68,11 +65,7 @@ fn get_trace_log_path() -> Option<PathBuf> {
         if !path.exists()
             && let Err(e) = create_dir_all(&path)
         {
-            eprintln!(
-                "[mssql-js] ERROR: Could not create log directory '{}': {}",
-                path.display(),
-                e
-            );
+            eprintln!("[mssql-js] ERROR: Could not create log directory '{path:?}': {e}",);
             return None;
         }
         return Some(path.join(TRACE_LOG_FILENAME));
@@ -145,8 +138,7 @@ pub fn init_tracing() {
                             },
                             Err(e) => {
                                 eprintln!(
-                                    "[mssql-js] ERROR: Could not create trace log file '{}': {}. File logging will be disabled.",
-                                    log_path.display(), e
+                                    "[mssql-js] ERROR: Could not create trace log file {log_path:?}: {e}. File logging will be disabled."
                                 );
                             }
                         }

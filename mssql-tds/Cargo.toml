@@ -46,6 +46,8 @@ encoding_rs = "0.8"
 x509-parser = "0.18.0"
 # For DNS resolution (reverse DNS lookup for SPN canonicalization)
 dns-lookup = "2.0"
+# Required to deserialize Vector(Float16) values from the TDS stream (Vector feature v2)
+half = "2.7.1"
 
 
 

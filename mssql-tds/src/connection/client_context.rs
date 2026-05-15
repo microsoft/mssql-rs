@@ -76,6 +76,8 @@ pub enum VectorVersion {
     Off,
     /// Support Vector feature version 1 (float32 dimension type)
     V1,
+    /// Support Vector feature version 2 (float16 and float32 dimension types)
+    V2,
 }
 
 /// Provides a trait for creating Entra ID tokens.
@@ -348,6 +350,7 @@ impl ClientContext {
                 port: 1433,
                 instance_name: None,
             },
+            // TODO: make V2 as default when full V2 support is added
             vector_version: VectorVersion::V1,
             user_agent: UserAgent::default(),
         }
@@ -403,6 +406,7 @@ impl ClientContext {
                 port: 1433,
                 instance_name: None,
             },
+            // TODO: make V2 as default when full V2 support is added
             vector_version: VectorVersion::V1,
             user_agent: UserAgent::default(),
         }

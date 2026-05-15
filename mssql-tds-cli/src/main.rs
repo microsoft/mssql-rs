@@ -20,7 +20,7 @@ use mssql_tds::core::TdsResult;
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = main_cli().await {
+    if let Err(e) = Box::pin(main_cli()).await {
         eprintln!("Application error: {e}");
     }
 }
