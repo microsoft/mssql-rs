@@ -128,7 +128,7 @@ mod tests {
     use super::*;
     use crate::api::alloc_handle::sql_alloc_handle;
     use crate::api::free_handle::sql_free_handle;
-    use crate::api::odbc_types::{SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::{SQL_HANDLE_ENV, SQL_NULL_HANDLE};
 
     fn alloc_env() -> SqlHandle {
         let mut h: SqlHandle = ptr::null_mut();
