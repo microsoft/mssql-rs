@@ -324,7 +324,7 @@ mod mock_server_tls_tests {
             mode: EncryptionSetting::Strict,
             trust_server_certificate: false,
             host_name_in_cert: None,
-            server_certificate: Some("tests/test_certificates/valid_cert.pem".to_string()),
+            server_certificate: Some("tests/test_certificates/valid_cert.pem".into()),
         };
 
         let provider = TdsConnectionProvider {};

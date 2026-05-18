@@ -1707,6 +1707,10 @@ impl PythonRowAdapter {
                 let vector = SqlVector::try_from_f32(values)?;
                 Ok(ColumnValues::Vector(vector))
             }
+            VectorBaseType::Float16 => Err(Error::UsageError(format!(
+                "Float16 VECTOR column '{}' is not supported in Python bulk copy yet",
+                target_meta.column_name
+            ))),
         }
     }
 
@@ -1791,6 +1795,10 @@ impl PythonRowAdapter {
                 let vector = SqlVector::try_from_f32(floats)?;
                 Ok(ColumnValues::Vector(vector))
             }
+            VectorBaseType::Float16 => Err(Error::UsageError(format!(
+                "Float16 VECTOR column '{}' is not supported in Python bulk copy JSON coercion",
+                target_meta.column_name
+            ))),
         }
     }
 
