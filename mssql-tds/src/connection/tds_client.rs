@@ -832,6 +832,22 @@ impl TdsClient {
     /// is no longer needed.
     ///
     /// Drains the token stream internally — no rows are returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` — the parameterized T-SQL statement to prepare. Parameter
+    ///   placeholders (e.g. `@p1`, `@db_name`) referenced here must be
+    ///   declared in `named_params`.
+    /// * `named_params` — declarations of the statement's parameters. Only
+    ///   the `name` and SQL `type` of each entry are used to build the
+    ///   `@params` declaration string passed to `sp_prepare`; any values
+    ///   carried by the entries are ignored. Supply the actual parameter
+    ///   values later on the matching
+    ///   [`execute_sp_execute()`](Self::execute_sp_execute) call.
+    /// * `timeout_sec` — optional per-request timeout in seconds. `None`
+    ///   means no timeout beyond the connection default.
+    /// * `cancel_handle` — optional handle to cooperatively cancel the
+    ///   request.
     #[instrument(skip(self, named_params), level = "info")]
     pub async fn execute_sp_prepare(
         &mut self,
@@ -889,10 +905,16 @@ impl TdsClient {
         let positional_parameters = Some(positional_parameters_vec);
 
         // Build the RPC request.
+        // sp_prepare's RPC contract is fixed: @handle (output int), @params (ntext),
+        // @stmt (ntext), @options (int, optional). It does not accept any user
+        // parameter values; those are sent later on sp_execute (or together on
+        // sp_prepexec / sp_executesql). Forwarding `named_params` here causes the
+        // server to surface "Procedure expects parameter '@options' of type 'int'."
+        // for any non-int user parameter type.
         let rpc = SqlRpc::new(
             RpcType::ProcId(RpcProcs::Prepare),
             positional_parameters,
-            Some(named_params),
+            None,
             &database_collation,
             &self.execution_context,
         );
@@ -901,10 +923,16 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         rpc.serialize(&mut packet_writer).await?;
 
-        // Drain to completion to get output parameters
-        self.drain_stream().await?;
+        // Drain to completion to get output parameters and any server errors.
+        let server_errors = self.drain_stream().await?;
 
         // We need to get the return value, and then extract the handle from it.
+        // If the server reported errors during prepare, surface them instead of a
+        // generic ProtocolError so callers can see the underlying SQL Server
+        // diagnostic.
+        if !server_errors.is_empty() {
+            return Err(crate::error::Error::from_sql_errors(server_errors));
+        }
         if self.return_values.len() == 1 {
             let returned_parameter = self.return_values.first().unwrap();
             if let ColumnValues::Int(handle) = &returned_parameter.value {
@@ -967,8 +995,13 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         rpc.serialize(&mut packet_writer).await?;
 
-        // Drain the result set. A successful unprepare will not return any results.
-        self.drain_stream().await?;
+        // Drain the result set. A successful unprepare returns no results,
+        // but surface any server errors collected during the drain instead of
+        // silently discarding them.
+        let server_errors = self.drain_stream().await?;
+        if !server_errors.is_empty() {
+            return Err(crate::error::Error::from_sql_errors(server_errors));
+        }
         Ok(())
     }
 

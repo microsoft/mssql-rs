@@ -299,6 +299,8 @@ impl TryFrom<u8> for VectorLayoutVersion {
 pub enum VectorBaseType {
     /// 32-bit floating point (0x00)
     Float32 = 0x00,
+    /// 16-bit (half-precision) floating point (0x01).
+    Float16 = 0x01,
 }
 
 impl VectorBaseType {
@@ -306,6 +308,19 @@ impl VectorBaseType {
     pub const fn element_size_bytes(self) -> usize {
         match self {
             VectorBaseType::Float32 => 4,
+            VectorBaseType::Float16 => 2,
+        }
+    }
+
+    /// Returns the maximum number of dimensions a single vector value of this
+    /// base type can hold. Based on the TDS protocol, the maximum payload size
+    /// is constrained by [`VECTOR_MAX_SIZE`] (8000 bytes) which allows up to
+    /// 1998 elements for Float32 and 3996 elements for Float16 vectors.
+    pub const fn max_dimensions(self) -> u16 {
+        // (VECTOR_MAX_SIZE - VECTOR_HEADER_SIZE) / element_size_bytes
+        match self {
+            VectorBaseType::Float32 => 1998,
+            VectorBaseType::Float16 => 3996,
         }
     }
 }
@@ -316,6 +331,7 @@ impl TryFrom<u8> for VectorBaseType {
     fn try_from(value: u8) -> TdsResult<Self> {
         match value {
             0x00 => Ok(VectorBaseType::Float32),
+            0x01 => Ok(VectorBaseType::Float16),
             _ => Err(Error::ProtocolError(format!(
                 "Unsupported Vector base type: 0x{:02X}",
                 value
@@ -324,8 +340,6 @@ impl TryFrom<u8> for VectorBaseType {
     }
 }
 
-/// Maximum number of dimensions in a TDS vector.
-pub(crate) const VECTOR_MAX_DIMENSIONS: u16 = 1998;
 /// Size of the vector header in bytes.
 pub const VECTOR_HEADER_SIZE: usize = 8;
 /// Maximum total vector payload size in bytes.
@@ -1189,11 +1203,15 @@ mod tests {
         let bt = VectorBaseType::try_from(0x00).unwrap();
         assert_eq!(bt, VectorBaseType::Float32);
         assert_eq!(bt.element_size_bytes(), 4);
+
+        let bt16 = VectorBaseType::try_from(0x01).unwrap();
+        assert_eq!(bt16, VectorBaseType::Float16);
+        assert_eq!(bt16.element_size_bytes(), 2);
     }
 
     #[test]
     fn vector_base_type_try_from_invalid() {
-        assert!(VectorBaseType::try_from(0x01).is_err());
+        assert!(VectorBaseType::try_from(0x02).is_err());
         assert!(VectorBaseType::try_from(0xFF).is_err());
     }
 

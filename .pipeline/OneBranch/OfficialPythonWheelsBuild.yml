@@ -10,8 +10,13 @@
 # Support:        https://aka.ms/onebranchsup                                   #
 #################################################################################
 
-# No CI or PR triggers — official builds are manual only
-trigger: none
+# Official build runs on every merge to main; no PR validation (PRs are
+# validated by the separate validation pipeline). Can also be queued manually.
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
 pr: none
 
 variables:
