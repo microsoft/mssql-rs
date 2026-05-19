@@ -262,7 +262,7 @@ fuzz_target!(|data: &[u8]| {
             // - Memory allocation for large parameter lists
             // - Handling of None parameter names
             let mut params_list = String::new();
-            build_parameter_list_string(&rpc_params, &mut params_list);
+            let _ = build_parameter_list_string(&rpc_params, &mut params_list);
         }
     }
 });
