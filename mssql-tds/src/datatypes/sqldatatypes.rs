@@ -499,6 +499,143 @@ pub struct TypeInfo {
     pub(crate) type_info_variant: TypeInfoVariant,
 }
 
+impl TypeInfo {
+    /// Build a `TypeInfo` for a fixed-length type (e.g., `int`, `bit`, `datetime`).
+    ///
+    /// `length` is derived from the type itself. Returns `Err` if `tds_type` is
+    /// not a fixed-length type.
+    pub fn fixed_len(tds_type: TdsDataType) -> TdsResult<Self> {
+        let t = FixedLengthTypes::try_from(tds_type)?;
+        Ok(Self {
+            tds_type,
+            length: t.get_len(),
+            type_info_variant: TypeInfoVariant::FixedLen(t),
+        })
+    }
+
+    /// Build a `TypeInfo` for a variable-length non-string, non-scale,
+    /// non-precision/scale type (e.g., `intn`, `bigint`, `bigvarbinary`, `image`,
+    /// `uniqueidentifier`, `date`, `sql_variant`).
+    ///
+    /// Returns `Err` for types that the parser routes through
+    /// `var_len_string` / `var_len_scale` / `var_len_precision_scale` /
+    /// `partial_len` / `fixed_len`.
+    pub fn var_len(tds_type: TdsDataType, length: usize) -> TdsResult<Self> {
+        let t = VariableLengthTypes::try_from(tds_type)?;
+        match t {
+            VariableLengthTypes::MoneyN
+            | VariableLengthTypes::DateTimeN
+            | VariableLengthTypes::IntN
+            | VariableLengthTypes::FltN
+            | VariableLengthTypes::Guid
+            | VariableLengthTypes::BitN
+            | VariableLengthTypes::DateN
+            | VariableLengthTypes::Image
+            | VariableLengthTypes::BigVarBinary
+            | VariableLengthTypes::BigBinary
+            | VariableLengthTypes::SsVariant => Ok(Self {
+                tds_type,
+                length,
+                type_info_variant: TypeInfoVariant::VarLen(t, length),
+            }),
+            _ => Err(Error::ProtocolError(format!(
+                "Invalid TDS type {tds_type:?} for var_len constructor"
+            ))),
+        }
+    }
+
+    /// Build a `TypeInfo` for a variable-length string type with optional collation
+    /// (`bigchar`, `bigvarchar`, `text`, `nchar`, `nvarchar`, `ntext`).
+    pub fn var_len_string(
+        tds_type: TdsDataType,
+        length: usize,
+        collation: Option<SqlCollation>,
+    ) -> TdsResult<Self> {
+        let t = VariableLengthTypes::try_from(tds_type)?;
+        match t {
+            VariableLengthTypes::BigChar
+            | VariableLengthTypes::BigVarChar
+            | VariableLengthTypes::Text
+            | VariableLengthTypes::NText
+            | VariableLengthTypes::NChar
+            | VariableLengthTypes::NVarChar => Ok(Self {
+                tds_type,
+                length,
+                type_info_variant: TypeInfoVariant::VarLenString(t, length, collation),
+            }),
+            _ => Err(Error::ProtocolError(format!(
+                "Invalid TDS type {tds_type:?} for var_len_string constructor"
+            ))),
+        }
+    }
+
+    /// Build a `TypeInfo` for a variable-length scale-bearing type
+    /// (`time`, `datetime2`, `datetimeoffset`, `vector`).
+    pub fn var_len_scale(tds_type: TdsDataType, length: usize, scale: u8) -> TdsResult<Self> {
+        let t = VariableLengthTypes::try_from(tds_type)?;
+        match t {
+            VariableLengthTypes::TimeN
+            | VariableLengthTypes::DateTime2N
+            | VariableLengthTypes::DateTimeOffsetN
+            | VariableLengthTypes::Vector => Ok(Self {
+                tds_type,
+                length,
+                type_info_variant: TypeInfoVariant::VarLenScale(t, scale),
+            }),
+            _ => Err(Error::ProtocolError(format!(
+                "Invalid TDS type {tds_type:?} for var_len_scale constructor"
+            ))),
+        }
+    }
+
+    /// Build a `TypeInfo` for a variable-length precision/scale type
+    /// (`decimal`, `numeric`, `decimaln`, `numericn`).
+    pub fn var_len_precision_scale(
+        tds_type: TdsDataType,
+        length: usize,
+        precision: u8,
+        scale: u8,
+    ) -> TdsResult<Self> {
+        let t = VariableLengthTypes::try_from(tds_type)?;
+        match t {
+            VariableLengthTypes::Decimal
+            | VariableLengthTypes::Numeric
+            | VariableLengthTypes::DecimalN
+            | VariableLengthTypes::NumericN => Ok(Self {
+                tds_type,
+                length,
+                type_info_variant: TypeInfoVariant::VarLenPrecisionScale(
+                    t, length, precision, scale,
+                ),
+            }),
+            _ => Err(Error::ProtocolError(format!(
+                "Invalid TDS type {tds_type:?} for var_len_precision_scale constructor"
+            ))),
+        }
+    }
+
+    /// Build a `TypeInfo` for a partially length-prefixed (PLP) type
+    /// (e.g., `varchar(max)`, `nvarchar(max)`, `varbinary(max)`, `xml`).
+    ///
+    /// `length` is the wire-declared length declarator. For streamed/`(max)`
+    /// types this is typically `0xFFFF` (the PLP sentinel), matching what the
+    /// parser produces. XML schema info and UDT info are not exposed by this
+    /// constructor; they remain internal to the parser. Returns `Err` if
+    /// `tds_type` is not a partial-length type.
+    pub fn partial_len(
+        tds_type: TdsDataType,
+        length: usize,
+        collation: Option<SqlCollation>,
+    ) -> TdsResult<Self> {
+        let t = PartialLengthType::try_from(tds_type)?;
+        Ok(Self {
+            tds_type,
+            length,
+            type_info_variant: TypeInfoVariant::PartialLen(t, Some(length), collation, None, None),
+        })
+    }
+}
+
 type Precision = u8;
 type Scale = u8;
 type Length = usize;
@@ -1389,5 +1526,183 @@ mod tests {
                 "{tds_type:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_type_info_fixed_len_constructor() {
+        let ti = TypeInfo::fixed_len(TdsDataType::Int4).unwrap();
+        assert_eq!(ti.tds_type, TdsDataType::Int4);
+        assert_eq!(ti.length, 4);
+        assert!(matches!(
+            ti.type_info_variant,
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4)
+        ));
+    }
+
+    #[test]
+    fn test_type_info_fixed_len_rejects_non_fixed() {
+        assert!(TypeInfo::fixed_len(TdsDataType::NVarChar).is_err());
+    }
+
+    #[test]
+    fn test_type_info_var_len_constructor() {
+        let ti = TypeInfo::var_len(TdsDataType::IntN, 4).unwrap();
+        assert_eq!(ti.tds_type, TdsDataType::IntN);
+        assert_eq!(ti.length, 4);
+        assert!(matches!(
+            ti.type_info_variant,
+            TypeInfoVariant::VarLen(VariableLengthTypes::IntN, 4)
+        ));
+    }
+
+    #[test]
+    fn test_type_info_var_len_rejects_fixed() {
+        assert!(TypeInfo::var_len(TdsDataType::Int4, 4).is_err());
+    }
+
+    #[test]
+    fn test_type_info_var_len_rejects_string_types() {
+        for t in [
+            TdsDataType::BigChar,
+            TdsDataType::BigVarChar,
+            TdsDataType::NChar,
+            TdsDataType::NVarChar,
+            TdsDataType::Text,
+            TdsDataType::NText,
+        ] {
+            assert!(
+                TypeInfo::var_len(t, 10).is_err(),
+                "var_len should reject {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_info_var_len_rejects_scale_and_decimal_types() {
+        for t in [
+            TdsDataType::TimeN,
+            TdsDataType::DateTime2N,
+            TdsDataType::DateTimeOffsetN,
+            TdsDataType::Vector,
+            TdsDataType::Decimal,
+            TdsDataType::Numeric,
+            TdsDataType::DecimalN,
+            TdsDataType::NumericN,
+        ] {
+            assert!(
+                TypeInfo::var_len(t, 10).is_err(),
+                "var_len should reject {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_info_var_len_string_constructor() {
+        let collation = crate::token::tokens::SqlCollation {
+            info: 0,
+            lcid_language_id: 1033,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let ti = TypeInfo::var_len_string(TdsDataType::BigVarChar, 100, Some(collation)).unwrap();
+        assert_eq!(ti.tds_type, TdsDataType::BigVarChar);
+        assert_eq!(ti.length, 100);
+        match ti.type_info_variant {
+            TypeInfoVariant::VarLenString(VariableLengthTypes::BigVarChar, 100, Some(_)) => {}
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_type_info_var_len_string_rejects_non_string_types() {
+        for t in [
+            TdsDataType::IntN,
+            TdsDataType::DateN,
+            TdsDataType::Vector,
+            TdsDataType::DecimalN,
+            TdsDataType::BigVarBinary,
+            TdsDataType::Int4,
+        ] {
+            assert!(
+                TypeInfo::var_len_string(t, 10, None).is_err(),
+                "var_len_string should reject {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_info_var_len_scale_constructor() {
+        let ti = TypeInfo::var_len_scale(TdsDataType::TimeN, 5, 7).unwrap();
+        assert_eq!(ti.tds_type, TdsDataType::TimeN);
+        assert_eq!(ti.length, 5);
+        assert!(matches!(
+            ti.type_info_variant,
+            TypeInfoVariant::VarLenScale(VariableLengthTypes::TimeN, 7)
+        ));
+    }
+
+    #[test]
+    fn test_type_info_var_len_scale_rejects_non_scale_types() {
+        for t in [
+            TdsDataType::IntN,
+            TdsDataType::DateN,
+            TdsDataType::BigVarChar,
+            TdsDataType::DecimalN,
+            TdsDataType::Int4,
+        ] {
+            assert!(
+                TypeInfo::var_len_scale(t, 10, 0).is_err(),
+                "var_len_scale should reject {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_info_var_len_precision_scale_constructor() {
+        let ti = TypeInfo::var_len_precision_scale(TdsDataType::DecimalN, 17, 38, 4).unwrap();
+        assert_eq!(ti.tds_type, TdsDataType::DecimalN);
+        assert_eq!(ti.length, 17);
+        assert!(matches!(
+            ti.type_info_variant,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::DecimalN, 17, 38, 4)
+        ));
+    }
+
+    #[test]
+    fn test_type_info_var_len_precision_scale_rejects_non_decimal_types() {
+        for t in [
+            TdsDataType::IntN,
+            TdsDataType::TimeN,
+            TdsDataType::BigVarChar,
+            TdsDataType::Vector,
+            TdsDataType::Int4,
+        ] {
+            assert!(
+                TypeInfo::var_len_precision_scale(t, 10, 18, 2).is_err(),
+                "var_len_precision_scale should reject {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_info_partial_len_constructor() {
+        let ti = TypeInfo::partial_len(TdsDataType::NVarChar, 0xFFFF, None).unwrap();
+        assert_eq!(ti.tds_type, TdsDataType::NVarChar);
+        assert_eq!(ti.length, 0xFFFF);
+        assert!(matches!(
+            ti.type_info_variant,
+            TypeInfoVariant::PartialLen(
+                PartialLengthType::NVarChar,
+                Some(0xFFFF),
+                None,
+                None,
+                None
+            )
+        ));
+    }
+
+    #[test]
+    fn test_type_info_partial_len_rejects_non_plp() {
+        assert!(TypeInfo::partial_len(TdsDataType::Int4, 0xFFFF, None).is_err());
     }
 }
