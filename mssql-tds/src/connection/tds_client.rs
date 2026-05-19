@@ -482,7 +482,7 @@ impl TdsClient {
         // Build the comma separated list of parameters
         let mut params_list_as_string = String::new();
 
-        build_parameter_list_string(&named_params, &mut params_list_as_string);
+        build_parameter_list_string(&named_params, &mut params_list_as_string)?;
 
         let params_as_sql_string = SqlType::NVarcharMax(Some(SqlString::from_utf8_string(
             params_list_as_string.clone(),
@@ -881,7 +881,7 @@ impl TdsClient {
         // Build the comma separated list of parameters
         let mut params_list_as_string = String::new();
 
-        build_parameter_list_string(&named_params, &mut params_list_as_string);
+        build_parameter_list_string(&named_params, &mut params_list_as_string)?;
 
         let params_as_sql_string =
             SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string)));
@@ -1047,7 +1047,7 @@ impl TdsClient {
         // Build the comma separated list of parameters
         let mut params_list_as_string = String::new();
 
-        build_parameter_list_string(&named_params, &mut params_list_as_string);
+        build_parameter_list_string(&named_params, &mut params_list_as_string)?;
 
         let params_as_sql_string =
             SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string)));

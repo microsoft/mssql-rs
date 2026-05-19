@@ -109,6 +109,7 @@ mod rpc_datatypes {
             ),
             ("guid", SqlType::Uuid(Some(Uuid::from_str(&guid).unwrap()))),
             ("decimal", SqlType::Decimal(Some(decimal.clone()))),
+            ("numeric", SqlType::Numeric(Some(decimal.clone()))),
             (
                 "smallmoney",
                 SqlType::SmallMoney(Some(SqlSmallMoney { int_val: 12345 })),
@@ -198,6 +199,9 @@ mod rpc_datatypes {
                 ColumnValues::Decimal(value) => {
                     assert_eq!(value, &decimal);
                 }
+                ColumnValues::Numeric(value) => {
+                    assert_eq!(value, &decimal);
+                }
                 ColumnValues::SmallMoney(value) => {
                     assert_eq!(value.int_val, 12345);
                 }
@@ -231,6 +235,7 @@ mod rpc_datatypes {
             ("datetime2", SqlType::DateTime2(None)),
             ("guid", SqlType::Uuid(None)),
             ("decimal", SqlType::Decimal(None)),
+            ("numeric", SqlType::Numeric(None)),
             ("smallmoney", SqlType::SmallMoney(None)),
             ("binary8000", SqlType::Binary(None, 8000)),
             ("money", SqlType::Money(None)),

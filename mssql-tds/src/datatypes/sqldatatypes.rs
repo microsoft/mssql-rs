@@ -110,8 +110,14 @@ pub enum TdsDataType {
 impl TdsDataType {
     /// Returns the T-SQL type name (e.g. `"bigint"`, `"nvarchar"`) used in
     /// stored-procedure `@parameters` metadata.
-    pub fn get_meta_type_name(&self) -> &'static str {
-        match self {
+    ///
+    /// Returns [`Error::ImplementationError`] for variants that have no SQL
+    /// declaration name (sentinels and variable-length nullable wire variants
+    /// that are never produced by `From<&SqlType>`). Such a call indicates a
+    /// programmer error: the caller reached a code path that should be
+    /// unreachable.
+    pub fn get_meta_type_name(&self) -> TdsResult<&'static str> {
+        let name = match self {
             TdsDataType::Int8 => "bigint",
             TdsDataType::Flt8 => "float",
             TdsDataType::Flt4 => "real",
@@ -145,19 +151,25 @@ impl TdsDataType {
             TdsDataType::DateTimeOffsetN => "datetimeoffset",
             TdsDataType::VarChar => "varchar",
             TdsDataType::VarBinary => "varbinary",
-            TdsDataType::Void => todo!(),
-            TdsDataType::IntN => todo!(),
-            TdsDataType::Binary => todo!(),
-            TdsDataType::Char => todo!(),
+            TdsDataType::Char => "char",
             TdsDataType::Decimal => "decimal",
             TdsDataType::Numeric => "numeric",
-            TdsDataType::BitN => todo!(),
-            TdsDataType::NumericN => todo!(),
-            TdsDataType::FltN => todo!(),
-            TdsDataType::MoneyN => todo!(),
-            TdsDataType::DateTimeN => todo!(),
-            TdsDataType::None => todo!(),
-        }
+            TdsDataType::NumericN => "numeric",
+            TdsDataType::Void
+            | TdsDataType::IntN
+            | TdsDataType::Binary
+            | TdsDataType::BitN
+            | TdsDataType::FltN
+            | TdsDataType::MoneyN
+            | TdsDataType::DateTimeN
+            | TdsDataType::None => {
+                return Err(Error::ImplementationError(format!(
+                    "get_meta_type_name called on TdsDataType::{self:?}, which has no \
+                     SQL declaration name; no SqlType currently maps to this variant"
+                )));
+            }
+        };
+        Ok(name)
     }
 }
 
@@ -907,43 +919,76 @@ mod tests {
 
     #[test]
     fn test_tds_data_type_get_meta_type_name() {
-        assert_eq!(TdsDataType::Int8.get_meta_type_name(), "bigint");
-        assert_eq!(TdsDataType::Flt8.get_meta_type_name(), "float");
-        assert_eq!(TdsDataType::Flt4.get_meta_type_name(), "real");
-        assert_eq!(TdsDataType::BigBinary.get_meta_type_name(), "binary");
-        assert_eq!(TdsDataType::BigVarBinary.get_meta_type_name(), "varbinary");
-        assert_eq!(TdsDataType::Image.get_meta_type_name(), "image");
-        assert_eq!(TdsDataType::Bit.get_meta_type_name(), "bit");
-        assert_eq!(TdsDataType::Int1.get_meta_type_name(), "tinyint");
-        assert_eq!(TdsDataType::Int2.get_meta_type_name(), "smallint");
-        assert_eq!(TdsDataType::Int4.get_meta_type_name(), "int");
-        assert_eq!(TdsDataType::BigChar.get_meta_type_name(), "char");
-        assert_eq!(TdsDataType::BigVarChar.get_meta_type_name(), "varchar");
-        assert_eq!(TdsDataType::Text.get_meta_type_name(), "text");
-        assert_eq!(TdsDataType::NChar.get_meta_type_name(), "nchar");
-        assert_eq!(TdsDataType::NVarChar.get_meta_type_name(), "nvarchar");
-        assert_eq!(TdsDataType::NText.get_meta_type_name(), "ntext");
-        assert_eq!(TdsDataType::DecimalN.get_meta_type_name(), "decimal");
-        assert_eq!(TdsDataType::Xml.get_meta_type_name(), "xml");
-        assert_eq!(TdsDataType::DateTime.get_meta_type_name(), "datetime");
-        assert_eq!(TdsDataType::DateTim4.get_meta_type_name(), "smalldatetime");
-        assert_eq!(TdsDataType::Money.get_meta_type_name(), "money");
-        assert_eq!(TdsDataType::Money4.get_meta_type_name(), "smallmoney");
-        assert_eq!(TdsDataType::Guid.get_meta_type_name(), "uniqueidentifier");
-        assert_eq!(TdsDataType::SsVariant.get_meta_type_name(), "sql_variant");
-        assert_eq!(TdsDataType::Udt.get_meta_type_name(), "udt");
-        assert_eq!(TdsDataType::Json.get_meta_type_name(), "json");
-        assert_eq!(TdsDataType::DateN.get_meta_type_name(), "date");
-        assert_eq!(TdsDataType::TimeN.get_meta_type_name(), "time");
-        assert_eq!(TdsDataType::DateTime2N.get_meta_type_name(), "datetime2");
-        assert_eq!(
-            TdsDataType::DateTimeOffsetN.get_meta_type_name(),
-            "datetimeoffset"
-        );
-        assert_eq!(TdsDataType::VarChar.get_meta_type_name(), "varchar");
-        assert_eq!(TdsDataType::VarBinary.get_meta_type_name(), "varbinary");
-        assert_eq!(TdsDataType::Decimal.get_meta_type_name(), "decimal");
-        assert_eq!(TdsDataType::Numeric.get_meta_type_name(), "numeric");
+        let cases = [
+            (TdsDataType::Int8, "bigint"),
+            (TdsDataType::Flt8, "float"),
+            (TdsDataType::Flt4, "real"),
+            (TdsDataType::BigBinary, "binary"),
+            (TdsDataType::BigVarBinary, "varbinary"),
+            (TdsDataType::Image, "image"),
+            (TdsDataType::Bit, "bit"),
+            (TdsDataType::Int1, "tinyint"),
+            (TdsDataType::Int2, "smallint"),
+            (TdsDataType::Int4, "int"),
+            (TdsDataType::BigChar, "char"),
+            (TdsDataType::BigVarChar, "varchar"),
+            (TdsDataType::Text, "text"),
+            (TdsDataType::NChar, "nchar"),
+            (TdsDataType::NVarChar, "nvarchar"),
+            (TdsDataType::NText, "ntext"),
+            (TdsDataType::DecimalN, "decimal"),
+            (TdsDataType::NumericN, "numeric"),
+            (TdsDataType::Xml, "xml"),
+            (TdsDataType::DateTime, "datetime"),
+            (TdsDataType::DateTim4, "smalldatetime"),
+            (TdsDataType::Money, "money"),
+            (TdsDataType::Money4, "smallmoney"),
+            (TdsDataType::Guid, "uniqueidentifier"),
+            (TdsDataType::SsVariant, "sql_variant"),
+            (TdsDataType::Udt, "udt"),
+            (TdsDataType::Json, "json"),
+            (TdsDataType::DateN, "date"),
+            (TdsDataType::TimeN, "time"),
+            (TdsDataType::DateTime2N, "datetime2"),
+            (TdsDataType::DateTimeOffsetN, "datetimeoffset"),
+            (TdsDataType::VarChar, "varchar"),
+            (TdsDataType::VarBinary, "varbinary"),
+            (TdsDataType::Decimal, "decimal"),
+            (TdsDataType::Numeric, "numeric"),
+            (TdsDataType::Char, "char"),
+        ];
+        for (variant, expected) in cases {
+            assert_eq!(variant.get_meta_type_name().unwrap(), expected);
+        }
+    }
+
+    /// Documents the contract for [`TdsDataType`] variants that intentionally have no
+    /// meta type name. None of these are produced by `From<&SqlType> for TdsDataType`, so
+    /// they are unreachable from the RPC parameter declaration path; the function returns
+    /// [`Error::ImplementationError`] for them. If a future `SqlType` ever maps to one of
+    /// these, [`TdsDataType::get_meta_type_name`] must be updated and this list pruned.
+    #[test]
+    fn test_tds_data_type_get_meta_type_name_unsupported_variants() {
+        let unsupported = [
+            TdsDataType::Void,
+            TdsDataType::IntN,
+            TdsDataType::Binary,
+            TdsDataType::BitN,
+            TdsDataType::FltN,
+            TdsDataType::MoneyN,
+            TdsDataType::DateTimeN,
+            TdsDataType::None,
+        ];
+        for variant in unsupported {
+            let err = variant.get_meta_type_name().expect_err(&format!(
+                "TdsDataType::{variant:?} unexpectedly returned a meta type name; \
+                 if you implemented it, update this test and the SqlType mapping."
+            ));
+            assert!(
+                matches!(err, Error::ImplementationError(_)),
+                "expected ImplementationError for TdsDataType::{variant:?}, got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1146,7 +1191,7 @@ mod tests {
     // Vector-specific tests
     #[test]
     fn test_vector_type_meta_name() {
-        assert_eq!(TdsDataType::Vector.get_meta_type_name(), "vector");
+        assert_eq!(TdsDataType::Vector.get_meta_type_name().unwrap(), "vector");
     }
 
     #[test]
