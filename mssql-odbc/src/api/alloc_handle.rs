@@ -116,23 +116,15 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
         "SQLAllocHandle(DBC): input_handle is not an ENV handle"
     );
 
-    // ODBC requires SQL_ATTR_ODBC_VERSION be set on the env before allocating
-    // a DBC. msodbcsql asserts this; we return SQL_ERROR per the no-panic guideline.
-    // TODO: surface HY010 "Function sequence error" once SQLGetDiagRec lands.
-    {
-        // Mutex can only be poisoned if a prior thread panicked while holding
-        // the env lock. Unreachable in current code (locked regions are trivial
-        // field reads/writes), but we bail with SQL_ERROR instead of unwrapping
-        // — a panic across the FFI boundary into a C caller is UB.
-        let Ok(state) = env.inner.lock() else {
-            error!("SQLAllocHandle(DBC): env mutex poisoned");
-            return SQL_ERROR;
-        };
-        if state.odbc_version == OdbcVersion::Unset {
-            error!("SQLAllocHandle(DBC): SQL_ATTR_ODBC_VERSION not set on env (HY010)");
-            return SQL_ERROR;
-        }
-    }
+    // DM enforces SQL_ATTR_ODBC_VERSION is set before SQLAllocConnect (HY010).
+    // msodbcsql asserts in debug only; we do the same.
+    debug_assert!(
+        env.inner
+            .lock()
+            .map(|s| s.odbc_version != OdbcVersion::Unset)
+            .unwrap_or(false),
+        "SQLAllocHandle(DBC): SQL_ATTR_ODBC_VERSION not set on env"
+    );
 
     let dbc = Box::new(DbcHandle::new(input_handle));
     let raw = handle_to_raw(dbc);
@@ -284,20 +276,6 @@ mod tests {
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, SQL_NULL_HANDLE, &mut dbc_handle) };
         assert_eq!(ret, SQL_INVALID_HANDLE);
         assert!(dbc_handle.is_null());
-    }
-
-    #[test]
-    fn alloc_dbc_without_version_set_returns_error() {
-        let mut env: SqlHandle = ptr::null_mut();
-        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) };
-        assert_eq!(ret, SQL_SUCCESS);
-
-        let mut dbc: SqlHandle = ptr::null_mut();
-        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) };
-        assert_eq!(ret, SQL_ERROR);
-        assert!(dbc.is_null());
-
-        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
     #[test]

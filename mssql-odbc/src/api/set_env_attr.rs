@@ -1,33 +1,26 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Implementation of SQLSetEnvAttr — sets an environment attribute.
+//! Implementation of SQLSetEnvAttr.
 //!
-//! Equivalent to msodbcsql's `SQLSetEnvAttr`. msodbcsql stores attributes as
-//! `UINT_PTR` in a flat `ENV::dwOptionsE[NUM_TOTAL_ENV_OPTS]` array indexed
-//! by `fAttribute - SQL_ENV_OPT_MIN`; we replace that array with typed fields
-//! on `EnvState` and dispatch via an explicit match. Result is the same with
-//! stronger compile-time guarantees and eager value validation.
-//!
-//! The Driver Manager owns HY010 (function sequence) enforcement, so we do
-//! not re-check it here.
+//! Mirrors msodbcsql's `SQLSetEnvAttr`, replacing its `dwOptionsE[]` table
+//! with typed fields on `EnvState`. The DM owns HY010 enforcement.
 
 use std::panic;
 
 use tracing::{debug, error, trace};
 
 use crate::api::odbc_types::{
-    SQL_ATTR_ODBC_VERSION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_OV_ODBC2, SQL_OV_ODBC3,
-    SQL_OV_ODBC3_80, SQL_SUCCESS, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_ATTR_ODBC_VERSION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
+    SqlPointer, SqlReturn,
 };
 use crate::handles::{EnvHandle, HandleType, OdbcVersion, handle_from_raw};
 
 /// Sets an attribute on an environment handle.
 ///
 /// # Safety
-/// Called from C via the ODBC Driver Manager.
-/// - `environment_handle` must be a valid `EnvHandle` previously returned by `SQLAllocHandle`.
-/// - `value_ptr` is interpreted as a tagged integer (ODBC convention for integer attributes).
+/// - `environment_handle` must be a valid `EnvHandle` from `SQLAllocHandle`.
+/// - `value_ptr` is an ODBC tagged integer for integer attributes.
 pub(crate) unsafe fn sql_set_env_attr(
     environment_handle: SqlHandle,
     attribute: SqlInteger,
@@ -47,22 +40,13 @@ pub(crate) unsafe fn sql_set_env_attr(
             return SQL_INVALID_HANDLE;
         }
 
-        // msodbcsql: `LPENV lpEnv = static_cast<LPENV>(hEnv);` (no null/type
-        // check — DM is trusted). We additionally validate the runtime type
-        // tag set up by SQLAllocHandle, which catches type-confused handles.
         let env = unsafe { handle_from_raw::<EnvHandle>(environment_handle) };
-        if env.header.object_type != HandleType::Env {
-            error!(
-                ?environment_handle,
-                "SQLSetEnvAttr: handle is not an ENV handle"
-            );
-            return SQL_INVALID_HANDLE;
-        }
+        debug_assert_eq!(
+            env.header.object_type,
+            HandleType::Env,
+            "SQLSetEnvAttr: input_handle is not an ENV handle"
+        );
 
-        // msodbcsql: `CMPCSAutoBlock csEnv(&lpEnv->csEnv);` — RAII lock on the
-        // env's critical section, serializing concurrent SQLSetEnvAttr /
-        // SQLAllocHandle(DBC) calls on the same HENV. We hold a `MutexGuard`
-        // instead; it is released at scope exit.
         let Ok(mut state) = env.inner.lock() else {
             error!("SQLSetEnvAttr: env mutex poisoned");
             return SQL_ERROR;
@@ -71,40 +55,22 @@ pub(crate) unsafe fn sql_set_env_attr(
         // TODO: equivalent of msodbcsql `FreeErrors(lpEnv)` — clear prior
         // diagnostic records on the handle. Deferred until diag infra lands.
 
-        // ODBC tagged-pointer convention: integer attribute values are passed
-        // as `(SQLPOINTER)(uintptr_t)value`. msodbcsql stores the pointer
-        // verbatim as `UINT_PTR` in `dwOptionsE[index]`; we recover the low
-        // 32 bits and dispatch on the attribute.
+        // ODBC tagged-pointer: integer values arrive as `(SQLPOINTER)(uintptr_t)value`.
         let value = value_ptr as usize as u32;
 
-        // msodbcsql normalizes `fAttribute` into a `dwOptionsE[]` index and
-        // bounds-checks against `NUMELEM(dwOptionsE)`, on failure invoking
-        // `SETRC_SERR_GOTO` (set `SQL_ERROR`, goto RetExit). The equivalent
-        // here is the `_ => SQL_ERROR` arm below; typed fields replace the
-        // raw integer table.
         match attribute {
-            SQL_ATTR_ODBC_VERSION => match value {
-                SQL_OV_ODBC2 => {
-                    state.odbc_version = OdbcVersion::Odbc2;
+            SQL_ATTR_ODBC_VERSION => match OdbcVersion::try_from(value) {
+                Ok(v) => {
+                    state.odbc_version = v;
                     SQL_SUCCESS
                 }
-                SQL_OV_ODBC3 => {
-                    state.odbc_version = OdbcVersion::Odbc3;
-                    SQL_SUCCESS
-                }
-                SQL_OV_ODBC3_80 => {
-                    state.odbc_version = OdbcVersion::Odbc3_80;
-                    SQL_SUCCESS
-                }
-                _ => {
+                Err(()) => {
                     error!(value, "SQLSetEnvAttr: invalid ODBC_VERSION value");
                     // TODO: SQLSTATE HY024 (invalid attribute value) when diag infra lands.
                     SQL_ERROR
                 }
             },
             _ => {
-                // msodbcsql equivalent: index out of `NUMELEM(dwOptionsE)`
-                // range, `SETRC_SERR_GOTO(retcode, RetExit)`.
                 error!(attribute, "SQLSetEnvAttr: unknown attribute");
                 // TODO: SQLSTATE HY092 (invalid attribute identifier).
                 SQL_ERROR
@@ -128,7 +94,9 @@ mod tests {
     use super::*;
     use crate::api::alloc_handle::sql_alloc_handle;
     use crate::api::free_handle::sql_free_handle;
-    use crate::api::odbc_types::{SQL_HANDLE_ENV, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::{
+        SQL_HANDLE_ENV, SQL_NULL_HANDLE, SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80,
+    };
 
     fn alloc_env() -> SqlHandle {
         let mut h: SqlHandle = ptr::null_mut();
@@ -275,20 +243,6 @@ mod tests {
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc3_80
         );
-        free_env(env);
-    }
-
-    #[test]
-    fn set_env_attr_after_free_returns_invalid() {
-        // Instead, simulate a stale/type-confused handle by poisoning the
-        // handle's runtime type tag while the allocation is still alive.
-        let env = alloc_env();
-        let env_ref = unsafe { &mut *(env as *mut EnvHandle) };
-        env_ref.header.object_type = HandleType::Invalid;
-        let ret = set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80);
-        assert_eq!(ret, SQL_INVALID_HANDLE);
-        // Restore so we can cleanly free the handle.
-        env_ref.header.object_type = HandleType::Env;
         free_env(env);
     }
 }
