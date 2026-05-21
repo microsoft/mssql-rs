@@ -40,7 +40,6 @@ pub(crate) struct EnvState {
     #[allow(dead_code)]
     pub(crate) output_nts: bool,
     /// Active child DBC handles, mirroring msodbcsql's `lppllpdbc`.
-    /// SQLFreeHandle(ENV) checks this is empty before freeing.
     pub(crate) connections: Vec<*mut c_void>,
 }
 

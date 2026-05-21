@@ -60,16 +60,45 @@ across the FFI boundary is **undefined behavior**.
 - Prefer `parking_lot` mutexes if added to deps (no poisoning), or handle
   poison explicitly with standard `Mutex`.
 
+### Cross-handle thread safety (alloc / free)
+
+ODBC handles form a parent–child hierarchy (ENV → DBC → STMT → DESC). The
+Driver Manager (DM) provides serialization guarantees that the driver relies on
+- verified against msodbcsql's behavior:
+
+#### DM guarantees we rely on
+
+- The DM ensures all child handles are freed before freeing a parent:
+  all DBCs freed before `SQLFreeEnv`, all STMTs freed before `SQLFreeConnect`.
+- `SQLAllocHandle(STMT)` and `SQLFreeHandle(DBC)` cannot race on the same DBC.
+  The DM enforces this via the ODBC connection state machine: `SQLAllocStmt`
+  requires state C4+ (connected), while `SQLFreeHandle(DBC)` requires state C2
+  (disconnected). These are mutually exclusive states, so the DM rejects one
+  before it ever reaches the driver. The same logic applies to ENV: `SQLFreeEnv`
+  requires no outstanding DBCs, which the DM verifies first. This means the
+  parent handle and its mutex are guaranteed alive during child allocation.
+- The DM ensures the DBC is disconnected before calling `SQLFreeConnect` via
+  call to `SQLDisconnect`, and `SQLDisconnect` automatically drops all
+  statements and descriptors.
+
+#### Locking rules (mirroring msodbcsql)
+
+- **Alloc path**: Lock the parent's mutex to register the new child in its list.
+- **Free path**: Lock the parent's mutex to unregister from its child list.
+- **Lock ordering**: Always lock parent before child (ENV before DBC, DBC before
+  STMT) to prevent deadlocks. This mirrors msodbcsql's documented rule:
+  *"get parent lock before child lock"* (`csEnv` → `csDbc`).
+- **`debug_assert!` for DM invariants**: The free path uses `debug_assert!` to
+  verify the DM upheld its guarantees (e.g., no outstanding children). These
+  fire in debug builds only — in release builds the driver trusts the DM and
+  frees unconditionally, matching msodbcsql.
+
 ## FFI boundary conventions
 
 - Every exported function goes through `exports.rs` as a thin
   `pub extern "C"` wrapper.
 - The wrapper calls a `pub(crate)` implementation function that contains the
   real logic inside `catch_unwind`.
-- `api/odbc_types.rs` declares all ODBC constants, type aliases, and
-  non-function declarations (the public API contract with C).
-- `api/exports.rs` declares all exported `extern "C"` functions (the driver's
-  symbol table).
 - Use `SqlReturn` (not raw `i16`) as the return type of internal functions
   to keep intent clear.
 - Pointer parameters from C must be treated as potentially null, invalid, or

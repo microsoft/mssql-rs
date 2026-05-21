@@ -14,11 +14,12 @@ use super::odbc_types::{SqlHandle, SqlReturn, SqlSmallInt};
 
 // ---- Handle allocation and management ---------------------------------------
 
-/// See [`alloc_handle::sql_alloc_handle`] for full safety requirements.
+/// Allocates an environment, connection, statement, or descriptor handle.
 ///
 /// # Safety
-/// Called from C via the ODBC Driver Manager. `output_handle` must be a valid,
-/// aligned, writable pointer.
+/// - `output_handle` must be a valid, aligned, writable pointer to [`SqlHandle`].
+/// - For `SQL_HANDLE_ENV`, `input_handle` must be `SQL_NULL_HANDLE`.
+/// - For other handle types, `input_handle` must be a valid parent handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLAllocHandle(
     handle_type: SqlSmallInt,
@@ -28,11 +29,11 @@ pub unsafe extern "C" fn SQLAllocHandle(
     unsafe { super::alloc_handle::sql_alloc_handle(handle_type, input_handle, output_handle) }
 }
 
-/// See [`free_handle::sql_free_handle`] for full safety requirements.
+/// Frees an environment, connection, statement, or descriptor handle
+/// previously allocated by [`SQLAllocHandle`].
 ///
 /// # Safety
-/// Called from C via the ODBC Driver Manager. `handle` must have been
-/// allocated by `SQLAllocHandle` and not already freed.
+/// - `handle` must have been allocated by [`SQLAllocHandle`] and not already freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLFreeHandle(handle_type: SqlSmallInt, handle: SqlHandle) -> SqlReturn {
     unsafe { super::free_handle::sql_free_handle(handle_type, handle) }

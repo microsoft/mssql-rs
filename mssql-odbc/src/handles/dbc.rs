@@ -37,8 +37,8 @@ pub(crate) struct DbcHandle {
 
 // SAFETY: The raw pointer `parent_env` prevents auto-impl of Send/Sync.
 // We assert these are safe because `parent_env` is set once at construction
-// and never mutated. It is dereferenced in `free_dbc` where the parent ENV
-// is guaranteed alive (ENV refuses to free while outstanding DBCs exist).
+// and never mutated. The parent ENV is guaranteed alive because the DM
+// ensures all DBCs are freed before calling SQLFreeEnv.
 // All mutable state is Mutex-protected.
 unsafe impl Send for DbcHandle {}
 unsafe impl Sync for DbcHandle {}
@@ -48,9 +48,10 @@ unsafe impl Sync for DbcHandle {}
 pub(crate) struct DbcState {
     #[allow(dead_code)]
     pub(crate) connection_state: ConnectionState,
-    // TODO: connection string, login timeout (default 15s), query timeout,
-    // authentication method, server name, database name, etc.
-    // These will be populated by SQLDriverConnect/SQLConnect/SQLSetConnectAttr.
+    /// Active child STMT handles, mirroring msodbcsql's `lppllpstmt`.
+    pub(crate) statements: Vec<*mut c_void>,
+    // TODO: connection string, login timeout, query timeout, autocommit mode, transaction state,
+    // server name, DB name, etc. — all mutable state that would be protected by the mutex.
 }
 
 impl DbcHandle {
@@ -62,6 +63,7 @@ impl DbcHandle {
             parent_env,
             inner: Mutex::new(DbcState {
                 connection_state: ConnectionState::Disconnected,
+                statements: Vec::new(),
             }),
         }
     }

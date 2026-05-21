@@ -3,11 +3,13 @@
 
 pub(crate) mod dbc;
 mod env;
+mod stmt;
 
 pub(crate) use dbc::DbcHandle;
 pub(crate) use env::EnvHandle;
 #[cfg(test)]
 pub(crate) use env::OdbcVersion;
+pub(crate) use stmt::StmtHandle;
 
 use std::ffi::c_void;
 
