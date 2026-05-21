@@ -2,15 +2,18 @@
 // Licensed under the MIT License.
 
 pub(crate) mod dbc;
+pub(crate) mod diag;
 mod env;
 mod stmt;
 
 pub(crate) use dbc::DbcHandle;
+pub(crate) use diag::DiagRecord;
 pub(crate) use env::EnvHandle;
 pub(crate) use env::OdbcVersion;
 pub(crate) use stmt::StmtHandle;
 
 use std::ffi::c_void;
+use std::sync::Mutex;
 
 use tracing::{debug, trace};
 
@@ -28,11 +31,24 @@ pub(crate) enum HandleType {
 }
 
 /// Common header shared by all handle types. Equivalent to msodbcsql's `tagOBJBASE`.
+///
+/// `diag_records` mirrors msodbcsql's `errinfo.lperrdataFirst` linked list —
+/// one entry per error/warning posted on the handle, read back by
+/// `SQLGetDiagRec`. Cleared at the start of each API call on the handle
+/// (msodbcsql's `FreeErrors`).
 #[derive(Debug)]
 pub(crate) struct HandleHeader {
-    #[allow(dead_code)]
     pub(crate) object_type: HandleType,
-    // TODO: diagnostics — Vec<DiagRecord> or similar for SQLGetDiagRec support.
+    pub(crate) diag_records: Mutex<Vec<DiagRecord>>,
+}
+
+impl HandleHeader {
+    pub(crate) fn new(object_type: HandleType) -> Self {
+        Self {
+            object_type,
+            diag_records: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 /// Converts a heap-allocated handle into an opaque `*mut c_void` for return through FFI.

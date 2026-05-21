@@ -57,9 +57,7 @@ pub(crate) struct DbcState {
 impl DbcHandle {
     pub(crate) fn new(parent_env: *mut c_void) -> Self {
         Self {
-            header: HandleHeader {
-                object_type: HandleType::Dbc,
-            },
+            header: HandleHeader::new(HandleType::Dbc),
             parent_env,
             inner: Mutex::new(DbcState {
                 connection_state: ConnectionState::Disconnected,

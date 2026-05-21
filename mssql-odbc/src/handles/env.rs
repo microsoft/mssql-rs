@@ -61,9 +61,7 @@ pub(crate) struct EnvState {
 impl EnvHandle {
     pub(crate) fn new() -> Self {
         Self {
-            header: HandleHeader {
-                object_type: HandleType::Env,
-            },
+            header: HandleHeader::new(HandleType::Env),
             inner: Mutex::new(EnvState {
                 odbc_version: OdbcVersion::Unset,
                 output_nts: true, // SQL_ATTR_OUTPUT_NTS defaults to SQL_TRUE

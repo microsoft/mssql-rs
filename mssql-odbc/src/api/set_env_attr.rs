@@ -14,7 +14,7 @@ use crate::api::odbc_types::{
     SQL_ATTR_ODBC_VERSION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
     SqlPointer, SqlReturn,
 };
-use crate::handles::{EnvHandle, HandleType, OdbcVersion, handle_from_raw};
+use crate::handles::{DiagRecord, EnvHandle, HandleType, OdbcVersion, handle_from_raw};
 
 /// Sets an attribute on an environment handle.
 ///
@@ -47,13 +47,16 @@ pub(crate) unsafe fn sql_set_env_attr(
             "SQLSetEnvAttr: input_handle is not an ENV handle"
         );
 
+        // Equivalent of msodbcsql `FreeErrors(lpEnv)` — clear any diagnostic
+        // records left from a prior call before processing this one.
+        if let Ok(mut diag) = env.header.diag_records.lock() {
+            diag.clear();
+        }
+
         let Ok(mut state) = env.inner.lock() else {
             error!("SQLSetEnvAttr: env mutex poisoned");
             return SQL_ERROR;
         };
-
-        // TODO: equivalent of msodbcsql `FreeErrors(lpEnv)` — clear prior
-        // diagnostic records on the handle. Deferred until diag infra lands.
 
         // ODBC tagged-pointer: integer values arrive as `(SQLPOINTER)(uintptr_t)value`.
         let value = value_ptr as usize as u32;
@@ -66,13 +69,13 @@ pub(crate) unsafe fn sql_set_env_attr(
                 }
                 Err(()) => {
                     error!(value, "SQLSetEnvAttr: invalid ODBC_VERSION value");
-                    // TODO: SQLSTATE HY024 (invalid attribute value) when diag infra lands.
+                    post_diag(env, *b"HY024", "Invalid attribute value");
                     SQL_ERROR
                 }
             },
             _ => {
                 error!(attribute, "SQLSetEnvAttr: unknown attribute");
-                // TODO: SQLSTATE HY092 (invalid attribute identifier).
+                post_diag(env, *b"HY092", "Invalid attribute identifier");
                 SQL_ERROR
             }
         }
@@ -85,6 +88,15 @@ pub(crate) unsafe fn sql_set_env_attr(
 
     trace!(?ret, "SQLSetEnvAttr returning");
     ret
+}
+
+/// Posts a diagnostic record on the ENV handle. Mutex-poisoning here is
+/// non-fatal — the worst case is the caller can't read the diag back, but
+/// the original SQL_ERROR return is what matters.
+fn post_diag(env: &EnvHandle, sql_state: [u8; 5], message: &str) {
+    if let Ok(mut diag) = env.header.diag_records.lock() {
+        diag.push(DiagRecord::new(sql_state, 0, message));
+    }
 }
 
 #[cfg(test)]
@@ -243,6 +255,44 @@ mod tests {
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc3_80
         );
+        free_env(env);
+    }
+
+    #[test]
+    fn invalid_version_posts_hy024_diag() {
+        let env = alloc_env();
+        assert_eq!(set_attr(env, SQL_ATTR_ODBC_VERSION, 9999), SQL_ERROR);
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
+        let recs = env_ref.header.diag_records.lock().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(&recs[0].sql_state, b"HY024");
+        free_env(env);
+    }
+
+    #[test]
+    fn unknown_attribute_posts_hy092_diag() {
+        let env = alloc_env();
+        assert_eq!(set_attr(env, 12345, 0), SQL_ERROR);
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
+        let recs = env_ref.header.diag_records.lock().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(&recs[0].sql_state, b"HY092");
+        free_env(env);
+    }
+
+    #[test]
+    fn successful_call_clears_prior_diag_records() {
+        // msodbcsql `FreeErrors` parity: a successful call wipes records left
+        // from a prior failed call on the same handle.
+        let env = alloc_env();
+        assert_eq!(set_attr(env, SQL_ATTR_ODBC_VERSION, 9999), SQL_ERROR);
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
+        assert_eq!(env_ref.header.diag_records.lock().unwrap().len(), 1);
+        assert_eq!(
+            set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80),
+            SQL_SUCCESS
+        );
+        assert!(env_ref.header.diag_records.lock().unwrap().is_empty());
         free_env(env);
     }
 }

@@ -28,9 +28,7 @@ unsafe impl Sync for StmtHandle {}
 impl StmtHandle {
     pub(crate) fn new(parent_dbc: *mut c_void) -> Self {
         Self {
-            header: HandleHeader {
-                object_type: HandleType::Stmt,
-            },
+            header: HandleHeader::new(HandleType::Stmt),
             parent_dbc,
         }
     }
