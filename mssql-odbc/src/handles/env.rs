@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use super::{HandleHeader, HandleType, HasHeader};
+use crate::api::odbc_types::{SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
 
 /// ODBC environment attributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,8 +13,22 @@ use super::{HandleHeader, HandleType, HasHeader};
 pub(crate) enum OdbcVersion {
     /// Not yet set — calls requiring a version will fail with HY010.
     Unset = 0,
+    Odbc2 = 2,
     Odbc3 = 3,
     Odbc3_80 = 380,
+}
+
+impl TryFrom<u32> for OdbcVersion {
+    type Error = ();
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            SQL_OV_ODBC2 => Ok(OdbcVersion::Odbc2),
+            SQL_OV_ODBC3 => Ok(OdbcVersion::Odbc3),
+            SQL_OV_ODBC3_80 => Ok(OdbcVersion::Odbc3_80),
+            _ => Err(()),
+        }
+    }
 }
 
 /// Environment handle — equivalent to msodbcsql's `struct tagENV`.

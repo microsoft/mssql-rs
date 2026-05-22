@@ -14,6 +14,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ODBC_CRATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+WORKSPACE_DIR="$(cd "$ODBC_CRATE_DIR/.." && pwd)"
 BUILD_TYPE="debug"
 TMPDIR_INI=""
 
@@ -38,11 +39,11 @@ else
     cargo build
 fi
 
-# Determine shared library path
+# Determine shared library path (workspace target dir).
 if [[ "$(uname -s)" == "Darwin" ]]; then
-    DRIVER_PATH="$ODBC_CRATE_DIR/target/$BUILD_TYPE/libmsodbcsql18.dylib"
+    DRIVER_PATH="$WORKSPACE_DIR/target/$BUILD_TYPE/libmsodbcsql18.dylib"
 else
-    DRIVER_PATH="$ODBC_CRATE_DIR/target/$BUILD_TYPE/libmsodbcsql18.so"
+    DRIVER_PATH="$WORKSPACE_DIR/target/$BUILD_TYPE/libmsodbcsql18.so"
 fi
 
 if [ ! -f "$DRIVER_PATH" ]; then

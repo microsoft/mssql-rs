@@ -10,7 +10,7 @@
 //! This file acts as the driver's export manifest — the Rust equivalent of a
 //! Windows `.def` file or a C header listing the public API surface.
 
-use super::odbc_types::{SqlHandle, SqlReturn, SqlSmallInt};
+use super::odbc_types::{SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlSmallInt};
 
 // ---- Handle allocation and management ---------------------------------------
 
@@ -37,4 +37,26 @@ pub unsafe extern "C" fn SQLAllocHandle(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLFreeHandle(handle_type: SqlSmallInt, handle: SqlHandle) -> SqlReturn {
     unsafe { super::free_handle::sql_free_handle(handle_type, handle) }
+}
+
+/// See [`set_env_attr::sql_set_env_attr`] for full safety requirements.
+///
+/// # Safety
+/// Called from C via the ODBC Driver Manager. `environment_handle` must be a
+/// valid ENV handle previously returned by `SQLAllocHandle`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLSetEnvAttr(
+    environment_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    string_length: SqlInteger,
+) -> SqlReturn {
+    unsafe {
+        super::set_env_attr::sql_set_env_attr(
+            environment_handle,
+            attribute,
+            value_ptr,
+            string_length,
+        )
+    }
 }
