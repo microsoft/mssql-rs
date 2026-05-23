@@ -22,6 +22,7 @@ pub(crate) enum ConnectionState {
 /// to the parent ENV and connection-level state. Field layout mirrors `tagDBC`:
 /// inherited `tagOBJBASE.ObjectType` first (lock-free), then the lock
 /// (`inner` ≈ `csDbc`) covering inherited `errinfo` plus derived fields.
+#[repr(C)]
 #[derive(Debug)]
 pub(crate) struct DbcHandle {
     pub(crate) object_type: HandleType,

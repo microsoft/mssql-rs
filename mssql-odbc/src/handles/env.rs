@@ -46,6 +46,7 @@ impl TryFrom<u32> for OdbcVersion {
 /// Rust note: `Mutex<T>` must wrap a `T`, so the locked fields live inside the
 /// nested `EnvState` struct rather than being peer members of `EnvHandle` the
 /// way they're peer members of `tagENV`. Everything else matches msodbcsql.
+#[repr(C)]
 #[derive(Debug)]
 pub(crate) struct EnvHandle {
     pub(crate) object_type: HandleType,

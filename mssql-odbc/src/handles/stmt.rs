@@ -11,6 +11,7 @@ use super::{DiagRecord, HandleType, HasObjectType};
 /// Created by `SQLAllocHandle(SQL_HANDLE_STMT, hdbc, ...)`. Field layout mirrors
 /// `tagSTMT`: inherited `ObjectType` first (lock-free), then the lock
 /// (`inner` ≈ `csStmt`) covering inherited `errinfo` plus derived fields.
+#[repr(C)]
 #[derive(Debug)]
 pub(crate) struct StmtHandle {
     pub(crate) object_type: HandleType,

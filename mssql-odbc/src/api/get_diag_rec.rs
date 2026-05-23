@@ -104,6 +104,26 @@ unsafe fn snapshot_record(
     rec_number: SqlSmallInt,
 ) -> Result<Option<DiagRecord>, SqlReturn> {
     let idx = (rec_number - 1) as usize;
+    let expected_type = match handle_type {
+        SQL_HANDLE_ENV => HandleType::Env,
+        SQL_HANDLE_DBC => HandleType::Dbc,
+        SQL_HANDLE_STMT => HandleType::Stmt,
+        _ => {
+            error!(handle_type, "SQLGetDiagRecW: unsupported handle type");
+            return Err(SQL_INVALID_HANDLE);
+        }
+    };
+
+    // All driver handles start with `HandleType` at offset 0.
+    let actual_type = unsafe { (handle as *const HandleType).read() };
+    if actual_type != expected_type {
+        error!(
+            ?actual_type,
+            ?expected_type,
+            "SQLGetDiagRecW: handle type does not match requested handle_type"
+        );
+        return Err(SQL_INVALID_HANDLE);
+    }
 
     macro_rules! read_from {
         ($ty:ty, $expected:expr) => {{
@@ -121,10 +141,7 @@ unsafe fn snapshot_record(
         SQL_HANDLE_ENV => read_from!(EnvHandle, HandleType::Env),
         SQL_HANDLE_DBC => read_from!(DbcHandle, HandleType::Dbc),
         SQL_HANDLE_STMT => read_from!(StmtHandle, HandleType::Stmt),
-        _ => {
-            error!(handle_type, "SQLGetDiagRecW: unsupported handle type");
-            Err(SQL_INVALID_HANDLE)
-        }
+        _ => Err(SQL_INVALID_HANDLE),
     }
 }
 
@@ -173,8 +190,8 @@ unsafe fn write_message(
         unsafe { message_text.add(copy_len).write(0) };
         copy_len < total
     } else {
-        // No output buffer: truncation if any content existed.
-        total > 0
+        // No output buffer: report length only; this is not truncation.
+        false
     };
 
     if truncated {
@@ -350,6 +367,51 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_INVALID_HANDLE);
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn handle_type_mismatch_returns_invalid_handle() {
+        let env = alloc_env();
+        let ret = unsafe {
+            sql_get_diag_rec_w(
+                SQL_HANDLE_DBC,
+                env,
+                1,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_INVALID_HANDLE);
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn null_message_buffer_reports_length_without_truncation() {
+        let env = alloc_env();
+        push_diag(env, *b"HY024", 0, "Invalid attribute value");
+
+        let mut state = [0u16; 6];
+        let mut text_len: SqlSmallInt = 0;
+        let ret = unsafe {
+            sql_get_diag_rec_w(
+                SQL_HANDLE_ENV,
+                env,
+                1,
+                state.as_mut_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                &mut text_len,
+            )
+        };
+
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(utf16_to_string(&state), "HY024");
+        assert_eq!(text_len, "Invalid attribute value".len() as SqlSmallInt);
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
