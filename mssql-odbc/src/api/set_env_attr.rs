@@ -14,7 +14,9 @@ use crate::api::odbc_types::{
     SQL_ATTR_ODBC_VERSION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
     SqlPointer, SqlReturn,
 };
+use crate::api::sqlstate::{SQLSTATE_HY024, SQLSTATE_HY092};
 use crate::handles::{DiagRecord, EnvHandle, HandleType, OdbcVersion, handle_from_raw};
+
 /// Sets an attribute on an environment handle.
 ///
 /// # Safety
@@ -46,10 +48,7 @@ pub(crate) unsafe fn sql_set_env_attr(
             "SQLSetEnvAttr: input_handle is not an ENV handle"
         );
 
-        let Ok(mut state) = env.inner.lock() else {
-            error!("SQLSetEnvAttr: env mutex poisoned");
-            return SQL_ERROR;
-        };
+        let mut state = env.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // Equivalent of msodbcsql `FreeErrors(lpEnv)` — clear any diagnostic
         // records left from a prior call before processing this one.
@@ -67,7 +66,7 @@ pub(crate) unsafe fn sql_set_env_attr(
                 Err(()) => {
                     error!(value, "SQLSetEnvAttr: invalid ODBC_VERSION value");
                     state.diag_records.push(DiagRecord::new(
-                        *b"HY024",
+                        SQLSTATE_HY024,
                         0,
                         "Invalid attribute value",
                     ));
@@ -77,7 +76,7 @@ pub(crate) unsafe fn sql_set_env_attr(
             _ => {
                 error!(attribute, "SQLSetEnvAttr: unknown attribute");
                 state.diag_records.push(DiagRecord::new(
-                    *b"HY092",
+                    SQLSTATE_HY092,
                     0,
                     "Invalid attribute identifier",
                 ));

@@ -30,7 +30,6 @@ pub(crate) struct DbcHandle {
     /// Mirrors msodbcsql's `lpdbc->lpenv`.
     #[allow(dead_code)]
     pub(crate) parent_env: *mut c_void,
-    #[allow(dead_code)]
     pub(crate) inner: Mutex<DbcState>,
 }
 

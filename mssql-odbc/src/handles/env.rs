@@ -48,9 +48,7 @@ impl TryFrom<u32> for OdbcVersion {
 /// way they're peer members of `tagENV`. Everything else matches msodbcsql.
 #[derive(Debug)]
 pub(crate) struct EnvHandle {
-    #[allow(dead_code)]
     pub(crate) object_type: HandleType,
-    #[allow(dead_code)]
     pub(crate) inner: Mutex<EnvState>,
 }
 

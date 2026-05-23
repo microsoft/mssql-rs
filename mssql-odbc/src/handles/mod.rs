@@ -25,12 +25,12 @@ use tracing::{debug, trace};
 /// `csEnv`/`csDbc`/`csStmt`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-#[allow(dead_code)]
 pub(crate) enum HandleType {
     Env = 1,
     Dbc = 2,
     Stmt = 3,
     Desc = 4,
+    /// Use-after-free poison value, matching msodbcsql's invalid ObjectType stamp.
     Invalid = 0xDEADBEEF,
 }
 

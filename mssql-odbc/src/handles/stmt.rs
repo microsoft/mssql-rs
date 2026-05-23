@@ -18,7 +18,6 @@ pub(crate) struct StmtHandle {
     /// the DBC owns the STMT's lifetime, not the other way around.
     /// Mirrors msodbcsql's `lpstmt->lpdbc`.
     pub(crate) parent_dbc: *mut c_void,
-    #[allow(dead_code)]
     pub(crate) inner: Mutex<StmtState>,
 }
 

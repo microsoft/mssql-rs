@@ -20,7 +20,9 @@ use crate::api::odbc_types::{
     SQL_SQLSTATE_SIZE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlReturn,
     SqlSmallInt, SqlWChar,
 };
-use crate::handles::{DbcHandle, DiagRecord, EnvHandle, HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{
+    DbcHandle, DiagRecord, EnvHandle, HandleType, StmtHandle, handle_from_raw,
+};
 
 /// Implementation of [`SQLGetDiagRecW`](super::exports::SQLGetDiagRecW).
 ///
@@ -88,7 +90,14 @@ pub(crate) unsafe fn sql_get_diag_rec_w(
 
 /// Clones the requested record out from under the handle's diag mutex.
 /// Returns `Ok(None)` if the index is past the end of the list.
-/// Returns `Err(rc)` for invalid-handle / poisoned-mutex cases.
+/// Returns `Err(rc)` for invalid-handle cases.
+///
+/// TODO: For ODBC 3.x parity with msodbcsql, diagnostic records should be
+/// sorted by priority before indexing (msodbcsql `SortErrors`). We currently
+/// return in posting order.
+/// TODO: Add an OOM-resilient fallback diagnostic path like msodbcsql's
+/// `ERR_STATUS_OOM`: store a non-allocating OOM flag on the handle and return
+/// static HY001 text for record 1 without heap allocation.
 unsafe fn snapshot_record(
     handle_type: SqlSmallInt,
     handle: SqlHandle,
@@ -103,10 +112,7 @@ unsafe fn snapshot_record(
                 h.object_type, $expected,
                 "SQLGetDiagRecW: handle type tag mismatch",
             );
-            let Ok(state) = h.inner.lock() else {
-                error!("SQLGetDiagRecW: handle mutex poisoned");
-                return Err(SQL_ERROR);
-            };
+            let state = h.inner.lock().unwrap_or_else(|e| e.into_inner());
             Ok(state.diag_records.get(idx).cloned())
         }};
     }
@@ -150,8 +156,7 @@ unsafe fn write_message(
     text_length_ptr: *mut SqlSmallInt,
     message: &str,
 ) -> SqlReturn {
-    let utf16: Vec<u16> = message.encode_utf16().collect();
-    let total = utf16.len();
+    let total = message.encode_utf16().count();
 
     if !text_length_ptr.is_null() {
         let len = SqlSmallInt::try_from(total).unwrap_or(SqlSmallInt::MAX);
@@ -159,11 +164,11 @@ unsafe fn write_message(
     }
 
     let truncated = if !message_text.is_null() && buffer_length > 0 {
-        let buf_len = buffer_length as usize;
+        let buf_len = usize::try_from(buffer_length).unwrap_or(0);
         // Reserve one slot for the NUL terminator.
         let copy_len = total.min(buf_len.saturating_sub(1));
-        for (i, ch) in utf16.iter().take(copy_len).enumerate() {
-            unsafe { message_text.add(i).write(*ch) };
+        for (i, ch) in message.encode_utf16().take(copy_len).enumerate() {
+            unsafe { message_text.add(i).write(ch) };
         }
         unsafe { message_text.add(copy_len).write(0) };
         copy_len < total
@@ -187,7 +192,7 @@ mod tests {
     use crate::api::alloc_handle::sql_alloc_handle;
     use crate::api::free_handle::sql_free_handle;
     use crate::api::odbc_types::{SQL_HANDLE_DESC, SQL_NULL_HANDLE};
-    use crate::handles::DiagRecord;
+    use crate::handles::{DiagRecord, handle_from_raw};
 
     fn alloc_env() -> SqlHandle {
         let mut h: SqlHandle = ptr::null_mut();
@@ -197,7 +202,7 @@ mod tests {
     }
 
     fn push_diag(env: SqlHandle, sql_state: [u8; 5], native: i32, msg: &str) {
-        let env_ref = unsafe { &*(env as *const EnvHandle) };
+        let env_ref = unsafe { handle_from_raw::<EnvHandle>(env) };
         env_ref
             .inner
             .lock()
