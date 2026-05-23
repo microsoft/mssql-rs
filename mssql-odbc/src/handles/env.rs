@@ -31,8 +31,14 @@ impl TryFrom<u32> for OdbcVersion {
     }
 }
 
-/// Environment handle — Rust port of msodbcsql's `struct tagENV : tagOBJBASE`.
+/// Environment handle — equivalent to msodbcsql's `struct tagENV`.
 ///
+/// One ENV is typically allocated per application. It owns connection handles
+/// and stores environment-level attributes (ODBC version, connection pooling mode).
+///
+/// Thread-safety: The `inner` mutex protects mutable state. msodbcsql uses
+/// `csEnv` (Unix) or relies on the Driver Manager (Windows) for serialization.
+/// We always protect with a mutex for safety regardless of platform.
 /// `object_type` is read lock-free; `inner` (`≈ csEnv`) protects all mutable state.
 #[repr(C)]
 #[derive(Debug)]

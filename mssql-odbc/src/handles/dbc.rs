@@ -16,9 +16,13 @@ pub(crate) enum ConnectionState {
     Connected,
 }
 
-/// Connection handle — Rust port of msodbcsql's `struct tagDBC : tagOBJBASE`.
+/// Connection handle — equivalent to msodbcsql's `struct tagDBC`.
 ///
-/// `object_type` is read lock-free; `inner` (`≈ csDbc`) protects all mutable state.
+/// Created by `SQLAllocHandle(SQL_HANDLE_DBC, henv, ...)`.
+/// Holds a back-pointer to the parent environment and connection-level state.
+///
+/// Thread-safety: The `inner` mutex protects mutable state, mirroring
+/// msodbcsql's `csDbc` critical section.
 #[repr(C)]
 #[derive(Debug)]
 pub(crate) struct DbcHandle {

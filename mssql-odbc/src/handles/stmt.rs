@@ -6,9 +6,9 @@ use std::sync::Mutex;
 
 use super::{DiagRecord, HandleType, HasObjectType};
 
-/// Statement handle — Rust port of msodbcsql's `struct tagSTMT : tagOBJBASE`.
+/// Statement handle — equivalent to msodbcsql's `struct tagSTMT`.
 ///
-/// `object_type` is read lock-free; `inner` (`≈ csStmt`) protects all mutable state.
+/// Created by `SQLAllocHandle(SQL_HANDLE_STMT, hdbc, ...)`.
 #[repr(C)]
 #[derive(Debug)]
 pub(crate) struct StmtHandle {

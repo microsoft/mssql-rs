@@ -26,7 +26,6 @@ pub(crate) enum HandleType {
     Stmt = 3,
     #[allow(dead_code)]
     Desc = 4,
-    /// Use-after-free poison value, matching msodbcsql's invalid ObjectType stamp.
     Invalid = 0xDEADBEEF,
 }
 
