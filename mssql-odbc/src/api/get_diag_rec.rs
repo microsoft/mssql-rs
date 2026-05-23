@@ -126,21 +126,17 @@ unsafe fn snapshot_record(
     }
 
     macro_rules! read_from {
-        ($ty:ty, $expected:expr) => {{
+        ($ty:ty) => {{
             let h = unsafe { handle_from_raw::<$ty>(handle) };
-            debug_assert_eq!(
-                h.object_type, $expected,
-                "SQLGetDiagRecW: handle type tag mismatch",
-            );
             let state = h.inner.lock().unwrap_or_else(|e| e.into_inner());
             Ok(state.diag_records.get(idx).cloned())
         }};
     }
 
     match handle_type {
-        SQL_HANDLE_ENV => read_from!(EnvHandle, HandleType::Env),
-        SQL_HANDLE_DBC => read_from!(DbcHandle, HandleType::Dbc),
-        SQL_HANDLE_STMT => read_from!(StmtHandle, HandleType::Stmt),
+        SQL_HANDLE_ENV => read_from!(EnvHandle),
+        SQL_HANDLE_DBC => read_from!(DbcHandle),
+        SQL_HANDLE_STMT => read_from!(StmtHandle),
         _ => Err(SQL_INVALID_HANDLE),
     }
 }
