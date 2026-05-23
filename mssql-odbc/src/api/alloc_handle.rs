@@ -111,7 +111,7 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
     // Validate that the parent handle is actually an ENV.
     let env = unsafe { handle_from_raw::<EnvHandle>(input_handle) };
     debug_assert_eq!(
-        env.header.object_type,
+        env.object_type,
         HandleType::Env,
         "SQLAllocHandle(DBC): input_handle is not an ENV handle"
     );
@@ -164,7 +164,7 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
 
     let dbc = unsafe { handle_from_raw::<DbcHandle>(input_handle) };
     debug_assert_eq!(
-        dbc.header.object_type,
+        dbc.object_type,
         HandleType::Dbc,
         "SQLAllocHandle(STMT): input_handle is not a DBC handle"
     );
@@ -224,7 +224,7 @@ mod tests {
 
         // Verify the handle header is correctly set.
         let env = unsafe { &*(handle as *const EnvHandle) };
-        assert_eq!(env.header.object_type, HandleType::Env);
+        assert_eq!(env.object_type, HandleType::Env);
 
         // Cleanup
         unsafe { free_handle::<EnvHandle>(handle) };
@@ -263,7 +263,7 @@ mod tests {
         assert!(!dbc_handle.is_null());
 
         let dbc = unsafe { &*(dbc_handle as *const DbcHandle) };
-        assert_eq!(dbc.header.object_type, HandleType::Dbc);
+        assert_eq!(dbc.object_type, HandleType::Dbc);
         assert_eq!(dbc.parent_env, env_handle);
 
         unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc_handle) };
@@ -353,7 +353,7 @@ mod tests {
         assert!(!stmt.is_null());
 
         let s = unsafe { &*(stmt as *const StmtHandle) };
-        assert_eq!(s.header.object_type, HandleType::Stmt);
+        assert_eq!(s.object_type, HandleType::Stmt);
         assert_eq!(s.parent_dbc, dbc);
 
         unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) };

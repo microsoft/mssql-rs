@@ -15,7 +15,6 @@ use crate::api::odbc_types::{
     SqlPointer, SqlReturn,
 };
 use crate::handles::{DiagRecord, EnvHandle, HandleType, OdbcVersion, handle_from_raw};
-
 /// Sets an attribute on an environment handle.
 ///
 /// # Safety
@@ -42,21 +41,19 @@ pub(crate) unsafe fn sql_set_env_attr(
 
         let env = unsafe { handle_from_raw::<EnvHandle>(environment_handle) };
         debug_assert_eq!(
-            env.header.object_type,
+            env.object_type,
             HandleType::Env,
             "SQLSetEnvAttr: input_handle is not an ENV handle"
         );
-
-        // Equivalent of msodbcsql `FreeErrors(lpEnv)` — clear any diagnostic
-        // records left from a prior call before processing this one.
-        if let Ok(mut diag) = env.header.diag_records.lock() {
-            diag.clear();
-        }
 
         let Ok(mut state) = env.inner.lock() else {
             error!("SQLSetEnvAttr: env mutex poisoned");
             return SQL_ERROR;
         };
+
+        // Equivalent of msodbcsql `FreeErrors(lpEnv)` — clear any diagnostic
+        // records left from a prior call before processing this one.
+        state.diag_records.clear();
 
         // ODBC tagged-pointer: integer values arrive as `(SQLPOINTER)(uintptr_t)value`.
         let value = value_ptr as usize as u32;
@@ -69,13 +66,21 @@ pub(crate) unsafe fn sql_set_env_attr(
                 }
                 Err(()) => {
                     error!(value, "SQLSetEnvAttr: invalid ODBC_VERSION value");
-                    post_diag(env, *b"HY024", "Invalid attribute value");
+                    state.diag_records.push(DiagRecord::new(
+                        *b"HY024",
+                        0,
+                        "Invalid attribute value",
+                    ));
                     SQL_ERROR
                 }
             },
             _ => {
                 error!(attribute, "SQLSetEnvAttr: unknown attribute");
-                post_diag(env, *b"HY092", "Invalid attribute identifier");
+                state.diag_records.push(DiagRecord::new(
+                    *b"HY092",
+                    0,
+                    "Invalid attribute identifier",
+                ));
                 SQL_ERROR
             }
         }
@@ -88,15 +93,6 @@ pub(crate) unsafe fn sql_set_env_attr(
 
     trace!(?ret, "SQLSetEnvAttr returning");
     ret
-}
-
-/// Posts a diagnostic record on the ENV handle. Mutex-poisoning here is
-/// non-fatal — the worst case is the caller can't read the diag back, but
-/// the original SQL_ERROR return is what matters.
-fn post_diag(env: &EnvHandle, sql_state: [u8; 5], message: &str) {
-    if let Ok(mut diag) = env.header.diag_records.lock() {
-        diag.push(DiagRecord::new(sql_state, 0, message));
-    }
 }
 
 #[cfg(test)]
@@ -263,9 +259,10 @@ mod tests {
         let env = alloc_env();
         assert_eq!(set_attr(env, SQL_ATTR_ODBC_VERSION, 9999), SQL_ERROR);
         let env_ref = unsafe { &*(env as *const EnvHandle) };
-        let recs = env_ref.header.diag_records.lock().unwrap();
-        assert_eq!(recs.len(), 1);
-        assert_eq!(&recs[0].sql_state, b"HY024");
+        let state = env_ref.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(&state.diag_records[0].sql_state, b"HY024");
+        drop(state);
         free_env(env);
     }
 
@@ -274,9 +271,10 @@ mod tests {
         let env = alloc_env();
         assert_eq!(set_attr(env, 12345, 0), SQL_ERROR);
         let env_ref = unsafe { &*(env as *const EnvHandle) };
-        let recs = env_ref.header.diag_records.lock().unwrap();
-        assert_eq!(recs.len(), 1);
-        assert_eq!(&recs[0].sql_state, b"HY092");
+        let state = env_ref.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(&state.diag_records[0].sql_state, b"HY092");
+        drop(state);
         free_env(env);
     }
 
@@ -287,12 +285,12 @@ mod tests {
         let env = alloc_env();
         assert_eq!(set_attr(env, SQL_ATTR_ODBC_VERSION, 9999), SQL_ERROR);
         let env_ref = unsafe { &*(env as *const EnvHandle) };
-        assert_eq!(env_ref.header.diag_records.lock().unwrap().len(), 1);
+        assert_eq!(env_ref.inner.lock().unwrap().diag_records.len(), 1);
         assert_eq!(
             set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80),
             SQL_SUCCESS
         );
-        assert!(env_ref.header.diag_records.lock().unwrap().is_empty());
+        assert!(env_ref.inner.lock().unwrap().diag_records.is_empty());
         free_env(env);
     }
 }

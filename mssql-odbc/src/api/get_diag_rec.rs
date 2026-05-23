@@ -100,14 +100,14 @@ unsafe fn snapshot_record(
         ($ty:ty, $expected:expr) => {{
             let h = unsafe { handle_from_raw::<$ty>(handle) };
             debug_assert_eq!(
-                h.header.object_type, $expected,
+                h.object_type, $expected,
                 "SQLGetDiagRecW: handle type tag mismatch",
             );
-            let Ok(recs) = h.header.diag_records.lock() else {
-                error!("SQLGetDiagRecW: diag mutex poisoned");
+            let Ok(state) = h.inner.lock() else {
+                error!("SQLGetDiagRecW: handle mutex poisoned");
                 return Err(SQL_ERROR);
             };
-            Ok(recs.get(idx).cloned())
+            Ok(state.diag_records.get(idx).cloned())
         }};
     }
 
@@ -199,10 +199,10 @@ mod tests {
     fn push_diag(env: SqlHandle, sql_state: [u8; 5], native: i32, msg: &str) {
         let env_ref = unsafe { &*(env as *const EnvHandle) };
         env_ref
-            .header
-            .diag_records
+            .inner
             .lock()
             .unwrap()
+            .diag_records
             .push(DiagRecord::new(sql_state, native, msg));
     }
 

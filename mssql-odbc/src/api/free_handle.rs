@@ -64,7 +64,7 @@ pub(crate) unsafe fn sql_free_handle(handle_type: SqlSmallInt, handle: SqlHandle
 unsafe fn free_env(handle: SqlHandle) -> SqlReturn {
     let env = unsafe { handle_from_raw::<EnvHandle>(handle) };
     debug_assert_eq!(
-        env.header.object_type,
+        env.object_type,
         HandleType::Env,
         "SQLFreeHandle(ENV): handle is not an ENV"
     );
@@ -92,7 +92,7 @@ unsafe fn free_env(handle: SqlHandle) -> SqlReturn {
 unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
     let dbc = unsafe { handle_from_raw::<DbcHandle>(handle) };
     debug_assert_eq!(
-        dbc.header.object_type,
+        dbc.object_type,
         HandleType::Dbc,
         "SQLFreeHandle(DBC): handle is not a DBC"
     );
@@ -130,7 +130,7 @@ unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
 unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
     let stmt = unsafe { handle_from_raw::<StmtHandle>(handle) };
     debug_assert_eq!(
-        stmt.header.object_type,
+        stmt.object_type,
         HandleType::Stmt,
         "SQLFreeHandle(STMT): handle is not a STMT"
     );

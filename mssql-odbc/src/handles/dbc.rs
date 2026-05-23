@@ -4,7 +4,7 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use super::{HandleHeader, HandleType, HasHeader};
+use super::{DiagRecord, HandleType, HasObjectType};
 
 /// Connection state machine — tracks whether the DBC is connected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,16 +16,15 @@ pub(crate) enum ConnectionState {
     Connected,
 }
 
-/// Connection handle — equivalent to msodbcsql's `struct tagDBC`.
+/// Connection handle — Rust port of msodbcsql's `struct tagDBC : tagOBJBASE`.
 ///
-/// Created by `SQLAllocHandle(SQL_HANDLE_DBC, henv, ...)`.
-/// Holds a back-pointer to the parent environment and connection-level state.
-///
-/// Thread-safety: The `inner` mutex protects mutable state, mirroring
-/// msodbcsql's `csDbc` critical section.
+/// Created by `SQLAllocHandle(SQL_HANDLE_DBC, henv, ...)`. Holds a back-pointer
+/// to the parent ENV and connection-level state. Field layout mirrors `tagDBC`:
+/// inherited `tagOBJBASE.ObjectType` first (lock-free), then the lock
+/// (`inner` ≈ `csDbc`) covering inherited `errinfo` plus derived fields.
 #[derive(Debug)]
 pub(crate) struct DbcHandle {
-    pub(crate) header: HandleHeader,
+    pub(crate) object_type: HandleType,
     /// Back-pointer to the parent ENV handle. Stored as opaque pointer because
     /// the ENV owns the DBC's lifetime, not the other way around.
     /// Mirrors msodbcsql's `lpdbc->lpenv`.
@@ -43,9 +42,13 @@ pub(crate) struct DbcHandle {
 unsafe impl Send for DbcHandle {}
 unsafe impl Sync for DbcHandle {}
 
-/// Mutable state within a connection handle, protected by the mutex.
+/// Fields of `tagDBC` protected by `csDbc`. Layout mirrors C++ inheritance:
+/// inherited `tagOBJBASE` fields first, then derived `tagDBC` fields.
 #[derive(Debug)]
 pub(crate) struct DbcState {
+    /// Inherited from `tagOBJBASE.errinfo` — see `EnvState::diag_records`.
+    pub(crate) diag_records: Vec<DiagRecord>,
+    // ---- derived tagDBC fields below ----
     #[allow(dead_code)]
     pub(crate) connection_state: ConnectionState,
     /// Active child STMT handles, mirroring msodbcsql's `lppllpstmt`.
@@ -57,9 +60,10 @@ pub(crate) struct DbcState {
 impl DbcHandle {
     pub(crate) fn new(parent_env: *mut c_void) -> Self {
         Self {
-            header: HandleHeader::new(HandleType::Dbc),
+            object_type: HandleType::Dbc,
             parent_env,
             inner: Mutex::new(DbcState {
+                diag_records: Vec::new(),
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
             }),
@@ -67,8 +71,8 @@ impl DbcHandle {
     }
 }
 
-impl HasHeader for DbcHandle {
-    fn header_mut(&mut self) -> &mut HandleHeader {
-        &mut self.header
+impl HasObjectType for DbcHandle {
+    fn object_type_mut(&mut self) -> &mut HandleType {
+        &mut self.object_type
     }
 }

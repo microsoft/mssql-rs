@@ -13,12 +13,16 @@ pub(crate) use env::OdbcVersion;
 pub(crate) use stmt::StmtHandle;
 
 use std::ffi::c_void;
-use std::sync::Mutex;
 
 use tracing::{debug, trace};
 
 /// Discriminant stored inside each handle for runtime type-checking.
 /// Mirrors msodbcsql's `OBJECTTYPE` enum — guards against misuse of freed or wrong-type handles.
+///
+/// Lives as a direct field on each `XxxHandle` (mirroring `tagOBJBASE::ObjectType`
+/// which is inlined into `tagENV` / `tagDBC` / `tagSTMT` via C++ inheritance).
+/// Read without taking the per-handle lock (msodbcsql reads `ObjectType` outside
+/// `csEnv`/`csDbc`/`csStmt`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 #[allow(dead_code)]
@@ -28,27 +32,6 @@ pub(crate) enum HandleType {
     Stmt = 3,
     Desc = 4,
     Invalid = 0xDEADBEEF,
-}
-
-/// Common header shared by all handle types. Equivalent to msodbcsql's `tagOBJBASE`.
-///
-/// `diag_records` mirrors msodbcsql's `errinfo.lperrdataFirst` linked list —
-/// one entry per error/warning posted on the handle, read back by
-/// `SQLGetDiagRec`. Cleared at the start of each API call on the handle
-/// (msodbcsql's `FreeErrors`).
-#[derive(Debug)]
-pub(crate) struct HandleHeader {
-    pub(crate) object_type: HandleType,
-    pub(crate) diag_records: Mutex<Vec<DiagRecord>>,
-}
-
-impl HandleHeader {
-    pub(crate) fn new(object_type: HandleType) -> Self {
-        Self {
-            object_type,
-            diag_records: Mutex::new(Vec::new()),
-        }
-    }
 }
 
 /// Converts a heap-allocated handle into an opaque `*mut c_void` for return through FFI.
@@ -98,18 +81,20 @@ pub(crate) unsafe fn handle_from_raw_mut<'a, T>(raw: *mut c_void) -> &'a mut T {
 /// # Safety
 /// Must only be called once per handle. The pointer is invalid after this call.
 #[allow(dead_code)]
-pub(crate) unsafe fn free_handle<T: HasHeader>(raw: *mut c_void) {
+pub(crate) unsafe fn free_handle<T: HasObjectType>(raw: *mut c_void) {
     if !raw.is_null() {
         let handle = unsafe { &mut *(raw as *mut T) };
-        let object_type = handle.header_mut().object_type;
+        let object_type = *handle.object_type_mut();
         debug!(?raw, ?object_type, "Freeing handle");
-        handle.header_mut().object_type = HandleType::Invalid;
+        *handle.object_type_mut() = HandleType::Invalid;
         let _ = unsafe { Box::from_raw(raw as *mut T) };
         trace!(?raw, "Handle freed");
     }
 }
 
-/// Trait for handle types that embed a `HandleHeader`.
-pub(crate) trait HasHeader {
-    fn header_mut(&mut self) -> &mut HandleHeader;
+/// Trait for handle types that expose the lock-free `ObjectType` field
+/// (used by `free_handle` to stamp `Invalid` on free for use-after-free
+/// detection — mirrors msodbcsql setting `ObjectType = LPINVALIDType`).
+pub(crate) trait HasObjectType {
+    fn object_type_mut(&mut self) -> &mut HandleType;
 }

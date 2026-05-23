@@ -4,7 +4,7 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use super::{HandleHeader, HandleType, HasHeader};
+use super::{DiagRecord, HandleType, HasObjectType};
 use crate::api::odbc_types::{SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
 
 /// ODBC environment attributes.
@@ -31,25 +31,38 @@ impl TryFrom<u32> for OdbcVersion {
     }
 }
 
-/// Environment handle — equivalent to msodbcsql's `struct tagENV`.
+/// Environment handle — Rust port of msodbcsql's `struct tagENV : tagOBJBASE`.
 ///
-/// One ENV is typically allocated per application. It owns connection handles
-/// and stores environment-level attributes (ODBC version, connection pooling mode).
+/// One ENV is typically allocated per application. Owns connection handles and
+/// environment attributes (ODBC version, connection pooling mode).
 ///
-/// Thread-safety: The `inner` mutex protects mutable state. msodbcsql uses
-/// `csEnv` (Unix) or relies on the Driver Manager (Windows) for serialization.
-/// We always protect with a mutex for safety regardless of platform.
+/// Field order mirrors msodbcsql's `tagENV`:
+/// - `object_type`  — inherited `tagOBJBASE.ObjectType`, read lock-free
+/// - `inner`        — Rust analog of `tagENV.csEnv`; the `Mutex<T>` covers the
+///   inherited `tagOBJBASE.errinfo` (as `EnvState::diag_records`) plus the
+///   derived `tagENV` fields (`dwOptionsE`, `lppllpdbc`, ...). One lock per
+///   handle, matching msodbcsql.
+///
+/// Rust note: `Mutex<T>` must wrap a `T`, so the locked fields live inside the
+/// nested `EnvState` struct rather than being peer members of `EnvHandle` the
+/// way they're peer members of `tagENV`. Everything else matches msodbcsql.
 #[derive(Debug)]
 pub(crate) struct EnvHandle {
     #[allow(dead_code)]
-    pub(crate) header: HandleHeader,
+    pub(crate) object_type: HandleType,
     #[allow(dead_code)]
     pub(crate) inner: Mutex<EnvState>,
 }
 
-/// Mutable state within an environment handle, protected by the mutex.
+/// Fields of `tagENV` protected by `csEnv`. Layout mirrors C++ inheritance:
+/// inherited `tagOBJBASE` fields first, then derived `tagENV` fields.
 #[derive(Debug)]
 pub(crate) struct EnvState {
+    /// Inherited from `tagOBJBASE.errinfo` — diagnostic records read by
+    /// `SQLGetDiagRec`, cleared at the start of each API call (msodbcsql's
+    /// `FreeErrors`).
+    pub(crate) diag_records: Vec<DiagRecord>,
+    // ---- derived tagENV fields below ----
     #[allow(dead_code)]
     pub(crate) odbc_version: OdbcVersion,
     #[allow(dead_code)]
@@ -61,8 +74,9 @@ pub(crate) struct EnvState {
 impl EnvHandle {
     pub(crate) fn new() -> Self {
         Self {
-            header: HandleHeader::new(HandleType::Env),
+            object_type: HandleType::Env,
             inner: Mutex::new(EnvState {
+                diag_records: Vec::new(),
                 odbc_version: OdbcVersion::Unset,
                 output_nts: true, // SQL_ATTR_OUTPUT_NTS defaults to SQL_TRUE
                 connections: Vec::new(),
@@ -71,8 +85,8 @@ impl EnvHandle {
     }
 }
 
-impl HasHeader for EnvHandle {
-    fn header_mut(&mut self) -> &mut HandleHeader {
-        &mut self.header
+impl HasObjectType for EnvHandle {
+    fn object_type_mut(&mut self) -> &mut HandleType {
+        &mut self.object_type
     }
 }
