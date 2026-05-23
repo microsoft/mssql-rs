@@ -20,9 +20,7 @@ use crate::api::odbc_types::{
     SQL_SQLSTATE_SIZE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlReturn,
     SqlSmallInt, SqlWChar,
 };
-use crate::handles::{
-    DbcHandle, DiagRecord, EnvHandle, HandleType, StmtHandle, handle_from_raw,
-};
+use crate::handles::{DbcHandle, DiagRecord, EnvHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Implementation of [`SQLGetDiagRecW`](super::exports::SQLGetDiagRecW).
 ///
