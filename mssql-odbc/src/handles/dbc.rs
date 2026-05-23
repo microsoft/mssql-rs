@@ -18,10 +18,7 @@ pub(crate) enum ConnectionState {
 
 /// Connection handle — Rust port of msodbcsql's `struct tagDBC : tagOBJBASE`.
 ///
-/// Created by `SQLAllocHandle(SQL_HANDLE_DBC, henv, ...)`. Holds a back-pointer
-/// to the parent ENV and connection-level state. Field layout mirrors `tagDBC`:
-/// inherited `tagOBJBASE.ObjectType` first (lock-free), then the lock
-/// (`inner` ≈ `csDbc`) covering inherited `errinfo` plus derived fields.
+/// `object_type` is read lock-free; `inner` (`≈ csDbc`) protects all mutable state.
 #[repr(C)]
 #[derive(Debug)]
 pub(crate) struct DbcHandle {
@@ -42,11 +39,9 @@ pub(crate) struct DbcHandle {
 unsafe impl Send for DbcHandle {}
 unsafe impl Sync for DbcHandle {}
 
-/// Fields of `tagDBC` protected by `csDbc`. Layout mirrors C++ inheritance:
-/// inherited `tagOBJBASE` fields first, then derived `tagDBC` fields.
+/// Mutable state within a connection handle, protected by `inner`.
 #[derive(Debug)]
 pub(crate) struct DbcState {
-    /// Inherited from `tagOBJBASE.errinfo` — see `EnvState::diag_records`.
     pub(crate) diag_records: Vec<DiagRecord>,
     // ---- derived tagDBC fields below ----
     #[allow(dead_code)]

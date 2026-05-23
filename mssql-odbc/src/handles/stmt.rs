@@ -8,9 +8,7 @@ use super::{DiagRecord, HandleType, HasObjectType};
 
 /// Statement handle — Rust port of msodbcsql's `struct tagSTMT : tagOBJBASE`.
 ///
-/// Created by `SQLAllocHandle(SQL_HANDLE_STMT, hdbc, ...)`. Field layout mirrors
-/// `tagSTMT`: inherited `ObjectType` first (lock-free), then the lock
-/// (`inner` ≈ `csStmt`) covering inherited `errinfo` plus derived fields.
+/// `object_type` is read lock-free; `inner` (`≈ csStmt`) protects all mutable state.
 #[repr(C)]
 #[derive(Debug)]
 pub(crate) struct StmtHandle {
@@ -22,11 +20,9 @@ pub(crate) struct StmtHandle {
     pub(crate) inner: Mutex<StmtState>,
 }
 
-/// Fields of `tagSTMT` protected by `csStmt`. Layout mirrors C++ inheritance:
-/// inherited `tagOBJBASE` fields first, then derived `tagSTMT` fields.
+/// Mutable state within a statement handle, protected by `inner`.
 #[derive(Debug)]
 pub(crate) struct StmtState {
-    /// Inherited from `tagOBJBASE.errinfo` — see `EnvState::diag_records`.
     pub(crate) diag_records: Vec<DiagRecord>,
     // ---- derived tagSTMT fields below ----
     // TODO: statement attributes (cursor type, concurrency, etc.) and execution state

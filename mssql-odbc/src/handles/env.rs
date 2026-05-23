@@ -33,19 +33,7 @@ impl TryFrom<u32> for OdbcVersion {
 
 /// Environment handle — Rust port of msodbcsql's `struct tagENV : tagOBJBASE`.
 ///
-/// One ENV is typically allocated per application. Owns connection handles and
-/// environment attributes (ODBC version, connection pooling mode).
-///
-/// Field order mirrors msodbcsql's `tagENV`:
-/// - `object_type`  — inherited `tagOBJBASE.ObjectType`, read lock-free
-/// - `inner`        — Rust analog of `tagENV.csEnv`; the `Mutex<T>` covers the
-///   inherited `tagOBJBASE.errinfo` (as `EnvState::diag_records`) plus the
-///   derived `tagENV` fields (`dwOptionsE`, `lppllpdbc`, ...). One lock per
-///   handle, matching msodbcsql.
-///
-/// Rust note: `Mutex<T>` must wrap a `T`, so the locked fields live inside the
-/// nested `EnvState` struct rather than being peer members of `EnvHandle` the
-/// way they're peer members of `tagENV`. Everything else matches msodbcsql.
+/// `object_type` is read lock-free; `inner` (`≈ csEnv`) protects all mutable state.
 #[repr(C)]
 #[derive(Debug)]
 pub(crate) struct EnvHandle {
@@ -53,13 +41,9 @@ pub(crate) struct EnvHandle {
     pub(crate) inner: Mutex<EnvState>,
 }
 
-/// Fields of `tagENV` protected by `csEnv`. Layout mirrors C++ inheritance:
-/// inherited `tagOBJBASE` fields first, then derived `tagENV` fields.
+/// Mutable state within an environment handle, protected by `inner`.
 #[derive(Debug)]
 pub(crate) struct EnvState {
-    /// Inherited from `tagOBJBASE.errinfo` — diagnostic records read by
-    /// `SQLGetDiagRec`, cleared at the start of each API call (msodbcsql's
-    /// `FreeErrors`).
     pub(crate) diag_records: Vec<DiagRecord>,
     // ---- derived tagENV fields below ----
     #[allow(dead_code)]

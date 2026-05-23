@@ -18,17 +18,13 @@ use tracing::{debug, trace};
 
 /// Discriminant stored inside each handle for runtime type-checking.
 /// Mirrors msodbcsql's `OBJECTTYPE` enum — guards against misuse of freed or wrong-type handles.
-///
-/// Lives as a direct field on each `XxxHandle` (mirroring `tagOBJBASE::ObjectType`
-/// which is inlined into `tagENV` / `tagDBC` / `tagSTMT` via C++ inheritance).
-/// Read without taking the per-handle lock (msodbcsql reads `ObjectType` outside
-/// `csEnv`/`csDbc`/`csStmt`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub(crate) enum HandleType {
     Env = 1,
     Dbc = 2,
     Stmt = 3,
+    #[allow(dead_code)]
     Desc = 4,
     /// Use-after-free poison value, matching msodbcsql's invalid ObjectType stamp.
     Invalid = 0xDEADBEEF,
