@@ -100,11 +100,13 @@ pub enum Error {
     #[error("Protocol Error: {0}")]
     ProtocolError(String),
 
-    /// TLS/SSL library error.
+    /// TLS/SSL library error (native-tls backend).
+    #[cfg(feature = "native-tls-backend")]
     #[error("TLS Error: {0}")]
     TlsError(#[from] native_tls::Error),
 
-    /// TLS handshake failed with host/SAN details.
+    /// TLS handshake failed with host/SAN details (native-tls backend).
+    #[cfg(feature = "native-tls-backend")]
     #[error(
         "TLS handshake failed while connecting to '{expected_host}': {source}. Certificate SANs: {cert_sans}"
     )]
@@ -116,6 +118,16 @@ pub enum Error {
         /// Subject Alternative Names found on the certificate.
         cert_sans: String,
     },
+
+    /// TLS/SSL library error (rustls backend).
+    #[cfg(feature = "rustls-backend")]
+    #[error("TLS Error (rustls): {0}")]
+    RustlsError(#[from] rustls::Error),
+
+    /// TLS I/O error during handshake (rustls backend).
+    #[cfg(feature = "rustls-backend")]
+    #[error("TLS handshake I/O error: {0}")]
+    RustlsIoError(String),
 
     /// Operation exceeded its deadline.
     #[error("Timeout Error: {0}")]

@@ -1,5 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+#![cfg(feature = "native-tls-backend")]
 
 //! Integration tests using the mock TDS server
 

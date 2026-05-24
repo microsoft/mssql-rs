@@ -5,7 +5,10 @@ use crate::connection::client_context::{IPAddressPreference, TransportContext};
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
 use crate::connection::transport::parallel_connect::{ParallelConnectConfig, parallel_connect};
+#[cfg(feature = "native-tls-backend")]
 use crate::connection::transport::ssl_handler::SslHandler;
+#[cfg(feature = "rustls-backend")]
+use crate::connection::transport::ssl_handler_rustls::SslHandler;
 use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
 use crate::core::{
     CancelHandle, EncryptionOptions, EncryptionSetting, NegotiatedEncryptionSetting, TdsResult,
@@ -607,24 +610,16 @@ impl NetworkTransport {
         // For TDS 7.4, wrap the stream in TlsOverTdsStream before TLS handshake
         // This is required because TLS packets must be framed within TDS packets during the handshake
         let base_stream: Box<dyn Stream> = if self.use_tds74_tls_wrapping {
-            #[cfg(target_os = "macos")]
-            {
-                // On macOS, wrap in BufferedTdsStream to handle Security.framework's
-                // multiple small writes during TLS handshake. Security.framework makes
-                // separate poll_write calls for ClientKeyExchange, ChangeCipherSpec, and
-                // Finished messages, but SQL Server expects them as a single TDS packet.
-                let tls_over_tds =
-                    crate::connection::transport::ssl_handler::TlsOverTdsStream::new(base_stream);
-                Box::new(
-                    crate::connection::transport::ssl_handler::BufferedTdsStream::new(tls_over_tds),
-                )
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Box::new(
-                    crate::connection::transport::ssl_handler::TlsOverTdsStream::new(base_stream),
-                )
-            }
+            // BufferedTdsStream batches writes during the TLS handshake and flushes
+            // them on poll_read. This is required because some TLS implementations
+            // (rustls, macOS Security.framework) make multiple small poll_write calls
+            // for ClientKeyExchange, ChangeCipherSpec, and Finished messages, but SQL
+            // Server expects the entire client flight as a single TDS message.
+            let tls_over_tds =
+                crate::connection::transport::tls_over_tds::TlsOverTdsStream::new(base_stream);
+            Box::new(
+                crate::connection::transport::tls_over_tds::BufferedTdsStream::new(tls_over_tds),
+            )
         } else {
             base_stream
         };
@@ -834,9 +829,16 @@ impl NetworkTransport {
 
         // Read more data if we don't have enough for the header
         while bytes_available < PacketWriter::PACKET_HEADER_SIZE {
-            let bytes_read = stream
+            let bytes_read = match stream
                 .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
-                .await?;
+                .await
+            {
+                Ok(n) => n,
+                // rustls returns UnexpectedEof when the peer closes without TLS close_notify.
+                // Treat this the same as a clean EOF (bytes_read == 0).
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+                Err(e) => return Err(e.into()),
+            };
             if bytes_read == 0 {
                 return Err(crate::error::Error::ConnectionClosed(
                     "Connection closed by server while reading TDS packet header".to_string(),
@@ -879,9 +881,14 @@ impl NetworkTransport {
 
         // Keep reading until we have the complete packet in memory.
         while bytes_available < packet_size_from_header {
-            let bytes_read = stream
+            let bytes_read = match stream
                 .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
-                .await?;
+                .await
+            {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+                Err(e) => return Err(e.into()),
+            };
             if bytes_read == 0 {
                 return Err(crate::error::Error::ConnectionClosed(
                     "Connection closed by server while reading TDS packet payload".to_string(),
@@ -1395,7 +1402,10 @@ pub(crate) mod tests {
     use super::*; // Brings in NetworkTransport, SslHandler, StreamRecoverer, etc.
     use crate::connection::client_context::ClientContext;
     use crate::connection::transport::network_transport::Stream;
+    #[cfg(feature = "native-tls-backend")]
     use crate::connection::transport::ssl_handler::SslHandler;
+    #[cfg(feature = "rustls-backend")]
+    use crate::connection::transport::ssl_handler_rustls::SslHandler;
     use crate::core::EncryptionOptions;
     use bytes::Bytes;
     use futures::SinkExt;

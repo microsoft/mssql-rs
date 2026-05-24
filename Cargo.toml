@@ -4,7 +4,7 @@ members = ["mssql-tds", "mssql-js", "mssql-tds-cli", "mssql-mock-tds"]
 exclude = ["mssql-py-core", "mssql-mock-tds-py"]
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(feature, values("sspi", "gssapi", "integrated-auth"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(feature, values("sspi", "gssapi", "integrated-auth", "native-tls-backend", "rustls-backend"))'] }
 
 [workspace.lints.clippy]
 # Don't Panic - prevent panics from unwraps and unsafe slicing or indexing

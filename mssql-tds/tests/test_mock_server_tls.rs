@@ -8,6 +8,7 @@
 //! (strict/direct TLS) modes.
 //!
 //! **Prerequisites:** Before running these tests, generate the test certificates:
+#![cfg(feature = "native-tls-backend")]
 //! ```bash
 //! cd mssql-tds/tests/test_certificates && ./generate_certs.sh
 //! ```

@@ -9,6 +9,7 @@
 
 use crate::core::TdsResult;
 use crate::error::Error;
+#[cfg(feature = "native-tls-backend")]
 use native_tls::Certificate;
 use std::fs;
 use std::path::Path;
@@ -16,7 +17,6 @@ use tracing::{debug, info};
 
 /// Load a certificate from a file path and convert to DER format.
 /// Supports both DER and PEM encoded X.509 certificates.
-/// Uses native-tls Certificate API for automatic format detection and conversion.
 ///
 /// # Arguments
 /// * `path` - Path to the certificate file
@@ -41,28 +41,78 @@ pub fn load_certificate_from_file(path: &Path) -> TdsResult<Vec<u8>> {
     })?;
 
     // Try to parse as PEM first, fall back to DER
-    // native-tls handles the format detection and parsing
-    let certificate = Certificate::from_pem(&cert_data)
-        .or_else(|_| {
-            debug!("Not PEM format, trying DER");
-            Certificate::from_der(&cert_data)
-        })
-        .map_err(|_| Error::InvalidCertificateFormat {
-            path: path.to_path_buf(),
-        })?;
+    #[cfg(feature = "native-tls-backend")]
+    {
+        let certificate = Certificate::from_pem(&cert_data)
+            .or_else(|_| {
+                debug!("Not PEM format, trying DER");
+                Certificate::from_der(&cert_data)
+            })
+            .map_err(|_| Error::InvalidCertificateFormat {
+                path: path.to_path_buf(),
+            })?;
 
-    // Convert to DER format for binary comparison
-    let der_data = certificate
-        .to_der()
-        .map_err(|_| Error::InvalidCertificateFormat {
-            path: path.to_path_buf(),
-        })?;
+        // Convert to DER format for binary comparison
+        let der_data = certificate
+            .to_der()
+            .map_err(|_| Error::InvalidCertificateFormat {
+                path: path.to_path_buf(),
+            })?;
 
-    info!(
-        "Successfully loaded certificate from: {path:?} ({} bytes)",
-        der_data.len()
-    );
-    Ok(der_data)
+        info!(
+            "Successfully loaded certificate from: {path:?} ({} bytes)",
+            der_data.len()
+        );
+        return Ok(der_data);
+    }
+
+    #[cfg(feature = "rustls-backend")]
+    {
+        // Try PEM first
+        if let Some(der_data) = try_load_pem_certificate(&cert_data) {
+            info!(
+                "Successfully loaded PEM certificate from: {path:?} ({} bytes)",
+                der_data.len()
+            );
+            return Ok(der_data);
+        }
+
+        // Fall back to DER (raw bytes are already DER-encoded)
+        // Validate it's a valid DER certificate by attempting to parse
+        if cert_data.first() == Some(&0x30) {
+            // 0x30 = ASN.1 SEQUENCE tag, basic DER validation
+            info!(
+                "Successfully loaded DER certificate from: {path:?} ({} bytes)",
+                cert_data.len()
+            );
+            return Ok(cert_data);
+        }
+
+        return Err(Error::InvalidCertificateFormat {
+            path: path.to_path_buf(),
+        });
+    }
+
+    #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
+    {
+        Err(Error::ImplementationError(
+            "No TLS backend enabled".to_string(),
+        ))
+    }
+}
+
+/// Try to parse PEM data and extract the first certificate as DER.
+#[cfg(feature = "rustls-backend")]
+fn try_load_pem_certificate(data: &[u8]) -> Option<Vec<u8>> {
+    use rustls_pemfile::certs;
+    use std::io::Cursor;
+
+    let mut reader = Cursor::new(data);
+    let certs_result: Result<Vec<_>, _> = certs(&mut reader).collect();
+    match certs_result {
+        Ok(certs) if !certs.is_empty() => Some(certs[0].to_vec()),
+        _ => None,
+    }
 }
 
 /// Check if a certificate has expired.

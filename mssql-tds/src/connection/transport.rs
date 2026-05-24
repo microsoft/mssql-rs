@@ -12,7 +12,13 @@ pub(crate) mod named_pipes;
 pub mod network_transport;
 /// Parallel TCP connect for MultiSubnetFailover.
 pub mod parallel_connect;
-/// SSL/TLS stream handling.
+/// TLS-backend-agnostic TDS/TLS framing (TlsOverTdsStream).
+pub(crate) mod tls_over_tds;
+/// SSL/TLS stream handling (native-tls backend).
+#[cfg(feature = "native-tls-backend")]
 pub mod ssl_handler;
+/// SSL/TLS stream handling (rustls backend).
+#[cfg(feature = "rustls-backend")]
+pub mod ssl_handler_rustls;
 /// High-level TDS transport abstraction.
 pub mod tds_transport;

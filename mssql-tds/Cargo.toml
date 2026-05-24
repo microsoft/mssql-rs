@@ -9,13 +9,16 @@ keywords = ["sql-server", "tds", "mssql", "database", "async"]
 categories = ["database", "network-programming"]
 
 [features]
-default = ["integrated-auth"]
+default = ["integrated-auth", "native-tls-backend"]
 # Windows SSPI (Security Support Provider Interface) for integrated authentication
 sspi = []
 # Unix GSSAPI (Kerberos) for integrated authentication
 gssapi = []
 # Enable both SSPI and GSSAPI for cross-platform integrated authentication
 integrated-auth = ["sspi", "gssapi"]
+# TLS backend selection (exactly one must be enabled)
+native-tls-backend = ["dep:native-tls", "dep:tokio-native-tls"]
+rustls-backend = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs", "dep:webpki-roots"]
 
 
 [lints]
@@ -24,8 +27,14 @@ workspace = true
 [dependencies]
 async-trait = "0.1.89"
 tokio = { version = "1.48.0", features = ["full"] }
-tokio-native-tls = "0.3.1"
-native-tls = { version = "0.2.18", features = ["alpn"] }
+tokio-native-tls = { version = "0.3.1", optional = true }
+native-tls = { version = "0.2.18", features = ["alpn"], optional = true }
+# rustls TLS backend (optional)
+tokio-rustls = { version = "0.26.4", optional = true }
+rustls = { version = "0.23.40", default-features = false, features = ["std", "tls12", "ring"], optional = true }
+rustls-pemfile = { version = "2.2.0", optional = true }
+rustls-native-certs = { version = "0.8.3", optional = true }
+webpki-roots = { version = "1.0.7", optional = true }
 futures = "0.3.31"
 byteorder = "1.5.0"
 tokio-util = { version = "0.7.17", features = ["full"] }
@@ -42,7 +51,6 @@ hostname = "0.4.2"
 # For LCID-based encoding conversion (TEXT/NTEXT reading)
 encoding_rs = "0.8"
 # For certificate expiry validation (ServerCertificate feature)
-# Note: native-tls handles PEM/DER parsing, x509-parser only for expiry check
 x509-parser = "0.18.0"
 # For DNS resolution (reverse DNS lookup for SPN canonicalization)
 dns-lookup = "2.0"
