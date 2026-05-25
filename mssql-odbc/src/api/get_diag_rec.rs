@@ -174,15 +174,21 @@ unsafe fn write_message(
         unsafe { text_length_ptr.write(len) };
     }
 
-    let truncated = if !message_text.is_null() && buffer_length > 0 {
-        let buf_len = usize::try_from(buffer_length).unwrap_or(0);
-        // Reserve one slot for the NUL terminator.
-        let copy_len = total.min(buf_len.saturating_sub(1));
-        for (i, ch) in message.encode_utf16().take(copy_len).enumerate() {
-            unsafe { message_text.add(i).write(ch) };
+    let truncated = if !message_text.is_null() {
+        if buffer_length <= 0 {
+            // Caller provided a buffer pointer but no space — cannot write any
+            // characters or the NUL terminator, so a non-empty message is truncated.
+            total > 0
+        } else {
+            let buf_len = usize::try_from(buffer_length).unwrap_or(0);
+            // Reserve one slot for the NUL terminator.
+            let copy_len = total.min(buf_len.saturating_sub(1));
+            for (i, ch) in message.encode_utf16().take(copy_len).enumerate() {
+                unsafe { message_text.add(i).write(ch) };
+            }
+            unsafe { message_text.add(copy_len).write(0) };
+            copy_len < total
         }
-        unsafe { message_text.add(copy_len).write(0) };
-        copy_len < total
     } else {
         // No output buffer: report length only; this is not truncation.
         false
@@ -304,6 +310,31 @@ mod tests {
         assert_eq!(utf16_to_string(&msg), "This me");
         // Full untruncated length is reported.
         assert_eq!(text_len, "This message is long".len() as SqlSmallInt);
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn zero_length_buffer_returns_success_with_info() {
+        let env = alloc_env();
+        push_diag(env, *b"HY024", 0, "Some message");
+
+        let mut state = [0u16; 6];
+        let mut msg = [0u16; 1]; // non-null but zero usable space
+        let mut text_len: SqlSmallInt = 0;
+        let ret = unsafe {
+            sql_get_diag_rec_w(
+                SQL_HANDLE_ENV,
+                env,
+                1,
+                state.as_mut_ptr(),
+                ptr::null_mut(),
+                msg.as_mut_ptr(),
+                0,
+                &mut text_len,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(text_len, "Some message".len() as SqlSmallInt);
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
