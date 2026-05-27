@@ -79,7 +79,14 @@ impl ActiveWriteState {
                 actual_payload_written
             }
         } else {
-            payload_written
+            // No header remaining — all bytes written are payload bytes.
+            // Cap by the current packet's remaining capacity.
+            let actual_payload_written =
+                std::cmp::min(payload_written, self.current_packet_bytes_remaining);
+            self.current_packet_bytes_remaining -= actual_payload_written;
+            self.payload_bytes_remaining -= actual_payload_written;
+            self.last_payload_written = actual_payload_written;
+            actual_payload_written
         }
     }
 
@@ -176,14 +183,12 @@ impl<S: Stream> AsyncRead for TlsOverTdsStream<S> {
                 // This might be a continuation of reading the header. An earlier loop iteration may have only
                 // partially retrieved the header. This function also may have returned pending.
                 // Use the bytes_of_packet_header_read field to pick up where we left off.
-                assert!(
-                    self.remaining_read_packet_payload_length < PacketWriter::PACKET_HEADER_SIZE
-                );
+                assert!(self.bytes_of_packet_header_read < PacketWriter::PACKET_HEADER_SIZE);
 
                 // Try to read the length of the header, potentially in chunks. If the read call returns Ok,
                 // but read_buffer.remaining() > 0, there's more of the header to read.
                 let mut read_buffer = ReadBuf::new(
-                    &mut packet_header_receive_bytes[self.remaining_read_packet_payload_length..],
+                    &mut packet_header_receive_bytes[self.bytes_of_packet_header_read..],
                 );
                 let header_read_result =
                     AsyncRead::poll_read(Pin::new(&mut self.wrapped_stream), cx, &mut read_buffer);
@@ -210,7 +215,7 @@ impl<S: Stream> AsyncRead for TlsOverTdsStream<S> {
                             // Update the cached read_buffer and returning pending so the caller will
                             // try to get more of the header.
                             debug!("Header bytes read {:?}", read_buffer.filled().len());
-                            self.bytes_of_packet_header_read -= read_buffer.filled().len();
+                            self.bytes_of_packet_header_read += read_buffer.filled().len();
                             continue;
                         } else {
                             // The whole header should have been read exactly.
@@ -318,7 +323,7 @@ impl<S: Stream> AsyncWrite for TlsOverTdsStream<S> {
                     let header_start_pos =
                         PacketWriter::PACKET_HEADER_SIZE - write_state.header_bytes_remaining;
                     slices.push(IoSlice::new(&packet_write_buffer[header_start_pos..]));
-                    slices.append(&mut Vec::from(bufs));
+                    slices.extend(bufs.iter().map(|b| IoSlice::new(b)));
                 } else {
                     // Find the correct position within the series of buffers to resume from.
                     let mut payload_starting_offset = write_state.last_payload_written;
@@ -464,10 +469,11 @@ impl BufferedTdsStream {
             let mut payload = self.buffer.take();
 
             let res = loop {
+                let pos = self.buffer_pos;
                 match AsyncWrite::poll_write(
                     Pin::new(&mut self.tls_over_tds_stream),
                     cx,
-                    &payload.as_ref().unwrap()[0..],
+                    &payload.as_ref().unwrap()[pos..],
                 ) {
                     Poll::Pending => break Poll::Pending,
                     Poll::Ready(Err(e)) => break Poll::Ready(Err(e)),

@@ -63,7 +63,7 @@ pub fn load_certificate_from_file(path: &Path) -> TdsResult<Vec<u8>> {
             "Successfully loaded certificate from: {path:?} ({} bytes)",
             der_data.len()
         );
-        return Ok(der_data);
+        Ok(der_data)
     }
 
     #[cfg(feature = "rustls-backend")]
@@ -78,19 +78,22 @@ pub fn load_certificate_from_file(path: &Path) -> TdsResult<Vec<u8>> {
         }
 
         // Fall back to DER (raw bytes are already DER-encoded)
-        // Validate it's a valid DER certificate by attempting to parse
-        if cert_data.first() == Some(&0x30) {
-            // 0x30 = ASN.1 SEQUENCE tag, basic DER validation
-            info!(
-                "Successfully loaded DER certificate from: {path:?} ({} bytes)",
-                cert_data.len()
-            );
-            return Ok(cert_data);
+        // Validate structurally by parsing with x509-parser
+        {
+            use x509_parser::prelude::FromDer;
+            use x509_parser::prelude::X509Certificate;
+            if X509Certificate::from_der(&cert_data).is_ok() {
+                info!(
+                    "Successfully loaded DER certificate from: {path:?} ({} bytes)",
+                    cert_data.len()
+                );
+                return Ok(cert_data);
+            }
         }
 
-        return Err(Error::InvalidCertificateFormat {
+        Err(Error::InvalidCertificateFormat {
             path: path.to_path_buf(),
-        });
+        })
     }
 
     #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]

@@ -22,7 +22,6 @@ use crate::core::{
     TdsResult,
 };
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct TlsValidationConfig {
     pub accept_invalid_certs: bool,
@@ -101,15 +100,30 @@ impl ServerCertVerifier for SkipHostnameVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, RustlsError> {
-        // Verify the cert chain but ignore the hostname
-        // We pass a dummy server name since we're skipping hostname verification
-        self.inner.verify_server_cert(
+        // Verify the cert chain but skip hostname verification by passing a
+        // dummy name that will not be checked against the certificate's SANs.
+        // We use "hostname.not" which is a syntactically-valid DNS name but
+        // will never match any real certificate SAN. However, since
+        // WebPkiServerVerifier validates both chain AND hostname, we cannot
+        // use it directly. Instead, we call verify_server_cert and if it
+        // fails only due to hostname mismatch, we still accept.
+        let dummy_name =
+            ServerName::try_from("hostname.verification.disabled").expect("valid DNS name");
+        match self.inner.verify_server_cert(
             end_entity,
             intermediates,
-            _server_name,
+            &dummy_name,
             ocsp_response,
             now,
-        )
+        ) {
+            Ok(verified) => Ok(verified),
+            Err(RustlsError::InvalidCertificate(rustls::CertificateError::NotValidForName)) => {
+                // Hostname mismatch is expected — we're intentionally skipping it.
+                // The chain itself was validated successfully.
+                Ok(ServerCertVerified::assertion())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn verify_tls12_signature(
@@ -191,11 +205,7 @@ fn build_client_config(validation: &TlsValidationConfig) -> TdsResult<ClientConf
 
         let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
             .build()
-            .map_err(|e| {
-                crate::error::Error::RustlsIoError(format!(
-                    "Failed to build WebPKI verifier: {e}"
-                ))
-            })?;
+            .map_err(|e| crate::error::Error::RustlsIoError(Box::new(e)))?;
         let verifier = SkipHostnameVerifier { inner };
         ClientConfig::builder()
             .dangerous()
@@ -366,10 +376,7 @@ impl SslHandler {
                 if validation.use_alpn {
                     match stream.get_ref().1.alpn_protocol() {
                         Some(proto) => {
-                            debug!(
-                                "Server negotiated ALPN: {}",
-                                String::from_utf8_lossy(proto)
-                            );
+                            debug!("Server negotiated ALPN: {}", String::from_utf8_lossy(proto));
                         }
                         None => {
                             debug!("Server did not negotiate an ALPN protocol");
@@ -418,10 +425,7 @@ impl SslHandler {
                     self.encryption_options.mode,
                     std::env::consts::OS,
                 );
-                Err(crate::error::Error::RustlsIoError(format!(
-                    "TLS handshake failed connecting to '{}': {}",
-                    host_name, e
-                )))
+                Err(crate::error::Error::RustlsIoError(Box::new(e)))
             }
         }
     }
@@ -643,7 +647,8 @@ mod tests {
             use_alpn: false,
         };
         // Full validation path: loads webpki-roots + native certs
-        let _config = build_client_config(&validation).expect("should build config with root certs");
+        let _config =
+            build_client_config(&validation).expect("should build config with root certs");
     }
 
     // ─── Config caching tests ───
@@ -658,7 +663,10 @@ mod tests {
         };
         let config1 = get_or_build_config(&validation).expect("should get config");
         let config2 = get_or_build_config(&validation).expect("should get config again");
-        assert!(Arc::ptr_eq(&config1, &config2), "cache should return the same Arc");
+        assert!(
+            Arc::ptr_eq(&config1, &config2),
+            "cache should return the same Arc"
+        );
     }
 
     #[test]
@@ -676,7 +684,10 @@ mod tests {
         };
         let config1 = get_or_build_config(&v1).expect("should get config1");
         let config2 = get_or_build_config(&v2).expect("should get config2");
-        assert!(!Arc::ptr_eq(&config1, &config2), "different configs should be different Arcs");
+        assert!(
+            !Arc::ptr_eq(&config1, &config2),
+            "different configs should be different Arcs"
+        );
     }
 
     // ─── AcceptAllCertVerifier tests ───
@@ -687,21 +698,22 @@ mod tests {
         // Create a dummy self-signed-like DER cert (just random bytes — verifier should not care)
         let dummy_cert = CertificateDer::from(vec![0u8; 128]);
         let server_name = ServerName::try_from("example.com").unwrap();
-        let result = verifier.verify_server_cert(
-            &dummy_cert,
-            &[],
-            &server_name,
-            &[],
-            UnixTime::now(),
+        let result =
+            verifier.verify_server_cert(&dummy_cert, &[], &server_name, &[], UnixTime::now());
+        assert!(
+            result.is_ok(),
+            "AcceptAllCertVerifier should accept any certificate"
         );
-        assert!(result.is_ok(), "AcceptAllCertVerifier should accept any certificate");
     }
 
     #[test]
     fn accept_all_verifier_returns_supported_schemes() {
         let verifier = AcceptAllCertVerifier;
         let schemes = verifier.supported_verify_schemes();
-        assert!(!schemes.is_empty(), "should report supported signature schemes");
+        assert!(
+            !schemes.is_empty(),
+            "should report supported signature schemes"
+        );
     }
 
     // ─── TlsValidationConfig equality / hashing tests ───

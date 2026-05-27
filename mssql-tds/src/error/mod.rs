@@ -127,7 +127,7 @@ pub enum Error {
     /// TLS I/O error during handshake (rustls backend).
     #[cfg(feature = "rustls-backend")]
     #[error("TLS handshake I/O error: {0}")]
-    RustlsIoError(String),
+    RustlsIoError(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// Operation exceeded its deadline.
     #[error("Timeout Error: {0}")]
