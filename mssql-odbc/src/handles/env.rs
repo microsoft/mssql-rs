@@ -4,8 +4,9 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use super::{DiagRecord, HandleType, HasObjectType};
+use super::{HandleType, HasObjectType};
 use crate::api::odbc_types::{SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
+use crate::error::DiagRecord;
 
 /// ODBC environment attributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,8 +40,7 @@ impl TryFrom<u32> for OdbcVersion {
 /// Thread-safety: The `inner` mutex protects mutable state. msodbcsql uses
 /// `csEnv` (Unix) or relies on the Driver Manager (Windows) for serialization.
 /// We always protect with a mutex for safety regardless of platform.
-/// `object_type` is read lock-free; `inner` (`≈ csEnv`) protects all mutable state.
-#[repr(C)]
+/// `object_type` is set once at construction and never mutated; `inner` (`≈ csEnv`) protects all mutable state.
 #[derive(Debug)]
 pub(crate) struct EnvHandle {
     pub(crate) object_type: HandleType,

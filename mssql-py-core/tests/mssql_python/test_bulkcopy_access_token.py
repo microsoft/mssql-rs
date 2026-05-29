@@ -191,7 +191,7 @@ class TestProcessConnectionString:
 
         conn_str = "Server=myserver;Database=mydb;Authentication=ActiveDirectoryInteractive"
         if platform.system().lower() != "windows":
-            _, attrs, auth_type, *_ = process_connection_string(conn_str)
+            _, attrs, auth_type = process_connection_string(conn_str)
             assert auth_type == "interactive"
             assert attrs is not None
             assert 1256 in attrs
@@ -201,7 +201,7 @@ class TestProcessConnectionString:
         from mssql_python.auth import process_connection_string
 
         conn_str = "Server=myserver;Database=mydb;Authentication=ActiveDirectoryDefault"
-        _, attrs, auth_type, *_ = process_connection_string(conn_str)
+        _, attrs, auth_type = process_connection_string(conn_str)
         assert auth_type == "default"
 
     @patch("mssql_python.auth.get_auth_token", return_value=b"\x00" * 8)
@@ -209,14 +209,14 @@ class TestProcessConnectionString:
         from mssql_python.auth import process_connection_string
 
         conn_str = "Server=myserver;Database=mydb;Authentication=ActiveDirectoryDeviceCode"
-        _, attrs, auth_type, *_ = process_connection_string(conn_str)
+        _, attrs, auth_type = process_connection_string(conn_str)
         assert auth_type == "devicecode"
 
     def test_no_auth_returns_none(self):
         from mssql_python.auth import process_connection_string
 
         conn_str = f"Server=myserver;Database=mydb;UID=sa;PWD={FAKE_PWD}"
-        _, attrs, auth_type, *_ = process_connection_string(conn_str)
+        _, attrs, auth_type = process_connection_string(conn_str)
         assert auth_type is None
         assert attrs is None
 
@@ -225,7 +225,7 @@ class TestProcessConnectionString:
         from mssql_python.auth import process_connection_string
 
         conn_str = f"Server=myserver;Database=mydb;UID=sa;PWD={FAKE_PWD};Authentication=ActiveDirectoryDefault"
-        processed, *_ = process_connection_string(conn_str)
+        processed, _, _ = process_connection_string(conn_str)
         lower = processed.lower()
         assert "uid=" not in lower
         assert "pwd=" not in lower
@@ -241,14 +241,14 @@ class TestProcessConnectionString:
             process_connection_string(12345)
 
     @patch("mssql_python.auth.get_auth_token", return_value=b"\x00" * 8)
-    def test_returns_four_tuple(self, _mock_token):
-        """process_connection_string returns a 4-tuple."""
+    def test_returns_three_tuple(self, _mock_token):
+        """process_connection_string always returns a 3-tuple."""
         from mssql_python.auth import process_connection_string
 
         result = process_connection_string(
             "Server=x;Database=y;Authentication=ActiveDirectoryDefault"
         )
-        assert len(result) == 4
+        assert len(result) == 3
 
 
 # ===========================================================================

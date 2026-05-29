@@ -2,12 +2,10 @@
 // Licensed under the MIT License.
 
 pub(crate) mod dbc;
-pub(crate) mod diag;
 mod env;
 mod stmt;
 
 pub(crate) use dbc::DbcHandle;
-pub(crate) use diag::DiagRecord;
 pub(crate) use env::EnvHandle;
 pub(crate) use env::OdbcVersion;
 pub(crate) use stmt::StmtHandle;
@@ -16,8 +14,9 @@ use std::ffi::c_void;
 
 use tracing::{debug, trace};
 
-/// Discriminant stored inside each handle for runtime type-checking.
-/// Mirrors msodbcsql's `OBJECTTYPE` enum — guards against misuse of freed or wrong-type handles.
+/// Discriminant stored inside each handle.
+/// Mirrors msodbcsql's `OBJECTTYPE` enum. Checked in debug builds via `debug_assert_eq!`;
+/// in release builds the DM is trusted to pass the correct handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub(crate) enum HandleType {

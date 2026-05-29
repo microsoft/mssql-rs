@@ -15,7 +15,8 @@ use crate::api::odbc_types::{
     SqlPointer, SqlReturn,
 };
 use crate::api::sqlstate::{SQLSTATE_HY024, SQLSTATE_HY092};
-use crate::handles::{DiagRecord, EnvHandle, HandleType, OdbcVersion, handle_from_raw};
+use crate::error::DiagRecord;
+use crate::handles::{EnvHandle, HandleType, OdbcVersion, handle_from_raw};
 
 /// Sets an attribute on an environment handle.
 ///
@@ -48,7 +49,10 @@ pub(crate) unsafe fn sql_set_env_attr(
             "SQLSetEnvAttr: input_handle is not an ENV handle"
         );
 
-        let mut state = env.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut state) = env.inner.lock() else {
+            error!("SQLSetEnvAttr: env mutex poisoned");
+            return SQL_ERROR;
+        };
 
         // Equivalent of msodbcsql `FreeErrors(lpEnv)` — clear any diagnostic
         // records left from a prior call before processing this one.

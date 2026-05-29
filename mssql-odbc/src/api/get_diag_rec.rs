@@ -20,7 +20,8 @@ use crate::api::odbc_types::{
     SQL_SQLSTATE_SIZE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlReturn,
     SqlSmallInt, SqlWChar,
 };
-use crate::handles::{DbcHandle, DiagRecord, EnvHandle, HandleType, StmtHandle, handle_from_raw};
+use crate::error::DiagRecord;
+use crate::handles::{DbcHandle, EnvHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Implementation of [`SQLGetDiagRecW`](super::exports::SQLGetDiagRecW).
 ///
@@ -88,7 +89,7 @@ pub(crate) unsafe fn sql_get_diag_rec_w(
 
 /// Clones the requested record out from under the handle's diag mutex.
 /// Returns `Ok(None)` if the index is past the end of the list.
-/// Returns `Err(rc)` for invalid-handle cases.
+/// Returns `Err(SQL_INVALID_HANDLE)` for unsupported handle types.
 ///
 /// TODO: For ODBC 3.x parity with msodbcsql, diagnostic records should be
 /// sorted by priority before indexing (msodbcsql `SortErrors`). We currently
@@ -102,40 +103,29 @@ unsafe fn snapshot_record(
     rec_number: SqlSmallInt,
 ) -> Result<Option<DiagRecord>, SqlReturn> {
     let idx = (rec_number - 1) as usize;
-    let expected_type = match handle_type {
-        SQL_HANDLE_ENV => HandleType::Env,
-        SQL_HANDLE_DBC => HandleType::Dbc,
-        SQL_HANDLE_STMT => HandleType::Stmt,
-        _ => {
-            error!(handle_type, "SQLGetDiagRecW: unsupported handle type");
-            return Err(SQL_INVALID_HANDLE);
-        }
-    };
-
-    // All driver handles start with `HandleType` at offset 0.
-    let actual_type = unsafe { (handle as *const HandleType).read() };
-    if actual_type != expected_type {
-        error!(
-            ?actual_type,
-            ?expected_type,
-            "SQLGetDiagRecW: handle type does not match requested handle_type"
-        );
-        return Err(SQL_INVALID_HANDLE);
-    }
 
     macro_rules! read_from {
-        ($ty:ty) => {{
+        ($ty:ty, $expected:expr) => {{
             let h = unsafe { handle_from_raw::<$ty>(handle) };
-            let state = h.inner.lock().unwrap_or_else(|e| e.into_inner());
+            debug_assert_eq!(
+                h.object_type, $expected,
+                "handle type mismatch — possible DM bug or memory corruption"
+            );
+            let Ok(state) = h.inner.lock() else {
+                return Err(SQL_ERROR);
+            };
             Ok(state.diag_records.get(idx).cloned())
         }};
     }
 
     match handle_type {
-        SQL_HANDLE_ENV => read_from!(EnvHandle),
-        SQL_HANDLE_DBC => read_from!(DbcHandle),
-        SQL_HANDLE_STMT => read_from!(StmtHandle),
-        _ => Err(SQL_INVALID_HANDLE),
+        SQL_HANDLE_ENV => read_from!(EnvHandle, HandleType::Env),
+        SQL_HANDLE_DBC => read_from!(DbcHandle, HandleType::Dbc),
+        SQL_HANDLE_STMT => read_from!(StmtHandle, HandleType::Stmt),
+        _ => {
+            error!(handle_type, "SQLGetDiagRecW: unsupported handle type");
+            Err(SQL_INVALID_HANDLE)
+        }
     }
 }
 
@@ -143,15 +133,15 @@ unsafe fn snapshot_record(
 /// so a zero-extending widen is sufficient — no `encode_utf16` needed.
 ///
 /// # Safety
-/// `sql_state` must be writable for `SQL_SQLSTATE_SIZE + 1` `SqlWChar`s or null.
-unsafe fn write_sql_state(sql_state: *mut SqlWChar, state: &[u8; SQL_SQLSTATE_SIZE]) {
-    if sql_state.is_null() {
+/// `dst` must be writable for `SQL_SQLSTATE_SIZE + 1` `SqlWChar`s or null.
+unsafe fn write_sql_state(dst: *mut SqlWChar, src: &[u8; SQL_SQLSTATE_SIZE]) {
+    if dst.is_null() {
         return;
     }
-    for (i, b) in state.iter().enumerate() {
-        unsafe { sql_state.add(i).write(SqlWChar::from(*b)) };
+    for (i, b) in src.iter().enumerate() {
+        unsafe { dst.add(i).write(SqlWChar::from(*b)) };
     }
-    unsafe { sql_state.add(SQL_SQLSTATE_SIZE).write(0) };
+    unsafe { dst.add(SQL_SQLSTATE_SIZE).write(0) };
 }
 
 /// Encodes `message` to UTF-16, writes it to `buffer` (NUL-terminated), and
@@ -159,22 +149,23 @@ unsafe fn write_sql_state(sql_state: *mut SqlWChar, state: &[u8; SQL_SQLSTATE_SI
 /// `SQL_SUCCESS_WITH_INFO` if the buffer was too small.
 ///
 /// # Safety
-/// `message_text` must be writable for `buffer_length` `SqlWChar`s or null.
+/// `message_dst` must be writable for `buffer_length` `SqlWChar`s or null.
 /// `text_length_ptr` must be writable for one `SqlSmallInt` or null.
 unsafe fn write_message(
-    message_text: *mut SqlWChar,
+    message_dst: *mut SqlWChar,
     buffer_length: SqlSmallInt,
     text_length_ptr: *mut SqlSmallInt,
-    message: &str,
+    message_src: &str,
 ) -> SqlReturn {
-    let total = message.encode_utf16().count();
+    let utf16: Vec<u16> = message_src.encode_utf16().collect();
+    let total = utf16.len();
 
     if !text_length_ptr.is_null() {
         let len = SqlSmallInt::try_from(total).unwrap_or(SqlSmallInt::MAX);
         unsafe { text_length_ptr.write(len) };
     }
 
-    let truncated = if !message_text.is_null() {
+    let truncated = if !message_dst.is_null() {
         if buffer_length <= 0 {
             // Caller provided a buffer pointer but no space — cannot write any
             // characters or the NUL terminator, so a non-empty message is truncated.
@@ -183,10 +174,10 @@ unsafe fn write_message(
             let buf_len = usize::try_from(buffer_length).unwrap_or(0);
             // Reserve one slot for the NUL terminator.
             let copy_len = total.min(buf_len.saturating_sub(1));
-            for (i, ch) in message.encode_utf16().take(copy_len).enumerate() {
-                unsafe { message_text.add(i).write(ch) };
+            for (i, ch) in utf16.iter().copied().take(copy_len).enumerate() {
+                unsafe { message_dst.add(i).write(ch) };
             }
-            unsafe { message_text.add(copy_len).write(0) };
+            unsafe { message_dst.add(copy_len).write(0) };
             copy_len < total
         }
     } else {
@@ -209,7 +200,8 @@ mod tests {
     use crate::api::alloc_handle::sql_alloc_handle;
     use crate::api::free_handle::sql_free_handle;
     use crate::api::odbc_types::{SQL_HANDLE_DESC, SQL_NULL_HANDLE};
-    use crate::handles::{DiagRecord, handle_from_raw};
+    use crate::error::DiagRecord;
+    use crate::handles::handle_from_raw;
 
     fn alloc_env() -> SqlHandle {
         let mut h: SqlHandle = ptr::null_mut();
@@ -396,25 +388,6 @@ mod tests {
     }
 
     #[test]
-    fn handle_type_mismatch_returns_invalid_handle() {
-        let env = alloc_env();
-        let ret = unsafe {
-            sql_get_diag_rec_w(
-                SQL_HANDLE_DBC,
-                env,
-                1,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                0,
-                ptr::null_mut(),
-            )
-        };
-        assert_eq!(ret, SQL_INVALID_HANDLE);
-        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
-    }
-
-    #[test]
     fn null_message_buffer_reports_length_without_truncation() {
         let env = alloc_env();
         push_diag(env, *b"HY024", 0, "Invalid attribute value");
@@ -459,6 +432,55 @@ mod tests {
         };
         assert_eq!(ret, SQL_NO_DATA);
         assert_eq!(text_len, 0);
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn loop_until_no_data_reads_all_records() {
+        let env = alloc_env();
+        push_diag(env, *b"HY000", 1, "first error");
+        push_diag(env, *b"HY001", 2, "second error");
+        push_diag(env, *b"HY024", 3, "third error");
+
+        let expected = [
+            ("HY000", 1i32, "first error"),
+            ("HY001", 2i32, "second error"),
+            ("HY024", 3i32, "third error"),
+        ];
+
+        let mut rec_number: SqlSmallInt = 1;
+        let mut records: Vec<(String, i32, String)> = Vec::new();
+        loop {
+            let mut state = [0u16; 6];
+            let mut native: SqlInteger = 0;
+            let mut msg = [0u16; 64];
+            let ret = unsafe {
+                sql_get_diag_rec_w(
+                    SQL_HANDLE_ENV,
+                    env,
+                    rec_number,
+                    state.as_mut_ptr(),
+                    &mut native,
+                    msg.as_mut_ptr(),
+                    msg.len() as SqlSmallInt,
+                    ptr::null_mut(),
+                )
+            };
+            if ret == SQL_NO_DATA {
+                break;
+            }
+            assert_eq!(ret, SQL_SUCCESS);
+            records.push((utf16_to_string(&state), native, utf16_to_string(&msg)));
+            rec_number += 1;
+        }
+
+        assert_eq!(records.len(), expected.len());
+        for (i, (exp_state, exp_native, exp_msg)) in expected.iter().enumerate() {
+            assert_eq!(&records[i].0, exp_state);
+            assert_eq!(records[i].1, *exp_native);
+            assert_eq!(&records[i].2, exp_msg);
+        }
+
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 }

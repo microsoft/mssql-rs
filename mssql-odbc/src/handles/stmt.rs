@@ -4,12 +4,12 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use super::{DiagRecord, HandleType, HasObjectType};
+use super::{HandleType, HasObjectType};
+use crate::error::DiagRecord;
 
 /// Statement handle — equivalent to msodbcsql's `struct tagSTMT`.
 ///
 /// Created by `SQLAllocHandle(SQL_HANDLE_STMT, hdbc, ...)`.
-#[repr(C)]
 #[derive(Debug)]
 pub(crate) struct StmtHandle {
     pub(crate) object_type: HandleType,

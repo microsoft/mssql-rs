@@ -137,6 +137,7 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
         unsafe { free_handle::<DbcHandle>(raw) };
         return SQL_ERROR;
     };
+    state.diag_records.clear();
     state.connections.push(raw);
 
     unsafe { output_handle.write(raw) };
@@ -180,6 +181,7 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
         unsafe { free_handle::<StmtHandle>(raw) };
         return SQL_ERROR;
     };
+    state.diag_records.clear();
     state.statements.push(raw);
 
     unsafe { output_handle.write(raw) };

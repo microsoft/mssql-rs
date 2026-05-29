@@ -4,7 +4,8 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use super::{DiagRecord, HandleType, HasObjectType};
+use super::{HandleType, HasObjectType};
+use crate::error::DiagRecord;
 
 /// Connection state machine — tracks whether the DBC is connected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +24,6 @@ pub(crate) enum ConnectionState {
 ///
 /// Thread-safety: The `inner` mutex protects mutable state, mirroring
 /// msodbcsql's `csDbc` critical section.
-#[repr(C)]
 #[derive(Debug)]
 pub(crate) struct DbcHandle {
     pub(crate) object_type: HandleType,
