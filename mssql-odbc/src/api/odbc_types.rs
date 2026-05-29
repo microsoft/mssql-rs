@@ -7,12 +7,13 @@
 use std::ffi::c_void;
 
 pub type SqlSmallInt = i16;
+pub type SqlUSmallInt = u16;
 pub type SqlInteger = i32;
 pub type SqlReturn = SqlSmallInt;
 pub type SqlHandle = *mut c_void;
+pub type SqlHWnd = *mut c_void;
 pub type SqlPointer = *mut c_void;
 /// UTF-16 code unit. ODBC `SQLWCHAR` is 16-bit on every supported platform
-/// (unixODBC, iODBC, and Windows DM all agree for the `W` API surface).
 pub type SqlWChar = u16;
 
 /// Length of a SQLSTATE string in characters (5 + NUL written separately).
@@ -47,3 +48,12 @@ pub const SQL_ATTR_ODBC_VERSION: SqlInteger = 200;
 pub const SQL_OV_ODBC2: u32 = 2;
 pub const SQL_OV_ODBC3: u32 = 3;
 pub const SQL_OV_ODBC3_80: u32 = 380;
+
+// DriverCompletion constants for SQLDriverConnect
+pub const SQL_DRIVER_NOPROMPT: SqlUSmallInt = 0;
+pub const SQL_DRIVER_COMPLETE: SqlUSmallInt = 1;
+pub const SQL_DRIVER_PROMPT: SqlUSmallInt = 2;
+pub const SQL_DRIVER_COMPLETE_REQUIRED: SqlUSmallInt = 3;
+
+// Null-terminated string sentinel
+pub const SQL_NTS: SqlSmallInt = -3;

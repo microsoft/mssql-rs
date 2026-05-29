@@ -129,6 +129,21 @@ cd build && ctest --output-on-failure -C Debug
 Tests that require a live SQL Server are automatically **skipped** when no
 connection is configured. Set environment variables to enable them:
 
+### Auto-detection
+
+When `ODBC_TEST_SERVER` is not set, `run_e2e.sh` probes `localhost:1433`. If a
+SQL Server is listening, it auto-configures `ODBC_TEST_SERVER=localhost`,
+`ODBC_TEST_UID=sa`, and resolves the password from `ODBC_TEST_PWD`,
+`SQL_PASSWORD`, or `mssql-tds/.env` (in that order).
+
+To bring up a local SQL Server in Docker:
+
+```bash
+./dev/dev-launchsql.sh
+```
+
+### Manual configuration
+
 | Variable | Required? | Default | Description |
 |---|---|---|---|
 | `ODBC_TEST_SERVER` | Yes (for connected tests) | *(none)* | SQL Server hostname or `host,port` |

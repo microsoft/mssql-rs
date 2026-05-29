@@ -24,7 +24,6 @@ pub(crate) struct StmtHandle {
 #[derive(Debug)]
 pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
-    // ---- derived tagSTMT fields below ----
     // TODO: statement attributes (cursor type, concurrency, etc.) and execution state
 }
 

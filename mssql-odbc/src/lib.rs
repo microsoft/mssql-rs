@@ -3,4 +3,5 @@
 
 pub mod api;
 mod error;
+mod connection;
 mod handles;

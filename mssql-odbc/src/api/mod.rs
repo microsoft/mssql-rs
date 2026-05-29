@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 mod alloc_handle;
+mod disconnect;
+mod driver_connect;
 mod free_handle;
 mod get_diag_rec;
 pub(crate) mod odbc_types;

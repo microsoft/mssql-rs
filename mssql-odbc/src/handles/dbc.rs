@@ -2,7 +2,10 @@
 // Licensed under the MIT License.
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use mssql_tds::connection::tds_client::TdsClient;
+use tokio::runtime::Runtime;
 
 use super::{HandleType, HasObjectType};
 use crate::error::DiagRecord;
@@ -13,6 +16,8 @@ use crate::error::DiagRecord;
 pub(crate) enum ConnectionState {
     /// Allocated but not connected (C2 in ODBC state table).
     Disconnected,
+    /// Connection attempt in progress - blocks concurrent SQLDriverConnect calls.
+    Connecting,
     /// Connected to a data source (C4/C5/C6 in ODBC state table).
     Connected,
 }
@@ -32,6 +37,9 @@ pub(crate) struct DbcHandle {
     /// Mirrors msodbcsql's `lpdbc->lpenv`.
     #[allow(dead_code)]
     pub(crate) parent_env: *mut c_void,
+    /// Shared Tokio runtime from the parent ENV.
+    pub(crate) runtime: Arc<Runtime>,
+    #[allow(dead_code)]
     pub(crate) inner: Mutex<DbcState>,
 }
 
@@ -52,19 +60,21 @@ pub(crate) struct DbcState {
     pub(crate) connection_state: ConnectionState,
     /// Active child STMT handles, mirroring msodbcsql's `lppllpstmt`.
     pub(crate) statements: Vec<*mut c_void>,
-    // TODO: connection string, login timeout, query timeout, autocommit mode, transaction state,
-    // server name, DB name, etc. — all mutable state that would be protected by the mutex.
+    /// Active TDS connection, present only when `connection_state == Connected`.
+    pub(crate) client: Option<TdsClient>,
 }
 
 impl DbcHandle {
-    pub(crate) fn new(parent_env: *mut c_void) -> Self {
+    pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<Runtime>) -> Self {
         Self {
             object_type: HandleType::Dbc,
             parent_env,
+            runtime,
             inner: Mutex::new(DbcState {
                 diag_records: Vec::new(),
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
+                client: None,
             }),
         }
     }

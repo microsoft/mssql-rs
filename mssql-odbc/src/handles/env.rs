@@ -2,7 +2,11 @@
 // Licensed under the MIT License.
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::io;
+use std::sync::{Arc, Mutex};
+
+use tokio::runtime::Runtime;
+use tracing::error;
 
 use super::{HandleType, HasObjectType};
 use crate::api::odbc_types::{SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
@@ -45,6 +49,9 @@ impl TryFrom<u32> for OdbcVersion {
 pub(crate) struct EnvHandle {
     pub(crate) object_type: HandleType,
     pub(crate) inner: Mutex<EnvState>,
+    /// Shared Tokio runtime for all connections on this ENV.
+    /// Wrapped in `Arc` so DBCs can hold a reference without lifetime issues.
+    pub(crate) runtime: Arc<Runtime>,
 }
 
 /// Mutable state within an environment handle, protected by `inner`.
@@ -61,8 +68,11 @@ pub(crate) struct EnvState {
 }
 
 impl EnvHandle {
-    pub(crate) fn new() -> Self {
-        Self {
+    pub(crate) fn new() -> io::Result<Self> {
+        let runtime = Runtime::new().inspect_err(|e| {
+            error!(%e, "failed to create Tokio runtime");
+        })?;
+        Ok(Self {
             object_type: HandleType::Env,
             inner: Mutex::new(EnvState {
                 diag_records: Vec::new(),
@@ -70,7 +80,8 @@ impl EnvHandle {
                 output_nts: true, // SQL_ATTR_OUTPUT_NTS defaults to SQL_TRUE
                 connections: Vec::new(),
             }),
-        }
+            runtime: Arc::new(runtime),
+        })
     }
 }
 

@@ -14,7 +14,6 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ODBC_CRATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-WORKSPACE_DIR="$(cd "$ODBC_CRATE_DIR/.." && pwd)"
 BUILD_TYPE="debug"
 TMPDIR_INI=""
 
@@ -39,11 +38,17 @@ else
     cargo build
 fi
 
-# Determine shared library path (workspace target dir).
+# Determine shared library path.
+# Cargo builds into the workspace root's target/ directory, which may differ
+# from the crate-local directory.  Use `cargo metadata` to resolve it.
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null \
+    || echo "$ODBC_CRATE_DIR/target")"
+
 if [[ "$(uname -s)" == "Darwin" ]]; then
-    DRIVER_PATH="$WORKSPACE_DIR/target/$BUILD_TYPE/libmsodbcsql18.dylib"
+    DRIVER_PATH="$TARGET_DIR/$BUILD_TYPE/libmsodbcsql18.dylib"
 else
-    DRIVER_PATH="$WORKSPACE_DIR/target/$BUILD_TYPE/libmsodbcsql18.so"
+    DRIVER_PATH="$TARGET_DIR/$BUILD_TYPE/libmsodbcsql18.so"
 fi
 
 if [ ! -f "$DRIVER_PATH" ]; then
@@ -65,6 +70,39 @@ EOF
 # process and its children, not the parent shell.
 export ODBCSYSINI="$TMPDIR_INI"
 echo "ODBCSYSINI=$ODBCSYSINI"
+
+# ---------------------------------------------------------------------------
+# Auto-detect dev SQL Server launched by dev/dev-launchsql.sh
+# If ODBC_TEST_SERVER is not set, check if localhost:1433 is reachable and
+# pull credentials from the dev environment (SQL_PASSWORD or mssql-tds/.env).
+# ---------------------------------------------------------------------------
+if [ -z "$ODBC_TEST_SERVER" ]; then
+    # Check if SQL Server is listening on localhost:1433
+    if (echo >/dev/tcp/localhost/1433) 2>/dev/null || nc -z localhost 1433 2>/dev/null; then
+        export ODBC_TEST_SERVER="localhost"
+        export ODBC_TEST_UID="${ODBC_TEST_UID:-sa}"
+        export ODBC_TEST_TRUST_CERT="${ODBC_TEST_TRUST_CERT:-Yes}"
+
+        # Resolve password: prefer ODBC_TEST_PWD > SQL_PASSWORD > mssql-tds/.env
+        if [ -z "$ODBC_TEST_PWD" ]; then
+            if [ -n "$SQL_PASSWORD" ]; then
+                export ODBC_TEST_PWD="$SQL_PASSWORD"
+            elif [ -f "$ODBC_CRATE_DIR/../mssql-tds/.env" ]; then
+                _pwd=$(grep -m1 '^SQL_PASSWORD=' "$ODBC_CRATE_DIR/../mssql-tds/.env" | cut -d= -f2-)
+                if [ -n "$_pwd" ]; then
+                    export ODBC_TEST_PWD="$_pwd"
+                fi
+            fi
+        fi
+
+        if [ -n "$ODBC_TEST_PWD" ]; then
+            echo "Auto-detected dev SQL Server at localhost:1433 (sa login)"
+        else
+            echo "Warning: SQL Server detected on localhost:1433 but no password found."
+            echo "  Set SQL_PASSWORD, ODBC_TEST_PWD, or run dev/dev-launchsql.sh first."
+        fi
+    fi
+fi
 
 echo ""
 echo "=== Configuring e2e tests (CMake) ==="
