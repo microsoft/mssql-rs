@@ -81,7 +81,7 @@ unsafe fn sql_driver_connect_w_impl(
 
     let dbc = unsafe { handle_from_raw::<DbcHandle>(connection_handle) };
     debug_assert_eq!(
-        dbc.header.object_type,
+        dbc.object_type,
         HandleType::Dbc,
         "SQLDriverConnectW: handle is not a DBC"
     );

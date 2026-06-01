@@ -39,7 +39,7 @@ unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
 
     let dbc = unsafe { handle_from_raw::<DbcHandle>(connection_handle) };
     debug_assert_eq!(
-        dbc.header.object_type,
+        dbc.object_type,
         HandleType::Dbc,
         "SQLDisconnect: handle is not a DBC"
     );
