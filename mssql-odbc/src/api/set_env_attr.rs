@@ -14,6 +14,8 @@ use crate::api::odbc_types::{
     SQL_ATTR_ODBC_VERSION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
     SqlPointer, SqlReturn,
 };
+use crate::api::sqlstate::{SQLSTATE_HY024, SQLSTATE_HY092};
+use crate::error::DiagRecord;
 use crate::handles::{EnvHandle, HandleType, OdbcVersion, handle_from_raw};
 
 /// Sets an attribute on an environment handle.
@@ -42,7 +44,7 @@ pub(crate) unsafe fn sql_set_env_attr(
 
         let env = unsafe { handle_from_raw::<EnvHandle>(environment_handle) };
         debug_assert_eq!(
-            env.header.object_type,
+            env.object_type,
             HandleType::Env,
             "SQLSetEnvAttr: input_handle is not an ENV handle"
         );
@@ -52,8 +54,9 @@ pub(crate) unsafe fn sql_set_env_attr(
             return SQL_ERROR;
         };
 
-        // TODO: equivalent of msodbcsql `FreeErrors(lpEnv)` — clear prior
-        // diagnostic records on the handle. Deferred until diag infra lands.
+        // Equivalent of msodbcsql `FreeErrors(lpEnv)` — clear any diagnostic
+        // records left from a prior call before processing this one.
+        state.diag_records.clear();
 
         // ODBC tagged-pointer: integer values arrive as `(SQLPOINTER)(uintptr_t)value`.
         let value = value_ptr as usize as u32;
@@ -66,13 +69,21 @@ pub(crate) unsafe fn sql_set_env_attr(
                 }
                 Err(()) => {
                     error!(value, "SQLSetEnvAttr: invalid ODBC_VERSION value");
-                    // TODO: SQLSTATE HY024 (invalid attribute value) when diag infra lands.
+                    state.diag_records.push(DiagRecord::new(
+                        SQLSTATE_HY024,
+                        0,
+                        "Invalid attribute value",
+                    ));
                     SQL_ERROR
                 }
             },
             _ => {
                 error!(attribute, "SQLSetEnvAttr: unknown attribute");
-                // TODO: SQLSTATE HY092 (invalid attribute identifier).
+                state.diag_records.push(DiagRecord::new(
+                    SQLSTATE_HY092,
+                    0,
+                    "Invalid attribute identifier",
+                ));
                 SQL_ERROR
             }
         }
@@ -243,6 +254,46 @@ mod tests {
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc3_80
         );
+        free_env(env);
+    }
+
+    #[test]
+    fn invalid_version_posts_hy024_diag() {
+        let env = alloc_env();
+        assert_eq!(set_attr(env, SQL_ATTR_ODBC_VERSION, 9999), SQL_ERROR);
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
+        let state = env_ref.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(&state.diag_records[0].sql_state, b"HY024");
+        drop(state);
+        free_env(env);
+    }
+
+    #[test]
+    fn unknown_attribute_posts_hy092_diag() {
+        let env = alloc_env();
+        assert_eq!(set_attr(env, 12345, 0), SQL_ERROR);
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
+        let state = env_ref.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(&state.diag_records[0].sql_state, b"HY092");
+        drop(state);
+        free_env(env);
+    }
+
+    #[test]
+    fn successful_call_clears_prior_diag_records() {
+        // msodbcsql `FreeErrors` parity: a successful call wipes records left
+        // from a prior failed call on the same handle.
+        let env = alloc_env();
+        assert_eq!(set_attr(env, SQL_ATTR_ODBC_VERSION, 9999), SQL_ERROR);
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
+        assert_eq!(env_ref.inner.lock().unwrap().diag_records.len(), 1);
+        assert_eq!(
+            set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80),
+            SQL_SUCCESS
+        );
+        assert!(env_ref.inner.lock().unwrap().diag_records.is_empty());
         free_env(env);
     }
 }

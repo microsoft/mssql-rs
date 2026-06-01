@@ -4,7 +4,8 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use super::{HandleHeader, HandleType, HasHeader};
+use super::{HandleType, HasObjectType};
+use crate::error::DiagRecord;
 
 /// Connection state machine — tracks whether the DBC is connected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,13 +26,12 @@ pub(crate) enum ConnectionState {
 /// msodbcsql's `csDbc` critical section.
 #[derive(Debug)]
 pub(crate) struct DbcHandle {
-    pub(crate) header: HandleHeader,
+    pub(crate) object_type: HandleType,
     /// Back-pointer to the parent ENV handle. Stored as opaque pointer because
     /// the ENV owns the DBC's lifetime, not the other way around.
     /// Mirrors msodbcsql's `lpdbc->lpenv`.
     #[allow(dead_code)]
     pub(crate) parent_env: *mut c_void,
-    #[allow(dead_code)]
     pub(crate) inner: Mutex<DbcState>,
 }
 
@@ -43,9 +43,11 @@ pub(crate) struct DbcHandle {
 unsafe impl Send for DbcHandle {}
 unsafe impl Sync for DbcHandle {}
 
-/// Mutable state within a connection handle, protected by the mutex.
+/// Mutable state within a connection handle, protected by `inner`.
 #[derive(Debug)]
 pub(crate) struct DbcState {
+    pub(crate) diag_records: Vec<DiagRecord>,
+    // ---- derived tagDBC fields below ----
     #[allow(dead_code)]
     pub(crate) connection_state: ConnectionState,
     /// Active child STMT handles, mirroring msodbcsql's `lppllpstmt`.
@@ -57,11 +59,10 @@ pub(crate) struct DbcState {
 impl DbcHandle {
     pub(crate) fn new(parent_env: *mut c_void) -> Self {
         Self {
-            header: HandleHeader {
-                object_type: HandleType::Dbc,
-            },
+            object_type: HandleType::Dbc,
             parent_env,
             inner: Mutex::new(DbcState {
+                diag_records: Vec::new(),
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
             }),
@@ -69,8 +70,8 @@ impl DbcHandle {
     }
 }
 
-impl HasHeader for DbcHandle {
-    fn header_mut(&mut self) -> &mut HandleHeader {
-        &mut self.header
+impl HasObjectType for DbcHandle {
+    fn object_type_mut(&mut self) -> &mut HandleType {
+        &mut self.object_type
     }
 }

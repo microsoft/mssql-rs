@@ -11,6 +11,12 @@ pub type SqlInteger = i32;
 pub type SqlReturn = SqlSmallInt;
 pub type SqlHandle = *mut c_void;
 pub type SqlPointer = *mut c_void;
+/// UTF-16 code unit. ODBC `SQLWCHAR` is 16-bit on every supported platform
+/// (unixODBC, iODBC, and Windows DM all agree for the `W` API surface).
+pub type SqlWChar = u16;
+
+/// Length of a SQLSTATE string in characters (5 + NUL written separately).
+pub const SQL_SQLSTATE_SIZE: usize = 5;
 
 // Return codes
 pub const SQL_SUCCESS: SqlReturn = 0;

@@ -1,6 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-pub mod api;
-mod error;
-mod handles;
+pub(crate) mod diag;
+
+pub(crate) use diag::DiagRecord;

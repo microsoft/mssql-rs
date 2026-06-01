@@ -12,8 +12,7 @@ across the FFI boundary is **undefined behavior**.
 - **Never** use `.unwrap()` or `.expect()` on `Result` or `Option`.
 - Use `.unwrap_or()`, `.unwrap_or_else()`, `.unwrap_or_default()`, or
   pattern matching instead.
-- For `Mutex::lock()`, use `.lock().unwrap_or_else(|e| e.into_inner())` (poison
-  recovery) or redesign to avoid the mutex.
+- For `Mutex::lock()`, return `SQL_ERROR` on poison — use `let Ok(state) = handle.inner.lock() else { return SQL_ERROR; }`. Do **not** recover via `e.into_inner()`.
 - Every `pub extern "C"` entry point must be wrapped in
   `std::panic::catch_unwind` as a last-resort safety net — but do **not** rely
   on it; prevent panics at the source.
@@ -32,6 +31,9 @@ across the FFI boundary is **undefined behavior**.
   `SqlReturn` code (`SQL_ERROR`, `SQL_INVALID_HANDLE`, etc.).
 - Store diagnostic info (SQLSTATE, message) on the handle so
   `SQLGetDiagRec` can report it — don't discard error details.
+- Every ODBC entry point must clear the handle's diagnostic records before
+  doing any work (`state.diag_records.clear()` after acquiring the lock) —
+  mirrors msodbcsql's `FreeErrors`.
 
 ## Unsafe code
 

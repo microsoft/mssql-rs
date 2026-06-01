@@ -4,8 +4,9 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use super::{HandleHeader, HandleType, HasHeader};
+use super::{HandleType, HasObjectType};
 use crate::api::odbc_types::{SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
+use crate::error::DiagRecord;
 
 /// ODBC environment attributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,17 +40,18 @@ impl TryFrom<u32> for OdbcVersion {
 /// Thread-safety: The `inner` mutex protects mutable state. msodbcsql uses
 /// `csEnv` (Unix) or relies on the Driver Manager (Windows) for serialization.
 /// We always protect with a mutex for safety regardless of platform.
+/// `object_type` is set once at construction and never mutated; `inner` (`≈ csEnv`) protects all mutable state.
 #[derive(Debug)]
 pub(crate) struct EnvHandle {
-    #[allow(dead_code)]
-    pub(crate) header: HandleHeader,
-    #[allow(dead_code)]
+    pub(crate) object_type: HandleType,
     pub(crate) inner: Mutex<EnvState>,
 }
 
-/// Mutable state within an environment handle, protected by the mutex.
+/// Mutable state within an environment handle, protected by `inner`.
 #[derive(Debug)]
 pub(crate) struct EnvState {
+    pub(crate) diag_records: Vec<DiagRecord>,
+    // ---- derived tagENV fields below ----
     #[allow(dead_code)]
     pub(crate) odbc_version: OdbcVersion,
     #[allow(dead_code)]
@@ -61,10 +63,9 @@ pub(crate) struct EnvState {
 impl EnvHandle {
     pub(crate) fn new() -> Self {
         Self {
-            header: HandleHeader {
-                object_type: HandleType::Env,
-            },
+            object_type: HandleType::Env,
             inner: Mutex::new(EnvState {
+                diag_records: Vec::new(),
                 odbc_version: OdbcVersion::Unset,
                 output_nts: true, // SQL_ATTR_OUTPUT_NTS defaults to SQL_TRUE
                 connections: Vec::new(),
@@ -73,8 +74,8 @@ impl EnvHandle {
     }
 }
 
-impl HasHeader for EnvHandle {
-    fn header_mut(&mut self) -> &mut HandleHeader {
-        &mut self.header
+impl HasObjectType for EnvHandle {
+    fn object_type_mut(&mut self) -> &mut HandleType {
+        &mut self.object_type
     }
 }
