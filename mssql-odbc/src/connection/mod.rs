@@ -84,7 +84,7 @@ impl fmt::Display for InvalidAttrValue {
 }
 
 /// Parsed connection parameters extracted from an ODBC connection string.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ConnectionParams {
     pub(crate) server: String,
     pub(crate) database: String,
@@ -94,6 +94,33 @@ pub(crate) struct ConnectionParams {
     pub(crate) encrypt: Option<String>,
     /// All key-value pairs from the original connection string (original case).
     pub(crate) raw: HashMap<String, String>,
+}
+
+impl fmt::Debug for ConnectionParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_raw: HashMap<_, _> = self
+            .raw
+            .iter()
+            .map(|(k, v)| {
+                let lower = k.to_ascii_lowercase();
+                if lower == KEY_PWD || lower == KEY_PASSWORD {
+                    (k.as_str(), "<REDACTED>")
+                } else {
+                    (k.as_str(), v.as_str())
+                }
+            })
+            .collect();
+
+        f.debug_struct("ConnectionParams")
+            .field("server", &self.server)
+            .field("database", &self.database)
+            .field("uid", &self.uid)
+            .field("pwd", &"<REDACTED>")
+            .field("trust_server_certificate", &self.trust_server_certificate)
+            .field("encrypt", &self.encrypt)
+            .field("raw", &redacted_raw)
+            .finish()
+    }
 }
 
 /// Parse an ODBC connection string into key-value pairs.
@@ -192,11 +219,17 @@ fn tokenize(input: &str) -> (Vec<(String, String)>, bool) {
             // Braced value — read until closing '}'
             chars.next(); // consume '{'
             let mut val = String::new();
+            let mut found_closing_brace = false;
             for c in chars.by_ref() {
                 if c == '}' {
+                    found_closing_brace = true;
                     break;
                 }
                 val.push(c);
+            }
+            if !found_closing_brace {
+                warn!(key = %key, "unterminated braced value in connection string");
+                has_warnings = true;
             }
             // Skip trailing chars up to ';'
             while chars.peek().is_some_and(|&c| c != ';') {
@@ -372,5 +405,22 @@ mod tests {
             parse_connection_string("Driver={ODBC Driver 18 for SQL Server};Server=h;UID=u;PWD=p")
                 .unwrap();
         assert!(!warn);
+    }
+
+    #[test]
+    fn unterminated_brace_sets_warning() {
+        // Missing closing '}' — consumes rest of string as value, warns
+        let (p, warn) = parse_connection_string("Server=h;PWD={abc;UID=u").unwrap();
+        assert!(warn);
+        assert_eq!(p.pwd, "abc;UID=u");
+        assert_eq!(p.uid, ""); // UID was swallowed into the braced value
+    }
+
+    #[test]
+    fn debug_redacts_password() {
+        let (p, _) = parse_connection_string("Server=h;UID=u;PWD=secret123").unwrap();
+        let debug_str = format!("{p:?}");
+        assert!(debug_str.contains("<REDACTED>"));
+        assert!(!debug_str.contains("secret123"));
     }
 }

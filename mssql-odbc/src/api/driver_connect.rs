@@ -229,16 +229,18 @@ unsafe fn do_connect(
     // TODO: build completed connection string from resolved attributes (DSN
     // expansion, negotiated encryption, default database) instead of echoing input.
     let out_utf16: Vec<u16> = conn_str.encode_utf16().collect();
-    let out_len = SqlSmallInt::try_from(out_utf16.len()).unwrap_or(SqlSmallInt::MAX);
+    let actual_len = out_utf16.len();
+    let out_len = SqlSmallInt::try_from(actual_len).unwrap_or(SqlSmallInt::MAX);
 
     if !string_length_2_ptr.is_null() {
         unsafe { string_length_2_ptr.write(out_len) };
     }
 
-    let mut truncated = false;
+    let mut truncated = actual_len > SqlSmallInt::MAX as usize;
     if !out_connection_string.is_null() && buffer_length > 0 {
-        let copy_len = out_len.min(buffer_length - 1) as usize;
-        truncated = out_len > buffer_length - 1;
+        let max_copy = (buffer_length - 1) as usize;
+        let copy_len = actual_len.min(max_copy);
+        truncated |= actual_len > max_copy;
         unsafe {
             std::ptr::copy_nonoverlapping(out_utf16.as_ptr(), out_connection_string, copy_len);
             out_connection_string.add(copy_len).write(0);
