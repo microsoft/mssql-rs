@@ -4,7 +4,6 @@
 //! Implementation of SQLDriverConnectW — connect using a connection string.
 
 use std::panic;
-use std::slice;
 
 use tracing::{debug, error, trace};
 
@@ -25,6 +24,7 @@ use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMeth
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
 
+use super::util::read_utf16;
 use crate::connection::parse_connection_string;
 
 /// Implementation of `SQLDriverConnectW`.
@@ -273,24 +273,6 @@ unsafe fn do_connect(
     }
 }
 
-/// Read a UTF-16 string from a pointer + length.
-/// If `length` is `SQL_NTS`, reads until null terminator.
-unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> String {
-    let slice = if length == SQL_NTS {
-        // Find null terminator
-        let mut len = 0usize;
-        unsafe {
-            while *ptr.add(len) != 0 {
-                len += 1;
-            }
-        }
-        unsafe { slice::from_raw_parts(ptr, len) }
-    } else {
-        unsafe { slice::from_raw_parts(ptr, length as usize) }
-    };
-    String::from_utf16_lossy(slice)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,19 +468,5 @@ mod tests {
         }
 
         unsafe { free_env_dbc(env, dbc) };
-    }
-
-    #[test]
-    fn read_utf16_with_nts() {
-        let input: Vec<u16> = "hello".encode_utf16().chain(std::iter::once(0)).collect();
-        let result = unsafe { read_utf16(input.as_ptr(), SQL_NTS) };
-        assert_eq!(result, "hello");
-    }
-
-    #[test]
-    fn read_utf16_with_explicit_length() {
-        let input: Vec<u16> = "hello world".encode_utf16().collect();
-        let result = unsafe { read_utf16(input.as_ptr(), 5) };
-        assert_eq!(result, "hello");
     }
 }

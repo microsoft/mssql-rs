@@ -151,3 +151,26 @@ pub unsafe extern "C" fn SQLDisconnect(connection_handle: SqlHandle) -> SqlRetur
     crate::init_tracing();
     unsafe { super::disconnect::sql_disconnect(connection_handle) }
 }
+
+// ---- Statement execution ---------------------------------------------------
+
+/// Executes a preparable statement, using the current values of the parameter
+/// marker variables if any parameter markers exist in the statement.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - `statement_text`, if non-null, must be readable for `text_length` `SQLWCHAR`s.
+///   If `text_length` is `SQL_NTS`, the string must be NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLExecDirectW(
+    statement_handle: SqlHandle,
+    statement_text: *const SqlWChar,
+    text_length: SqlSmallInt,
+) -> SqlReturn {
+    unsafe { super::exec_direct::sql_exec_direct_w(statement_handle, statement_text, text_length) }
+}
+
+// TODO(SQLFetch): implement SQLFetch — advance `stmt_state.row_cursor` and
+// return SQL_SUCCESS while `row_cursor < pending_rows.len()`, SQL_NO_DATA when
+// exhausted.  Also implement SQLGetData to expose `pending_rows[row_cursor - 1]`
+// to the application.

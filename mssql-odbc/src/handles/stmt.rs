@@ -4,6 +4,9 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
+use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::query::metadata::ColumnMetadata;
+
 use super::{HandleType, HasObjectType};
 use crate::error::{DiagRecord, HasDiagnostics};
 
@@ -24,7 +27,16 @@ pub(crate) struct StmtHandle {
 #[derive(Debug)]
 pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
-    // TODO: statement attributes (cursor type, concurrency, etc.) and execution state
+    /// Column metadata from the most recent execution.
+    pub(crate) column_metadata: Vec<ColumnMetadata>,
+    // TODO(SQLFetch): `pending_rows` holds every row buffered during SQLExecDirect.
+    // SQLFetch should increment `row_cursor` and return SQL_SUCCESS while
+    // `row_cursor < pending_rows.len()`.  SQLGetData reads
+    // `pending_rows[row_cursor - 1]` for the current row's column values.
+    /// Buffered rows from the most recent execution.
+    pub(crate) pending_rows: Vec<Vec<ColumnValues>>,
+    /// Cursor into `pending_rows`; 0 = before first row.
+    pub(crate) row_cursor: usize,
 }
 
 impl HasDiagnostics for StmtState {
@@ -47,6 +59,9 @@ impl StmtHandle {
             parent_dbc,
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
+                column_metadata: Vec::new(),
+                pending_rows: Vec::new(),
+                row_cursor: 0,
             }),
         }
     }
