@@ -112,6 +112,33 @@ pub(crate) struct ConnectionParams {
     pub(crate) encrypt: Option<String>,
 }
 
+impl ConnectionParams {
+    pub(crate) fn fmt_as_odbc_conn_str(&self) -> String {
+        let mut parts = Vec::new();
+
+        if !self.server.is_empty() {
+            parts.push(format!("Server={}", self.server));
+        }
+        if !self.database.is_empty() {
+            parts.push(format!("Database={}", self.database));
+        }
+        if !self.uid.is_empty() {
+            parts.push(format!("UID={}", self.uid));
+        }
+        if !self.pwd.is_empty() {
+            parts.push("PWD=******".to_string());
+        }
+        if self.trust_server_certificate {
+            parts.push("TrustServerCertificate=yes".to_string());
+        }
+        if let Some(encrypt) = &self.encrypt {
+            parts.push(format!("Encrypt={encrypt}"));
+        }
+
+        parts.join(";")
+    }
+}
+
 impl fmt::Debug for ConnectionParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionParams")
@@ -181,7 +208,7 @@ pub(crate) fn parse_connection_string(
                     validate_attr(&lower, value, ENCRYPT_VALUES)?;
                     params.encrypt = Some(value.clone());
                 }
-                ConnAttrKey::Count => unreachable!("sentinel variant is not a parsed slot"),
+                ConnAttrKey::Count => {}
             }
             continue;
         }
@@ -385,7 +412,8 @@ mod tests {
         let (p, ..) = parse_connection_string("UID=first;User Id=second;PWD=p;Server=h").unwrap();
         assert_eq!(p.uid, "first");
 
-        let (p, ..) = parse_connection_string("Server=h;UID=u;PWD=p;Encrypt=yes;Encrypt=banana").unwrap();
+        let (p, ..) =
+            parse_connection_string("Server=h;UID=u;PWD=p;Encrypt=yes;Encrypt=banana").unwrap();
         assert_eq!(p.encrypt.as_deref(), Some("yes"));
     }
 
@@ -448,5 +476,16 @@ mod tests {
         let debug_str = format!("{p:?}");
         assert!(debug_str.contains("<REDACTED>"));
         assert!(!debug_str.contains("secret123"));
+    }
+
+    #[test]
+    fn fmt_as_odbc_conn_str_redacts_password() {
+        let (p, _) =
+            parse_connection_string("Server=h;Database=db;UID=u;PWD=secret;Encrypt=strict")
+                .unwrap();
+        assert_eq!(
+            p.fmt_as_odbc_conn_str(),
+            "Server=h;Database=db;UID=u;PWD=******;Encrypt=strict"
+        );
     }
 }

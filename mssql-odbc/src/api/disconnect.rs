@@ -7,7 +7,7 @@ use std::panic;
 
 use tracing::{debug, error, trace};
 
-use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS, SqlHandle, SqlReturn};
+use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
 use crate::handles::DbcHandle;
 use crate::handles::StmtHandle;
 use crate::handles::dbc::ConnectionState;
@@ -34,7 +34,7 @@ pub(crate) unsafe fn sql_disconnect(connection_handle: SqlHandle) -> SqlReturn {
 unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
     if connection_handle.is_null() {
         error!("SQLDisconnect: connection_handle is null");
-        return SQL_ERROR;
+        return SQL_INVALID_HANDLE;
     }
 
     let dbc = unsafe { handle_from_raw::<DbcHandle>(connection_handle) };
@@ -123,9 +123,9 @@ mod tests {
     }
 
     #[test]
-    fn null_handle_returns_error() {
+    fn null_handle_returns_invalid_handle() {
         let ret = unsafe { sql_disconnect(SQL_NULL_HANDLE) };
-        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(ret, SQL_INVALID_HANDLE);
         // TODO: verify SQLSTATE HY009 via SQLGetDiagRec
     }
 }

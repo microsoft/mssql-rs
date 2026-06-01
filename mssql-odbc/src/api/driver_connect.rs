@@ -226,9 +226,10 @@ unsafe fn do_connect(
     }
 
     // Write output connection string
-    // TODO: build completed connection string from resolved attributes (DSN
-    // expansion, negotiated encryption, default database) instead of echoing input.
-    let out_utf16: Vec<u16> = conn_str.encode_utf16().collect();
+    // TODO: build completed output connection string from resolved attributes and negotiated
+    // settings; current output is reconstructed from parsed input fields with password redacted.
+    let redacted_conn_str = params.fmt_as_odbc_conn_str();
+    let out_utf16: Vec<u16> = redacted_conn_str.encode_utf16().collect();
     let actual_len = out_utf16.len();
     let out_len = SqlSmallInt::try_from(actual_len).unwrap_or(SqlSmallInt::MAX);
 
