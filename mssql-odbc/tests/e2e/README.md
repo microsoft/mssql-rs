@@ -44,6 +44,22 @@ tests/e2e/
 ```bash
 # From mssql-odbc/tests/e2e/
 ./run_e2e.sh
+
+# Verbose CTest output + Rust tracing
+./run_e2e.sh --verbose
+```
+
+In `--verbose` mode, `run_e2e.sh` defaults to:
+
+- `MSSQL_TDS_TRACE=true`
+- `MSSQL_TDS_TRACE_LEVEL=warn,msodbcsql18=debug`
+
+unless those variables are already set in your environment.
+
+To override the verbose default filter:
+
+```bash
+MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=trace" ./run_e2e.sh --verbose
 ```
 
 ### Windows (requires Administrator)

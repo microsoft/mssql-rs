@@ -55,6 +55,28 @@ Or run test binaries directly (self-registers the driver automatically):
 ./build/alloc_env_test
 ```
 
+## Tracing
+
+Tracing is disabled by default. Enable it with environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MSSQL_TDS_TRACE` | `false` | Set to `true` to enable tracing output |
+| `MSSQL_TDS_TRACE_LEVEL` | `warn` | Tracing filter expression (`tracing_subscriber::EnvFilter`) |
+
+Examples:
+
+```bash
+# Enable default warn-level logging
+MSSQL_TDS_TRACE=true cargo test -p mssql-odbc
+
+# ODBC-driver-focused debug logs only
+MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=debug" cargo test -p mssql-odbc
+
+# Full filter syntax is supported
+MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=debug,mssql_tds=off" cargo test -p mssql-odbc
+```
+
 ## Architecture
 
 ```
