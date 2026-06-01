@@ -6,7 +6,6 @@
 //! Parses `;`-delimited `Key=Value` connection strings per the ODBC spec.
 //! Supports `{braced values}` for values containing `;` or `=`.
 
-use std::collections::HashMap;
 use std::fmt;
 
 use tracing::warn;
@@ -47,6 +46,25 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
 // Valid attribute values
 const YES_NO: &[&str] = &["yes", "no"];
 const ENCRYPT_VALUES: &[&str] = &["yes", "mandatory", "no", "optional", "strict"];
+
+#[derive(Copy, Clone)]
+enum ConnAttrKey {
+    Server,
+    Database,
+    Uid,
+    Pwd,
+    TrustServerCert,
+    Encrypt,
+    Count,
+}
+
+impl ConnAttrKey {
+    const COUNT: usize = ConnAttrKey::Count as usize;
+
+    const fn idx(self) -> usize {
+        self as usize
+    }
+}
 
 fn validate_attr(
     key: &str,
@@ -92,25 +110,10 @@ pub(crate) struct ConnectionParams {
     pub(crate) pwd: String,
     pub(crate) trust_server_certificate: bool,
     pub(crate) encrypt: Option<String>,
-    /// All key-value pairs from the original connection string (original case).
-    pub(crate) raw: HashMap<String, String>,
 }
 
 impl fmt::Debug for ConnectionParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let redacted_raw: HashMap<_, _> = self
-            .raw
-            .iter()
-            .map(|(k, v)| {
-                let lower = k.to_ascii_lowercase();
-                if lower == KEY_PWD || lower == KEY_PASSWORD {
-                    (k.as_str(), "<REDACTED>")
-                } else {
-                    (k.as_str(), v.as_str())
-                }
-            })
-            .collect();
-
         f.debug_struct("ConnectionParams")
             .field("server", &self.server)
             .field("database", &self.database)
@@ -118,7 +121,6 @@ impl fmt::Debug for ConnectionParams {
             .field("pwd", &"<REDACTED>")
             .field("trust_server_certificate", &self.trust_server_certificate)
             .field("encrypt", &self.encrypt)
-            .field("raw", &redacted_raw)
             .finish()
     }
 }
@@ -136,30 +138,52 @@ pub(crate) fn parse_connection_string(
 ) -> Result<(ConnectionParams, bool), InvalidAttrValue> {
     let (pairs, mut has_warnings) = tokenize(input);
     let mut params = ConnectionParams::default();
+    let mut seen_slots = [false; ConnAttrKey::COUNT];
 
     for (key, value) in &pairs {
-        params.raw.insert(key.clone(), value.clone());
         let lower = key.to_ascii_lowercase();
-        match lower.as_str() {
-            KEY_SERVER => params.server = value.clone(),
-            KEY_DATABASE | KEY_INITIAL_CATALOG => params.database = value.clone(),
-            KEY_UID | KEY_USER_ID => params.uid = value.clone(),
-            KEY_PWD | KEY_PASSWORD => params.pwd = value.clone(),
-            KEY_TRUST_SRV_CERT => {
-                validate_attr(&lower, value, YES_NO)?;
-                params.trust_server_certificate = is_yes(value);
-            }
-            KEY_ENCRYPT => {
-                validate_attr(&lower, value, ENCRYPT_VALUES)?;
-                params.encrypt = Some(value.clone());
-            }
-            _ if KNOWN_IGNORED_KEYS.contains(&lower.as_str()) => {}
+
+        let slot = match lower.as_str() {
+            KEY_SERVER => Some(ConnAttrKey::Server),
+            KEY_DATABASE | KEY_INITIAL_CATALOG => Some(ConnAttrKey::Database),
+            KEY_UID | KEY_USER_ID => Some(ConnAttrKey::Uid),
+            KEY_PWD | KEY_PASSWORD => Some(ConnAttrKey::Pwd),
+            KEY_TRUST_SRV_CERT => Some(ConnAttrKey::TrustServerCert),
+            KEY_ENCRYPT => Some(ConnAttrKey::Encrypt),
+            _ if KNOWN_IGNORED_KEYS.contains(&lower.as_str()) => None,
             _ => {
                 // Match msodbcsql behavior: unknown attributes are ignored,
                 // but reported as warning (01S00) on successful connect.
                 warn!(key = %key, "unknown connection string attribute");
                 has_warnings = true;
+                None
             }
+        };
+
+        if let Some(slot) = slot {
+            let idx = slot.idx();
+            if seen_slots[idx] {
+                // Match msodbcsql behavior: ignore duplicate recognized attributes.
+                continue;
+            }
+            seen_slots[idx] = true;
+
+            match slot {
+                ConnAttrKey::Server => params.server = value.clone(),
+                ConnAttrKey::Database => params.database = value.clone(),
+                ConnAttrKey::Uid => params.uid = value.clone(),
+                ConnAttrKey::Pwd => params.pwd = value.clone(),
+                ConnAttrKey::TrustServerCert => {
+                    validate_attr(&lower, value, YES_NO)?;
+                    params.trust_server_certificate = is_yes(value);
+                }
+                ConnAttrKey::Encrypt => {
+                    validate_attr(&lower, value, ENCRYPT_VALUES)?;
+                    params.encrypt = Some(value.clone());
+                }
+                ConnAttrKey::Count => unreachable!("sentinel variant is not a parsed slot"),
+            }
+            continue;
         }
     }
     Ok((params, has_warnings))
@@ -354,13 +378,15 @@ mod tests {
     }
 
     #[test]
-    fn raw_map_and_duplicates() {
-        let (p, ..) = parse_connection_string("Server=h;UID=u;PWD=p;App=MyApp").unwrap();
-        assert_eq!(p.raw.get("App"), Some(&"MyApp".to_string()));
-        assert_eq!(p.raw.get("Server"), Some(&"h".to_string()));
-
+    fn duplicates_follow_first_wins() {
         let (p, ..) = parse_connection_string("Server=first;Server=second;UID=u;PWD=p").unwrap();
-        assert_eq!(p.server, "second");
+        assert_eq!(p.server, "first");
+
+        let (p, ..) = parse_connection_string("UID=first;User Id=second;PWD=p;Server=h").unwrap();
+        assert_eq!(p.uid, "first");
+
+        let (p, ..) = parse_connection_string("Server=h;UID=u;PWD=p;Encrypt=yes;Encrypt=banana").unwrap();
+        assert_eq!(p.encrypt.as_deref(), Some("yes"));
     }
 
     #[test]
