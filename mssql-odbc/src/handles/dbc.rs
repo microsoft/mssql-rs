@@ -60,6 +60,11 @@ pub(crate) struct DbcState {
     pub(crate) connection_state: ConnectionState,
     /// Active child STMT handles, mirroring msodbcsql's `lppllpstmt`.
     pub(crate) statements: Vec<*mut c_void>,
+    /// The STMT handle that currently has an open cursor, if any.
+    /// Set when SQLExecDirect succeeds; cleared by SQLCloseCursor /
+    /// SQLFreeStmt(SQL_CLOSE). Used to enforce the non-MARS rule that only
+    /// one statement may hold an open cursor per connection at a time.
+    pub(crate) active_stmt: Option<*mut c_void>,
     /// Active TDS connection, present only when `connection_state == Connected`.
     pub(crate) client: Option<TdsClient>,
 }
@@ -80,6 +85,7 @@ impl DbcHandle {
                 diag_records: Vec::new(),
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
+                active_stmt: None,
                 client: None,
             }),
         }

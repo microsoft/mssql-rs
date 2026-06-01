@@ -68,42 +68,62 @@ unsafe fn sql_exec_direct_w_impl(
         return SQL_ERROR;
     }
 
-    // TODO(Phase2): In Phase 1, SQLExecDirect drains the entire result set and calls
-    // close_query() before returning, so the TDS connection is always clean — silently
-    // overwriting pending_rows on a re-execute is safe. In Phase 2 (streaming), rows
-    // stay live on the wire and re-executing without closing first would corrupt TDS.
-    // msodbcsql checks lpstmt->wStatus & (STMT_ST_EXECSTARTED|STMT_ST_CURS_OPEN).
-
     let sql = unsafe { read_utf16(statement_text, text_length) };
     debug!(sql = %sql, "SQLExecDirectW: executing");
 
     // Access parent DBC
     let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
 
-    // TODO(SQLDriverConnect): Holding the full DBC lock for the duration of execute +
-    // row drain is a Phase 1 simplification. It prevents concurrent STMT operations on
-    // the same DBC and makes SQLCancel impossible. Fixing this requires changes to how
-    // TdsClient is owned inside DbcState.
-    let Ok(mut dbc_state) = dbc.inner.lock() else {
-        error!("SQLExecDirectW: dbc mutex poisoned");
-        return SQL_ERROR;
+    // Precondition checks + take TdsClient out of DbcState.
+    // Lock is held only briefly — no I/O inside this block.
+    let mut client = {
+        let Ok(mut dbc_state) = dbc.inner.lock() else {
+            error!("SQLExecDirectW: dbc mutex poisoned");
+            return SQL_ERROR;
+        };
+
+        if dbc_state.connection_state != ConnectionState::Connected {
+            error!("SQLExecDirectW: DBC is not connected");
+            return SQL_ERROR;
+        }
+
+        // SQLSTATE 24000: re-executing on a statement that already has an open cursor.
+        {
+            let Ok(stmt_state) = stmt.inner.lock() else {
+                error!("SQLExecDirectW: stmt mutex poisoned");
+                return SQL_ERROR;
+            };
+            if stmt_state.cursor_open {
+                error!("SQLExecDirectW: cursor is already open on this statement");
+                // TODO: post DiagRecord with SQLSTATE 24000
+                return SQL_ERROR;
+            }
+        }
+
+        // SQLSTATE HY000: another statement on this DBC already holds an open cursor.
+        if let Some(busy_stmt) = dbc_state.active_stmt
+            && busy_stmt != statement_handle
+        {
+            error!("SQLExecDirectW: connection is busy with results for another statement");
+            // TODO: post DiagRecord with SQLSTATE HY000
+            return SQL_ERROR;
+        }
+
+        let Some(client) = dbc_state.client.take() else {
+            error!("SQLExecDirectW: no active TDS client");
+            return SQL_ERROR;
+        };
+
+        client
+        // dbc_state dropped here — DBC lock released before any network I/O.
     };
 
-    if dbc_state.connection_state != ConnectionState::Connected {
-        error!("SQLExecDirectW: DBC is not connected");
-        return SQL_ERROR;
-    }
-
-    let Some(client) = dbc_state.client.as_mut() else {
-        error!("SQLExecDirectW: no active TDS client");
-        return SQL_ERROR;
-    };
-
-    // Execute the SQL batch.
-    let exec_result = dbc.runtime.block_on(client.execute(sql, None, None));
-    if let Err(e) = exec_result {
+    // Execute the SQL batch. DBC lock is NOT held during network I/O, so SQLCancel
+    // and other DBC-level operations on concurrent threads can proceed.
+    if let Err(e) = dbc.runtime.block_on(client.execute(sql, None, None)) {
         error!(%e, "SQLExecDirectW: execution failed");
         // TODO: post diagnostic record with SQLSTATE 42000 or HY000
+        if let Ok(mut ds) = dbc.inner.lock() { ds.client = Some(client); }
         return SQL_ERROR;
     }
 
@@ -112,13 +132,13 @@ unsafe fn sql_exec_direct_w_impl(
 
     let mut rows = Vec::new();
     loop {
-        let row_result = dbc.runtime.block_on(client.next_row());
-        match row_result {
+        match dbc.runtime.block_on(client.next_row()) {
             Ok(Some(row)) => rows.push(row),
             Ok(None) => break,
             Err(e) => {
                 error!(%e, "SQLExecDirectW: error reading row");
                 let _ = dbc.runtime.block_on(client.close_query());
+                if let Ok(mut ds) = dbc.inner.lock() { ds.client = Some(client); }
                 return SQL_ERROR;
             }
         }
@@ -127,12 +147,14 @@ unsafe fn sql_exec_direct_w_impl(
     // Close the server-side cursor so the connection is ready for the next query.
     if let Err(e) = dbc.runtime.block_on(client.close_query()) {
         error!(%e, "SQLExecDirectW: failed to close query");
+        if let Ok(mut ds) = dbc.inner.lock() { ds.client = Some(client); }
         return SQL_ERROR;
     }
 
     // Store results in the statement handle.
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLExecDirectW: stmt mutex poisoned");
+        if let Ok(mut ds) = dbc.inner.lock() { ds.client = Some(client); }
         return SQL_ERROR;
     };
 
@@ -140,18 +162,24 @@ unsafe fn sql_exec_direct_w_impl(
     // Fields consumed by SQLFetch — see TODO(SQLFetch) in stmt.rs for the contract.
     stmt_state.pending_rows = rows;
     stmt_state.row_cursor = 0;
+    stmt_state.cursor_open = true;
     stmt_state.diag_records.clear();
+    let has_rows = !stmt_state.pending_rows.is_empty();
+    let row_count = stmt_state.pending_rows.len();
+    drop(stmt_state);
 
-    debug!(
-        rows = stmt_state.pending_rows.len(),
-        "SQLExecDirectW: execution complete"
-    );
+    // Return client to DbcState and record this stmt as the active cursor owner.
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        error!("SQLExecDirectW: dbc mutex poisoned storing active_stmt");
+        return SQL_ERROR;
+    };
+    dbc_state.client = Some(client);
+    dbc_state.active_stmt = Some(statement_handle);
+    drop(dbc_state);
 
-    if stmt_state.pending_rows.is_empty() {
-        SQL_NO_DATA
-    } else {
-        SQL_SUCCESS
-    }
+    debug!(rows = row_count, "SQLExecDirectW: execution complete");
+
+    if has_rows { SQL_SUCCESS } else { SQL_NO_DATA }
 }
 
 #[cfg(test)]

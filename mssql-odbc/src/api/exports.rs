@@ -1,4 +1,4 @@
-// Copyright (c) Microsoft Corporation.
+﻿// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
 //! Exported ODBC entry points for the msodbcsql18 shared library.
@@ -11,7 +11,8 @@
 //! Windows `.def` file or a C header listing the public API surface.
 
 use super::odbc_types::{
-    SqlHWnd, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_SUCCESS, SqlHWnd, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt,
+    SqlWChar,
 };
 
 // ---- Handle allocation and management ---------------------------------------
@@ -28,7 +29,6 @@ pub unsafe extern "C" fn SQLAllocHandle(
     input_handle: SqlHandle,
     output_handle_ptr: *mut SqlHandle,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::alloc_handle::sql_alloc_handle(handle_type, input_handle, output_handle_ptr) }
 }
 
@@ -39,7 +39,6 @@ pub unsafe extern "C" fn SQLAllocHandle(
 /// - `handle` must have been allocated by [`SQLAllocHandle`] and not already freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLFreeHandle(handle_type: SqlSmallInt, handle: SqlHandle) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::free_handle::sql_free_handle(handle_type, handle) }
 }
 
@@ -56,7 +55,6 @@ pub unsafe extern "C" fn SQLSetEnvAttr(
     value_ptr: SqlPointer,
     string_length: SqlInteger,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::set_env_attr::sql_set_env_attr(
             environment_handle,
@@ -91,7 +89,6 @@ pub unsafe extern "C" fn SQLGetDiagRecW(
     buffer_length: SqlSmallInt,
     text_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::get_diag_rec::sql_get_diag_rec_w(
             handle_type,
@@ -127,7 +124,6 @@ pub unsafe extern "C" fn SQLDriverConnectW(
     string_length2_ptr: *mut SqlSmallInt,
     driver_completion: SqlUSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::driver_connect::sql_driver_connect_w(
             connection_handle,
@@ -150,6 +146,41 @@ pub unsafe extern "C" fn SQLDriverConnectW(
 pub unsafe extern "C" fn SQLDisconnect(connection_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();
     unsafe { super::disconnect::sql_disconnect(connection_handle) }
+}
+
+// ---- Cursor management ------------------------------------------------------
+
+/// Closes the open cursor on a statement handle and discards any pending rows.
+///
+/// Returns `SQL_ERROR` (SQLSTATE 24000) if no cursor is open on this statement.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLCloseCursor(statement_handle: SqlHandle) -> SqlReturn {
+    unsafe { super::close_cursor::sql_close_cursor(statement_handle) }
+}
+
+/// Frees resources associated with a statement handle.
+///
+/// Only `SQL_CLOSE` is implemented; it closes the open cursor (no-op if none).
+/// Other options (`SQL_DROP`, `SQL_UNBIND`, `SQL_RESET_PARAMS`) are not yet implemented.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLFreeStmt(
+    statement_handle: SqlHandle,
+    option: SqlUSmallInt,
+) -> SqlReturn {
+    const SQL_CLOSE: SqlUSmallInt = 0;
+    match option {
+        SQL_CLOSE => unsafe { super::close_cursor::sql_free_stmt_close(statement_handle) },
+        _ => {
+            // TODO: SQL_DROP, SQL_UNBIND, SQL_RESET_PARAMS
+            SQL_SUCCESS
+        }
+    }
 }
 
 // ---- Statement execution ---------------------------------------------------

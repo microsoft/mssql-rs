@@ -37,6 +37,9 @@ pub(crate) struct StmtState {
     pub(crate) pending_rows: Vec<Vec<ColumnValues>>,
     /// Cursor into `pending_rows`; 0 = before first row.
     pub(crate) row_cursor: usize,
+    /// True from the end of a successful SQLExecDirect until SQLCloseCursor /
+    /// SQLFreeStmt(SQL_CLOSE). Mirrors msodbcsql's RS_SELECTION / STMT_ST_CURS_OPEN.
+    pub(crate) cursor_open: bool,
 }
 
 impl HasDiagnostics for StmtState {
@@ -62,6 +65,7 @@ impl StmtHandle {
                 column_metadata: Vec::new(),
                 pending_rows: Vec::new(),
                 row_cursor: 0,
+                cursor_open: false,
             }),
         }
     }

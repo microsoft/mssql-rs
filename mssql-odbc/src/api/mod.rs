@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 mod alloc_handle;
+mod close_cursor;
 mod disconnect;
 mod driver_connect;
 mod exec_direct;
