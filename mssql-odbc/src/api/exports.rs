@@ -10,23 +10,26 @@
 //! This file acts as the driver's export manifest — the Rust equivalent of a
 //! Windows `.def` file or a C header listing the public API surface.
 
-use super::odbc_types::{SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlSmallInt, SqlWChar};
+use super::odbc_types::{
+    SqlHWnd, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+};
 
 // ---- Handle allocation and management ---------------------------------------
 
 /// Allocates an environment, connection, statement, or descriptor handle.
 ///
 /// # Safety
-/// - `output_handle` must be a valid, aligned, writable pointer to [`SqlHandle`].
+/// - `output_handle_ptr` must be a valid, aligned, writable pointer to [`SqlHandle`].
 /// - For `SQL_HANDLE_ENV`, `input_handle` must be `SQL_NULL_HANDLE`.
 /// - For other handle types, `input_handle` must be a valid parent handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLAllocHandle(
     handle_type: SqlSmallInt,
     input_handle: SqlHandle,
-    output_handle: *mut SqlHandle,
+    output_handle_ptr: *mut SqlHandle,
 ) -> SqlReturn {
-    unsafe { super::alloc_handle::sql_alloc_handle(handle_type, input_handle, output_handle) }
+    crate::init_tracing();
+    unsafe { super::alloc_handle::sql_alloc_handle(handle_type, input_handle, output_handle_ptr) }
 }
 
 /// Frees an environment, connection, statement, or descriptor handle
@@ -36,9 +39,11 @@ pub unsafe extern "C" fn SQLAllocHandle(
 /// - `handle` must have been allocated by [`SQLAllocHandle`] and not already freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLFreeHandle(handle_type: SqlSmallInt, handle: SqlHandle) -> SqlReturn {
+    crate::init_tracing();
     unsafe { super::free_handle::sql_free_handle(handle_type, handle) }
 }
 
+// ---- Attribute management --------------------------------------------------
 /// See [`set_env_attr::sql_set_env_attr`] for full safety requirements.
 ///
 /// # Safety
@@ -51,6 +56,7 @@ pub unsafe extern "C" fn SQLSetEnvAttr(
     value_ptr: SqlPointer,
     string_length: SqlInteger,
 ) -> SqlReturn {
+    crate::init_tracing();
     unsafe {
         super::set_env_attr::sql_set_env_attr(
             environment_handle,
@@ -85,6 +91,7 @@ pub unsafe extern "C" fn SQLGetDiagRecW(
     buffer_length: SqlSmallInt,
     text_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
+    crate::init_tracing();
     unsafe {
         super::get_diag_rec::sql_get_diag_rec_w(
             handle_type,
@@ -97,4 +104,50 @@ pub unsafe extern "C" fn SQLGetDiagRecW(
             text_length_ptr,
         )
     }
+}
+
+// ---- Connection management --------------------------------------------------
+
+/// Establishes a connection to a data source.
+///
+/// # Safety
+/// - `connection_handle` must be a valid DBC handle from [`SQLAllocHandle`].
+/// - `in_connection_string` must point to a valid UTF-16 buffer of at least
+///   `string_length1` characters (or null-terminated if `string_length1` is `SQL_NTS`).
+/// - `out_connection_string` (if non-null) must be writable for `buffer_length` wide chars.
+/// - `string_length2_ptr` (if non-null) must be a writable `SqlSmallInt` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLDriverConnectW(
+    connection_handle: SqlHandle,
+    window_handle: SqlHWnd,
+    in_connection_string: *const SqlWChar,
+    string_length1: SqlSmallInt,
+    out_connection_string: *mut SqlWChar,
+    buffer_length: SqlSmallInt,
+    string_length2_ptr: *mut SqlSmallInt,
+    driver_completion: SqlUSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::driver_connect::sql_driver_connect_w(
+            connection_handle,
+            window_handle,
+            in_connection_string,
+            string_length1,
+            out_connection_string,
+            buffer_length,
+            string_length2_ptr,
+            driver_completion,
+        )
+    }
+}
+
+/// Disconnects from the data source associated with a connection handle.
+///
+/// # Safety
+/// - `connection_handle` must be a valid DBC handle that is currently connected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLDisconnect(connection_handle: SqlHandle) -> SqlReturn {
+    crate::init_tracing();
+    unsafe { super::disconnect::sql_disconnect(connection_handle) }
 }

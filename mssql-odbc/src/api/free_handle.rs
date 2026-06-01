@@ -107,12 +107,15 @@ unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
 
     // Unregister from parent ENV
     let env = unsafe { handle_from_raw::<EnvHandle>(dbc.parent_env) };
-    let Ok(mut env_state) = env.inner.lock() else {
-        error!(?handle, "SQLFreeHandle(DBC): env mutex poisoned");
-        return SQL_ERROR;
-    };
-    if let Some(i) = env_state.connections.iter().position(|&p| p == handle) {
-        env_state.connections.swap_remove(i);
+    {
+        // Lock scope for ENV mutex - so that we unlock before deallocating the DBC
+        let Ok(mut env_state) = env.inner.lock() else {
+            error!(?handle, "SQLFreeHandle(DBC): env mutex poisoned");
+            return SQL_ERROR;
+        };
+        if let Some(i) = env_state.connections.iter().position(|&p| p == handle) {
+            env_state.connections.swap_remove(i);
+        }
     }
 
     unsafe { free_handle::<DbcHandle>(handle) };
@@ -137,15 +140,18 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
 
     // Lock parent DBC and try to unregister.
     let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
-    let Ok(mut dbc_state) = dbc.inner.lock() else {
-        error!(?handle, "SQLFreeHandle(STMT): dbc mutex poisoned");
-        return SQL_ERROR;
-    };
-    let Some(i) = dbc_state.statements.iter().position(|&p| p == handle) else {
-        // Already dropped by SQLDisconnect - early return.
-        return SQL_SUCCESS;
-    };
-    dbc_state.statements.swap_remove(i);
+    {
+        // Lock scope for DBC mutex - so that we unlock before deallocating the STMT
+        let Ok(mut dbc_state) = dbc.inner.lock() else {
+            error!(?handle, "SQLFreeHandle(STMT): dbc mutex poisoned");
+            return SQL_ERROR;
+        };
+        let Some(i) = dbc_state.statements.iter().position(|&p| p == handle) else {
+            // Already dropped by SQLDisconnect - early return.
+            return SQL_SUCCESS;
+        };
+        dbc_state.statements.swap_remove(i);
+    }
 
     unsafe { free_handle::<StmtHandle>(handle) };
     SQL_SUCCESS
@@ -157,13 +163,31 @@ mod tests {
 
     use super::*;
     use crate::api::alloc_handle::sql_alloc_handle;
-    use crate::api::odbc_types::{SQL_HANDLE_ENV, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::{
+        SQL_ATTR_ODBC_VERSION, SQL_HANDLE_ENV, SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
+    };
+    use crate::api::set_env_attr::sql_set_env_attr;
 
-    #[test]
-    fn free_env_returns_success() {
+    /// Allocate an ENV handle with ODBC 3.80 version set.
+    fn alloc_env() -> SqlHandle {
         let mut env: SqlHandle = ptr::null_mut();
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) };
         assert_eq!(ret, SQL_SUCCESS);
+        let ret = unsafe {
+            sql_set_env_attr(
+                env,
+                SQL_ATTR_ODBC_VERSION,
+                SQL_OV_ODBC3_80 as usize as *mut std::ffi::c_void,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        env
+    }
+
+    #[test]
+    fn free_env_returns_success() {
+        let env = alloc_env();
 
         let ret = unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
         assert_eq!(ret, SQL_SUCCESS);
@@ -171,9 +195,7 @@ mod tests {
 
     #[test]
     fn free_dbc_returns_success() {
-        let mut env: SqlHandle = ptr::null_mut();
-        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) };
-        assert_eq!(ret, SQL_SUCCESS);
+        let env = alloc_env();
 
         let mut dbc: SqlHandle = ptr::null_mut();
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) };
@@ -210,9 +232,7 @@ mod tests {
         // The DM guarantees all DBCs are freed before calling SQLFreeEnv.
         // The driver trusts this and frees unconditionally (matching msodbcsql).
         // In debug builds, debug_assert! fires and catch_unwind returns SQL_ERROR.
-        let mut env: SqlHandle = ptr::null_mut();
-        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) };
-        assert_eq!(ret, SQL_SUCCESS);
+        let env = alloc_env();
 
         let mut dbc: SqlHandle = ptr::null_mut();
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) };
@@ -234,9 +254,7 @@ mod tests {
 
     // --- Helper: alloc ENV + DBC for STMT tests ---
     fn alloc_env_dbc() -> (SqlHandle, SqlHandle) {
-        let mut env: SqlHandle = ptr::null_mut();
-        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) };
-        assert_eq!(ret, SQL_SUCCESS);
+        let env = alloc_env();
         let mut dbc: SqlHandle = ptr::null_mut();
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) };
         assert_eq!(ret, SQL_SUCCESS);

@@ -82,7 +82,12 @@ unsafe fn alloc_env(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
         return SQL_INVALID_HANDLE;
     }
 
-    let env = Box::new(EnvHandle::new());
+    let env = match EnvHandle::new() {
+        Ok(e) => Box::new(e),
+        Err(_) => {
+            return SQL_ERROR;
+        }
+    };
     let raw = handle_to_raw(env);
 
     unsafe { output_handle.write(raw) };
@@ -126,7 +131,7 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
         "SQLAllocHandle(DBC): SQL_ATTR_ODBC_VERSION not set on env"
     );
 
-    let dbc = Box::new(DbcHandle::new(input_handle));
+    let dbc = Box::new(DbcHandle::new(input_handle, env.runtime.clone()));
     let raw = handle_to_raw(dbc);
 
     // The DM guarantees SQLFreeHandle(ENV) cannot be called while
@@ -336,9 +341,7 @@ mod tests {
 
     // --- Helper: alloc ENV + DBC for STMT tests ---
     fn alloc_env_dbc() -> (SqlHandle, SqlHandle) {
-        let mut env: SqlHandle = ptr::null_mut();
-        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) };
-        assert_eq!(ret, SQL_SUCCESS);
+        let env = alloc_env_v3_80();
         let mut dbc: SqlHandle = ptr::null_mut();
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) };
         assert_eq!(ret, SQL_SUCCESS);

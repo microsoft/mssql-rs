@@ -44,6 +44,22 @@ tests/e2e/
 ```bash
 # From mssql-odbc/tests/e2e/
 ./run_e2e.sh
+
+# Verbose CTest output + Rust tracing
+./run_e2e.sh --verbose
+```
+
+In `--verbose` mode, `run_e2e.sh` defaults to:
+
+- `MSSQL_TDS_TRACE=true`
+- `MSSQL_TDS_TRACE_LEVEL=warn,msodbcsql18=debug`
+
+unless those variables are already set in your environment.
+
+To override the verbose default filter:
+
+```bash
+MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=trace" ./run_e2e.sh --verbose
 ```
 
 ### Windows (requires Administrator)
@@ -128,6 +144,21 @@ cd build && ctest --output-on-failure -C Debug
 
 Tests that require a live SQL Server are automatically **skipped** when no
 connection is configured. Set environment variables to enable them:
+
+### Auto-detection
+
+When `ODBC_TEST_SERVER` is not set, `run_e2e.sh` probes `localhost:1433`. If a
+SQL Server is listening, it auto-configures `ODBC_TEST_SERVER=localhost`,
+`ODBC_TEST_UID=sa`, and resolves the password from `ODBC_TEST_PWD`,
+`SQL_PASSWORD`, or `mssql-tds/.env` (in that order).
+
+To bring up a local SQL Server in Docker:
+
+```bash
+./dev/dev-launchsql.sh
+```
+
+### Manual configuration
 
 | Variable | Required? | Default | Description |
 |---|---|---|---|
