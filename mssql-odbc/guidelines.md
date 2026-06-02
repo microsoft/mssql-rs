@@ -29,10 +29,11 @@ across the FFI boundary is **undefined behavior**.
   error types at the call site.
 - At FFI boundaries, convert every `Result::Err` into the appropriate
   `SqlReturn` code (`SQL_ERROR`, `SQL_INVALID_HANDLE`, etc.).
-- Store diagnostic info (SQLSTATE, message) on the handle so
-  `SQLGetDiagRec` can report it — don't discard error details.
-- Every ODBC entry point must clear the handle's diagnostic records before
-  doing any work (`state.diag_records.clear()` after acquiring the lock) —
+- Store diagnostic info (SQLSTATE, message) on the handle via
+  `post_sql_error(...)` so `SQLGetDiagRec` can report it — don't discard
+  error details.
+- Every ODBC entry point must clear the handle's diagnostic records at API
+  entry by calling `free_errors(...)` after acquiring the handle lock —
   mirrors msodbcsql's `FreeErrors`.
 
 ## Unsafe code

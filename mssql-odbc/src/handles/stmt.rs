@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use super::{HandleType, HasObjectType};
-use crate::error::DiagRecord;
+use crate::error::{DiagRecord, HasDiagnostics};
 
 /// Statement handle — equivalent to msodbcsql's `struct tagSTMT`.
 ///
@@ -25,6 +25,12 @@ pub(crate) struct StmtHandle {
 pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
     // TODO: statement attributes (cursor type, concurrency, etc.) and execution state
+}
+
+impl HasDiagnostics for StmtState {
+    fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
+        &mut self.diag_records
+    }
 }
 
 // SAFETY: The raw pointer `parent_dbc` prevents auto-impl of Send/Sync.

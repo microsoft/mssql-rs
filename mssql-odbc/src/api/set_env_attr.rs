@@ -15,7 +15,7 @@ use crate::api::odbc_types::{
     SqlPointer, SqlReturn,
 };
 use crate::api::sqlstate::{SQLSTATE_HY024, SQLSTATE_HY092};
-use crate::error::DiagRecord;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::{EnvHandle, HandleType, OdbcVersion, handle_from_raw};
 
 /// Sets an attribute on an environment handle.
@@ -56,7 +56,7 @@ pub(crate) unsafe fn sql_set_env_attr(
 
         // Equivalent of msodbcsql `FreeErrors(lpEnv)` — clear any diagnostic
         // records left from a prior call before processing this one.
-        state.diag_records.clear();
+        free_errors(&mut state);
 
         // ODBC tagged-pointer: integer values arrive as `(SQLPOINTER)(uintptr_t)value`.
         let value = value_ptr as usize as u32;
@@ -69,21 +69,18 @@ pub(crate) unsafe fn sql_set_env_attr(
                 }
                 Err(()) => {
                     error!(value, "SQLSetEnvAttr: invalid ODBC_VERSION value");
-                    state.diag_records.push(DiagRecord::new(
-                        SQLSTATE_HY024,
-                        0,
-                        "Invalid attribute value",
-                    ));
+                    post_sql_error(&mut state, SQLSTATE_HY024, 0, "Invalid attribute value");
                     SQL_ERROR
                 }
             },
             _ => {
                 error!(attribute, "SQLSetEnvAttr: unknown attribute");
-                state.diag_records.push(DiagRecord::new(
+                post_sql_error(
+                    &mut state,
                     SQLSTATE_HY092,
                     0,
-                    "Invalid attribute identifier",
-                ));
+                    "Invalid attribute/option identifier",
+                );
                 SQL_ERROR
             }
         }

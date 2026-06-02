@@ -8,7 +8,7 @@ use mssql_tds::connection::tds_client::TdsClient;
 use tokio::runtime::Runtime;
 
 use super::{HandleType, HasObjectType};
-use crate::error::DiagRecord;
+use crate::error::{DiagRecord, HasDiagnostics};
 
 /// Connection state machine — tracks whether the DBC is connected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +62,12 @@ pub(crate) struct DbcState {
     pub(crate) statements: Vec<*mut c_void>,
     /// Active TDS connection, present only when `connection_state == Connected`.
     pub(crate) client: Option<TdsClient>,
+}
+
+impl HasDiagnostics for DbcState {
+    fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
+        &mut self.diag_records
+    }
 }
 
 impl DbcHandle {

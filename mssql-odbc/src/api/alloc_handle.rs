@@ -11,9 +11,9 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
     SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
 };
+use crate::error::free_errors;
 use crate::handles::{
-    DbcHandle, EnvHandle, HandleType, OdbcVersion, StmtHandle, free_handle, handle_from_raw,
-    handle_to_raw,
+    DbcHandle, EnvHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw, handle_to_raw,
 };
 
 /// Implementation of [`SQLAllocHandle`](super::exports::SQLAllocHandle).
@@ -121,29 +121,22 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
         "SQLAllocHandle(DBC): input_handle is not an ENV handle"
     );
 
+    let Ok(mut env_state) = env.inner.lock() else {
+        error!("SQLAllocHandle(DBC): env mutex poisoned");
+        return SQL_ERROR;
+    };
+    free_errors(&mut env_state);
+
     // DM enforces SQL_ATTR_ODBC_VERSION is set before SQLAllocConnect (HY010).
     // msodbcsql asserts in debug only; we do the same.
     debug_assert!(
-        env.inner
-            .lock()
-            .map(|s| s.odbc_version != OdbcVersion::Unset)
-            .unwrap_or(false),
+        env_state.odbc_version != OdbcVersion::Unset,
         "SQLAllocHandle(DBC): SQL_ATTR_ODBC_VERSION not set on env"
     );
 
     let dbc = Box::new(DbcHandle::new(input_handle, env.runtime.clone()));
     let raw = handle_to_raw(dbc);
-
-    // The DM guarantees SQLFreeHandle(ENV) cannot be called while
-    // SQLAllocHandle(DBC) is in progress on the same ENV, so the
-    // parent ENV and its mutex are guaranteed alive here.
-    let Ok(mut state) = env.inner.lock() else {
-        error!("SQLAllocHandle(DBC): env mutex poisoned — freeing DBC");
-        unsafe { free_handle::<DbcHandle>(raw) };
-        return SQL_ERROR;
-    };
-    state.diag_records.clear();
-    state.connections.push(raw);
+    env_state.connections.push(raw);
 
     unsafe { output_handle.write(raw) };
 
@@ -175,19 +168,15 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
         "SQLAllocHandle(STMT): input_handle is not a DBC handle"
     );
 
-    let stmt = Box::new(StmtHandle::new(input_handle));
-    let raw = handle_to_raw(stmt);
-
-    // The DM guarantees SQLFreeHandle(DBC) cannot be called while
-    // SQLAllocHandle(STMT) is in progress on the same DBC, so the
-    // parent DBC and its mutex are guaranteed alive here.
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("SQLAllocHandle(STMT): dbc mutex poisoned — freeing STMT");
-        unsafe { free_handle::<StmtHandle>(raw) };
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        error!("SQLAllocHandle(STMT): dbc mutex poisoned");
         return SQL_ERROR;
     };
-    state.diag_records.clear();
-    state.statements.push(raw);
+    free_errors(&mut dbc_state);
+
+    let stmt = Box::new(StmtHandle::new(input_handle));
+    let raw = handle_to_raw(stmt);
+    dbc_state.statements.push(raw);
 
     unsafe { output_handle.write(raw) };
 
