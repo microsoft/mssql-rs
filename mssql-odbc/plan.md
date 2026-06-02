@@ -272,3 +272,35 @@ Audit of [microsoft/mssql-python](https://github.com/microsoft/mssql-python) —
 | **Cleanup** (1) | `SQLFreeStmt` |
 
 **Not used by mssql-python**: `SQLConnect`, `SQLBrowseConnect`, `SQLGetFunctions`, `SQLSetPos`, `SQLBulkOperations`, `SQLCloseCursor`, `SQLCancel`, `SQLProcedureColumns`, `SQLGetDiagField`, `SQLGetDescField`, all `bcp_*` functions.
+
+---
+
+## Appendix: ODBC APIs used by pyodbc but not mssql-python
+
+Audit of [mkleehammer/pyodbc](https://github.com/mkleehammer/pyodbc) (source call sites) and diffed against the mssql-python API list above.
+
+| ODBC APIs used by pyodbc but not mssql-python |
+|----------|
+| `SQLCancel` |
+| `SQLColAttribute` |
+| `SQLDataSources` |
+| `SQLDataSourcesW` |
+| `SQLDescribeCol` |
+| `SQLDrivers` |
+| `SQLExecDirect` |
+| `SQLForeignKeys` |
+| `SQLGetDiagField` |
+| `SQLGetInfo` |
+| `SQLGetStmtAttr` |
+| `SQLGetTypeInfo` |
+| `SQLNumParams` |
+| `SQLPrepare` |
+| `SQLPrimaryKeys` |
+| `SQLProcedureColumns` |
+| `SQLProcedures` |
+| `SQLSetConnectAttr` |
+| `SQLSetDescField` |
+| `SQLSetStmtAttr` |
+| `SQLSpecialColumns` |
+| `SQLStatistics` |
+| `SQLTables` |
