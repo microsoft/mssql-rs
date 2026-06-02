@@ -12,7 +12,7 @@ use std::panic;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
-use crate::api::sqlstate::SQLSTATE_24000;
+use super::sqlstate::*;
 use crate::error::DiagRecord;
 use crate::handles::{DbcHandle, HandleType, StmtHandle, handle_from_raw};
 

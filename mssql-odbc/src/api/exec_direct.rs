@@ -12,7 +12,7 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
     SqlWChar,
 };
-use crate::api::sqlstate::{SQLSTATE_24000, SQLSTATE_HY000};
+use super::sqlstate::*;
 use crate::error::DiagRecord;
 use crate::handles::dbc::{ConnectionState, DbcHandle};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
