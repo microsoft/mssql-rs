@@ -14,8 +14,9 @@ use std::ffi::c_void;
 
 use tracing::{debug, trace};
 
-/// Discriminant stored inside each handle for runtime type-checking.
-/// Mirrors msodbcsql's `OBJECTTYPE` enum — guards against misuse of freed or wrong-type handles.
+/// Discriminant stored inside each handle.
+/// Mirrors msodbcsql's `OBJECTTYPE` enum. Checked in debug builds via `debug_assert_eq!`;
+/// in release builds the DM is trusted to pass the correct handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub(crate) enum HandleType {
