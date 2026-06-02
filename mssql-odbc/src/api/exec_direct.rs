@@ -20,7 +20,8 @@ use mssql_tds::connection::tds_client::ResultSet;
 /// Implementation of `SQLExecDirectW`.
 ///
 /// Executes a SQL statement directly on the connection associated with `statement_handle`.
-/// Buffers the complete result set in the statement handle for subsequent `SQLFetch` calls.
+/// Leaves the result set open for subsequent `SQLFetch` calls; call `SQLCloseCursor` or
+/// `SQLFreeStmt(SQL_CLOSE)` to drain the wire and release the connection.
 ///
 /// # Safety
 /// - `statement_handle` must be a valid `StmtHandle` allocated by `SQLAllocHandle`.
@@ -150,17 +151,8 @@ unsafe fn sql_exec_direct_w_impl(
     // Capture metadata for SQLNumResultCols / SQLDescribeCol.
     let metadata = client.get_metadata().clone();
 
-    // Drain remaining tokens so the connection is idle and ready for the next statement.
-    // cursor_open is NOT set — Phase 1 fully drains here; SQLFetch (next PR) will set it.
-    if let Err(e) = dbc.runtime.block_on(client.close_query()) {
-        error!(%e, "SQLExecDirectW: failed to close query");
-        if let Ok(mut ds) = dbc.inner.lock() {
-            ds.client = Some(client);
-        }
-        return SQL_ERROR;
-    }
-
-    // Store metadata in statement state.
+    // Store metadata and mark cursor open. Do not drain — SQLFetch will consume rows;
+    // SQLCloseCursor / SQLFreeStmt(SQL_CLOSE) will drain the wire.
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLExecDirectW: stmt mutex poisoned");
         if let Ok(mut ds) = dbc.inner.lock() {
@@ -169,16 +161,17 @@ unsafe fn sql_exec_direct_w_impl(
         return SQL_ERROR;
     };
     stmt_state.column_metadata = metadata;
+    stmt_state.cursor_open = true;
     stmt_state.diag_records.clear();
     drop(stmt_state);
 
-    // Return client to DbcState. active_stmt is not set — the batch is fully drained
-    // and the connection is idle. SQLFetch will manage active_stmt when rows are live.
+    // Return client to DBC and claim the connection for this statement.
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("SQLExecDirectW: dbc mutex poisoned storing client");
         return SQL_ERROR;
     };
     dbc_state.client = Some(client);
+    dbc_state.active_stmt = Some(statement_handle);
     drop(dbc_state);
 
     debug!("SQLExecDirectW: execution complete");

@@ -74,7 +74,7 @@ unsafe fn sql_close_cursor_impl(statement_handle: SqlHandle) -> SqlReturn {
     close_cursor_on_stmt(&mut stmt_state);
     drop(stmt_state);
 
-    release_active_stmt(stmt, statement_handle);
+    drain_and_release(stmt, statement_handle);
 
     debug!("SQLCloseCursor: cursor closed");
     SQL_SUCCESS
@@ -102,27 +102,47 @@ unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
     close_cursor_on_stmt(&mut stmt_state);
     drop(stmt_state);
 
-    release_active_stmt(stmt, statement_handle);
+    drain_and_release(stmt, statement_handle);
 
     debug!("SQLFreeStmt(SQL_CLOSE): cursor closed");
     SQL_SUCCESS
 }
 
-/// Resets cursor state on the statement.
+/// Clears cursor state on the statement.
 fn close_cursor_on_stmt(stmt_state: &mut crate::handles::stmt::StmtState) {
     stmt_state.cursor_open = false;
     stmt_state.column_metadata.clear();
 }
 
-/// Clears `dbc.active_stmt` if it points to this statement.
-fn release_active_stmt(stmt: &StmtHandle, statement_handle: SqlHandle) {
+/// Takes the TDS client from the DBC, drains any pending tokens, and clears `active_stmt`.
+/// No locks are held during the network I/O.
+fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) {
     let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
-    let Ok(mut dbc_state) = dbc.inner.lock() else {
-        error!("SQLCloseCursor: dbc mutex poisoned when releasing active_stmt");
+
+    let client = {
+        let Ok(mut dbc_state) = dbc.inner.lock() else {
+            error!("drain_and_release: dbc mutex poisoned");
+            return;
+        };
+        let client = dbc_state.client.take();
+        if dbc_state.active_stmt == Some(statement_handle) {
+            dbc_state.active_stmt = None;
+        }
+        client
+    };
+
+    let Some(mut client) = client else {
+        error!("drain_and_release: no TDS client to drain — this is a bug");
         return;
     };
-    if dbc_state.active_stmt == Some(statement_handle) {
-        dbc_state.active_stmt = None;
+
+    if let Err(e) = dbc.runtime.block_on(client.close_query()) {
+        error!(%e, "drain_and_release: failed to drain TDS stream — connection may be broken");
+        return;
+    }
+
+    if let Ok(mut dbc_state) = dbc.inner.lock() {
+        dbc_state.client = Some(client);
     }
 }
 
