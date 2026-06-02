@@ -45,12 +45,13 @@ TEST_F(ExecDirectLiveTest, SelectScalar) {
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
 
-// Query that produces no rows returns SQL_NO_DATA (Phase 1 behavior: driver
-// drains all rows eagerly and returns SQL_NO_DATA when the result set is empty).
+// Query that produces no rows still returns SQL_SUCCESS — the driver drains
+// the result set eagerly in Phase 1, but SQLExecDirect always returns success
+// for a well-formed query. Callers discover "no rows" via SQLFetch → SQL_NO_DATA.
 TEST_F(ExecDirectLiveTest, EmptyResultSet) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1 WHERE 1 = 0");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
-    EXPECT_EQ(SQL_NO_DATA, rc);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
 
 // Syntactically invalid SQL returns SQL_ERROR.

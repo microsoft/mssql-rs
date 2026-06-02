@@ -10,8 +10,7 @@ use tracing::{debug, error, trace};
 use super::sqlstate::*;
 use super::util::read_utf16;
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
-    SqlWChar,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
 };
 use crate::error::DiagRecord;
 use crate::handles::dbc::{ConnectionState, DbcHandle};
@@ -75,8 +74,26 @@ unsafe fn sql_exec_direct_w_impl(
     // Access parent DBC
     let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
 
-    // Precondition checks + take TdsClient out of DbcState.
-    // Lock is held only briefly — no I/O inside this block.
+    // Check STMT state first (cursor_open). Lock order: STMT → DBC everywhere,
+    // matching SQLCloseCursor, to prevent ABBA deadlock.
+    {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLExecDirectW: stmt mutex poisoned");
+            return SQL_ERROR;
+        };
+        if stmt_state.cursor_open {
+            error!("SQLExecDirectW: cursor is already open on this statement");
+            stmt_state.diag_records.clear();
+            stmt_state.diag_records.push(DiagRecord::new(
+                SQLSTATE_24000,
+                0,
+                "Invalid cursor state",
+            ));
+            return SQL_ERROR;
+        }
+    }
+
+    // Take TdsClient out of DbcState. Lock is held only briefly — no I/O inside.
     let mut client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLExecDirectW: dbc mutex poisoned");
@@ -85,32 +102,21 @@ unsafe fn sql_exec_direct_w_impl(
 
         if dbc_state.connection_state != ConnectionState::Connected {
             error!("SQLExecDirectW: DBC is not connected");
+            drop(dbc_state);
+            if let Ok(mut ss) = stmt.inner.lock() {
+                ss.diag_records.clear();
+                ss.diag_records
+                    .push(DiagRecord::new(SQLSTATE_08003, 0, "Connection not open"));
+            }
             return SQL_ERROR;
         }
 
-        // SQLSTATE 24000: re-executing on a statement that already has an open cursor.
-        {
-            let Ok(mut stmt_state) = stmt.inner.lock() else {
-                error!("SQLExecDirectW: stmt mutex poisoned");
-                return SQL_ERROR;
-            };
-            if stmt_state.cursor_open {
-                error!("SQLExecDirectW: cursor is already open on this statement");
-                stmt_state.diag_records.clear();
-                stmt_state.diag_records.push(DiagRecord::new(
-                    SQLSTATE_24000,
-                    0,
-                    "Invalid cursor state",
-                ));
-                return SQL_ERROR;
-            }
-        }
-
-        // SQLSTATE HY000: another statement on this DBC already holds an open cursor.
+        // HY000: another statement on this DBC already holds an open cursor.
         if let Some(busy_stmt) = dbc_state.active_stmt
             && busy_stmt != statement_handle
         {
             error!("SQLExecDirectW: connection is busy with results for another statement");
+            drop(dbc_state);
             if let Ok(mut ss) = stmt.inner.lock() {
                 ss.diag_records.clear();
                 ss.diag_records.push(DiagRecord::new(
@@ -131,8 +137,7 @@ unsafe fn sql_exec_direct_w_impl(
         // dbc_state dropped here — DBC lock released before any network I/O.
     };
 
-    // Execute the SQL batch. DBC lock is NOT held during network I/O, so SQLCancel
-    // and other DBC-level operations on concurrent threads can proceed.
+    // Execute the SQL batch. Neither DBC nor STMT lock is held during I/O.
     if let Err(e) = dbc.runtime.block_on(client.execute(sql, None, None)) {
         error!(%e, "SQLExecDirectW: execution failed");
         // TODO: post diagnostic record with SQLSTATE 42000 or HY000
@@ -142,12 +147,11 @@ unsafe fn sql_exec_direct_w_impl(
         return SQL_ERROR;
     }
 
-    // Buffer metadata for SQLNumResultCols / SQLDescribeCol.
-    // Row buffering is deferred to SQLFetch (next PR); close_query drains remaining tokens.
+    // Capture metadata for SQLNumResultCols / SQLDescribeCol.
     let metadata = client.get_metadata().clone();
-    let has_rows = !metadata.is_empty();
 
-    // Drain remaining tokens and close the server-side cursor.
+    // Drain remaining tokens so the connection is idle and ready for the next statement.
+    // cursor_open is NOT set — Phase 1 fully drains here; SQLFetch (next PR) will set it.
     if let Err(e) = dbc.runtime.block_on(client.close_query()) {
         error!(%e, "SQLExecDirectW: failed to close query");
         if let Ok(mut ds) = dbc.inner.lock() {
@@ -156,7 +160,7 @@ unsafe fn sql_exec_direct_w_impl(
         return SQL_ERROR;
     }
 
-    // Store results in the statement handle.
+    // Store metadata in statement state.
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLExecDirectW: stmt mutex poisoned");
         if let Ok(mut ds) = dbc.inner.lock() {
@@ -164,24 +168,21 @@ unsafe fn sql_exec_direct_w_impl(
         }
         return SQL_ERROR;
     };
-
     stmt_state.column_metadata = metadata;
-    stmt_state.cursor_open = true;
     stmt_state.diag_records.clear();
     drop(stmt_state);
 
-    // Return client to DbcState and record this stmt as the active cursor owner.
+    // Return client to DbcState. active_stmt is not set — the batch is fully drained
+    // and the connection is idle. SQLFetch will manage active_stmt when rows are live.
     let Ok(mut dbc_state) = dbc.inner.lock() else {
-        error!("SQLExecDirectW: dbc mutex poisoned storing active_stmt");
+        error!("SQLExecDirectW: dbc mutex poisoned storing client");
         return SQL_ERROR;
     };
     dbc_state.client = Some(client);
-    dbc_state.active_stmt = Some(statement_handle);
     drop(dbc_state);
 
     debug!("SQLExecDirectW: execution complete");
-
-    if has_rows { SQL_SUCCESS } else { SQL_NO_DATA }
+    SQL_SUCCESS
 }
 
 #[cfg(test)]
