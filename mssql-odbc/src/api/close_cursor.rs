@@ -11,8 +11,8 @@ use std::panic;
 
 use tracing::{debug, error};
 
-use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
 use super::sqlstate::*;
+use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
 use crate::error::DiagRecord;
 use crate::handles::{DbcHandle, HandleType, StmtHandle, handle_from_raw};
 
