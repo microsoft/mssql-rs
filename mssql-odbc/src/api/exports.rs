@@ -29,6 +29,7 @@ pub unsafe extern "C" fn SQLAllocHandle(
     input_handle: SqlHandle,
     output_handle_ptr: *mut SqlHandle,
 ) -> SqlReturn {
+    crate::init_tracing();
     unsafe { super::alloc_handle::sql_alloc_handle(handle_type, input_handle, output_handle_ptr) }
 }
 
@@ -39,6 +40,7 @@ pub unsafe extern "C" fn SQLAllocHandle(
 /// - `handle` must have been allocated by [`SQLAllocHandle`] and not already freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLFreeHandle(handle_type: SqlSmallInt, handle: SqlHandle) -> SqlReturn {
+    crate::init_tracing();
     unsafe { super::free_handle::sql_free_handle(handle_type, handle) }
 }
 
@@ -55,6 +57,7 @@ pub unsafe extern "C" fn SQLSetEnvAttr(
     value_ptr: SqlPointer,
     string_length: SqlInteger,
 ) -> SqlReturn {
+    crate::init_tracing();
     unsafe {
         super::set_env_attr::sql_set_env_attr(
             environment_handle,
@@ -89,6 +92,7 @@ pub unsafe extern "C" fn SQLGetDiagRecW(
     buffer_length: SqlSmallInt,
     text_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
+    crate::init_tracing();
     unsafe {
         super::get_diag_rec::sql_get_diag_rec_w(
             handle_type,
@@ -124,6 +128,7 @@ pub unsafe extern "C" fn SQLDriverConnectW(
     string_length2_ptr: *mut SqlSmallInt,
     driver_completion: SqlUSmallInt,
 ) -> SqlReturn {
+    crate::init_tracing();
     unsafe {
         super::driver_connect::sql_driver_connect_w(
             connection_handle,
