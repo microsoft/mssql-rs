@@ -129,8 +129,12 @@ unsafe fn sql_exec_direct_w_impl(
             return SQL_ERROR;
         }
 
+        // Claim the connection before releasing the lock. Concurrent threads will
+        // now see active_stmt and get HY000 instead of "no active TDS client".
+        dbc_state.active_stmt = Some(statement_handle);
         let Some(client) = dbc_state.client.take() else {
             error!("SQLExecDirectW: no active TDS client");
+            dbc_state.active_stmt = None;
             return SQL_ERROR;
         };
 
@@ -144,19 +148,53 @@ unsafe fn sql_exec_direct_w_impl(
         // TODO: post diagnostic record with SQLSTATE 42000 or HY000
         if let Ok(mut ds) = dbc.inner.lock() {
             ds.client = Some(client);
+            ds.active_stmt = None;
         }
         return SQL_ERROR;
     }
 
     // Capture metadata for SQLNumResultCols / SQLDescribeCol.
     let metadata = client.get_metadata().clone();
+    // A non-empty metadata vec means COLMETADATA was received — there is a result set
+    // (SELECT or similar). DDL / DML produces no COLMETADATA, so metadata is empty.
+    let has_result_set = !metadata.is_empty();
 
-    // Store metadata and mark cursor open. Do not drain — SQLFetch will consume rows;
+    if !has_result_set {
+        // DDL / DML: drain trailing DONE tokens and return the connection to idle.
+        // No cursor is opened — the app can re-execute immediately without SQLCloseCursor.
+        if let Err(e) = dbc.runtime.block_on(client.close_query()) {
+            error!(%e, "SQLExecDirectW: failed to drain after DDL/DML");
+            if let Ok(mut ds) = dbc.inner.lock() {
+                ds.active_stmt = None;
+            }
+            return SQL_ERROR;
+        }
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLExecDirectW: stmt mutex poisoned");
+            if let Ok(mut ds) = dbc.inner.lock() {
+                ds.client = Some(client);
+                ds.active_stmt = None;
+            }
+            return SQL_ERROR;
+        };
+        stmt_state.column_metadata = metadata; // empty vec
+        stmt_state.diag_records.clear();
+        drop(stmt_state);
+        if let Ok(mut ds) = dbc.inner.lock() {
+            ds.client = Some(client);
+            ds.active_stmt = None;
+        }
+        debug!("SQLExecDirectW: DDL/DML complete");
+        return SQL_SUCCESS;
+    }
+
+    // Result-bearing query: leave the result set open for SQLFetch.
     // SQLCloseCursor / SQLFreeStmt(SQL_CLOSE) will drain the wire.
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLExecDirectW: stmt mutex poisoned");
         if let Ok(mut ds) = dbc.inner.lock() {
             ds.client = Some(client);
+            ds.active_stmt = None;
         }
         return SQL_ERROR;
     };
@@ -165,13 +203,12 @@ unsafe fn sql_exec_direct_w_impl(
     stmt_state.diag_records.clear();
     drop(stmt_state);
 
-    // Return client to DBC and claim the connection for this statement.
+    // Return client to DBC. active_stmt is already set from the claim above.
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("SQLExecDirectW: dbc mutex poisoned storing client");
         return SQL_ERROR;
     };
     dbc_state.client = Some(client);
-    dbc_state.active_stmt = Some(statement_handle);
     drop(dbc_state);
 
     debug!("SQLExecDirectW: execution complete");

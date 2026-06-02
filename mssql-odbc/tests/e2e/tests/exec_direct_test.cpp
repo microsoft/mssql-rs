@@ -61,11 +61,15 @@ TEST_F(ExecDirectLiveTest, InvalidSql) {
     EXPECT_SQL_ERROR(rc);
 }
 
-// Re-executing on the same STMT succeeds (Phase 1: each execute drains fully
-// and resets pending_rows, so re-use is always safe).
+// Re-executing on the same STMT requires closing the cursor first.
+// SQLExecDirectW leaves an open cursor for result-bearing queries; the caller
+// must call SQLCloseCursor (or SQLFreeStmt(SQL_CLOSE)) before re-executing.
 TEST_F(ExecDirectLiveTest, ReExecute) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLCloseCursor(stmt_);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 
     rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);

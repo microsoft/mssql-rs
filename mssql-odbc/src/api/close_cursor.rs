@@ -115,34 +115,47 @@ fn close_cursor_on_stmt(stmt_state: &mut crate::handles::stmt::StmtState) {
 }
 
 /// Takes the TDS client from the DBC, drains any pending tokens, and clears `active_stmt`.
+/// `active_stmt` is kept set until the drain finishes so concurrent threads see the
+/// connection as busy (HY000) throughout — not just until `client` is taken.
 /// No locks are held during the network I/O.
 fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) {
     let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
 
+    // Take the client; intentionally leave active_stmt set while draining.
     let client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("drain_and_release: dbc mutex poisoned");
             return;
         };
-        let client = dbc_state.client.take();
-        if dbc_state.active_stmt == Some(statement_handle) {
-            dbc_state.active_stmt = None;
-        }
-        client
+        dbc_state.client.take()
     };
 
     let Some(mut client) = client else {
         error!("drain_and_release: no TDS client to drain — this is a bug");
+        if let Ok(mut ds) = dbc.inner.lock()
+            && ds.active_stmt == Some(statement_handle)
+        {
+            ds.active_stmt = None;
+        }
         return;
     };
 
     if let Err(e) = dbc.runtime.block_on(client.close_query()) {
         error!(%e, "drain_and_release: failed to drain TDS stream — connection may be broken");
+        if let Ok(mut ds) = dbc.inner.lock()
+            && ds.active_stmt == Some(statement_handle)
+        {
+            ds.active_stmt = None;
+        }
         return;
     }
 
+    // Drain complete: return client and release busy claim atomically.
     if let Ok(mut dbc_state) = dbc.inner.lock() {
         dbc_state.client = Some(client);
+        if dbc_state.active_stmt == Some(statement_handle) {
+            dbc_state.active_stmt = None;
+        }
     }
 }
 
