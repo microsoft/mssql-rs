@@ -1,4 +1,4 @@
-// Copyright (c) Microsoft Corporation.
+﻿// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
 //! Exported ODBC entry points for the msodbcsql18 shared library.
@@ -158,6 +158,7 @@ pub unsafe extern "C" fn SQLDisconnect(connection_handle: SqlHandle) -> SqlRetur
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLCloseCursor(statement_handle: SqlHandle) -> SqlReturn {
+    crate::init_tracing();
     unsafe { super::close_cursor::sql_close_cursor(statement_handle) }
 }
 
@@ -173,6 +174,7 @@ pub unsafe extern "C" fn SQLFreeStmt(
     statement_handle: SqlHandle,
     option: SqlUSmallInt,
 ) -> SqlReturn {
+    crate::init_tracing();
     const SQL_CLOSE: SqlUSmallInt = 0;
     match option {
         SQL_CLOSE => unsafe { super::close_cursor::sql_free_stmt_close(statement_handle) },
@@ -198,6 +200,7 @@ pub unsafe extern "C" fn SQLExecDirectW(
     statement_text: *const SqlWChar,
     text_length: SqlSmallInt,
 ) -> SqlReturn {
+    crate::init_tracing();
     unsafe { super::exec_direct::sql_exec_direct_w(statement_handle, statement_text, text_length) }
 }
 
