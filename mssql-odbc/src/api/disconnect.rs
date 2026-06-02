@@ -83,8 +83,9 @@ unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
     }
     state.statements.clear();
 
-    // Drop the TDS client (closes the connection)
+    // Drop the TDS client (closes the connection) and clear connection-level cursor claim.
     state.client = None;
+    state.active_stmt = None;
     state.connection_state = ConnectionState::Disconnected;
 
     debug!("SQLDisconnect: disconnected successfully");
