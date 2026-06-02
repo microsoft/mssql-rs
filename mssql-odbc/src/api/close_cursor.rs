@@ -12,6 +12,7 @@ use std::panic;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
+use crate::error::{DiagRecord, SQLSTATE_24000};
 use crate::handles::{DbcHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Closes the cursor on `statement_handle` and discards any pending rows.
@@ -62,7 +63,10 @@ unsafe fn sql_close_cursor_impl(statement_handle: SqlHandle) -> SqlReturn {
 
     if !stmt_state.cursor_open {
         error!("SQLCloseCursor: no cursor is open — SQLSTATE 24000");
-        // TODO: post DiagRecord with SQLSTATE 24000
+        stmt_state.diag_records.clear();
+        stmt_state
+            .diag_records
+            .push(DiagRecord::new(SQLSTATE_24000, 0, "Invalid cursor state"));
         return SQL_ERROR;
     }
 
@@ -106,8 +110,6 @@ unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
 /// Resets cursor state on the statement.
 fn close_cursor_on_stmt(stmt_state: &mut crate::handles::stmt::StmtState) {
     stmt_state.cursor_open = false;
-    stmt_state.pending_rows.clear();
-    stmt_state.row_cursor = 0;
     stmt_state.column_metadata.clear();
 }
 

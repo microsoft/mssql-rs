@@ -10,7 +10,6 @@ mod free_handle;
 mod get_diag_rec;
 pub(crate) mod odbc_types;
 mod set_env_attr;
-pub(crate) mod sqlstate;
 pub(crate) mod util;
 
 // Exported ODBC entry points — the driver's public API surface.

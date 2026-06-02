@@ -12,6 +12,7 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
     SqlWChar,
 };
+use crate::error::{DiagRecord, SQLSTATE_24000, SQLSTATE_HY000};
 use crate::handles::dbc::{ConnectionState, DbcHandle};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::ResultSet;
@@ -25,7 +26,6 @@ use mssql_tds::connection::tds_client::ResultSet;
 /// - `statement_handle` must be a valid `StmtHandle` allocated by `SQLAllocHandle`.
 /// - `statement_text` must point to a valid UTF-16 buffer readable for `text_length` characters.
 ///   If `text_length` is `SQL_NTS`, the string must be NUL-terminated.
-#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_exec_direct_w(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
@@ -89,13 +89,18 @@ unsafe fn sql_exec_direct_w_impl(
 
         // SQLSTATE 24000: re-executing on a statement that already has an open cursor.
         {
-            let Ok(stmt_state) = stmt.inner.lock() else {
+            let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLExecDirectW: stmt mutex poisoned");
                 return SQL_ERROR;
             };
             if stmt_state.cursor_open {
                 error!("SQLExecDirectW: cursor is already open on this statement");
-                // TODO: post DiagRecord with SQLSTATE 24000
+                stmt_state.diag_records.clear();
+                stmt_state.diag_records.push(DiagRecord::new(
+                    SQLSTATE_24000,
+                    0,
+                    "Invalid cursor state",
+                ));
                 return SQL_ERROR;
             }
         }
@@ -105,7 +110,14 @@ unsafe fn sql_exec_direct_w_impl(
             && busy_stmt != statement_handle
         {
             error!("SQLExecDirectW: connection is busy with results for another statement");
-            // TODO: post DiagRecord with SQLSTATE HY000
+            if let Ok(mut ss) = stmt.inner.lock() {
+                ss.diag_records.clear();
+                ss.diag_records.push(DiagRecord::new(
+                    SQLSTATE_HY000,
+                    0,
+                    "Connection is busy with results for another hstmt",
+                ));
+            }
             return SQL_ERROR;
         }
 
@@ -123,49 +135,38 @@ unsafe fn sql_exec_direct_w_impl(
     if let Err(e) = dbc.runtime.block_on(client.execute(sql, None, None)) {
         error!(%e, "SQLExecDirectW: execution failed");
         // TODO: post diagnostic record with SQLSTATE 42000 or HY000
-        if let Ok(mut ds) = dbc.inner.lock() { ds.client = Some(client); }
+        if let Ok(mut ds) = dbc.inner.lock() {
+            ds.client = Some(client);
+        }
         return SQL_ERROR;
     }
 
-    // Buffer metadata and all rows from the result set.
+    // Buffer metadata for SQLNumResultCols / SQLDescribeCol.
+    // Row buffering is deferred to SQLFetch (next PR); close_query drains remaining tokens.
     let metadata = client.get_metadata().clone();
+    let has_rows = !metadata.is_empty();
 
-    let mut rows = Vec::new();
-    loop {
-        match dbc.runtime.block_on(client.next_row()) {
-            Ok(Some(row)) => rows.push(row),
-            Ok(None) => break,
-            Err(e) => {
-                error!(%e, "SQLExecDirectW: error reading row");
-                let _ = dbc.runtime.block_on(client.close_query());
-                if let Ok(mut ds) = dbc.inner.lock() { ds.client = Some(client); }
-                return SQL_ERROR;
-            }
-        }
-    }
-
-    // Close the server-side cursor so the connection is ready for the next query.
+    // Drain remaining tokens and close the server-side cursor.
     if let Err(e) = dbc.runtime.block_on(client.close_query()) {
         error!(%e, "SQLExecDirectW: failed to close query");
-        if let Ok(mut ds) = dbc.inner.lock() { ds.client = Some(client); }
+        if let Ok(mut ds) = dbc.inner.lock() {
+            ds.client = Some(client);
+        }
         return SQL_ERROR;
     }
 
     // Store results in the statement handle.
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLExecDirectW: stmt mutex poisoned");
-        if let Ok(mut ds) = dbc.inner.lock() { ds.client = Some(client); }
+        if let Ok(mut ds) = dbc.inner.lock() {
+            ds.client = Some(client);
+        }
         return SQL_ERROR;
     };
 
     stmt_state.column_metadata = metadata;
-    // Fields consumed by SQLFetch — see TODO(SQLFetch) in stmt.rs for the contract.
-    stmt_state.pending_rows = rows;
-    stmt_state.row_cursor = 0;
     stmt_state.cursor_open = true;
     stmt_state.diag_records.clear();
-    let has_rows = !stmt_state.pending_rows.is_empty();
-    let row_count = stmt_state.pending_rows.len();
     drop(stmt_state);
 
     // Return client to DbcState and record this stmt as the active cursor owner.
@@ -177,7 +178,7 @@ unsafe fn sql_exec_direct_w_impl(
     dbc_state.active_stmt = Some(statement_handle);
     drop(dbc_state);
 
-    debug!(rows = row_count, "SQLExecDirectW: execution complete");
+    debug!("SQLExecDirectW: execution complete");
 
     if has_rows { SQL_SUCCESS } else { SQL_NO_DATA }
 }

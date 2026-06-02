@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
 //! Exported ODBC entry points for the msodbcsql18 shared library.
@@ -201,7 +201,7 @@ pub unsafe extern "C" fn SQLExecDirectW(
     unsafe { super::exec_direct::sql_exec_direct_w(statement_handle, statement_text, text_length) }
 }
 
-// TODO(SQLFetch): implement SQLFetch — advance `stmt_state.row_cursor` and
-// return SQL_SUCCESS while `row_cursor < pending_rows.len()`, SQL_NO_DATA when
-// exhausted.  Also implement SQLGetData to expose `pending_rows[row_cursor - 1]`
+// TODO(SQLFetch): implement SQLFetch — call client.next_row() from the wire,
+// return SQL_SUCCESS per row, SQL_NO_DATA when exhausted.
+// Also implement SQLGetData to expose the current row's column values.
 // to the application.
