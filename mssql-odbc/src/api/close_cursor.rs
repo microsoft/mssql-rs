@@ -142,10 +142,11 @@ fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) {
 
     if let Err(e) = dbc.runtime.block_on(client.close_query()) {
         error!(%e, "drain_and_release: failed to drain TDS stream — connection may be broken");
-        if let Ok(mut ds) = dbc.inner.lock()
-            && ds.active_stmt == Some(statement_handle)
-        {
-            ds.active_stmt = None;
+        if let Ok(mut ds) = dbc.inner.lock() {
+            ds.client = Some(client);
+            if ds.active_stmt == Some(statement_handle) {
+                ds.active_stmt = None;
+            }
         }
         return;
     }

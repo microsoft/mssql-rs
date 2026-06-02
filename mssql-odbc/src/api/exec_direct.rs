@@ -165,6 +165,7 @@ unsafe fn sql_exec_direct_w_impl(
         if let Err(e) = dbc.runtime.block_on(client.close_query()) {
             error!(%e, "SQLExecDirectW: failed to drain after DDL/DML");
             if let Ok(mut ds) = dbc.inner.lock() {
+                ds.client = Some(client);
                 ds.active_stmt = None;
             }
             return SQL_ERROR;
