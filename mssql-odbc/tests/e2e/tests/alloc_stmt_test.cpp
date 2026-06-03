@@ -76,6 +76,7 @@ TEST_F(AllocStmtTest, DisconnectedDbcFails) {
     SQLHSTMT hstmt = SQL_NULL_HSTMT;
     SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_STMT, hdbc_, &hstmt);
     ASSERT_FALSE(SQL_SUCCEEDED(rc));
+    EXPECT_FALSE(ODBCTestUtils::GetDiagState(SQL_HANDLE_DBC, hdbc_).empty());
 }
 
 // ===================================================================
