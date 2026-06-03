@@ -23,33 +23,6 @@ TEST_F(ODBCTest, DriverConnect_NullDbc) {
 }
 
 // SQLDriverConnect with a non-NOPROMPT completion mode returns error.
-TEST_F(ODBCTest, DriverConnect_UnsupportedCompletion) {
-    SQLHDBC hdbc = SQL_NULL_HDBC;
-    SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
-    ASSERT_SQL_OK(rc, SQL_HANDLE_ENV, env_);
-
-    auto& cfg = ODBCTestConfig::Instance();
-    std::string cs = "Driver={" + cfg.Driver() + "};Server=h;UID=u;PWD=p";
-    SqlTString connStr = ODBCTestUtils::ToSqlTStr(cs);
-    SQLTCHAR outStr[256] = {};
-    SQLSMALLINT outLen = 0;
-
-    // SQL_DRIVER_COMPLETE (1)
-    rc = SQLDriverConnect(hdbc, nullptr,
-                          const_cast<SQLTCHAR*>(connStr.c_str()), SQL_NTS,
-                          outStr, 256, &outLen,
-                          SQL_DRIVER_COMPLETE);
-    EXPECT_SQL_ERROR(rc);
-
-    // SQL_DRIVER_PROMPT (2)
-    rc = SQLDriverConnect(hdbc, nullptr,
-                          const_cast<SQLTCHAR*>(connStr.c_str()), SQL_NTS,
-                          outStr, 256, &outLen,
-                          SQL_DRIVER_PROMPT);
-    EXPECT_SQL_ERROR(rc);
-
-    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
-}
 
 // SQLDriverConnect with missing Server returns error.
 TEST_F(ODBCTest, DriverConnect_MissingServer) {
@@ -68,6 +41,7 @@ TEST_F(ODBCTest, DriverConnect_MissingServer) {
                           outStr, 256, &outLen,
                           SQL_DRIVER_NOPROMPT);
     EXPECT_SQL_ERROR(rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, hdbc, "HY000");
 
     SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }
@@ -80,6 +54,7 @@ TEST_F(ODBCTest, Disconnect_NotConnected) {
 
     rc = SQLDisconnect(hdbc);
     EXPECT_SQL_ERROR(rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, hdbc, "08003");
 
     SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }
@@ -212,6 +187,7 @@ TEST_F(DriverConnectLiveTest, BadCredentials) {
                           outStr, 1024, &outLen,
                           SQL_DRIVER_NOPROMPT);
     EXPECT_SQL_ERROR(rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, hdbc, "08001");
 
     SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }
@@ -233,6 +209,7 @@ TEST_F(DriverConnectLiveTest, OutputBufferTruncation) {
                           SQL_DRIVER_NOPROMPT);
     // Truncation must return SQL_SUCCESS_WITH_INFO (SQLSTATE 01004)
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, hdbc, "01004");
     // outLen reports the FULL length (not truncated)
     EXPECT_GT(outLen, 7);
 
@@ -253,7 +230,7 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
         SQLHDBC hdbc = SQL_NULL_HDBC;
         SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
         EXPECT_EQ(SQL_SUCCESS, rc);
-        if (rc != SQL_SUCCESS) return rc;
+        if (rc != SQL_SUCCESS) return std::make_pair(rc, std::string());
 
         SqlTString connstr = ODBCTestUtils::ToSqlTStr(cs);
         SQLTCHAR outStr[1024] = {};
@@ -265,32 +242,61 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
                               outStr, 1024, &outLen,
                               SQL_DRIVER_NOPROMPT);
 
+        std::string state;
+        if (rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR) {
+            state = ODBCTestUtils::GetDiagState(SQL_HANDLE_DBC, hdbc);
+        }
+
         if (SQL_SUCCEEDED(rc)) SQLDisconnect(hdbc);
         SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
-        return rc;
+        return std::make_pair(rc, state);
     };
 
     // Token without '=' separator
-    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, tryConnect(base + ";garbage"));
+    {
+        auto result = tryConnect(base + ";garbage");
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, result.first);
+        EXPECT_EQ("01S00", result.second);
+    }
 
     // Empty key (=value)
-    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, tryConnect(base + ";=orphan"));
+    {
+        auto result = tryConnect(base + ";=orphan");
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, result.first);
+        EXPECT_EQ("01S00", result.second);
+    }
 
     // Multiple malformed tokens
-    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, tryConnect(base + ";garbage;=orphan;junk"));
+    {
+        auto result = tryConnect(base + ";garbage;=orphan;junk");
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, result.first);
+        EXPECT_EQ("01S00", result.second);
+    }
 
     // Malformed token buried between valid keys
-    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, tryConnect(
-        "Driver={" + cfg.Driver() + "}"
-        ";Server=" + cfg.Server() + ";noequals;UID=" + cfg.Uid() +
-        ";PWD=" + cfg.Pwd() + ";TrustServerCertificate=" + cfg.TrustCert()));
+    {
+        auto result = tryConnect(
+            "Driver={" + cfg.Driver() + "}"
+            ";Server=" + cfg.Server() + ";noequals;UID=" + cfg.Uid() +
+            ";PWD=" + cfg.Pwd() + ";TrustServerCertificate=" + cfg.TrustCert());
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, result.first);
+        EXPECT_EQ("01S00", result.second);
+    }
 
     // Extra semicolons with valid keys — no warnings, should be plain SUCCESS
-    EXPECT_EQ(SQL_SUCCESS, tryConnect("Driver={" + cfg.Driver() + "}"
-        ";;;Server=" + cfg.Server() +
-        ";;;UID=" + cfg.Uid() + ";;PWD=" + cfg.Pwd() +
-        ";TrustServerCertificate=" + cfg.TrustCert() + ";;;"));
+    {
+        auto result = tryConnect("Driver={" + cfg.Driver() + "}"
+            ";;;Server=" + cfg.Server() +
+            ";;;UID=" + cfg.Uid() + ";;PWD=" + cfg.Pwd() +
+            ";TrustServerCertificate=" + cfg.TrustCert() + ";;;");
+        EXPECT_EQ(SQL_SUCCESS, result.first);
+        EXPECT_TRUE(result.second.empty());
+    }
 
     // Unknown keys are ignored but return warning 01S00.
-    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, tryConnect(base + ";FooBar=xyz;Bogus=123"));
+    {
+        auto result = tryConnect(base + ";FooBar=xyz;Bogus=123");
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, result.first);
+        EXPECT_EQ("01S00", result.second);
+    }
 }

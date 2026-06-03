@@ -8,6 +8,8 @@ use std::panic;
 use tracing::{debug, error, trace};
 
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
+use crate::api::sqlstate::{SQLSTATE_08003, SQLSTATE_HY000};
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::DbcHandle;
 use crate::handles::StmtHandle;
 use crate::handles::dbc::ConnectionState;
@@ -49,9 +51,11 @@ unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
         return SQL_ERROR;
     };
 
+    free_errors(&mut state);
+
     if state.connection_state != ConnectionState::Connected {
         error!("SQLDisconnect: not connected");
-        // TODO: post SQLSTATE 08003
+        post_sql_error(&mut state, SQLSTATE_08003, 0, "Connection does not exist");
         return SQL_ERROR;
     }
 
@@ -66,6 +70,12 @@ unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
         // Acquire and immediately release — waits for any in-flight operation to complete.
         let Ok(guard) = stmt.inner.lock() else {
             error!(?stmt_ptr, "SQLDisconnect: stmt mutex poisoned");
+            post_sql_error(
+                &mut state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error while disconnecting statements",
+            );
             return SQL_ERROR;
         };
         drop(guard);

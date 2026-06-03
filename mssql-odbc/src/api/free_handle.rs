@@ -11,6 +11,8 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DBC_INFO_TOKEN, SQL_HANDLE_DESC, SQL_HANDLE_ENV,
     SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
 };
+use crate::api::sqlstate::SQLSTATE_HY000;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::{DbcHandle, EnvHandle, HandleType, StmtHandle, free_handle, handle_from_raw};
 
 /// Implementation of [`SQLFreeHandle`](super::exports::SQLFreeHandle).
@@ -69,6 +71,10 @@ unsafe fn free_env(handle: SqlHandle) -> SqlReturn {
         "SQLFreeHandle(ENV): handle is not an ENV"
     );
 
+    if let Ok(mut state) = env.inner.lock() {
+        free_errors(&mut state);
+    }
+
     debug_assert!(
         env.inner
             .lock()
@@ -97,6 +103,10 @@ unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
         "SQLFreeHandle(DBC): handle is not a DBC"
     );
 
+    if let Ok(mut state) = dbc.inner.lock() {
+        free_errors(&mut state);
+    }
+
     debug_assert!(
         dbc.inner
             .lock()
@@ -111,6 +121,14 @@ unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
         // Lock scope for ENV mutex - so that we unlock before deallocating the DBC
         let Ok(mut env_state) = env.inner.lock() else {
             error!(?handle, "SQLFreeHandle(DBC): env mutex poisoned");
+            if let Ok(mut dbc_state) = dbc.inner.lock() {
+                post_sql_error(
+                    &mut dbc_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error while freeing connection",
+                );
+            }
             return SQL_ERROR;
         };
         if let Some(i) = env_state.connections.iter().position(|&p| p == handle) {
@@ -138,12 +156,24 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
         "SQLFreeHandle(STMT): handle is not a STMT"
     );
 
+    if let Ok(mut state) = stmt.inner.lock() {
+        free_errors(&mut state);
+    }
+
     // Lock parent DBC and try to unregister.
     let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
     {
         // Lock scope for DBC mutex - so that we unlock before deallocating the STMT
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!(?handle, "SQLFreeHandle(STMT): dbc mutex poisoned");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error while freeing statement",
+                );
+            }
             return SQL_ERROR;
         };
         let Some(i) = dbc_state.statements.iter().position(|&p| p == handle) else {

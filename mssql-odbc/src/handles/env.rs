@@ -10,7 +10,7 @@ use tracing::error;
 
 use super::{HandleType, HasObjectType};
 use crate::api::odbc_types::{SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
-use crate::error::DiagRecord;
+use crate::error::{DiagRecord, HasDiagnostics};
 
 /// ODBC environment attributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +65,12 @@ pub(crate) struct EnvState {
     pub(crate) output_nts: bool,
     /// Active child DBC handles, mirroring msodbcsql's `lppllpdbc`.
     pub(crate) connections: Vec<*mut c_void>,
+}
+
+impl HasDiagnostics for EnvState {
+    fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
+        &mut self.diag_records
+    }
 }
 
 impl EnvHandle {

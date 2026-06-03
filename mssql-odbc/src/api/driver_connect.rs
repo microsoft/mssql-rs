@@ -12,8 +12,13 @@ use crate::api::odbc_types::{
     SQL_DRIVER_NOPROMPT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS,
     SQL_SUCCESS_WITH_INFO, SqlHWnd, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
+use crate::api::sqlstate::{
+    SQLSTATE_01S00, SQLSTATE_01004, SQLSTATE_08001, SQLSTATE_HY000, SQLSTATE_HY009, SQLSTATE_HY010,
+    SQLSTATE_HY024, SQLSTATE_HY110,
+};
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::DbcHandle;
-use crate::handles::dbc::ConnectionState;
+use crate::handles::dbc::{ConnectionState, DbcState};
 use crate::handles::{HandleType, handle_from_raw};
 
 use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
@@ -86,12 +91,20 @@ unsafe fn sql_driver_connect_w_impl(
         "SQLDriverConnectW: handle is not a DBC"
     );
 
-    // Only SQL_DRIVER_NOPROMPT is supported (no UI prompting)
+    let Ok(mut state) = dbc.inner.lock() else {
+        error!("SQLDriverConnectW: dbc mutex poisoned");
+        return SQL_ERROR;
+    };
+
+    free_errors(&mut state);
+
+    // Only SQL_DRIVER_NOPROMPT is supported (no UI prompting).
     if driver_completion != SQL_DRIVER_NOPROMPT {
         error!(
             driver_completion,
-            "SQLDriverConnectW: only SQL_DRIVER_NOPROMPT is supported" // TODO: post SQLSTATE HY110
+            "SQLDriverConnectW: only SQL_DRIVER_NOPROMPT is supported"
         );
+        post_sql_error(&mut state, SQLSTATE_HY110, 0, "Invalid driver completion");
         return SQL_ERROR;
     }
 
@@ -103,27 +116,23 @@ unsafe fn sql_driver_connect_w_impl(
 
     // Transition to Connecting state under lock - prevents concurrent connect race.
     // 08002 (already connected) is DM-enforced, so we debug_assert only.
-    {
-        let Ok(mut state) = dbc.inner.lock() else {
-            error!("SQLDriverConnectW: dbc mutex poisoned");
-            return SQL_ERROR;
-        };
-        debug_assert_ne!(
-            state.connection_state,
-            ConnectionState::Connected,
-            "SQLDriverConnectW: DM should reject connect on already-connected handle (08002)"
-        );
-        if state.connection_state != ConnectionState::Disconnected {
-            error!("SQLDriverConnectW: connection attempt already in progress");
-            return SQL_ERROR;
-        }
-        state.connection_state = ConnectionState::Connecting;
+    debug_assert_ne!(
+        state.connection_state,
+        ConnectionState::Connected,
+        "SQLDriverConnectW: DM should reject connect on already-connected handle (08002)"
+    );
+    if state.connection_state != ConnectionState::Disconnected {
+        error!("SQLDriverConnectW: connection attempt already in progress");
+        post_sql_error(&mut state, SQLSTATE_HY010, 0, "Function sequence error");
+        return SQL_ERROR;
     }
+    state.connection_state = ConnectionState::Connecting;
 
     // From here on, any early return must reset state to Disconnected.
     let result = unsafe {
         do_connect(
             dbc,
+            &mut state,
             in_connection_string,
             string_length_1,
             out_connection_string,
@@ -134,9 +143,7 @@ unsafe fn sql_driver_connect_w_impl(
 
     if result != SQL_SUCCESS && result != SQL_SUCCESS_WITH_INFO {
         // Reset state on failure
-        if let Ok(mut state) = dbc.inner.lock() {
-            state.connection_state = ConnectionState::Disconnected;
-        }
+        state.connection_state = ConnectionState::Disconnected;
     }
 
     result
@@ -145,6 +152,7 @@ unsafe fn sql_driver_connect_w_impl(
 /// Inner connect logic, separated so the caller can reset state on failure.
 unsafe fn do_connect(
     dbc: &DbcHandle,
+    state: &mut DbcState,
     in_connection_string: *const SqlWChar,
     string_length_1: SqlSmallInt,
     out_connection_string: *mut SqlWChar,
@@ -154,7 +162,7 @@ unsafe fn do_connect(
     // Read the input connection string (UTF-16 → String)
     if in_connection_string.is_null() {
         error!("SQLDriverConnectW: in_connection_string is null");
-        // TODO: post SQLSTATE HY009
+        post_sql_error(state, SQLSTATE_HY009, 0, "Invalid use of null pointer");
         return SQL_ERROR;
     }
 
@@ -166,7 +174,7 @@ unsafe fn do_connect(
         Ok(result) => result,
         Err(e) => {
             error!(%e, "SQLDriverConnectW: invalid connection string attribute value");
-            // TODO: post SQLSTATE 01S00
+            post_sql_error(state, SQLSTATE_HY024, 0, e.to_string());
             return SQL_ERROR;
         }
     };
@@ -174,7 +182,12 @@ unsafe fn do_connect(
     // Validate required fields. Let mssql-tds validate based on auth method.
     if params.server.is_empty() {
         error!("SQLDriverConnectW: Server not specified in connection string");
-        // TODO: post SQLSTATE HY000
+        post_sql_error(
+            state,
+            SQLSTATE_HY000,
+            0,
+            "Server not specified in connection string",
+        );
         return SQL_ERROR;
     }
 
@@ -210,20 +223,10 @@ unsafe fn do_connect(
         Ok(c) => c,
         Err(e) => {
             error!(%e, "SQLDriverConnectW: connection failed");
-            // TODO: post SQLSTATE 08001
+            post_sql_error(state, SQLSTATE_08001, 0, e.to_string());
             return SQL_ERROR;
         }
     };
-
-    // Store the client and transition to Connected
-    {
-        let Ok(mut state) = dbc.inner.lock() else {
-            error!("SQLDriverConnectW: dbc mutex poisoned");
-            return SQL_ERROR;
-        };
-        state.client = Some(client);
-        state.connection_state = ConnectionState::Connected;
-    }
 
     // Write output connection string
     // TODO: build completed output connection string from resolved attributes and negotiated
@@ -248,9 +251,22 @@ unsafe fn do_connect(
         }
     }
 
+    state.client = Some(client);
+    state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
+
     if has_warnings || truncated {
-        // TODO: post SQLSTATE 01004 for truncation, 01S00 for malformed tokens via SQLGetDiagRec
+        if has_warnings {
+            post_sql_error(
+                state,
+                SQLSTATE_01S00,
+                0,
+                "Invalid connection string attribute",
+            );
+        }
+        if truncated {
+            post_sql_error(state, SQLSTATE_01004, 0, "String data, right truncation");
+        }
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
