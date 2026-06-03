@@ -12,7 +12,7 @@ use super::util::read_utf16;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
 };
-use crate::error::DiagRecord;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::{ConnectionState, DbcHandle};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::ResultSet;
@@ -64,10 +64,11 @@ unsafe fn sql_exec_direct_w_impl(
         "SQLExecDirectW: handle is not a STMT"
     );
 
-    if statement_text.is_null() {
-        error!("SQLExecDirectW: statement_text is null");
-        return SQL_ERROR;
-    }
+    // The DM rejects null statement_text before calling the driver; see SQLExecDirect spec.
+    debug_assert!(
+        !statement_text.is_null(),
+        "SQLExecDirectW: statement_text is null — DM should have rejected this"
+    );
 
     let sql = unsafe { read_utf16(statement_text, text_length) };
     debug!(sql = %sql, "SQLExecDirectW: executing");
@@ -82,14 +83,10 @@ unsafe fn sql_exec_direct_w_impl(
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
         };
+        free_errors(&mut stmt_state);
         if stmt_state.cursor_open {
             error!("SQLExecDirectW: cursor is already open on this statement");
-            stmt_state.diag_records.clear();
-            stmt_state.diag_records.push(DiagRecord::new(
-                SQLSTATE_24000,
-                0,
-                "Invalid cursor state",
-            ));
+            post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "Invalid cursor state");
             return SQL_ERROR;
         }
     }
@@ -105,9 +102,7 @@ unsafe fn sql_exec_direct_w_impl(
             error!("SQLExecDirectW: DBC is not connected");
             drop(dbc_state);
             if let Ok(mut ss) = stmt.inner.lock() {
-                ss.diag_records.clear();
-                ss.diag_records
-                    .push(DiagRecord::new(SQLSTATE_08003, 0, "Connection not open"));
+                post_sql_error(&mut ss, SQLSTATE_08003, 0, "Connection not open");
             }
             return SQL_ERROR;
         }
@@ -119,12 +114,12 @@ unsafe fn sql_exec_direct_w_impl(
             error!("SQLExecDirectW: connection is busy with results for another statement");
             drop(dbc_state);
             if let Ok(mut ss) = stmt.inner.lock() {
-                ss.diag_records.clear();
-                ss.diag_records.push(DiagRecord::new(
+                post_sql_error(
+                    &mut ss,
                     SQLSTATE_HY000,
                     0,
                     "Connection is busy with results for another hstmt",
-                ));
+                );
             }
             return SQL_ERROR;
         }
@@ -135,6 +130,10 @@ unsafe fn sql_exec_direct_w_impl(
         let Some(client) = dbc_state.client.take() else {
             error!("SQLExecDirectW: no active TDS client");
             dbc_state.active_stmt = None;
+            drop(dbc_state);
+            if let Ok(mut ss) = stmt.inner.lock() {
+                post_sql_error(&mut ss, SQLSTATE_HY000, 0, "No active TDS client");
+            }
             return SQL_ERROR;
         };
 
@@ -144,11 +143,14 @@ unsafe fn sql_exec_direct_w_impl(
 
     // Execute the SQL batch. Neither DBC nor STMT lock is held during I/O.
     if let Err(e) = dbc.runtime.block_on(client.execute(sql, None, None)) {
+        let msg = e.to_string();
         error!(%e, "SQLExecDirectW: execution failed");
-        // TODO: post diagnostic record with SQLSTATE 42000 or HY000
         if let Ok(mut ds) = dbc.inner.lock() {
             ds.client = Some(client);
             ds.active_stmt = None;
+        }
+        if let Ok(mut ss) = stmt.inner.lock() {
+            post_sql_error(&mut ss, SQLSTATE_HY000, 0, msg);
         }
         return SQL_ERROR;
     }
@@ -163,10 +165,14 @@ unsafe fn sql_exec_direct_w_impl(
         // DDL / DML: drain trailing DONE tokens and return the connection to idle.
         // No cursor is opened — the app can re-execute immediately without SQLCloseCursor.
         if let Err(e) = dbc.runtime.block_on(client.close_query()) {
+            let msg = e.to_string();
             error!(%e, "SQLExecDirectW: failed to drain after DDL/DML");
             if let Ok(mut ds) = dbc.inner.lock() {
                 ds.client = Some(client);
                 ds.active_stmt = None;
+            }
+            if let Ok(mut ss) = stmt.inner.lock() {
+                post_sql_error(&mut ss, SQLSTATE_HY000, 0, msg);
             }
             return SQL_ERROR;
         }
@@ -179,7 +185,6 @@ unsafe fn sql_exec_direct_w_impl(
             return SQL_ERROR;
         };
         stmt_state.column_metadata = metadata; // empty vec
-        stmt_state.diag_records.clear();
         drop(stmt_state);
         if let Ok(mut ds) = dbc.inner.lock() {
             ds.client = Some(client);
@@ -201,7 +206,6 @@ unsafe fn sql_exec_direct_w_impl(
     };
     stmt_state.column_metadata = metadata;
     stmt_state.cursor_open = true;
-    stmt_state.diag_records.clear();
     drop(stmt_state);
 
     // Return client to DBC. active_stmt is already set from the claim above.

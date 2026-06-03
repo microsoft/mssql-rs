@@ -69,6 +69,10 @@ TEST_F(ExecDirectLiveTest, ReExecute) {
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 
+    // Re-executing while the cursor is still open must fail (SQLSTATE 24000).
+    rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    EXPECT_EQ(SQL_ERROR, rc);
+
     rc = SQLCloseCursor(stmt_);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 
