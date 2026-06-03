@@ -63,11 +63,13 @@ unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
     // TODO: free user-allocated descriptors (once descriptor support is added)
 
     // Drop all child STMT handles.
-    // Safety: the DBC lock is held, so no new statement operation can start (they
-    // need the DBC to access the TDS client). The stmt lock drains any in-flight op.
+    // Note: the DBC lock prevents any *new* SQLExecDirectW from taking the client (it needs
+    // the DBC lock). However, a call that already took the client and is mid-execute() holds
+    // no locks during I/O, so it can race here and access a STMT handle we are about to free.
+    // TODO: fix with refcounted handle lifetimes so STMT handles cannot be freed while in use.
     for &stmt_ptr in &state.statements {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_ptr) };
-        // Acquire and immediately release — waits for any in-flight operation to complete.
+        // Acquire and immediately release — serializes with any op still holding the STMT lock.
         let Ok(guard) = stmt.inner.lock() else {
             error!(?stmt_ptr, "SQLDisconnect: stmt mutex poisoned");
             post_sql_error(
@@ -83,8 +85,9 @@ unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
     }
     state.statements.clear();
 
-    // Drop the TDS client (closes the connection)
+    // Drop the TDS client (closes the connection) and clear connection-level cursor claim.
     state.client = None;
+    state.active_stmt = None;
     state.connection_state = ConnectionState::Disconnected;
 
     debug!("SQLDisconnect: disconnected successfully");

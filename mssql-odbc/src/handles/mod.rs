@@ -3,7 +3,7 @@
 
 pub(crate) mod dbc;
 mod env;
-mod stmt;
+pub(crate) mod stmt;
 
 pub(crate) use dbc::DbcHandle;
 pub(crate) use env::EnvHandle;

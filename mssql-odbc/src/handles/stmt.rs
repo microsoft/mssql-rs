@@ -4,6 +4,8 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
+use mssql_tds::query::metadata::ColumnMetadata;
+
 use super::{HandleType, HasObjectType};
 use crate::error::{DiagRecord, HasDiagnostics};
 
@@ -24,7 +26,11 @@ pub(crate) struct StmtHandle {
 #[derive(Debug)]
 pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
-    // TODO: statement attributes (cursor type, concurrency, etc.) and execution state
+    /// Column metadata from the most recent execution.
+    pub(crate) column_metadata: Vec<ColumnMetadata>,
+    /// True from the end of a successful SQLExecDirect until SQLCloseCursor /
+    /// SQLFreeStmt(SQL_CLOSE). Mirrors msodbcsql's RS_SELECTION / STMT_ST_CURS_OPEN.
+    pub(crate) cursor_open: bool,
 }
 
 impl HasDiagnostics for StmtState {
@@ -47,6 +53,8 @@ impl StmtHandle {
             parent_dbc,
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
+                column_metadata: Vec::new(),
+                cursor_open: false,
             }),
         }
     }
