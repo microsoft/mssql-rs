@@ -37,6 +37,9 @@ pub(crate) struct StmtState {
 }
 
 impl HasDiagnostics for StmtState {
+    fn diag_records(&self) -> &[DiagRecord] {
+        &self.diag_records
+    }
     fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
         &mut self.diag_records
     }

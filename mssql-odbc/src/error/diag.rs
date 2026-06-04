@@ -7,7 +7,7 @@
 //! `tagOBJBASE::errinfo`. Each entry represents one error or warning the
 //! driver returned to the DM; `SQLGetDiagRec` reads them back by index.
 
-use std::ops::DerefMut;
+use std::ops::{Deref, DerefMut};
 use std::sync::MutexGuard;
 
 /// SQLSTATE stored as 5 ASCII bytes (no NUL).
@@ -15,12 +15,17 @@ pub(crate) type SqlState = [u8; 5];
 
 /// Implemented by state structs that store ODBC diagnostic records.
 pub(crate) trait HasDiagnostics {
+    fn diag_records(&self) -> &[DiagRecord];
     fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord>;
 }
 
 // If T implements HasDiagnostics, then MutexGuard<T> does too by delegation.
 // This allows helper calls like free_errors(&mut state) where state is a MutexGuard.
 impl<T: HasDiagnostics + ?Sized> HasDiagnostics for MutexGuard<'_, T> {
+    fn diag_records(&self) -> &[DiagRecord] {
+        self.deref().diag_records()
+    }
+
     fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
         self.deref_mut().diag_records_mut()
     }

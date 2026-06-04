@@ -57,3 +57,9 @@ pub const SQL_DRIVER_COMPLETE_REQUIRED: SqlUSmallInt = 3;
 
 // Null-terminated string sentinel
 pub const SQL_NTS: SqlSmallInt = -3;
+
+// Diagnostic field identifiers (SQLGetDiagField)
+pub const SQL_DIAG_NUMBER: SqlSmallInt = 2;
+pub const SQL_DIAG_SQLSTATE: SqlSmallInt = 4;
+pub const SQL_DIAG_NATIVE: SqlSmallInt = 5;
+pub const SQL_DIAG_MESSAGE_TEXT: SqlSmallInt = 6;

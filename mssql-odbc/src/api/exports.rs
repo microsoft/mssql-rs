@@ -11,8 +11,8 @@
 //! Windows `.def` file or a C header listing the public API surface.
 
 use super::odbc_types::{
-    SQL_SUCCESS, SqlHWnd, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt,
-    SqlWChar,
+    SQL_NO_DATA, SQL_SUCCESS, SqlHWnd, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlSmallInt,
+    SqlUSmallInt, SqlWChar,
 };
 
 // ---- Handle allocation and management ---------------------------------------
@@ -74,7 +74,7 @@ pub unsafe extern "C" fn SQLSetEnvAttr(
 /// posted on the given handle.
 ///
 /// # Safety
-/// - `handle` must be a valid handle of type `handle_type`, or null.
+/// - `handle` must be a valid handle of type `handle_type`.
 /// - `sql_state`, if non-null, must be writable for at least
 ///   `SQL_SQLSTATE_SIZE + 1` `SQLWCHAR`s (6 code units including NUL).
 /// - `message_text`, if non-null, must be writable for `buffer_length` `SQLWCHAR`s.
@@ -94,7 +94,7 @@ pub unsafe extern "C" fn SQLGetDiagRecW(
 ) -> SqlReturn {
     crate::init_tracing();
     unsafe {
-        super::get_diag_rec::sql_get_diag_rec_w(
+        super::get_diag::sql_get_diag_rec_w(
             handle_type,
             handle,
             rec_number,
@@ -103,6 +103,39 @@ pub unsafe extern "C" fn SQLGetDiagRecW(
             message_text,
             buffer_length,
             text_length_ptr,
+        )
+    }
+}
+
+/// Retrieves a single diagnostic field value for a given record on a handle.
+///
+/// Supports `SQL_DIAG_NUMBER` (header field, record count) and the per-record
+/// fields `SQL_DIAG_SQLSTATE`, `SQL_DIAG_NATIVE`, and `SQL_DIAG_MESSAGE_TEXT`.
+/// Unrecognized identifiers return `SQL_ERROR`.
+///
+/// # Safety
+/// - `handle` must be a valid handle of type `handle_type`.
+/// - `diag_info_ptr` and `string_length_ptr` must be valid for the requested field.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetDiagFieldW(
+    handle_type: SqlSmallInt,
+    handle: SqlHandle,
+    rec_number: SqlSmallInt,
+    diag_identifier: SqlSmallInt,
+    diag_info_ptr: SqlPointer,
+    buffer_length: SqlSmallInt,
+    string_length_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::get_diag::sql_get_diag_field_w(
+            handle_type,
+            handle,
+            rec_number,
+            diag_identifier,
+            diag_info_ptr,
+            buffer_length,
+            string_length_ptr,
         )
     }
 }
@@ -209,6 +242,7 @@ pub unsafe extern "C" fn SQLExecDirectW(
     unsafe { super::exec_direct::sql_exec_direct_w(statement_handle, statement_text, text_length) }
 }
 
+// ---- Result set processing --------------------------------
 /// Fetches the next row from the current result set.
 ///
 /// Returns `SQL_SUCCESS` when a row is available or `SQL_NO_DATA` when the
@@ -220,4 +254,221 @@ pub unsafe extern "C" fn SQLExecDirectW(
 pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();
     unsafe { super::fetch::sql_fetch(statement_handle) }
+}
+
+// ---- Result set processing (TO-BE-IMPLEMENTED) --------------------------------
+
+/// Returns the number of columns in the result set.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle.
+/// - `column_count_ptr` must be a valid, writable pointer to [`SqlSmallInt`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLNumResultCols(
+    _statement_handle: SqlHandle,
+    column_count_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    if !column_count_ptr.is_null() {
+        unsafe { *column_count_ptr = 0 };
+    }
+    SQL_SUCCESS
+}
+
+/// Retrieves column value data from the current row.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle.
+/// - `target_value_ptr` (if non-null) must be writable for `buffer_length` bytes.
+/// - `str_len_or_ind_ptr` (if non-null) must be a writable pointer to [`i64`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetData(
+    _statement_handle: SqlHandle,
+    _col_or_param_number: SqlUSmallInt,
+    _target_type: SqlSmallInt,
+    _target_value_ptr: SqlPointer,
+    _buffer_length: i64,
+    _str_len_or_ind_ptr: *mut i64,
+) -> SqlReturn {
+    crate::init_tracing();
+    SQL_NO_DATA
+}
+
+/// Gets metadata for a result set column.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle.
+/// - `column_number` must be a valid column index (1-based).
+/// - Output pointers must be writable for their respective types.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLDescribeColW(
+    _statement_handle: SqlHandle,
+    _column_number: SqlUSmallInt,
+    _column_name: *mut SqlWChar,
+    _buffer_length: SqlSmallInt,
+    _name_length_ptr: *mut SqlSmallInt,
+    _data_type_ptr: *mut SqlSmallInt,
+    _column_size_ptr: *mut u64,
+    _decimal_digits_ptr: *mut SqlSmallInt,
+    _nullable_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    SQL_SUCCESS
+}
+
+/// Moves to the next result set in a batch.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLMoreResults(_statement_handle: SqlHandle) -> SqlReturn {
+    crate::init_tracing();
+    SQL_NO_DATA
+}
+
+/// Returns the row count from the last INSERT, UPDATE, or DELETE statement.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle.
+/// - `row_count_ptr` must be a valid, writable pointer to [`i64`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLRowCount(
+    _statement_handle: SqlHandle,
+    row_count_ptr: *mut i64,
+) -> SqlReturn {
+    crate::init_tracing();
+    if !row_count_ptr.is_null() {
+        unsafe { *row_count_ptr = 0 };
+    }
+    SQL_SUCCESS
+}
+
+// ---- Attribute management (TO-BE-IMPLEMENTED) --------------------------------
+
+/// Sets a connection attribute.
+///
+/// # Safety
+/// - `connection_handle` must be a valid DBC handle.
+/// - `attribute` must be a valid connection attribute identifier.
+/// - `value_ptr` validity depends on the attribute type.
+/// - `string_length` is used only for string-type attributes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLSetConnectAttrW(
+    _connection_handle: SqlHandle,
+    _attribute: SqlInteger,
+    _value_ptr: SqlPointer,
+    _string_length: SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    SQL_SUCCESS
+}
+
+/// Retrieves a connection attribute.
+///
+/// # Safety
+/// - `connection_handle` must be a valid DBC handle.
+/// - `attribute` must be a valid connection attribute identifier.
+/// - Output pointers must be valid and writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetConnectAttrW(
+    _connection_handle: SqlHandle,
+    _attribute: SqlInteger,
+    _value_ptr: SqlPointer,
+    _buffer_length: SqlInteger,
+    _string_length_ptr: *mut SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    SQL_SUCCESS
+}
+
+/// Sets a statement attribute.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle.
+/// - `attribute` must be a valid statement attribute identifier.
+/// - `value_ptr` validity depends on the attribute type.
+/// - `string_length` is used only for string-type attributes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLSetStmtAttrW(
+    _statement_handle: SqlHandle,
+    _attribute: SqlInteger,
+    _value_ptr: SqlPointer,
+    _string_length: SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    SQL_SUCCESS
+}
+
+/// Retrieves a statement attribute.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle.
+/// - `attribute` must be a valid statement attribute identifier.
+/// - Output pointers must be valid and writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetStmtAttrW(
+    _statement_handle: SqlHandle,
+    _attribute: SqlInteger,
+    _value_ptr: SqlPointer,
+    _buffer_length: SqlInteger,
+    _string_length_ptr: *mut SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    SQL_SUCCESS
+}
+
+// ---- Descriptor and parameter management (TO-BE-IMPLEMENTED) -----------------
+
+/// Gets a descriptor field.
+///
+/// # Safety
+/// - `descriptor_handle` must be a valid descriptor handle.
+/// - `record_number` must be valid for the descriptor.
+/// - `field_identifier` must be a valid field identifier.
+/// - Output pointers must be valid and writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetDescFieldW(
+    _descriptor_handle: SqlHandle,
+    _record_number: SqlSmallInt,
+    _field_identifier: SqlSmallInt,
+    _value_ptr: SqlPointer,
+    _buffer_length: SqlInteger,
+    _string_length_ptr: *mut SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    SQL_SUCCESS
+}
+
+/// Binds a parameter marker to a memory buffer.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle.
+/// - `parameter_number` must be valid.
+/// - `value_ptr` must be a valid, aligned pointer (if non-null).
+/// - `str_len_or_ind_ptr` (if non-null) must point to a valid [`i64`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLBindParameter(
+    _statement_handle: SqlHandle,
+    _parameter_number: SqlUSmallInt,
+    _input_output_type: SqlSmallInt,
+    _value_type: SqlSmallInt,
+    _parameter_type: SqlSmallInt,
+    _column_size: u64,
+    _decimal_digits: SqlSmallInt,
+    _value_ptr: SqlPointer,
+    _buffer_length: i64,
+    _str_len_or_ind_ptr: *mut i64,
+) -> SqlReturn {
+    crate::init_tracing();
+    SQL_SUCCESS
+}
+
+/// Cancels the processing of the statement.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLCancel(_statement_handle: SqlHandle) -> SqlReturn {
+    crate::init_tracing();
+    SQL_SUCCESS
 }
