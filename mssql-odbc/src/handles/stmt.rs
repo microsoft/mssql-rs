@@ -4,6 +4,7 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
+use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
 
 use super::{HandleType, HasObjectType};
@@ -28,6 +29,8 @@ pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
+    /// Current fetched row, populated by SQLFetch for later SQLGetData support.
+    pub(crate) current_row: Option<Vec<ColumnValues>>,
     /// True from the end of a successful SQLExecDirect until SQLCloseCursor /
     /// SQLFreeStmt(SQL_CLOSE). Mirrors msodbcsql's RS_SELECTION / STMT_ST_CURS_OPEN.
     pub(crate) cursor_open: bool,
@@ -54,6 +57,7 @@ impl StmtHandle {
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
+                current_row: None,
                 cursor_open: false,
             }),
         }

@@ -17,6 +17,11 @@ TEST(ExecDirectTest, NullHandle) {
     EXPECT_EQ(SQL_INVALID_HANDLE, rc);
 }
 
+TEST(ExecDirectTest, FetchNullHandle) {
+    SQLRETURN rc = SQLFetch(SQL_NULL_HSTMT);
+    EXPECT_EQ(SQL_INVALID_HANDLE, rc);
+}
+
 // ===================================================================
 // Tests that require a live SQL Server
 // ===================================================================
@@ -40,17 +45,46 @@ TEST_F(ExecDirectLiveTest, NullSqlText) {
 
 // Simple scalar query returns SQL_SUCCESS.
 TEST_F(ExecDirectLiveTest, SelectScalar) {
-    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLFetch(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLFetch(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLFetch(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLFetch(stmt_);
+    EXPECT_EQ(SQL_NO_DATA, rc);
+
+    rc = SQLCloseCursor(stmt_);
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
 
-// Query that produces no rows still returns SQL_SUCCESS — the driver drains
-// the result set eagerly in Phase 1, but SQLExecDirect always returns success
-// for a well-formed query. Callers discover "no rows" via SQLFetch → SQL_NO_DATA.
+// Query that produces no rows still returns SQL_SUCCESS.
+// Callers discover "no rows" via SQLFetch -> SQL_NO_DATA.
 TEST_F(ExecDirectLiveTest, EmptyResultSet) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1 WHERE 1 = 0");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLFetch(stmt_);
+    EXPECT_EQ(SQL_NO_DATA, rc);
+
+    // SQL_NO_DATA does not implicitly close cursor state.
+    // Re-exec requires explicit SQLCloseCursor / SQLFreeStmt(SQL_CLOSE).
+    rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY000");
+
+    rc = SQLCloseCursor(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
 
@@ -72,10 +106,79 @@ TEST_F(ExecDirectLiveTest, ReExecute) {
     // Re-executing while the cursor is still open must fail (SQLSTATE 24000).
     rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY000");
 
     rc = SQLCloseCursor(stmt_);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 
     rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
+
+TEST_F(ExecDirectLiveTest, DmlDoesNotOpenCursor) {
+    SqlTString dml = ODBCTestUtils::ToSqlTStr("CREATE TABLE #t(i int); INSERT INTO #t VALUES (1);");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(dml.c_str()), SQL_NTS);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    // DML/DDL path should not open a cursor.
+    rc = SQLFetch(stmt_);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY000");
+
+    // Re-execute should succeed without explicit close for no-resultset path.
+    SqlTString select_one = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(select_one.c_str()), SQL_NTS);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLCloseCursor(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
+
+TEST_F(ExecDirectLiveTest, FetchOnFreshStatementReturnsHy010) {
+    SQLRETURN rc = SQLFetch(stmt_);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
+}
+
+TEST_F(ExecDirectLiveTest, FreeStmtCloseAfterNoDataAllowsReExecute) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLFetch(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    rc = SQLFetch(stmt_);
+    ASSERT_EQ(SQL_NO_DATA, rc);
+
+    rc = SQLFreeStmt(stmt_, SQL_CLOSE);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
+
+TEST_F(ExecDirectLiveTest, CloseVsFreeStmtWhenNoCursorOpen) {
+    SQLRETURN rc = SQLCloseCursor(stmt_);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+
+    rc = SQLFreeStmt(stmt_, SQL_CLOSE);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
+
+TEST_F(ExecDirectLiveTest, DoubleFetchAtEndReturnsNoData) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLFetch(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    rc = SQLFetch(stmt_);
+    ASSERT_EQ(SQL_NO_DATA, rc);
+
+    rc = SQLFetch(stmt_);
+    EXPECT_EQ(SQL_NO_DATA, rc);
+
+    rc = SQLCloseCursor(stmt_);
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }

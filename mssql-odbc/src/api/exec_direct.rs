@@ -76,8 +76,7 @@ unsafe fn sql_exec_direct_w_impl(
     // Access parent DBC
     let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
 
-    // Check STMT state first (cursor_open). Lock order: STMT → DBC everywhere,
-    // matching SQLCloseCursor, to prevent ABBA deadlock.
+    // Check STMT state first (cursor_open).
     {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
@@ -89,6 +88,7 @@ unsafe fn sql_exec_direct_w_impl(
             post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "Invalid cursor state");
             return SQL_ERROR;
         }
+        stmt_state.current_row = None;
     }
 
     // Take TdsClient out of DbcState. Lock is held only briefly — no I/O inside.

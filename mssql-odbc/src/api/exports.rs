@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
 //! Exported ODBC entry points for the msodbcsql18 shared library.
@@ -209,7 +209,15 @@ pub unsafe extern "C" fn SQLExecDirectW(
     unsafe { super::exec_direct::sql_exec_direct_w(statement_handle, statement_text, text_length) }
 }
 
-// TODO(SQLFetch): implement SQLFetch — call client.next_row() from the wire,
-// return SQL_SUCCESS per row, SQL_NO_DATA when exhausted.
-// Also implement SQLGetData to expose the current row's column values.
-// to the application.
+/// Fetches the next row from the current result set.
+///
+/// Returns `SQL_SUCCESS` when a row is available or `SQL_NO_DATA` when the
+/// result set is exhausted.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
+    crate::init_tracing();
+    unsafe { super::fetch::sql_fetch(statement_handle) }
+}

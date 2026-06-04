@@ -6,6 +6,7 @@ mod close_cursor;
 mod disconnect;
 mod driver_connect;
 mod exec_direct;
+pub(crate) mod fetch;
 mod free_handle;
 mod get_diag_rec;
 pub(crate) mod odbc_types;

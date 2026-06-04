@@ -108,6 +108,7 @@ unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
 /// Resets cursor state on the statement (cursor is no longer open, metadata cleared).
 fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
     stmt_state.cursor_open = false;
+    stmt_state.current_row = None;
     stmt_state.column_metadata.clear();
 }
 
