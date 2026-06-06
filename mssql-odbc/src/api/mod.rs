@@ -8,6 +8,7 @@ mod driver_connect;
 mod exec_direct;
 pub(crate) mod fetch;
 mod free_handle;
+mod get_data;
 mod get_diag;
 pub(crate) mod odbc_types;
 mod set_env_attr;

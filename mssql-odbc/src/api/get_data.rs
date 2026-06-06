@@ -1,0 +1,443 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Minimal SQLGetData implementation for Phase 1.
+
+use std::panic;
+
+use tracing::{debug, error, trace};
+
+use super::odbc_types::{
+    SQL_C_CHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt,
+};
+use super::sqlstate::*;
+use crate::error::{free_errors, post_sql_error};
+use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use mssql_tds::datatypes::column_values::ColumnValues;
+
+/// Implements SQLGetData for current-row retrieval.
+///
+/// Phase 1 scope:
+/// - Requires an open cursor and a current fetched row.
+/// - Supports only `SQL_C_CHAR` output.
+/// - Supports basic scalar conversion to UTF-8 text.
+/// - Repeated calls on the same column do not advance an offset; each call
+///   returns the same prefix for the current value (no chunked streaming yet).
+pub(crate) unsafe fn sql_get_data(
+    statement_handle: SqlHandle,
+    column_number: SqlUSmallInt,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
+    debug!(
+        ?statement_handle,
+        column_number, target_type, buffer_length, "SQLGetData called"
+    );
+
+    let result = panic::catch_unwind(|| unsafe {
+        sql_get_data_impl(
+            statement_handle,
+            column_number,
+            target_type,
+            target_value_ptr,
+            buffer_length,
+            strlen_or_ind_ptr,
+        )
+    });
+
+    let ret = result.unwrap_or_else(|_| {
+        error!("SQLGetData: panic caught at FFI boundary");
+        SQL_ERROR
+    });
+    trace!(?ret, "SQLGetData returning");
+    ret
+}
+
+unsafe fn sql_get_data_impl(
+    statement_handle: SqlHandle,
+    column_number: SqlUSmallInt,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
+    if statement_handle.is_null() {
+        error!("SQLGetData: statement_handle is null");
+        return SQL_INVALID_HANDLE;
+    }
+    if buffer_length < 0 {
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+        if let Ok(mut ss) = stmt.inner.lock() {
+            free_errors(&mut ss);
+            post_sql_error(
+                &mut ss,
+                SQLSTATE_HY090,
+                0,
+                "Invalid string or buffer length",
+            );
+        }
+        return SQL_ERROR;
+    }
+
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+    debug_assert_eq!(stmt.object_type, HandleType::Stmt);
+
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("SQLGetData: stmt mutex poisoned");
+        return SQL_ERROR;
+    };
+
+    free_errors(&mut stmt_state);
+
+    if !stmt_state.cursor_open {
+        post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "Invalid cursor state");
+        return SQL_ERROR;
+    }
+
+    let Some(row) = stmt_state.current_row.as_ref() else {
+        post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "No current row");
+        return SQL_ERROR;
+    };
+
+    let col_index = usize::from(column_number);
+    if col_index == 0 || col_index > row.len() {
+        post_sql_error(
+            &mut stmt_state,
+            SQLSTATE_07009,
+            0,
+            "Invalid descriptor index",
+        );
+        return SQL_ERROR;
+    }
+
+    if target_type != SQL_C_CHAR {
+        post_sql_error(
+            &mut stmt_state,
+            SQLSTATE_HYC00,
+            0,
+            "Target type not yet implemented",
+        );
+        return SQL_ERROR;
+    }
+
+    let value = &row[col_index - 1];
+    if matches!(value, ColumnValues::Null) {
+        if !strlen_or_ind_ptr.is_null() {
+            unsafe { strlen_or_ind_ptr.write(SQL_NULL_DATA) };
+        }
+        if !target_value_ptr.is_null() && buffer_length > 0 {
+            unsafe { *(target_value_ptr as *mut u8) = 0 };
+        }
+        return SQL_SUCCESS;
+    }
+
+    let Some(as_text) = column_value_to_text(value) else {
+        post_sql_error(
+            &mut stmt_state,
+            SQLSTATE_HYC00,
+            0,
+            "Column type conversion not yet implemented",
+        );
+        return SQL_ERROR;
+    };
+
+    let bytes = as_text.as_bytes();
+    if !strlen_or_ind_ptr.is_null() {
+        unsafe { strlen_or_ind_ptr.write(bytes.len() as SqlLen) };
+    }
+
+    if target_value_ptr.is_null() {
+        return SQL_SUCCESS;
+    }
+
+    let buf_len = buffer_length as usize;
+    if buf_len == 0 {
+        if bytes.is_empty() {
+            return SQL_SUCCESS;
+        }
+        post_sql_error(
+            &mut stmt_state,
+            SQLSTATE_01004,
+            0,
+            "String data, right truncated",
+        );
+        return SQL_SUCCESS_WITH_INFO;
+    }
+
+    let copy_len = bytes.len().min(buf_len.saturating_sub(1));
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), target_value_ptr as *mut u8, copy_len);
+        *((target_value_ptr as *mut u8).add(copy_len)) = 0;
+    }
+
+    if copy_len < bytes.len() {
+        post_sql_error(
+            &mut stmt_state,
+            SQLSTATE_01004,
+            0,
+            "String data, right truncated",
+        );
+        SQL_SUCCESS_WITH_INFO
+    } else {
+        SQL_SUCCESS
+    }
+}
+
+fn column_value_to_text(v: &ColumnValues) -> Option<String> {
+    match v {
+        ColumnValues::TinyInt(x) => Some(x.to_string()),
+        ColumnValues::SmallInt(x) => Some(x.to_string()),
+        ColumnValues::Int(x) => Some(x.to_string()),
+        ColumnValues::BigInt(x) => Some(x.to_string()),
+        ColumnValues::Real(x) => Some(x.to_string()),
+        ColumnValues::Float(x) => Some(x.to_string()),
+        ColumnValues::Bit(x) => Some(if *x { "1".into() } else { "0".into() }),
+        ColumnValues::String(s) => Some(s.to_utf8_string()),
+        ColumnValues::Uuid(u) => Some(u.to_string()),
+        ColumnValues::Null => Some(String::new()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::alloc_handle::sql_alloc_handle;
+    use crate::api::free_handle::sql_free_handle;
+    use crate::api::odbc_types::{
+        SQL_ATTR_ODBC_VERSION, SQL_C_LONG, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
+        SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
+    };
+    use crate::api::set_env_attr::sql_set_env_attr;
+    use mssql_tds::datatypes::sql_string::SqlString;
+
+    unsafe fn alloc_env_dbc_stmt() -> (SqlHandle, SqlHandle, SqlHandle) {
+        let mut env: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_env_attr(
+                    env,
+                    SQL_ATTR_ODBC_VERSION,
+                    SQL_OV_ODBC3_80 as usize as *mut std::ffi::c_void,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
+            SQL_SUCCESS
+        );
+        let mut stmt: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) },
+            SQL_SUCCESS
+        );
+        (env, dbc, stmt)
+    }
+
+    unsafe fn free_env_dbc_stmt(env: SqlHandle, dbc: SqlHandle, stmt: SqlHandle) {
+        unsafe {
+            sql_free_handle(SQL_HANDLE_STMT, stmt);
+            sql_free_handle(SQL_HANDLE_DBC, dbc);
+            sql_free_handle(SQL_HANDLE_ENV, env);
+        }
+    }
+
+    #[test]
+    fn get_data_null_handle() {
+        let ret = unsafe {
+            sql_get_data(
+                SQL_NULL_HANDLE,
+                1,
+                SQL_C_CHAR,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn get_data_without_cursor_returns_24000() {
+        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let mut buf = [0u8; 16];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
+    }
+
+    #[test]
+    fn get_data_string_success() {
+        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.cursor_open = true;
+            s.current_row = Some(vec![ColumnValues::String(SqlString::from_utf8_string(
+                "hello".to_string(),
+            ))]);
+        }
+
+        let mut buf = [0u8; 16];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, 5);
+        assert_eq!(std::str::from_utf8(&buf[..5]).unwrap(), "hello");
+        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
+    }
+
+    #[test]
+    fn get_data_truncation_returns_info() {
+        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.cursor_open = true;
+            s.current_row = Some(vec![ColumnValues::Int(12345)]);
+        }
+
+        let mut buf = [0u8; 3];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(ind, 5);
+        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
+    }
+
+    #[test]
+    fn get_data_empty_string_zero_buffer_no_truncation() {
+        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.cursor_open = true;
+            s.current_row = Some(vec![ColumnValues::String(SqlString::from_utf8_string(
+                String::new(),
+            ))]);
+        }
+
+        let mut ind: SqlLen = -1;
+        let ret = unsafe { sql_get_data(stmt, 1, SQL_C_CHAR, std::ptr::null_mut(), 0, &mut ind) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, 0);
+        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
+    }
+
+    #[test]
+    fn get_data_null_column_writes_indicator() {
+        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.cursor_open = true;
+            s.current_row = Some(vec![ColumnValues::Null]);
+        }
+
+        let mut buf = [0u8; 4];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, SQL_NULL_DATA);
+        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
+    }
+
+    #[test]
+    fn get_data_unsupported_target_type() {
+        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.cursor_open = true;
+            s.current_row = Some(vec![ColumnValues::Int(1)]);
+        }
+
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_LONG,
+                (&mut out as *mut i32).cast(),
+                std::mem::size_of::<i32>() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
+    }
+
+    #[test]
+    fn get_data_invalid_column_index() {
+        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.cursor_open = true;
+            s.current_row = Some(vec![ColumnValues::Int(1)]);
+        }
+
+        let mut buf = [0u8; 8];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                2,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
+    }
+}

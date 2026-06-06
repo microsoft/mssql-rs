@@ -9,6 +9,7 @@ use std::ffi::c_void;
 pub type SqlSmallInt = i16;
 pub type SqlUSmallInt = u16;
 pub type SqlInteger = i32;
+pub type SqlLen = isize;
 pub type SqlReturn = SqlSmallInt;
 pub type SqlHandle = *mut c_void;
 pub type SqlHWnd = *mut c_void;
@@ -63,3 +64,10 @@ pub const SQL_DIAG_NUMBER: SqlSmallInt = 2;
 pub const SQL_DIAG_SQLSTATE: SqlSmallInt = 4;
 pub const SQL_DIAG_NATIVE: SqlSmallInt = 5;
 pub const SQL_DIAG_MESSAGE_TEXT: SqlSmallInt = 6;
+
+// C target types for SQLGetData / SQLBindCol.
+pub const SQL_C_CHAR: SqlSmallInt = 1;
+pub const SQL_C_LONG: SqlSmallInt = 4;
+
+// Length/indicator constants.
+pub const SQL_NULL_DATA: SqlLen = -1;

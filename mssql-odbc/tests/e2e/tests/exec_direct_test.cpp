@@ -182,3 +182,22 @@ TEST_F(ExecDirectLiveTest, DoubleFetchAtEndReturnsNoData) {
     rc = SQLCloseCursor(stmt_);
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
+
+TEST_F(ExecDirectLiveTest, GetDataBasicChar) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 42");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLFetch(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR buf[16] = {0};
+    SQLLEN ind = 0;
+    rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, ind);
+    EXPECT_STREQ("42", reinterpret_cast<const char*>(buf));
+
+    rc = SQLCloseCursor(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
