@@ -10,6 +10,10 @@ use mssql_tds::query::metadata::ColumnMetadata;
 use super::{HandleType, HasObjectType};
 use crate::error::{DiagRecord, HasDiagnostics};
 
+pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
+pub(crate) const STMT_STATE_EXEC_CONTEXT: u32 = 0x0000_1000;
+pub(crate) const STMT_STATE_CURSOR_OPEN: u32 = 0x0000_0800;
+
 /// Statement handle — equivalent to msodbcsql's `struct tagSTMT`.
 ///
 /// Created by `SQLAllocHandle(SQL_HANDLE_STMT, hdbc, ...)`.
@@ -31,9 +35,22 @@ pub(crate) struct StmtState {
     pub(crate) column_metadata: Vec<ColumnMetadata>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
-    /// True from the end of a successful SQLExecDirect until SQLCloseCursor /
-    /// SQLFreeStmt(SQL_CLOSE). Mirrors msodbcsql's RS_SELECTION / STMT_ST_CURS_OPEN.
-    pub(crate) cursor_open: bool,
+    /// Statement lifecycle/status flags used for ODBC API state checks.
+    pub(crate) state_flags: u32,
+}
+
+impl StmtState {
+    pub(crate) fn has_state(&self, mask: u32) -> bool {
+        (self.state_flags & mask) != 0
+    }
+
+    pub(crate) fn set_state(&mut self, mask: u32) {
+        self.state_flags |= mask;
+    }
+
+    pub(crate) fn clear_state(&mut self, mask: u32) {
+        self.state_flags &= !mask;
+    }
 }
 
 impl HasDiagnostics for StmtState {
@@ -61,7 +78,7 @@ impl StmtHandle {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
                 current_row: None,
-                cursor_open: false,
+                state_flags: 0,
             }),
         }
     }

@@ -20,6 +20,7 @@ use crate::api::odbc_types::{
     SQL_SQLSTATE_SIZE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer,
     SqlReturn, SqlSmallInt, SqlWChar,
 };
+use crate::api::util::copy_utf16_with_nul;
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::handles::{DbcHandle, EnvHandle, HandleType, StmtHandle, handle_from_raw};
 
@@ -269,32 +270,6 @@ unsafe fn handle_record_field(
             SQL_ERROR
         }
     }
-}
-
-/// Copies a UTF-16 string into a caller buffer, NUL-terminating within the
-/// buffer. Returns `true` if `src` was truncated (i.e., did not fit including
-/// the NUL terminator). A null `dst` reports no truncation — callers use it to
-/// query the required length without copying.
-///
-/// Mirrors msodbcsql's `StringCchCopyN(dst, cchBuf, src, cchSrc)` semantics:
-/// at most `buf_chars - 1` source characters are copied, followed by a single
-/// NUL. If `buf_chars == 0`, nothing is written.
-///
-/// # Safety
-/// `dst`, if non-null, must be writable for `buf_chars` `SqlWChar`s.
-unsafe fn copy_utf16_with_nul(dst: *mut SqlWChar, buf_chars: usize, src: &[u16]) -> bool {
-    if dst.is_null() {
-        return false;
-    }
-    if buf_chars == 0 {
-        return !src.is_empty();
-    }
-    let copy_len = src.len().min(buf_chars - 1);
-    for (i, ch) in src.iter().copied().take(copy_len).enumerate() {
-        unsafe { dst.add(i).write(ch) };
-    }
-    unsafe { dst.add(copy_len).write(0) };
-    copy_len < src.len()
 }
 
 /// `SQLGetDiagFieldW` string-field writer. Buffer size and reported length are

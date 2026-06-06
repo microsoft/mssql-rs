@@ -79,7 +79,7 @@ TEST_F(ExecDirectLiveTest, EmptyResultSet) {
     // Re-exec requires explicit SQLCloseCursor / SQLFreeStmt(SQL_CLOSE).
     rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     EXPECT_EQ(SQL_ERROR, rc);
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY000");
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
 
     rc = SQLCloseCursor(stmt_);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
@@ -106,7 +106,7 @@ TEST_F(ExecDirectLiveTest, ReExecute) {
     // Re-executing while the cursor is still open must fail (SQLSTATE 24000).
     rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     EXPECT_EQ(SQL_ERROR, rc);
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY000");
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
 
     rc = SQLCloseCursor(stmt_);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
@@ -123,7 +123,7 @@ TEST_F(ExecDirectLiveTest, DmlDoesNotOpenCursor) {
     // DML/DDL path should not open a cursor.
     rc = SQLFetch(stmt_);
     EXPECT_EQ(SQL_ERROR, rc);
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY000");
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
 
     // Re-execute should succeed without explicit close for no-resultset path.
     SqlTString select_one = ODBCTestUtils::ToSqlTStr("SELECT 1");

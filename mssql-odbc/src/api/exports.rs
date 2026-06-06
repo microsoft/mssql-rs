@@ -256,8 +256,6 @@ pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
     unsafe { super::fetch::sql_fetch(statement_handle) }
 }
 
-// ---- Result set processing (TO-BE-IMPLEMENTED) --------------------------------
-
 /// Returns the number of columns in the result set.
 ///
 /// # Safety
@@ -265,14 +263,11 @@ pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
 /// - `column_count_ptr` must be a valid, writable pointer to [`SqlSmallInt`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLNumResultCols(
-    _statement_handle: SqlHandle,
+    statement_handle: SqlHandle,
     column_count_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
     crate::init_tracing();
-    if !column_count_ptr.is_null() {
-        unsafe { *column_count_ptr = 0 };
-    }
-    SQL_SUCCESS
+    unsafe { super::num_result_cols::sql_num_result_cols(statement_handle, column_count_ptr) }
 }
 
 /// Gets metadata for a result set column.
@@ -283,19 +278,61 @@ pub unsafe extern "C" fn SQLNumResultCols(
 /// - Output pointers must be writable for their respective types.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLDescribeColW(
-    _statement_handle: SqlHandle,
-    _column_number: SqlUSmallInt,
-    _column_name: *mut SqlWChar,
-    _buffer_length: SqlSmallInt,
-    _name_length_ptr: *mut SqlSmallInt,
-    _data_type_ptr: *mut SqlSmallInt,
-    _column_size_ptr: *mut u64,
-    _decimal_digits_ptr: *mut SqlSmallInt,
-    _nullable_ptr: *mut SqlSmallInt,
+    statement_handle: SqlHandle,
+    column_number: SqlUSmallInt,
+    column_name: *mut SqlWChar,
+    buffer_length: SqlSmallInt,
+    name_length_ptr: *mut SqlSmallInt,
+    data_type_ptr: *mut SqlSmallInt,
+    column_size_ptr: *mut u64,
+    decimal_digits_ptr: *mut SqlSmallInt,
+    nullable_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
     crate::init_tracing();
-    SQL_SUCCESS
+    unsafe {
+        super::describe_col::sql_describe_col_w(
+            statement_handle,
+            column_number,
+            column_name,
+            buffer_length,
+            name_length_ptr,
+            data_type_ptr,
+            column_size_ptr,
+            decimal_digits_ptr,
+            nullable_ptr,
+        )
+    }
 }
+
+/// Retrieves data for a single column in the current fetched row.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - `target_value_ptr`, when non-null, must be writable for `buffer_length` bytes.
+/// - `strlen_or_ind_ptr`, when non-null, must be writable for one `SqlLen`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetData(
+    statement_handle: SqlHandle,
+    column_number: SqlUSmallInt,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::get_data::sql_get_data(
+            statement_handle,
+            column_number,
+            target_type,
+            target_value_ptr,
+            buffer_length,
+            strlen_or_ind_ptr,
+        )
+    }
+}
+
+// ---- Result set processing (TO-BE-IMPLEMENTED) --------------------------------
 
 /// Moves to the next result set in a batch.
 ///
@@ -452,35 +489,4 @@ pub unsafe extern "C" fn SQLBindParameter(
 pub unsafe extern "C" fn SQLCancel(_statement_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();
     SQL_SUCCESS
-}
-
-/// Retrieves data for a single column in the current fetched row.
-///
-/// Phase 1 supports only `SQL_C_CHAR` conversion from the current row materialized
-/// by `SQLFetch`.
-///
-/// # Safety
-/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - `target_value_ptr`, when non-null, must be writable for `buffer_length` bytes.
-/// - `strlen_or_ind_ptr`, when non-null, must be writable for one `SqlLen`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn SQLGetData(
-    statement_handle: SqlHandle,
-    column_number: SqlUSmallInt,
-    target_type: SqlSmallInt,
-    target_value_ptr: SqlPointer,
-    buffer_length: SqlLen,
-    strlen_or_ind_ptr: *mut SqlLen,
-) -> SqlReturn {
-    crate::init_tracing();
-    unsafe {
-        super::get_data::sql_get_data(
-            statement_handle,
-            column_number,
-            target_type,
-            target_value_ptr,
-            buffer_length,
-            strlen_or_ind_ptr,
-        )
-    }
 }

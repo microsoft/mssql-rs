@@ -13,13 +13,13 @@ use crate::api::odbc_types::{
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::DbcHandle;
+use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::ResultSet;
 
 /// Implements SQLFetch for the current forward-only result set.
 ///
 /// This is the Phase 1 firehose-only path (FetchScroll with `SQL_FETCH_NEXT`
-/// semantics).
 /// TODO: Add server-side cursor RPC fetch path and async re-entry handling.
 ///
 /// # Safety
@@ -47,7 +47,7 @@ unsafe fn sql_fetch_impl(statement_handle: SqlHandle) -> SqlReturn {
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
-        if !stmt_state.cursor_open {
+        if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
             error!("SQLFetch: no open cursor on this statement");
             post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "Invalid cursor state");
             return SQL_ERROR;
@@ -84,17 +84,12 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         }
 
         if dbc_state.active_stmt.is_none() {
-            error!("SQLFetch: statement does not own the connection while cursor is open");
-            drop(dbc_state);
-            if let Ok(mut ss) = stmt.inner.lock() {
-                post_sql_error(
-                    &mut ss,
-                    SQLSTATE_HY000,
-                    0,
-                    "Connection is not owned by this hstmt",
-                );
-            }
-            return SQL_ERROR;
+            // End-of-set was already reached on a previous fetch: the connection
+            // was drained and `active_stmt` cleared, but `CURSOR_OPEN` stays set
+            // until SQLCloseCursor / SQLFreeStmt(SQL_CLOSE). Subsequent fetches
+            // legitimately return SQL_NO_DATA rather than an error.
+            debug!("SQLFetch: cursor already drained; returning SQL_NO_DATA");
+            return SQL_NO_DATA;
         }
 
         let Some(client) = dbc_state.client.take() else {
@@ -156,9 +151,8 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
 
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.current_row = None;
-                // Keep cursor state open until SQLCloseCursor / SQLFreeStmt(SQL_CLOSE)
+                // Cursor stays open until SQLCloseCursor / SQLFreeStmt(SQL_CLOSE)
                 // so re-execute requires an explicit close.
-                stmt_state.cursor_open = true;
             }
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
@@ -175,7 +169,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             error!(%e, "SQLFetch: row fetch failed");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.current_row = None;
-                stmt_state.cursor_open = false;
+                stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_sql_error(&mut stmt_state, SQLSTATE_HY000, 0, msg);
             }
             if let Ok(mut dbc_state) = dbc.inner.lock() {
@@ -200,6 +194,7 @@ mod tests {
     };
     use crate::api::set_env_attr::sql_set_env_attr;
     use crate::handles::dbc::DbcHandle;
+    use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 
     unsafe fn alloc_env_dbc_stmt() -> (SqlHandle, SqlHandle, SqlHandle) {
         let mut env: SqlHandle = SQL_NULL_HANDLE;
@@ -265,7 +260,7 @@ mod tests {
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut stmt_state = stmt_handle.inner.lock().unwrap();
-            stmt_state.cursor_open = true;
+            stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
         }
 
         let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(dbc) };
@@ -294,5 +289,33 @@ mod tests {
             sql_free_handle(SQL_HANDLE_STMT, other_stmt);
             free_env_dbc_stmt(env, dbc, stmt);
         };
+    }
+
+    /// CURSOR_OPEN is set but `active_stmt` is `None` — i.e. a previous fetch
+    /// already drained the result set and cleared connection ownership, but
+    /// the cursor hasn't been explicitly closed yet. Subsequent fetches must
+    /// return `SQL_NO_DATA`, not an error.
+    #[test]
+    fn fetch_after_cursor_drained_returns_no_data() {
+        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut stmt_state = stmt_handle.inner.lock().unwrap();
+            stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
+        }
+        // Leave dbc.active_stmt as None and dbc.client as None — this mirrors
+        // the post-drain state that fetch_rows_next produces on Ok(None).
+
+        let ret = unsafe { sql_fetch(stmt) };
+        assert_eq!(ret, SQL_NO_DATA);
+
+        // No diagnostic should be posted on the drained-cursor path.
+        let stmt_state = stmt_handle.inner.lock().unwrap();
+        assert!(stmt_state.diag_records.is_empty());
+        assert!(stmt_state.has_state(STMT_STATE_CURSOR_OPEN));
+        drop(stmt_state);
+
+        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 }

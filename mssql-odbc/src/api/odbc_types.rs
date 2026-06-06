@@ -59,6 +59,42 @@ pub const SQL_DRIVER_COMPLETE_REQUIRED: SqlUSmallInt = 3;
 // Null-terminated string sentinel
 pub const SQL_NTS: SqlSmallInt = -3;
 
+// ODBC-SQL-type identifiers.
+pub const SQL_UNKNOWN_TYPE: SqlSmallInt = 0;
+pub const SQL_CHAR: SqlSmallInt = 1;
+pub const SQL_NUMERIC: SqlSmallInt = 2;
+pub const SQL_DECIMAL: SqlSmallInt = 3;
+pub const SQL_INTEGER: SqlSmallInt = 4;
+pub const SQL_SMALLINT: SqlSmallInt = 5;
+pub const SQL_FLOAT: SqlSmallInt = 6;
+pub const SQL_REAL: SqlSmallInt = 7;
+pub const SQL_DOUBLE: SqlSmallInt = 8;
+pub const SQL_DATETIME: SqlSmallInt = 9;
+pub const SQL_VARCHAR: SqlSmallInt = 12;
+pub const SQL_TIMESTAMP: SqlSmallInt = 11;
+pub const SQL_TYPE_DATE: SqlSmallInt = 91;
+pub const SQL_TYPE_TIME: SqlSmallInt = 92;
+pub const SQL_TYPE_TIMESTAMP: SqlSmallInt = 93;
+pub const SQL_LONGVARCHAR: SqlSmallInt = -1;
+pub const SQL_BINARY: SqlSmallInt = -2;
+pub const SQL_VARBINARY: SqlSmallInt = -3;
+pub const SQL_LONGVARBINARY: SqlSmallInt = -4;
+pub const SQL_BIGINT: SqlSmallInt = -5;
+pub const SQL_TINYINT: SqlSmallInt = -6;
+pub const SQL_BIT: SqlSmallInt = -7;
+pub const SQL_WCHAR: SqlSmallInt = -8;
+pub const SQL_WVARCHAR: SqlSmallInt = -9;
+pub const SQL_WLONGVARCHAR: SqlSmallInt = -10;
+pub const SQL_GUID: SqlSmallInt = -11;
+
+// SQL Server-specific ODBC-SQL-type identifiers (msodbcsql/sqlncli extensions).
+pub const SQL_SS_TIME2: SqlSmallInt = -154;
+pub const SQL_SS_TIMESTAMPOFFSET: SqlSmallInt = -155;
+
+// Values of NULLABLE field in descriptor
+pub const SQL_NO_NULLS: SqlSmallInt = 0;
+pub const SQL_NULLABLE: SqlSmallInt = 1;
+
 // Diagnostic field identifiers (SQLGetDiagField)
 pub const SQL_DIAG_NUMBER: SqlSmallInt = 2;
 pub const SQL_DIAG_SQLSTATE: SqlSmallInt = 4;

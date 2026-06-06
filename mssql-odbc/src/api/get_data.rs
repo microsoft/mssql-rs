@@ -13,6 +13,7 @@ use super::odbc_types::{
 };
 use super::sqlstate::*;
 use crate::error::{free_errors, post_sql_error};
+use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::datatypes::column_values::ColumnValues;
 
@@ -68,22 +69,17 @@ unsafe fn sql_get_data_impl(
         error!("SQLGetData: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    if buffer_length < 0 {
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
-        if let Ok(mut ss) = stmt.inner.lock() {
-            free_errors(&mut ss);
-            post_sql_error(
-                &mut ss,
-                SQLSTATE_HY090,
-                0,
-                "Invalid string or buffer length",
-            );
-        }
-        return SQL_ERROR;
-    }
 
     let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
-    debug_assert_eq!(stmt.object_type, HandleType::Stmt);
+    debug_assert_eq!(
+        stmt.object_type,
+        HandleType::Stmt,
+        "SQLGetData: handle is not a STMT"
+    );
+    debug_assert!(
+        buffer_length >= 0,
+        "SQLGetData: DM should reject negative buffer_length (HY090)"
+    );
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLGetData: stmt mutex poisoned");
@@ -92,7 +88,7 @@ unsafe fn sql_get_data_impl(
 
     free_errors(&mut stmt_state);
 
-    if !stmt_state.cursor_open {
+    if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
         post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "Invalid cursor state");
         return SQL_ERROR;
     }
@@ -292,7 +288,7 @@ mod tests {
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
-            s.cursor_open = true;
+            s.set_state(STMT_STATE_CURSOR_OPEN);
             s.current_row = Some(vec![ColumnValues::String(SqlString::from_utf8_string(
                 "hello".to_string(),
             ))]);
@@ -322,7 +318,7 @@ mod tests {
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
-            s.cursor_open = true;
+            s.set_state(STMT_STATE_CURSOR_OPEN);
             s.current_row = Some(vec![ColumnValues::Int(12345)]);
         }
 
@@ -349,7 +345,7 @@ mod tests {
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
-            s.cursor_open = true;
+            s.set_state(STMT_STATE_CURSOR_OPEN);
             s.current_row = Some(vec![ColumnValues::String(SqlString::from_utf8_string(
                 String::new(),
             ))]);
@@ -368,7 +364,7 @@ mod tests {
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
-            s.cursor_open = true;
+            s.set_state(STMT_STATE_CURSOR_OPEN);
             s.current_row = Some(vec![ColumnValues::Null]);
         }
 
@@ -395,7 +391,7 @@ mod tests {
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
-            s.cursor_open = true;
+            s.set_state(STMT_STATE_CURSOR_OPEN);
             s.current_row = Some(vec![ColumnValues::Int(1)]);
         }
 
@@ -421,7 +417,7 @@ mod tests {
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
-            s.cursor_open = true;
+            s.set_state(STMT_STATE_CURSOR_OPEN);
             s.current_row = Some(vec![ColumnValues::Int(1)]);
         }
 

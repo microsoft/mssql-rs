@@ -72,6 +72,28 @@ impl ColumnMetadata {
         }
     }
 
+    /// Returns the precision (max decimal digits) for numeric types.
+    ///
+    /// - `decimal`/`numeric` → declared precision (1–38).
+    /// - `money` → 19, `smallmoney` → 10 (T-SQL fixed precisions).
+    /// - `MoneyN` → 19 if 8-byte payload, 10 if 4-byte payload.
+    /// - All other types → `None`.
+    pub fn get_precision(&self) -> Option<u8> {
+        use crate::datatypes::sqldatatypes::{FixedLengthTypes, VariableLengthTypes};
+
+        match self.type_info.type_info_variant {
+            TypeInfoVariant::VarLenPrecisionScale(_, _, precision, _) => Some(precision),
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Money) => Some(19),
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Money4) => Some(10),
+            TypeInfoVariant::VarLen(VariableLengthTypes::MoneyN, length) => match length {
+                8 => Some(19),
+                4 => Some(10),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Returns the SQL collation for string-typed columns, or `None` for non-string types.
     pub fn get_collation(&self) -> Option<SqlCollation> {
         // Collation is only applicable to string types which are either VarLen strings

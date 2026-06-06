@@ -14,6 +14,7 @@ use tracing::{debug, error};
 use super::sqlstate::*;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
 use crate::error::{free_errors, post_sql_error};
+use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT};
 use crate::handles::{DbcHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Closes the cursor on `statement_handle` and discards any pending rows.
@@ -62,7 +63,7 @@ unsafe fn sql_close_cursor_impl(statement_handle: SqlHandle) -> SqlReturn {
         return SQL_ERROR;
     };
     free_errors(&mut stmt_state);
-    if !stmt_state.cursor_open {
+    if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
         error!("SQLCloseCursor: no cursor is open — SQLSTATE 24000");
         post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "Invalid cursor state");
         return SQL_ERROR;
@@ -92,7 +93,7 @@ unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
     };
     free_errors(&mut stmt_state);
     // No-op if cursor is already closed.
-    if !stmt_state.cursor_open {
+    if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
         return SQL_SUCCESS;
     }
 
@@ -107,7 +108,7 @@ unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
 
 /// Resets cursor state on the statement (cursor is no longer open, metadata cleared).
 fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
-    stmt_state.cursor_open = false;
+    stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);
     stmt_state.current_row = None;
     stmt_state.column_metadata.clear();
 }

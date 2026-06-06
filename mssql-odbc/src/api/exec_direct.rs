@@ -14,13 +14,15 @@ use crate::api::odbc_types::{
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::{ConnectionState, DbcHandle};
+use crate::handles::stmt::{
+    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::ResultSet;
 
 /// Implementation of `SQLExecDirectW`.
 ///
 /// Executes a SQL statement directly on the connection associated with `statement_handle`.
-/// Leaves the result set open for subsequent `SQLFetch` calls; call `SQLCloseCursor` or
 /// `SQLFreeStmt(SQL_CLOSE)` to drain the wire and release the connection.
 ///
 /// # Safety
@@ -76,19 +78,24 @@ unsafe fn sql_exec_direct_w_impl(
     // Access parent DBC
     let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
 
-    // Check STMT state first (cursor_open).
+    // Check STMT state first.
     {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
-        if stmt_state.cursor_open {
-            error!("SQLExecDirectW: cursor is already open on this statement");
+        if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
+            error!("SQLExecDirectW: statement has an active execute or open cursor");
             post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "Invalid cursor state");
             return SQL_ERROR;
         }
+        // A new execute invalidates prior metadata/context immediately, so a
+        // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
+        stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
+        stmt_state.column_metadata.clear();
         stmt_state.current_row = None;
+        stmt_state.set_state(STMT_STATE_EXEC_STARTED);
     }
 
     // Take TdsClient out of DbcState. Lock is held only briefly — no I/O inside.
@@ -104,6 +111,7 @@ unsafe fn sql_exec_direct_w_impl(
             if let Ok(mut ss) = stmt.inner.lock() {
                 post_sql_error(&mut ss, SQLSTATE_08003, 0, "Connection not open");
             }
+            clear_exec_started(stmt);
             return SQL_ERROR;
         }
 
@@ -121,6 +129,7 @@ unsafe fn sql_exec_direct_w_impl(
                     "Connection is busy with results for another hstmt",
                 );
             }
+            clear_exec_started(stmt);
             return SQL_ERROR;
         }
 
@@ -134,6 +143,7 @@ unsafe fn sql_exec_direct_w_impl(
             if let Ok(mut ss) = stmt.inner.lock() {
                 post_sql_error(&mut ss, SQLSTATE_HY000, 0, "No active TDS client");
             }
+            clear_exec_started(stmt);
             return SQL_ERROR;
         };
 
@@ -152,6 +162,7 @@ unsafe fn sql_exec_direct_w_impl(
         if let Ok(mut ss) = stmt.inner.lock() {
             post_sql_error(&mut ss, SQLSTATE_HY000, 0, msg);
         }
+        clear_exec_started(stmt);
         return SQL_ERROR;
     }
 
@@ -174,6 +185,7 @@ unsafe fn sql_exec_direct_w_impl(
             if let Ok(mut ss) = stmt.inner.lock() {
                 post_sql_error(&mut ss, SQLSTATE_HY000, 0, msg);
             }
+            clear_exec_started(stmt);
             return SQL_ERROR;
         }
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -182,9 +194,12 @@ unsafe fn sql_exec_direct_w_impl(
                 ds.client = Some(client);
                 ds.active_stmt = None;
             }
+            clear_exec_started(stmt);
             return SQL_ERROR;
         };
         stmt_state.column_metadata = metadata; // empty vec
+        stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
+        stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
         drop(stmt_state);
         if let Ok(mut ds) = dbc.inner.lock() {
             ds.client = Some(client);
@@ -202,15 +217,18 @@ unsafe fn sql_exec_direct_w_impl(
             ds.client = Some(client);
             ds.active_stmt = None;
         }
+        clear_exec_started(stmt);
         return SQL_ERROR;
     };
     stmt_state.column_metadata = metadata;
-    stmt_state.cursor_open = true;
+    stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
+    stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     drop(stmt_state);
 
     // Return client to DBC. active_stmt is already set from the claim above.
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("SQLExecDirectW: dbc mutex poisoned storing client");
+        clear_exec_started(stmt);
         return SQL_ERROR;
     };
     dbc_state.client = Some(client);
@@ -218,6 +236,12 @@ unsafe fn sql_exec_direct_w_impl(
 
     debug!("SQLExecDirectW: execution complete");
     SQL_SUCCESS
+}
+
+fn clear_exec_started(stmt: &StmtHandle) {
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+    }
 }
 
 #[cfg(test)]

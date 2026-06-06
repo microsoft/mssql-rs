@@ -15,6 +15,7 @@ use crate::api::sqlstate::{
     SQLSTATE_01S00, SQLSTATE_01004, SQLSTATE_08001, SQLSTATE_HY000, SQLSTATE_HY009, SQLSTATE_HY010,
     SQLSTATE_HY024, SQLSTATE_HY110,
 };
+use crate::api::util::copy_utf16_with_nul;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::DbcHandle;
 use crate::handles::dbc::{ConnectionState, DbcState};
@@ -108,10 +109,15 @@ unsafe fn sql_driver_connect_w_impl(
         return SQL_ERROR;
     }
 
-    // HY090 (negative string_length_1) is DM-enforced per spec.
+    // HY090 (negative string_length_1 / buffer_length) is DM-enforced per spec.
+    // https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqldriverconnect-function
     debug_assert!(
         string_length_1 >= 0 || string_length_1 == SQL_NTS,
         "SQLDriverConnectW: DM should reject negative string_length_1 (HY090)"
+    );
+    debug_assert!(
+        buffer_length >= 0,
+        "SQLDriverConnectW: DM should reject negative buffer_length (HY090)"
     );
 
     // Transition to Connecting state under lock - prevents concurrent connect race.
@@ -241,15 +247,8 @@ unsafe fn do_connect(
     }
 
     let mut truncated = actual_len > SqlSmallInt::MAX as usize;
-    if !out_connection_string.is_null() && buffer_length > 0 {
-        let max_copy = (buffer_length - 1) as usize;
-        let copy_len = actual_len.min(max_copy);
-        truncated |= actual_len > max_copy;
-        unsafe {
-            std::ptr::copy_nonoverlapping(out_utf16.as_ptr(), out_connection_string, copy_len);
-            out_connection_string.add(copy_len).write(0);
-        }
-    }
+    truncated |=
+        unsafe { copy_utf16_with_nul(out_connection_string, buffer_length as usize, &out_utf16) };
 
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;

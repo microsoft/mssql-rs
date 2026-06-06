@@ -3,6 +3,7 @@
 
 mod alloc_handle;
 mod close_cursor;
+mod describe_col;
 mod disconnect;
 mod driver_connect;
 mod exec_direct;
@@ -10,6 +11,7 @@ pub(crate) mod fetch;
 mod free_handle;
 mod get_data;
 mod get_diag;
+mod num_result_cols;
 pub(crate) mod odbc_types;
 mod set_env_attr;
 pub(crate) mod sqlstate;
