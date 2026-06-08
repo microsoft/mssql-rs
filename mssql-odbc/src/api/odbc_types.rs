@@ -91,6 +91,11 @@ pub const SQL_GUID: SqlSmallInt = -11;
 pub const SQL_SS_TIME2: SqlSmallInt = -154;
 pub const SQL_SS_TIMESTAMPOFFSET: SqlSmallInt = -155;
 
+// ODBC C types
+pub const SQL_C_CHAR: SqlSmallInt = 1;
+pub const SQL_C_WCHAR: SqlSmallInt = -8;
+pub const SQL_C_LONG: SqlSmallInt = 4;
+
 // Values of NULLABLE field in descriptor
 pub const SQL_NO_NULLS: SqlSmallInt = 0;
 pub const SQL_NULLABLE: SqlSmallInt = 1;
@@ -100,10 +105,6 @@ pub const SQL_DIAG_NUMBER: SqlSmallInt = 2;
 pub const SQL_DIAG_SQLSTATE: SqlSmallInt = 4;
 pub const SQL_DIAG_NATIVE: SqlSmallInt = 5;
 pub const SQL_DIAG_MESSAGE_TEXT: SqlSmallInt = 6;
-
-// C target types for SQLGetData / SQLBindCol.
-pub const SQL_C_CHAR: SqlSmallInt = 1;
-pub const SQL_C_LONG: SqlSmallInt = 4;
 
 // Length/indicator constants.
 pub const SQL_NULL_DATA: SqlLen = -1;

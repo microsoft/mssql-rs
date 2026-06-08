@@ -132,36 +132,20 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             SQL_SUCCESS
         }
         Ok(None) => {
-            // Ensure the full batch is drained before releasing statement ownership.
-            if let Err(e) = dbc.runtime.block_on(client.close_query()) {
-                let msg = e.to_string();
-                error!(%e, "SQLFetch: failed to drain remaining results at end-of-set");
-                if let Ok(mut stmt_state) = stmt.inner.lock() {
-                    stmt_state.current_row = None;
-                    post_sql_error(&mut stmt_state, SQLSTATE_HY000, 0, msg);
-                }
-                if let Ok(mut dbc_state) = dbc.inner.lock() {
-                    dbc_state.client = Some(client);
-                    if dbc_state.active_stmt == Some(statement_handle) {
-                        dbc_state.active_stmt = None;
-                    }
-                }
-                return SQL_ERROR;
-            }
-
+            // End of current rowset. Do NOT drain the rest of the batch — the
+            // application may call SQLMoreResults to advance to a subsequent
+            // result set (msodbcsql behaviour). Cursor stays open; active_stmt
+            // stays set so the connection remains "busy" with this statement.
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.current_row = None;
-                // Cursor stays open until SQLCloseCursor / SQLFreeStmt(SQL_CLOSE)
-                // so re-execute requires an explicit close.
+                // Dont clear CURSOR_OPEN here
+                // Cursor stays open until SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE)
             }
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
-                if dbc_state.active_stmt == Some(statement_handle) {
-                    dbc_state.active_stmt = None;
-                }
             }
 
-            debug!("SQLFetch: no more rows");
+            debug!("SQLFetch: no more rows in current result set");
             SQL_NO_DATA
         }
         Err(e) => {

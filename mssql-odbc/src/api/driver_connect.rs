@@ -15,7 +15,7 @@ use crate::api::sqlstate::{
     SQLSTATE_01S00, SQLSTATE_01004, SQLSTATE_08001, SQLSTATE_HY000, SQLSTATE_HY009, SQLSTATE_HY010,
     SQLSTATE_HY024, SQLSTATE_HY110,
 };
-use crate::api::util::copy_utf16_with_nul;
+use crate::api::util::copy_with_nul;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::DbcHandle;
 use crate::handles::dbc::{ConnectionState, DbcState};
@@ -248,10 +248,12 @@ unsafe fn do_connect(
 
     let mut truncated = actual_len > SqlSmallInt::MAX as usize;
     truncated |=
-        unsafe { copy_utf16_with_nul(out_connection_string, buffer_length as usize, &out_utf16) };
+        unsafe { copy_with_nul(out_connection_string, buffer_length as usize, &out_utf16) };
 
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
+    // TODO: This print is for demo purposes only. Remove before release.
+    println!("**** Connected via mssql-odbc Driver ****");
     debug!("SQLDriverConnectW: connected successfully");
 
     if has_warnings || truncated {

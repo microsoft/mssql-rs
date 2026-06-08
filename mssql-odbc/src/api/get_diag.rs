@@ -20,7 +20,7 @@ use crate::api::odbc_types::{
     SQL_SQLSTATE_SIZE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer,
     SqlReturn, SqlSmallInt, SqlWChar,
 };
-use crate::api::util::copy_utf16_with_nul;
+use crate::api::util::copy_with_nul;
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::handles::{DbcHandle, EnvHandle, HandleType, StmtHandle, handle_from_raw};
 
@@ -300,7 +300,7 @@ unsafe fn write_utf16_field_bytes(
     }
 
     let buf_chars = (buffer_length_bytes as usize) / mem::size_of::<SqlWChar>();
-    let truncated = unsafe { copy_utf16_with_nul(dst as *mut SqlWChar, buf_chars, src_utf16) };
+    let truncated = unsafe { copy_with_nul(dst as *mut SqlWChar, buf_chars, src_utf16) };
 
     if truncated {
         SQL_SUCCESS_WITH_INFO
@@ -444,7 +444,7 @@ unsafe fn write_message(
     }
 
     let buf_chars = buffer_length as usize;
-    let truncated = unsafe { copy_utf16_with_nul(message_dst, buf_chars, &utf16) };
+    let truncated = unsafe { copy_with_nul(message_dst, buf_chars, &utf16) };
 
     if truncated {
         SQL_SUCCESS_WITH_INFO

@@ -8,10 +8,12 @@ use std::panic;
 use tracing::{debug, error, trace};
 
 use super::odbc_types::{
-    SQL_C_CHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt,
+    SQL_C_CHAR, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NULL_DATA, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt,
 };
 use super::sqlstate::*;
+use crate::api::odbc_types::SqlWChar;
+use crate::api::util::copy_with_nul;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -109,7 +111,7 @@ unsafe fn sql_get_data_impl(
         return SQL_ERROR;
     }
 
-    if target_type != SQL_C_CHAR {
+    if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
         post_sql_error(
             &mut stmt_state,
             SQLSTATE_HYC00,
@@ -119,13 +121,29 @@ unsafe fn sql_get_data_impl(
         return SQL_ERROR;
     }
 
+    // Output buffer capacity in element units (u8 for SQL_C_CHAR, SqlWChar for
+    // SQL_C_WCHAR). buffer_length is always in bytes per the ODBC spec.
+    let buf_elements = if target_type == SQL_C_WCHAR {
+        (buffer_length as usize) / std::mem::size_of::<SqlWChar>()
+    } else {
+        buffer_length as usize
+    };
+
     let value = &row[col_index - 1];
     if matches!(value, ColumnValues::Null) {
         if !strlen_or_ind_ptr.is_null() {
             unsafe { strlen_or_ind_ptr.write(SQL_NULL_DATA) };
         }
-        if !target_value_ptr.is_null() && buffer_length > 0 {
-            unsafe { *(target_value_ptr as *mut u8) = 0 };
+        // Write a NUL terminator into the caller buffer when there's room. The
+        // helper handles null `dst` and zero-length uniformly.
+        if target_type == SQL_C_WCHAR {
+            unsafe {
+                copy_with_nul(target_value_ptr as *mut SqlWChar, buf_elements, &[]);
+            }
+        } else {
+            unsafe {
+                copy_with_nul(target_value_ptr as *mut u8, buf_elements, &[]);
+            }
         }
         return SQL_SUCCESS;
     }
@@ -140,38 +158,55 @@ unsafe fn sql_get_data_impl(
         return SQL_ERROR;
     };
 
-    let bytes = as_text.as_bytes();
-    if !strlen_or_ind_ptr.is_null() {
-        unsafe { strlen_or_ind_ptr.write(bytes.len() as SqlLen) };
-    }
-
-    if target_value_ptr.is_null() {
-        return SQL_SUCCESS;
-    }
-
-    let buf_len = buffer_length as usize;
-    if buf_len == 0 {
-        if bytes.is_empty() {
-            return SQL_SUCCESS;
+    if target_type == SQL_C_WCHAR {
+        let utf16: Vec<u16> = as_text.encode_utf16().collect();
+        unsafe {
+            write_string_result(
+                &mut stmt_state,
+                &utf16,
+                target_value_ptr as *mut SqlWChar,
+                buf_elements,
+                strlen_or_ind_ptr,
+            )
         }
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_01004,
-            0,
-            "String data, right truncated",
-        );
-        return SQL_SUCCESS_WITH_INFO;
+    } else {
+        unsafe {
+            write_string_result(
+                &mut stmt_state,
+                as_text.as_bytes(),
+                target_value_ptr as *mut u8,
+                buf_elements,
+                strlen_or_ind_ptr,
+            )
+        }
     }
+}
 
-    let copy_len = bytes.len().min(buf_len.saturating_sub(1));
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), target_value_ptr as *mut u8, copy_len);
-        *((target_value_ptr as *mut u8).add(copy_len)) = 0;
+/// Writes `src` to the caller's output buffer with ODBC string semantics:
+/// the indicator (when present) reports the untruncated byte length, the
+/// payload is NUL-terminated within the buffer, and truncation is reported via
+/// SQLSTATE 01004 + `SQL_SUCCESS_WITH_INFO`.
+///
+/// `buf_elements` is the buffer capacity in units of `T` (not bytes).
+///
+/// # Safety
+/// - `target_value_ptr`, if non-null, must be writable for `buf_elements` `T`s.
+/// - `strlen_or_ind_ptr`, if non-null, must be writable for one `SqlLen`.
+unsafe fn write_string_result<T: Copy + Default>(
+    stmt_state: &mut crate::handles::stmt::StmtState,
+    src: &[T],
+    target_value_ptr: *mut T,
+    buf_elements: usize,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
+    if !strlen_or_ind_ptr.is_null() {
+        let byte_len = std::mem::size_of_val(src) as SqlLen;
+        unsafe { strlen_or_ind_ptr.write(byte_len) };
     }
-
-    if copy_len < bytes.len() {
+    let truncated = unsafe { copy_with_nul(target_value_ptr, buf_elements, src) };
+    if truncated {
         post_sql_error(
-            &mut stmt_state,
+            stmt_state,
             SQLSTATE_01004,
             0,
             "String data, right truncated",
@@ -434,6 +469,104 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
+        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
+    }
+
+    /// Helper: read a NUL-terminated UTF-16 buffer back to a Rust String.
+    fn read_until_nul(buf: &[u16]) -> String {
+        let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+        String::from_utf16(&buf[..len]).unwrap()
+    }
+
+    #[test]
+    fn get_data_wchar_success() {
+        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.current_row = Some(vec![ColumnValues::String(SqlString::from_utf8_string(
+                "héllo".to_string(),
+            ))]);
+        }
+
+        let mut buf = [0u16; 16];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_WCHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        // Indicator is byte length of untruncated value, excluding NUL.
+        // "héllo" → 5 u16 units → 10 bytes.
+        assert_eq!(ind, 10);
+        assert_eq!(read_until_nul(&buf), "héllo");
+        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
+    }
+
+    #[test]
+    fn get_data_wchar_truncation_returns_info() {
+        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.current_row = Some(vec![ColumnValues::Int(12345)]);
+        }
+
+        // 3 u16 slots = 6 bytes. "12345" needs 6 units (5 chars + NUL) → truncated.
+        let mut buf = [0u16; 3];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_WCHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        // Untruncated byte length: 5 chars × 2 bytes = 10.
+        assert_eq!(ind, 10);
+        assert_eq!(read_until_nul(&buf), "12");
+        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
+    }
+
+    #[test]
+    fn get_data_wchar_null_column_writes_nul_and_indicator() {
+        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.current_row = Some(vec![ColumnValues::Null]);
+        }
+
+        let mut buf = [0xDEADu16; 4];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_WCHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, SQL_NULL_DATA);
+        // First slot must be NUL; nothing else touched.
+        assert_eq!(buf[0], 0);
+        assert_eq!(&buf[1..], &[0xDEAD; 3]);
         unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 }

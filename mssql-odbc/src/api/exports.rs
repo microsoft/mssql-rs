@@ -11,8 +11,8 @@
 //! Windows `.def` file or a C header listing the public API surface.
 
 use super::odbc_types::{
-    SQL_NO_DATA, SQL_SUCCESS, SqlHWnd, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn,
-    SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_SUCCESS, SqlHWnd, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
+    SqlUSmallInt, SqlWChar,
 };
 
 // ---- Handle allocation and management ---------------------------------------
@@ -332,17 +332,21 @@ pub unsafe extern "C" fn SQLGetData(
     }
 }
 
-// ---- Result set processing (TO-BE-IMPLEMENTED) --------------------------------
-
 /// Moves to the next result set in a batch.
+///
+/// Returns `SQL_SUCCESS` when positioned on the next result set,
+/// `SQL_NO_DATA` when the batch is exhausted (cursor is closed), or
+/// `SQL_ERROR` on failure.
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn SQLMoreResults(_statement_handle: SqlHandle) -> SqlReturn {
+pub unsafe extern "C" fn SQLMoreResults(statement_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();
-    SQL_NO_DATA
+    unsafe { super::more_results::sql_more_results(statement_handle) }
 }
+
+// ---- Result set processing (TO-BE-IMPLEMENTED) --------------------------------
 
 /// Returns the row count from the last INSERT, UPDATE, or DELETE statement.
 ///

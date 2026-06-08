@@ -107,7 +107,7 @@ unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
 }
 
 /// Resets cursor state on the statement (cursor is no longer open, metadata cleared).
-fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
+pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
     stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);
     stmt_state.current_row = None;
     stmt_state.column_metadata.clear();
@@ -117,7 +117,7 @@ fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
 /// `active_stmt` is kept set until the drain finishes so concurrent threads see the
 /// connection as busy (HY000) throughout — not just until `client` is taken.
 /// No locks are held during the network I/O.
-fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) {
+pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) {
     let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
 
     // Take the client; intentionally leave active_stmt set while draining.

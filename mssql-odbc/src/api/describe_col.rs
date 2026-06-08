@@ -17,7 +17,7 @@ use crate::api::odbc_types::{
     SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{SQLSTATE_01004, SQLSTATE_07009, SQLSTATE_HY010};
-use crate::api::util::copy_utf16_with_nul;
+use crate::api::util::copy_with_nul;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -128,8 +128,7 @@ unsafe fn sql_describe_col_w_impl(
         unsafe { name_length_ptr.write(len) };
     }
 
-    let truncated =
-        unsafe { copy_utf16_with_nul(column_name, buffer_length as usize, &name_utf16) };
+    let truncated = unsafe { copy_with_nul(column_name, buffer_length as usize, &name_utf16) };
 
     if !data_type_ptr.is_null() {
         unsafe { data_type_ptr.write(odbc_sql_type(meta)) };
@@ -248,10 +247,17 @@ fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
             let scale = meta.get_scale().unwrap_or(0) as u64;
             if scale > 0 { 9 + scale } else { 8 }
         }
-        TdsDataType::DateTime
-        | TdsDataType::DateTim4
-        | TdsDataType::DateTimeN
-        | TdsDataType::DateTime2N => {
+        // datetime: fixed scale 3, display "yyyy-mm-dd hh:mm:ss.fff" = 23 chars.
+        TdsDataType::DateTime => 23,
+        // smalldatetime: minute-resolution, fixed scale 0, display "yyyy-mm-dd hh:mm" = 16.
+        TdsDataType::DateTim4 => 16,
+        TdsDataType::DateTimeN => match meta.type_info.length {
+            8 => 23,
+            4 => 16,
+            _ => 0,
+        },
+        // datetime2: "yyyy-mm-dd hh:mm:ss[.fffffff]". scale=0 → 19; scale>0 → 20 + scale.
+        TdsDataType::DateTime2N => {
             let scale = meta.get_scale().unwrap_or(0) as u64;
             if scale > 0 { 20 + scale } else { 19 }
         }
@@ -280,8 +286,15 @@ fn decimal_digits(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmall
     match meta.data_type {
         // T-SQL `money` and `smallmoney` both have a fixed scale of 4. They are stored
         // as FixedLen/VarLen variants without a scale field, so `get_scale()` returns
-        // None — hard-code the spec-mandated value here, mirroring `get_precision()`.
+        // None - hard-code the spec-mandated value here, mirroring `get_precision()`.
         TdsDataType::Money | TdsDataType::Money4 | TdsDataType::MoneyN => 4,
+        TdsDataType::DateTime => 3,
+        TdsDataType::DateTim4 => 0,
+        TdsDataType::DateTimeN => match meta.type_info.length {
+            8 => 3,
+            4 => 0,
+            _ => 0,
+        },
         _ => meta.get_scale().unwrap_or(0) as SqlSmallInt,
     }
 }

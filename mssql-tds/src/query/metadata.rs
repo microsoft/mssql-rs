@@ -286,6 +286,66 @@ mod tests {
     }
 
     #[test]
+    fn test_get_precision_decimal_numeric() {
+        // VarLenPrecisionScale: declared precision returned verbatim, regardless of scale.
+        let dec = create_test_column_metadata(
+            0x00,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::DecimalN, 17, 38, 4),
+        );
+        assert_eq!(dec.get_precision(), Some(38));
+
+        let num = create_test_column_metadata(
+            0x00,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::NumericN, 9, 18, 0),
+        );
+        assert_eq!(num.get_precision(), Some(18));
+    }
+
+    #[test]
+    fn test_get_precision_money_types() {
+        // money/smallmoney have T-SQL fixed precisions; MoneyN dispatches on wire length.
+        let cases = [
+            (TypeInfoVariant::FixedLen(FixedLengthTypes::Money), Some(19)),
+            (
+                TypeInfoVariant::FixedLen(FixedLengthTypes::Money4),
+                Some(10),
+            ),
+            (
+                TypeInfoVariant::VarLen(VariableLengthTypes::MoneyN, 8),
+                Some(19),
+            ),
+            (
+                TypeInfoVariant::VarLen(VariableLengthTypes::MoneyN, 4),
+                Some(10),
+            ),
+            // MoneyN only ever carries 4 or 8 on the wire; anything else is malformed.
+            (
+                TypeInfoVariant::VarLen(VariableLengthTypes::MoneyN, 6),
+                None,
+            ),
+        ];
+        for (variant, expected) in cases {
+            let meta = create_test_column_metadata(0x00, variant);
+            assert_eq!(meta.get_precision(), expected);
+        }
+    }
+
+    #[test]
+    fn test_get_precision_none_for_non_numeric() {
+        // Variants that don't carry numeric precision all return None.
+        let cases = [
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+            TypeInfoVariant::VarLen(VariableLengthTypes::IntN, 4),
+            TypeInfoVariant::VarLenScale(VariableLengthTypes::TimeN, 7),
+            TypeInfoVariant::PartialLen(PartialLengthType::BigVarChar, None, None, None, None),
+        ];
+        for variant in cases {
+            let meta = create_test_column_metadata(0x00, variant);
+            assert_eq!(meta.get_precision(), None);
+        }
+    }
+
+    #[test]
     fn test_get_collation_varlen_string() {
         let collation = SqlCollation {
             info: 0,

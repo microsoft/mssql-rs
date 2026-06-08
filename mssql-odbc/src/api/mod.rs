@@ -11,6 +11,7 @@ pub(crate) mod fetch;
 mod free_handle;
 mod get_data;
 mod get_diag;
+mod more_results;
 mod num_result_cols;
 pub(crate) mod odbc_types;
 mod set_env_attr;
