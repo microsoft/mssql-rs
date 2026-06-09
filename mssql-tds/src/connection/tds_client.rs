@@ -428,6 +428,7 @@ impl TdsClient {
         // No metadata means no rows were returned, so we set has_open_batch to false.
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
+            self.current_metadata = None;
         } else {
             self.current_metadata = metadata;
 
@@ -514,6 +515,7 @@ impl TdsClient {
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
             self.current_result_set_has_been_read_till_end = true;
+            self.current_metadata = None;
         } else {
             self.current_metadata = metadata;
             self.current_result_set_has_been_read_till_end = false;
@@ -814,6 +816,7 @@ impl TdsClient {
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
             self.current_result_set_has_been_read_till_end = true;
+            self.current_metadata = None;
         } else {
             self.current_metadata = metadata;
             self.current_result_set_has_been_read_till_end = false;
@@ -1081,6 +1084,7 @@ impl TdsClient {
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
             self.current_result_set_has_been_read_till_end = true;
+            self.current_metadata = None;
         } else {
             self.current_metadata = metadata;
             self.current_result_set_has_been_read_till_end = false;
@@ -1150,6 +1154,7 @@ impl TdsClient {
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
             self.current_result_set_has_been_read_till_end = true;
+            self.current_metadata = None;
         } else {
             self.current_metadata = metadata;
             self.current_result_set_has_been_read_till_end = false;
@@ -1726,6 +1731,7 @@ impl TdsClient {
         let metadata = self.move_to_column_metadata().await?;
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
+            self.current_metadata = None;
         } else {
             self.current_metadata = metadata;
             self.execution_context.set_has_open_batch(true);
@@ -1941,19 +1947,31 @@ mod tests {
     use crate::datatypes::row_writer::RowWriter;
     use crate::io::reader_writer::{NetworkReader, NetworkWriter};
     use crate::io::token_stream::{ParserContext, RowReadResult, TdsTokenStreamReader};
-    use crate::token::tokens::Tokens;
+    use crate::token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, Tokens};
     use async_trait::async_trait;
+    use std::collections::VecDeque;
 
     // ── Minimal mock transport for reconnect() unit tests ──
 
     #[derive(Debug)]
     struct TestTransport {
         closed: bool,
+        pending_tokens: VecDeque<Tokens>,
     }
 
     impl TestTransport {
         fn new() -> Self {
-            Self { closed: false }
+            Self {
+                closed: false,
+                pending_tokens: VecDeque::new(),
+            }
+        }
+
+        fn with_tokens(tokens: Vec<Tokens>) -> Self {
+            Self {
+                closed: false,
+                pending_tokens: VecDeque::from(tokens),
+            }
         }
     }
 
@@ -1965,6 +1983,9 @@ mod tests {
             _remaining_request_timeout: Option<Duration>,
             _cancel_handle: Option<&CancelHandle>,
         ) -> TdsResult<Tokens> {
+            if let Some(tok) = self.pending_tokens.pop_front() {
+                return Ok(tok);
+            }
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
 
@@ -2046,6 +2067,36 @@ mod tests {
             execution_context,
             client_context,
         )
+    }
+
+    fn create_test_client_with_tokens(tokens: Vec<Tokens>) -> TdsClient {
+        let transport = Box::new(TestTransport::with_tokens(tokens));
+        let negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let execution_context = crate::connection::execution_context::ExecutionContext::new();
+        let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            client_context,
+        )
+    }
+
+    fn done_no_more() -> Tokens {
+        Tokens::Done(DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::Insert,
+            row_count: 0,
+        })
+    }
+
+    fn empty_col_metadata() -> Tokens {
+        Tokens::ColMetadata(ColMetadataToken::default())
+    }
+
+    fn stale_metadata() -> Arc<ColMetadataToken> {
+        Arc::new(ColMetadataToken::default())
     }
 
     #[test]
@@ -2296,5 +2347,115 @@ mod tests {
         let mut client = create_test_client();
         client.recovery_context.recovery_count = 3;
         assert_eq!(client.connection_recovery_count(), 3);
+    }
+
+    // ── execute() / current_metadata invariants ──
+    //
+    // After an execute path returns, `current_metadata` must reflect the
+    // current batch:
+    //   - DDL/DML (no COLMETADATA from the server) → `current_metadata` is None
+    //     and `has_open_batch` is false.
+    //   - Result-bearing query (COLMETADATA received) → `current_metadata`
+    //     points at the freshly received metadata and `has_open_batch` is true.
+    // No state from a prior batch is observable via `get_metadata()`.
+
+    /// Seeds a client with stale metadata + a single DONE token, runs `invoke`,
+    /// and asserts the no-result-set post-conditions. Failure attribution comes
+    /// from the calling test's name.
+    async fn assert_no_result_set_clears_metadata<F>(invoke: F)
+    where
+        F: AsyncFnOnce(&mut TdsClient) -> TdsResult<()>,
+    {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client.current_metadata = Some(stale_metadata());
+
+        invoke(&mut client)
+            .await
+            .expect("execute path should succeed against the queued DONE token");
+
+        assert!(
+            client.current_metadata.is_none(),
+            "DDL/DML must clear cached metadata so get_metadata() doesn't return stale columns"
+        );
+        assert!(
+            !client.execution_context.has_open_batch(),
+            "no result set => has_open_batch must be false"
+        );
+        assert!(client.get_metadata().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_clears_stale_metadata_when_no_result_set() {
+        assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
+            c.execute("INSERT INTO t VALUES (1)".to_string(), None, None)
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_replaces_stale_metadata_when_result_set_returned() {
+        let mut client = create_test_client_with_tokens(vec![empty_col_metadata(), done_no_more()]);
+        let stale = stale_metadata();
+        client.current_metadata = Some(Arc::clone(&stale));
+
+        client
+            .execute("SELECT 1".to_string(), None, None)
+            .await
+            .expect("execute should consume COLMETADATA and return Ok");
+
+        let new_metadata = client
+            .current_metadata
+            .as_ref()
+            .expect("COLMETADATA branch must populate current_metadata");
+        assert!(
+            !Arc::ptr_eq(new_metadata, &stale),
+            "current_metadata must point to the freshly received COLMETADATA, not the stale Arc"
+        );
+        assert!(
+            client.execution_context.has_open_batch(),
+            "result-set => has_open_batch must be true"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stored_procedure_clears_stale_metadata_when_no_result_set() {
+        assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
+            c.execute_stored_procedure("dbo.do_work".to_string(), None, None, None, None)
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_sp_executesql_clears_stale_metadata_when_no_result_set() {
+        assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
+            c.execute_sp_executesql("UPDATE t SET v = 1".to_string(), Vec::new(), None, None)
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_clears_stale_metadata_when_no_result_set() {
+        assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
+            c.execute_sp_prepexec("UPDATE t SET v = 1".to_string(), Vec::new(), None, None)
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_sp_execute_clears_stale_metadata_when_no_result_set() {
+        assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
+            c.execute_sp_execute(42, None, None, None, None).await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn get_dtc_address_clears_stale_metadata_when_no_result_set() {
+        assert_no_result_set_clears_metadata(async |c: &mut TdsClient| c.get_dtc_address().await)
+            .await;
     }
 }
