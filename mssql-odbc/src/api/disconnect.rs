@@ -3,9 +3,7 @@
 
 //! Implementation of SQLDisconnect — close a connection to a data source.
 
-use std::panic;
-
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
 use crate::api::sqlstate::{SQLSTATE_08003, SQLSTATE_HY000};
@@ -20,17 +18,10 @@ use crate::handles::{HandleType, free_handle, handle_from_raw};
 /// # Safety
 /// - `connection_handle` must be a valid `DbcHandle` previously connected via `SQLDriverConnectW`.
 pub(crate) unsafe fn sql_disconnect(connection_handle: SqlHandle) -> SqlReturn {
-    debug!("SQLDisconnect called");
-
-    let result = panic::catch_unwind(|| unsafe { sql_disconnect_impl(connection_handle) });
-
-    let ret = result.unwrap_or_else(|_| {
-        error!("SQLDisconnect: panic caught at FFI boundary");
-        SQL_ERROR
-    });
-
-    trace!(?ret, "SQLDisconnect returning");
-    ret
+    debug!(?connection_handle, "SQLDisconnect called");
+    crate::ffi_entry!("SQLDisconnect", unsafe {
+        sql_disconnect_impl(connection_handle)
+    })
 }
 
 unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {

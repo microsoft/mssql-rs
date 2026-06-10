@@ -3,9 +3,7 @@
 
 //! Implementation of SQLExecDirectW — execute a SQL statement directly.
 
-use std::panic;
-
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use super::sqlstate::*;
 use super::util::read_utf16;
@@ -34,19 +32,16 @@ pub(crate) unsafe fn sql_exec_direct_w(
     statement_text: *const SqlWChar,
     text_length: SqlSmallInt,
 ) -> SqlReturn {
-    debug!("SQLExecDirectW called");
+    debug!(
+        ?statement_handle,
+        ?statement_text,
+        text_length,
+        "SQLExecDirectW called",
+    );
 
-    let result = panic::catch_unwind(|| unsafe {
+    crate::ffi_entry!("SQLExecDirectW", unsafe {
         sql_exec_direct_w_impl(statement_handle, statement_text, text_length)
-    });
-
-    let ret = result.unwrap_or_else(|_| {
-        error!("SQLExecDirectW: panic caught at FFI boundary");
-        SQL_ERROR
-    });
-
-    trace!(?ret, "SQLExecDirectW returning");
-    ret
+    })
 }
 
 unsafe fn sql_exec_direct_w_impl(

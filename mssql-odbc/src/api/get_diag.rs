@@ -10,9 +10,9 @@
 //! Only the `W` (UTF-16) variant is exported — modern DMs (unixODBC, iODBC,
 //! Windows) translate ANSI calls to `W` for the driver.
 
-use std::{mem, panic};
+use std::mem;
 
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use crate::api::odbc_types::{
     SQL_DIAG_MESSAGE_TEXT, SQL_DIAG_NATIVE, SQL_DIAG_NUMBER, SQL_DIAG_SQLSTATE, SQL_ERROR,
@@ -43,11 +43,15 @@ pub(crate) unsafe fn sql_get_diag_rec_w(
         handle_type,
         ?handle,
         rec_number,
+        ?sql_state,
+        ?native_error_ptr,
+        ?message_text,
         buffer_length,
-        "SQLGetDiagRecW called"
+        ?text_length_ptr,
+        "SQLGetDiagRecW called",
     );
 
-    let result = panic::catch_unwind(|| {
+    crate::ffi_entry!("SQLGetDiagRecW", {
         if handle.is_null() {
             error!("SQLGetDiagRecW: handle is null");
             return SQL_INVALID_HANDLE;
@@ -79,14 +83,7 @@ pub(crate) unsafe fn sql_get_diag_rec_w(
             unsafe { native_error_ptr.write(rec.native_error) };
         }
         unsafe { write_message(message_text, buffer_length, text_length_ptr, &rec.message) }
-    });
-
-    let ret = result.unwrap_or_else(|_| {
-        error!("SQLGetDiagRecW: panic caught at FFI boundary");
-        SQL_ERROR
-    });
-    trace!(?ret, "SQLGetDiagRecW returning");
-    ret
+    })
 }
 
 /// Implementation of [`SQLGetDiagFieldW`](super::exports::SQLGetDiagFieldW).
@@ -117,11 +114,13 @@ pub(crate) unsafe fn sql_get_diag_field_w(
         ?handle,
         rec_number,
         diag_identifier,
+        ?diag_info_ptr,
         buffer_length,
-        "SQLGetDiagFieldW called"
+        ?string_length_ptr,
+        "SQLGetDiagFieldW called",
     );
 
-    let result = panic::catch_unwind(|| {
+    crate::ffi_entry!("SQLGetDiagFieldW", {
         if handle.is_null() {
             error!("SQLGetDiagFieldW: handle is null");
             return SQL_INVALID_HANDLE;
@@ -150,14 +149,7 @@ pub(crate) unsafe fn sql_get_diag_field_w(
                 )
             }
         }
-    });
-
-    let ret = result.unwrap_or_else(|_| {
-        error!("SQLGetDiagFieldW: panic caught at FFI boundary");
-        SQL_ERROR
-    });
-    trace!(?ret, "SQLGetDiagFieldW returning");
-    ret
+    })
 }
 
 /// Returns `true` if `diag_identifier` is a header diagnostic field. Header

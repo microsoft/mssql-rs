@@ -6,9 +6,7 @@
 //! Mirrors msodbcsql's `SQLSetEnvAttr`, replacing its `dwOptionsE[]` table
 //! with typed fields on `EnvState`. The DM owns HY010 enforcement.
 
-use std::panic;
-
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{
@@ -33,10 +31,10 @@ pub(crate) unsafe fn sql_set_env_attr(
         ?environment_handle,
         attribute,
         ?value_ptr,
-        "SQLSetEnvAttr called"
+        "SQLSetEnvAttr called",
     );
 
-    let result = panic::catch_unwind(|| {
+    crate::ffi_entry!("SQLSetEnvAttr", {
         if environment_handle.is_null() {
             error!("SQLSetEnvAttr: environment_handle is null");
             return SQL_INVALID_HANDLE;
@@ -84,15 +82,7 @@ pub(crate) unsafe fn sql_set_env_attr(
                 SQL_ERROR
             }
         }
-    });
-
-    let ret = result.unwrap_or_else(|_| {
-        error!("SQLSetEnvAttr: panic caught at FFI boundary");
-        SQL_ERROR
-    });
-
-    trace!(?ret, "SQLSetEnvAttr returning");
-    ret
+    })
 }
 
 #[cfg(test)]

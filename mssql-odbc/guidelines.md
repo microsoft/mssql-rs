@@ -13,9 +13,9 @@ across the FFI boundary is **undefined behavior**.
 - Use `.unwrap_or()`, `.unwrap_or_else()`, `.unwrap_or_default()`, or
   pattern matching instead.
 - For `Mutex::lock()`, return `SQL_ERROR` on poison — use `let Ok(state) = handle.inner.lock() else { return SQL_ERROR; }`. Do **not** recover via `e.into_inner()`.
-- Every `pub extern "C"` entry point must be wrapped in
-  `std::panic::catch_unwind` as a last-resort safety net — but do **not** rely
-  on it; prevent panics at the source.
+- Every FFI entry point must be wrapped in the `crate::ffi_entry!` macro
+  (see [FFI boundary conventions](#ffi-boundary-conventions)). The macro is
+  a last-resort safety net — write code that cannot panic in the first place.
 - Never use `unreachable!()`, `todo!()`, or `unimplemented!()` in non-test code.
   Use explicit error returns instead.
 - Array/slice access: prefer `.get()` over indexing (`[]`), which panics on
@@ -100,8 +100,31 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
 
 - Every exported function goes through `exports.rs` as a thin
   `pub extern "C"` wrapper.
-- The wrapper calls a `pub(crate)` implementation function that contains the
-  real logic inside `catch_unwind`.
+- The wrapper calls a `pub(crate)` implementation function that contains
+  the real logic.
+- **Every FFI implementation function MUST wrap its body in the
+  `crate::ffi_entry!` macro.** This is non-negotiable — it is the single
+  panic boundary that converts a Rust panic into `SQL_ERROR` instead of
+  unwinding across the C ABI (undefined behavior).
+  Shape:
+
+  ```rust
+  pub(crate) unsafe fn sql_xxx(/* args */) -> SqlReturn {
+      debug!(/* all args */, "SQLXxx called");
+      crate::ffi_entry!("SQLXxx", {
+          // real implementation
+      })
+  }
+  ```
+
+- The first line of every FFI implementation function must be a `debug!` log
+  of every argument (pointers logged with `?` — no deref).
+- The `pub extern "C"` wrapper in `exports.rs` must call
+  `crate::init_tracing()` before delegating to the impl — `ffi_entry!` does
+  not initialize tracing itself.
+- Never call `std::panic::catch_unwind` directly in this crate; always go
+  through `ffi_entry!` so the panic-log message, return-code mapping, and
+  trailing trace are uniform.
 - Use `SqlReturn` (not raw `i16`) as the return type of internal functions
   to keep intent clear.
 - Pointer parameters from C must be treated as potentially null, invalid, or

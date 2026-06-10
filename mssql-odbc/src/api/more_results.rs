@@ -8,9 +8,7 @@
 //! if any. Returns `SQL_SUCCESS` when a new result set is positioned,
 //! `SQL_NO_DATA` when the batch is exhausted, or `SQL_ERROR` on failure.
 
-use std::panic;
-
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
 
@@ -28,17 +26,10 @@ use crate::handles::{DbcHandle, HandleType, StmtHandle, handle_from_raw};
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
 pub(crate) unsafe fn sql_more_results(statement_handle: SqlHandle) -> SqlReturn {
-    debug!("SQLMoreResults called");
-
-    let result = panic::catch_unwind(|| unsafe { sql_more_results_impl(statement_handle) });
-
-    let ret = result.unwrap_or_else(|_| {
-        error!("SQLMoreResults: panic caught at FFI boundary");
-        SQL_ERROR
-    });
-
-    trace!(?ret, "SQLMoreResults returning");
-    ret
+    debug!(?statement_handle, "SQLMoreResults called");
+    crate::ffi_entry!("SQLMoreResults", unsafe {
+        sql_more_results_impl(statement_handle)
+    })
 }
 
 unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {

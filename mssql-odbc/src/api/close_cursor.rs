@@ -7,8 +7,6 @@
 //! connection-level "busy" claim, allowing other statements on the same DBC
 //! to execute.
 
-use std::panic;
-
 use tracing::{debug, error};
 
 use super::sqlstate::*;
@@ -26,10 +24,9 @@ use crate::handles::{DbcHandle, HandleType, StmtHandle, handle_from_raw};
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
 pub(crate) unsafe fn sql_close_cursor(statement_handle: SqlHandle) -> SqlReturn {
-    let result = panic::catch_unwind(|| unsafe { sql_close_cursor_impl(statement_handle) });
-    result.unwrap_or_else(|_| {
-        error!("SQLCloseCursor: panic caught at FFI boundary");
-        SQL_ERROR
+    debug!(?statement_handle, "SQLCloseCursor called");
+    crate::ffi_entry!("SQLCloseCursor", unsafe {
+        sql_close_cursor_impl(statement_handle)
     })
 }
 
@@ -42,10 +39,9 @@ pub(crate) unsafe fn sql_close_cursor(statement_handle: SqlHandle) -> SqlReturn 
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
 pub(crate) unsafe fn sql_free_stmt_close(statement_handle: SqlHandle) -> SqlReturn {
-    let result = panic::catch_unwind(|| unsafe { sql_free_stmt_close_impl(statement_handle) });
-    result.unwrap_or_else(|_| {
-        error!("SQLFreeStmt(SQL_CLOSE): panic caught at FFI boundary");
-        SQL_ERROR
+    debug!(?statement_handle, "SQLFreeStmt(SQL_CLOSE) called");
+    crate::ffi_entry!("SQLFreeStmt(SQL_CLOSE)", unsafe {
+        sql_free_stmt_close_impl(statement_handle)
     })
 }
 

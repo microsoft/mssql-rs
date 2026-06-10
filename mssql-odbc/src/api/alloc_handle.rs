@@ -3,9 +3,7 @@
 
 //! Implementation of SQLAllocHandle — the ODBC handle allocation entry point.
 
-use std::panic;
-
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
@@ -32,7 +30,7 @@ pub(crate) unsafe fn sql_alloc_handle(
         "SQLAllocHandle called"
     );
 
-    let result = panic::catch_unwind(|| {
+    crate::ffi_entry!("SQLAllocHandle", {
         if output_handle.is_null() {
             error!("SQLAllocHandle: output_handle is null");
             return SQL_INVALID_HANDLE;
@@ -57,15 +55,7 @@ pub(crate) unsafe fn sql_alloc_handle(
                 SQL_INVALID_HANDLE
             }
         }
-    });
-
-    let ret = result.unwrap_or_else(|_| {
-        error!("SQLAllocHandle: panic caught at FFI boundary");
-        SQL_ERROR
-    });
-
-    trace!(handle_type, ?ret, "SQLAllocHandle returning");
-    ret
+    })
 }
 
 /// Allocates an environment handle.

@@ -3,9 +3,7 @@
 
 //! Minimal SQLGetData implementation for Phase 1.
 
-use std::panic;
-
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use super::odbc_types::{
     SQL_C_CHAR, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NULL_DATA, SQL_SUCCESS,
@@ -37,10 +35,15 @@ pub(crate) unsafe fn sql_get_data(
 ) -> SqlReturn {
     debug!(
         ?statement_handle,
-        column_number, target_type, buffer_length, "SQLGetData called"
+        column_number,
+        target_type,
+        ?target_value_ptr,
+        buffer_length,
+        ?strlen_or_ind_ptr,
+        "SQLGetData called",
     );
 
-    let result = panic::catch_unwind(|| unsafe {
+    crate::ffi_entry!("SQLGetData", unsafe {
         sql_get_data_impl(
             statement_handle,
             column_number,
@@ -49,14 +52,7 @@ pub(crate) unsafe fn sql_get_data(
             buffer_length,
             strlen_or_ind_ptr,
         )
-    });
-
-    let ret = result.unwrap_or_else(|_| {
-        error!("SQLGetData: panic caught at FFI boundary");
-        SQL_ERROR
-    });
-    trace!(?ret, "SQLGetData returning");
-    ret
+    })
 }
 
 unsafe fn sql_get_data_impl(

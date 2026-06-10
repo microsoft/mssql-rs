@@ -3,8 +3,6 @@
 
 //! Implementation of SQLFetch for forward-only, firehose result sets.
 
-use std::panic;
-
 use tracing::{debug, error};
 
 use super::sqlstate::*;
@@ -25,11 +23,8 @@ use mssql_tds::connection::tds_client::ResultSet;
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
 pub(crate) unsafe fn sql_fetch(statement_handle: SqlHandle) -> SqlReturn {
-    let result = panic::catch_unwind(|| unsafe { sql_fetch_impl(statement_handle) });
-    result.unwrap_or_else(|_| {
-        error!("SQLFetch: panic caught at FFI boundary");
-        SQL_ERROR
-    })
+    debug!(?statement_handle, "SQLFetch called");
+    crate::ffi_entry!("SQLFetch", unsafe { sql_fetch_impl(statement_handle) })
 }
 
 unsafe fn sql_fetch_impl(statement_handle: SqlHandle) -> SqlReturn {

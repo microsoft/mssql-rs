@@ -3,9 +3,7 @@
 
 //! Implementation of SQLDriverConnectW — connect using a connection string.
 
-use std::panic;
-
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use crate::api::odbc_types::{
     SQL_DRIVER_NOPROMPT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS,
@@ -48,9 +46,18 @@ pub(crate) unsafe fn sql_driver_connect_w(
     string_length_2_ptr: *mut SqlSmallInt,
     driver_completion: SqlUSmallInt,
 ) -> SqlReturn {
-    debug!("SQLDriverConnectW called");
+    debug!(
+        ?connection_handle,
+        ?in_connection_string,
+        string_length_1,
+        ?out_connection_string,
+        buffer_length,
+        ?string_length_2_ptr,
+        driver_completion,
+        "SQLDriverConnectW called",
+    );
 
-    let result = panic::catch_unwind(|| unsafe {
+    crate::ffi_entry!("SQLDriverConnectW", unsafe {
         sql_driver_connect_w_impl(
             connection_handle,
             in_connection_string,
@@ -60,15 +67,7 @@ pub(crate) unsafe fn sql_driver_connect_w(
             string_length_2_ptr,
             driver_completion,
         )
-    });
-
-    let ret = result.unwrap_or_else(|_| {
-        error!("SQLDriverConnectW: panic caught at FFI boundary");
-        SQL_ERROR
-    });
-
-    trace!(?ret, "SQLDriverConnectW returning");
-    ret
+    })
 }
 
 unsafe fn sql_driver_connect_w_impl(

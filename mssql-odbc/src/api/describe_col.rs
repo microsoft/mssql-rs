@@ -3,10 +3,8 @@
 
 //! Implementation of SQLDescribeColW.
 
-use std::panic;
-
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DECIMAL, SQL_DOUBLE, SQL_ERROR, SQL_GUID,
@@ -36,10 +34,18 @@ pub(crate) unsafe fn sql_describe_col_w(
 ) -> SqlReturn {
     debug!(
         ?statement_handle,
-        column_number, buffer_length, "SQLDescribeColW called"
+        column_number,
+        ?column_name,
+        buffer_length,
+        ?name_length_ptr,
+        ?data_type_ptr,
+        ?column_size_ptr,
+        ?decimal_digits_ptr,
+        ?nullable_ptr,
+        "SQLDescribeColW called",
     );
 
-    let result = panic::catch_unwind(|| unsafe {
+    crate::ffi_entry!("SQLDescribeColW", unsafe {
         sql_describe_col_w_impl(
             statement_handle,
             column_number,
@@ -51,15 +57,7 @@ pub(crate) unsafe fn sql_describe_col_w(
             decimal_digits_ptr,
             nullable_ptr,
         )
-    });
-
-    let ret = result.unwrap_or_else(|_| {
-        error!("SQLDescribeColW: panic caught at FFI boundary");
-        SQL_ERROR
-    });
-
-    trace!(?ret, "SQLDescribeColW returning");
-    ret
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

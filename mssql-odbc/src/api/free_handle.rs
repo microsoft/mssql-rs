@@ -3,9 +3,7 @@
 
 //! Implementation of SQLFreeHandle — the ODBC handle deallocation entry point.
 
-use std::panic;
-
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DBC_INFO_TOKEN, SQL_HANDLE_DESC, SQL_HANDLE_ENV,
@@ -22,7 +20,7 @@ use crate::handles::{DbcHandle, EnvHandle, HandleType, StmtHandle, free_handle, 
 pub(crate) unsafe fn sql_free_handle(handle_type: SqlSmallInt, handle: SqlHandle) -> SqlReturn {
     debug!(handle_type, ?handle, "SQLFreeHandle called");
 
-    let result = panic::catch_unwind(|| {
+    crate::ffi_entry!("SQLFreeHandle", {
         if handle.is_null() {
             error!("SQLFreeHandle: handle is null");
             return SQL_INVALID_HANDLE;
@@ -44,15 +42,7 @@ pub(crate) unsafe fn sql_free_handle(handle_type: SqlSmallInt, handle: SqlHandle
                 SQL_INVALID_HANDLE
             }
         }
-    });
-
-    let ret = result.unwrap_or_else(|_| {
-        error!("SQLFreeHandle: panic caught at FFI boundary");
-        SQL_ERROR
-    });
-
-    trace!(handle_type, ?ret, "SQLFreeHandle returning");
-    ret
+    })
 }
 
 /// Mirrors msodbcsql's `ExportImp::SQLFreeEnv`.

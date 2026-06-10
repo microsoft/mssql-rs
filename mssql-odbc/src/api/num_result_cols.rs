@@ -3,9 +3,7 @@
 
 //! Implementation of SQLNumResultCols.
 
-use std::panic;
-
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
@@ -27,20 +25,12 @@ pub(crate) unsafe fn sql_num_result_cols(
     debug!(
         ?statement_handle,
         ?column_count_ptr,
-        "SQLNumResultCols called"
+        "SQLNumResultCols called",
     );
 
-    let result = panic::catch_unwind(|| unsafe {
+    crate::ffi_entry!("SQLNumResultCols", unsafe {
         sql_num_result_cols_impl(statement_handle, column_count_ptr)
-    });
-
-    let ret = result.unwrap_or_else(|_| {
-        error!("SQLNumResultCols: panic caught at FFI boundary");
-        SQL_ERROR
-    });
-
-    trace!(?ret, "SQLNumResultCols returning");
-    ret
+    })
 }
 
 unsafe fn sql_num_result_cols_impl(
