@@ -9,6 +9,7 @@ use mssql_tds::connection::client_context::DriverVersion;
 mod bulkcopy;
 mod connection;
 mod cursor;
+mod python_entra_token_factory;
 mod python_logger_adapter;
 mod row_writer;
 mod tracing_init;
@@ -80,5 +81,12 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<connection::PyCoreConnection>()?;
     m.add_class::<cursor::PyCoreCursor>()?;
+
+    // Test-only hook to drive PythonEntraIdTokenFactory::create_token from
+    // Python tests. Underscore-prefixed to mark as internal/test-only.
+    m.add_function(wrap_pyfunction!(
+        python_entra_token_factory::invoke_entra_id_token_factory,
+        m
+    )?)?;
     Ok(())
 }
