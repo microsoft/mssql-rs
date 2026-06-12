@@ -5,6 +5,7 @@ use bitflags::bitflags;
 
 use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
 use crate::datatypes::encoder::SqlValueEncoder;
+use crate::datatypes::sql_tvp::TvpTypeName;
 use crate::datatypes::sqltypes::SqlType;
 use crate::{
     core::TdsResult,
@@ -83,6 +84,13 @@ impl RpcParameter {
     }
 
     fn get_sql_name_impl(value: &SqlType) -> TdsResult<String> {
+        // Table-valued parameters are declared by their schema-qualified table
+        // type name with the mandatory `READONLY` suffix, not via a base TDS
+        // type name (which `get_meta_type_name` would reject for `SqlTable`).
+        if let SqlType::Table(type_name, _) = value {
+            return Ok(Self::format_tvp_sql_name(type_name));
+        }
+
         // For nullable types, we need to check the actual datatype to derive the name.
         let tds_type = TdsDataType::from(value);
         let type_name = tds_type.get_meta_type_name()?;
@@ -156,6 +164,18 @@ impl RpcParameter {
         } else {
             Ok(format!("{type_name}({len_in_metadata})"))
         }
+    }
+
+    /// Formats a table-valued parameter's declaration name for `sp_executesql`,
+    /// e.g. `[dbo].[MyType] READONLY`.
+    ///
+    /// The schema defaults to `dbo` when unspecified (SQL Server's default
+    /// schema). The catalog/database part is intentionally omitted: SQL Server
+    /// forbids cross-database TVP types in parameter declarations. The
+    /// `READONLY` suffix is mandatory for TVP parameters.
+    fn format_tvp_sql_name(type_name: &TvpTypeName) -> String {
+        let schema = type_name.schema_name.as_deref().unwrap_or("dbo");
+        format!("[{schema}].[{}] READONLY", type_name.type_name)
     }
 
     /// Serializes the RPC parameter into the provided `PacketWriter`.
@@ -290,6 +310,7 @@ impl From<&SqlType> for TdsDataType {
             SqlType::DateTime(_) => TdsDataType::DateTime,
             SqlType::Date(_) => TdsDataType::DateN,
             SqlType::Vector(_, _, _) => TdsDataType::Vector,
+            SqlType::Table(_, _) => TdsDataType::SqlTable,
         }
     }
 }
@@ -351,5 +372,37 @@ mod tests {
              update test if you added a mapping.",
         );
         assert!(matches!(err, Error::ImplementationError(_)));
+    }
+
+    /// Table-valued parameters are declared by their schema-qualified table type
+    /// name with the mandatory `READONLY` suffix; the schema defaults to `dbo`.
+    #[test]
+    fn test_get_sql_name_tvp() {
+        use crate::datatypes::sql_tvp::TvpTypeName;
+
+        let schema_qualified = SqlType::Table(
+            TvpTypeName::new(Some("sales".to_string()), "OrderList".to_string()),
+            None,
+        );
+        assert_eq!(
+            RpcParameter::get_sql_name(&schema_qualified).unwrap(),
+            "[sales].[OrderList] READONLY"
+        );
+
+        let default_schema = SqlType::Table(TvpTypeName::new(None, "OrderList".to_string()), None);
+        assert_eq!(
+            RpcParameter::get_sql_name(&default_schema).unwrap(),
+            "[dbo].[OrderList] READONLY"
+        );
+    }
+
+    /// A `SqlType::Table` maps to the `SqlTable` TDS wire type.
+    #[test]
+    fn test_tds_data_type_from_table() {
+        use crate::datatypes::sql_tvp::TvpTypeName;
+        use crate::datatypes::sqldatatypes::TdsDataType;
+
+        let value = SqlType::Table(TvpTypeName::new(None, "OrderList".to_string()), None);
+        assert_eq!(TdsDataType::from(&value), TdsDataType::SqlTable);
     }
 }

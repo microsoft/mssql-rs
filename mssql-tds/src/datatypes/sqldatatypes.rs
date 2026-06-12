@@ -97,6 +97,8 @@ pub enum TdsDataType {
     Udt = 0xF0,
     /// XML data (`0xF1`).
     Xml = 0xF1,
+    /// Table-valued parameter (`0xF3`).
+    SqlTable = 0xF3,
     /// JSON data (`0xF4`).
     Json = 0xF4,
     /// Fixed-dimension float vector (`0xF5`).
@@ -162,6 +164,7 @@ impl TdsDataType {
             | TdsDataType::FltN
             | TdsDataType::MoneyN
             | TdsDataType::DateTimeN
+            | TdsDataType::SqlTable
             | TdsDataType::None => {
                 return Err(Error::ImplementationError(format!(
                     "get_meta_type_name called on TdsDataType::{self:?}, which has no \
@@ -220,6 +223,7 @@ impl TryFrom<u8> for TdsDataType {
             0xEF => Ok(TdsDataType::NChar),
             0xF0 => Ok(TdsDataType::Udt),
             0xF1 => Ok(TdsDataType::Xml),
+            0xF3 => Ok(TdsDataType::SqlTable),
             0xF4 => Ok(TdsDataType::Json),
             0xF5 => Ok(TdsDataType::Vector),
             _ => Err(Error::ProtocolError(format(format_args!(
@@ -1141,6 +1145,7 @@ mod tests {
         assert_eq!(TdsDataType::try_from(0x7F).unwrap(), TdsDataType::Int8);
         assert_eq!(TdsDataType::try_from(0xE7).unwrap(), TdsDataType::NVarChar);
         assert_eq!(TdsDataType::try_from(0xF1).unwrap(), TdsDataType::Xml);
+        assert_eq!(TdsDataType::try_from(0xF3).unwrap(), TdsDataType::SqlTable);
         assert_eq!(TdsDataType::try_from(0xF4).unwrap(), TdsDataType::Json);
     }
 
