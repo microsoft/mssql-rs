@@ -7,6 +7,7 @@ use crate::connection::bulk_copy::{BulkCopyOptions, BulkLoadRow, ResolvedColumnM
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::ClientContext;
 use crate::connection::session_recovery::RecoveryContext;
+use crate::cursor::{CursorConcurrency, CursorOpenResponse, CursorScrollOption, FetchDirection};
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
@@ -1163,6 +1164,335 @@ impl TdsClient {
         Ok(())
     }
 
+    /// Extracts an `i32` from the return values at the given index.
+    fn extract_return_value_int(&self, index: usize) -> TdsResult<i32> {
+        let rv = self.return_values.get(index).ok_or_else(|| {
+            crate::error::Error::ProtocolError(format!(
+                "Expected return value at index {index}, but only {} values received",
+                self.return_values.len()
+            ))
+        })?;
+        match &rv.value {
+            ColumnValues::Int(v) => Ok(*v),
+            other => Err(crate::error::Error::ProtocolError(format!(
+                "Expected Int return value at index {index}, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Opens a server cursor with a SQL statement (`sp_cursoropen`, RPC ID 2).
+    ///
+    /// Returns the server-assigned cursor handle and negotiated scroll/concurrency
+    /// options. The response stream (including any metadata tokens) is fully
+    /// consumed before returning.
+    ///
+    /// TODO: `AUTO_FETCH` is not yet supported. Passing `AUTO_FETCH` in
+    /// `scroll_opt` returns an error. This will be implemented in a future PR.
+    #[instrument(skip(self), level = "info")]
+    pub async fn cursor_open(
+        &mut self,
+        stmt: &str,
+        scroll_opt: CursorScrollOption,
+        cc_opt: CursorConcurrency,
+        row_count: i32,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<CursorOpenResponse> {
+        if scroll_opt.contains(CursorScrollOption::AUTO_FETCH) {
+            return Err(crate::error::Error::UsageError(
+                "AUTO_FETCH is not yet supported in cursor_open".to_string(),
+            ));
+        }
+
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        // Parameter order matches sp_cursoropen positional spec.
+        let params = vec![
+            RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None)),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(stmt.to_string()))),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(scroll_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(cc_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(row_count)),
+            ),
+        ];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorOpen),
+            Some(params),
+            None,
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        self.consume_cursor_open_response().await
+    }
+
+    /// Opens a parameterized server cursor (`sp_cursoropen`, RPC ID 2).
+    ///
+    /// Same as [`cursor_open`](Self::cursor_open) but includes a parameter
+    /// declaration list and bound parameter values. The `PARAMETERIZED_STMT`
+    /// flag (`0x1000`) is automatically added to `scroll_opt`.
+    #[allow(clippy::too_many_arguments)] // Matches sp_cursoropen's 7+ positional parameters
+    #[instrument(skip(self, params), level = "info")]
+    pub async fn cursor_open_with_params(
+        &mut self,
+        stmt: &str,
+        params: Vec<RpcParameter>,
+        scroll_opt: CursorScrollOption,
+        cc_opt: CursorConcurrency,
+        row_count: i32,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<CursorOpenResponse> {
+        if scroll_opt.contains(CursorScrollOption::AUTO_FETCH) {
+            return Err(crate::error::Error::UsageError(
+                "AUTO_FETCH is not yet supported in cursor_open_with_params".to_string(),
+            ));
+        }
+
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        // Ensure PARAMETERIZED_STMT is set
+        let scroll_opt = scroll_opt | CursorScrollOption::PARAMETERIZED_STMT;
+
+        // Build the parameter declaration string from the named params
+        let mut param_def_string = String::new();
+        build_parameter_list_string(&params, &mut param_def_string)?;
+
+        // Parameter order matches sp_cursoropen positional spec.
+        let positional_params = vec![
+            RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None)),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(stmt.to_string()))),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(scroll_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(cc_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(row_count)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(param_def_string))),
+            ),
+        ];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorOpen),
+            Some(positional_params),
+            Some(params),
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        self.consume_cursor_open_response().await
+    }
+
+    /// Shared response handling for `cursor_open` and `cursor_open_with_params`.
+    ///
+    /// The sp_cursoropen response sends ColMetadata (describing cursor columns)
+    /// followed by TabName, ColInfo, Order tokens, then DoneInProc,
+    /// ReturnStatus, ReturnValue×4, DoneProc.
+    /// `move_to_column_metadata` stops at ColMetadata; `drain_stream` reads the
+    /// rest and collects the OUTPUT parameters.
+    async fn consume_cursor_open_response(&mut self) -> TdsResult<CursorOpenResponse> {
+        let metadata = self.move_to_column_metadata().await?;
+        self.current_metadata = metadata;
+        let server_errors = self.drain_stream().await?;
+        self.execution_context.set_has_open_batch(false);
+        self.current_result_set_has_been_read_till_end = true;
+
+        if !server_errors.is_empty() {
+            return Err(crate::error::Error::from_sql_errors(server_errors));
+        }
+
+        Ok(CursorOpenResponse {
+            cursor_id: self.extract_return_value_int(0)?,
+            negotiated_scroll: CursorScrollOption::from_bits_truncate(
+                self.extract_return_value_int(1)? as u32,
+            ),
+            negotiated_concurrency: CursorConcurrency::from_bits_truncate(
+                self.extract_return_value_int(2)? as u32,
+            ),
+            row_count: self.extract_return_value_int(3)?,
+        })
+    }
+
+    /// Fetches rows from an open cursor (`sp_cursorfetch`, RPC ID 7).
+    ///
+    /// After calling this, use `get_next_row_into()` to read rows and then
+    /// `close_query()` before the next command. If no rows are available
+    /// (end of cursor), `has_open_batch` will be false and no row reading
+    /// is needed.
+    #[instrument(skip(self), level = "info")]
+    pub async fn cursor_fetch(
+        &mut self,
+        cursor_id: i32,
+        direction: FetchDirection,
+        row_num: i32,
+        num_rows: i32,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        let params = vec![
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(cursor_id))),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::Int(Some(direction.bits() as i32)),
+            ),
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(row_num))),
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(num_rows))),
+        ];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorFetch),
+            Some(params),
+            None,
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        let metadata = self.move_to_column_metadata().await?;
+        if metadata.is_none() {
+            self.execution_context.set_has_open_batch(false);
+            self.current_result_set_has_been_read_till_end = true;
+        } else {
+            self.current_metadata = metadata;
+            self.current_result_set_has_been_read_till_end = false;
+            self.execution_context.set_has_open_batch(true);
+        }
+        Ok(())
+    }
+
+    /// Closes a server cursor and releases server resources (`sp_cursorclose`, RPC ID 9).
+    ///
+    /// After this call the `cursor_id` is invalid and must not be reused.
+    /// Passing `-1` closes all cursors on the current connection.
+    #[instrument(skip(self), level = "info")]
+    pub async fn cursor_close(
+        &mut self,
+        cursor_id: i32,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        let params = vec![RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::Int(Some(cursor_id)),
+        )];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorClose),
+            Some(params),
+            None,
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        let server_errors = self.drain_stream().await?;
+        self.execution_context.set_has_open_batch(false);
+        if !server_errors.is_empty() {
+            return Err(crate::error::Error::from_sql_errors(server_errors));
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self), level = "info")]
     async fn drain_rows(&mut self) -> TdsResult<()> {
         if self.maybe_has_unread_rows() {
@@ -1342,6 +1672,9 @@ impl TdsClient {
                     info!(?info_token);
                     continue;
                 }
+                Tokens::TabName | Tokens::ColInfo => {
+                    continue;
+                }
                 _ => {
                     info!("move_to_column_metadata: {:?}", token);
                     return Err(UsageError(format!(
@@ -1467,6 +1800,9 @@ impl TdsClient {
                     }
                     Tokens::Info(info_token) => {
                         info!(?info_token);
+                        continue;
+                    }
+                    Tokens::TabName | Tokens::ColInfo => {
                         continue;
                     }
                     _ => {
