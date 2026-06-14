@@ -148,14 +148,13 @@ unsafe fn sql_exec_direct_w_impl(
 
     // Execute the SQL batch. Neither DBC nor STMT lock is held during I/O.
     if let Err(e) = dbc.runtime.block_on(client.execute(sql, None, None)) {
-        let msg = e.to_string();
         error!(%e, "SQLExecDirectW: execution failed");
         if let Ok(mut ds) = dbc.inner.lock() {
             ds.client = Some(client);
             ds.active_stmt = None;
         }
         if let Ok(mut ss) = stmt.inner.lock() {
-            post_sql_error(&mut ss, SQLSTATE_HY000, 0, msg);
+            post_tds_error(&mut ss, &e, SQLSTATE_HY000);
         }
         clear_exec_started(stmt);
         return SQL_ERROR;
@@ -171,14 +170,13 @@ unsafe fn sql_exec_direct_w_impl(
         // DDL / DML: drain trailing DONE tokens and return the connection to idle.
         // No cursor is opened — the app can re-execute immediately without SQLCloseCursor.
         if let Err(e) = dbc.runtime.block_on(client.close_query()) {
-            let msg = e.to_string();
             error!(%e, "SQLExecDirectW: failed to drain after DDL/DML");
             if let Ok(mut ds) = dbc.inner.lock() {
                 ds.client = Some(client);
                 ds.active_stmt = None;
             }
             if let Ok(mut ss) = stmt.inner.lock() {
-                post_sql_error(&mut ss, SQLSTATE_HY000, 0, msg);
+                post_tds_error(&mut ss, &e, SQLSTATE_HY000);
             }
             clear_exec_started(stmt);
             return SQL_ERROR;

@@ -88,7 +88,7 @@ TEST_F(GetDiagFieldTest, DiagSqlstateAndByteLength) {
                                      &string_len);
     EXPECT_EQ(SQL_SUCCESS, rc);
     std::string sql_state(state, state + 5);
-    EXPECT_EQ("HY000", sql_state);
+    EXPECT_EQ("08001", sql_state);
     // StringLengthPtr must report bytes: 5 chars × sizeof(SQLWCHAR).
     EXPECT_EQ(static_cast<SQLSMALLINT>(5 * sizeof(SQLWCHAR)), string_len);
 }

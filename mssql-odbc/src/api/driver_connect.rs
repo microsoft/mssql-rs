@@ -10,8 +10,8 @@ use crate::api::odbc_types::{
     SQL_SUCCESS_WITH_INFO, SqlHWnd, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
-    SQLSTATE_01S00, SQLSTATE_01004, SQLSTATE_08001, SQLSTATE_HY000, SQLSTATE_HY009, SQLSTATE_HY010,
-    SQLSTATE_HY024, SQLSTATE_HY110,
+    SQLSTATE_01S00, SQLSTATE_01004, SQLSTATE_08001, SQLSTATE_HY009, SQLSTATE_HY010, SQLSTATE_HY024,
+    SQLSTATE_HY110, post_tds_error,
 };
 use crate::api::util::copy_with_nul;
 use crate::error::{free_errors, post_sql_error};
@@ -189,7 +189,7 @@ unsafe fn do_connect(
         error!("SQLDriverConnectW: Server not specified in connection string");
         post_sql_error(
             state,
-            SQLSTATE_HY000,
+            SQLSTATE_08001,
             0,
             "Server not specified in connection string",
         );
@@ -228,7 +228,7 @@ unsafe fn do_connect(
         Ok(c) => c,
         Err(e) => {
             error!(%e, "SQLDriverConnectW: connection failed");
-            post_sql_error(state, SQLSTATE_08001, 0, e.to_string());
+            post_tds_error(state, &e, SQLSTATE_08001);
             return SQL_ERROR;
         }
     };
@@ -278,11 +278,42 @@ mod tests {
     use super::*;
     use crate::api::alloc_handle::sql_alloc_handle;
     use crate::api::free_handle::sql_free_handle;
+    use crate::api::get_diag::sql_get_diag_rec_w;
     use crate::api::odbc_types::{
         SQL_ATTR_ODBC_VERSION, SQL_DRIVER_COMPLETE, SQL_HANDLE_DBC, SQL_HANDLE_ENV,
         SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
     };
     use crate::api::set_env_attr::sql_set_env_attr;
+
+    /// Read SQLSTATE for record `rec_number` on a DBC handle by calling the
+    /// driver's own `SQLGetDiagRecW` entry point. Tests use this to verify
+    /// the diagnostic surface that real ODBC apps see, not just the internal
+    /// `diag_records` vec.
+    unsafe fn diag_sqlstate(dbc: SqlHandle, rec_number: SqlSmallInt) -> String {
+        let mut state_buf = [0u16; 6];
+        let mut msg_buf = [0u16; 256];
+        let ret = unsafe {
+            sql_get_diag_rec_w(
+                SQL_HANDLE_DBC,
+                dbc,
+                rec_number,
+                state_buf.as_mut_ptr(),
+                std::ptr::null_mut(),
+                msg_buf.as_mut_ptr(),
+                msg_buf.len() as SqlSmallInt,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            ret, SQL_SUCCESS,
+            "SQLGetDiagRecW(rec={rec_number}) returned {ret}"
+        );
+        let len = state_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(state_buf.len());
+        String::from_utf16(&state_buf[..len]).unwrap()
+    }
 
     /// Helper: allocate ENV + DBC for tests.
     unsafe fn alloc_env_dbc() -> (SqlHandle, SqlHandle) {
@@ -358,7 +389,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        // TODO: verify SQLSTATE HY110 via SQLGetDiagRec
+        assert_eq!(unsafe { diag_sqlstate(dbc, 1) }, "HY110");
 
         unsafe { free_env_dbc(env, dbc) };
     }
@@ -380,7 +411,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        // TODO: verify SQLSTATE HY009 via SQLGetDiagRec
+        assert_eq!(unsafe { diag_sqlstate(dbc, 1) }, "HY009");
 
         unsafe { free_env_dbc(env, dbc) };
     }
@@ -406,7 +437,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        // TODO: verify SQLSTATE HY000 via SQLGetDiagRec
+        assert_eq!(unsafe { diag_sqlstate(dbc, 1) }, "08001");
 
         unsafe { free_env_dbc(env, dbc) };
     }
@@ -433,7 +464,7 @@ mod tests {
         };
         // Missing server → error, but proves explicit length was used
         assert_eq!(ret, SQL_ERROR);
-        // TODO: verify SQLSTATE HY000 via SQLGetDiagRec
+        assert_eq!(unsafe { diag_sqlstate(dbc, 1) }, "08001");
 
         unsafe { free_env_dbc(env, dbc) };
     }
@@ -464,7 +495,11 @@ mod tests {
                 )
             };
             assert_eq!(ret, SQL_ERROR, "mode {mode} should be rejected");
-            // TODO: verify SQLSTATE HY110 via SQLGetDiagRec
+            assert_eq!(
+                unsafe { diag_sqlstate(dbc, 1) },
+                "HY110",
+                "mode {mode} should post HY110"
+            );
         }
 
         unsafe { free_env_dbc(env, dbc) };

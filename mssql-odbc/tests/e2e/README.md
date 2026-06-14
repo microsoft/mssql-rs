@@ -62,6 +62,24 @@ To override the verbose default filter:
 MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=trace" ./run_e2e.sh --verbose
 ```
 
+### Comparing against msodbcsql 18
+
+`run_e2e.sh` can rerun the same gtest suite against the Microsoft C++ driver
+and print a parity table — useful for spotting behavioral divergence between
+the two drivers.
+
+```bash
+# Default ini path: /etc/odbcinst.ini
+./run_e2e.sh --compare-with-msodbcsql
+
+# Custom ini path
+./run_e2e.sh --compare-with-msodbcsql --msodbcsql-ini=/opt/msodbcsql/odbcinst.ini
+```
+
+Both INIs must register the driver under the same section name
+(`[ODBC Driver 18 for SQL Server]`). The script exits `0` only if **both**
+runs pass.
+
 ### Windows (requires Administrator)
 
 ```powershell

@@ -16,7 +16,7 @@ use super::close_cursor::reset_cursor_state;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SqlHandle, SqlReturn,
 };
-use crate::api::sqlstate::SQLSTATE_HY000;
+use crate::api::sqlstate::{SQLSTATE_HY000, post_tds_error};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{DbcHandle, HandleType, StmtHandle, handle_from_raw};
@@ -122,12 +122,11 @@ unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
             SQL_NO_DATA
         }
         Err(e) => {
-            let msg = e.to_string();
             error!(%e, "SQLMoreResults: move_to_next failed");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 // Treat as terminal: clear cursor state and post diagnostic.
                 reset_cursor_state(&mut stmt_state);
-                post_sql_error(&mut stmt_state, SQLSTATE_HY000, 0, msg);
+                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
             }
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);

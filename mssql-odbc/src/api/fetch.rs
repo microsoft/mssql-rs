@@ -144,12 +144,11 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             SQL_NO_DATA
         }
         Err(e) => {
-            let msg = e.to_string();
             error!(%e, "SQLFetch: row fetch failed");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.current_row = None;
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
-                post_sql_error(&mut stmt_state, SQLSTATE_HY000, 0, msg);
+                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
             }
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
