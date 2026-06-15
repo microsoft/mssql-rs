@@ -34,55 +34,71 @@ pub(crate) unsafe fn sql_set_env_attr(
         "SQLSetEnvAttr called",
     );
 
-    crate::ffi_entry!("SQLSetEnvAttr", {
-        if environment_handle.is_null() {
-            error!("SQLSetEnvAttr: environment_handle is null");
-            return SQL_INVALID_HANDLE;
-        }
+    crate::ffi_entry!("SQLSetEnvAttr", unsafe {
+        sql_set_env_attr_impl(environment_handle, attribute, value_ptr)
+    })
+}
 
-        let env = unsafe { handle_from_raw::<EnvHandle>(environment_handle) };
-        debug_assert_eq!(
-            env.object_type,
-            HandleType::Env,
-            "SQLSetEnvAttr: input_handle is not an ENV handle"
-        );
+unsafe fn sql_set_env_attr_impl(
+    environment_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+) -> SqlReturn {
+    if environment_handle.is_null() {
+        error!("SQLSetEnvAttr: environment_handle is null");
+        return SQL_INVALID_HANDLE;
+    }
 
-        let Ok(mut state) = env.inner.lock() else {
-            error!("SQLSetEnvAttr: env mutex poisoned");
-            return SQL_ERROR;
-        };
+    let env = unsafe { handle_from_raw::<EnvHandle>(environment_handle) };
+    debug_assert_eq!(
+        env.object_type,
+        HandleType::Env,
+        "SQLSetEnvAttr: input_handle is not an ENV handle"
+    );
 
-        // Equivalent of msodbcsql `FreeErrors(lpEnv)` — clear any diagnostic
-        // records left from a prior call before processing this one.
-        free_errors(&mut state);
+    sql_set_env_attr_safe(env, attribute, value_ptr)
+}
 
-        // ODBC tagged-pointer: integer values arrive as `(SQLPOINTER)(uintptr_t)value`.
-        let value = value_ptr as usize as u32;
+fn sql_set_env_attr_safe(
+    env: &EnvHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+) -> SqlReturn {
+    let Ok(mut state) = env.inner.lock() else {
+        error!("SQLSetEnvAttr: env mutex poisoned");
+        return SQL_ERROR;
+    };
 
-        match attribute {
-            SQL_ATTR_ODBC_VERSION => match OdbcVersion::try_from(value) {
-                Ok(v) => {
-                    state.odbc_version = v;
-                    SQL_SUCCESS
-                }
-                Err(()) => {
-                    error!(value, "SQLSetEnvAttr: invalid ODBC_VERSION value");
-                    post_sql_error(&mut state, SQLSTATE_HY024, 0, "Invalid attribute value");
-                    SQL_ERROR
-                }
-            },
-            _ => {
-                error!(attribute, "SQLSetEnvAttr: unknown attribute");
-                post_sql_error(
-                    &mut state,
-                    SQLSTATE_HY092,
-                    0,
-                    "Invalid attribute/option identifier",
-                );
+    // Equivalent of msodbcsql `FreeErrors(lpEnv)` — clear any diagnostic
+    // records left from a prior call before processing this one.
+    free_errors(&mut state);
+
+    // ODBC tagged-pointer: integer values arrive as `(SQLPOINTER)(uintptr_t)value`.
+    let value = value_ptr as usize as u32;
+
+    match attribute {
+        SQL_ATTR_ODBC_VERSION => match OdbcVersion::try_from(value) {
+            Ok(v) => {
+                state.odbc_version = v;
+                SQL_SUCCESS
+            }
+            Err(()) => {
+                error!(value, "SQLSetEnvAttr: invalid ODBC_VERSION value");
+                post_sql_error(&mut state, SQLSTATE_HY024, 0, "Invalid attribute value");
                 SQL_ERROR
             }
+        },
+        _ => {
+            error!(attribute, "SQLSetEnvAttr: unknown attribute");
+            post_sql_error(
+                &mut state,
+                SQLSTATE_HY092,
+                0,
+                "Invalid attribute/option identifier",
+            );
+            SQL_ERROR
         }
-    })
+    }
 }
 
 #[cfg(test)]

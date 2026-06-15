@@ -13,7 +13,7 @@ use super::sqlstate::*;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT};
-use crate::handles::{DbcHandle, HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Closes the cursor on `statement_handle` and discards any pending rows.
 ///
@@ -50,10 +50,12 @@ unsafe fn sql_close_cursor_impl(statement_handle: SqlHandle) -> SqlReturn {
         error!("SQLCloseCursor: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-
     let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(stmt.object_type, HandleType::Stmt);
+    sql_close_cursor_safe(statement_handle, stmt)
+}
 
+fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLCloseCursor: stmt mutex poisoned");
         return SQL_ERROR;
@@ -79,10 +81,12 @@ unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
         error!("SQLFreeStmt(SQL_CLOSE): statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-
     let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(stmt.object_type, HandleType::Stmt);
+    sql_free_stmt_close_safe(statement_handle, stmt)
+}
 
+fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLFreeStmt(SQL_CLOSE): stmt mutex poisoned");
         return SQL_ERROR;
@@ -114,7 +118,7 @@ pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtStat
 /// connection as busy (HY000) throughout — not just until `client` is taken.
 /// No locks are held during the network I/O.
 pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) {
-    let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
+    let dbc = stmt.parent_dbc();
 
     // Take the client; intentionally leave active_stmt set while draining.
     let client = {

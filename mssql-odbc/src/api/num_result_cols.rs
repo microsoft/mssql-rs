@@ -49,7 +49,10 @@ unsafe fn sql_num_result_cols_impl(
         HandleType::Stmt,
         "SQLNumResultCols: handle is not a STMT"
     );
+    sql_num_result_cols_safe(stmt, column_count_ptr)
+}
 
+fn sql_num_result_cols_safe(stmt: &StmtHandle, column_count_ptr: *mut SqlSmallInt) -> SqlReturn {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLNumResultCols: stmt mutex poisoned");
         return SQL_ERROR;

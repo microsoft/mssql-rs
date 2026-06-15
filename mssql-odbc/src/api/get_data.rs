@@ -74,6 +74,25 @@ unsafe fn sql_get_data_impl(
         HandleType::Stmt,
         "SQLGetData: handle is not a STMT"
     );
+
+    sql_get_data_safe(
+        stmt,
+        column_number,
+        target_type,
+        target_value_ptr,
+        buffer_length,
+        strlen_or_ind_ptr,
+    )
+}
+
+fn sql_get_data_safe(
+    stmt: &StmtHandle,
+    column_number: SqlUSmallInt,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
     debug_assert!(
         buffer_length >= 0,
         "SQLGetData: DM should reject negative buffer_length (HY090)"
@@ -154,25 +173,21 @@ unsafe fn sql_get_data_impl(
 
     if target_type == SQL_C_WCHAR {
         let utf16: Vec<u16> = as_text.encode_utf16().collect();
-        unsafe {
-            write_string_result(
-                &mut stmt_state,
-                &utf16,
-                target_value_ptr as *mut SqlWChar,
-                buf_elements,
-                strlen_or_ind_ptr,
-            )
-        }
+        write_string_result(
+            &mut stmt_state,
+            &utf16,
+            target_value_ptr as *mut SqlWChar,
+            buf_elements,
+            strlen_or_ind_ptr,
+        )
     } else {
-        unsafe {
-            write_string_result(
-                &mut stmt_state,
-                as_text.as_bytes(),
-                target_value_ptr as *mut u8,
-                buf_elements,
-                strlen_or_ind_ptr,
-            )
-        }
+        write_string_result(
+            &mut stmt_state,
+            as_text.as_bytes(),
+            target_value_ptr as *mut u8,
+            buf_elements,
+            strlen_or_ind_ptr,
+        )
     }
 }
 
@@ -183,10 +198,10 @@ unsafe fn sql_get_data_impl(
 ///
 /// `buf_elements` is the buffer capacity in units of `T` (not bytes).
 ///
-/// # Safety
-/// - `target_value_ptr`, if non-null, must be writable for `buf_elements` `T`s.
-/// - `strlen_or_ind_ptr`, if non-null, must be writable for one `SqlLen`.
-unsafe fn write_string_result<T: Copy + Default>(
+/// The caller-provided pointers are written through small `unsafe` blocks
+/// inside this function; both pointer arguments are obligations of the FFI
+/// caller (validated against the buffer length passed by the DM).
+fn write_string_result<T: Copy + Default>(
     stmt_state: &mut crate::handles::stmt::StmtState,
     src: &[T],
     target_value_ptr: *mut T,

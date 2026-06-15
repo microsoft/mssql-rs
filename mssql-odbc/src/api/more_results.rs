@@ -19,7 +19,7 @@ use crate::api::odbc_types::{
 use crate::api::sqlstate::{SQLSTATE_HY000, post_tds_error};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
-use crate::handles::{DbcHandle, HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Advances to the next result set on a statement.
 ///
@@ -37,10 +37,12 @@ unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
         error!("SQLMoreResults: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-
     let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(stmt.object_type, HandleType::Stmt);
+    sql_more_results_safe(statement_handle, stmt)
+}
 
+fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     // Free any stale diagnostics and observe cursor state.
     let cursor_open = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -56,7 +58,7 @@ unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
         return SQL_NO_DATA;
     }
 
-    let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
+    let dbc = stmt.parent_dbc();
 
     // Take the client; keep active_stmt set so concurrent statements continue
     // to see the connection as busy throughout the advance.

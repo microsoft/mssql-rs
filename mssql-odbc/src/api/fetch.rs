@@ -10,7 +10,6 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SqlHandle, SqlReturn,
 };
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::dbc::DbcHandle;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::ResultSet;
@@ -32,10 +31,12 @@ unsafe fn sql_fetch_impl(statement_handle: SqlHandle) -> SqlReturn {
         error!("SQLFetch: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-
     let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(stmt.object_type, HandleType::Stmt);
+    sql_fetch_safe(statement_handle, stmt)
+}
 
+fn sql_fetch_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetch: stmt mutex poisoned");
@@ -54,7 +55,7 @@ unsafe fn sql_fetch_impl(statement_handle: SqlHandle) -> SqlReturn {
 
 /// Row materialization step for one forward fetch operation.
 fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
-    let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
+    let dbc = stmt.parent_dbc();
 
     let mut client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {

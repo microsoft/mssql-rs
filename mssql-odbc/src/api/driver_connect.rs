@@ -91,6 +91,38 @@ unsafe fn sql_driver_connect_w_impl(
         "SQLDriverConnectW: handle is not a DBC"
     );
 
+    debug_assert!(
+        string_length_1 == SQL_NTS || string_length_1 >= 0,
+        "SQLDriverConnectW: string_length_1 must be SQL_NTS or non-negative (HY090)"
+    );
+
+    // Read the input connection string up-front so the inner helper works on `String`.
+    // `do_connect` still needs to validate the null-pointer case (it posts a diagnostic),
+    // so we capture that condition here and pass an `Option`.
+    let conn_str = if in_connection_string.is_null() {
+        None
+    } else {
+        Some(unsafe { read_utf16(in_connection_string, string_length_1) })
+    };
+
+    sql_driver_connect_w_safe(
+        dbc,
+        conn_str,
+        out_connection_string,
+        buffer_length,
+        string_length_2_ptr,
+        driver_completion,
+    )
+}
+
+fn sql_driver_connect_w_safe(
+    dbc: &DbcHandle,
+    conn_str: Option<String>,
+    out_connection_string: *mut SqlWChar,
+    buffer_length: SqlSmallInt,
+    string_length_2_ptr: *mut SqlSmallInt,
+    driver_completion: SqlUSmallInt,
+) -> SqlReturn {
     let Ok(mut state) = dbc.inner.lock() else {
         error!("SQLDriverConnectW: dbc mutex poisoned");
         return SQL_ERROR;
@@ -108,12 +140,8 @@ unsafe fn sql_driver_connect_w_impl(
         return SQL_ERROR;
     }
 
-    // HY090 (negative string_length_1 / buffer_length) is DM-enforced per spec.
+    // HY090 (negative buffer_length) is DM-enforced per spec.
     // https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqldriverconnect-function
-    debug_assert!(
-        string_length_1 >= 0 || string_length_1 == SQL_NTS,
-        "SQLDriverConnectW: DM should reject negative string_length_1 (HY090)"
-    );
     debug_assert!(
         buffer_length >= 0,
         "SQLDriverConnectW: DM should reject negative buffer_length (HY090)"
@@ -134,17 +162,14 @@ unsafe fn sql_driver_connect_w_impl(
     state.connection_state = ConnectionState::Connecting;
 
     // From here on, any early return must reset state to Disconnected.
-    let result = unsafe {
-        do_connect(
-            dbc,
-            &mut state,
-            in_connection_string,
-            string_length_1,
-            out_connection_string,
-            buffer_length,
-            string_length_2_ptr,
-        )
-    };
+    let result = do_connect(
+        dbc,
+        &mut state,
+        conn_str,
+        out_connection_string,
+        buffer_length,
+        string_length_2_ptr,
+    );
 
     if result != SQL_SUCCESS && result != SQL_SUCCESS_WITH_INFO {
         // Reset state on failure
@@ -155,23 +180,19 @@ unsafe fn sql_driver_connect_w_impl(
 }
 
 /// Inner connect logic, separated so the caller can reset state on failure.
-unsafe fn do_connect(
+fn do_connect(
     dbc: &DbcHandle,
     state: &mut DbcState,
-    in_connection_string: *const SqlWChar,
-    string_length_1: SqlSmallInt,
+    conn_str: Option<String>,
     out_connection_string: *mut SqlWChar,
     buffer_length: SqlSmallInt,
     string_length_2_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    // Read the input connection string (UTF-16 → String)
-    if in_connection_string.is_null() {
+    let Some(conn_str) = conn_str else {
         error!("SQLDriverConnectW: in_connection_string is null");
         post_sql_error(state, SQLSTATE_HY009, 0, "Invalid use of null pointer");
         return SQL_ERROR;
-    }
-
-    let conn_str = unsafe { read_utf16(in_connection_string, string_length_1) };
+    };
 
     // Parse connection string - malformed tokens produce warnings (01S00),
     // invalid attribute values produce errors (E_FAIL in msodbcsql).
@@ -279,7 +300,7 @@ mod tests {
     use crate::api::get_diag::sql_get_diag_rec_w;
     use crate::api::odbc_types::{
         SQL_ATTR_ODBC_VERSION, SQL_DRIVER_COMPLETE, SQL_HANDLE_DBC, SQL_HANDLE_ENV,
-        SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
+        SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
     };
     use crate::api::set_env_attr::sql_set_env_attr;
 

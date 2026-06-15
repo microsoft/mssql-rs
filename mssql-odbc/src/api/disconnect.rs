@@ -29,14 +29,16 @@ unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
         error!("SQLDisconnect: connection_handle is null");
         return SQL_INVALID_HANDLE;
     }
-
     let dbc = unsafe { handle_from_raw::<DbcHandle>(connection_handle) };
     debug_assert_eq!(
         dbc.object_type,
         HandleType::Dbc,
         "SQLDisconnect: handle is not a DBC"
     );
+    sql_disconnect_safe(dbc)
+}
 
+fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     let Ok(mut state) = dbc.inner.lock() else {
         error!("SQLDisconnect: dbc mutex poisoned");
         return SQL_ERROR;
@@ -59,8 +61,10 @@ unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
     // no locks during I/O, so it can race here and access a STMT handle we are about to free.
     // TODO: fix with refcounted handle lifetimes so STMT handles cannot be freed while in use.
     for &stmt_ptr in &state.statements {
+        // SAFETY: `stmt_ptr` came from `handle_to_raw::<StmtHandle>` and is still
+        // live (the DBC owns it). Acquire the STMT lock to serialize with any
+        // op still holding it, then drop the box.
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_ptr) };
-        // Acquire and immediately release — serializes with any op still holding the STMT lock.
         let Ok(guard) = stmt.inner.lock() else {
             error!(?stmt_ptr, "SQLDisconnect: stmt mutex poisoned");
             post_sql_error(

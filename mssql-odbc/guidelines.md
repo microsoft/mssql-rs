@@ -1,13 +1,11 @@
 # mssql-odbc — Rust Guidelines
 
 Rules for writing safe, panic-free Rust in the ODBC driver. This crate produces
-a C shared library loaded via `dlopen` — panics, undefined behavior, and memory
-errors are fatal and unrecoverable in that context.
+a C shared library loaded via `dlopen` into arbitrary host processes — panics
+unwinding across the FFI boundary, undefined behavior, and memory errors are all
+fatal and unrecoverable.
 
 ## No panics
-
-The ODBC driver runs inside arbitrary host processes. A panic that unwinds
-across the FFI boundary is **undefined behavior**.
 
 - **Never** use `.unwrap()` or `.expect()` on `Result` or `Option` in
   non-test code. Tests under `#[cfg(test)]` may use them since panics
@@ -63,6 +61,38 @@ across the FFI boundary is **undefined behavior**.
 - Never dereference a pointer received from C without validating it.
 - Use `#[unsafe(no_mangle)]` only in `exports.rs` — keep implementations
   in separate modules as `pub(crate)` safe functions.
+
+### Safe-core / unsafe-shell split
+
+Push `unsafe` to the edges. Each FFI implementation is split into two layers:
+
+- A thin `unsafe fn sql_xxx_impl(...)` **shim** whose only job is to turn raw
+  C pointers into validated Rust references:
+  1. Null-check the handle → `SQL_INVALID_HANDLE`.
+  2. `unsafe { handle_from_raw::<T>(handle) }` to obtain `&T`.
+  3. `debug_assert_eq!(h.object_type, HandleType::X)` to catch DM contract
+     violations in debug builds.
+  4. Decode any input strings (`read_utf16`, etc.).
+  5. Delegate everything else to the safe core.
+- A safe `fn sql_xxx_safe(handle: &T, ...) -> SqlReturn` **core** that holds all
+  business logic: locking, state mutation, value mapping. It receives validated
+  references (never raw handle pointers) and only opens small, locally-justified
+  `unsafe { write_if_some(...) }` / `unsafe { copy_with_nul(...) }` blocks to
+  write to caller out-pointers.
+
+Rules of thumb:
+
+- A function should be a **safe `fn`** (even if it contains `unsafe {}` blocks)
+  whenever it can discharge the safety obligation from its own arguments and
+  invariants — e.g. an accessor like `StmtHandle::parent_dbc(&self) -> &DbcHandle`,
+  where `&self` already guarantees a valid handle.
+- A function should be an **`unsafe fn`** only when it relies on an
+  unverifiable caller promise — e.g. the validity of a raw pointer passed
+  across the FFI boundary (the `*_impl` shims).
+- Validation that only inspects scalar arguments (e.g.
+  `debug_assert!(buffer_length >= 0, ...)`) belongs in the safe core, not the
+  shim. The shim should be limited to null-checks and pointer→reference
+  conversion.
 
 ## Memory management
 
@@ -129,13 +159,27 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   Shape:
 
   ```rust
-  pub(crate) unsafe fn sql_xxx(/* args */) -> SqlReturn {
+  pub(crate) unsafe fn sql_xxx(/* raw args */) -> SqlReturn {
       debug!(/* all args */, "SQLXxx called");
-      crate::ffi_entry!("SQLXxx", {
-          // real implementation
-      })
+      crate::ffi_entry!("SQLXxx", unsafe { sql_xxx_impl(/* raw args */) })
+  }
+
+  // Thin unsafe shim: raw pointers -> validated references, then delegate.
+  unsafe fn sql_xxx_impl(/* raw args */) -> SqlReturn {
+      if handle.is_null() { return SQL_INVALID_HANDLE; }
+      let h = unsafe { handle_from_raw::<XxxHandle>(handle) };
+      debug_assert_eq!(h.object_type, HandleType::Xxx);
+      sql_xxx_safe(h, /* scalar/decoded args */)
+  }
+
+  // Safe core: all business logic; only small unsafe out-pointer writes.
+  fn sql_xxx_safe(handle: &XxxHandle, /* args */) -> SqlReturn {
+      // ...
   }
   ```
+
+  See [Safe-core / unsafe-shell split](#safe-core--unsafe-shell-split) for the
+  full rationale.
 
 - The first line of every FFI implementation function must be a `debug!` log
   of every argument (pointers logged with `?` — no deref).

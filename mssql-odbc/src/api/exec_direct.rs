@@ -11,7 +11,7 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
 };
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::dbc::{ConnectionState, DbcHandle};
+use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
 };
@@ -68,10 +68,18 @@ unsafe fn sql_exec_direct_w_impl(
     );
 
     let sql = unsafe { read_utf16(statement_text, text_length) };
+    sql_exec_direct_w_safe(statement_handle, stmt, sql)
+}
+
+fn sql_exec_direct_w_safe(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    sql: String,
+) -> SqlReturn {
     debug!(sql = %sql, "SQLExecDirectW: executing");
 
     // Access parent DBC
-    let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
+    let dbc = stmt.parent_dbc();
 
     // Check STMT state first.
     {

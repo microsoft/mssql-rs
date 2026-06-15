@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
 
-use super::{HandleType, HasObjectType};
+use super::{DbcHandle, HandleType, HasObjectType};
 use crate::error::{DiagRecord, HasDiagnostics};
 
 pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
@@ -81,6 +81,19 @@ impl StmtHandle {
                 state_flags: 0,
             }),
         }
+    }
+
+    /// Returns a reference to the parent DBC handle.
+    ///
+    /// The returned reference is bound to `&self` so it cannot outlive this
+    /// statement handle, and the parent DBC is guaranteed alive for at least
+    /// that long because the DM frees all STMT handles before freeing their
+    /// parent DBC.
+    pub(crate) fn parent_dbc(&self) -> &DbcHandle {
+        // SAFETY: `parent_dbc` is set at construction to a live `DbcHandle`
+        // pointer (allocated by `handle_to_raw::<DbcHandle>`), is never
+        // mutated, and the DBC outlives this STMT per the DM contract.
+        unsafe { &*(self.parent_dbc as *const DbcHandle) }
     }
 }
 

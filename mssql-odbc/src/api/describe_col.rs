@@ -77,18 +77,43 @@ unsafe fn sql_describe_col_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    // BufferLength is validated by the DM (SQLSTATE HY090). See:
-    // https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqldescribecol-function
-    debug_assert!(
-        buffer_length >= 0,
-        "SQLDescribeColW: DM should reject negative buffer_length (HY090)"
-    );
-
     let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
         "SQLDescribeColW: handle is not a STMT"
+    );
+
+    sql_describe_col_w_safe(
+        stmt,
+        column_number,
+        column_name,
+        buffer_length,
+        name_length_ptr,
+        data_type_ptr,
+        column_size_ptr,
+        decimal_digits_ptr,
+        nullable_ptr,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sql_describe_col_w_safe(
+    stmt: &StmtHandle,
+    column_number: SqlUSmallInt,
+    column_name: *mut SqlWChar,
+    buffer_length: SqlSmallInt,
+    name_length_ptr: *mut SqlSmallInt,
+    data_type_ptr: *mut SqlSmallInt,
+    column_size_ptr: *mut u64,
+    decimal_digits_ptr: *mut SqlSmallInt,
+    nullable_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
+    // BufferLength is validated by the DM (SQLSTATE HY090). See:
+    // https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqldescribecol-function
+    debug_assert!(
+        buffer_length >= 0,
+        "SQLDescribeColW: DM should reject negative buffer_length (HY090)"
     );
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
