@@ -322,54 +322,7 @@ mod tests {
     use std::ptr;
 
     use super::*;
-    use crate::api::alloc_handle::sql_alloc_handle;
-    use crate::api::free_handle::sql_free_handle;
-    use crate::api::odbc_types::{
-        SQL_ATTR_ODBC_VERSION, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_NULL_HANDLE,
-        SQL_OV_ODBC3_80,
-    };
-    use crate::api::set_env_attr::sql_set_env_attr;
-
-    unsafe fn alloc_env_dbc_stmt() -> (SqlHandle, SqlHandle, SqlHandle) {
-        let mut env: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
-            SQL_SUCCESS
-        );
-        assert_eq!(
-            unsafe {
-                sql_set_env_attr(
-                    env,
-                    SQL_ATTR_ODBC_VERSION,
-                    SQL_OV_ODBC3_80 as usize as *mut std::ffi::c_void,
-                    0,
-                )
-            },
-            SQL_SUCCESS
-        );
-
-        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
-            SQL_SUCCESS
-        );
-
-        let mut stmt: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) },
-            SQL_SUCCESS
-        );
-
-        (env, dbc, stmt)
-    }
-
-    unsafe fn free_all(env: SqlHandle, dbc: SqlHandle, stmt: SqlHandle) {
-        unsafe {
-            sql_free_handle(SQL_HANDLE_STMT, stmt);
-            sql_free_handle(SQL_HANDLE_DBC, dbc);
-            sql_free_handle(SQL_HANDLE_ENV, env);
-        }
-    }
+    use crate::test_support::TestHandles;
 
     /// Calls `sql_describe_col_w` with default-ish out pointers. Intended for
     /// error-path tests where the values of the out params are irrelevant.
@@ -401,7 +354,8 @@ mod tests {
 
     #[test]
     fn fresh_stmt_returns_sequence_error() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
 
         let rc = unsafe { describe(stmt, 1) };
         assert_eq!(rc, SQL_ERROR);
@@ -410,14 +364,12 @@ mod tests {
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert_eq!(stmt_state.diag_records.len(), 1);
         assert_eq!(stmt_state.diag_records[0].sql_state, SQLSTATE_HY010);
-        drop(stmt_state);
-
-        unsafe { free_all(env, dbc, stmt) };
     }
 
     #[test]
     fn column_number_zero_returns_invalid_descriptor_index() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
 
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         stmt_handle
@@ -432,14 +384,12 @@ mod tests {
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert_eq!(stmt_state.diag_records.len(), 1);
         assert_eq!(stmt_state.diag_records[0].sql_state, SQLSTATE_07009);
-        drop(stmt_state);
-
-        unsafe { free_all(env, dbc, stmt) };
     }
 
     #[test]
     fn column_number_past_end_returns_invalid_descriptor_index() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
 
         // EXEC_CONTEXT is set but column_metadata is empty (e.g., the prior
         // statement was DML/DDL with zero result columns). Any column_number
@@ -457,8 +407,5 @@ mod tests {
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert_eq!(stmt_state.diag_records.len(), 1);
         assert_eq!(stmt_state.diag_records[0].sql_state, SQLSTATE_07009);
-        drop(stmt_state);
-
-        unsafe { free_all(env, dbc, stmt) };
     }
 }

@@ -295,14 +295,11 @@ fn do_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::alloc_handle::sql_alloc_handle;
-    use crate::api::free_handle::sql_free_handle;
     use crate::api::get_diag::sql_get_diag_rec_w;
     use crate::api::odbc_types::{
-        SQL_ATTR_ODBC_VERSION, SQL_DRIVER_COMPLETE, SQL_HANDLE_DBC, SQL_HANDLE_ENV,
-        SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
+        SQL_DRIVER_COMPLETE, SQL_HANDLE_DBC, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_HANDLE,
     };
-    use crate::api::set_env_attr::sql_set_env_attr;
+    use crate::test_support::TestHandles;
 
     /// Read SQLSTATE for record `rec_number` on a DBC handle by calling the
     /// driver's own `SQLGetDiagRecW` entry point. Tests use this to verify
@@ -334,38 +331,6 @@ mod tests {
         String::from_utf16(&state_buf[..len]).unwrap()
     }
 
-    /// Helper: allocate ENV + DBC for tests.
-    unsafe fn alloc_env_dbc() -> (SqlHandle, SqlHandle) {
-        let mut env: SqlHandle = SQL_NULL_HANDLE;
-        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) };
-        assert_eq!(ret, SQL_SUCCESS);
-        assert!(!env.is_null());
-
-        let ret = unsafe {
-            sql_set_env_attr(
-                env,
-                SQL_ATTR_ODBC_VERSION,
-                SQL_OV_ODBC3_80 as usize as *mut std::ffi::c_void,
-                0,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS);
-
-        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
-        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) };
-        assert_eq!(ret, SQL_SUCCESS);
-        assert!(!dbc.is_null());
-
-        (env, dbc)
-    }
-
-    unsafe fn free_env_dbc(env: SqlHandle, dbc: SqlHandle) {
-        unsafe {
-            sql_free_handle(SQL_HANDLE_DBC, dbc);
-            sql_free_handle(SQL_HANDLE_ENV, env);
-        }
-    }
-
     #[test]
     fn null_handle_returns_invalid_handle() {
         let conn_str: Vec<u16> = "Server=host;UID=u;PWD=p"
@@ -389,7 +354,8 @@ mod tests {
 
     #[test]
     fn unsupported_driver_completion() {
-        let (env, dbc) = unsafe { alloc_env_dbc() };
+        let h = TestHandles::with_env_dbc();
+        let dbc = h.dbc;
         let conn_str: Vec<u16> = "Server=host;UID=u;PWD=p"
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -409,13 +375,12 @@ mod tests {
         };
         assert_eq!(ret, SQL_ERROR);
         assert_eq!(unsafe { diag_sqlstate(dbc, 1) }, "HY110");
-
-        unsafe { free_env_dbc(env, dbc) };
     }
 
     #[test]
     fn null_connection_string_returns_error() {
-        let (env, dbc) = unsafe { alloc_env_dbc() };
+        let h = TestHandles::with_env_dbc();
+        let dbc = h.dbc;
 
         let ret = unsafe {
             sql_driver_connect_w(
@@ -431,13 +396,12 @@ mod tests {
         };
         assert_eq!(ret, SQL_ERROR);
         assert_eq!(unsafe { diag_sqlstate(dbc, 1) }, "HY009");
-
-        unsafe { free_env_dbc(env, dbc) };
     }
 
     #[test]
     fn missing_server_returns_error() {
-        let (env, dbc) = unsafe { alloc_env_dbc() };
+        let h = TestHandles::with_env_dbc();
+        let dbc = h.dbc;
         let conn_str: Vec<u16> = "UID=u;PWD=p"
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -457,14 +421,13 @@ mod tests {
         };
         assert_eq!(ret, SQL_ERROR);
         assert_eq!(unsafe { diag_sqlstate(dbc, 1) }, "08001");
-
-        unsafe { free_env_dbc(env, dbc) };
     }
 
     #[test]
     fn explicit_string_length() {
         // Pass an explicit length instead of SQL_NTS — extra chars after length are ignored.
-        let (env, dbc) = unsafe { alloc_env_dbc() };
+        let h = TestHandles::with_env_dbc();
+        let dbc = h.dbc;
         // "UID=u;PWD=p" is 11 chars — Server is missing, so validation fails.
         // But we're testing that explicit length is respected (no null terminator needed).
         let conn_str: Vec<u16> = "UID=u;PWD=pGARBAGE".encode_utf16().collect();
@@ -484,13 +447,12 @@ mod tests {
         // Missing server → error, but proves explicit length was used
         assert_eq!(ret, SQL_ERROR);
         assert_eq!(unsafe { diag_sqlstate(dbc, 1) }, "08001");
-
-        unsafe { free_env_dbc(env, dbc) };
     }
 
     #[test]
     fn all_driver_completion_modes_rejected_except_noprompt() {
-        let (env, dbc) = unsafe { alloc_env_dbc() };
+        let h = TestHandles::with_env_dbc();
+        let dbc = h.dbc;
         let conn_str: Vec<u16> = "Server=h;UID=u;PWD=p"
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -520,7 +482,5 @@ mod tests {
                 "mode {mode} should post HY110"
             );
         }
-
-        unsafe { free_env_dbc(env, dbc) };
     }
 }

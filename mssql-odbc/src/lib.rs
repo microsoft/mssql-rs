@@ -7,6 +7,8 @@ pub mod api;
 mod connection;
 mod error;
 mod handles;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 static INIT_TRACING: Once = Once::new();
 

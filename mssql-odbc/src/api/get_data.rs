@@ -243,52 +243,9 @@ fn column_value_to_text(v: &ColumnValues) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::alloc_handle::sql_alloc_handle;
-    use crate::api::free_handle::sql_free_handle;
-    use crate::api::odbc_types::{
-        SQL_ATTR_ODBC_VERSION, SQL_C_LONG, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
-        SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
-    };
-    use crate::api::set_env_attr::sql_set_env_attr;
+    use crate::api::odbc_types::{SQL_C_LONG, SQL_NULL_HANDLE};
+    use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::SqlString;
-
-    unsafe fn alloc_env_dbc_stmt() -> (SqlHandle, SqlHandle, SqlHandle) {
-        let mut env: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
-            SQL_SUCCESS
-        );
-        assert_eq!(
-            unsafe {
-                sql_set_env_attr(
-                    env,
-                    SQL_ATTR_ODBC_VERSION,
-                    SQL_OV_ODBC3_80 as usize as *mut std::ffi::c_void,
-                    0,
-                )
-            },
-            SQL_SUCCESS
-        );
-        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
-            SQL_SUCCESS
-        );
-        let mut stmt: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) },
-            SQL_SUCCESS
-        );
-        (env, dbc, stmt)
-    }
-
-    unsafe fn free_env_dbc_stmt(env: SqlHandle, dbc: SqlHandle, stmt: SqlHandle) {
-        unsafe {
-            sql_free_handle(SQL_HANDLE_STMT, stmt);
-            sql_free_handle(SQL_HANDLE_DBC, dbc);
-            sql_free_handle(SQL_HANDLE_ENV, env);
-        }
-    }
 
     #[test]
     fn get_data_null_handle() {
@@ -307,7 +264,8 @@ mod tests {
 
     #[test]
     fn get_data_without_cursor_returns_24000() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
         let mut buf = [0u8; 16];
         let mut ind: SqlLen = 0;
         let ret = unsafe {
@@ -321,12 +279,12 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 
     #[test]
     fn get_data_string_success() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
@@ -351,12 +309,12 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(ind, 5);
         assert_eq!(std::str::from_utf8(&buf[..5]).unwrap(), "hello");
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 
     #[test]
     fn get_data_truncation_returns_info() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
@@ -378,12 +336,12 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
         assert_eq!(ind, 5);
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 
     #[test]
     fn get_data_empty_string_zero_buffer_no_truncation() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
@@ -397,12 +355,12 @@ mod tests {
         let ret = unsafe { sql_get_data(stmt, 1, SQL_C_CHAR, std::ptr::null_mut(), 0, &mut ind) };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(ind, 0);
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 
     #[test]
     fn get_data_null_column_writes_indicator() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
@@ -424,12 +382,12 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(ind, SQL_NULL_DATA);
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 
     #[test]
     fn get_data_unsupported_target_type() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
@@ -450,12 +408,12 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 
     #[test]
     fn get_data_invalid_column_index() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
@@ -476,7 +434,6 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 
     /// Helper: read a NUL-terminated UTF-16 buffer back to a Rust String.
@@ -487,7 +444,8 @@ mod tests {
 
     #[test]
     fn get_data_wchar_success() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
@@ -514,12 +472,12 @@ mod tests {
         // "héllo" → 5 u16 units → 10 bytes.
         assert_eq!(ind, 10);
         assert_eq!(read_until_nul(&buf), "héllo");
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 
     #[test]
     fn get_data_wchar_truncation_returns_info() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
@@ -544,12 +502,12 @@ mod tests {
         // Untruncated byte length: 5 chars × 2 bytes = 10.
         assert_eq!(ind, 10);
         assert_eq!(read_until_nul(&buf), "12");
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 
     #[test]
     fn get_data_wchar_null_column_writes_nul_and_indicator() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         {
             let mut s = stmt_handle.inner.lock().unwrap();
@@ -574,6 +532,5 @@ mod tests {
         // First slot must be NUL; nothing else touched.
         assert_eq!(buf[0], 0);
         assert_eq!(&buf[1..], &[0xDEAD; 3]);
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 }

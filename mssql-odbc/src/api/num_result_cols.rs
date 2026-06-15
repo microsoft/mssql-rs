@@ -82,48 +82,9 @@ mod tests {
     use std::ptr;
 
     use super::*;
-    use crate::api::alloc_handle::sql_alloc_handle;
-    use crate::api::free_handle::sql_free_handle;
-    use crate::api::odbc_types::{
-        SQL_ATTR_ODBC_VERSION, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_NULL_HANDLE,
-        SQL_OV_ODBC3_80,
-    };
-    use crate::api::set_env_attr::sql_set_env_attr;
     use crate::handles::handle_from_raw;
     use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
-
-    unsafe fn alloc_env_dbc_stmt() -> (SqlHandle, SqlHandle, SqlHandle) {
-        let mut env: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
-            SQL_SUCCESS
-        );
-        assert_eq!(
-            unsafe {
-                sql_set_env_attr(
-                    env,
-                    SQL_ATTR_ODBC_VERSION,
-                    SQL_OV_ODBC3_80 as usize as *mut std::ffi::c_void,
-                    0,
-                )
-            },
-            SQL_SUCCESS
-        );
-
-        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
-            SQL_SUCCESS
-        );
-
-        let mut stmt: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) },
-            SQL_SUCCESS
-        );
-
-        (env, dbc, stmt)
-    }
+    use crate::test_support::TestHandles;
 
     #[test]
     fn null_handle_returns_invalid_handle() {
@@ -134,30 +95,24 @@ mod tests {
 
     #[test]
     fn null_out_ptr_is_tolerated() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt_handle
             .inner
             .lock()
             .unwrap()
             .set_state(STMT_STATE_EXEC_CONTEXT);
 
-        let rc: i16 = unsafe { sql_num_result_cols(stmt, ptr::null_mut()) };
+        let rc: i16 = unsafe { sql_num_result_cols(h.stmt, ptr::null_mut()) };
         assert_eq!(rc, SQL_SUCCESS);
-
-        unsafe {
-            sql_free_handle(SQL_HANDLE_STMT, stmt);
-            sql_free_handle(SQL_HANDLE_DBC, dbc);
-            sql_free_handle(SQL_HANDLE_ENV, env);
-        }
     }
 
     #[test]
     fn dml_or_ddl_returns_zero_columns() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt_handle
             .inner
             .lock()
@@ -165,35 +120,22 @@ mod tests {
             .set_state(STMT_STATE_EXEC_CONTEXT);
 
         let mut count: SqlSmallInt = -1;
-        let rc = unsafe { sql_num_result_cols(stmt, &mut count) };
+        let rc = unsafe { sql_num_result_cols(h.stmt, &mut count) };
         assert_eq!(rc, SQL_SUCCESS);
         assert_eq!(count, 0);
-
-        unsafe {
-            sql_free_handle(SQL_HANDLE_STMT, stmt);
-            sql_free_handle(SQL_HANDLE_DBC, dbc);
-            sql_free_handle(SQL_HANDLE_ENV, env);
-        }
     }
 
     #[test]
     fn fresh_stmt_returns_sequence_error() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
 
         let mut count: SqlSmallInt = -1;
-        let rc = unsafe { sql_num_result_cols(stmt, &mut count) };
+        let rc = unsafe { sql_num_result_cols(h.stmt, &mut count) };
         assert_eq!(rc, SQL_ERROR);
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert_eq!(stmt_state.diag_records.len(), 1);
         assert_eq!(stmt_state.diag_records[0].sql_state, SQLSTATE_HY010);
-        drop(stmt_state);
-
-        unsafe {
-            sql_free_handle(SQL_HANDLE_STMT, stmt);
-            sql_free_handle(SQL_HANDLE_DBC, dbc);
-            sql_free_handle(SQL_HANDLE_ENV, env);
-        }
     }
 }

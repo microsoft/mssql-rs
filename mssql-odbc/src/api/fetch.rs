@@ -165,53 +165,10 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::alloc_handle::sql_alloc_handle;
-    use crate::api::free_handle::sql_free_handle;
-    use crate::api::odbc_types::{
-        SQL_ATTR_ODBC_VERSION, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_NULL_HANDLE,
-        SQL_OV_ODBC3_80,
-    };
-    use crate::api::set_env_attr::sql_set_env_attr;
+    use crate::api::odbc_types::SQL_NULL_HANDLE;
     use crate::handles::dbc::DbcHandle;
     use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
-
-    unsafe fn alloc_env_dbc_stmt() -> (SqlHandle, SqlHandle, SqlHandle) {
-        let mut env: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
-            0
-        );
-        assert_eq!(
-            unsafe {
-                sql_set_env_attr(
-                    env,
-                    SQL_ATTR_ODBC_VERSION,
-                    SQL_OV_ODBC3_80 as usize as *mut std::ffi::c_void,
-                    0,
-                )
-            },
-            0
-        );
-        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
-            0
-        );
-        let mut stmt: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) },
-            0
-        );
-        (env, dbc, stmt)
-    }
-
-    unsafe fn free_env_dbc_stmt(env: SqlHandle, dbc: SqlHandle, stmt: SqlHandle) {
-        unsafe {
-            sql_free_handle(SQL_HANDLE_STMT, stmt);
-            sql_free_handle(SQL_HANDLE_DBC, dbc);
-            sql_free_handle(SQL_HANDLE_ENV, env);
-        }
-    }
+    use crate::test_support::TestHandles;
 
     #[test]
     fn fetch_null_handle() {
@@ -221,34 +178,29 @@ mod tests {
 
     #[test]
     fn fetch_without_open_cursor_returns_error() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
-        let ret = unsafe { sql_fetch(stmt) };
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret = unsafe { sql_fetch(h.stmt) };
         assert_eq!(ret, SQL_ERROR);
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 
     #[test]
     fn fetch_busy_with_other_statement_returns_hy000() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
-        let mut other_stmt: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut other_stmt) },
-            0
-        );
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other_stmt = h.alloc_extra_stmt();
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut stmt_state = stmt_handle.inner.lock().unwrap();
             stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
         }
 
-        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(dbc) };
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut dbc_state = dbc_handle.inner.lock().unwrap();
             dbc_state.active_stmt = Some(other_stmt);
         }
 
-        let ret = unsafe { sql_fetch(stmt) };
+        let ret = unsafe { sql_fetch(h.stmt) };
         assert_eq!(ret, SQL_ERROR);
 
         let stmt_state = stmt_handle.inner.lock().unwrap();
@@ -262,12 +214,6 @@ mod tests {
 
         let dbc_state = dbc_handle.inner.lock().unwrap();
         assert_eq!(dbc_state.active_stmt, Some(other_stmt));
-        drop(dbc_state);
-
-        unsafe {
-            sql_free_handle(SQL_HANDLE_STMT, other_stmt);
-            free_env_dbc_stmt(env, dbc, stmt);
-        };
     }
 
     /// CURSOR_OPEN is set but `active_stmt` is `None` — i.e. a previous fetch
@@ -276,9 +222,9 @@ mod tests {
     /// return `SQL_NO_DATA`, not an error.
     #[test]
     fn fetch_after_cursor_drained_returns_no_data() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut stmt_state = stmt_handle.inner.lock().unwrap();
             stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -286,15 +232,12 @@ mod tests {
         // Leave dbc.active_stmt as None and dbc.client as None — this mirrors
         // the post-drain state that fetch_rows_next produces on Ok(None).
 
-        let ret = unsafe { sql_fetch(stmt) };
+        let ret = unsafe { sql_fetch(h.stmt) };
         assert_eq!(ret, SQL_NO_DATA);
 
         // No diagnostic should be posted on the drained-cursor path.
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert!(stmt_state.diag_records.is_empty());
         assert!(stmt_state.has_state(STMT_STATE_CURSOR_OPEN));
-        drop(stmt_state);
-
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 }

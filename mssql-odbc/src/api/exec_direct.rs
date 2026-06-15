@@ -248,47 +248,8 @@ fn clear_exec_started(stmt: &StmtHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::alloc_handle::sql_alloc_handle;
-    use crate::api::free_handle::sql_free_handle;
-    use crate::api::odbc_types::{
-        SQL_ATTR_ODBC_VERSION, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_NTS,
-        SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
-    };
-    use crate::api::set_env_attr::sql_set_env_attr;
-
-    unsafe fn alloc_env_dbc_stmt() -> (SqlHandle, SqlHandle, SqlHandle) {
-        let mut env: SqlHandle = SQL_NULL_HANDLE;
-        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) };
-        assert_eq!(ret, SQL_SUCCESS);
-
-        let ret = unsafe {
-            sql_set_env_attr(
-                env,
-                SQL_ATTR_ODBC_VERSION,
-                SQL_OV_ODBC3_80 as usize as *mut std::ffi::c_void,
-                0,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS);
-
-        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
-        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) };
-        assert_eq!(ret, SQL_SUCCESS);
-
-        let mut stmt: SqlHandle = SQL_NULL_HANDLE;
-        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) };
-        assert_eq!(ret, SQL_SUCCESS);
-
-        (env, dbc, stmt)
-    }
-
-    unsafe fn free_env_dbc_stmt(env: SqlHandle, dbc: SqlHandle, stmt: SqlHandle) {
-        unsafe {
-            sql_free_handle(SQL_HANDLE_STMT, stmt);
-            sql_free_handle(SQL_HANDLE_DBC, dbc);
-            sql_free_handle(SQL_HANDLE_ENV, env);
-        }
-    }
+    use crate::api::odbc_types::{SQL_NTS, SQL_NULL_HANDLE};
+    use crate::test_support::TestHandles;
 
     #[test]
     fn null_handle_returns_invalid_handle() {
@@ -302,26 +263,22 @@ mod tests {
 
     #[test]
     fn null_statement_text_returns_error() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
 
-        let ret = unsafe { sql_exec_direct_w(stmt, std::ptr::null(), SQL_NTS) };
+        let ret = unsafe { sql_exec_direct_w(h.stmt, std::ptr::null(), SQL_NTS) };
         assert_eq!(ret, SQL_ERROR);
-
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 
     #[test]
     fn disconnected_dbc_returns_error() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
 
         let sql: Vec<u16> = "SELECT 1"
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let ret = unsafe { sql_exec_direct_w(stmt, sql.as_ptr(), SQL_NTS) };
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
         // DBC is not connected
         assert_eq!(ret, SQL_ERROR);
-
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 }

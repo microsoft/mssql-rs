@@ -162,51 +162,8 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::alloc_handle::sql_alloc_handle;
-    use crate::api::free_handle::sql_free_handle;
-    use crate::api::odbc_types::{
-        SQL_ATTR_ODBC_VERSION, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_NULL_HANDLE,
-        SQL_OV_ODBC3_80,
-    };
-    use crate::api::set_env_attr::sql_set_env_attr;
-
-    unsafe fn alloc_env_dbc_stmt() -> (SqlHandle, SqlHandle, SqlHandle) {
-        let mut env: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
-            SQL_SUCCESS
-        );
-        assert_eq!(
-            unsafe {
-                sql_set_env_attr(
-                    env,
-                    SQL_ATTR_ODBC_VERSION,
-                    SQL_OV_ODBC3_80 as usize as *mut std::ffi::c_void,
-                    0,
-                )
-            },
-            SQL_SUCCESS
-        );
-        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
-            SQL_SUCCESS
-        );
-        let mut stmt: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) },
-            SQL_SUCCESS
-        );
-        (env, dbc, stmt)
-    }
-
-    unsafe fn free_env_dbc_stmt(env: SqlHandle, dbc: SqlHandle, stmt: SqlHandle) {
-        unsafe {
-            sql_free_handle(SQL_HANDLE_STMT, stmt);
-            sql_free_handle(SQL_HANDLE_DBC, dbc);
-            sql_free_handle(SQL_HANDLE_ENV, env);
-        }
-    }
+    use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::test_support::TestHandles;
 
     #[test]
     fn close_cursor_null_handle() {
@@ -216,11 +173,10 @@ mod tests {
 
     #[test]
     fn close_cursor_no_cursor_open_returns_error() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
         // No execute has been called — cursor_open is false.
-        let ret = unsafe { sql_close_cursor(stmt) };
+        let ret = unsafe { sql_close_cursor(h.stmt) };
         assert_eq!(ret, SQL_ERROR);
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 
     #[test]
@@ -231,10 +187,9 @@ mod tests {
 
     #[test]
     fn free_stmt_close_no_cursor_is_noop() {
-        let (env, dbc, stmt) = unsafe { alloc_env_dbc_stmt() };
+        let h = TestHandles::with_env_dbc_stmt();
         // No execute has been called — cursor_open is false; SQL_CLOSE is a no-op.
-        let ret = unsafe { sql_free_stmt_close(stmt) };
+        let ret = unsafe { sql_free_stmt_close(h.stmt) };
         assert_eq!(ret, SQL_SUCCESS);
-        unsafe { free_env_dbc_stmt(env, dbc, stmt) };
     }
 }

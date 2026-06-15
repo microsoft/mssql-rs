@@ -207,6 +207,20 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
 ## Testing
 
 - Unit tests for pure logic go in `#[cfg(test)]` modules inside the source file.
+- Allocate ODBC handles in unit tests **only** through
+  `crate::test_support::TestHandles` — never hand-roll the
+  `sql_alloc_handle` / `sql_set_env_attr` / `sql_free_handle` sequence in a
+  test module:
+  - Use `TestHandles::with_env()`, `with_env_dbc()`, or `with_env_dbc_stmt()`
+    to allocate the handle chain you need; access the handles via the
+    `.env` / `.dbc` / `.stmt` fields.
+  - Use `handles.alloc_extra_stmt()` when a test needs a second statement on
+    the same connection.
+  - Never free the handles manually — `TestHandles` frees them
+    child-before-parent on `Drop`, which is also the order `SQLFreeHandle`
+    requires. Adding manual `sql_free_handle` calls risks double-frees.
+  - If you need a handle shape the constructors don't cover, extend
+    `TestHandles` rather than open-coding allocation in the test.
 - End-to-end tests that exercise the loadable `.so`/`.dll` through a real
   Driver Manager live in `tests/e2e/` as a CMake-built C++ suite (run via
   `tests/e2e/run_e2e.sh` / `.ps1`). There is no Rust integration test
