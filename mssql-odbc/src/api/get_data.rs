@@ -11,7 +11,7 @@ use super::odbc_types::{
 };
 use super::sqlstate::*;
 use crate::api::odbc_types::SqlWChar;
-use crate::api::util::copy_with_nul;
+use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -127,9 +127,7 @@ unsafe fn sql_get_data_impl(
 
     let value = &row[col_index - 1];
     if matches!(value, ColumnValues::Null) {
-        if !strlen_or_ind_ptr.is_null() {
-            unsafe { strlen_or_ind_ptr.write(SQL_NULL_DATA) };
-        }
+        unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
         // Write a NUL terminator into the caller buffer when there's room. The
         // helper handles null `dst` and zero-length uniformly.
         if target_type == SQL_C_WCHAR {
@@ -195,10 +193,8 @@ unsafe fn write_string_result<T: Copy + Default>(
     buf_elements: usize,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    if !strlen_or_ind_ptr.is_null() {
-        let byte_len = std::mem::size_of_val(src) as SqlLen;
-        unsafe { strlen_or_ind_ptr.write(byte_len) };
-    }
+    let byte_len = std::mem::size_of_val(src) as SqlLen;
+    unsafe { write_if_some(strlen_or_ind_ptr, byte_len) };
     let truncated = unsafe { copy_with_nul(target_value_ptr, buf_elements, src) };
     if truncated {
         post_sql_error(

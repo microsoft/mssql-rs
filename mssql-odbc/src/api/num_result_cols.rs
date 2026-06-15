@@ -9,6 +9,7 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
 };
 use crate::api::sqlstate::SQLSTATE_HY010;
+use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -68,9 +69,7 @@ unsafe fn sql_num_result_cols_impl(
 
     let column_count =
         SqlSmallInt::try_from(stmt_state.column_metadata.len()).unwrap_or(SqlSmallInt::MAX);
-    if !column_count_ptr.is_null() {
-        unsafe { column_count_ptr.write(column_count) };
-    }
+    unsafe { write_if_some(column_count_ptr, column_count) };
 
     SQL_SUCCESS
 }

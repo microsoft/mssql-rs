@@ -15,7 +15,7 @@ use crate::api::odbc_types::{
     SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{SQLSTATE_01004, SQLSTATE_07009, SQLSTATE_HY010};
-use crate::api::util::copy_with_nul;
+use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -121,30 +121,20 @@ unsafe fn sql_describe_col_w_impl(
     let meta = &stmt_state.column_metadata[(column_number - 1) as usize];
 
     let name_utf16: Vec<u16> = meta.column_name.encode_utf16().collect();
-    if !name_length_ptr.is_null() {
-        let len = SqlSmallInt::try_from(name_utf16.len()).unwrap_or(SqlSmallInt::MAX);
-        unsafe { name_length_ptr.write(len) };
-    }
+    let name_len = SqlSmallInt::try_from(name_utf16.len()).unwrap_or(SqlSmallInt::MAX);
+    unsafe { write_if_some(name_length_ptr, name_len) };
 
     let truncated = unsafe { copy_with_nul(column_name, buffer_length as usize, &name_utf16) };
 
-    if !data_type_ptr.is_null() {
-        unsafe { data_type_ptr.write(odbc_sql_type(meta)) };
-    }
-    if !column_size_ptr.is_null() {
-        unsafe { column_size_ptr.write(column_size(meta)) };
-    }
-    if !decimal_digits_ptr.is_null() {
-        unsafe { decimal_digits_ptr.write(decimal_digits(meta)) };
-    }
-    if !nullable_ptr.is_null() {
-        let nullable = if meta.is_nullable() {
-            SQL_NULLABLE
-        } else {
-            SQL_NO_NULLS
-        };
-        unsafe { nullable_ptr.write(nullable) };
-    }
+    unsafe { write_if_some(data_type_ptr, odbc_sql_type(meta)) };
+    unsafe { write_if_some(column_size_ptr, column_size(meta)) };
+    unsafe { write_if_some(decimal_digits_ptr, decimal_digits(meta)) };
+    let nullable = if meta.is_nullable() {
+        SQL_NULLABLE
+    } else {
+        SQL_NO_NULLS
+    };
+    unsafe { write_if_some(nullable_ptr, nullable) };
 
     if truncated {
         post_sql_error(

@@ -5,6 +5,20 @@ use std::slice;
 
 use crate::api::odbc_types::{SQL_NTS, SqlSmallInt, SqlWChar};
 
+/// Write `value` to `ptr` if non-null. Every ODBC out-parameter pointer may
+/// legitimately be null (caller opting out of that value), so the
+/// `if (p) *p = v;` idiom appears at almost every entry point. Centralizing
+/// it keeps individual call sites clean and puts a single chokepoint to audit
+/// when reviewing pointer writes.
+///
+/// # Safety
+/// `ptr`, if non-null, must be valid and properly aligned for one `T`.
+pub(crate) unsafe fn write_if_some<T: Copy>(ptr: *mut T, value: T) {
+    if !ptr.is_null() {
+        unsafe { ptr.write(value) };
+    }
+}
+
 /// Copies `src` into a caller buffer, NUL-terminating within the buffer.
 /// Returns `true` if `src` was truncated (i.e., did not fit including the NUL
 /// terminator). A null `dst` reports no truncation - callers use it to query
@@ -65,8 +79,21 @@ pub(crate) unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> St
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_with_nul, read_utf16};
+    use super::{copy_with_nul, read_utf16, write_if_some};
     use crate::api::odbc_types::{SQL_NTS, SqlWChar};
+
+    #[test]
+    fn write_if_some_writes_through_non_null_ptr() {
+        let mut value: i32 = 0;
+        unsafe { write_if_some(&mut value as *mut i32, 42) };
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn write_if_some_no_op_on_null() {
+        // Must not deref or panic on null. Compile-only smoke test.
+        unsafe { write_if_some::<i32>(std::ptr::null_mut(), 42) };
+    }
 
     #[test]
     fn read_utf16_nts() {

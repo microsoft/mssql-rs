@@ -9,7 +9,9 @@ errors are fatal and unrecoverable in that context.
 The ODBC driver runs inside arbitrary host processes. A panic that unwinds
 across the FFI boundary is **undefined behavior**.
 
-- **Never** use `.unwrap()` or `.expect()` on `Result` or `Option`.
+- **Never** use `.unwrap()` or `.expect()` on `Result` or `Option` in
+  non-test code. Tests under `#[cfg(test)]` may use them since panics
+  there are caught by the test harness.
 - Use `.unwrap_or()`, `.unwrap_or_else()`, `.unwrap_or_default()`, or
   pattern matching instead.
 - For `Mutex::lock()`, return `SQL_ERROR` on poison — use `let Ok(state) = handle.inner.lock() else { return SQL_ERROR; }`. Do **not** recover via `e.into_inner()`.
@@ -29,9 +31,20 @@ across the FFI boundary is **undefined behavior**.
   error types at the call site.
 - At FFI boundaries, convert every `Result::Err` into the appropriate
   `SqlReturn` code (`SQL_ERROR`, `SQL_INVALID_HANDLE`, etc.).
-- Store diagnostic info (SQLSTATE, message) on the handle via
-  `post_sql_error(...)` so `SQLGetDiagRec` can report it — don't discard
-  error details.
+- Store diagnostic info on the handle so `SQLGetDiagRec` / `SQLGetDiagField`
+  can report it — don't discard error details. Two posters, choose by source:
+  - `post_sql_error(state, sqlstate, native, message)` — for errors the
+    driver itself raises (invalid arg, sequence error, truncation, etc.).
+    Posts exactly one record.
+  - `post_tds_error(state, &tds_err, default_sqlstate)` — for any
+    `mssql_tds::TdsError` bubbling up from the protocol layer. For
+    `TdsError::SqlServerError` it fans out to one record per server-reported
+    error, mapping each error number to a SQLSTATE via the static
+    `SERVER_ERROR_TO_SQL_STATE_MAP`; for other variants it posts a single
+    record using `default_sqlstate`. Pick `08001` for connect-time
+    failures and `HY000` for execution/fetch failures.
+  Never hand-roll `post_sql_error` over a `TdsError` — you lose the
+  per-server-error fan-out and the SQLSTATE mapping.
 - Every ODBC entry point must clear the handle's diagnostic records at API
   entry by calling `free_errors(...)` after acquiring the handle lock —
   mirrors msodbcsql's `FreeErrors`.
@@ -41,6 +54,12 @@ across the FFI boundary is **undefined behavior**.
 - Minimize `unsafe` blocks — keep them as small as possible and comment
   the safety invariant they rely on.
 - All raw-pointer writes must be guarded by a null check first.
+- For the ubiquitous "write to caller out-param if non-null" pattern, use
+  `crate::api::util::write_if_some(ptr, value)` instead of hand-rolling
+  `if !ptr.is_null() { unsafe { ptr.write(v) } }`. The helper is the single
+  audited chokepoint for that pattern. Skip the helper only when an outer
+  null check guards expensive work that should be elided on null
+  (e.g., looking up a value before writing it).
 - Never dereference a pointer received from C without validating it.
 - Use `#[unsafe(no_mangle)]` only in `exports.rs` — keep implementations
   in separate modules as `pub(crate)` safe functions.
@@ -60,8 +79,9 @@ across the FFI boundary is **undefined behavior**.
   from different threads. Protect mutable state with `Mutex` or `RwLock`.
 - Keep lock scopes narrow — lock, copy/update, unlock. Never hold a lock
   across an FFI call or I/O operation.
-- Prefer `parking_lot` mutexes if added to deps (no poisoning), or handle
-  poison explicitly with standard `Mutex`.
+- Handle poison explicitly with `std::sync::Mutex` — see the no-panics
+  rule above for the canonical `let Ok(state) = ... else { return SQL_ERROR; }`
+  pattern.
 
 ### Cross-handle thread safety (alloc / free)
 
@@ -136,13 +156,17 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   raw `i16` / `*mut c_void` in business logic.
 - Avoid `as` casts for numeric conversions — use `TryFrom` / `TryInto` and
   handle the error. `as` silently truncates.
-- Pointer casts between handle types must go through well-defined conversion
-  functions (e.g., `handle_to_raw`, `raw_to_handle`).
+- Pointer casts between handle types must go through the well-defined
+  conversion functions in `crate::handles`: `handle_to_raw`,
+  `handle_from_raw`, `handle_from_raw_mut`, `free_handle`.
 
 ## Testing
 
 - Unit tests for pure logic go in `#[cfg(test)]` modules inside the source file.
-- Integration tests that exercise the exported C API go in `tests/`.
+- End-to-end tests that exercise the loadable `.so`/`.dll` through a real
+  Driver Manager live in `tests/e2e/` as a CMake-built C++ suite (run via
+  `tests/e2e/run_e2e.sh` / `.ps1`). There is no Rust integration test
+  directory — the loaded-driver entry points are best exercised in C++.
 - Every new `SQLXxx` function must have at least:
   - A success-path test.
   - A null-output-handle test.

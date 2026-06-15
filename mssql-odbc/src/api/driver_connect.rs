@@ -13,7 +13,7 @@ use crate::api::sqlstate::{
     SQLSTATE_01S00, SQLSTATE_01004, SQLSTATE_08001, SQLSTATE_HY009, SQLSTATE_HY010, SQLSTATE_HY024,
     SQLSTATE_HY110, post_tds_error,
 };
-use crate::api::util::copy_with_nul;
+use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::DbcHandle;
 use crate::handles::dbc::{ConnectionState, DbcState};
@@ -241,9 +241,7 @@ unsafe fn do_connect(
     let actual_len = out_utf16.len();
     let out_len = SqlSmallInt::try_from(actual_len).unwrap_or(SqlSmallInt::MAX);
 
-    if !string_length_2_ptr.is_null() {
-        unsafe { string_length_2_ptr.write(out_len) };
-    }
+    unsafe { write_if_some(string_length_2_ptr, out_len) };
 
     let mut truncated = actual_len > SqlSmallInt::MAX as usize;
     truncated |=

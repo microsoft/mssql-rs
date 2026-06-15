@@ -20,7 +20,7 @@ use crate::api::odbc_types::{
     SQL_SQLSTATE_SIZE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer,
     SqlReturn, SqlSmallInt, SqlWChar,
 };
-use crate::api::util::copy_with_nul;
+use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::handles::{DbcHandle, EnvHandle, HandleType, StmtHandle, handle_from_raw};
 
@@ -65,9 +65,7 @@ pub(crate) unsafe fn sql_get_diag_rec_w(
         }
 
         // Per spec, the text-length out-param is initialized to 0.
-        if !text_length_ptr.is_null() {
-            unsafe { text_length_ptr.write(0) };
-        }
+        unsafe { write_if_some(text_length_ptr, 0) };
 
         // TODO: Do we need to snapshot here? Copy to user buffer directly?
         let snapshot = match unsafe { snapshot_record(handle_type, handle, rec_number) } {
@@ -79,9 +77,7 @@ pub(crate) unsafe fn sql_get_diag_rec_w(
         };
 
         unsafe { write_sql_state(sql_state, &rec.sql_state) };
-        if !native_error_ptr.is_null() {
-            unsafe { native_error_ptr.write(rec.native_error) };
-        }
+        unsafe { write_if_some(native_error_ptr, rec.native_error) };
         unsafe { write_message(message_text, buffer_length, text_length_ptr, &rec.message) }
     })
 }
@@ -243,9 +239,7 @@ unsafe fn handle_record_field(
             }
         }
         SQL_DIAG_NATIVE => {
-            if !diag_info_ptr.is_null() {
-                unsafe { (diag_info_ptr as *mut SqlInteger).write(rec.native_error) };
-            }
+            unsafe { write_if_some(diag_info_ptr as *mut SqlInteger, rec.native_error) };
             SQL_SUCCESS
         }
         SQL_DIAG_MESSAGE_TEXT => {
@@ -286,10 +280,8 @@ unsafe fn write_utf16_field_bytes(
     }
 
     let total_bytes = src_utf16.len().saturating_mul(mem::size_of::<SqlWChar>());
-    if !string_length_ptr.is_null() {
-        let len = SqlSmallInt::try_from(total_bytes).unwrap_or(SqlSmallInt::MAX);
-        unsafe { string_length_ptr.write(len) };
-    }
+    let total_len = SqlSmallInt::try_from(total_bytes).unwrap_or(SqlSmallInt::MAX);
+    unsafe { write_if_some(string_length_ptr, total_len) };
 
     let buf_chars = (buffer_length_bytes as usize) / mem::size_of::<SqlWChar>();
     let truncated = unsafe { copy_with_nul(dst as *mut SqlWChar, buf_chars, src_utf16) };
@@ -430,10 +422,8 @@ unsafe fn write_message(
 
     let utf16: Vec<u16> = message_src.encode_utf16().collect();
 
-    if !text_length_ptr.is_null() {
-        let len = SqlSmallInt::try_from(utf16.len()).unwrap_or(SqlSmallInt::MAX);
-        unsafe { text_length_ptr.write(len) };
-    }
+    let utf16_len = SqlSmallInt::try_from(utf16.len()).unwrap_or(SqlSmallInt::MAX);
+    unsafe { write_if_some(text_length_ptr, utf16_len) };
 
     let buf_chars = buffer_length as usize;
     let truncated = unsafe { copy_with_nul(message_dst, buf_chars, &utf16) };
