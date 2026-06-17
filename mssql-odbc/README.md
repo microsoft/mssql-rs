@@ -35,7 +35,7 @@ The `build.rs` script embeds platform-specific metadata:
 ### Rust unit tests
 
 ```bash
-cargo test -p mssql-odbc
+cargo btest -p mssql-odbc
 ```
 
 ### C++ e2e tests (Google Test)
@@ -68,13 +68,13 @@ Examples:
 
 ```bash
 # Enable default warn-level logging
-MSSQL_TDS_TRACE=true cargo test -p mssql-odbc
+MSSQL_TDS_TRACE=true cargo btest -p mssql-odbc
 
 # ODBC-driver-focused debug logs only
-MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=debug" cargo test -p mssql-odbc
+MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=debug" cargo btest -p mssql-odbc
 
 # Full filter syntax is supported
-MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=debug,mssql_tds=off" cargo test -p mssql-odbc
+MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=debug,mssql_tds=off" cargo btest -p mssql-odbc
 ```
 
 ## Architecture
@@ -91,5 +91,18 @@ mssql-tds (TDS protocol)
 SQL Server
 ```
 
-Each ODBC entry point is a `#[unsafe(no_mangle)] pub unsafe extern "C"` function
-that the Driver Manager resolves by symbol name.
+Each ODBC entry point is a thin `pub unsafe extern "C"` wrapper in `exports.rs`
+that the Driver Manager resolves by symbol name. The wrapper delegates to a
+layered impl: panic boundary (`ffi_entry!` macro) → unsafe shim (raw-pointer
+validation) → safe core (business logic). See the conventions file below for
+details.
+
+## Conventions
+
+Before writing or modifying code in this crate, read
+[`.github/instructions/mssql-odbc.instructions.md`](../.github/instructions/mssql-odbc.instructions.md).
+It covers panic safety, FFI boundary conventions (the mandatory `ffi_entry!`
+macro and safe-core/unsafe-shell split), unsafe-code rules, memory ownership
+rules, concurrency and handle-hierarchy locking, diagnostic posting
+(`post_sql_error` vs. `post_tds_error`), and testing requirements (the
+`TestHandles` helper).

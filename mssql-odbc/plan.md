@@ -20,11 +20,13 @@ The driver follows a three-layer architecture with strict separation of concerns
 ```
 ┌─────────────────────────────────────────────────────┐
 │  FFI Layer  (api/exports.rs — extern "C" symbols)   │
-│  C API exports, panic catching, pointer validation  │
+│  Each entry point: wrapper → ffi_entry! panic       │
+│  boundary → unsafe shim (raw-pointer validation)   │
+│  → safe core (business logic).                     │
 ├─────────────────────────────────────────────────────┤
-│  ODBC Layer  (api/, handles/, state/, etc.)          │
+│  ODBC Layer  (api/, handles/, connection/, error/)  │
 │  Handles, state machines, type conversions,         │
-│  diagnostics, catalog, connection str parsing etc.  │
+│  diagnostics, connection-string parsing, etc.       │
 ├─────────────────────────────────────────────────────┤
 │  TDS Layer  (mssql-tds — local path dependency)     │
 │  TDS protocol, authentication, token parsing,       │
@@ -36,33 +38,58 @@ The driver follows a three-layer architecture with strict separation of concerns
 
 ### Crate Structure
 
-Today this lives as a single crate (`mssql-odbc/`) producing the cdylib. Internal separation is via modules:
+A single crate (`mssql-odbc/`) producing the cdylib. Internal separation is via modules:
 
 ```
 mssql-odbc/
 ├── src/
-│   ├── lib.rs             # cdylib root — declares top-level modules
-│   ├── api/               # ODBC API layer
-│   │   ├── exports.rs     # All #[unsafe(no_mangle)] pub extern "C" symbols (driver export manifest)
-│   │   ├── alloc_handle.rs # SQLAllocHandle implementation
-│   │   ├── free_handle.rs  # SQLFreeHandle implementation
-│   │   └── odbc_types.rs  # ODBC C type aliases (SqlHandle, SqlReturn, etc.) and constants
-│   ├── handles/           # Env, Connection, Statement, Descriptor handles
-│   │   ├── env.rs         # EnvHandle, EnvState, OdbcVersion
-│   │   └── dbc.rs         # DbcHandle, DbcState, ConnectionState
-│   ├── state/             # State machines, HY010 enforcement (planned)
-│   ├── types/             # SQL_C_* ↔ SQL_* type conversions (planned)
-│   ├── catalog/           # SQLTables, SQLColumns, etc. (planned)
-│   ├── diagnostics/       # SQLGetDiagRec, SQLSTATE mapping (planned)
-│   ├── platform_windows/  # DTC, DSN config GUI (cfg(windows)) (planned)
-│   └── platform_unix/     # Placeholder (cfg(unix)) (planned)
-├── tests/                 # Integration / E2E tests via ODBC Driver Manager
-├── benches/               # criterion benchmarks
-├── build.rs               # Platform-specific linker config, .def/.map exports
+│   ├── lib.rs              # cdylib root — declares modules, hosts ffi_entry! macro and init_tracing()
+│   ├── test_support.rs     # TestHandles helper for unit tests
+│   ├── api/                # ODBC API layer — one file per SQLXxx (or family)
+│   │   ├── mod.rs
+│   │   ├── exports.rs        # All #[unsafe(no_mangle)] pub extern "C" symbols
+│   │   ├── odbc_types.rs     # ODBC C type aliases (SqlHandle, SqlReturn, ...) and constants
+│   │   ├── sqlstate.rs       # SQLSTATE constants
+│   │   ├── util.rs           # Shared helpers (write_if_some, read_utf16, copy_with_nul, ...)
+│   │   ├── alloc_handle.rs   # SQLAllocHandle
+│   │   ├── free_handle.rs    # SQLFreeHandle
+│   │   ├── set_env_attr.rs   # SQLSetEnvAttr
+│   │   ├── driver_connect.rs # SQLDriverConnect[W]
+│   │   ├── disconnect.rs     # SQLDisconnect
+│   │   ├── exec_direct.rs    # SQLExecDirect[W]
+│   │   ├── fetch.rs          # SQLFetch
+│   │   ├── get_data.rs       # SQLGetData
+│   │   ├── num_result_cols.rs# SQLNumResultCols
+│   │   ├── describe_col.rs   # SQLDescribeCol[W]
+│   │   ├── more_results.rs   # SQLMoreResults
+│   │   ├── close_cursor.rs   # SQLCloseCursor / SQLFreeStmt(SQL_CLOSE)
+│   │   └── get_diag.rs       # SQLGetDiagRec[W] / SQLGetDiagField[W]
+│   ├── handles/            # Env, DBC, STMT handle structs and state
+│   │   ├── mod.rs            # HandleType, handle_to_raw / handle_from_raw conversions
+│   │   ├── env.rs            # EnvHandle, EnvState, OdbcVersion
+│   │   ├── dbc.rs            # DbcHandle, DbcState, ConnectionState
+│   │   └── stmt.rs           # StmtHandle, StmtState
+│   ├── connection/         # Connection-string parsing and connect orchestration
+│   │   └── mod.rs
+│   └── error/              # Diagnostic record posting (post_sql_error, post_tds_error)
+│       ├── mod.rs            # free_errors, error posters, SQLSTATE mapping table
+│       └── diag.rs           # DiagRec storage, SQLGetDiagRec / SQLGetDiagField backing
+├── tests/
+│   └── e2e/                # CMake-built Google Test C++ suite that loads the driver
+│                           # via the ODBC Driver Manager (run_e2e.sh / .ps1)
+├── build.rs                # Platform-specific linker config (soname, install_name, .def)
+├── README.md
+├── plan.md                 # This document
 └── Cargo.toml
 ```
 
-If the crate grows large enough to warrant splitting (e.g. separating FFI from logic), that restructuring is a Phase 1 task.
+New SQLXxx implementations follow the layered shape from
+[.github/instructions/mssql-odbc.instructions.md](../.github/instructions/mssql-odbc.instructions.md):
+thin `extern "C"` wrapper in `exports.rs` → `ffi_entry!` panic boundary →
+`unsafe fn sql_xxx_impl` shim (raw-pointer validation) → safe `fn sql_xxx_safe`
+core (business logic). Each new SQLXxx generally lives in its own file under
+`api/`. If the crate grows large enough to warrant splitting (e.g. separating
+FFI from logic), that restructuring is a follow-up task.
 
 ---
 
@@ -81,7 +108,7 @@ If the crate grows large enough to warrant splitting (e.g. separating FFI from l
 
 ## Roadmap
 
-The project is organized into 14 phases grouped by priority. We start with foundational infrastructure and the MVP, then layer on data types, authentication, encryption, and advanced features.
+The project is organized into 15 phases grouped by priority. We start with foundational infrastructure and the MVP, then layer on data types, authentication, encryption, and advanced features.
 
 ### Phase 1: Setup
 - Cargo workspace initialization, CI/CD pipelines, build infrastructure
@@ -163,7 +190,7 @@ The project is organized into 14 phases grouped by priority. We start with found
 - SQLSTATE audit: verify every error path returns the correct SQLSTATE per ODBC 3.x spec (HY000, HY001, HY010, 42000, 08001, etc.)
 - Connection pooling: SQLSetEnvAttr(SQL_ATTR_CONNECTION_POOLING), state reset on pool return, dead connection detection
 - Connection resiliency: auto-reconnect via ConnectRetryCount / ConnectRetryInterval connection string keywords
-- Async execution: SQLSetStmtAttr(SQL_ATTR_ASYNC_ENABLE), polling via repeated SQLExecDirect calls returning SQL_STILL_EXECUTING
+- Async execution: see **Phase 15: Asynchronous Execution** (dedicated phase)
 - DTC support: Windows ITransactionDispenser integration for distributed transactions (platform_windows)
 - DSN configuration GUI: ConfigDSNW dialog for Windows ODBC Data Source Administrator (platform_windows)
 - Error message resource files (.rll for Windows localized messages)
@@ -180,6 +207,70 @@ The project is organized into 14 phases grouped by priority. We start with found
 - Multiple active SQLExecDirect / SQLFetch calls on separate statements sharing one connection
 - TDS session multiplexing — delegated to mssql-tds; ODBC layer routes results to correct statement handle
 - When MARS is off, return HY000 if a second statement executes while results are pending
+
+### Phase 15: Asynchronous Execution (Polling Method)
+
+**Scope decision: mirror msodbcsql — statement-level async only.** Verified against
+the msodbcsql source (`/Sql/Ntdbms/sqlncli/odbc/sqlcinfo.cpp`, `sqlcmisc.cpp`):
+the reference driver advertises `SQL_ASYNC_MODE = SQL_AM_STATEMENT`,
+`SQL_MAX_ASYNC_CONCURRENT_STATEMENTS = 1`, and `SQL_ASYNC_DBC_FUNCTIONS = 0`.
+We match this exactly so we remain a drop-in replacement.
+
+**What we support (statement-level):**
+- `SQLSetStmtAttr(SQL_ATTR_ASYNC_ENABLE, SQL_ASYNC_ENABLE_ON/OFF)` — writable per
+  statement, toggleable between operations. Default is `SQL_ASYNC_ENABLE_OFF`
+  (set at statement allocation).
+- `SQLGetInfo` advertises: `SQL_ASYNC_MODE = SQL_AM_STATEMENT`,
+  `SQL_MAX_ASYNC_CONCURRENT_STATEMENTS = 1`, `SQL_ASYNC_DBC_FUNCTIONS = 0`.
+- Async-capable statement functions return `SQL_STILL_EXECUTING` while the
+  operation is in flight; the app polls by re-calling the *same* function with
+  the *same* arguments until it returns the final code. Target set (match
+  msodbcsql): `SQLExecDirect[W]`, `SQLExecute`, `SQLFetch`, `SQLFetchScroll`,
+  `SQLMoreResults`, `SQLGetData`, `SQLNumResultCols`, `SQLDescribeCol[W]`,
+  `SQLColAttribute[W]`, `SQLPrepare[W]`, and the catalog functions.
+- Cancellation of an in-flight async op via `SQLCancel` / `SQLCancelHandle`
+  (wires into the existing Phase 4 cancel path / mssql-tds `CancelHandle`).
+
+**What we explicitly do NOT support (matching msodbcsql):**
+- **No connection-level async** (`SQL_AM_CONNECTION`). The `SQL_ATTR_ASYNC_ENABLE`
+  statement attribute is therefore *not* read-only and is *not* settable via
+  `SQLSetConnectAttr` to fan out to statements.
+- **No async connection functions** (`SQL_ATTR_ASYNC_DBC_FUNCTIONS_ENABLE`):
+  `SQLConnect`/`SQLDriverConnect`/`SQLDisconnect`/`SQLEndTran` stay synchronous.
+  Return the appropriate error if an app tries to enable DBC-level async.
+
+**State-machine rules:**
+- Setting `SQL_ATTR_ASYNC_ENABLE` while that statement has an async op in
+  progress returns **HY010** (function sequence error) — the *only* timing
+  restriction (mirrors msodbcsql's `ASYNC_INPROGRESS` guard).
+- At most one async op per statement handle; with
+  `SQL_MAX_ASYNC_CONCURRENT_STATEMENTS = 1`, only one statement per connection
+  may have an async op in flight (non-MARS). A second async op on the connection
+  returns HY010.
+- While an op is `SQL_STILL_EXECUTING`, only the original function plus
+  `SQLCancel`/`SQLCancelHandle`, `SQLGetDiagRec`/`SQLGetDiagField`, and the
+  read-only info functions may be called on that handle; anything else → HY010.
+- Each repeated (polling) call clears the previous diagnostic records, per spec.
+
+**Runtime implications (see `tokio.md`):**
+- True async ODBC requires a **`multi_thread`** Tokio runtime: `SQLExecDirect`
+  spawns the work via `runtime.spawn(...)`, stores the `JoinHandle` on the
+  statement, and returns `SQL_STILL_EXECUTING`. A worker thread drives the future
+  while the app thread is outside the driver; the polling re-call checks
+  `JoinHandle::is_finished()`. A `current_thread` runtime cannot do this (the
+  spawned task freezes once `block_on` returns).
+- `StmtState` gains a `pending: Option<JoinHandle<...>>` (or equivalent) plus the
+  async-enabled flag stored in the per-statement attribute table.
+- Ownership of the `TdsClient` must move into the spawned future and back on
+  completion (same take/return dance as the sync path, but across the spawn).
+
+**Out of scope for this phase (future):** the ODBC 3.8 notification method
+(`SQL_ATTR_ASYNC_STMT_EVENT`) — polling method only, matching the initial
+msodbcsql parity bar.
+
+**Milestone**: `SQLExecDirect` on an async-enabled statement returns
+`SQL_STILL_EXECUTING`, polls to completion on a worker thread, and `SQLCancel`
+interrupts an in-flight query.
 
 ---
 
@@ -199,7 +290,8 @@ The project is organized into 14 phases grouped by priority. We start with found
       │         │         │         │
       │         │         │         └───► Phase 9: Always Encrypted
       │         │         │
-      │         │         └───► Phase 14: MARS
+      │         │         ├───► Phase 14: MARS
+      │         │         └───► Phase 15: Async Execution
       │         │
       │         ├───► Phase 6: Auth E2E Validation
       │         ├───► Phase 7: TLS Encryption
@@ -211,7 +303,7 @@ The project is organized into 14 phases grouped by priority. We start with found
       └───► Phase 12: Cross-Cutting (alongside any phase)
 ```
 
-Phases **6, 7, 8, 10, 11, and 13** can proceed in parallel once Phase 3 is complete. Phase 9 (Always Encrypted) requires Phases 4 and 5. Phase 11 (Catalog) can ship incrementally — each function is independent. Phase 12 cross-cutting items can be picked up alongside any phase. Phases 13 (BCP) and 14 (MARS) are deferred — not required for initial releases.
+Phases **6, 7, 8, 10, 11, and 13** can proceed in parallel once Phase 3 is complete. Phase 9 (Always Encrypted) requires Phases 4 and 5. Phase 11 (Catalog) can ship incrementally — each function is independent. Phase 12 cross-cutting items can be picked up alongside any phase. Phases 13 (BCP) and 14 (MARS) are deferred — not required for initial releases. Phase 15 (Async Execution) requires Phase 4 (cancellation path) and a `multi_thread` Tokio runtime; it is deferred — not required for initial releases.
 
 ---
 

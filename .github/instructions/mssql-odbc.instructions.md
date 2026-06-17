@@ -1,9 +1,18 @@
+---
+applyTo: "mssql-odbc/**"
+---
+
 # mssql-odbc — Rust Guidelines
 
 Rules for writing safe, panic-free Rust in the ODBC driver. This crate produces
 a C shared library loaded via `dlopen` into arbitrary host processes — panics
 unwinding across the FFI boundary, undefined behavior, and memory errors are all
 fatal and unrecoverable.
+
+## Project context
+
+Before making changes, also read [mssql-odbc/README.md](../../mssql-odbc/README.md)
+for architecture, supported features, and build/run instructions.
 
 ## No panics
 
@@ -96,10 +105,18 @@ Rules of thumb:
 
 ## Memory management
 
-- Heap allocations handed to C (via `Box::into_raw` / `handle_to_raw`) must
-  have a corresponding deallocation path (e.g., `SQLFreeHandle`).
-- Never use `std::mem::forget` to skip destructors unless the ownership has
-  been explicitly transferred to C.
+- **Same side allocates and frees.** Whoever produced an allocation owns
+  freeing it; the FFI boundary never transfers deallocation responsibility:
+  - Rust-allocated memory (`Box`, `Vec`, `String`, anything from
+    `Box::into_raw` / `handle_to_raw`) must be freed by Rust via the
+    matching `SQLFreeHandle` / `Box::from_raw` path. Never expect the
+    caller (DM or app) to `free()` it, and never `mem::forget` it without
+    a paired free path.
+  - Caller-provided out-buffers (`*mut SQLCHAR` for `SQLGetData`, output
+    pointers for `SQLDescribeCol`, etc.) are owned by the caller. Write
+    into them, but never `free`, `realloc`, or wrap them in a `Box` —
+    doing so hands them to Rust's allocator and corrupts the caller's
+    memory.
 - Prefer `Box` for single-owner heap objects; use `Arc` only when shared
   ownership is genuinely required.
 
@@ -208,23 +225,18 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
 
 - Unit tests for pure logic go in `#[cfg(test)]` modules inside the source file.
 - Allocate ODBC handles in unit tests **only** through
-  `crate::test_support::TestHandles` — never hand-roll the
-  `sql_alloc_handle` / `sql_set_env_attr` / `sql_free_handle` sequence in a
-  test module:
-  - Use `TestHandles::with_env()`, `with_env_dbc()`, or `with_env_dbc_stmt()`
-    to allocate the handle chain you need; access the handles via the
-    `.env` / `.dbc` / `.stmt` fields.
-  - Use `handles.alloc_extra_stmt()` when a test needs a second statement on
-    the same connection.
-  - Never free the handles manually — `TestHandles` frees them
-    child-before-parent on `Drop`, which is also the order `SQLFreeHandle`
-    requires. Adding manual `sql_free_handle` calls risks double-frees.
+  `crate::test_support::TestHandles`:
+  - Use `with_env()`, `with_env_dbc()`, `with_env_dbc_stmt()`, or
+    `alloc_extra_stmt()` to get the handle chain you need; access via
+    `.env` / `.dbc` / `.stmt`.
+  - Never free handles manually — `TestHandles::Drop` frees them
+    child-before-parent (the order `SQLFreeHandle` requires). Manual
+    `sql_free_handle` calls risk double-frees.
   - If you need a handle shape the constructors don't cover, extend
     `TestHandles` rather than open-coding allocation in the test.
 - End-to-end tests that exercise the loadable `.so`/`.dll` through a real
   Driver Manager live in `tests/e2e/` as a CMake-built C++ suite (run via
-  `tests/e2e/run_e2e.sh` / `.ps1`). There is no Rust integration test
-  directory — the loaded-driver entry points are best exercised in C++.
+  `tests/e2e/run_e2e.sh` / `.ps1`).
 - Every new `SQLXxx` function must have at least:
   - A success-path test.
   - A null-output-handle test.
