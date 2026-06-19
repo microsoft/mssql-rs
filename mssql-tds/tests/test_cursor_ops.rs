@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Integration tests for cursor RPC methods: cursor_open, cursor_fetch, cursor_close.
+//! Integration tests for cursor RPC methods: cursor_open, cursor_fetch,
+//! cursor_close, plus the prepared-cursor lifecycle (cursor_prepexec,
+//! cursor_execute, cursor_prepare, cursor_unprepare).
 //! These run against a live SQL Server instance (Docker).
 
 mod common;
@@ -881,5 +883,465 @@ async fn cursor_fetch_prev_on_forward_only() {
         .await;
     assert!(result.is_err(), "PREV on FORWARD_ONLY cursor should fail");
 
+    client.close_connection().await.unwrap();
+}
+
+// --- Prepared cursor lifecycle (PR 3) ---
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_prepexec_and_close() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 50).await;
+
+    let resp = client
+        .cursor_prepexec(
+            "SELECT id, name, value FROM #ct ORDER BY id",
+            vec![],
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        resp.prepared_handle, 0,
+        "Server should assign a prepared handle"
+    );
+    assert_ne!(
+        resp.cursor.cursor_id, 0,
+        "Server should assign a cursor handle"
+    );
+    assert!(
+        !resp.cursor.negotiated_concurrency.is_empty(),
+        "Server should return a valid concurrency, got {:?}",
+        resp.cursor.negotiated_concurrency
+    );
+    assert!(
+        !resp.cursor.negotiated_scroll.is_empty(),
+        "Server should return a valid scroll option, got {:?}",
+        resp.cursor.negotiated_scroll
+    );
+
+    client
+        .cursor_fetch(
+            resp.cursor.cursor_id,
+            FetchDirection::NEXT,
+            0,
+            10,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = read_all_rows(&mut client).await;
+    assert_eq!(rows.len(), 10, "Expected 10 rows from first fetch");
+    assert_eq!(rows[0][0], ColumnValues::Int(1));
+
+    client
+        .cursor_close(resp.cursor.cursor_id, None, None)
+        .await
+        .unwrap();
+    client
+        .cursor_unprepare(resp.prepared_handle, None, None)
+        .await
+        .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_prepexec_then_reexecute() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 30).await;
+
+    // prepexec opens the first cursor and returns a reusable prepared handle.
+    let prep = client
+        .cursor_prepexec(
+            "SELECT id FROM #ct ORDER BY id",
+            vec![],
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let cursor_a = prep.cursor.cursor_id;
+
+    // Re-execute the same prepared handle -> opens a SECOND, distinct cursor
+    // while the first is still open.
+    let exec = client
+        .cursor_execute(
+            prep.prepared_handle,
+            vec![],
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let cursor_b = exec.cursor_id;
+
+    assert_ne!(cursor_b, 0);
+    assert_ne!(
+        cursor_a, cursor_b,
+        "Each execution should open a distinct cursor handle"
+    );
+
+    client
+        .cursor_fetch(cursor_a, FetchDirection::NEXT, 0, 100, None, None)
+        .await
+        .unwrap();
+    let rows_a = read_all_rows(&mut client).await;
+    assert_eq!(rows_a.len(), 30, "First cursor should see all 30 rows");
+
+    client
+        .cursor_fetch(cursor_b, FetchDirection::NEXT, 0, 100, None, None)
+        .await
+        .unwrap();
+    let rows_b = read_all_rows(&mut client).await;
+    assert_eq!(
+        rows_b.len(),
+        30,
+        "Re-executed cursor should see all 30 rows"
+    );
+
+    client.cursor_close(cursor_a, None, None).await.unwrap();
+    client.cursor_close(cursor_b, None, None).await.unwrap();
+    client
+        .cursor_unprepare(prep.prepared_handle, None, None)
+        .await
+        .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_prepare_execute_unprepare() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 25).await;
+
+    // Prepare only -- no cursor opened yet, no rows returned.
+    let prep = client
+        .cursor_prepare(
+            "SELECT id, value FROM #ct ORDER BY id",
+            "",
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        prep.prepared_handle, 0,
+        "Server should assign a prepared handle"
+    );
+    assert!(
+        !prep.negotiated_concurrency.is_empty(),
+        "Server should return a valid concurrency, got {:?}",
+        prep.negotiated_concurrency
+    );
+    assert!(
+        !prep.negotiated_scroll.is_empty(),
+        "Server should return a valid scroll option, got {:?}",
+        prep.negotiated_scroll
+    );
+
+    // Execute the prepared handle to open a cursor.
+    let exec = client
+        .cursor_execute(
+            prep.prepared_handle,
+            vec![],
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(exec.cursor_id, 0, "Execute should open a cursor");
+
+    client
+        .cursor_fetch(exec.cursor_id, FetchDirection::NEXT, 0, 100, None, None)
+        .await
+        .unwrap();
+    let rows = read_all_rows(&mut client).await;
+    assert_eq!(rows.len(), 25, "Expected all 25 rows");
+
+    client
+        .cursor_close(exec.cursor_id, None, None)
+        .await
+        .unwrap();
+    client
+        .cursor_unprepare(prep.prepared_handle, None, None)
+        .await
+        .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_prepexec_with_params() {
+    use mssql_tds::datatypes::sqltypes::SqlType;
+    use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 100).await;
+
+    let resp = client
+        .cursor_prepexec(
+            "SELECT id, name FROM #ct WHERE id >= @min_id AND id <= @max_id ORDER BY id",
+            vec![
+                RpcParameter::new(
+                    Some("@min_id".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(20)),
+                ),
+                RpcParameter::new(
+                    Some("@max_id".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(24)),
+                ),
+            ],
+            CursorScrollOption::STATIC,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(resp.prepared_handle, 0);
+    assert_ne!(resp.cursor.cursor_id, 0);
+    // STATIC cursors build a snapshot, so the server reports a known row count.
+    assert!(
+        resp.cursor.row_count >= 0,
+        "STATIC cursor should report a non-negative row_count, got {}",
+        resp.cursor.row_count
+    );
+
+    client
+        .cursor_fetch(
+            resp.cursor.cursor_id,
+            FetchDirection::NEXT,
+            0,
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = read_all_rows(&mut client).await;
+    assert_eq!(rows.len(), 5, "Expected rows 20..=24");
+    assert_eq!(rows[0][0], ColumnValues::Int(20));
+    assert_eq!(rows[4][0], ColumnValues::Int(24));
+
+    client
+        .cursor_close(resp.cursor.cursor_id, None, None)
+        .await
+        .unwrap();
+    client
+        .cursor_unprepare(resp.prepared_handle, None, None)
+        .await
+        .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_prepare_execute_with_params() {
+    use mssql_tds::datatypes::sqltypes::SqlType;
+    use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 100).await;
+
+    // Prepare with an explicit parameter declaration; types are fixed here.
+    let prep = client
+        .cursor_prepare(
+            "SELECT id FROM #ct WHERE id = @target",
+            "@target INT",
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(prep.prepared_handle, 0);
+
+    // Execute with @target = 42.
+    let exec = client
+        .cursor_execute(
+            prep.prepared_handle,
+            vec![RpcParameter::new(
+                Some("@target".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(42)),
+            )],
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    client
+        .cursor_fetch(exec.cursor_id, FetchDirection::NEXT, 0, 100, None, None)
+        .await
+        .unwrap();
+    let rows = read_all_rows(&mut client).await;
+    assert_eq!(rows.len(), 1, "Expected exactly the @target=42 row");
+    assert_eq!(rows[0][0], ColumnValues::Int(42));
+    client
+        .cursor_close(exec.cursor_id, None, None)
+        .await
+        .unwrap();
+
+    // Re-execute the same prepared handle with a different value @target = 7.
+    let exec2 = client
+        .cursor_execute(
+            prep.prepared_handle,
+            vec![RpcParameter::new(
+                Some("@target".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(7)),
+            )],
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    client
+        .cursor_fetch(exec2.cursor_id, FetchDirection::NEXT, 0, 100, None, None)
+        .await
+        .unwrap();
+    let rows2 = read_all_rows(&mut client).await;
+    assert_eq!(rows2.len(), 1, "Expected exactly the @target=7 row");
+    assert_eq!(rows2[0][0], ColumnValues::Int(7));
+    client
+        .cursor_close(exec2.cursor_id, None, None)
+        .await
+        .unwrap();
+
+    client
+        .cursor_unprepare(prep.prepared_handle, None, None)
+        .await
+        .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+// --- Failure scenarios (PR 3) ---
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_prepexec_rejects_auto_fetch() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+
+    let result = client
+        .cursor_prepexec(
+            "SELECT 1",
+            vec![],
+            CursorScrollOption::FORWARD_ONLY | CursorScrollOption::AUTO_FETCH,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await;
+
+    assert!(result.is_err(), "AUTO_FETCH should be rejected");
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains("AUTO_FETCH"),
+        "Expected AUTO_FETCH usage error, got: {err_msg}"
+    );
+
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_execute_rejects_auto_fetch() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+
+    let result = client
+        .cursor_execute(
+            1,
+            vec![],
+            CursorScrollOption::FORWARD_ONLY | CursorScrollOption::AUTO_FETCH,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await;
+
+    assert!(result.is_err(), "AUTO_FETCH should be rejected");
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains("AUTO_FETCH"),
+        "Expected AUTO_FETCH usage error, got: {err_msg}"
+    );
+
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_prepexec_invalid_sql() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+
+    let result = client
+        .cursor_prepexec(
+            "SELECT * FROM this_table_does_not_exist_xyz_67890",
+            vec![],
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Preparing a cursor with invalid SQL should fail"
+    );
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains("Invalid object name") || err_msg.contains("208"),
+        "Expected invalid object name error, got: {err_msg}"
+    );
+
+    // Connection should still be usable after the error.
+    client
+        .execute("SELECT 1".to_string(), None, None)
+        .await
+        .unwrap();
+    client.close_query().await.unwrap();
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_unprepare_invalid_handle() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+
+    // Unpreparing a handle that was never created should not panic. The server
+    // may return an error or drain silently -- either outcome is acceptable; the
+    // critical thing is no panic and a still-usable connection afterwards.
+    let _ = client.cursor_unprepare(999999, None, None).await;
+
+    client
+        .execute("SELECT 1".to_string(), None, None)
+        .await
+        .unwrap();
+    client.close_query().await.unwrap();
     client.close_connection().await.unwrap();
 }
