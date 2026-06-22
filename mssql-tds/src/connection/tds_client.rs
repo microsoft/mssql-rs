@@ -9,13 +9,14 @@ use crate::connection::client_context::ClientContext;
 use crate::connection::session_recovery::RecoveryContext;
 use crate::cursor::{
     CursorConcurrency, CursorOpenResponse, CursorOperation, CursorOptionCode, CursorOptionValue,
-    CursorPrepExecResponse, CursorPrepareResponse, CursorScrollOption, FetchDirection,
+    CursorPrepExecResponse, CursorPrepareResponse, CursorScrollOption, CursorStatus,
+    FetchDirection,
 };
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sqltypes::SqlType;
-use crate::error::Error::UsageError;
+use crate::error::Error::{ProtocolError, UsageError};
 use crate::error::SqlErrorInfo;
 use crate::io::packet_writer::PacketWriter;
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
@@ -51,6 +52,17 @@ use crate::{
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// State of the `ReturnStatus` token observed while draining the most recent
+/// cursor RPC response. Distinguishes "no token was sent" from an actual raw
+/// status value, so neither case is silently collapsed at interpretation time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReturnStatus {
+    /// No `ReturnStatus` token was sent for the most recent RPC.
+    NotReceived,
+    /// The server sent a `ReturnStatus` token carrying this raw value.
+    Received(i32),
+}
+
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -67,6 +79,9 @@ pub struct TdsClient {
     count_map: HashMap<CurrentCommand, u64>,
 
     return_values: Vec<ReturnValue>,
+    /// State of the most recent `ReturnStatus` token, captured while draining a
+    /// cursor RPC response and interpreted as a [`CursorStatus`].
+    last_return_status: ReturnStatus,
     current_result_set_has_been_read_till_end: bool,
 
     /// The remaining request timeout for operations. This is updated after each token read.
@@ -105,6 +120,7 @@ impl TdsClient {
             current_metadata: None,
             count_map: HashMap::new(),
             return_values: Vec::new(),
+            last_return_status: ReturnStatus::NotReceived,
             current_result_set_has_been_read_till_end: false,
             remaining_request_timeout: None,
             cancel_handle: None,
@@ -1441,6 +1457,7 @@ impl TdsClient {
     /// rest and collects the OUTPUT parameters.
     async fn consume_cursor_open_response(&mut self) -> TdsResult<CursorOpenResponse> {
         self.drain_cursor_response().await?;
+        let status = self.captured_cursor_status()?;
 
         Ok(CursorOpenResponse {
             cursor_id: self.extract_return_value_int(0)?,
@@ -1451,7 +1468,25 @@ impl TdsClient {
                 self.extract_return_value_int(2)? as u32,
             ),
             row_count: self.extract_return_value_int(3)?,
+            status,
         })
+    }
+
+    /// Interprets the most recently captured `ReturnStatus` token as a
+    /// [`CursorStatus`] for the open-family RPCs.
+    ///
+    /// A missing token (`NotReceived`) maps to [`CursorStatus::Succeeded`]; an
+    /// unrecognized raw value is surfaced as a protocol error rather than being
+    /// silently treated as success.
+    fn captured_cursor_status(&self) -> TdsResult<CursorStatus> {
+        match self.last_return_status {
+            ReturnStatus::NotReceived => Ok(CursorStatus::Succeeded),
+            ReturnStatus::Received(raw) => CursorStatus::from_raw(raw).ok_or_else(|| {
+                ProtocolError(format!(
+                    "server returned an unrecognized cursor status: {raw}"
+                ))
+            }),
+        }
     }
 
     /// Shared response tail for the cursor open-family RPCs (`sp_cursoropen`,
@@ -1465,6 +1500,9 @@ impl TdsClient {
         // Clear any stale metadata up-front so an error here cannot leak columns
         // from a previous result set through get_metadata().
         self.current_metadata = None;
+        // Clear any stale return status so a missing ReturnStatus token surfaces
+        // as Succeeded rather than the previous RPC's status.
+        self.last_return_status = ReturnStatus::NotReceived;
         let metadata = self.move_to_column_metadata().await?;
         self.current_metadata = metadata;
         let server_errors = self.drain_stream().await?;
@@ -1871,6 +1909,7 @@ impl TdsClient {
         rpc.serialize(&mut pw).await?;
 
         self.drain_cursor_response().await?;
+        let status = self.captured_cursor_status()?;
 
         // OUTPUT ordinals: 0=prepared_handle, 1=cursor, 2=scrollopt, 3=ccopt, 4=rowcount
         Ok(CursorPrepExecResponse {
@@ -1884,6 +1923,7 @@ impl TdsClient {
                     self.extract_return_value_int(3)? as u32,
                 ),
                 row_count: self.extract_return_value_int(4)?,
+                status,
             },
         })
     }
@@ -2062,6 +2102,7 @@ impl TdsClient {
         rpc.serialize(&mut pw).await?;
 
         self.drain_cursor_response().await?;
+        let status = self.captured_cursor_status()?;
 
         // OUTPUT ordinals: 0=prepared_handle, 1=scrollopt, 2=ccopt (no rowcount).
         Ok(CursorPrepareResponse {
@@ -2072,6 +2113,7 @@ impl TdsClient {
             negotiated_concurrency: CursorConcurrency::from_bits_truncate(
                 self.extract_return_value_int(2)? as u32,
             ),
+            status,
         })
     }
 
@@ -2180,8 +2222,9 @@ impl TdsClient {
                     let return_value = return_value_token.into();
                     self.return_values.push(return_value);
                 }
-                Tokens::ReturnStatus(_return_status) => {
-                    info!(?_return_status);
+                Tokens::ReturnStatus(return_status) => {
+                    self.last_return_status = ReturnStatus::Received(return_status.value);
+                    info!(?return_status);
                 }
                 _ => {
                     info!(?token);
@@ -2291,6 +2334,7 @@ impl TdsClient {
                     self.return_values.push(return_value);
                 }
                 Tokens::ReturnStatus(return_status) => {
+                    self.last_return_status = ReturnStatus::Received(return_status.value);
                     info!("Received return_status token: {:?}", return_status);
                     continue;
                 }

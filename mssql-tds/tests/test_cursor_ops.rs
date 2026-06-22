@@ -12,7 +12,7 @@ use common::{begin_connection, build_tcp_datasource};
 use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
 use mssql_tds::cursor::{
     CursorConcurrency, CursorOperation, CursorOptionCode, CursorOptionValue, CursorScrollOption,
-    FetchDirection,
+    CursorStatus, FetchDirection,
 };
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sqltypes::SqlType;
@@ -1541,5 +1541,89 @@ async fn cursor_option_rejects_type_mismatch() {
         "error should mention expected type: {err_msg}"
     );
 
+    client.close_connection().await.unwrap();
+}
+
+// --- Status surfacing (Gap 2): CursorStatus on open-family responses ---
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_open_reports_succeeded_status() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 5).await;
+
+    let resp = client
+        .cursor_open(
+            "SELECT id FROM #ct ORDER BY id",
+            CursorScrollOption::KEYSET_DRIVEN,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // A normal open is neither auto-closed nor asynchronously populated.
+    assert_eq!(resp.status, CursorStatus::Succeeded);
+
+    client
+        .cursor_close(resp.cursor_id, None, None)
+        .await
+        .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_prepexec_reports_succeeded_status() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 3).await;
+
+    let resp = client
+        .cursor_prepexec(
+            "SELECT id FROM #ct ORDER BY id",
+            vec![],
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.cursor.status, CursorStatus::Succeeded);
+
+    client
+        .cursor_close(resp.cursor.cursor_id, None, None)
+        .await
+        .unwrap();
+    client
+        .cursor_unprepare(resp.prepared_handle, None, None)
+        .await
+        .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_prepare_reports_succeeded_status() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 3).await;
+
+    let resp = client
+        .cursor_prepare(
+            "SELECT id FROM #ct ORDER BY id",
+            "",
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // Prepare opens no cursor, so the status is always success.
+    assert_eq!(resp.status, CursorStatus::Succeeded);
+
+    client
+        .cursor_unprepare(resp.prepared_handle, None, None)
+        .await
+        .unwrap();
     client.close_connection().await.unwrap();
 }

@@ -8,7 +8,7 @@
 //! set `AUTO_FETCH` or `RETURN_METADATA`, rows/metadata are available in the
 //! token stream via `get_next_row_into()`.
 
-use super::cursor_types::{CursorConcurrency, CursorScrollOption};
+use super::cursor_types::{CursorConcurrency, CursorScrollOption, CursorStatus};
 
 /// Response from `sp_cursoropen` (`RpcProcs::CursorOpen`),
 /// `sp_cursorexecute` (`RpcProcs::CursorExecute`), or the cursor portion
@@ -30,6 +30,10 @@ pub struct CursorOpenResponse {
     /// Row count returned by the server. When `AUTO_FETCH` is set, this
     /// is the number of rows in the first fetch batch.
     pub row_count: i32,
+    /// Cursor status from the RPC `ReturnStatus` token. Reports whether the
+    /// cursor was auto-closed ([`CursorStatus::Closed`]) at end-of-results or is
+    /// still being populated asynchronously ([`CursorStatus::Async`], keyset).
+    pub status: CursorStatus,
 }
 
 /// Response from `sp_cursorprepexec` (`RpcProcs::CursorPrepExec`).
@@ -56,6 +60,9 @@ pub struct CursorPrepareResponse {
     pub negotiated_scroll: CursorScrollOption,
     /// Concurrency the server will grant (negotiated at prepare time).
     pub negotiated_concurrency: CursorConcurrency,
+    /// Status from the RPC `ReturnStatus` token (normally
+    /// [`CursorStatus::Succeeded`] for a prepare, which opens no cursor).
+    pub status: CursorStatus,
 }
 
 #[cfg(test)]
@@ -69,6 +76,7 @@ mod tests {
             negotiated_scroll: CursorScrollOption::FORWARD_ONLY,
             negotiated_concurrency: CursorConcurrency::READONLY,
             row_count: 100,
+            status: CursorStatus::Succeeded,
         };
         assert_eq!(resp.cursor_id, 42);
         assert_eq!(resp.negotiated_scroll, CursorScrollOption::FORWARD_ONLY);
@@ -84,6 +92,7 @@ mod tests {
             negotiated_scroll: CursorScrollOption::KEYSET_DRIVEN,
             negotiated_concurrency: CursorConcurrency::READONLY,
             row_count: 0,
+            status: CursorStatus::Succeeded,
         };
         assert_ne!(resp.negotiated_scroll, CursorScrollOption::DYNAMIC);
         assert_eq!(resp.negotiated_scroll, CursorScrollOption::KEYSET_DRIVEN);
@@ -96,6 +105,7 @@ mod tests {
             negotiated_scroll: CursorScrollOption::STATIC,
             negotiated_concurrency: CursorConcurrency::OPTCC,
             row_count: 50,
+            status: CursorStatus::Succeeded,
         };
         let cloned = resp.clone();
         assert_eq!(resp, cloned);
@@ -110,6 +120,7 @@ mod tests {
                 negotiated_scroll: CursorScrollOption::KEYSET_DRIVEN,
                 negotiated_concurrency: CursorConcurrency::OPTCC,
                 row_count: 200,
+                status: CursorStatus::Succeeded,
             },
         };
         assert_eq!(resp.prepared_handle, 99);
@@ -130,6 +141,7 @@ mod tests {
                 negotiated_scroll: CursorScrollOption::DYNAMIC,
                 negotiated_concurrency: CursorConcurrency::LOCKCC,
                 row_count: 0,
+                status: CursorStatus::Succeeded,
             },
         };
         let cloned = resp.clone();
@@ -142,16 +154,15 @@ mod tests {
             prepared_handle: 77,
             negotiated_scroll: CursorScrollOption::FORWARD_ONLY | CursorScrollOption::AUTO_CLOSE,
             negotiated_concurrency: CursorConcurrency::READONLY,
+            status: CursorStatus::Succeeded,
         };
         assert_eq!(resp.prepared_handle, 77);
-        assert!(
-            resp.negotiated_scroll
-                .contains(CursorScrollOption::FORWARD_ONLY)
-        );
-        assert!(
-            resp.negotiated_scroll
-                .contains(CursorScrollOption::AUTO_CLOSE)
-        );
+        assert!(resp
+            .negotiated_scroll
+            .contains(CursorScrollOption::FORWARD_ONLY));
+        assert!(resp
+            .negotiated_scroll
+            .contains(CursorScrollOption::AUTO_CLOSE));
         assert_eq!(resp.negotiated_concurrency, CursorConcurrency::READONLY);
     }
 
@@ -161,6 +172,7 @@ mod tests {
             prepared_handle: 12,
             negotiated_scroll: CursorScrollOption::STATIC,
             negotiated_concurrency: CursorConcurrency::OPTCCVAL,
+            status: CursorStatus::Succeeded,
         };
         let cloned = resp.clone();
         assert_eq!(resp, cloned);
