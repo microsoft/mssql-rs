@@ -9,13 +9,23 @@ keywords = ["sql-server", "tds", "mssql", "database", "async"]
 categories = ["database", "network-programming"]
 
 [features]
-default = ["integrated-auth"]
+default = ["integrated-auth", "tls-schannel-direct-on-windows"]
 # Windows SSPI (Security Support Provider Interface) for integrated authentication
 sspi = []
 # Unix GSSAPI (Kerberos) for integrated authentication
 gssapi = []
 # Enable both SSPI and GSSAPI for cross-platform integrated authentication
 integrated-auth = ["sspi", "gssapi"]
+# Use the in-tree Schannel-direct TLS engine (Windows-only effect; on
+# non-Windows targets this feature is a no-op because the win_tls module
+# itself is cfg(windows) gated).
+tls-schannel-direct = []
+# Default-on bundle that routes the dispatcher to the Schannel-direct
+# engine on Windows. Kept as a separate feature so downstream crates can
+# disable it (`default-features = false`) to fall back to native-tls
+# unconditionally — useful as an escape hatch if the rewrite needs to
+# be temporarily disabled in production.
+tls-schannel-direct-on-windows = ["tls-schannel-direct"]
 
 
 [lints]
@@ -54,6 +64,15 @@ half = "2.7.1"
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["namedpipeapi", "winerror", "winbase"] }
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Wdk_System_SystemServices"] }
+# Low-level raw SSPI / Schannel / CryptoAPI bindings for the win_tls module.
+# Pulled in directly because the `windows` crate's safe wrappers don't expose
+# the SecBuffer / InitializeSecurityContextW shapes we need verbatim.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+] }
 
 [target.'cfg(unix)'.dependencies]
 # For runtime GSSAPI library detection using dlopen/dlsym
