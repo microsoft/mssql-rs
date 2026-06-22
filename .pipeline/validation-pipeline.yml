@@ -1,7 +1,6 @@
-# CI trigger only on development. Main-branch builds are produced by the
-# Official pipeline (OneBranch/OfficialPythonWheelsBuild.yml) on merge.
-trigger:
-- development
+# PR validation pipeline for internal ADO and GitHub pull requests.
+# Purely a PR pipeline; CI on merge to development is handled by validation-pipeline-ci.yml.
+trigger: none
 
 parameters:
 - name: buildType
