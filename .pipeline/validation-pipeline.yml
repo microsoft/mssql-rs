@@ -29,3 +29,6 @@ stages:
     buildType: ${{ parameters.buildType }}
     RunFuzz: ${{ parameters.RunFuzz }}
     RunLongHaul: ${{ parameters.RunLongHaul }}
+    # PR validation for internal ADO and GitHub PRs. GitHub PRs run in the public
+    # project, which lacks 'Magnitude Test', so exclude the infra stages here.
+    includeInfraStages: false

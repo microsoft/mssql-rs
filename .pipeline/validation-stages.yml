@@ -21,6 +21,11 @@ parameters:
   type: boolean
   default: false
 
+- name: includeInfraStages
+  displayName: Include infra stages (Long-Haul, Private Link Smoke) that require the 'Magnitude Test' service connection
+  type: boolean
+  default: true
+
 stages:
 - stage: Build
   displayName: Build Stage
@@ -486,32 +491,33 @@ stages:
             container: tdslibrs.azurecr.io/import/ubuntu:24.04
             entry: deb-bookworm.sh
 
-# Long-haul BCP test stage (30 minutes)
-- stage: LongHaul
-  displayName: Long-Haul BCP Test (30 min)
-  dependsOn: []
-  condition: eq('${{ parameters.RunLongHaul }}', 'true')
-  jobs:
-  - job: LongHaul_BCP_Test
-    displayName: Long-Haul BCP Test Ubuntu
-    pool:
-      name: RUST-1ES-POOL-WUS3
-      demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
-    variables:
-      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
-    steps:
-      - template: templates/test-longhaul-template.yml
-        parameters:
-          durationSeconds: 1800  # 30 minutes
-          batchSize: 1000
+- ${{ if eq(parameters.includeInfraStages, true) }}:
+  # Long-haul BCP test stage (30 minutes)
+  - stage: LongHaul
+    displayName: Long-Haul BCP Test (30 min)
+    dependsOn: []
+    condition: eq('${{ parameters.RunLongHaul }}', 'true')
+    jobs:
+    - job: LongHaul_BCP_Test
+      displayName: Long-Haul BCP Test Ubuntu
+      pool:
+        name: RUST-1ES-POOL-WUS3
+        demands:
+          - imageOverride -equals RUST-1ES-UBUSLIM
+      variables:
+        CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      steps:
+        - template: templates/test-longhaul-template.yml
+          parameters:
+            durationSeconds: 1800  # 30 minutes
+            batchSize: 1000
 
-# Private-link smoke test for mssql-py-core (non-PR only)
-# Deploys wheel into ACI on trusted VNet, runs pytest suite via managed identity
-- stage: PrivateLink_Smoke
-  displayName: Private Link Smoke Test
-  dependsOn:
-    - Build
-  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
-  jobs:
-    - template: templates/private-link-smoke-template.yml
+  # Private-link smoke test for mssql-py-core (non-PR only)
+  # Deploys wheel into ACI on trusted VNet, runs pytest suite via managed identity
+  - stage: PrivateLink_Smoke
+    displayName: Private Link Smoke Test
+    dependsOn:
+      - Build
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+    jobs:
+      - template: templates/private-link-smoke-template.yml

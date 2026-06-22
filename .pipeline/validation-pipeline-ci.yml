@@ -1,5 +1,7 @@
-# GitHub main CI pipeline. Runs the full validation suite in CI mode when
+# GitHub main CI pipeline. Runs the validation suite in CI mode when
 # microsoft/mssql-rs main is updated. PR validation is handled by validation-pipeline.yml.
+# Runs with internal resource access ('Magnitude Test' available), so the infra
+# stages (Long-Haul, Private Link Smoke) are included.
 trigger:
 - main
 pr: none
@@ -30,3 +32,5 @@ stages:
     buildType: ${{ parameters.buildType }}
     RunFuzz: ${{ parameters.RunFuzz }}
     RunLongHaul: ${{ parameters.RunLongHaul }}
+    # Runs with internal resource access, so keep the infra stages.
+    includeInfraStages: true
