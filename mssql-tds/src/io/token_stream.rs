@@ -8,11 +8,11 @@ use crate::io::packet_reader::TdsPacketReader;
 use crate::query::metadata::ColumnMetadata;
 use crate::token::parsers::TokenParser;
 use crate::token::parsers::{
-    ColMetadataTokenParser, DoneInProcTokenParser, DoneProcTokenParser, DoneTokenParser,
-    EnvChangeTokenParser, ErrorTokenParser, FeatureExtAckTokenParser, FedAuthInfoTokenParser,
-    InfoTokenParser, LoginAckTokenParser, NbcRowTokenParser, OrderTokenParser,
-    ReturnStatusTokenParser, ReturnValueTokenParser, RowTokenParser, SessionStateTokenParser,
-    SspiTokenParser,
+    ColInfoTokenParser, ColMetadataTokenParser, DoneInProcTokenParser, DoneProcTokenParser,
+    DoneTokenParser, EnvChangeTokenParser, ErrorTokenParser, FeatureExtAckTokenParser,
+    FedAuthInfoTokenParser, InfoTokenParser, LoginAckTokenParser, NbcRowTokenParser,
+    OrderTokenParser, ReturnStatusTokenParser, ReturnValueTokenParser, RowTokenParser,
+    SessionStateTokenParser, SspiTokenParser, TabNameTokenParser,
 };
 use crate::token::tokens::{ColMetadataToken, TokenType, Tokens};
 use async_trait::async_trait;
@@ -164,6 +164,8 @@ pub(crate) async fn dispatch_token<R: TdsPacketReader + Send + Sync>(
         TokenParsers::NbcRow(parser) => parser.parse(reader, context).await,
         TokenParsers::ReturnValue(parser) => parser.parse(reader, context).await,
         TokenParsers::SessionState(parser) => parser.parse(reader, context).await,
+        TokenParsers::TabName(parser) => parser.parse(reader, context).await,
+        TokenParsers::ColInfo(parser) => parser.parse(reader, context).await,
         TokenParsers::Sspi(parser) => parser.parse(reader, context).await,
     }
 }
@@ -410,6 +412,8 @@ impl Default for GenericTokenParserRegistry {
             TokenType::SessionState,
             TokenParsers::from(SessionStateTokenParser),
         );
+        internal_registry.insert(TokenType::TabName, TokenParsers::from(TabNameTokenParser));
+        internal_registry.insert(TokenType::ColInfo, TokenParsers::from(ColInfoTokenParser));
         Self {
             parsers: internal_registry,
         }
@@ -440,6 +444,8 @@ pub enum TokenParsers {
     NbcRow(NbcRowTokenParser<GenericDecoder>),
     ReturnValue(ReturnValueTokenParser<GenericDecoder>),
     SessionState(SessionStateTokenParser),
+    TabName(TabNameTokenParser),
+    ColInfo(ColInfoTokenParser),
     Sspi(SspiTokenParser),
 }
 
@@ -472,6 +478,8 @@ impl_from_token_parser!(
     NbcRowTokenParser<GenericDecoder> => NbcRow,
     ReturnValueTokenParser<GenericDecoder> => ReturnValue,
     SessionStateTokenParser => SessionState,
+    TabNameTokenParser => TabName,
+    ColInfoTokenParser => ColInfo,
     SspiTokenParser => Sspi
 );
 
@@ -510,6 +518,8 @@ mod tests {
         assert!(registry.get_parser(&TokenType::NbcRow).is_some());
         assert!(registry.get_parser(&TokenType::ReturnValue).is_some());
         assert!(registry.get_parser(&TokenType::SessionState).is_some());
+        assert!(registry.get_parser(&TokenType::TabName).is_some());
+        assert!(registry.get_parser(&TokenType::ColInfo).is_some());
     }
 
     #[test]
@@ -528,7 +538,7 @@ mod tests {
 
         // Test with an unsupported token type (using a type that's not registered)
         // This tests the negative case
-        let unsupported_type = TokenType::TabName; // This token type is not registered in the default registry
+        let unsupported_type = TokenType::AltMetadata; // This token type is not registered in the default registry
         assert!(registry.get_parser(&unsupported_type).is_none());
     }
 

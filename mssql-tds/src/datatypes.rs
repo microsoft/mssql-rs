@@ -21,6 +21,8 @@ pub mod row_writer;
 pub mod sql_json;
 /// SQL Server character string type with encoding.
 pub mod sql_string;
+/// Table-valued parameter (TVP) types for RPC calls.
+pub mod sql_tvp;
 /// SQL Server `vector` column type.
 pub mod sql_vector;
 /// Wire-level TDS data type identifiers.

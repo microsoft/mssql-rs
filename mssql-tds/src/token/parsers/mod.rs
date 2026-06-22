@@ -48,6 +48,7 @@
 pub(crate) mod common;
 
 // Individual parser modules
+pub(crate) mod col_info_parser;
 pub(crate) mod colmetadata_parser;
 pub(crate) mod done_parser;
 pub(crate) mod envchange_parser;
@@ -63,11 +64,13 @@ pub(crate) mod returnvalue_parser;
 pub(crate) mod row_parser;
 pub(crate) mod session_state_parser;
 pub(crate) mod sspi_parser;
+pub(crate) mod tab_name_parser;
 
 // Re-export TokenParser trait
 pub(crate) use common::TokenParser;
 
 // Re-export all parser types
+pub(crate) use col_info_parser::ColInfoTokenParser;
 pub(crate) use colmetadata_parser::ColMetadataTokenParser;
 pub(crate) use done_parser::{DoneInProcTokenParser, DoneProcTokenParser, DoneTokenParser};
 pub(crate) use envchange_parser::EnvChangeTokenParser;
@@ -83,6 +86,7 @@ pub(crate) use returnvalue_parser::ReturnValueTokenParser;
 pub(crate) use row_parser::RowTokenParser;
 pub(crate) use session_state_parser::SessionStateTokenParser;
 pub(crate) use sspi_parser::SspiTokenParser;
+pub(crate) use tab_name_parser::TabNameTokenParser;
 
 // Fuzzing exports
 #[cfg(fuzzing)]

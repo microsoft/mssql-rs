@@ -8,6 +8,10 @@ use crate::datatypes::column_values::{
     SqlMoney, SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
 };
 use crate::datatypes::sql_json::SqlJson;
+use crate::datatypes::sql_tvp::{
+    TVP_END_TOKEN, TVP_NOMETADATA_TOKEN, TvpTableData, TvpTypeName, write_tvp_column_metadata,
+    write_tvp_order_unique, write_tvp_rows, write_tvp_type_name,
+};
 use crate::datatypes::sql_vector::SqlVector;
 use crate::datatypes::tds_value_serializer::{TdsTypeContext, TdsValueSerializer};
 use crate::{
@@ -108,9 +112,15 @@ pub enum SqlType {
     /// Although SqlVector has dimension & base type information, we also pass it separately so
     /// that we can serialize NULL vector parameters (where SqlVector=None) with correct metadata.
     Vector(Option<SqlVector>, u16, VectorBaseType),
+
+    /// Table-valued parameter (input-only, TDS type `0xF3`).
+    ///
+    /// The type name is always present because the wire format requires it
+    /// even for NULL TVPs. `None` table data encodes a NULL TVP; `Some` with
+    /// an empty row set encodes an empty TVP.
+    Table(TvpTypeName, Option<TvpTableData>),
     // To be added in future
     // Variant
-    // TVP
 }
 
 type NullableTdsType = TdsDataType;
@@ -165,6 +175,7 @@ impl SqlType {
             SqlType::Money(_) => TdsDataType::MoneyN,
             SqlType::SmallMoney(_) => TdsDataType::MoneyN,
             SqlType::Vector(_, _, _) => TdsDataType::Vector,
+            SqlType::Table(_, _) => TdsDataType::SqlTable,
         }
     }
 
@@ -179,7 +190,7 @@ impl SqlType {
 
     /// Convert this SqlType to a ColumnValues (for value serialization) and a TdsTypeContext.
     /// Returns (ColumnValues, TdsTypeContext).
-    fn to_column_value_and_context(
+    pub(crate) fn to_column_value_and_context(
         &self,
         db_collation: &SqlCollation,
     ) -> (ColumnValues, TdsTypeContext) {
@@ -627,6 +638,11 @@ impl SqlType {
                 };
                 (cv, ctx)
             }
+
+            // Table (TVP): input-only, no ColumnValues counterpart. Serialization is
+            // handled by the `serialize_table` short-circuit in `serialize`, so this
+            // arm is a safe fallback that never feeds real wire data.
+            SqlType::Table(_, _) => (ColumnValues::Null, base_ctx),
         }
     }
 
@@ -640,6 +656,14 @@ impl SqlType {
         // but RPC sends raw UTF-8 bytes with TDS type 0xF4.
         if let SqlType::Json(json) = self {
             return self.serialize_json(packet_writer, json).await;
+        }
+
+        // TVP needs special handling: the payload is a whole table (3-part name,
+        // column metadata, and rows), not a single type preamble + value.
+        if let SqlType::Table(type_name, table) = self {
+            return self
+                .serialize_table(packet_writer, db_collation, type_name, table)
+                .await;
         }
 
         // Step 1: Write the RPC type metadata preamble
@@ -659,6 +683,28 @@ impl SqlType {
         &self,
         packet_writer: &mut PacketWriter<'_>,
         db_collation: &SqlCollation,
+    ) -> TdsResult<()> {
+        // RPC parameters carry their precision/scale inside the value itself, so
+        // no overrides are supplied here.
+        self.write_type_info(packet_writer, db_collation, None, None)
+            .await
+    }
+
+    /// Write the TDS `TYPE_INFO` for this type: the type byte followed by its
+    /// length/precision/scale/collation metadata.
+    ///
+    /// Shared by RPC parameter serialization and TVP column metadata. For
+    /// `Decimal`/`Numeric` (precision and scale) and `Time`/`DateTime2`/
+    /// `DateTimeOffset` (scale), the `precision_override`/`scale_override`
+    /// arguments supply metadata that a `None`-valued type template cannot
+    /// carry; when present they take precedence over the value's own
+    /// precision/scale. RPC callers pass `None` for both.
+    pub(crate) async fn write_type_info(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        db_collation: &SqlCollation,
+        precision_override: Option<u8>,
+        scale_override: Option<u8>,
     ) -> TdsResult<()> {
         let nullable_type = self.get_nullable_type();
 
@@ -680,16 +726,17 @@ impl SqlType {
             SqlType::Decimal(opt) | SqlType::Numeric(opt) => {
                 packet_writer.write_byte_async(nullable_type as u8).await?;
                 packet_writer.write_byte_async(DECIMAL_FIXED_SIZE).await?;
-                match opt {
-                    Some(v) => {
-                        packet_writer.write_byte_async(v.precision).await?;
-                        packet_writer.write_byte_async(v.scale).await?;
-                    }
-                    None => {
-                        packet_writer.write_byte_async(1).await?;
-                        packet_writer.write_byte_async(0).await?;
-                    }
-                }
+                // Overrides (used by TVP column metadata, whose templates carry a
+                // `None` value) take precedence over the value's own precision/scale,
+                // falling back to the TDS defaults (precision 1, scale 0).
+                let precision = precision_override
+                    .or_else(|| opt.as_ref().map(|v| v.precision))
+                    .unwrap_or(1);
+                let scale = scale_override
+                    .or_else(|| opt.as_ref().map(|v| v.scale))
+                    .unwrap_or(0);
+                packet_writer.write_byte_async(precision).await?;
+                packet_writer.write_byte_async(scale).await?;
             }
 
             // Money types: type byte + size byte
@@ -728,30 +775,27 @@ impl SqlType {
             // Time: type byte + scale
             SqlType::Time(opt) => {
                 packet_writer.write_byte_async(nullable_type as u8).await?;
-                let scale = match opt {
-                    Some(t) => t.get_scale(),
-                    None => DEFAULT_VARTIME_SCALE,
-                };
+                let scale = scale_override
+                    .or_else(|| opt.as_ref().map(|t| t.get_scale()))
+                    .unwrap_or(DEFAULT_VARTIME_SCALE);
                 packet_writer.write_byte_async(scale).await?;
             }
 
             // DateTime2: type byte + scale
             SqlType::DateTime2(opt) => {
                 packet_writer.write_byte_async(nullable_type as u8).await?;
-                let scale = match opt {
-                    Some(dt2) => dt2.time.get_scale(),
-                    None => DEFAULT_VARTIME_SCALE,
-                };
+                let scale = scale_override
+                    .or_else(|| opt.as_ref().map(|dt2| dt2.time.get_scale()))
+                    .unwrap_or(DEFAULT_VARTIME_SCALE);
                 packet_writer.write_byte_async(scale).await?;
             }
 
             // DateTimeOffset: type byte + scale
             SqlType::DateTimeOffset(opt) => {
                 packet_writer.write_byte_async(nullable_type as u8).await?;
-                let scale = match opt {
-                    Some(dto) => dto.datetime2.time.get_scale(),
-                    None => DEFAULT_VARTIME_SCALE,
-                };
+                let scale = scale_override
+                    .or_else(|| opt.as_ref().map(|dto| dto.datetime2.time.get_scale()))
+                    .unwrap_or(DEFAULT_VARTIME_SCALE);
                 packet_writer.write_byte_async(scale).await?;
             }
 
@@ -905,6 +949,18 @@ impl SqlType {
                 packet_writer.write_u16_async(exact_size).await?;
                 packet_writer.write_byte_async(*base_type as u8).await?;
             }
+
+            // Table (TVP): metadata and rows are written by the dedicated
+            // `serialize_table` path, which short-circuits in `serialize` before
+            // this method is reached. A TVP is never a column type within another
+            // TVP, so `write_type_info` is never legitimately called on it either.
+            SqlType::Table(_, _) => {
+                return Err(Error::ImplementationError(
+                    "TVP serialization is not handled by write_type_info; \
+                     it is dispatched via serialize_table"
+                        .to_string(),
+                ));
+            }
         }
 
         Ok(())
@@ -943,6 +999,50 @@ impl SqlType {
                 packet_writer.write_u64_async(PLP_NULL).await?;
             }
         }
+        Ok(())
+    }
+
+    /// Serialize a Table-Valued Parameter (TDS type `0xF3`).
+    ///
+    /// Writes the type byte, the three-part type name, then either the NULL-TVP
+    /// encoding (`TVP_NOMETADATA` column count followed by two end tokens) or the
+    /// full column metadata, optional order/unique hints, and row data. This is
+    /// dispatched from [`serialize`](Self::serialize) and replaces the generic
+    /// type-preamble + value path, which does not fit a tabular payload.
+    async fn serialize_table(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        db_collation: &SqlCollation,
+        type_name: &TvpTypeName,
+        table: &Option<TvpTableData>,
+    ) -> TdsResult<()> {
+        // Type byte (0xF3) and the three-part name are always present, even for
+        // a NULL TVP.
+        type_name.validate()?;
+        packet_writer
+            .write_byte_async(TdsDataType::SqlTable as u8)
+            .await?;
+        write_tvp_type_name(packet_writer, type_name).await?;
+
+        match table {
+            // NULL TVP: TVP_NOMETADATA column count, then two end tokens (end of
+            // optional metadata, end of row set).
+            None => {
+                packet_writer.write_u16_async(TVP_NOMETADATA_TOKEN).await?;
+                packet_writer.write_byte_async(TVP_END_TOKEN).await?;
+                packet_writer.write_byte_async(TVP_END_TOKEN).await?;
+            }
+            // Non-NULL TVP: column metadata, optional order/unique block (which
+            // also writes the end-of-metadata token), then the row set (which
+            // writes the end-of-rows token).
+            Some(data) => {
+                data.validate()?;
+                write_tvp_column_metadata(packet_writer, &data.columns, db_collation).await?;
+                write_tvp_order_unique(packet_writer, &data.order_hints).await?;
+                write_tvp_rows(packet_writer, &data.columns, &data.rows, db_collation).await?;
+            }
+        }
+
         Ok(())
     }
 

@@ -136,6 +136,29 @@ pub struct MultiPartName {
     pub(crate) table_name: String,
 }
 
+impl MultiPartName {
+    /// Server name component, if provided by the server.
+    pub fn server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
+    }
+
+    /// Catalog (database) name component, if provided by the server.
+    pub fn catalog_name(&self) -> Option<&str> {
+        self.catalog_name.as_deref()
+    }
+
+    /// Schema name component, if provided by the server.
+    pub fn schema_name(&self) -> Option<&str> {
+        self.schema_name.as_deref()
+    }
+
+    /// Table name component. Always present when a `MultiPartName` is returned
+    /// (may be empty if the server sent an empty string).
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // For column encryption metadata which is not implemented yet.
 pub(crate) struct ColumnEncryptionMetadata {
@@ -346,6 +369,31 @@ mod tests {
     }
 
     #[test]
+    fn test_get_precision_varlen_precision_scale() {
+        let metadata = create_test_column_metadata(
+            0x00,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::DecimalN, 18, 38, 4),
+        );
+        assert_eq!(metadata.get_precision(), Some(38));
+    }
+
+    #[test]
+    fn test_get_precision_varlen_scale_only_is_none() {
+        let metadata = create_test_column_metadata(
+            0x00,
+            TypeInfoVariant::VarLenScale(VariableLengthTypes::TimeN, 7),
+        );
+        assert_eq!(metadata.get_precision(), None);
+    }
+
+    #[test]
+    fn test_get_precision_none() {
+        let metadata =
+            create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert_eq!(metadata.get_precision(), None);
+    }
+
+    #[test]
     fn test_get_collation_varlen_string() {
         let collation = SqlCollation {
             info: 0,
@@ -404,6 +452,29 @@ mod tests {
         assert!(multi_part.server_name.is_none());
         assert!(multi_part.catalog_name.is_none());
         assert!(multi_part.schema_name.is_none());
+    }
+
+    #[test]
+    fn test_multi_part_name_accessors() {
+        let multi_part = MultiPartName {
+            server_name: Some("server".to_string()),
+            catalog_name: Some("catalog".to_string()),
+            schema_name: Some("dbo".to_string()),
+            table_name: "users".to_string(),
+        };
+        assert_eq!(multi_part.server_name(), Some("server"));
+        assert_eq!(multi_part.catalog_name(), Some("catalog"));
+        assert_eq!(multi_part.schema_name(), Some("dbo"));
+        assert_eq!(multi_part.table_name(), "users");
+    }
+
+    #[test]
+    fn test_multi_part_name_accessors_default() {
+        let multi_part = MultiPartName::default();
+        assert_eq!(multi_part.server_name(), None);
+        assert_eq!(multi_part.catalog_name(), None);
+        assert_eq!(multi_part.schema_name(), None);
+        assert_eq!(multi_part.table_name(), "");
     }
 
     #[test]

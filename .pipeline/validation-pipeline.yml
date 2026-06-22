@@ -152,7 +152,7 @@ stages:
         parameters:
           architecture: ARM64
           buildType: ${{ parameters.buildType }}
-          testFilter: -E 'not (test(query_processing_driver) | test(query_result) | test(connectivity) | test(transaction) | test(rpc_results) | test(timeout_and_cancel) | test(rpc_datatypes) | test(client_based_iterators) | test(connect_fetch_multiple_packets) | test(iter_rows) | test(bulk_copy) | test(transport_protocols) | test(vector_integration_tests) | test(no_protocol_resolution) | test(multi_subnet_failover) | test(encryption_tests) | binary(test_tls_handshake))'
+          testFilter: -E 'not (test(query_processing_driver) | test(query_result) | test(connectivity) | test(transaction) | test(rpc_results) | test(timeout_and_cancel) | test(rpc_datatypes) | test(client_based_iterators) | test(connect_fetch_multiple_packets) | test(iter_rows) | test(bulk_copy) | test(transport_protocols) | test(vector_integration_tests) | test(no_protocol_resolution) | test(multi_subnet_failover) | test(encryption_tests) | binary(test_tls_handshake) | binary(test_tvp) | binary(test_cursor_ops))'
           additionalPythonTestArgs: '--skip-integration'
       - template: templates/build-template-alpine.yml
         parameters:

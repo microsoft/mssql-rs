@@ -441,6 +441,43 @@ impl PyCoreConnection {
         context.tds_authentication_method = transformed.method;
         context.access_token = transformed.access_token;
 
+        // Optional Entra ID token factory provided by Python (e.g. mssql-python
+        // wires this up for ActiveDirectoryServicePrincipal to acquire a JWT
+        // via azure-identity during the FedAuth handshake). The factory is
+        // registered under the resolved auth method; mssql-tds dispatches to
+        // it via `ClientContext::entra_id_token_factory()`.
+        if let Some(factory_obj) = dict.get_item("entra_id_token_factory")?
+            && !factory_obj.is_none()
+        {
+            if !factory_obj.is_callable() {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "entra_id_token_factory must be a callable (e.g., a function) that returns an access token",
+                ));
+            }
+
+            let factory = crate::python_entra_token_factory::PythonEntraIdTokenFactory::new(
+                factory_obj.unbind(),
+            );
+            context
+                .auth_method_map
+                .insert(context.tds_authentication_method.clone(), Box::new(factory));
+
+            // For factory-based AD methods (ServicePrincipal, Password) the
+            // login-packet user_name/password fields are not serialized on the
+            // wire: the factory captures the credentials itself and delivers a
+            // JWT during FedAuth. Drop them from ClientContext so the
+            // client_secret does not outlive the registration any longer than
+            // necessary.
+            if matches!(
+                context.tds_authentication_method,
+                mssql_tds::connection::client_context::TdsAuthenticationMethod::ActiveDirectoryServicePrincipal
+                    | mssql_tds::connection::client_context::TdsAuthenticationMethod::ActiveDirectoryPassword
+            ) {
+                context.user_name = String::new();
+                context.password = String::new();
+            }
+        }
+
         // Set library_name to "mssql-python" for Python driver
         context.library_name = "mssql-python".to_string();
 
