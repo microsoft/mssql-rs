@@ -8,8 +8,8 @@ use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::ClientContext;
 use crate::connection::session_recovery::RecoveryContext;
 use crate::cursor::{
-    CursorConcurrency, CursorOpenResponse, CursorPrepExecResponse, CursorPrepareResponse,
-    CursorScrollOption, FetchDirection,
+    CursorConcurrency, CursorOpenResponse, CursorOperation, CursorOptionCode, CursorOptionValue,
+    CursorPrepExecResponse, CursorPrepareResponse, CursorScrollOption, FetchDirection,
 };
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
@@ -1575,6 +1575,173 @@ impl TdsClient {
 
         let rpc = SqlRpc::new(
             RpcType::ProcId(RpcProcs::CursorClose),
+            Some(params),
+            None,
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        let server_errors = self.drain_stream().await?;
+        self.execution_context.set_has_open_batch(false);
+        if !server_errors.is_empty() {
+            return Err(crate::error::Error::from_sql_errors(server_errors));
+        }
+        Ok(())
+    }
+
+    /// Performs a positioned operation on the current fetch buffer of an open
+    /// cursor (`sp_cursor`, RPC ID 1).
+    ///
+    /// Supports positioned `UPDATE` / `DELETE` / `INSERT` (and `LOCK`,
+    /// `REFRESH`, `SETPOSITION`) via [`CursorOperation`]. The `values` are the
+    /// column values for `UPDATE` / `INSERT`, supplied as **named** parameters
+    /// whose names are the target columns prefixed with `@` (e.g. `@Name`);
+    /// pass an empty vector for `DELETE` / `LOCK`. `rownum` selects the 1-based
+    /// row within the fetch buffer (`0` targets all rows). `table` names the
+    /// target table when the cursor's SELECT joins multiple tables; pass `""`
+    /// to default to the first table in the FROM clause.
+    ///
+    /// Requires an updatable cursor (non-`READONLY` concurrency). A concurrency
+    /// conflict or constraint violation is surfaced as an
+    /// [`Error`](crate::error::Error) carrying the server message.
+    #[allow(clippy::too_many_arguments)] // Matches sp_cursor's positional parameters
+    #[instrument(skip(self, values), level = "info")]
+    pub async fn perform_cursor_operation(
+        &mut self,
+        cursor_id: i32,
+        optype: CursorOperation,
+        rownum: i32,
+        table: &str,
+        values: Vec<RpcParameter>,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        // sp_cursor positional params: cursor, optype, rownum, table. The column
+        // values follow as named (@column) RPC parameters, so no parameter
+        // declaration string is sent (unlike sp_cursoropen).
+        let positional_params = vec![
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(cursor_id))),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::Int(Some(optype.bits() as i32)),
+            ),
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(rownum))),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(table.to_string()))),
+            ),
+        ];
+
+        let user_params = if values.is_empty() {
+            None
+        } else {
+            Some(values)
+        };
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::Cursor),
+            Some(positional_params),
+            user_params,
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        let server_errors = self.drain_stream().await?;
+        self.execution_context.set_has_open_batch(false);
+        if !server_errors.is_empty() {
+            return Err(crate::error::Error::from_sql_errors(server_errors));
+        }
+        Ok(())
+    }
+
+    /// Sets an option on an open cursor (`sp_cursoroption`, RPC ID 8).
+    ///
+    /// Most commonly used to assign a **name** to the cursor
+    /// ([`CursorOptionCode::CursorName`]) so Transact-SQL `WHERE CURRENT OF`
+    /// positioned statements can target it, or to toggle text-pointer handling.
+    /// The `value` variant must match what `code` expects: only
+    /// [`CursorOptionCode::CursorName`] takes a [`CursorOptionValue::String`];
+    /// every other code takes a [`CursorOptionValue::Int`]. A mismatch returns
+    /// a usage error without contacting the server.
+    #[instrument(skip(self), level = "info")]
+    pub async fn set_cursor_option(
+        &mut self,
+        cursor_id: i32,
+        code: CursorOptionCode,
+        value: CursorOptionValue,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        // Validate the value type matches the option code before any server
+        // round-trip, so bad input fails fast.
+        let value_param = match (&value, code.expects_string()) {
+            (CursorOptionValue::String(s), true) => RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(s.clone()))),
+            ),
+            (CursorOptionValue::Int(i), false) => {
+                RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(*i)))
+            }
+            _ => {
+                return Err(UsageError(format!(
+                    "sp_cursoroption code {code:?} expects a {} value",
+                    if code.expects_string() {
+                        "string"
+                    } else {
+                        "integer"
+                    }
+                )));
+            }
+        };
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        // sp_cursoroption positional params: cursor, code, value.
+        let params = vec![
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(cursor_id))),
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(code as i32))),
+            value_param,
+        ];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorOption),
             Some(params),
             None,
             &db_collation,

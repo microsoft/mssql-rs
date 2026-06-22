@@ -53,6 +53,12 @@ impl ColumnMetadata {
     pub fn is_encrypted(&self) -> bool {
         (self.flags & 0x2000) != 0x00
     }
+    /// Column is a key column used in cursor operations (`fKey`, bit 14 of the
+    /// COLMETADATA Flags word). A driver uses this to build positioned-update
+    /// predicates (`WHERE` clauses) for updatable server cursors.
+    pub fn is_key_column(&self) -> bool {
+        (self.flags & 0x4000) != 0x00
+    }
     /// Column uses Partially Length-prefixed (PLP) encoding (e.g., `varchar(max)`).
     pub fn is_plp(&self) -> bool {
         matches!(
@@ -258,6 +264,17 @@ mod tests {
         let metadata =
             create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
         assert!(!metadata.is_encrypted());
+    }
+
+    #[test]
+    fn test_is_key_column() {
+        let metadata =
+            create_test_column_metadata(0x4000, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert!(metadata.is_key_column());
+
+        let metadata =
+            create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert!(!metadata.is_key_column());
     }
 
     #[test]

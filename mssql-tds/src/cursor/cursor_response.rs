@@ -18,8 +18,8 @@ use super::cursor_types::{CursorConcurrency, CursorScrollOption};
 /// type/concurrency values (which may differ from what the caller requested).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorOpenResponse {
-    /// Server-assigned cursor handle. Pass to `cursor_fetch`, `cursor_op`,
-    /// `cursor_option`, and `cursor_close`.
+    /// Server-assigned cursor handle. Pass to `cursor_fetch`,
+    /// `perform_cursor_operation`, `set_cursor_option`, and `cursor_close`.
     pub cursor_id: i32,
     /// Cursor type the server actually granted. May differ from the
     /// requested `scrollopt` if the server downgraded.
