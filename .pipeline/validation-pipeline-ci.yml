@@ -1,7 +1,8 @@
-# CI trigger only on development. Main-branch builds are produced by the
-# Official pipeline (OneBranch/OfficialPythonWheelsBuild.yml) on merge.
+# GitHub main CI pipeline. Runs the full validation suite in CI mode when
+# microsoft/mssql-rs main is updated. PR validation is handled by validation-pipeline.yml.
 trigger:
-- development
+- main
+pr: none
 
 parameters:
 - name: buildType
