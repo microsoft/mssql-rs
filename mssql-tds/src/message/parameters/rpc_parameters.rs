@@ -310,6 +310,7 @@ impl From<&SqlType> for TdsDataType {
             SqlType::DateTime(_) => TdsDataType::DateTime,
             SqlType::Date(_) => TdsDataType::DateN,
             SqlType::Vector(_, _, _) => TdsDataType::Vector,
+            SqlType::Variant(_) => TdsDataType::SsVariant,
             SqlType::Table(_, _) => TdsDataType::SqlTable,
         }
     }
@@ -352,6 +353,11 @@ mod tests {
             // Sibling fix: SqlType::Char / SqlType::NChar must produce `char(N)` / `nchar(N)`.
             (SqlType::Char(None, 10), "char(10)"),
             (SqlType::NChar(None, 25), "nchar(25)"),
+            // sql_variant declares as `sql_variant` with no length suffix.
+            (
+                SqlType::Variant(Box::new(SqlType::Int(Some(1)))),
+                "sql_variant",
+            ),
         ];
         for (sql_type, expected) in cases {
             let rpc_param = RpcParameter::get_sql_name(&sql_type)
