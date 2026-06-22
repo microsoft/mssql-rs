@@ -12,7 +12,7 @@ use common::{begin_connection, build_tcp_datasource};
 use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
 use mssql_tds::cursor::{
     CursorConcurrency, CursorOperation, CursorOptionCode, CursorOptionValue, CursorScrollOption,
-    CursorStatus, FetchDirection,
+    CursorStatus, FetchDirection, FetchStatus,
 };
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sqltypes::SqlType;
@@ -1625,5 +1625,80 @@ async fn cursor_prepare_reports_succeeded_status() {
         .cursor_unprepare(resp.prepared_handle, None, None)
         .await
         .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+// --- Per-row rowstat / FetchStatus (Gap 3) ---
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_rowstat_succeeded() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 5).await;
+
+    let resp = client
+        .cursor_open(
+            "SELECT id, name, value FROM #ct ORDER BY id",
+            CursorScrollOption::KEYSET_DRIVEN,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let cursor_id = resp.cursor_id;
+
+    client
+        .cursor_fetch(cursor_id, FetchDirection::NEXT, 0, 5, None, None)
+        .await
+        .unwrap();
+
+    // next_cursor_row splits the hidden trailing rowstat column off each row.
+    let mut ids = Vec::new();
+    while let Some((row, status)) = client.next_cursor_row().await.unwrap() {
+        // Unchanged keyset rows fetch successfully.
+        assert!(
+            status.contains(FetchStatus::SUCCEEDED),
+            "expected SUCCEEDED rowstat, got {status:?}"
+        );
+        // Only id, name, value remain after the rowstat is stripped.
+        assert_eq!(
+            row.len(),
+            3,
+            "rowstat column should be stripped from the row"
+        );
+        if let ColumnValues::Int(id) = row[0] {
+            ids.push(id);
+        }
+    }
+    client.close_query().await.unwrap();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+
+    client.cursor_close(cursor_id, None, None).await.unwrap();
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn next_cursor_row_rejects_non_cursor_result() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 2).await;
+
+    // An ordinary query result has no trailing rowstat column, so next_cursor_row
+    // must refuse to strip a real data column.
+    client
+        .execute("SELECT id FROM #ct ORDER BY id".to_string(), None, None)
+        .await
+        .unwrap();
+    let result = client.next_cursor_row().await;
+    assert!(
+        result.is_err(),
+        "next_cursor_row on a normal result set must error"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("rowstat"),
+        "error should mention rowstat: {err_msg}"
+    );
+    client.close_query().await.unwrap();
     client.close_connection().await.unwrap();
 }

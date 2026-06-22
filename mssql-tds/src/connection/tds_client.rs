@@ -10,7 +10,7 @@ use crate::connection::session_recovery::RecoveryContext;
 use crate::cursor::{
     CursorConcurrency, CursorOpenResponse, CursorOperation, CursorOptionCode, CursorOptionValue,
     CursorPrepExecResponse, CursorPrepareResponse, CursorScrollOption, CursorStatus,
-    FetchDirection,
+    FetchDirection, FetchStatus,
 };
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
@@ -1578,6 +1578,56 @@ impl TdsClient {
             self.execution_context.set_has_open_batch(true);
         }
         Ok(())
+    }
+
+    /// Reads the next row from an open cursor's fetch buffer, splitting off the
+    /// hidden trailing `rowstat` column and decoding it as a [`FetchStatus`].
+    ///
+    /// `sp_cursorfetch` appends a hidden `int` `rowstat` column to every row
+    /// (see [`cursor_fetch`](Self::cursor_fetch)). This method strips that
+    /// column from the returned data and decodes it, so a driver can report
+    /// per-row state (`SQL_ROW_DELETED` / `UPDATED` / `ADDED`) for keyset and
+    /// dynamic cursors. Use it instead of [`next_row`](ResultSet::next_row) when
+    /// consuming a cursor fetch.
+    ///
+    /// Returns `Ok(None)` at the end of the fetch buffer. The data columns are
+    /// returned without the `rowstat`, though
+    /// [`get_metadata`](ResultSet::get_metadata) still includes its descriptor.
+    /// Returns a usage error if the current result set is not a cursor fetch
+    /// (no trailing `rowstat` column).
+    #[instrument(skip(self), level = "info")]
+    pub async fn next_cursor_row(&mut self) -> TdsResult<Option<(Vec<ColumnValues>, FetchStatus)>> {
+        // Guard: only valid on an sp_cursorfetch result, whose last column is the
+        // hidden `rowstat`. Refuse to strip a real column from a normal result.
+        let has_rowstat = self
+            .get_metadata()
+            .last()
+            .map(|c| c.column_name.eq_ignore_ascii_case("rowstat"))
+            .unwrap_or(false);
+        if !has_rowstat {
+            return Err(UsageError(
+                "next_cursor_row requires a cursor fetch result with a trailing rowstat column"
+                    .to_string(),
+            ));
+        }
+
+        let Some(mut row) = self.next_row().await? else {
+            return Ok(None);
+        };
+        let rowstat = row.pop().ok_or_else(|| {
+            crate::error::Error::ProtocolError(
+                "cursor fetch row is missing its trailing rowstat column".to_string(),
+            )
+        })?;
+        let bits = match rowstat {
+            ColumnValues::Int(v) => v as u32,
+            other => {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "expected an INT rowstat column at the end of a cursor fetch row, got {other:?}"
+                )));
+            }
+        };
+        Ok(Some((row, FetchStatus::from_bits_truncate(bits))))
     }
 
     /// Closes a server cursor and releases server resources (`sp_cursorclose`, RPC ID 9).

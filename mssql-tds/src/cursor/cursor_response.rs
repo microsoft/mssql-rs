@@ -157,12 +157,14 @@ mod tests {
             status: CursorStatus::Succeeded,
         };
         assert_eq!(resp.prepared_handle, 77);
-        assert!(resp
-            .negotiated_scroll
-            .contains(CursorScrollOption::FORWARD_ONLY));
-        assert!(resp
-            .negotiated_scroll
-            .contains(CursorScrollOption::AUTO_CLOSE));
+        assert!(
+            resp.negotiated_scroll
+                .contains(CursorScrollOption::FORWARD_ONLY)
+        );
+        assert!(
+            resp.negotiated_scroll
+                .contains(CursorScrollOption::AUTO_CLOSE)
+        );
         assert_eq!(resp.negotiated_concurrency, CursorConcurrency::READONLY);
     }
 
