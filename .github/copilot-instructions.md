@@ -1,4 +1,4 @@
-# Copilot Instructions — mssql-tds
+# Copilot Instructions — mssql-rs
 
 ## Project Overview
 
@@ -100,7 +100,6 @@ Every `.rs` file must start with:
 ### Branches
 
 - Feature branches: `dev/<developer>/<feature-name>`
-- Integration branch: `development`
 - Default branch: `main`
 
 ### Pre-Commit Hook
