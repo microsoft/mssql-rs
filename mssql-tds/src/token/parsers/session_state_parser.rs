@@ -306,7 +306,7 @@ mod tests {
         // Regression: a 0xFF-encoded state_len near u32::MAX previously triggered
         // `bytes_read + state_len` overflow in the bounds check.
         let mut bytes = Vec::new();
-        let total_len: u32 = 11; // u32 total_length (4) + seq(4) + status(1) + state_id(1) + len_byte(1)
+        let total_len: u32 = 11; // bytes after total_length: seq(4) + status(1) + state_id(1) + len_byte(1) + extended_len(4)
         bytes.extend_from_slice(&total_len.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes()); // sequence_number
         bytes.push(0x00); // status
