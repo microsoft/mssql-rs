@@ -1,0 +1,523 @@
+# Shared validation stages consumed by validation-pipeline.yml (development CI/PR)
+# and validation-pipeline-ci.yml (GitHub main CI). Single source of truth for stages.
+
+parameters:
+- name: buildType
+  displayName: Type of the build to produce
+  type: string
+  values:
+  - Both
+  - Debug
+  - Release
+  default: Both
+
+- name: RunFuzz
+  displayName: Run Fuzz Tests (30 min)
+  type: boolean
+  default: false
+
+- name: RunLongHaul
+  displayName: Run Long-Haul BCP Test (30 min)
+  type: boolean
+  default: false
+
+- name: includeInfraStages
+  displayName: Include infra stages (Long-Haul, Private Link Smoke) that require the 'Magnitude Test' service connection
+  type: boolean
+  default: true
+
+stages:
+- stage: Build
+  displayName: Build Stage
+  condition: and(eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  jobs:
+  - job: Build_Windows
+    displayName: Build Windows
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-Win22-Sql25-1P
+    variables:
+      # For details on this CARGO_TARGET_DIR setting, see https://eng.ms/docs/more/rust/topics/onebranch-workaround
+      CARGO_TARGET_DIR: C:\cargo_target_dir
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+      - template: sql-setup-template.yml
+        parameters:
+          buildTarget: Windows
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Windows
+      - template: install-dependencies.yml
+        parameters:
+          osType: Windows
+      - template: build-template.yml
+        parameters:
+          osType: Windows
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E "not (test(connectivity))"
+      - template: build-python-wheels-template.yml
+        parameters:
+          osType: Windows
+          architecture: x64
+
+  - job: Build_Windows_Arm
+    displayName: Build Windows ARM
+    pool:
+      name: RUST-1ES-POOL-ARM-WUS3
+      demands:
+        - imageOverride -equals RUST-WINSRV-ARM
+    variables:
+      # For details on this CARGO_TARGET_DIR setting, see https://eng.ms/docs/more/rust/topics/onebranch-workaround
+      CARGO_TARGET_DIR: C:\cargo_target_dir
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+      # Add Node.js to PATH for Azure DevOps tasks
+      # Using x64 Node.js via Windows ARM64 emulation since ARM64 Node isn't available
+      - pwsh: ./scripts/setup-nodejs-path.ps1
+        displayName: 'Add Node.js to PATH for ADO tasks'
+
+      # Create Node.js in the agent's externals folder where ADO tasks expect it
+      - pwsh: ./scripts/install-nodejs-to-agent.ps1
+        displayName: 'Install Node.js to agent externals folder'
+
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Windows
+
+      - template: install-dependencies.yml
+        parameters:
+          osType: Windows
+          enableJsDeps: false
+      - template: build-python-wheels-template.yml
+        parameters:
+          osType: Windows
+          architecture: arm64
+          # Python 3.10 excluded - limited ARM64 support
+          pythonVersions:
+          - '3.11'
+          - '3.12'
+          - '3.13'
+          - '3.14'
+
+  - job: Build_Linux
+    displayName: Build Linux
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: build-template-container.yml
+        parameters:
+          architecture: x64
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+          enableJsBuild: true
+          enableJsTest: true
+      - template: build-template-alpine.yml
+        parameters:
+          osType: Linux
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+      - template: build-python-wheels-template.yml
+        parameters:
+          osType: Linux
+          architecture: x64
+      - template: build-python-wheels-template.yml
+        parameters:
+          osType: Alpine
+          architecture: x64
+
+  - job: Build_Linux_ARM
+    displayName: Build Linux ARM
+    pool:
+      name: RUST-1ES-POOL-ARM-WUS3
+      demands:
+        - imageOverride -equals RUST-UBUNTU-ARM64
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+      - script: |
+          .pipeline/scripts/print-disk-info.sh
+        displayName: 'Print debug information about agent'
+
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: build-template-container.yml
+        parameters:
+          architecture: ARM64
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(query_processing_driver) | test(query_result) | test(connectivity) | test(transaction) | test(rpc_results) | test(timeout_and_cancel) | test(rpc_datatypes) | test(client_based_iterators) | test(connect_fetch_multiple_packets) | test(iter_rows) | test(bulk_copy) | test(transport_protocols) | test(vector_integration_tests) | test(no_protocol_resolution) | test(multi_subnet_failover) | test(encryption_tests) | binary(test_tls_handshake) | binary(test_tvp) | binary(test_cursor_ops))'
+          additionalPythonTestArgs: '--skip-integration'
+      - template: build-template-alpine.yml
+        parameters:
+          osType: Linux
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+      - template: build-python-wheels-template.yml
+        parameters:
+          osType: Linux
+          architecture: ARM64
+      - template: build-python-wheels-template.yml
+        parameters:
+          osType: Alpine
+          architecture: ARM64
+  - job: Build_MacOS
+    displayName: Build MacOS
+    pool:
+      name: Azure Pipelines
+      vmImage: macOS-latest
+    variables:
+      # For details on this CARGO_TARGET_DIR setting, see https://eng.ms/docs/more/rust/topics/onebranch-workaround
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: MacOS
+      - template: install-dependencies.yml
+        parameters:
+          osType: MacOS 
+      - template: build-template.yml
+        parameters:
+          osType: MacOS
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+          enableJsBuild: true
+          enableTests: false
+      - template: build-python-wheels-template.yml
+        parameters:
+          osType: MacOS
+          architecture: x64
+
+  - job: Test_MacOS
+    displayName: Test MacOS
+    pool:
+      name: Azure Pipelines
+      vmImage: macOS-latest
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+      TRUST_SERVER_CERTIFICATE: 'true'
+    steps:
+      - template: sql-setup-template.yml
+        parameters:
+          buildTarget: MacOS
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: MacOS
+      - template: install-dependencies.yml
+        parameters:
+          osType: MacOS
+      - template: build-template.yml
+        parameters:
+          osType: MacOS
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+          enableRustBuild: false
+          enableClippy: false
+
+# Kerberos tests for PRs (fast - 2 distros: ubuntu22 + alpine318)
+- stage: Kerberos_Test_PR
+  displayName: Kerberos Test (PR)
+  dependsOn: []  # Run in parallel with Build stage
+  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  jobs:
+    - template: kerberos-test-template.yml
+      parameters:
+        profiles:
+          - ubuntu22
+          - alpine318
+        testTimeout: 45
+        useArchive: false  # PR builds compile from source to validate the PR code
+
+# Kerberos tests for merge (full matrix across all distros)
+- stage: Kerberos_Test_Full
+  displayName: Kerberos Test (Full Matrix)
+  dependsOn:
+    - Build
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  jobs:
+    - template: kerberos-test-template.yml
+      parameters:
+        profiles:
+          - ubuntu22
+          - ubuntu24
+          - alpine318
+          - alpine319
+          - alpine320
+          - alpine321
+          - debian
+          - rhel9
+          - oracle9
+        testTimeout: 120
+        # useArchive: true (default) - uses pre-built nextest archives for faster testing
+
+- stage: Fuzz
+  displayName: Fuzz Testing Stage
+  dependsOn: []
+  condition: eq('${{ parameters.RunFuzz }}', 'true')
+  jobs:
+  - job: Fuzz_TokenStream_Linux
+    displayName: Fuzz Test Token Stream Linux (30 min)
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: install-dependencies.yml
+        parameters:
+          osType: Linux
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 1800
+          fuzzTarget: fuzz_token_stream
+
+  - job: Fuzz_TdsClient_Linux
+    displayName: Fuzz Test TdsClient Linux (30 min)
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: install-dependencies.yml
+        parameters:
+          osType: Linux
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 1800
+          fuzzTarget: fuzz_tds_client
+
+  - job: Fuzz_Additional_Targets_Linux
+    displayName: Fuzz Additional Targets Linux (Serial - 5 min each)
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: install-dependencies.yml
+        parameters:
+          osType: Linux
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_connection_provider
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_api_inputs
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_parameter_encoding
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_connection_provider_network
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_connection_provider_context
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_bulk_copy
+
+- stage: Build_mssql_python
+  dependsOn: []
+  condition: and(eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Build mssql-python
+  jobs:
+  - job: Build_mssql_python_Linux
+    displayName: Build mssql-python (cross-repo)
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: test-mssql-python-template.yml
+
+  - job: Build_mssql_python_MacOS
+    displayName: Build mssql-python macOS (cross-repo)
+    pool:
+      name: Azure Pipelines
+      vmImage: macOS-latest
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: test-mssql-python-macos-template.yml
+
+- stage: Test_alpine
+  dependsOn: 
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test Alpine
+  jobs:
+    - template: test-matrix-template-alpine.yml
+      parameters:
+        artifactName: 'Build_Linux'
+        matrix:
+          Alpine3_18:
+            container: tdslibrs.azurecr.io/import/alpine:3.18
+            entry: alpine.sh
+          Alpine3_19:
+            container: tdslibrs.azurecr.io/import/alpine:3.19
+            entry: alpine.sh
+          Alpine3_20:
+            container: tdslibrs.azurecr.io/import/alpine:3.20
+            entry: alpine.sh
+          Alpine3_21:
+            container: tdslibrs.azurecr.io/import/alpine:3.21
+            entry: alpine.sh
+
+- stage: Test_alpine_arm64
+  dependsOn: 
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test Alpine arm64
+  jobs:
+    - template: test-matrix-template-alpine_arm64.yml
+      parameters:
+        artifactName: 'Build_Linux_ARM'
+        poolName: RUST-1ES-POOL-ARM-WUS3
+        poolImageOverride: imageOverride -equals RUST-UBUNTU-ARM64
+        matrix:
+          Alpine3_18:
+            container: tdslibrs.azurecr.io/import/alpine:3.18
+            entry: alpine.sh
+          Alpine3_19:
+            container: tdslibrs.azurecr.io/import/alpine:3.19
+            entry: alpine.sh
+          Alpine3_20:
+            container: tdslibrs.azurecr.io/import/alpine:3.20
+            entry: alpine.sh
+          Alpine3_21:
+            container: tdslibrs.azurecr.io/import/alpine:3.21
+            entry: alpine.sh
+
+- stage: Test_amd64
+  dependsOn: 
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test Linux amd64
+  jobs:
+    - template: test-matrix-template.yml
+      parameters:
+        matrix:
+          DebianBookworm:
+            container: tdslibrs.azurecr.io/import/debian:bookworm
+            entry: deb-bookworm.sh
+          AzLinux3:
+            container: mcr.microsoft.com/azurelinux/base/core:3.0
+            entry: azlinux3.sh
+          RHEL9:
+            container: tdslibrs.azurecr.io/import/redhat/ubi9:latest
+            entry: rhel.sh
+          OracleLinux9:
+            container: tdslibrs.azurecr.io/import/oraclelinux:9
+            entry: rhel.sh
+          SLES15:
+            container: registry.suse.com/suse/sle15
+            entry: sles.sh
+          Ubuntu22:
+            container: tdslibrs.azurecr.io/import/ubuntu:22.04
+            entry: deb-bookworm.sh
+          Ubuntu24:
+            container: tdslibrs.azurecr.io/import/ubuntu:24.04
+            entry: deb-bookworm.sh
+
+
+- stage: Test_arm64
+  dependsOn: 
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test Linux arm64
+  jobs:
+    - template: test-matrix-template-arm64.yml
+      parameters:
+        matrix:
+          DebianBookworm:
+            container: tdslibrs.azurecr.io/import/debian:bookworm
+            entry: deb-bookworm.sh
+          AzLinux3:
+            container: mcr.microsoft.com/azurelinux/base/core:3.0
+            entry: azlinux3.sh
+          RHEL9:
+            container: tdslibrs.azurecr.io/import/redhat/ubi9:latest
+            entry: rhel.sh
+          OracleLinux9:
+            container: tdslibrs.azurecr.io/import/oraclelinux:9
+            entry: rhel.sh
+          SLES15:
+            container: registry.suse.com/suse/sle15
+            entry: sles.sh
+          Ubuntu22:
+            container: tdslibrs.azurecr.io/import/ubuntu:22.04
+            entry: deb-bookworm.sh
+          Ubuntu24:
+            container: tdslibrs.azurecr.io/import/ubuntu:24.04
+            entry: deb-bookworm.sh
+
+- ${{ if eq(parameters.includeInfraStages, true) }}:
+  # Long-haul BCP test stage (30 minutes)
+  - stage: LongHaul
+    displayName: Long-Haul BCP Test (30 min)
+    dependsOn: []
+    condition: eq('${{ parameters.RunLongHaul }}', 'true')
+    jobs:
+    - job: LongHaul_BCP_Test
+      displayName: Long-Haul BCP Test Ubuntu
+      pool:
+        name: RUST-1ES-POOL-WUS3
+        demands:
+          - imageOverride -equals RUST-1ES-UBUSLIM
+      variables:
+        CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      steps:
+        - template: test-longhaul-template.yml
+          parameters:
+            durationSeconds: 1800  # 30 minutes
+            batchSize: 1000
+
+  # Private-link smoke test for mssql-py-core (non-PR only)
+  # Deploys wheel into ACI on trusted VNet, runs pytest suite via managed identity
+  - stage: PrivateLink_Smoke
+    displayName: Private Link Smoke Test
+    dependsOn:
+      - Build
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+    jobs:
+      - template: private-link-smoke-template.yml

@@ -80,7 +80,7 @@ jobs:
       - task: AzureCLI@2
         displayName: 'Login to ACR and pull images'
         inputs:
-          azureSubscription: 'Magnitude Test'
+          azureSubscription: 'ACR-Tdslibrs'
           scriptType: 'bash'
           scriptLocation: 'inlineScript'
           inlineScript: |
