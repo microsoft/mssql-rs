@@ -1006,11 +1006,10 @@ where
         return Ok(type_info);
     }
 
-    unimplemented!(
-        "Couldnt find the Variable length equivalent of data_type.
-        Is this UDT: {:?}",
-        data_type
-    )
+    Err(Error::ProtocolError(format!(
+        "Unsupported TDS data type in TYPE_INFO stream: {data_type:?}. \
+         No variable-length encoding known for this type."
+    )))
 }
 
 /// Returns `true` if the TDS data type uses Unicode encoding (NVarChar, NChar, NText).
@@ -1154,6 +1153,24 @@ mod tests {
         assert!(TdsDataType::try_from(0xFF).is_err());
         assert!(TdsDataType::try_from(0x00).is_err());
         assert!(TdsDataType::try_from(0x99).is_err());
+    }
+
+    /// Regression: `read_type_info` previously called `unimplemented!()` for data
+    /// types that are neither fixed-length, variable-length, nor PLP (e.g. `SqlTable`
+    /// in a column metadata stream). Fuzzing reproduced this as a panic. The function
+    /// must now return a `ProtocolError` instead.
+    #[tokio::test]
+    async fn read_type_info_rejects_unsupported_type() {
+        use crate::token::parsers::common::test_utils::MockReader;
+
+        let mut reader = MockReader::new(Vec::new());
+        let err = read_type_info(&mut reader, TdsDataType::SqlTable)
+            .await
+            .expect_err("SqlTable has no variable-length encoding; expected ProtocolError");
+        assert!(
+            matches!(err, Error::ProtocolError(_)),
+            "expected ProtocolError, got {err:?}"
+        );
     }
 
     #[test]
