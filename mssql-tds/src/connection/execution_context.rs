@@ -3,7 +3,9 @@
 
 use crate::core::TdsResult;
 use crate::message::login::EnvChangeProperties;
-use crate::token::tokens::{EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType};
+use crate::token::tokens::{
+    EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, SqlCollation,
+};
 use tracing::{info, instrument};
 
 /// Execution context tracks the state of the current connection session.
@@ -41,6 +43,27 @@ impl ExecutionContext {
     /// COMMIT or ROLLBACK.
     pub(crate) fn has_active_transaction(&self) -> bool {
         self.transaction_descriptor != 0
+    }
+
+    /// Returns the current database name if it changed since login via an
+    /// ENVCHANGE token (e.g. a `USE` statement), or `None` if it is still the
+    /// database negotiated at login.
+    pub(crate) fn current_database(&self) -> Option<&str> {
+        self.change_properties.database.as_deref()
+    }
+
+    /// Returns the current language if it changed since login via an
+    /// ENVCHANGE token (e.g. `SET LANGUAGE`), or `None` if it is still the
+    /// language negotiated at login.
+    pub(crate) fn current_language(&self) -> Option<&str> {
+        self.change_properties.language.as_deref()
+    }
+
+    /// Returns the current database collation if it changed since login via an
+    /// ENVCHANGE token, or `None` if it is still the collation negotiated at
+    /// login.
+    pub(crate) fn current_collation(&self) -> Option<SqlCollation> {
+        self.change_properties.database_collation
     }
 
     pub(crate) fn get_outstanding_requests(&self) -> u32 {
@@ -350,6 +373,48 @@ mod tests {
                 .lcid_language_id,
             1033
         );
+    }
+
+    #[test]
+    fn test_current_database_accessor() {
+        let mut ctx = ExecutionContext::new();
+        assert_eq!(ctx.current_database(), None);
+        let change_token = EnvChangeToken {
+            sub_type: EnvChangeTokenSubType::Database,
+            change_type: EnvChangeContainer::from(("master".to_string(), "tempdb".to_string())),
+        };
+        ctx.capture_change_property(&change_token).unwrap();
+        assert_eq!(ctx.current_database(), Some("tempdb"));
+    }
+
+    #[test]
+    fn test_current_language_accessor() {
+        let mut ctx = ExecutionContext::new();
+        assert_eq!(ctx.current_language(), None);
+        let change_token = EnvChangeToken {
+            sub_type: EnvChangeTokenSubType::Language,
+            change_type: EnvChangeContainer::from(("".to_string(), "français".to_string())),
+        };
+        ctx.capture_change_property(&change_token).unwrap();
+        assert_eq!(ctx.current_language(), Some("français"));
+    }
+
+    #[test]
+    fn test_current_collation_accessor() {
+        let mut ctx = ExecutionContext::new();
+        assert_eq!(ctx.current_collation(), None);
+        let collation = SqlCollation {
+            info: 0,
+            lcid_language_id: 1036,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let change_token = EnvChangeToken {
+            sub_type: EnvChangeTokenSubType::SqlCollation,
+            change_type: EnvChangeContainer::from((Some(SqlCollation::default()), Some(collation))),
+        };
+        ctx.capture_change_property(&change_token).unwrap();
+        assert_eq!(ctx.current_collation().unwrap().lcid_language_id, 1036);
     }
 
     #[test]

@@ -709,6 +709,10 @@ impl NetworkTransport {
         if let Some(stream) = self.stream.as_mut() {
             stream.shutdown().await?;
         }
+        // Drop the stream so the transport reports the connection as dead
+        // (`is_connection_dead()`), which connection pools rely on to avoid
+        // handing out a closed connection.
+        self.stream = None;
         Ok(())
     }
 
@@ -1371,6 +1375,10 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
         if let Some(stream) = self.stream.as_mut() {
             stream.shutdown().await?;
         }
+        // Drop the stream so the transport reports the connection as dead
+        // (`is_connection_dead()`), which connection pools rely on to avoid
+        // handing out a closed connection.
+        self.stream = None;
         Ok(())
     }
 

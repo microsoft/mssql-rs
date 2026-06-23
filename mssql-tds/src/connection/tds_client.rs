@@ -261,9 +261,60 @@ impl TdsClient {
         })
     }
 
-    /// Returns the database collation negotiated during login.
+    /// Returns the current database collation.
+    ///
+    /// If the collation changed after login (via an ENVCHANGE token), the
+    /// updated value is returned; otherwise the collation negotiated at login.
     pub fn get_collation(&self) -> SqlCollation {
-        self.negotiated_settings.database_collation
+        self.execution_context
+            .current_collation()
+            .unwrap_or(self.negotiated_settings.database_collation)
+    }
+
+    /// Returns the name of the database the connection is currently using.
+    ///
+    /// Reflects any change made after login (e.g. a `USE` statement, surfaced
+    /// via an ENVCHANGE token); otherwise the database negotiated at login.
+    ///
+    /// Intended for connection-pool consumers that need to match a pooled
+    /// connection to a request or decide whether a reset is required.
+    pub fn database(&self) -> &str {
+        self.execution_context
+            .current_database()
+            .unwrap_or(&self.negotiated_settings.database)
+    }
+
+    /// Returns the language the connection is currently using.
+    ///
+    /// Reflects any change made after login (e.g. `SET LANGUAGE`, surfaced via
+    /// an ENVCHANGE token); otherwise the language negotiated at login.
+    ///
+    /// Intended for connection-pool consumers that need to match a pooled
+    /// connection to a request or decide whether a reset is required.
+    pub fn language(&self) -> &str {
+        self.execution_context
+            .current_language()
+            .unwrap_or(&self.negotiated_settings.language)
+    }
+
+    /// Returns the negotiated TDS packet size, in bytes.
+    ///
+    /// The packet size is fixed for the lifetime of the connection (the server
+    /// rejects mid-session packet-size changes), so this always reflects the
+    /// value negotiated at login.
+    pub fn packet_size(&self) -> u32 {
+        self.negotiated_settings.session_settings.packet_size
+    }
+
+    /// Returns `true` if the underlying connection is known to be dead.
+    ///
+    /// Performs a cheap, non-blocking socket poll. A `false` result means the
+    /// connection is alive or its state is unknown; a `true` result means the
+    /// connection has been closed or broken. This is intended for connection
+    /// pools that need to validate an idle connection before handing it out for
+    /// reuse, without sending a round-trip to the server.
+    pub fn is_connection_dead(&self) -> bool {
+        self.transport.is_connection_dead()
     }
 
     pub(crate) fn get_current_metadata(&self) -> Option<&ColMetadataToken> {
