@@ -48,7 +48,7 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     tracing_init::init_tracing();
 
     // Statically capture the Python version once during module initialization
-    let py_version = m.py().version();
+    let py_version = pyo3::Python::version_str();
     let _ = RUNTIME_DETAILS.set(format!("Python {}", py_version));
 
     // Statically capture the mssql_python driver version during module initialization
