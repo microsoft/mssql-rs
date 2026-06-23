@@ -1,0 +1,113 @@
+# Pipeline to create a PR from GitHub main into the Azure DevOps stable branch.
+# Runs automatically when microsoft/mssql-rs main is updated (resource-repository
+# trigger), and can be triggered manually. Skips PR creation if:
+# - An active PR into stable from the sync branch already exists
+# - There are no changes between GitHub main and stable
+#
+# Prerequisites:
+# - The github.com_microsoft service connection authorized in this project.
+# - The Build Service identity has Contribute + Create branch on this repo and
+#   permission to create pull requests.
+
+trigger: none
+
+pr: none
+
+parameters:
+- name: targetBranch
+  displayName: ADO branch to sync GitHub main into
+  type: string
+  default: stable
+- name: syncBranch
+  displayName: Intermediate ADO branch carrying GitHub main
+  type: string
+  default: sync/github-main-to-stable
+
+resources:
+  repositories:
+  - repository: ghmain
+    type: github
+    name: microsoft/mssql-rs
+    endpoint: github.com_microsoft
+    ref: refs/heads/main
+    trigger:
+      branches:
+        include:
+        - main
+
+pool:
+  name: RUST-1ES-POOL-WUS3
+  demands:
+    - imageOverride -equals RUST-1ES-UBUSLIM
+
+steps:
+# ADO repo: we push the sync branch here and open the PR. persistCredentials lets
+# us push back to origin using System.AccessToken.
+- checkout: self
+  fetchDepth: 0
+  persistCredentials: true
+  path: s/ado
+
+# GitHub repo: authenticated checkout of main via the service connection.
+- checkout: ghmain
+  fetchDepth: 0
+  path: s/gh
+
+- script: |
+    set -euo pipefail
+
+    ADO_DIR="$(Agent.BuildDirectory)/s/ado"
+    GH_DIR="$(Agent.BuildDirectory)/s/gh"
+
+    cd "$ADO_DIR"
+
+    # The GitHub checkout is in detached HEAD, so fetch its commit explicitly by
+    # HEAD; this also brings the object closure into the ADO clone. ADO's
+    # checkout doesn't populate origin/<branch> tracking refs, so capture both
+    # sides from FETCH_HEAD rather than relying on origin/$TARGET_BRANCH.
+    git fetch "$GH_DIR" HEAD
+    GH_MAIN_SHA="$(git rev-parse FETCH_HEAD)"
+    echo "GitHub main is at $GH_MAIN_SHA"
+
+    git fetch origin "$TARGET_BRANCH"
+    TARGET_SHA="$(git rev-parse FETCH_HEAD)"
+    echo "$TARGET_BRANCH is at $TARGET_SHA"
+
+    if git diff --quiet "$TARGET_SHA..$GH_MAIN_SHA"; then
+      echo "No changes between GitHub main and $TARGET_BRANCH. Skipping."
+      exit 0
+    fi
+    echo "Changes detected between GitHub main and $TARGET_BRANCH."
+
+    # Refresh the sync branch to the latest GitHub main so any open PR updates too.
+    git push origin --force "$GH_MAIN_SHA:refs/heads/$SYNC_BRANCH"
+
+    PR_EXISTS=$(az repos pr list \
+      --organization "$(System.TeamFoundationCollectionUri)" \
+      --project "$(System.TeamProject)" \
+      --repository "$(Build.Repository.Name)" \
+      --source-branch "$SYNC_BRANCH" \
+      --target-branch "$TARGET_BRANCH" \
+      --status active \
+      --query "[0].pullRequestId" \
+      --output tsv)
+
+    if [ -n "$PR_EXISTS" ]; then
+      echo "Active PR #$PR_EXISTS for $SYNC_BRANCH -> $TARGET_BRANCH already exists. Branch updated; skipping create."
+      exit 0
+    fi
+
+    echo "No active PR found. Creating PR $SYNC_BRANCH -> $TARGET_BRANCH."
+    az repos pr create \
+      --organization "$(System.TeamFoundationCollectionUri)" \
+      --project "$(System.TeamProject)" \
+      --repository "$(Build.Repository.Name)" \
+      --source-branch "$SYNC_BRANCH" \
+      --target-branch "$TARGET_BRANCH" \
+      --title "Sync GitHub main to $TARGET_BRANCH" \
+      --description $'Sync of GitHub microsoft/mssql-rs main into the '"$TARGET_BRANCH"$' branch.\n\nBefore merging, ensure CI has had a good run on GitHub main.'
+  displayName: Sync GitHub main to stable
+  env:
+    TARGET_BRANCH: ${{ parameters.targetBranch }}
+    SYNC_BRANCH: ${{ parameters.syncBranch }}
+    AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
