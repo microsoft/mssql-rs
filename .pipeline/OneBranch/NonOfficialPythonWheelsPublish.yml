@@ -8,15 +8,13 @@
 # Support:        https://aka.ms/onebranchsup                                   #
 #################################################################################
 
-# CI trigger only on development. Main-branch coverage comes from the
-# Official pipeline (on merge) and the nightly schedule below; no need to
-# also fire NonOfficial on every merge to main.
+# Source repo is GitHub microsoft/mssql-rs. CI runs on merge to main and on
+# PRs into main. Nightly schedule (below) also runs against main.
 trigger:
-- development
+- main
 
 pr:
 - main
-- development
 
 # Nightly builds
 schedules:
