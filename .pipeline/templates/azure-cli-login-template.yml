@@ -1,7 +1,7 @@
 steps:
 - task: AzureCLI@2
   inputs:
-    azureSubscription: 'Magnitude Test'
+    azureSubscription: 'ACR-Tdslibrs'
     scriptType: 'bash'
     scriptLocation: 'inlineScript'
     inlineScript: 'az acr login -n tdslibrs'

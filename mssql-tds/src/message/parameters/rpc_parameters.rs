@@ -5,6 +5,7 @@ use bitflags::bitflags;
 
 use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
 use crate::datatypes::encoder::SqlValueEncoder;
+use crate::datatypes::sql_tvp::TvpTypeName;
 use crate::datatypes::sqltypes::SqlType;
 use crate::{
     core::TdsResult,
@@ -69,20 +70,30 @@ impl RpcParameter {
 
     /// Get the SQL type name from a SqlType value for use in parameter declarations.
     /// This is used to build the parameter list string for sp_executesql and sp_prepare.
+    ///
+    /// Returns [`Error::ImplementationError`] if the `SqlType` maps to a [`TdsDataType`]
+    /// variant that has no SQL declaration name (see [`TdsDataType::get_meta_type_name`]).
     #[cfg(fuzzing)]
-    pub fn get_sql_name(value: &SqlType) -> String {
+    pub fn get_sql_name(value: &SqlType) -> TdsResult<String> {
         Self::get_sql_name_impl(value)
     }
 
     #[cfg(not(fuzzing))]
-    pub(crate) fn get_sql_name(value: &SqlType) -> String {
+    pub(crate) fn get_sql_name(value: &SqlType) -> TdsResult<String> {
         Self::get_sql_name_impl(value)
     }
 
-    fn get_sql_name_impl(value: &SqlType) -> String {
+    fn get_sql_name_impl(value: &SqlType) -> TdsResult<String> {
+        // Table-valued parameters are declared by their schema-qualified table
+        // type name with the mandatory `READONLY` suffix, not via a base TDS
+        // type name (which `get_meta_type_name` would reject for `SqlTable`).
+        if let SqlType::Table(type_name, _) = value {
+            return Ok(Self::format_tvp_sql_name(type_name));
+        }
+
         // For nullable types, we need to check the actual datatype to derive the name.
         let tds_type = TdsDataType::from(value);
-        let type_name = tds_type.get_meta_type_name();
+        let type_name = tds_type.get_meta_type_name()?;
 
         let len_in_metadata = match value {
             SqlType::NVarcharMax(_) | SqlType::VarBinaryMax(_) | SqlType::VarcharMax(_) => {
@@ -105,6 +116,10 @@ impl RpcParameter {
             }
             SqlType::Binary(_, len) => {
                 // For binary types, we need to send the length.
+                len.to_string()
+            }
+            SqlType::Char(_, len) | SqlType::NChar(_, len) => {
+                // For Char and NChar, send the declared length as `char(N)` / `nchar(N)`.
                 len.to_string()
             }
             SqlType::Time(time) => {
@@ -145,10 +160,22 @@ impl RpcParameter {
         };
 
         if len_in_metadata.is_empty() {
-            type_name.to_string()
+            Ok(type_name.to_string())
         } else {
-            format!("{type_name}({len_in_metadata})").to_string()
+            Ok(format!("{type_name}({len_in_metadata})"))
         }
+    }
+
+    /// Formats a table-valued parameter's declaration name for `sp_executesql`,
+    /// e.g. `[dbo].[MyType] READONLY`.
+    ///
+    /// The schema defaults to `dbo` when unspecified (SQL Server's default
+    /// schema). The catalog/database part is intentionally omitted: SQL Server
+    /// forbids cross-database TVP types in parameter declarations. The
+    /// `READONLY` suffix is mandatory for TVP parameters.
+    fn format_tvp_sql_name(type_name: &TvpTypeName) -> String {
+        let schema = type_name.schema_name.as_deref().unwrap_or("dbo");
+        format!("[{schema}].[{}] READONLY", type_name.type_name)
     }
 
     /// Serializes the RPC parameter into the provided `PacketWriter`.
@@ -212,7 +239,10 @@ impl RpcParameter {
 /// Builds a comma-separated list of parameter names and types for the RPC call.
 /// This is used to construct the parameter declaration string for sp_executesql.
 #[cfg(fuzzing)]
-pub fn build_parameter_list_string(named_params: &Vec<RpcParameter>, params_list: &mut String) {
+pub fn build_parameter_list_string(
+    named_params: &Vec<RpcParameter>,
+    params_list: &mut String,
+) -> TdsResult<()> {
     build_parameter_list_string_impl(named_params, params_list)
 }
 
@@ -220,17 +250,20 @@ pub fn build_parameter_list_string(named_params: &Vec<RpcParameter>, params_list
 pub(crate) fn build_parameter_list_string(
     named_params: &Vec<RpcParameter>,
     params_list: &mut String,
-) {
+) -> TdsResult<()> {
     build_parameter_list_string_impl(named_params, params_list)
 }
 
-fn build_parameter_list_string_impl(named_params: &Vec<RpcParameter>, params_list: &mut String) {
+fn build_parameter_list_string_impl(
+    named_params: &Vec<RpcParameter>,
+    params_list: &mut String,
+) -> TdsResult<()> {
     let mut first_param = true;
     for param in named_params {
         if let Some(param_name) = &param.name {
             // TODO: while persisting types with length, we need to compute the length and
             // add the length after the type name. e.g. Nvarchar(200), varchar(100) etc.
-            let param_type_name = RpcParameter::get_sql_name(&param.value);
+            let param_type_name = RpcParameter::get_sql_name(&param.value)?;
             if first_param {
                 first_param = false;
             } else {
@@ -239,6 +272,7 @@ fn build_parameter_list_string_impl(named_params: &Vec<RpcParameter>, params_lis
             params_list.push_str(&format!("{param_name} {param_type_name} "));
         }
     }
+    Ok(())
 }
 
 impl From<&SqlType> for TdsDataType {
@@ -276,6 +310,8 @@ impl From<&SqlType> for TdsDataType {
             SqlType::DateTime(_) => TdsDataType::DateTime,
             SqlType::Date(_) => TdsDataType::DateN,
             SqlType::Vector(_, _, _) => TdsDataType::Vector,
+            SqlType::Variant(_) => TdsDataType::SsVariant,
+            SqlType::Table(_, _) => TdsDataType::SqlTable,
         }
     }
 }
@@ -283,60 +319,96 @@ impl From<&SqlType> for TdsDataType {
 #[cfg(test)]
 mod tests {
     use crate::datatypes::sqltypes::SqlType;
+    use crate::error::Error;
     use crate::message::parameters::rpc_parameters::RpcParameter;
 
     #[test]
     fn test_get_sql_names() {
-        let sql_type = SqlType::NVarchar(None, 50);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "nvarchar(50)".to_string());
+        let decimal =
+            crate::datatypes::decoder::DecimalParts::from_i64(12345, 18, 5).expect("decimal parts");
+        let cases: Vec<(SqlType, &str)> = vec![
+            (SqlType::NVarchar(None, 50), "nvarchar(50)"),
+            (SqlType::VarBinary(None, 100), "varbinary(100)"),
+            (SqlType::Time(None), "time(7)"),
+            (SqlType::DateTimeOffset(None), "datetimeoffset(7)"),
+            (SqlType::DateTime2(None), "datetime2(7)"),
+            (SqlType::NVarcharMax(None), "nvarchar(MAX)"),
+            (SqlType::VarcharMax(None), "varchar(MAX)"),
+            (SqlType::NVarchar(None, 4000), "nvarchar(4000)"),
+            (SqlType::Varchar(None, 4000), "varchar(4000)"),
+            (SqlType::VarBinary(None, 4000), "varbinary(4000)"),
+            (SqlType::VarBinaryMax(None), "varbinary(MAX)"),
+            (
+                SqlType::Vector(
+                    None,
+                    3,
+                    crate::datatypes::sqldatatypes::VectorBaseType::Float32,
+                ),
+                "vector(3)",
+            ),
+            // GH #45: SqlType::Numeric must not error when generating the RPC parameter
+            // declaration. Covers both the value-present and value-absent paths.
+            (SqlType::Numeric(Some(decimal)), "numeric(18,5)"),
+            (SqlType::Numeric(None), "numeric(18, 10)"),
+            // Sibling fix: SqlType::Char / SqlType::NChar must produce `char(N)` / `nchar(N)`.
+            (SqlType::Char(None, 10), "char(10)"),
+            (SqlType::NChar(None, 25), "nchar(25)"),
+            // sql_variant declares as `sql_variant` with no length suffix.
+            (
+                SqlType::Variant(Box::new(SqlType::Int(Some(1)))),
+                "sql_variant",
+            ),
+        ];
+        for (sql_type, expected) in cases {
+            let rpc_param = RpcParameter::get_sql_name(&sql_type)
+                .unwrap_or_else(|e| panic!("get_sql_name failed for {sql_type:?}: {e}"));
+            assert_eq!(rpc_param, expected, "case: {sql_type:?}");
+        }
+    }
 
-        let sql_type = SqlType::VarBinary(None, 100);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "varbinary(100)".to_string());
-
-        let sql_type = SqlType::Time(None);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "time(7)".to_string());
-
-        let sql_type = SqlType::DateTimeOffset(None);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "datetimeoffset(7)".to_string());
-
-        let sql_type = SqlType::DateTime2(None);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "datetime2(7)".to_string());
-
-        let sql_type = SqlType::NVarcharMax(None);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "nvarchar(MAX)".to_string());
-
-        let sql_type = SqlType::VarcharMax(None);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "varchar(MAX)".to_string());
-
-        let sql_type = SqlType::NVarchar(None, 4000);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "nvarchar(4000)".to_string());
-
-        let sql_type = SqlType::Varchar(None, 4000);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "varchar(4000)".to_string());
-
-        let sql_type = SqlType::VarBinary(None, 4000);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "varbinary(4000)".to_string());
-
-        let sql_type = SqlType::VarBinaryMax(None);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "varbinary(MAX)".to_string());
-
-        let sql_type = SqlType::Vector(
-            None,
-            3,
-            crate::datatypes::sqldatatypes::VectorBaseType::Float32,
+    /// `get_sql_name` must surface `Error::ImplementationError` when the underlying
+    /// `TdsDataType` has no SQL declaration name, rather than panicking. There is no
+    /// `SqlType` that currently routes to such a variant, so this is exercised by
+    /// constructing the `TdsDataType` directly.
+    #[test]
+    fn test_get_sql_name_propagates_implementation_error() {
+        use crate::datatypes::sqldatatypes::TdsDataType;
+        let err = TdsDataType::IntN.get_meta_type_name().expect_err(
+            "TdsDataType::IntN should have no SQL declaration name; \
+             update test if you added a mapping.",
         );
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "vector(3)".to_string());
+        assert!(matches!(err, Error::ImplementationError(_)));
+    }
+
+    /// Table-valued parameters are declared by their schema-qualified table type
+    /// name with the mandatory `READONLY` suffix; the schema defaults to `dbo`.
+    #[test]
+    fn test_get_sql_name_tvp() {
+        use crate::datatypes::sql_tvp::TvpTypeName;
+
+        let schema_qualified = SqlType::Table(
+            TvpTypeName::new(Some("sales".to_string()), "OrderList".to_string()),
+            None,
+        );
+        assert_eq!(
+            RpcParameter::get_sql_name(&schema_qualified).unwrap(),
+            "[sales].[OrderList] READONLY"
+        );
+
+        let default_schema = SqlType::Table(TvpTypeName::new(None, "OrderList".to_string()), None);
+        assert_eq!(
+            RpcParameter::get_sql_name(&default_schema).unwrap(),
+            "[dbo].[OrderList] READONLY"
+        );
+    }
+
+    /// A `SqlType::Table` maps to the `SqlTable` TDS wire type.
+    #[test]
+    fn test_tds_data_type_from_table() {
+        use crate::datatypes::sql_tvp::TvpTypeName;
+        use crate::datatypes::sqldatatypes::TdsDataType;
+
+        let value = SqlType::Table(TvpTypeName::new(None, "OrderList".to_string()), None);
+        assert_eq!(TdsDataType::from(&value), TdsDataType::SqlTable);
     }
 }

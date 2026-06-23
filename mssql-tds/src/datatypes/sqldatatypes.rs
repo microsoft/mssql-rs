@@ -97,6 +97,8 @@ pub enum TdsDataType {
     Udt = 0xF0,
     /// XML data (`0xF1`).
     Xml = 0xF1,
+    /// Table-valued parameter (`0xF3`).
+    SqlTable = 0xF3,
     /// JSON data (`0xF4`).
     Json = 0xF4,
     /// Fixed-dimension float vector (`0xF5`).
@@ -110,8 +112,14 @@ pub enum TdsDataType {
 impl TdsDataType {
     /// Returns the T-SQL type name (e.g. `"bigint"`, `"nvarchar"`) used in
     /// stored-procedure `@parameters` metadata.
-    pub fn get_meta_type_name(&self) -> &'static str {
-        match self {
+    ///
+    /// Returns [`Error::ImplementationError`] for variants that have no SQL
+    /// declaration name (sentinels and variable-length nullable wire variants
+    /// that are never produced by `From<&SqlType>`). Such a call indicates a
+    /// programmer error: the caller reached a code path that should be
+    /// unreachable.
+    pub fn get_meta_type_name(&self) -> TdsResult<&'static str> {
+        let name = match self {
             TdsDataType::Int8 => "bigint",
             TdsDataType::Flt8 => "float",
             TdsDataType::Flt4 => "real",
@@ -145,19 +153,26 @@ impl TdsDataType {
             TdsDataType::DateTimeOffsetN => "datetimeoffset",
             TdsDataType::VarChar => "varchar",
             TdsDataType::VarBinary => "varbinary",
-            TdsDataType::Void => todo!(),
-            TdsDataType::IntN => todo!(),
-            TdsDataType::Binary => todo!(),
-            TdsDataType::Char => todo!(),
+            TdsDataType::Char => "char",
             TdsDataType::Decimal => "decimal",
             TdsDataType::Numeric => "numeric",
-            TdsDataType::BitN => todo!(),
-            TdsDataType::NumericN => todo!(),
-            TdsDataType::FltN => todo!(),
-            TdsDataType::MoneyN => todo!(),
-            TdsDataType::DateTimeN => todo!(),
-            TdsDataType::None => todo!(),
-        }
+            TdsDataType::NumericN => "numeric",
+            TdsDataType::Void
+            | TdsDataType::IntN
+            | TdsDataType::Binary
+            | TdsDataType::BitN
+            | TdsDataType::FltN
+            | TdsDataType::MoneyN
+            | TdsDataType::DateTimeN
+            | TdsDataType::SqlTable
+            | TdsDataType::None => {
+                return Err(Error::ImplementationError(format!(
+                    "get_meta_type_name called on TdsDataType::{self:?}, which has no \
+                     SQL declaration name; no SqlType currently maps to this variant"
+                )));
+            }
+        };
+        Ok(name)
     }
 }
 
@@ -208,6 +223,7 @@ impl TryFrom<u8> for TdsDataType {
             0xEF => Ok(TdsDataType::NChar),
             0xF0 => Ok(TdsDataType::Udt),
             0xF1 => Ok(TdsDataType::Xml),
+            0xF3 => Ok(TdsDataType::SqlTable),
             0xF4 => Ok(TdsDataType::Json),
             0xF5 => Ok(TdsDataType::Vector),
             _ => Err(Error::ProtocolError(format(format_args!(
@@ -485,6 +501,143 @@ pub struct TypeInfo {
     pub length: Length,
     /// Category-specific metadata (fixed, variable, partial-length, etc.).
     pub(crate) type_info_variant: TypeInfoVariant,
+}
+
+impl TypeInfo {
+    /// Build a `TypeInfo` for a fixed-length type (e.g., `int`, `bit`, `datetime`).
+    ///
+    /// `length` is derived from the type itself. Returns `Err` if `tds_type` is
+    /// not a fixed-length type.
+    pub fn fixed_len(tds_type: TdsDataType) -> TdsResult<Self> {
+        let t = FixedLengthTypes::try_from(tds_type)?;
+        Ok(Self {
+            tds_type,
+            length: t.get_len(),
+            type_info_variant: TypeInfoVariant::FixedLen(t),
+        })
+    }
+
+    /// Build a `TypeInfo` for a variable-length non-string, non-scale,
+    /// non-precision/scale type (e.g., `intn`, `bigint`, `bigvarbinary`, `image`,
+    /// `uniqueidentifier`, `date`, `sql_variant`).
+    ///
+    /// Returns `Err` for types that the parser routes through
+    /// `var_len_string` / `var_len_scale` / `var_len_precision_scale` /
+    /// `partial_len` / `fixed_len`.
+    pub fn var_len(tds_type: TdsDataType, length: usize) -> TdsResult<Self> {
+        let t = VariableLengthTypes::try_from(tds_type)?;
+        match t {
+            VariableLengthTypes::MoneyN
+            | VariableLengthTypes::DateTimeN
+            | VariableLengthTypes::IntN
+            | VariableLengthTypes::FltN
+            | VariableLengthTypes::Guid
+            | VariableLengthTypes::BitN
+            | VariableLengthTypes::DateN
+            | VariableLengthTypes::Image
+            | VariableLengthTypes::BigVarBinary
+            | VariableLengthTypes::BigBinary
+            | VariableLengthTypes::SsVariant => Ok(Self {
+                tds_type,
+                length,
+                type_info_variant: TypeInfoVariant::VarLen(t, length),
+            }),
+            _ => Err(Error::ProtocolError(format!(
+                "Invalid TDS type {tds_type:?} for var_len constructor"
+            ))),
+        }
+    }
+
+    /// Build a `TypeInfo` for a variable-length string type with optional collation
+    /// (`bigchar`, `bigvarchar`, `text`, `nchar`, `nvarchar`, `ntext`).
+    pub fn var_len_string(
+        tds_type: TdsDataType,
+        length: usize,
+        collation: Option<SqlCollation>,
+    ) -> TdsResult<Self> {
+        let t = VariableLengthTypes::try_from(tds_type)?;
+        match t {
+            VariableLengthTypes::BigChar
+            | VariableLengthTypes::BigVarChar
+            | VariableLengthTypes::Text
+            | VariableLengthTypes::NText
+            | VariableLengthTypes::NChar
+            | VariableLengthTypes::NVarChar => Ok(Self {
+                tds_type,
+                length,
+                type_info_variant: TypeInfoVariant::VarLenString(t, length, collation),
+            }),
+            _ => Err(Error::ProtocolError(format!(
+                "Invalid TDS type {tds_type:?} for var_len_string constructor"
+            ))),
+        }
+    }
+
+    /// Build a `TypeInfo` for a variable-length scale-bearing type
+    /// (`time`, `datetime2`, `datetimeoffset`, `vector`).
+    pub fn var_len_scale(tds_type: TdsDataType, length: usize, scale: u8) -> TdsResult<Self> {
+        let t = VariableLengthTypes::try_from(tds_type)?;
+        match t {
+            VariableLengthTypes::TimeN
+            | VariableLengthTypes::DateTime2N
+            | VariableLengthTypes::DateTimeOffsetN
+            | VariableLengthTypes::Vector => Ok(Self {
+                tds_type,
+                length,
+                type_info_variant: TypeInfoVariant::VarLenScale(t, scale),
+            }),
+            _ => Err(Error::ProtocolError(format!(
+                "Invalid TDS type {tds_type:?} for var_len_scale constructor"
+            ))),
+        }
+    }
+
+    /// Build a `TypeInfo` for a variable-length precision/scale type
+    /// (`decimal`, `numeric`, `decimaln`, `numericn`).
+    pub fn var_len_precision_scale(
+        tds_type: TdsDataType,
+        length: usize,
+        precision: u8,
+        scale: u8,
+    ) -> TdsResult<Self> {
+        let t = VariableLengthTypes::try_from(tds_type)?;
+        match t {
+            VariableLengthTypes::Decimal
+            | VariableLengthTypes::Numeric
+            | VariableLengthTypes::DecimalN
+            | VariableLengthTypes::NumericN => Ok(Self {
+                tds_type,
+                length,
+                type_info_variant: TypeInfoVariant::VarLenPrecisionScale(
+                    t, length, precision, scale,
+                ),
+            }),
+            _ => Err(Error::ProtocolError(format!(
+                "Invalid TDS type {tds_type:?} for var_len_precision_scale constructor"
+            ))),
+        }
+    }
+
+    /// Build a `TypeInfo` for a partially length-prefixed (PLP) type
+    /// (e.g., `varchar(max)`, `nvarchar(max)`, `varbinary(max)`, `xml`).
+    ///
+    /// `length` is the wire-declared length declarator. For streamed/`(max)`
+    /// types this is typically `0xFFFF` (the PLP sentinel), matching what the
+    /// parser produces. XML schema info and UDT info are not exposed by this
+    /// constructor; they remain internal to the parser. Returns `Err` if
+    /// `tds_type` is not a partial-length type.
+    pub fn partial_len(
+        tds_type: TdsDataType,
+        length: usize,
+        collation: Option<SqlCollation>,
+    ) -> TdsResult<Self> {
+        let t = PartialLengthType::try_from(tds_type)?;
+        Ok(Self {
+            tds_type,
+            length,
+            type_info_variant: TypeInfoVariant::PartialLen(t, Some(length), collation, None, None),
+        })
+    }
 }
 
 type Precision = u8;
@@ -907,43 +1060,76 @@ mod tests {
 
     #[test]
     fn test_tds_data_type_get_meta_type_name() {
-        assert_eq!(TdsDataType::Int8.get_meta_type_name(), "bigint");
-        assert_eq!(TdsDataType::Flt8.get_meta_type_name(), "float");
-        assert_eq!(TdsDataType::Flt4.get_meta_type_name(), "real");
-        assert_eq!(TdsDataType::BigBinary.get_meta_type_name(), "binary");
-        assert_eq!(TdsDataType::BigVarBinary.get_meta_type_name(), "varbinary");
-        assert_eq!(TdsDataType::Image.get_meta_type_name(), "image");
-        assert_eq!(TdsDataType::Bit.get_meta_type_name(), "bit");
-        assert_eq!(TdsDataType::Int1.get_meta_type_name(), "tinyint");
-        assert_eq!(TdsDataType::Int2.get_meta_type_name(), "smallint");
-        assert_eq!(TdsDataType::Int4.get_meta_type_name(), "int");
-        assert_eq!(TdsDataType::BigChar.get_meta_type_name(), "char");
-        assert_eq!(TdsDataType::BigVarChar.get_meta_type_name(), "varchar");
-        assert_eq!(TdsDataType::Text.get_meta_type_name(), "text");
-        assert_eq!(TdsDataType::NChar.get_meta_type_name(), "nchar");
-        assert_eq!(TdsDataType::NVarChar.get_meta_type_name(), "nvarchar");
-        assert_eq!(TdsDataType::NText.get_meta_type_name(), "ntext");
-        assert_eq!(TdsDataType::DecimalN.get_meta_type_name(), "decimal");
-        assert_eq!(TdsDataType::Xml.get_meta_type_name(), "xml");
-        assert_eq!(TdsDataType::DateTime.get_meta_type_name(), "datetime");
-        assert_eq!(TdsDataType::DateTim4.get_meta_type_name(), "smalldatetime");
-        assert_eq!(TdsDataType::Money.get_meta_type_name(), "money");
-        assert_eq!(TdsDataType::Money4.get_meta_type_name(), "smallmoney");
-        assert_eq!(TdsDataType::Guid.get_meta_type_name(), "uniqueidentifier");
-        assert_eq!(TdsDataType::SsVariant.get_meta_type_name(), "sql_variant");
-        assert_eq!(TdsDataType::Udt.get_meta_type_name(), "udt");
-        assert_eq!(TdsDataType::Json.get_meta_type_name(), "json");
-        assert_eq!(TdsDataType::DateN.get_meta_type_name(), "date");
-        assert_eq!(TdsDataType::TimeN.get_meta_type_name(), "time");
-        assert_eq!(TdsDataType::DateTime2N.get_meta_type_name(), "datetime2");
-        assert_eq!(
-            TdsDataType::DateTimeOffsetN.get_meta_type_name(),
-            "datetimeoffset"
-        );
-        assert_eq!(TdsDataType::VarChar.get_meta_type_name(), "varchar");
-        assert_eq!(TdsDataType::VarBinary.get_meta_type_name(), "varbinary");
-        assert_eq!(TdsDataType::Decimal.get_meta_type_name(), "decimal");
-        assert_eq!(TdsDataType::Numeric.get_meta_type_name(), "numeric");
+        let cases = [
+            (TdsDataType::Int8, "bigint"),
+            (TdsDataType::Flt8, "float"),
+            (TdsDataType::Flt4, "real"),
+            (TdsDataType::BigBinary, "binary"),
+            (TdsDataType::BigVarBinary, "varbinary"),
+            (TdsDataType::Image, "image"),
+            (TdsDataType::Bit, "bit"),
+            (TdsDataType::Int1, "tinyint"),
+            (TdsDataType::Int2, "smallint"),
+            (TdsDataType::Int4, "int"),
+            (TdsDataType::BigChar, "char"),
+            (TdsDataType::BigVarChar, "varchar"),
+            (TdsDataType::Text, "text"),
+            (TdsDataType::NChar, "nchar"),
+            (TdsDataType::NVarChar, "nvarchar"),
+            (TdsDataType::NText, "ntext"),
+            (TdsDataType::DecimalN, "decimal"),
+            (TdsDataType::NumericN, "numeric"),
+            (TdsDataType::Xml, "xml"),
+            (TdsDataType::DateTime, "datetime"),
+            (TdsDataType::DateTim4, "smalldatetime"),
+            (TdsDataType::Money, "money"),
+            (TdsDataType::Money4, "smallmoney"),
+            (TdsDataType::Guid, "uniqueidentifier"),
+            (TdsDataType::SsVariant, "sql_variant"),
+            (TdsDataType::Udt, "udt"),
+            (TdsDataType::Json, "json"),
+            (TdsDataType::DateN, "date"),
+            (TdsDataType::TimeN, "time"),
+            (TdsDataType::DateTime2N, "datetime2"),
+            (TdsDataType::DateTimeOffsetN, "datetimeoffset"),
+            (TdsDataType::VarChar, "varchar"),
+            (TdsDataType::VarBinary, "varbinary"),
+            (TdsDataType::Decimal, "decimal"),
+            (TdsDataType::Numeric, "numeric"),
+            (TdsDataType::Char, "char"),
+        ];
+        for (variant, expected) in cases {
+            assert_eq!(variant.get_meta_type_name().unwrap(), expected);
+        }
+    }
+
+    /// Documents the contract for [`TdsDataType`] variants that intentionally have no
+    /// meta type name. None of these are produced by `From<&SqlType> for TdsDataType`, so
+    /// they are unreachable from the RPC parameter declaration path; the function returns
+    /// [`Error::ImplementationError`] for them. If a future `SqlType` ever maps to one of
+    /// these, [`TdsDataType::get_meta_type_name`] must be updated and this list pruned.
+    #[test]
+    fn test_tds_data_type_get_meta_type_name_unsupported_variants() {
+        let unsupported = [
+            TdsDataType::Void,
+            TdsDataType::IntN,
+            TdsDataType::Binary,
+            TdsDataType::BitN,
+            TdsDataType::FltN,
+            TdsDataType::MoneyN,
+            TdsDataType::DateTimeN,
+            TdsDataType::None,
+        ];
+        for variant in unsupported {
+            let err = variant.get_meta_type_name().expect_err(&format!(
+                "TdsDataType::{variant:?} unexpectedly returned a meta type name; \
+                 if you implemented it, update this test and the SqlType mapping."
+            ));
+            assert!(
+                matches!(err, Error::ImplementationError(_)),
+                "expected ImplementationError for TdsDataType::{variant:?}, got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -959,6 +1145,7 @@ mod tests {
         assert_eq!(TdsDataType::try_from(0x7F).unwrap(), TdsDataType::Int8);
         assert_eq!(TdsDataType::try_from(0xE7).unwrap(), TdsDataType::NVarChar);
         assert_eq!(TdsDataType::try_from(0xF1).unwrap(), TdsDataType::Xml);
+        assert_eq!(TdsDataType::try_from(0xF3).unwrap(), TdsDataType::SqlTable);
         assert_eq!(TdsDataType::try_from(0xF4).unwrap(), TdsDataType::Json);
     }
 
@@ -1146,7 +1333,7 @@ mod tests {
     // Vector-specific tests
     #[test]
     fn test_vector_type_meta_name() {
-        assert_eq!(TdsDataType::Vector.get_meta_type_name(), "vector");
+        assert_eq!(TdsDataType::Vector.get_meta_type_name().unwrap(), "vector");
     }
 
     #[test]
@@ -1344,5 +1531,183 @@ mod tests {
                 "{tds_type:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_type_info_fixed_len_constructor() {
+        let ti = TypeInfo::fixed_len(TdsDataType::Int4).unwrap();
+        assert_eq!(ti.tds_type, TdsDataType::Int4);
+        assert_eq!(ti.length, 4);
+        assert!(matches!(
+            ti.type_info_variant,
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4)
+        ));
+    }
+
+    #[test]
+    fn test_type_info_fixed_len_rejects_non_fixed() {
+        assert!(TypeInfo::fixed_len(TdsDataType::NVarChar).is_err());
+    }
+
+    #[test]
+    fn test_type_info_var_len_constructor() {
+        let ti = TypeInfo::var_len(TdsDataType::IntN, 4).unwrap();
+        assert_eq!(ti.tds_type, TdsDataType::IntN);
+        assert_eq!(ti.length, 4);
+        assert!(matches!(
+            ti.type_info_variant,
+            TypeInfoVariant::VarLen(VariableLengthTypes::IntN, 4)
+        ));
+    }
+
+    #[test]
+    fn test_type_info_var_len_rejects_fixed() {
+        assert!(TypeInfo::var_len(TdsDataType::Int4, 4).is_err());
+    }
+
+    #[test]
+    fn test_type_info_var_len_rejects_string_types() {
+        for t in [
+            TdsDataType::BigChar,
+            TdsDataType::BigVarChar,
+            TdsDataType::NChar,
+            TdsDataType::NVarChar,
+            TdsDataType::Text,
+            TdsDataType::NText,
+        ] {
+            assert!(
+                TypeInfo::var_len(t, 10).is_err(),
+                "var_len should reject {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_info_var_len_rejects_scale_and_decimal_types() {
+        for t in [
+            TdsDataType::TimeN,
+            TdsDataType::DateTime2N,
+            TdsDataType::DateTimeOffsetN,
+            TdsDataType::Vector,
+            TdsDataType::Decimal,
+            TdsDataType::Numeric,
+            TdsDataType::DecimalN,
+            TdsDataType::NumericN,
+        ] {
+            assert!(
+                TypeInfo::var_len(t, 10).is_err(),
+                "var_len should reject {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_info_var_len_string_constructor() {
+        let collation = crate::token::tokens::SqlCollation {
+            info: 0,
+            lcid_language_id: 1033,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let ti = TypeInfo::var_len_string(TdsDataType::BigVarChar, 100, Some(collation)).unwrap();
+        assert_eq!(ti.tds_type, TdsDataType::BigVarChar);
+        assert_eq!(ti.length, 100);
+        match ti.type_info_variant {
+            TypeInfoVariant::VarLenString(VariableLengthTypes::BigVarChar, 100, Some(_)) => {}
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_type_info_var_len_string_rejects_non_string_types() {
+        for t in [
+            TdsDataType::IntN,
+            TdsDataType::DateN,
+            TdsDataType::Vector,
+            TdsDataType::DecimalN,
+            TdsDataType::BigVarBinary,
+            TdsDataType::Int4,
+        ] {
+            assert!(
+                TypeInfo::var_len_string(t, 10, None).is_err(),
+                "var_len_string should reject {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_info_var_len_scale_constructor() {
+        let ti = TypeInfo::var_len_scale(TdsDataType::TimeN, 5, 7).unwrap();
+        assert_eq!(ti.tds_type, TdsDataType::TimeN);
+        assert_eq!(ti.length, 5);
+        assert!(matches!(
+            ti.type_info_variant,
+            TypeInfoVariant::VarLenScale(VariableLengthTypes::TimeN, 7)
+        ));
+    }
+
+    #[test]
+    fn test_type_info_var_len_scale_rejects_non_scale_types() {
+        for t in [
+            TdsDataType::IntN,
+            TdsDataType::DateN,
+            TdsDataType::BigVarChar,
+            TdsDataType::DecimalN,
+            TdsDataType::Int4,
+        ] {
+            assert!(
+                TypeInfo::var_len_scale(t, 10, 0).is_err(),
+                "var_len_scale should reject {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_info_var_len_precision_scale_constructor() {
+        let ti = TypeInfo::var_len_precision_scale(TdsDataType::DecimalN, 17, 38, 4).unwrap();
+        assert_eq!(ti.tds_type, TdsDataType::DecimalN);
+        assert_eq!(ti.length, 17);
+        assert!(matches!(
+            ti.type_info_variant,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::DecimalN, 17, 38, 4)
+        ));
+    }
+
+    #[test]
+    fn test_type_info_var_len_precision_scale_rejects_non_decimal_types() {
+        for t in [
+            TdsDataType::IntN,
+            TdsDataType::TimeN,
+            TdsDataType::BigVarChar,
+            TdsDataType::Vector,
+            TdsDataType::Int4,
+        ] {
+            assert!(
+                TypeInfo::var_len_precision_scale(t, 10, 18, 2).is_err(),
+                "var_len_precision_scale should reject {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_info_partial_len_constructor() {
+        let ti = TypeInfo::partial_len(TdsDataType::NVarChar, 0xFFFF, None).unwrap();
+        assert_eq!(ti.tds_type, TdsDataType::NVarChar);
+        assert_eq!(ti.length, 0xFFFF);
+        assert!(matches!(
+            ti.type_info_variant,
+            TypeInfoVariant::PartialLen(
+                PartialLengthType::NVarChar,
+                Some(0xFFFF),
+                None,
+                None,
+                None
+            )
+        ));
+    }
+
+    #[test]
+    fn test_type_info_partial_len_rejects_non_plp() {
+        assert!(TypeInfo::partial_len(TdsDataType::Int4, 0xFFFF, None).is_err());
     }
 }

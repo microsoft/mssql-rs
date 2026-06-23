@@ -109,6 +109,7 @@ mod rpc_datatypes {
             ),
             ("guid", SqlType::Uuid(Some(Uuid::from_str(&guid).unwrap()))),
             ("decimal", SqlType::Decimal(Some(decimal.clone()))),
+            ("numeric", SqlType::Numeric(Some(decimal.clone()))),
             (
                 "smallmoney",
                 SqlType::SmallMoney(Some(SqlSmallMoney { int_val: 12345 })),
@@ -198,6 +199,9 @@ mod rpc_datatypes {
                 ColumnValues::Decimal(value) => {
                     assert_eq!(value, &decimal);
                 }
+                ColumnValues::Numeric(value) => {
+                    assert_eq!(value, &decimal);
+                }
                 ColumnValues::SmallMoney(value) => {
                     assert_eq!(value.int_val, 12345);
                 }
@@ -231,6 +235,7 @@ mod rpc_datatypes {
             ("datetime2", SqlType::DateTime2(None)),
             ("guid", SqlType::Uuid(None)),
             ("decimal", SqlType::Decimal(None)),
+            ("numeric", SqlType::Numeric(None)),
             ("smallmoney", SqlType::SmallMoney(None)),
             ("binary8000", SqlType::Binary(None, 8000)),
             ("money", SqlType::Money(None)),
@@ -819,5 +824,261 @@ mod rpc_datatypes {
             ColumnValues::SmallMoney(sm) => assert_eq!(sm.int_val, 50_000),
             other => panic!("Expected SmallMoney, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // sql_variant RPC round-trips (server actually receives the type)
+    //
+    // A value sent as `SqlType::Variant(inner)` is declared `sql_variant`
+    // on the wire. `SELECT @v` returns a sql_variant column, which the
+    // decoder unwraps back to the inner base type's `ColumnValues`.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn variant_int_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let row = roundtrip_params(
+            &mut client,
+            vec![("v", SqlType::Variant(Box::new(SqlType::Int(Some(42)))))],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::Int(v) => assert_eq!(*v, 42),
+            other => panic!("Expected Int from sql_variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn variant_bigint_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let row = roundtrip_params(
+            &mut client,
+            vec![(
+                "v",
+                SqlType::Variant(Box::new(SqlType::BigInt(Some(9_000_000_000)))),
+            )],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::BigInt(v) => assert_eq!(*v, 9_000_000_000),
+            other => panic!("Expected BigInt from sql_variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn variant_bit_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let row = roundtrip_params(
+            &mut client,
+            vec![("v", SqlType::Variant(Box::new(SqlType::Bit(Some(true)))))],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::Bit(v) => assert!(*v),
+            other => panic!("Expected Bit from sql_variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn variant_uuid_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let guid = "123e4567-e89b-12d3-a456-426614174000";
+        let row = roundtrip_params(
+            &mut client,
+            vec![(
+                "v",
+                SqlType::Variant(Box::new(SqlType::Uuid(Some(Uuid::from_str(guid).unwrap())))),
+            )],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::Uuid(v) => assert_eq!(v.to_string(), guid),
+            other => panic!("Expected Uuid from sql_variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn variant_nvarchar_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let val = SqlString::from_utf8_string("héllo 日本語".to_string());
+        let row = roundtrip_params(
+            &mut client,
+            vec![(
+                "v",
+                SqlType::Variant(Box::new(SqlType::NVarchar(Some(val), 50))),
+            )],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "héllo 日本語"),
+            other => panic!("Expected String from sql_variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn variant_varbinary_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let data = vec![1u8, 2, 3, 4, 5];
+        let row = roundtrip_params(
+            &mut client,
+            vec![(
+                "v",
+                SqlType::Variant(Box::new(SqlType::VarBinary(Some(data.clone()), 100))),
+            )],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::Bytes(b) => assert_eq!(b, &data),
+            other => panic!("Expected Bytes from sql_variant, got {other:?}"),
+        }
+    }
+
+    /// Regression coverage for PR review comment 96219: the inner Decimal/Numeric
+    /// precision and scale must be preserved through the sql_variant wire path
+    /// (they are sourced from the value, not forced to 38/0 by the context).
+    #[tokio::test]
+    async fn variant_decimal_preserves_precision_scale() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        // 123.45 -> precision 5, scale 2. If scale were forced to 0 the value
+        // would come back as a whole number instead of "123.45".
+        let dp = DecimalParts::from_string("123.45", 5, 2).unwrap();
+        let row = roundtrip_params(
+            &mut client,
+            vec![("v", SqlType::Variant(Box::new(SqlType::Decimal(Some(dp)))))],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
+                assert_eq!(format!("{d}"), "123.45");
+                assert_eq!(d.scale, 2);
+                assert_eq!(d.precision, 5);
+            }
+            other => panic!("Expected Decimal/Numeric from sql_variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn variant_high_precision_decimal_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let dp = DecimalParts::from_string("123456.789", 9, 3).unwrap();
+        let row = roundtrip_params(
+            &mut client,
+            vec![("v", SqlType::Variant(Box::new(SqlType::Numeric(Some(dp)))))],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
+                assert_eq!(format!("{d}"), "123456.789");
+                assert_eq!(d.scale, 3);
+            }
+            other => panic!("Expected Numeric from sql_variant, got {other:?}"),
+        }
+    }
+
+    /// Boundary case for PR review comment 96220: a sized string at the non-MAX
+    /// limit (`nvarchar(4000)`) is accepted inside a sql_variant and round-trips.
+    #[tokio::test]
+    async fn variant_nvarchar_at_max_chars_accepted() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let val = SqlString::from_utf8_string("boundary".to_string());
+        let row = roundtrip_params(
+            &mut client,
+            vec![(
+                "v",
+                SqlType::Variant(Box::new(SqlType::NVarchar(Some(val), 4000))),
+            )],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "boundary"),
+            other => panic!("Expected String from sql_variant, got {other:?}"),
+        }
+    }
+
+    /// Boundary case for PR review comment 96220: a sized binary at the non-MAX
+    /// limit (`varbinary(8000)`) is accepted inside a sql_variant and round-trips.
+    #[tokio::test]
+    async fn variant_varbinary_at_max_len_accepted() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let data = vec![7u8, 8, 9];
+        let row = roundtrip_params(
+            &mut client,
+            vec![(
+                "v",
+                SqlType::Variant(Box::new(SqlType::VarBinary(Some(data.clone()), 8000))),
+            )],
+        )
+        .await
+        .unwrap();
+        match &row[0] {
+            ColumnValues::Bytes(b) => assert_eq!(b, &data),
+            other => panic!("Expected Bytes from sql_variant, got {other:?}"),
+        }
+    }
+
+    /// PR review comment 96220: a sized string whose declared length is promoted
+    /// to MAX/PLP (`nvarchar(4001)`) cannot live in a sql_variant and is rejected
+    /// by the full execute path before reaching the server.
+    #[tokio::test]
+    async fn variant_oversized_nvarchar_rejected() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let val = SqlString::from_utf8_string("x".to_string());
+        let result = roundtrip_params(
+            &mut client,
+            vec![(
+                "v",
+                SqlType::Variant(Box::new(SqlType::NVarchar(Some(val), 4001))),
+            )],
+        )
+        .await;
+        assert!(
+            matches!(result, Err(mssql_tds::error::Error::UsageError(_))),
+            "expected UsageError for oversized nvarchar in sql_variant, got {result:?}"
+        );
+    }
+
+    /// PR review comment 96220: an oversized declared binary length
+    /// (`varbinary(8001)`) is promoted to MAX and rejected inside a sql_variant.
+    #[tokio::test]
+    async fn variant_oversized_varbinary_rejected() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let result = roundtrip_params(
+            &mut client,
+            vec![(
+                "v",
+                SqlType::Variant(Box::new(SqlType::VarBinary(Some(vec![1, 2]), 8001))),
+            )],
+        )
+        .await;
+        assert!(
+            matches!(result, Err(mssql_tds::error::Error::UsageError(_))),
+            "expected UsageError for oversized varbinary in sql_variant, got {result:?}"
+        );
+    }
+
+    /// PR review comment 96221: wrapping a table-valued parameter in a sql_variant
+    /// is rejected by the full execute path rather than silently sent as NULL.
+    #[tokio::test]
+    async fn variant_table_rejected() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let tvp = SqlType::Table(
+            mssql_tds::datatypes::sql_tvp::TvpTypeName::new(None, "MyType".to_string()),
+            None,
+        );
+        let result =
+            roundtrip_params(&mut client, vec![("v", SqlType::Variant(Box::new(tvp)))]).await;
+        assert!(
+            matches!(result, Err(mssql_tds::error::Error::UsageError(_))),
+            "expected UsageError for TVP in sql_variant, got {result:?}"
+        );
     }
 }
