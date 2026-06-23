@@ -19,7 +19,7 @@ use crate::error::Error::UsageError;
 use crate::error::SqlErrorInfo;
 use crate::io::packet_writer::PacketWriter;
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
-use crate::message::messages::PacketType;
+use crate::message::messages::{PacketType, ResetConnectionMode};
 use crate::message::parameters::rpc_parameters::{
     RpcParameter, StatusFlags, build_parameter_list_string,
 };
@@ -384,6 +384,31 @@ impl TdsClient {
             .unwrap_or(u32::MAX);
             t.saturating_sub(elapsed_secs)
         })
+    }
+
+    /// Requests that the connection be reset before the next request is
+    /// processed by the server, to support connection pooling.
+    ///
+    /// This sets the RESETCONNECTION (or RESETCONNECTIONSKIPTRAN) status bit on
+    /// the first packet of the next SQL Batch, RPC, or Transaction Manager
+    /// request sent on this connection (MS-TDS section 2.2.3.1.2). The server
+    /// resets the session state back to its login defaults — equivalent to
+    /// `sp_reset_connection` — before processing that request. The request is
+    /// one-shot: it is cleared once the next such request has been sent.
+    ///
+    /// # Parameters
+    /// - `preserve_transaction` — when `true`, the reset preserves the current
+    ///   transaction state (a local or enlisted/distributed transaction survives
+    ///   the reset) by using RESETCONNECTIONSKIPTRAN instead of RESETCONNECTION.
+    ///   Callers (typically a connection pool) should pass `true` only when the
+    ///   pooled connection is enlisted in a transaction that must outlive the
+    ///   reset.
+    pub fn prepare_reset_connection(&mut self, preserve_transaction: bool) {
+        let mode = match preserve_transaction {
+            true => ResetConnectionMode::ResetSkipTran,
+            false => ResetConnectionMode::Reset,
+        };
+        self.transport.as_writer().set_reset_mode(mode);
     }
 
     /// Sends a SQL batch to the server for execution.
@@ -2681,6 +2706,7 @@ mod tests {
     struct TestTransport {
         closed: bool,
         pending_tokens: VecDeque<Tokens>,
+        reset_mode: ResetConnectionMode,
     }
 
     impl TestTransport {
@@ -2688,6 +2714,7 @@ mod tests {
             Self {
                 closed: false,
                 pending_tokens: VecDeque::new(),
+                reset_mode: ResetConnectionMode::None,
             }
         }
 
@@ -2695,6 +2722,7 @@ mod tests {
             Self {
                 closed: false,
                 pending_tokens: VecDeque::from(tokens),
+                reset_mode: ResetConnectionMode::None,
             }
         }
     }
@@ -2745,6 +2773,12 @@ mod tests {
         fn get_encryption_setting(&self) -> crate::core::NegotiatedEncryptionSetting {
             crate::core::NegotiatedEncryptionSetting::NoEncryption
         }
+        fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
+            self.reset_mode = mode;
+        }
+        fn take_reset_mode(&mut self) -> ResetConnectionMode {
+            std::mem::replace(&mut self.reset_mode, ResetConnectionMode::None)
+        }
     }
 
     #[async_trait]
@@ -2791,6 +2825,36 @@ mod tests {
             execution_context,
             client_context,
         )
+    }
+
+    #[test]
+    fn prepare_reset_connection_routes_mode_to_transport() {
+        let mut client = create_test_client();
+
+        // Default: no reset pending.
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::None
+        );
+
+        // Plain reset.
+        client.prepare_reset_connection(false);
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::Reset
+        );
+        // take_reset_mode is one-shot.
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::None
+        );
+
+        // Preserve transaction => SKIPTRAN.
+        client.prepare_reset_connection(true);
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::ResetSkipTran
+        );
     }
 
     fn create_test_client_with_tokens(tokens: Vec<Tokens>) -> TdsClient {

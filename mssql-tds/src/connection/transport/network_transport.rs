@@ -23,7 +23,7 @@ use crate::io::token_stream::{
 };
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
-use crate::message::messages::Request;
+use crate::message::messages::{Request, ResetConnectionMode};
 use crate::token::tokens::{DoneStatus, Tokens};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
@@ -491,6 +491,9 @@ pub(crate) struct NetworkTransport {
     /// Handle to extract the underlying stream when disabling TLS.
     /// This is set during enable_ssl and used during disable_ssl for "Login Only" mode.
     extractable_stream_handle: Option<extractable_stream::ExtractableStreamHandle>,
+    /// Pending connection-reset request to apply to the next SQL Batch, RPC, or
+    /// Transaction Manager request. Consumed by the packet writer.
+    pending_reset: ResetConnectionMode,
 }
 
 impl std::fmt::Debug for NetworkTransport {
@@ -549,6 +552,14 @@ impl NetworkWriter for NetworkTransport {
         self.encryption
             .unwrap_or(NegotiatedEncryptionSetting::NoEncryption)
     }
+
+    fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
+        self.pending_reset = mode;
+    }
+
+    fn take_reset_mode(&mut self) -> ResetConnectionMode {
+        std::mem::replace(&mut self.pending_reset, ResetConnectionMode::None)
+    }
 }
 
 impl NetworkTransport {
@@ -568,6 +579,7 @@ impl NetworkTransport {
             tds_read_buffer: TdsReadBuffer::new(packet_size as usize),
             use_tds74_tls_wrapping,
             extractable_stream_handle: None,
+            pending_reset: ResetConnectionMode::None,
         }
     }
 
