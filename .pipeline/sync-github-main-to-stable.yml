@@ -1,6 +1,6 @@
 # Pipeline to create a PR from GitHub main into the Azure DevOps stable branch.
 # The pipeline source is GitHub microsoft/mssql-rs, so it triggers natively on
-# every merge to main (via the Azure Pipelines GitHub App) and can also be run
+# every update to main (via the Azure Pipelines GitHub App) and can also be run
 # manually. The Azure Repos mssql-rs repository is a 'git' resource we push the
 # sync branch to and open the PR against, authenticated with System.AccessToken.
 # Skips PR creation if:
@@ -18,22 +18,17 @@ trigger:
 pr: none
 
 parameters:
-- name: targetBranch
-  displayName: ADO branch to sync GitHub main into
-  type: string
-  default: stable
 - name: syncBranch
   displayName: Intermediate ADO branch carrying GitHub main
   type: string
   default: sync/github-main-to-stable
-- name: adoRepository
-  displayName: Azure Repos repository to sync into
-  type: string
-  default: mssql-rs
 
 resources:
   repositories:
   # Azure Repos mssql-rs: we push the sync branch here and open the PR.
+  # NOTE: 'name' and 'ref' are resolved before parameters, so they cannot be
+  # parameterized. The target repo (mssql-rs) and branch (stable) are therefore
+  # hard-coded here and mirrored into the script env below to keep them in sync.
   - repository: ado
     type: git
     name: mssql-rs/mssql-rs
@@ -112,7 +107,7 @@ steps:
       --description $'Sync of GitHub microsoft/mssql-rs main into the '"$TARGET_BRANCH"$' branch.\n\nBefore merging, ensure CI has had a good run on GitHub main.'
   displayName: Sync GitHub main to target branch
   env:
-    TARGET_BRANCH: ${{ parameters.targetBranch }}
+    TARGET_BRANCH: stable
     SYNC_BRANCH: ${{ parameters.syncBranch }}
-    ADO_REPOSITORY: ${{ parameters.adoRepository }}
+    ADO_REPOSITORY: mssql-rs
     AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
