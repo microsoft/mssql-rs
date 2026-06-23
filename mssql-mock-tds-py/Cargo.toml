@@ -10,7 +10,7 @@ name = "mssql_mock_tds_py"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.24", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py39"] }
 mssql-mock-tds = { path = "../mssql-mock-tds" }
 tokio = { version = "1.48.0", features = ["full"] }
 native-tls = "0.2"
