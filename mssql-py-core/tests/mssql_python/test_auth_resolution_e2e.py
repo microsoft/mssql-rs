@@ -950,7 +950,7 @@ class TestBulkcopyTokenAcquisition:
                 with pytest.raises(RuntimeError, match="Spy stop"):
                     cur.bulkcopy(_BULKCOPY_TABLE, [(1, "test")], timeout=30)
 
-            mock_get.assert_called_once_with(auth_type)
+            mock_get.assert_called_once_with(auth_type, None)
 
     def test_token_acquisition_failure_raises(self, sql_conn_with_fake_auth):
         """If get_raw_token fails, _bulkcopy raises RuntimeError."""
