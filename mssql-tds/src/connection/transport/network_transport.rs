@@ -539,7 +539,11 @@ impl NetworkReader for NetworkTransport {
 #[async_trait]
 impl NetworkWriter for NetworkTransport {
     async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
-        let stream = self.stream.as_mut().expect("Stream not available");
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            crate::error::Error::ConnectionClosed(
+                "Cannot send: connection has been closed".to_string(),
+            )
+        })?;
         stream.write_all(data).await?;
         Ok(())
     }
@@ -600,7 +604,11 @@ impl NetworkTransport {
         let bytes_read = self
             .stream
             .as_mut()
-            .expect("Stream not available")
+            .ok_or_else(|| {
+                crate::error::Error::ConnectionClosed(
+                    "Cannot receive: connection has been closed".to_string(),
+                )
+            })?
             .read(buffer)
             .await?;
         if bytes_read == 0 {
@@ -846,7 +854,11 @@ impl NetworkTransport {
             self.tds_read_buffer.pending_bytes_offset = 0;
         }
 
-        let stream = self.stream.as_mut().expect("Stream not available");
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            crate::error::Error::ConnectionClosed(
+                "Cannot read TDS packet: connection has been closed".to_string(),
+            )
+        })?;
 
         // Read more data if we don't have enough for the header
         while bytes_available < PacketWriter::PACKET_HEADER_SIZE {
