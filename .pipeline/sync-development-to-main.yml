@@ -1,11 +1,19 @@
-# Pipeline to create a PR from development to main after a PR merges into development.
-# Can also be triggered manually. Skips PR creation if:
-# - A PR from development to main already exists
-# - There are no changes between development and main
+# Pipeline to create a PR from development to main and stable after a PR merges into development.
+# Can also be triggered manually. For each target branch, skips PR creation if:
+# - A PR from development to that target already exists
+# - There are no changes between development and that target
 
 trigger: none
 
 pr: none
+
+parameters:
+- name: targetBranches
+  displayName: Target branches to sync development into
+  type: object
+  default:
+  - main
+  - stable
 
 resources:
   repositories:
@@ -22,49 +30,45 @@ steps:
   persistCredentials: true
 
 - script: |
-    git fetch origin main development
-    if git diff --quiet origin/main..origin/development; then
-      echo "No changes between development and main. Skipping."
-      echo "##vso[task.setvariable variable=hasChanges]false"
-    else
-      echo "Changes detected between development and main."
-      echo "##vso[task.setvariable variable=hasChanges]true"
-    fi
-  displayName: Check for changes
+    set -euo pipefail
 
-- script: |
-    PR_EXISTS=$(az repos pr list \
-      --organization "$(System.TeamFoundationCollectionUri)" \
-      --project "$(System.TeamProject)" \
-      --repository "$(Build.Repository.Name)" \
-      --source-branch development \
-      --target-branch main \
-      --status active \
-      --query "[0].pullRequestId" \
-      --output tsv)
+    git fetch origin development $TARGETS
 
-    if [ -n "$PR_EXISTS" ]; then
-      echo "Active PR #$PR_EXISTS already exists. Skipping."
-      echo "##vso[task.setvariable variable=prExists]true"
-    else
-      echo "No active PR found."
-      echo "##vso[task.setvariable variable=prExists]false"
-    fi
-  displayName: Check for existing PR
-  condition: eq(variables['hasChanges'], 'true')
+    for TARGET in $TARGETS; do
+      echo "----- Processing development -> $TARGET -----"
+
+      if git diff --quiet "origin/$TARGET..origin/development"; then
+        echo "No changes between development and $TARGET. Skipping."
+        continue
+      fi
+      echo "Changes detected between development and $TARGET."
+
+      PR_EXISTS=$(az repos pr list \
+        --organization "$(System.TeamFoundationCollectionUri)" \
+        --project "$(System.TeamProject)" \
+        --repository "$(Build.Repository.Name)" \
+        --source-branch development \
+        --target-branch "$TARGET" \
+        --status active \
+        --query "[0].pullRequestId" \
+        --output tsv)
+
+      if [ -n "$PR_EXISTS" ]; then
+        echo "Active PR #$PR_EXISTS for development -> $TARGET already exists. Skipping."
+        continue
+      fi
+
+      echo "No active PR found. Creating PR development -> $TARGET."
+      az repos pr create \
+        --organization "$(System.TeamFoundationCollectionUri)" \
+        --project "$(System.TeamProject)" \
+        --repository "$(Build.Repository.Name)" \
+        --source-branch development \
+        --target-branch "$TARGET" \
+        --title "Sync development to $TARGET" \
+        --description $'Sync of development to '"$TARGET"$' branch.\n\nBefore merging this PR, ensure that the CI has had a good run on the development branch.'
+    done
+  displayName: Sync development to target branches
   env:
-    AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
-
-- script: |
-    az repos pr create \
-      --organization "$(System.TeamFoundationCollectionUri)" \
-      --project "$(System.TeamProject)" \
-      --repository "$(Build.Repository.Name)" \
-      --source-branch development \
-      --target-branch main \
-      --title "Sync development to main" \
-      --description $'Sync of development to main branch.\n\nBefore merging this PR, ensure that the CI has had a good run on the development branch.'
-  displayName: Create PR
-  condition: and(eq(variables['hasChanges'], 'true'), eq(variables['prExists'], 'false'))
-  env:
+    TARGETS: ${{ join(' ', parameters.targetBranches) }}
     AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)

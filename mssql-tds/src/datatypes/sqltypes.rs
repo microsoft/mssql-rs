@@ -8,6 +8,10 @@ use crate::datatypes::column_values::{
     SqlMoney, SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
 };
 use crate::datatypes::sql_json::SqlJson;
+use crate::datatypes::sql_tvp::{
+    TVP_END_TOKEN, TVP_NOMETADATA_TOKEN, TvpTableData, TvpTypeName, write_tvp_column_metadata,
+    write_tvp_order_unique, write_tvp_rows, write_tvp_type_name,
+};
 use crate::datatypes::sql_vector::SqlVector;
 use crate::datatypes::tds_value_serializer::{TdsTypeContext, TdsValueSerializer};
 use crate::{
@@ -108,15 +112,30 @@ pub enum SqlType {
     /// Although SqlVector has dimension & base type information, we also pass it separately so
     /// that we can serialize NULL vector parameters (where SqlVector=None) with correct metadata.
     Vector(Option<SqlVector>, u16, VectorBaseType),
-    // To be added in future
-    // Variant
-    // TVP
+
+    /// `sql_variant` container wrapping a concrete inner `SqlType`.
+    ///
+    /// The inner `SqlType` carries the base type, value, and nullability. An inner value of
+    /// `None` is serialized as a NULL variant. The inner type must be one that `sql_variant`
+    /// can hold: it cannot be a MAX type (`nvarchar(max)`, `varchar(max)`, `varbinary(max)`),
+    /// `xml`, `json`, `text`/`ntext`, a vector, or another `sql_variant`.
+    Variant(Box<SqlType>),
+
+    /// Table-valued parameter (input-only, TDS type `0xF3`).
+    ///
+    /// The type name is always present because the wire format requires it
+    /// even for NULL TVPs. `None` table data encodes a NULL TVP; `Some` with
+    /// an empty row set encodes an empty TVP.
+    Table(TvpTypeName, Option<TvpTableData>),
 }
 
 type NullableTdsType = TdsDataType;
 
 // The maximum length of a variable length type in TDS is 8000 bytes.
 pub(crate) const VAR_TDS_MAX_LENGTH: u16 = 8000u16;
+
+// The maximum data length advertised in sql_variant TYPE_INFO metadata (0x1F49).
+pub(crate) const SQL_VARIANT_MAX_LENGTH: u32 = 8009u32;
 
 // The length of a NULL value in TDS is 65535 bytes for variable length types.
 pub(crate) const MAX_U16_LENGTH: u16 = 65535u16;
@@ -165,6 +184,8 @@ impl SqlType {
             SqlType::Money(_) => TdsDataType::MoneyN,
             SqlType::SmallMoney(_) => TdsDataType::MoneyN,
             SqlType::Vector(_, _, _) => TdsDataType::Vector,
+            SqlType::Variant(_) => TdsDataType::SsVariant,
+            SqlType::Table(_, _) => TdsDataType::SqlTable,
         }
     }
 
@@ -179,7 +200,7 @@ impl SqlType {
 
     /// Convert this SqlType to a ColumnValues (for value serialization) and a TdsTypeContext.
     /// Returns (ColumnValues, TdsTypeContext).
-    fn to_column_value_and_context(
+    pub(crate) fn to_column_value_and_context(
         &self,
         db_collation: &SqlCollation,
     ) -> (ColumnValues, TdsTypeContext) {
@@ -627,6 +648,23 @@ impl SqlType {
                 };
                 (cv, ctx)
             }
+
+            // sql_variant: recurse on the inner type to get its ColumnValues and context
+            // (which carries collation/precision/scale), then override the TDS type to
+            // SQL_VARIANT so the value serializer wraps it as a variant.
+            SqlType::Variant(inner) => {
+                let (cv, inner_ctx) = inner.to_column_value_and_context(db_collation);
+                let ctx = TdsTypeContext {
+                    tds_type: TdsDataType::SsVariant as u8,
+                    ..inner_ctx
+                };
+                (cv, ctx)
+            }
+
+            // Table (TVP): input-only, no ColumnValues counterpart. Serialization is
+            // handled by the `serialize_table` short-circuit in `serialize`, so this
+            // arm is a safe fallback that never feeds real wire data.
+            SqlType::Table(_, _) => (ColumnValues::Null, base_ctx),
         }
     }
 
@@ -640,6 +678,14 @@ impl SqlType {
         // but RPC sends raw UTF-8 bytes with TDS type 0xF4.
         if let SqlType::Json(json) = self {
             return self.serialize_json(packet_writer, json).await;
+        }
+
+        // TVP needs special handling: the payload is a whole table (3-part name,
+        // column metadata, and rows), not a single type preamble + value.
+        if let SqlType::Table(type_name, table) = self {
+            return self
+                .serialize_table(packet_writer, db_collation, type_name, table)
+                .await;
         }
 
         // Step 1: Write the RPC type metadata preamble
@@ -659,6 +705,28 @@ impl SqlType {
         &self,
         packet_writer: &mut PacketWriter<'_>,
         db_collation: &SqlCollation,
+    ) -> TdsResult<()> {
+        // RPC parameters carry their precision/scale inside the value itself, so
+        // no overrides are supplied here.
+        self.write_type_info(packet_writer, db_collation, None, None)
+            .await
+    }
+
+    /// Write the TDS `TYPE_INFO` for this type: the type byte followed by its
+    /// length/precision/scale/collation metadata.
+    ///
+    /// Shared by RPC parameter serialization and TVP column metadata. For
+    /// `Decimal`/`Numeric` (precision and scale) and `Time`/`DateTime2`/
+    /// `DateTimeOffset` (scale), the `precision_override`/`scale_override`
+    /// arguments supply metadata that a `None`-valued type template cannot
+    /// carry; when present they take precedence over the value's own
+    /// precision/scale. RPC callers pass `None` for both.
+    pub(crate) async fn write_type_info(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        db_collation: &SqlCollation,
+        precision_override: Option<u8>,
+        scale_override: Option<u8>,
     ) -> TdsResult<()> {
         let nullable_type = self.get_nullable_type();
 
@@ -680,16 +748,17 @@ impl SqlType {
             SqlType::Decimal(opt) | SqlType::Numeric(opt) => {
                 packet_writer.write_byte_async(nullable_type as u8).await?;
                 packet_writer.write_byte_async(DECIMAL_FIXED_SIZE).await?;
-                match opt {
-                    Some(v) => {
-                        packet_writer.write_byte_async(v.precision).await?;
-                        packet_writer.write_byte_async(v.scale).await?;
-                    }
-                    None => {
-                        packet_writer.write_byte_async(1).await?;
-                        packet_writer.write_byte_async(0).await?;
-                    }
-                }
+                // Overrides (used by TVP column metadata, whose templates carry a
+                // `None` value) take precedence over the value's own precision/scale,
+                // falling back to the TDS defaults (precision 1, scale 0).
+                let precision = precision_override
+                    .or_else(|| opt.as_ref().map(|v| v.precision))
+                    .unwrap_or(1);
+                let scale = scale_override
+                    .or_else(|| opt.as_ref().map(|v| v.scale))
+                    .unwrap_or(0);
+                packet_writer.write_byte_async(precision).await?;
+                packet_writer.write_byte_async(scale).await?;
             }
 
             // Money types: type byte + size byte
@@ -728,30 +797,27 @@ impl SqlType {
             // Time: type byte + scale
             SqlType::Time(opt) => {
                 packet_writer.write_byte_async(nullable_type as u8).await?;
-                let scale = match opt {
-                    Some(t) => t.get_scale(),
-                    None => DEFAULT_VARTIME_SCALE,
-                };
+                let scale = scale_override
+                    .or_else(|| opt.as_ref().map(|t| t.get_scale()))
+                    .unwrap_or(DEFAULT_VARTIME_SCALE);
                 packet_writer.write_byte_async(scale).await?;
             }
 
             // DateTime2: type byte + scale
             SqlType::DateTime2(opt) => {
                 packet_writer.write_byte_async(nullable_type as u8).await?;
-                let scale = match opt {
-                    Some(dt2) => dt2.time.get_scale(),
-                    None => DEFAULT_VARTIME_SCALE,
-                };
+                let scale = scale_override
+                    .or_else(|| opt.as_ref().map(|dt2| dt2.time.get_scale()))
+                    .unwrap_or(DEFAULT_VARTIME_SCALE);
                 packet_writer.write_byte_async(scale).await?;
             }
 
             // DateTimeOffset: type byte + scale
             SqlType::DateTimeOffset(opt) => {
                 packet_writer.write_byte_async(nullable_type as u8).await?;
-                let scale = match opt {
-                    Some(dto) => dto.datetime2.time.get_scale(),
-                    None => DEFAULT_VARTIME_SCALE,
-                };
+                let scale = scale_override
+                    .or_else(|| opt.as_ref().map(|dto| dto.datetime2.time.get_scale()))
+                    .unwrap_or(DEFAULT_VARTIME_SCALE);
                 packet_writer.write_byte_async(scale).await?;
             }
 
@@ -905,9 +971,70 @@ impl SqlType {
                 packet_writer.write_u16_async(exact_size).await?;
                 packet_writer.write_byte_async(*base_type as u8).await?;
             }
+
+            // sql_variant: type byte + 4-byte (DWORD) max data length.
+            // Validate the inner type first so an unsupported variant errors before any
+            // bytes are written.
+            SqlType::Variant(inner) => {
+                Self::validate_variant_inner(inner)?;
+                packet_writer.write_byte_async(nullable_type as u8).await?;
+                packet_writer
+                    .write_u32_async(SQL_VARIANT_MAX_LENGTH)
+                    .await?;
+            }
+
+            // Table (TVP): metadata and rows are written by the dedicated
+            // `serialize_table` path, which short-circuits in `serialize` before
+            // this method is reached. A TVP is never a column type within another
+            // TVP, so `write_type_info` is never legitimately called on it either.
+            SqlType::Table(_, _) => {
+                return Err(Error::ImplementationError(
+                    "TVP serialization is not handled by write_type_info; \
+                     it is dispatched via serialize_table"
+                        .to_string(),
+                ));
+            }
         }
 
         Ok(())
+    }
+
+    /// Validate that the inner type of a `sql_variant` is one the server can store.
+    ///
+    /// `sql_variant` cannot hold MAX types, `xml`, `json`, `text`/`ntext`, vectors,
+    /// table-valued parameters, or a nested `sql_variant`. It also cannot hold sized
+    /// string/binary types whose declared length exceeds the non-MAX limit, since those
+    /// are promoted to MAX/PLP by the type-info paths. Returns [`Error::UsageError`] for
+    /// any of these.
+    fn validate_variant_inner(inner: &SqlType) -> TdsResult<()> {
+        // nvarchar tops out at 4000 characters before promotion to nvarchar(max).
+        const NVARCHAR_MAX_CHARS: u16 = 4000;
+
+        let unsupported = match inner {
+            SqlType::NVarcharMax(_) => Some("nvarchar(max)"),
+            SqlType::VarcharMax(_) => Some("varchar(max)"),
+            SqlType::VarBinaryMax(_) => Some("varbinary(max)"),
+            SqlType::Text(_) => Some("text"),
+            SqlType::NText(_) => Some("ntext"),
+            SqlType::Xml(_) => Some("xml"),
+            SqlType::Json(_) => Some("json"),
+            SqlType::Vector(_, _, _) => Some("vector"),
+            SqlType::Variant(_) => Some("sql_variant (nested)"),
+            SqlType::Table(_, _) => Some("table-valued parameter (TVP)"),
+            // Sized string/binary types whose declared length exceeds the non-MAX limit
+            // are promoted to MAX/PLP, which sql_variant cannot hold.
+            SqlType::NVarchar(_, len) if *len > NVARCHAR_MAX_CHARS => Some("nvarchar(max)"),
+            SqlType::Varchar(_, len) if *len > VAR_TDS_MAX_LENGTH => Some("varchar(max)"),
+            SqlType::VarBinary(_, len) if *len > VAR_TDS_MAX_LENGTH => Some("varbinary(max)"),
+            _ => None,
+        };
+
+        match unsupported {
+            Some(type_name) => Err(Error::UsageError(format!(
+                "sql_variant cannot hold a value of type {type_name}."
+            ))),
+            None => Ok(()),
+        }
     }
 
     async fn serialize_json(
@@ -943,6 +1070,50 @@ impl SqlType {
                 packet_writer.write_u64_async(PLP_NULL).await?;
             }
         }
+        Ok(())
+    }
+
+    /// Serialize a Table-Valued Parameter (TDS type `0xF3`).
+    ///
+    /// Writes the type byte, the three-part type name, then either the NULL-TVP
+    /// encoding (`TVP_NOMETADATA` column count followed by two end tokens) or the
+    /// full column metadata, optional order/unique hints, and row data. This is
+    /// dispatched from [`serialize`](Self::serialize) and replaces the generic
+    /// type-preamble + value path, which does not fit a tabular payload.
+    async fn serialize_table(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        db_collation: &SqlCollation,
+        type_name: &TvpTypeName,
+        table: &Option<TvpTableData>,
+    ) -> TdsResult<()> {
+        // Type byte (0xF3) and the three-part name are always present, even for
+        // a NULL TVP.
+        type_name.validate()?;
+        packet_writer
+            .write_byte_async(TdsDataType::SqlTable as u8)
+            .await?;
+        write_tvp_type_name(packet_writer, type_name).await?;
+
+        match table {
+            // NULL TVP: TVP_NOMETADATA column count, then two end tokens (end of
+            // optional metadata, end of row set).
+            None => {
+                packet_writer.write_u16_async(TVP_NOMETADATA_TOKEN).await?;
+                packet_writer.write_byte_async(TVP_END_TOKEN).await?;
+                packet_writer.write_byte_async(TVP_END_TOKEN).await?;
+            }
+            // Non-NULL TVP: column metadata, optional order/unique block (which
+            // also writes the end-of-metadata token), then the row set (which
+            // writes the end-of-rows token).
+            Some(data) => {
+                data.validate()?;
+                write_tvp_column_metadata(packet_writer, &data.columns, db_collation).await?;
+                write_tvp_order_unique(packet_writer, &data.order_hints).await?;
+                write_tvp_rows(packet_writer, &data.columns, &data.rows, db_collation).await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1085,6 +1256,161 @@ mod json_tests {
         test_cursor.set_position(PacketWriter::PACKET_HEADER_SIZE as u64);
         assert_eq!(test_cursor.get_u8(), TdsDataType::Json as u8); // Valdate tds type
         assert_eq!(test_cursor.get_u64_le(), PLP_NULL);
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use std::io::Cursor;
+
+    use bytes::Buf;
+
+    use crate::{
+        datatypes::{
+            sql_string::SqlString,
+            sqldatatypes::TdsDataType,
+            sqltypes::{SQL_VARIANT_MAX_LENGTH, SqlType},
+        },
+        error::Error,
+        io::{
+            packet_reader::tests::MockNetworkReaderWriter,
+            packet_writer::{PacketWriter, TdsPacketWriter},
+        },
+        message::messages::PacketType,
+        token::tokens::SqlCollation,
+    };
+
+    fn default_collation() -> SqlCollation {
+        SqlCollation {
+            info: 0x00000409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        }
+    }
+
+    async fn serialize_to_bytes(sql_type: &SqlType) -> Vec<u8> {
+        let mut mock_reader_writer = MockNetworkReaderWriter::default();
+        let mut packet_writer = PacketWriter::new(
+            PacketType::TabularResult,
+            &mut mock_reader_writer,
+            None,
+            None,
+        );
+        sql_type
+            .serialize(&mut packet_writer, &default_collation())
+            .await
+            .unwrap();
+        packet_writer.finalize().await.unwrap();
+        let payload = mock_reader_writer.get_written_data();
+        payload[PacketWriter::PACKET_HEADER_SIZE..].to_vec()
+    }
+
+    #[tokio::test]
+    async fn metadata_emits_type_byte_and_max_length() {
+        let bytes = serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Int(Some(42))))).await;
+        let mut cursor = Cursor::new(bytes);
+        // TYPE_INFO: 0x62 + u32 max data length (8009)
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+    }
+
+    #[tokio::test]
+    async fn variant_int_round_trip_bytes() {
+        let bytes = serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Int(Some(42))))).await;
+        let mut cursor = Cursor::new(bytes);
+        // Metadata
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        // Value: total_length = 2 + 0(prop) + 4(data) = 6
+        assert_eq!(cursor.get_u32_le(), 6);
+        assert_eq!(cursor.get_u8(), TdsDataType::Int4 as u8); // base type
+        assert_eq!(cursor.get_u8(), 0); // prop_len = 0
+        assert_eq!(cursor.get_i32_le(), 42); // data
+    }
+
+    #[tokio::test]
+    async fn variant_null_emits_zero_length() {
+        let bytes = serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Int(None)))).await;
+        let mut cursor = Cursor::new(bytes);
+        // Metadata still written
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        // NULL variant value: 4-byte length = 0
+        assert_eq!(cursor.get_u32_le(), 0);
+    }
+
+    #[tokio::test]
+    async fn variant_nvarchar_writes_collation_props() {
+        let val = SqlString::from_utf8_string("Hi".to_string());
+        let bytes = serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::NVarchar(
+            Some(val),
+            10,
+        ))))
+        .await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        // "Hi" UTF-16LE = 4 bytes. total_length = 2 + 7(prop) + 4(data) = 13
+        assert_eq!(cursor.get_u32_le(), 13);
+        assert_eq!(cursor.get_u8(), TdsDataType::NVarChar as u8); // base type
+        assert_eq!(cursor.get_u8(), 7); // prop_len = 7 (collation[5] + max_len[2])
+    }
+
+    #[tokio::test]
+    async fn to_cv_variant_overrides_tds_type() {
+        let (cv, ctx) = SqlType::Variant(Box::new(SqlType::Int(Some(7))))
+            .to_column_value_and_context(&default_collation());
+        assert_eq!(cv, crate::datatypes::column_values::ColumnValues::Int(7));
+        assert_eq!(ctx.tds_type, TdsDataType::SsVariant as u8);
+    }
+
+    #[tokio::test]
+    async fn to_cv_variant_null_inner() {
+        let (cv, ctx) = SqlType::Variant(Box::new(SqlType::BigInt(None)))
+            .to_column_value_and_context(&default_collation());
+        assert_eq!(cv, crate::datatypes::column_values::ColumnValues::Null);
+        assert_eq!(ctx.tds_type, TdsDataType::SsVariant as u8);
+    }
+
+    #[tokio::test]
+    async fn variant_rejects_unsupported_inner_types() {
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+        let unsupported = vec![
+            SqlType::NVarcharMax(None),
+            SqlType::VarcharMax(None),
+            SqlType::VarBinaryMax(None),
+            SqlType::Text(None),
+            SqlType::NText(None),
+            SqlType::Xml(None),
+            SqlType::Json(None),
+            SqlType::Vector(None, 3, VectorBaseType::Float32),
+            SqlType::Variant(Box::new(SqlType::Int(Some(1)))),
+            SqlType::Table(
+                crate::datatypes::sql_tvp::TvpTypeName::new(None, "MyType".to_string()),
+                None,
+            ),
+            // Sized string/binary types promoted to MAX/PLP cannot live in a sql_variant.
+            SqlType::NVarchar(None, 4001),
+            SqlType::Varchar(None, 8001),
+            SqlType::VarBinary(None, 8001),
+        ];
+        for inner in unsupported {
+            let mut mock_reader_writer = MockNetworkReaderWriter::default();
+            let mut packet_writer = PacketWriter::new(
+                PacketType::TabularResult,
+                &mut mock_reader_writer,
+                None,
+                None,
+            );
+            let result = SqlType::Variant(Box::new(inner))
+                .serialize(&mut packet_writer, &default_collation())
+                .await;
+            assert!(
+                matches!(result, Err(Error::UsageError(_))),
+                "expected UsageError for unsupported variant inner type"
+            );
+        }
     }
 }
 

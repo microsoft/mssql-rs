@@ -7,6 +7,10 @@ use crate::connection::bulk_copy::{BulkCopyOptions, BulkLoadRow, ResolvedColumnM
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::ClientContext;
 use crate::connection::session_recovery::RecoveryContext;
+use crate::cursor::{
+    CursorConcurrency, CursorOpenResponse, CursorPrepExecResponse, CursorPrepareResponse,
+    CursorScrollOption, FetchDirection,
+};
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
@@ -428,6 +432,7 @@ impl TdsClient {
         // No metadata means no rows were returned, so we set has_open_batch to false.
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
+            self.current_metadata = None;
         } else {
             self.current_metadata = metadata;
 
@@ -514,6 +519,7 @@ impl TdsClient {
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
             self.current_result_set_has_been_read_till_end = true;
+            self.current_metadata = None;
         } else {
             self.current_metadata = metadata;
             self.current_result_set_has_been_read_till_end = false;
@@ -814,6 +820,7 @@ impl TdsClient {
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
             self.current_result_set_has_been_read_till_end = true;
+            self.current_metadata = None;
         } else {
             self.current_metadata = metadata;
             self.current_result_set_has_been_read_till_end = false;
@@ -1081,6 +1088,7 @@ impl TdsClient {
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
             self.current_result_set_has_been_read_till_end = true;
+            self.current_metadata = None;
         } else {
             self.current_metadata = metadata;
             self.current_result_set_has_been_read_till_end = false;
@@ -1150,10 +1158,725 @@ impl TdsClient {
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
             self.current_result_set_has_been_read_till_end = true;
+            self.current_metadata = None;
         } else {
             self.current_metadata = metadata;
             self.current_result_set_has_been_read_till_end = false;
             self.execution_context.set_has_open_batch(true);
+        }
+        Ok(())
+    }
+
+    /// Extracts an `i32` from the return values at the given index.
+    fn extract_return_value_int(&self, index: usize) -> TdsResult<i32> {
+        let rv = self.return_values.get(index).ok_or_else(|| {
+            crate::error::Error::ProtocolError(format!(
+                "Expected return value at index {index}, but only {} values received",
+                self.return_values.len()
+            ))
+        })?;
+        match &rv.value {
+            ColumnValues::Int(v) => Ok(*v),
+            other => Err(crate::error::Error::ProtocolError(format!(
+                "Expected Int return value at index {index}, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Opens a server cursor with a SQL statement (`sp_cursoropen`, RPC ID 2).
+    ///
+    /// Returns the server-assigned cursor handle and negotiated scroll/concurrency
+    /// options. The response stream (including any metadata tokens) is fully
+    /// consumed before returning.
+    ///
+    /// TODO: `AUTO_FETCH` is not yet supported. Passing `AUTO_FETCH` in
+    /// `scroll_opt` returns an error. This will be implemented in a future PR.
+    #[instrument(skip(self), level = "info")]
+    pub async fn cursor_open(
+        &mut self,
+        stmt: &str,
+        scroll_opt: CursorScrollOption,
+        cc_opt: CursorConcurrency,
+        row_count: i32,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<CursorOpenResponse> {
+        if scroll_opt.contains(CursorScrollOption::AUTO_FETCH) {
+            return Err(crate::error::Error::UsageError(
+                "AUTO_FETCH is not yet supported in cursor_open".to_string(),
+            ));
+        }
+
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        // Parameter order matches sp_cursoropen positional spec.
+        let params = vec![
+            RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None)),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(stmt.to_string()))),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(scroll_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(cc_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(row_count)),
+            ),
+        ];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorOpen),
+            Some(params),
+            None,
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        self.consume_cursor_open_response().await
+    }
+
+    /// Opens a parameterized server cursor (`sp_cursoropen`, RPC ID 2).
+    ///
+    /// Same as [`cursor_open`](Self::cursor_open) but includes a parameter
+    /// declaration list and bound parameter values. The `PARAMETERIZED_STMT`
+    /// flag (`0x1000`) is added to `scroll_opt` only when `params` is non-empty.
+    #[allow(clippy::too_many_arguments)] // Matches sp_cursoropen's 7+ positional parameters
+    #[instrument(skip(self, params), level = "info")]
+    pub async fn cursor_open_with_params(
+        &mut self,
+        stmt: &str,
+        params: Vec<RpcParameter>,
+        scroll_opt: CursorScrollOption,
+        cc_opt: CursorConcurrency,
+        row_count: i32,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<CursorOpenResponse> {
+        if scroll_opt.contains(CursorScrollOption::AUTO_FETCH) {
+            return Err(crate::error::Error::UsageError(
+                "AUTO_FETCH is not yet supported in cursor_open_with_params".to_string(),
+            ));
+        }
+
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        // Add PARAMETERIZED_STMT only when the statement actually has parameters.
+        let scroll_opt = if params.is_empty() {
+            scroll_opt
+        } else {
+            scroll_opt | CursorScrollOption::PARAMETERIZED_STMT
+        };
+
+        // Build the parameter declaration string from the named params
+        let mut param_def_string = String::new();
+        build_parameter_list_string(&params, &mut param_def_string)?;
+
+        // Parameter order matches sp_cursoropen positional spec.
+        let positional_params = vec![
+            RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None)),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(stmt.to_string()))),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(scroll_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(cc_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(row_count)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(param_def_string))),
+            ),
+        ];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorOpen),
+            Some(positional_params),
+            Some(params),
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        self.consume_cursor_open_response().await
+    }
+
+    /// Shared response handling for `cursor_open` and `cursor_open_with_params`.
+    ///
+    /// The sp_cursoropen response sends ColMetadata (describing cursor columns)
+    /// followed by TabName, ColInfo, Order tokens, then DoneInProc,
+    /// ReturnStatus, ReturnValue×4, DoneProc.
+    /// `move_to_column_metadata` stops at ColMetadata; `drain_stream` reads the
+    /// rest and collects the OUTPUT parameters.
+    async fn consume_cursor_open_response(&mut self) -> TdsResult<CursorOpenResponse> {
+        self.drain_cursor_response().await?;
+
+        Ok(CursorOpenResponse {
+            cursor_id: self.extract_return_value_int(0)?,
+            negotiated_scroll: CursorScrollOption::from_bits_truncate(
+                self.extract_return_value_int(1)? as u32,
+            ),
+            negotiated_concurrency: CursorConcurrency::from_bits_truncate(
+                self.extract_return_value_int(2)? as u32,
+            ),
+            row_count: self.extract_return_value_int(3)?,
+        })
+    }
+
+    /// Shared response tail for the cursor open-family RPCs (`sp_cursoropen`,
+    /// `sp_cursorexecute`, `sp_cursorprepexec`, `sp_cursorprepare`).
+    ///
+    /// Captures any schema `ColMetadata`, then eagerly drains the remaining
+    /// tokens (`ReturnValue`/`ReturnStatus`/`Done`), resets the batch state, and
+    /// surfaces any server errors. The OUTPUT parameters are left in
+    /// `self.return_values` for the caller to extract by ordinal.
+    async fn drain_cursor_response(&mut self) -> TdsResult<()> {
+        // Clear any stale metadata up-front so an error here cannot leak columns
+        // from a previous result set through get_metadata().
+        self.current_metadata = None;
+        let metadata = self.move_to_column_metadata().await?;
+        self.current_metadata = metadata;
+        let server_errors = self.drain_stream().await?;
+        self.execution_context.set_has_open_batch(false);
+        self.current_result_set_has_been_read_till_end = true;
+
+        if !server_errors.is_empty() {
+            return Err(crate::error::Error::from_sql_errors(server_errors));
+        }
+        Ok(())
+    }
+
+    /// Fetches rows from an open cursor (`sp_cursorfetch`, RPC ID 7).
+    ///
+    /// After calling this, use `get_next_row_into()` to read rows and then
+    /// `close_query()` before the next command. If no rows are available
+    /// (end of cursor), `has_open_batch` will be false and no row reading
+    /// is needed.
+    #[instrument(skip(self), level = "info")]
+    pub async fn cursor_fetch(
+        &mut self,
+        cursor_id: i32,
+        direction: FetchDirection,
+        row_num: i32,
+        num_rows: i32,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        let params = vec![
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(cursor_id))),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::Int(Some(direction.bits() as i32)),
+            ),
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(row_num))),
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(num_rows))),
+        ];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorFetch),
+            Some(params),
+            None,
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        let metadata = self.move_to_column_metadata().await?;
+        if metadata.is_none() {
+            self.execution_context.set_has_open_batch(false);
+            self.current_result_set_has_been_read_till_end = true;
+        } else {
+            self.current_metadata = metadata;
+            self.current_result_set_has_been_read_till_end = false;
+            self.execution_context.set_has_open_batch(true);
+        }
+        Ok(())
+    }
+
+    /// Closes a server cursor and releases server resources (`sp_cursorclose`, RPC ID 9).
+    ///
+    /// After this call the `cursor_id` is invalid and must not be reused.
+    /// Passing `-1` closes all cursors on the current connection.
+    #[instrument(skip(self), level = "info")]
+    pub async fn cursor_close(
+        &mut self,
+        cursor_id: i32,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        let params = vec![RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::Int(Some(cursor_id)),
+        )];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorClose),
+            Some(params),
+            None,
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        let server_errors = self.drain_stream().await?;
+        self.execution_context.set_has_open_batch(false);
+        if !server_errors.is_empty() {
+            return Err(crate::error::Error::from_sql_errors(server_errors));
+        }
+        Ok(())
+    }
+
+    /// Prepares and opens a server cursor in a single round-trip
+    /// (`sp_cursorprepexec`, RPC ID 5).
+    ///
+    /// Returns a reusable prepared handle (for later [`cursor_execute`] /
+    /// [`cursor_unprepare`]) together with the opened cursor's handle and
+    /// negotiated scroll/concurrency options. The parameter declaration list is
+    /// built internally from `params`; the `PARAMETERIZED_STMT` flag is added
+    /// automatically when `params` is non-empty.
+    ///
+    /// Metadata is requested via the default RPC header — no `options` proc
+    /// parameter is sent, matching the ODBC wire contract.
+    ///
+    /// TODO: `AUTO_FETCH` is not yet supported. Passing `AUTO_FETCH` in
+    /// `scroll_opt` returns an error.
+    ///
+    /// TODO: Piggyback unprepare is not exposed. The `sp_cursorprepexec`
+    /// first procedure parameter (prepared-handle input/output) can carry an existing handle to
+    /// release it in the same round-trip; this method always sends NULL, so a
+    /// previously prepared handle must be released separately via
+    /// [`cursor_unprepare`](Self::cursor_unprepare).
+    ///
+    /// [`cursor_execute`]: Self::cursor_execute
+    /// [`cursor_unprepare`]: Self::cursor_unprepare
+    #[allow(clippy::too_many_arguments)] // Matches sp_cursorprepexec's positional parameters
+    #[instrument(skip(self, params), level = "info")]
+    pub async fn cursor_prepexec(
+        &mut self,
+        stmt: &str,
+        params: Vec<RpcParameter>,
+        scroll_opt: CursorScrollOption,
+        cc_opt: CursorConcurrency,
+        row_count: i32,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<CursorPrepExecResponse> {
+        if scroll_opt.contains(CursorScrollOption::AUTO_FETCH) {
+            return Err(UsageError(
+                "AUTO_FETCH is not yet supported in cursor_prepexec".to_string(),
+            ));
+        }
+
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        // Add PARAMETERIZED_STMT only when the statement actually has parameters.
+        let scroll_opt = if params.is_empty() {
+            scroll_opt
+        } else {
+            scroll_opt | CursorScrollOption::PARAMETERIZED_STMT
+        };
+
+        // Build the parameter declaration list from the named params.
+        let mut param_def_string = String::new();
+        build_parameter_list_string(&params, &mut param_def_string)?;
+
+        // Parameter order matches the sp_cursorprepexec ODBC wire contract:
+        // prepared_handle(OUT), cursor(OUT), params(decl), stmt, scrollopt, ccopt, rowcount.
+        let positional_params = vec![
+            RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None)),
+            RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None)),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(param_def_string))),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(stmt.to_string()))),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(scroll_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(cc_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(row_count)),
+            ),
+        ];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorPrepExec),
+            Some(positional_params),
+            Some(params),
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        self.drain_cursor_response().await?;
+
+        // OUTPUT ordinals: 0=prepared_handle, 1=cursor, 2=scrollopt, 3=ccopt, 4=rowcount
+        Ok(CursorPrepExecResponse {
+            prepared_handle: self.extract_return_value_int(0)?,
+            cursor: CursorOpenResponse {
+                cursor_id: self.extract_return_value_int(1)?,
+                negotiated_scroll: CursorScrollOption::from_bits_truncate(
+                    self.extract_return_value_int(2)? as u32,
+                ),
+                negotiated_concurrency: CursorConcurrency::from_bits_truncate(
+                    self.extract_return_value_int(3)? as u32,
+                ),
+                row_count: self.extract_return_value_int(4)?,
+            },
+        })
+    }
+
+    /// Executes a previously prepared cursor (`sp_cursorexecute`, RPC ID 4).
+    ///
+    /// Opens a fresh cursor from a prepare handle returned by [`cursor_prepare`]
+    /// or [`cursor_prepexec`], returning a **new** cursor handle each time along
+    /// with the negotiated scroll/concurrency options. Bound parameter values are
+    /// supplied via `params`; their types were fixed at prepare time, so no
+    /// declaration list is sent.
+    ///
+    /// TODO: `AUTO_FETCH` is not yet supported. Passing `AUTO_FETCH` in
+    /// `scroll_opt` returns an error.
+    ///
+    /// [`cursor_prepare`]: Self::cursor_prepare
+    /// [`cursor_prepexec`]: Self::cursor_prepexec
+    #[allow(clippy::too_many_arguments)] // Matches sp_cursorexecute's positional parameters
+    #[instrument(skip(self, params), level = "info")]
+    pub async fn cursor_execute(
+        &mut self,
+        prepared_handle: i32,
+        params: Vec<RpcParameter>,
+        scroll_opt: CursorScrollOption,
+        cc_opt: CursorConcurrency,
+        row_count: i32,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<CursorOpenResponse> {
+        if scroll_opt.contains(CursorScrollOption::AUTO_FETCH) {
+            return Err(UsageError(
+                "AUTO_FETCH is not yet supported in cursor_execute".to_string(),
+            ));
+        }
+
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        // Parameter order matches the sp_cursorexecute wire contract:
+        // prepared_handle(IN), cursor(OUT), scrollopt, ccopt, rowcount.
+        let positional_params = vec![
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(prepared_handle))),
+            RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None)),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(scroll_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(cc_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(row_count)),
+            ),
+        ];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorExecute),
+            Some(positional_params),
+            Some(params),
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        // prepared_handle is plain INPUT (no ReturnValue), so the OUTPUT ordinals
+        // match sp_cursoropen: 0=cursor, 1=scrollopt, 2=ccopt, 3=rowcount.
+        self.consume_cursor_open_response().await
+    }
+
+    /// Prepares a server cursor without opening it (`sp_cursorprepare`, RPC ID 3).
+    ///
+    /// Compiles the statement and returns a reusable prepared handle plus the
+    /// negotiated scroll/concurrency options. No cursor is opened and no rows are
+    /// returned — call [`cursor_execute`] to open a cursor from the handle.
+    ///
+    /// `param_def` is the explicit parameter declaration list (e.g.
+    /// `"@p1 INT, @p2 NVARCHAR(50)"`); pass `""` for a non-parameterized
+    /// statement. The `options` parameter (`PREPARE_METADATA`) is sent so the
+    /// server returns the result-set column metadata.
+    ///
+    /// [`cursor_execute`]: Self::cursor_execute
+    #[instrument(skip(self), level = "info")]
+    pub async fn cursor_prepare(
+        &mut self,
+        stmt: &str,
+        param_def: &str,
+        scroll_opt: CursorScrollOption,
+        cc_opt: CursorConcurrency,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<CursorPrepareResponse> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        // Add PARAMETERIZED_STMT only when a declaration list is supplied.
+        let scroll_opt = if param_def.is_empty() {
+            scroll_opt
+        } else {
+            scroll_opt | CursorScrollOption::PARAMETERIZED_STMT
+        };
+
+        // options = PREPARE_METADATA: ask the server to return the column metadata.
+        const PREPARE_METADATA: i32 = 0x0001;
+
+        // Parameter order matches the sp_cursorprepare wire contract:
+        // prepared_handle(OUT), params(decl), stmt, options, scrollopt, ccopt.
+        let positional_params = vec![
+            RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None)),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(param_def.to_string()))),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(stmt.to_string()))),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::Int(Some(PREPARE_METADATA)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(scroll_opt.bits() as i32)),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(Some(cc_opt.bits() as i32)),
+            ),
+        ];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorPrepare),
+            Some(positional_params),
+            None,
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        self.drain_cursor_response().await?;
+
+        // OUTPUT ordinals: 0=prepared_handle, 1=scrollopt, 2=ccopt (no rowcount).
+        Ok(CursorPrepareResponse {
+            prepared_handle: self.extract_return_value_int(0)?,
+            negotiated_scroll: CursorScrollOption::from_bits_truncate(
+                self.extract_return_value_int(1)? as u32,
+            ),
+            negotiated_concurrency: CursorConcurrency::from_bits_truncate(
+                self.extract_return_value_int(2)? as u32,
+            ),
+        })
+    }
+
+    /// Releases a prepared cursor handle (`sp_cursorunprepare`, RPC ID 6).
+    ///
+    /// After this call the `prepared_handle` is invalid and must not be reused
+    /// with [`cursor_execute`](Self::cursor_execute).
+    #[instrument(skip(self), level = "info")]
+    pub async fn cursor_unprepare(
+        &mut self,
+        prepared_handle: i32,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        let params = vec![RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::Int(Some(prepared_handle)),
+        )];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorUnprepare),
+            Some(params),
+            None,
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        let server_errors = self.drain_stream().await?;
+        self.execution_context.set_has_open_batch(false);
+        if !server_errors.is_empty() {
+            return Err(crate::error::Error::from_sql_errors(server_errors));
         }
         Ok(())
     }
@@ -1337,6 +2060,9 @@ impl TdsClient {
                     info!(?info_token);
                     continue;
                 }
+                Tokens::TabName | Tokens::ColInfo => {
+                    continue;
+                }
                 _ => {
                     info!("move_to_column_metadata: {:?}", token);
                     return Err(UsageError(format!(
@@ -1462,6 +2188,9 @@ impl TdsClient {
                     }
                     Tokens::Info(info_token) => {
                         info!(?info_token);
+                        continue;
+                    }
+                    Tokens::TabName | Tokens::ColInfo => {
                         continue;
                     }
                     _ => {
@@ -1726,6 +2455,7 @@ impl TdsClient {
         let metadata = self.move_to_column_metadata().await?;
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
+            self.current_metadata = None;
         } else {
             self.current_metadata = metadata;
             self.execution_context.set_has_open_batch(true);
@@ -1941,19 +2671,31 @@ mod tests {
     use crate::datatypes::row_writer::RowWriter;
     use crate::io::reader_writer::{NetworkReader, NetworkWriter};
     use crate::io::token_stream::{ParserContext, RowReadResult, TdsTokenStreamReader};
-    use crate::token::tokens::Tokens;
+    use crate::token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, Tokens};
     use async_trait::async_trait;
+    use std::collections::VecDeque;
 
     // ── Minimal mock transport for reconnect() unit tests ──
 
     #[derive(Debug)]
     struct TestTransport {
         closed: bool,
+        pending_tokens: VecDeque<Tokens>,
     }
 
     impl TestTransport {
         fn new() -> Self {
-            Self { closed: false }
+            Self {
+                closed: false,
+                pending_tokens: VecDeque::new(),
+            }
+        }
+
+        fn with_tokens(tokens: Vec<Tokens>) -> Self {
+            Self {
+                closed: false,
+                pending_tokens: VecDeque::from(tokens),
+            }
         }
     }
 
@@ -1965,6 +2707,9 @@ mod tests {
             _remaining_request_timeout: Option<Duration>,
             _cancel_handle: Option<&CancelHandle>,
         ) -> TdsResult<Tokens> {
+            if let Some(tok) = self.pending_tokens.pop_front() {
+                return Ok(tok);
+            }
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
 
@@ -2046,6 +2791,36 @@ mod tests {
             execution_context,
             client_context,
         )
+    }
+
+    fn create_test_client_with_tokens(tokens: Vec<Tokens>) -> TdsClient {
+        let transport = Box::new(TestTransport::with_tokens(tokens));
+        let negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let execution_context = crate::connection::execution_context::ExecutionContext::new();
+        let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            client_context,
+        )
+    }
+
+    fn done_no_more() -> Tokens {
+        Tokens::Done(DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::Insert,
+            row_count: 0,
+        })
+    }
+
+    fn empty_col_metadata() -> Tokens {
+        Tokens::ColMetadata(ColMetadataToken::default())
+    }
+
+    fn stale_metadata() -> Arc<ColMetadataToken> {
+        Arc::new(ColMetadataToken::default())
     }
 
     #[test]
@@ -2296,5 +3071,115 @@ mod tests {
         let mut client = create_test_client();
         client.recovery_context.recovery_count = 3;
         assert_eq!(client.connection_recovery_count(), 3);
+    }
+
+    // ── execute() / current_metadata invariants ──
+    //
+    // After an execute path returns, `current_metadata` must reflect the
+    // current batch:
+    //   - DDL/DML (no COLMETADATA from the server) → `current_metadata` is None
+    //     and `has_open_batch` is false.
+    //   - Result-bearing query (COLMETADATA received) → `current_metadata`
+    //     points at the freshly received metadata and `has_open_batch` is true.
+    // No state from a prior batch is observable via `get_metadata()`.
+
+    /// Seeds a client with stale metadata + a single DONE token, runs `invoke`,
+    /// and asserts the no-result-set post-conditions. Failure attribution comes
+    /// from the calling test's name.
+    async fn assert_no_result_set_clears_metadata<F>(invoke: F)
+    where
+        F: AsyncFnOnce(&mut TdsClient) -> TdsResult<()>,
+    {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client.current_metadata = Some(stale_metadata());
+
+        invoke(&mut client)
+            .await
+            .expect("execute path should succeed against the queued DONE token");
+
+        assert!(
+            client.current_metadata.is_none(),
+            "DDL/DML must clear cached metadata so get_metadata() doesn't return stale columns"
+        );
+        assert!(
+            !client.execution_context.has_open_batch(),
+            "no result set => has_open_batch must be false"
+        );
+        assert!(client.get_metadata().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_clears_stale_metadata_when_no_result_set() {
+        assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
+            c.execute("INSERT INTO t VALUES (1)".to_string(), None, None)
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_replaces_stale_metadata_when_result_set_returned() {
+        let mut client = create_test_client_with_tokens(vec![empty_col_metadata(), done_no_more()]);
+        let stale = stale_metadata();
+        client.current_metadata = Some(Arc::clone(&stale));
+
+        client
+            .execute("SELECT 1".to_string(), None, None)
+            .await
+            .expect("execute should consume COLMETADATA and return Ok");
+
+        let new_metadata = client
+            .current_metadata
+            .as_ref()
+            .expect("COLMETADATA branch must populate current_metadata");
+        assert!(
+            !Arc::ptr_eq(new_metadata, &stale),
+            "current_metadata must point to the freshly received COLMETADATA, not the stale Arc"
+        );
+        assert!(
+            client.execution_context.has_open_batch(),
+            "result-set => has_open_batch must be true"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stored_procedure_clears_stale_metadata_when_no_result_set() {
+        assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
+            c.execute_stored_procedure("dbo.do_work".to_string(), None, None, None, None)
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_sp_executesql_clears_stale_metadata_when_no_result_set() {
+        assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
+            c.execute_sp_executesql("UPDATE t SET v = 1".to_string(), Vec::new(), None, None)
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_clears_stale_metadata_when_no_result_set() {
+        assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
+            c.execute_sp_prepexec("UPDATE t SET v = 1".to_string(), Vec::new(), None, None)
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_sp_execute_clears_stale_metadata_when_no_result_set() {
+        assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
+            c.execute_sp_execute(42, None, None, None, None).await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn get_dtc_address_clears_stale_metadata_when_no_result_set() {
+        assert_no_result_set_clears_metadata(async |c: &mut TdsClient| c.get_dtc_address().await)
+            .await;
     }
 }

@@ -102,6 +102,8 @@ pub(crate) enum Tokens {
     Order(OrderToken),
     ReturnStatus(ReturnStatusToken),
     ReturnValue(ReturnValueToken),
+    TabName,
+    ColInfo,
 }
 
 /// Union of all parsed TDS tokens (public under `fuzzing` cfg).
@@ -125,6 +127,8 @@ pub enum Tokens {
     Order(OrderToken),
     ReturnStatus(ReturnStatusToken),
     ReturnValue(ReturnValueToken),
+    TabName,
+    ColInfo,
 }
 
 macro_rules! impl_from_token {
@@ -170,6 +174,8 @@ impl Token for Tokens {
             Tokens::ReturnStatus(token) => token.token_type(),
             Tokens::ReturnValue(token) => token.token_type(),
             Tokens::SessionState(token) => token.token_type(),
+            Tokens::TabName => TokenType::TabName,
+            Tokens::ColInfo => TokenType::ColInfo,
         }
     }
 }
