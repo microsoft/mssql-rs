@@ -10,7 +10,7 @@ use super::util::read_utf16;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
 };
-use crate::error::{free_errors, post_sql_error};
+use crate::error::free_errors;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
@@ -90,7 +90,7 @@ fn sql_exec_direct_w_safe(
         free_errors(&mut stmt_state);
         if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
             error!("SQLExecDirectW: statement has an active execute or open cursor");
-            post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "Invalid cursor state");
+            post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
         // A new execute invalidates prior metadata/context immediately, so a
@@ -112,7 +112,7 @@ fn sql_exec_direct_w_safe(
             error!("SQLExecDirectW: DBC is not connected");
             drop(dbc_state);
             if let Ok(mut ss) = stmt.inner.lock() {
-                post_sql_error(&mut ss, SQLSTATE_08003, 0, "Connection not open");
+                post_diag(&mut ss, ERR_CONNECTION_DOES_NOT_EXIST);
             }
             clear_exec_started(stmt);
             return SQL_ERROR;
@@ -125,12 +125,7 @@ fn sql_exec_direct_w_safe(
             error!("SQLExecDirectW: connection is busy with results for another statement");
             drop(dbc_state);
             if let Ok(mut ss) = stmt.inner.lock() {
-                post_sql_error(
-                    &mut ss,
-                    SQLSTATE_HY000,
-                    0,
-                    "Connection is busy with results for another hstmt",
-                );
+                post_diag(&mut ss, ERR_CONNECTION_BUSY);
             }
             clear_exec_started(stmt);
             return SQL_ERROR;
@@ -144,7 +139,7 @@ fn sql_exec_direct_w_safe(
             dbc_state.active_stmt = None;
             drop(dbc_state);
             if let Ok(mut ss) = stmt.inner.lock() {
-                post_sql_error(&mut ss, SQLSTATE_HY000, 0, "No active TDS client");
+                post_diag(&mut ss, ERR_NO_ACTIVE_TDS_CLIENT);
             }
             clear_exec_started(stmt);
             return SQL_ERROR;

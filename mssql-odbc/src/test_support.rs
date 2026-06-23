@@ -18,6 +18,8 @@ use crate::api::odbc_types::{
     SQL_OV_ODBC3_80, SQL_SUCCESS, SqlHandle,
 };
 use crate::api::set_env_attr::sql_set_env_attr;
+use crate::handles::dbc::ConnectionState;
+use crate::handles::{DbcHandle, handle_from_raw};
 
 /// Owns a set of test ODBC handles and frees them on drop.
 ///
@@ -97,6 +99,17 @@ impl TestHandles {
         assert!(!stmt.is_null());
         self.extra_stmts.push(stmt);
         stmt
+    }
+
+    /// Force the DBC into the `Connected` state without establishing a real
+    /// TDS client. Only valid for code paths that gate on `connection_state`
+    /// but never touch the client — e.g. SQLPrepare's deferred prepare. Paths
+    /// that take the `TdsClient` will still see `None` and must not use this.
+    pub(crate) fn mark_dbc_connected(&self) {
+        assert!(!self.dbc.is_null(), "mark_dbc_connected requires a DBC");
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(self.dbc) };
+        let mut state = dbc.inner.lock().expect("dbc mutex poisoned");
+        state.connection_state = ConnectionState::Connected;
     }
 }
 

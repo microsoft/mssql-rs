@@ -78,9 +78,13 @@ impl HasDiagnostics for EnvState {
 
 impl EnvHandle {
     pub(crate) fn new() -> io::Result<Self> {
-        let runtime = Runtime::new().inspect_err(|e| {
-            error!(%e, "failed to create Tokio runtime");
-        })?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .inspect_err(|e| {
+                error!(%e, "failed to create Tokio runtime");
+            })?;
         Ok(Self {
             object_type: HandleType::Env,
             inner: Mutex::new(EnvState {

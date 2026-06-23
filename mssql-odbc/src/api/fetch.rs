@@ -9,7 +9,7 @@ use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SqlHandle, SqlReturn,
 };
-use crate::error::{free_errors, post_sql_error};
+use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::ResultSet;
@@ -45,7 +45,7 @@ fn sql_fetch_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
         free_errors(&mut stmt_state);
         if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
             error!("SQLFetch: no open cursor on this statement");
-            post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "Invalid cursor state");
+            post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
     }
@@ -69,12 +69,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             error!("SQLFetch: connection is busy with results for another statement");
             drop(dbc_state);
             if let Ok(mut ss) = stmt.inner.lock() {
-                post_sql_error(
-                    &mut ss,
-                    SQLSTATE_HY000,
-                    0,
-                    "Connection is busy with results for another hstmt",
-                );
+                post_diag(&mut ss, ERR_CONNECTION_BUSY);
             }
             return SQL_ERROR;
         }
@@ -94,7 +89,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             // clearing it would briefly hide the busy state from other statements.
             drop(dbc_state);
             if let Ok(mut ss) = stmt.inner.lock() {
-                post_sql_error(&mut ss, SQLSTATE_HY000, 0, "No active TDS client");
+                post_diag(&mut ss, ERR_NO_ACTIVE_TDS_CLIENT);
             }
             return SQL_ERROR;
         };
@@ -208,7 +203,7 @@ mod tests {
         assert_eq!(stmt_state.diag_records[0].sql_state, SQLSTATE_HY000);
         assert_eq!(
             stmt_state.diag_records[0].message,
-            "Connection is busy with results for another hstmt"
+            "Connection is busy with results for another command"
         );
         drop(stmt_state);
 

@@ -11,7 +11,7 @@ use tracing::{debug, error};
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
-use crate::error::{free_errors, post_sql_error};
+use crate::error::free_errors;
 use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -63,7 +63,7 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
     free_errors(&mut stmt_state);
     if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
         error!("SQLCloseCursor: no cursor is open — SQLSTATE 24000");
-        post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "Invalid cursor state");
+        post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
         return SQL_ERROR;
     }
 

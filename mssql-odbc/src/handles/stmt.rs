@@ -11,8 +11,9 @@ use super::{DbcHandle, HandleType, HasObjectType};
 use crate::error::{DiagRecord, HasDiagnostics};
 
 pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
-pub(crate) const STMT_STATE_EXEC_CONTEXT: u32 = 0x0000_1000;
+pub(crate) const STMT_STATE_PREPARED: u32 = 0x0000_0200;
 pub(crate) const STMT_STATE_CURSOR_OPEN: u32 = 0x0000_0800;
+pub(crate) const STMT_STATE_EXEC_CONTEXT: u32 = 0x0000_1000;
 
 /// Statement handle — equivalent to msodbcsql's `struct tagSTMT`.
 ///
@@ -33,6 +34,10 @@ pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
+    /// SQL text stored by `SQLPrepare`, awaiting execution. The server-side
+    /// prepare is deferred (msodbcsql parity) — bundled into `SQLExecute` via
+    /// `sp_prepexec`, or triggered lazily if metadata is needed first.
+    pub(crate) prepared_sql: Option<String>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
     /// Statement lifecycle/status flags used for ODBC API state checks.
@@ -77,6 +82,7 @@ impl StmtHandle {
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
+                prepared_sql: None,
                 current_row: None,
                 state_flags: 0,
             }),

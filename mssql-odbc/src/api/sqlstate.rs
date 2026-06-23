@@ -20,6 +20,72 @@ pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
 
+// Driver-raised diagnostics: a fixed SQLSTATE paired with its canonical
+// message text. Bundling the two means a call site posts one value and can't
+// accidentally pair a message with the wrong SQLSTATE. This mirrors msodbcsql's
+// `IDS_*` resource entries, which likewise bind a state to a string. Several
+// entries can share a SQLSTATE (HY000 is the general-error state), so these are
+// keyed by logical error, not by state. Server-originated errors don't use
+// this — their text comes from the wire (see `post_tds_error`).
+
+/// A driver-raised diagnostic: a fixed SQLSTATE and its canonical message.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DiagMsg {
+    pub(crate) state: [u8; 5],
+    pub(crate) text: &'static str,
+}
+
+pub(crate) const ERR_INVALID_CURSOR_STATE: DiagMsg = DiagMsg {
+    state: SQLSTATE_24000,
+    text: "Invalid cursor state",
+};
+pub(crate) const ERR_CONNECTION_DOES_NOT_EXIST: DiagMsg = DiagMsg {
+    state: SQLSTATE_08003,
+    text: "Connection does not exist",
+};
+pub(crate) const ERR_NO_ACTIVE_TDS_CLIENT: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "No active TDS client",
+};
+pub(crate) const ERR_CONNECTION_BUSY: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "Connection is busy with results for another command",
+};
+pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY010,
+    text: "Function sequence error",
+};
+pub(crate) const ERR_INVALID_DESCRIPTOR_INDEX: DiagMsg = DiagMsg {
+    state: SQLSTATE_07009,
+    text: "Invalid descriptor index",
+};
+pub(crate) const ERR_STRING_RIGHT_TRUNCATION: DiagMsg = DiagMsg {
+    state: SQLSTATE_01004,
+    text: "String data, right truncation",
+};
+pub(crate) const ERR_INVALID_NULL_POINTER: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY009,
+    text: "Invalid use of null pointer",
+};
+pub(crate) const ERR_INVALID_ATTRIBUTE_VALUE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY024,
+    text: "Invalid attribute value",
+};
+pub(crate) const ERR_INVALID_ATTRIBUTE_IDENTIFIER: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY092,
+    text: "Invalid attribute/option identifier",
+};
+pub(crate) const ERR_INVALID_CONNECTION_STRING_ATTRIBUTE: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S00,
+    text: "Invalid connection string attribute",
+};
+
+/// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with
+/// native error 0. For server-originated errors use [`post_tds_error`].
+pub(crate) fn post_diag(state: &mut impl HasDiagnostics, msg: DiagMsg) {
+    post_sql_error(state, msg.state, 0, msg.text);
+}
+
 /// SQL Server engine error number → ODBC 3.x SQLSTATE.
 ///
 /// We keep only the 3.x state (not 2.x) since that is the behavior
@@ -315,5 +381,15 @@ mod tests {
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_HY000);
         assert_eq!(s.records[0].native_error, 0);
+    }
+
+    #[test]
+    fn post_diag_uses_bundled_state_and_message() {
+        let mut s = FakeState::default();
+        post_diag(&mut s, ERR_CONNECTION_DOES_NOT_EXIST);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_08003);
+        assert_eq!(s.records[0].native_error, 0);
+        assert_eq!(s.records[0].message, "Connection does not exist");
     }
 }

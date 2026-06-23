@@ -6,8 +6,8 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
-use crate::api::sqlstate::{SQLSTATE_08003, SQLSTATE_HY000};
-use crate::error::{free_errors, post_sql_error};
+use crate::api::sqlstate::{ERR_CONNECTION_DOES_NOT_EXIST, post_diag};
+use crate::error::free_errors;
 use crate::handles::DbcHandle;
 use crate::handles::StmtHandle;
 use crate::handles::dbc::ConnectionState;
@@ -48,7 +48,7 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
 
     if state.connection_state != ConnectionState::Connected {
         error!("SQLDisconnect: not connected");
-        post_sql_error(&mut state, SQLSTATE_08003, 0, "Connection does not exist");
+        post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
         return SQL_ERROR;
     }
 
@@ -67,12 +67,6 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_ptr) };
         let Ok(guard) = stmt.inner.lock() else {
             error!(?stmt_ptr, "SQLDisconnect: stmt mutex poisoned");
-            post_sql_error(
-                &mut state,
-                SQLSTATE_HY000,
-                0,
-                "Internal error while disconnecting statements",
-            );
             return SQL_ERROR;
         };
         drop(guard);

@@ -11,8 +11,8 @@
 //! Windows `.def` file or a C header listing the public API surface.
 
 use super::odbc_types::{
-    SQL_SUCCESS, SqlHWnd, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
-    SqlUSmallInt, SqlWChar,
+    SQL_CLOSE, SQL_SUCCESS, SqlHWnd, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn,
+    SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 
 // ---- Handle allocation and management ---------------------------------------
@@ -213,7 +213,6 @@ pub unsafe extern "C" fn SQLFreeStmt(
     option: SqlUSmallInt,
 ) -> SqlReturn {
     crate::init_tracing();
-    const SQL_CLOSE: SqlUSmallInt = 0;
     match option {
         SQL_CLOSE => unsafe { super::close_cursor::sql_free_stmt_close(statement_handle) },
         _ => {
@@ -224,6 +223,25 @@ pub unsafe extern "C" fn SQLFreeStmt(
 }
 
 // ---- Statement execution ---------------------------------------------------
+
+/// Prepares a SQL statement for later execution with `SQLExecute`.
+///
+/// The server-side prepare is deferred and bundled into `SQLExecute`
+/// (`sp_prepexec`), matching msodbcsql. No network I/O happens at prepare time.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - `statement_text`, if non-null, must be readable for `text_length` `SQLWCHAR`s.
+///   If `text_length` is `SQL_NTS`, the string must be NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLPrepareW(
+    statement_handle: SqlHandle,
+    statement_text: *const SqlWChar,
+    text_length: SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe { super::prepare::sql_prepare_w(statement_handle, statement_text, text_length) }
+}
 
 /// Executes a preparable statement, using the current values of the parameter
 /// marker variables if any parameter markers exist in the statement.

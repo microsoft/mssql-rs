@@ -14,9 +14,11 @@ use crate::api::odbc_types::{
     SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlHandle, SqlReturn,
     SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
-use crate::api::sqlstate::{SQLSTATE_01004, SQLSTATE_07009, SQLSTATE_HY010};
+use crate::api::sqlstate::{
+    ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_INDEX, ERR_STRING_RIGHT_TRUNCATION, post_diag,
+};
 use crate::api::util::{copy_with_nul, write_if_some};
-use crate::error::{free_errors, post_sql_error};
+use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -124,22 +126,12 @@ fn sql_describe_col_w_safe(
     free_errors(&mut stmt_state);
 
     if !stmt_state.has_state(STMT_STATE_EXEC_CONTEXT) {
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_HY010,
-            0,
-            "Function sequence error",
-        );
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
         return SQL_ERROR;
     }
 
     if column_number == 0 || column_number as usize > stmt_state.column_metadata.len() {
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_07009,
-            0,
-            "Invalid descriptor index",
-        );
+        post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
         return SQL_ERROR;
     }
 
@@ -162,12 +154,7 @@ fn sql_describe_col_w_safe(
     unsafe { write_if_some(nullable_ptr, nullable) };
 
     if truncated {
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_01004,
-            0,
-            "String data, right truncation",
-        );
+        post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
@@ -363,7 +350,10 @@ mod tests {
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert_eq!(stmt_state.diag_records.len(), 1);
-        assert_eq!(stmt_state.diag_records[0].sql_state, SQLSTATE_HY010);
+        assert_eq!(
+            stmt_state.diag_records[0].sql_state,
+            ERR_FUNCTION_SEQUENCE.state
+        );
     }
 
     #[test]
@@ -383,7 +373,10 @@ mod tests {
 
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert_eq!(stmt_state.diag_records.len(), 1);
-        assert_eq!(stmt_state.diag_records[0].sql_state, SQLSTATE_07009);
+        assert_eq!(
+            stmt_state.diag_records[0].sql_state,
+            ERR_INVALID_DESCRIPTOR_INDEX.state
+        );
     }
 
     #[test]
@@ -406,6 +399,9 @@ mod tests {
 
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert_eq!(stmt_state.diag_records.len(), 1);
-        assert_eq!(stmt_state.diag_records[0].sql_state, SQLSTATE_07009);
+        assert_eq!(
+            stmt_state.diag_records[0].sql_state,
+            ERR_INVALID_DESCRIPTOR_INDEX.state
+        );
     }
 }

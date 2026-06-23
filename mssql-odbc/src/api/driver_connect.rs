@@ -10,8 +10,9 @@ use crate::api::odbc_types::{
     SQL_SUCCESS_WITH_INFO, SqlHWnd, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
-    SQLSTATE_01S00, SQLSTATE_01004, SQLSTATE_08001, SQLSTATE_HY009, SQLSTATE_HY010, SQLSTATE_HY024,
-    SQLSTATE_HY110, post_tds_error,
+    ERR_FUNCTION_SEQUENCE, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE, ERR_INVALID_NULL_POINTER,
+    ERR_STRING_RIGHT_TRUNCATION, SQLSTATE_08001, SQLSTATE_HY024, SQLSTATE_HY110, post_diag,
+    post_tds_error,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
@@ -156,7 +157,7 @@ fn sql_driver_connect_w_safe(
     );
     if state.connection_state != ConnectionState::Disconnected {
         error!("SQLDriverConnectW: connection attempt already in progress");
-        post_sql_error(&mut state, SQLSTATE_HY010, 0, "Function sequence error");
+        post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
         return SQL_ERROR;
     }
     state.connection_state = ConnectionState::Connecting;
@@ -190,7 +191,7 @@ fn do_connect(
 ) -> SqlReturn {
     let Some(conn_str) = conn_str else {
         error!("SQLDriverConnectW: in_connection_string is null");
-        post_sql_error(state, SQLSTATE_HY009, 0, "Invalid use of null pointer");
+        post_diag(state, ERR_INVALID_NULL_POINTER);
         return SQL_ERROR;
     };
 
@@ -276,15 +277,10 @@ fn do_connect(
 
     if has_warnings || truncated {
         if has_warnings {
-            post_sql_error(
-                state,
-                SQLSTATE_01S00,
-                0,
-                "Invalid connection string attribute",
-            );
+            post_diag(state, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE);
         }
         if truncated {
-            post_sql_error(state, SQLSTATE_01004, 0, "String data, right truncation");
+            post_diag(state, ERR_STRING_RIGHT_TRUNCATION);
         }
         SQL_SUCCESS_WITH_INFO
     } else {

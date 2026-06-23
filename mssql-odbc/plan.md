@@ -396,3 +396,67 @@ Audit of [mkleehammer/pyodbc](https://github.com/mkleehammer/pyodbc) (source cal
 | `SQLSpecialColumns` |
 | `SQLStatistics` |
 | `SQLTables` |
+
+---
+
+## Appendix: Known Issues
+
+### Disconnect Lifetime Race Condition
+
+**Issue**: A use-after-free (UAF) can occur if a thread calls `SQLDisconnect` while another thread is mid-execute (during `SQLExecDirectW` network I/O), even though the ODBC spec and Driver Manager should prevent this scenario in correct usage.
+
+**Root Cause**:
+- In `SQLExecDirectW` ([exec_direct.rs line ~150](src/api/exec_direct.rs#L148-L150)), the DBC lock is released before I/O begins to avoid holding the lock during network operations.
+- Thread A (executing) takes the TdsClient, releases the DBC lock, and begins `block_on(client.execute(...))`.
+- Thread B (disconnecting) locks the DBC, sees the connection is connected, then frees all STMT handles in a loop by taking the STMT lock and immediately deallocating the `Box<StmtHandle>`.
+- Thread A's I/O completes and attempts to lock the STMT handle again to post error diagnostics, but the memory has already been freed by Thread B → UAF.
+
+**Why It Doesn't Fire in Practice**:
+The ODBC spec explicitly gates `SQLDisconnect` via the Driver Manager with `HY010` (function sequence error) if:
+- any statement is still executing **asynchronously** (returns `SQL_STILL_EXECUTING`), or
+- any statement/connection is in a `SQL_NEED_DATA` flow (data-at-execution parameters).
+
+([SQLDisconnect diagnostics](https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqldisconnect-function?view=sql-server-ver17#diagnostics))
+([Statement Transitions](https://learn.microsoft.com/en-us/sql/odbc/reference/appendixes/statement-transitions?view=sql-server-ver17#sqldisconnect))
+
+For **synchronous** in-flight operations, the spec does not explicitly gate `SQLDisconnect` at the DM level, but the intended usage pattern is: app drains all results via `SQLFetch`/`SQLGetData`, calls `SQLCloseCursor` or `SQLFreeStmt(SQL_CLOSE)`, *then* `SQLDisconnect`. In correct ODBC usage, this ordering ensures no concurrent synchronous I/O exists when `SQLDisconnect` is called.
+
+**How msodbcsql Handles It** ([sqlcconn.cpp lines 1297-1314](https://msodbcsql/Sql/Ntdbms/sqlncli/odbc/sqlcconn.cpp)):
+msodbcsql uses **BATCHCTX refcounting** — a separate batch execution context independent of the STMT handle lifetime:
+1. When a statement starts executing, it attaches a `BATCHCTX*` (batch context) with a reference count.
+2. Thread A (executing) holds a strong reference to the BATCHCTX, incrementing its refcount.
+3. When `SQLDisconnect` frees a STMT handle, it does **not** free the BATCHCTX; only the STMT handle box is deallocated.
+4. Thread A's in-flight I/O still holds a reference to the BATCHCTX; when the operation completes, the refcount drops and cleanup happens cleanly.
+5. Thread B (disconnecting) can safely free STMT handles because the underlying batch state remains alive while referenced.
+
+**Fix (Phase 3+)** (Not fixed now — does not affect correct ODBC usage):
+Introduce an `Arc<BatchContext>` wrapper so each TdsClient operation holds a strong reference across I/O. The `StmtHandle` can be deallocated immediately by `SQLDisconnect`, but the arc keeps the underlying state alive until all in-flight operations complete. This mirrors msodbcsql's BATCHCTX pattern but using Rust's Arc for automatic refcounting.
+
+See [disconnect.rs line 63](src/api/disconnect.rs#L63) for the TODO comment noting this exact issue.
+
+---
+
+## Appendix: Authentication Method Support Comparison
+
+| Authentication Method | mssql-tds | mssql-python | mssql-odbc (target) | Notes |
+|---|---|---|---|---|
+| **SQL Server Auth** |
+| Password | ✅ | ✅ | ✅ | Username + password |
+| **Integrated / Domain** |
+| SSPI / Integrated | ✅ | ✅ | ✅ | Windows SSPI or Unix GSSAPI/Kerberos |
+| **Entra ID / Azure AD** |
+| ActiveDirectoryPassword | ✅ | ✅ | ✅ | Username + password |
+| ActiveDirectoryInteractive | ✅ | ✅ | ✅ | Browser-based interactive sign-in |
+| ActiveDirectoryDeviceCode | ✅ | ✅ | ✅ | Device code flow (headless/CLI environments) |
+| ActiveDirectoryServicePrincipal | ✅ | ✅ | ✅ | Client ID + secret or certificate |
+| ActiveDirectoryManagedIdentity / MSI | ✅ | ✅ | ✅ | System-assigned or user-assigned identity |
+| ActiveDirectoryDefault | ✅ | ✅ | ✅ | Auto-detect auth method from environment |
+| ActiveDirectoryIntegrated | ✅ | ❌ | ✅ | Entra with current user's Kerberos ticket |
+| **Advanced** |
+| ActiveDirectoryWorkloadIdentity | ✅ | ❌ | ✅ | Kubernetes workload identity |
+| AccessToken (JWT) | ✅ | ❌ | ✅ | Pre-acquired bearer access token |
+
+**Summary**:
+- **mssql-tds** supports all 12 methods (foundation layer)
+- **mssql-python** supports 9 core methods (Password, Integrated, and 7 Entra flows)
+- **mssql-odbc** targets full parity with mssql-tds (all 12 methods delegated via tds layer)

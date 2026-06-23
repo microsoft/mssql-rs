@@ -13,7 +13,7 @@ use crate::api::odbc_types::{
     SQL_ATTR_ODBC_VERSION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
     SqlPointer, SqlReturn,
 };
-use crate::error::{free_errors, post_sql_error};
+use crate::error::free_errors;
 use crate::handles::{EnvHandle, HandleType, OdbcVersion, handle_from_raw};
 
 /// Sets an attribute on an environment handle.
@@ -84,18 +84,13 @@ fn sql_set_env_attr_safe(
             }
             Err(()) => {
                 error!(value, "SQLSetEnvAttr: invalid ODBC_VERSION value");
-                post_sql_error(&mut state, SQLSTATE_HY024, 0, "Invalid attribute value");
+                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
                 SQL_ERROR
             }
         },
         _ => {
             error!(attribute, "SQLSetEnvAttr: unknown attribute");
-            post_sql_error(
-                &mut state,
-                SQLSTATE_HY092,
-                0,
-                "Invalid attribute/option identifier",
-            );
+            post_diag(&mut state, ERR_INVALID_ATTRIBUTE_IDENTIFIER);
             SQL_ERROR
         }
     }

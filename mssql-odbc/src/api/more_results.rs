@@ -16,8 +16,10 @@ use super::close_cursor::reset_cursor_state;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SqlHandle, SqlReturn,
 };
-use crate::api::sqlstate::{SQLSTATE_HY000, post_tds_error};
-use crate::error::{free_errors, post_sql_error};
+use crate::api::sqlstate::{
+    ERR_CONNECTION_BUSY, ERR_NO_ACTIVE_TDS_CLIENT, SQLSTATE_HY000, post_diag, post_tds_error,
+};
+use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -73,12 +75,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             error!("SQLMoreResults: connection is busy with results for another statement");
             drop(dbc_state);
             if let Ok(mut ss) = stmt.inner.lock() {
-                post_sql_error(
-                    &mut ss,
-                    SQLSTATE_HY000,
-                    0,
-                    "Connection is busy with results for another hstmt",
-                );
+                post_diag(&mut ss, ERR_CONNECTION_BUSY);
             }
             return SQL_ERROR;
         }
@@ -86,7 +83,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             error!("SQLMoreResults: no active TDS client");
             drop(dbc_state);
             if let Ok(mut ss) = stmt.inner.lock() {
-                post_sql_error(&mut ss, SQLSTATE_HY000, 0, "No active TDS client");
+                post_diag(&mut ss, ERR_NO_ACTIVE_TDS_CLIENT);
             }
             return SQL_ERROR;
         };

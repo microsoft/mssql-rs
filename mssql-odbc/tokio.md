@@ -101,12 +101,14 @@ Key facts that matter for the runtime decision:
 | **Tokio-coupled** | Uses `tokio::net::TcpStream`, `tokio_native_tls`, `tokio::time::timeout`, `tokio_util::sync::CancellationToken`, and `tokio::spawn`. It needs Tokio specifically, not just any executor. |
 | **Never builds a runtime** | The crate calls `tokio::spawn` / `.await` and assumes an ambient runtime exists. The *consumer* owns the runtime. |
 | **Half-duplex per connection** | TDS is request → full response → next request. One `TdsClient` does one thing at a time. No parallelism *within* a connection. |
+| **Concurrency scales across connections** | Multiple `TdsClient`s on separate connections can progress concurrently on the runtime. The one-at-a-time rule is per connection, not process-wide. |
 | **Real concurrency only at connect** | `parallel_connect` uses `tokio::spawn` to race up to 64 IPs (MultiSubnetFailover); SSRP uses `tokio::spawn` for a UDP listener; Windows named-pipe open uses `spawn_blocking`. The steady-state query path is a single linear chain of `.await`s. |
 
 **Implication:** the runtime's job for `mssql-odbc` is overwhelmingly
 *non-blocking I/O + cancellation + timeouts for one operation at a time per
-connection*, not CPU-bound parallel work. The only place a worker pool earns its
-keep today is `parallel_connect`.
+connection*; throughput scales by having multiple active connections, not by
+trying to pipeline a single connection. The only place a worker pool earns
+extra keep *within one connection* today is `parallel_connect`.
 
 ---
 

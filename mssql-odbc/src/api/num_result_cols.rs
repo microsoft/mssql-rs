@@ -8,9 +8,9 @@ use tracing::{debug, error};
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
 };
-use crate::api::sqlstate::SQLSTATE_HY010;
+use crate::api::sqlstate::{ERR_FUNCTION_SEQUENCE, post_diag};
 use crate::api::util::write_if_some;
-use crate::error::{free_errors, post_sql_error};
+use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -61,12 +61,7 @@ fn sql_num_result_cols_safe(stmt: &StmtHandle, column_count_ptr: *mut SqlSmallIn
     free_errors(&mut stmt_state);
 
     if !stmt_state.has_state(STMT_STATE_EXEC_CONTEXT) {
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_HY010,
-            0,
-            "Function sequence error",
-        );
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
         return SQL_ERROR;
     }
 
@@ -136,6 +131,9 @@ mod tests {
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert_eq!(stmt_state.diag_records.len(), 1);
-        assert_eq!(stmt_state.diag_records[0].sql_state, SQLSTATE_HY010);
+        assert_eq!(
+            stmt_state.diag_records[0].sql_state,
+            ERR_FUNCTION_SEQUENCE.state
+        );
     }
 }

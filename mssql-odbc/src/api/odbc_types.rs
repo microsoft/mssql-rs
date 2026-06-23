@@ -56,6 +56,12 @@ pub const SQL_DRIVER_COMPLETE: SqlUSmallInt = 1;
 pub const SQL_DRIVER_PROMPT: SqlUSmallInt = 2;
 pub const SQL_DRIVER_COMPLETE_REQUIRED: SqlUSmallInt = 3;
 
+// SQLFreeStmt option constants
+pub const SQL_CLOSE: SqlUSmallInt = 0;
+pub const SQL_DROP: SqlUSmallInt = 1;
+pub const SQL_UNBIND: SqlUSmallInt = 2;
+pub const SQL_RESET_PARAMS: SqlUSmallInt = 3;
+
 // Null-terminated string sentinel
 pub const SQL_NTS: SqlSmallInt = -3;
 

@@ -106,7 +106,7 @@ fn sql_get_data_safe(
     free_errors(&mut stmt_state);
 
     if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
-        post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "Invalid cursor state");
+        post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
         return SQL_ERROR;
     }
 
@@ -117,12 +117,7 @@ fn sql_get_data_safe(
 
     let col_index = usize::from(column_number);
     if col_index == 0 || col_index > row.len() {
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_07009,
-            0,
-            "Invalid descriptor index",
-        );
+        post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
         return SQL_ERROR;
     }
 
@@ -212,12 +207,7 @@ fn write_string_result<T: Copy + Default>(
     unsafe { write_if_some(strlen_or_ind_ptr, byte_len) };
     let truncated = unsafe { copy_with_nul(target_value_ptr, buf_elements, src) };
     if truncated {
-        post_sql_error(
-            stmt_state,
-            SQLSTATE_01004,
-            0,
-            "String data, right truncated",
-        );
+        post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION);
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
