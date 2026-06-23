@@ -22,8 +22,13 @@ The two status bits already exist in `PacketStatusFlags` but are marked
 - `0x10` **RESETCONNECTIONSKIPTRAN** — same as `0x08`, but does **not** modify
   the transaction state (a local or enlisted/distributed transaction survives
   the reset). MUST NOT be combined with `0x08`.
-- The server acknowledges via an `ENVCHANGE`/`SESSIONSTATE` reset (already
-  handled on the receive side in `tds_client.rs`).
+- The server acknowledges via an `ENVCHANGE` (subtype 18, `ResetConnection`) /
+  `SESSIONSTATE` reset. `tds_client.rs` reacts to the token by resetting the
+  recovery/session-state table, and `execution_context::capture_change_property`
+  treats the `ResetConnection` subtype as an informational no-op. (Originally
+  this subtype returned an `UnimplementedFeature` error, which caused the first
+  query after a reset to fail; this was found and fixed via the integration
+  tests running against a live server.)
 
 ### How the other drivers implement it
 
