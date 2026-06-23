@@ -172,10 +172,12 @@ impl ExecutionContext {
                 })
             }
             EnvChangeTokenSubType::ResetConnection => {
-                Err(crate::error::Error::UnimplementedFeature {
-                    feature: "ResetConnection environment change".to_string(),
-                    context: "capture_change_property".to_string(),
-                })
+                // Server acknowledgement that the connection was reset to login
+                // defaults (in response to a RESETCONNECTION / RESETCONNECTIONSKIPTRAN
+                // request). It carries no property for the execution context to
+                // capture; the session-state reset is handled by the caller.
+                info!("Connection reset acknowledged by server");
+                Ok(())
             }
             EnvChangeTokenSubType::UserInstanceName => {
                 Err(crate::error::Error::UnimplementedFeature {
@@ -476,7 +478,6 @@ mod tests {
             EnvChangeTokenSubType::PromoteTransaction,
             EnvChangeTokenSubType::TransactionManagerAddress,
             EnvChangeTokenSubType::TransactionEnded,
-            EnvChangeTokenSubType::ResetConnection,
             EnvChangeTokenSubType::UserInstanceName,
             EnvChangeTokenSubType::Routing,
         ];
@@ -491,5 +492,18 @@ mod tests {
                 "Expected UnimplementedFeature for {sub_type:?}, got: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_reset_connection_env_change_is_accepted() {
+        // The server sends a ResetConnection ENVCHANGE to acknowledge a
+        // RESETCONNECTION / RESETCONNECTIONSKIPTRAN request. It must be
+        // accepted gracefully rather than treated as an unimplemented feature.
+        let mut ctx = ExecutionContext::new();
+        let token = EnvChangeToken {
+            sub_type: EnvChangeTokenSubType::ResetConnection,
+            change_type: EnvChangeContainer::from((Vec::<u8>::new(), Vec::<u8>::new())),
+        };
+        assert!(ctx.capture_change_property(&token).is_ok());
     }
 }
