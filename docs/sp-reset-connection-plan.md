@@ -59,29 +59,44 @@ Because dotnet-sqlclient uses SKIPTRAN, we implement **both** `0x08` and `0x10`.
 
 ## Implementation Steps
 
+Rather than threading a `reset_mode` argument through the ~25
+`create_packet_writer` call sites, the pending reset is stored as
+connection-level state on the transport (which already owns connection-scoped
+state such as encryption and session settings) and consumed once when the first
+packet of an eligible request is built.
+
 1. **`src/message/messages.rs`** — add a `ResetConnectionMode { None, Reset,
    ResetSkipTran }` enum; remove the `#[allow(dead_code)]` markers on the two
    `PacketStatusFlags` reset variants once they are used.
-2. **`src/message/messages.rs`** — thread a `reset_mode` argument through
-   `PacketType::create_packet_writer` and `Request::create_packet_writer`.
-3. **`src/io/packet_writer.rs`** — store `reset_mode` on `PacketWriter`; in
-   `populate_header_and_send`, apply the reset bit only when
-   `self.is_first_packet` is true and `reset_mode != None`, OR it into the
-   status in `build_header`. Defensively gate by packet type.
-4. **`src/connection/tds_client.rs`** — add a `pending_reset:
-   ResetConnectionMode` field (init `None`) and a public
-   `prepare_reset_connection(&mut self, preserve_transaction: bool)` method. In
-   the Batch/RPC/Transaction-Manager send paths, read `pending_reset`, pass it
-   into `create_packet_writer`, and clear it to `None` after a successful send.
-5. **Tests** — enum value asserts; `packet_writer` tests verifying the first
-   packet of single- and multi-packet messages carries `EOM | 0x08` / `EOM |
-   0x10` while later packets do not; a `tds_client` test confirming the flag is
-   cleared after one request.
+2. **`src/io/reader_writer.rs`** — extend the `NetworkWriter` trait with default
+   no-op `set_reset_mode(&mut self, ResetConnectionMode)` and
+   `take_reset_mode(&mut self) -> ResetConnectionMode` methods, so existing test
+   mocks need no changes.
+3. **`src/connection/transport/network_transport.rs`** — add a `pending_reset:
+   ResetConnectionMode` field (init `None`) to `NetworkTransport` and override
+   the two trait methods; `take_reset_mode` returns and clears the field
+   (`std::mem::replace`).
+4. **`src/io/packet_writer.rs`** — in `PacketWriter::new`, consume the pending
+   reset via `take_reset_mode` only for `SqlBatch` / `RpcRequest` /
+   `TransactionManager` packet types; store it on `PacketWriter`. In
+   `populate_header_and_send`, pass the mode to `build_header` only when
+   `self.is_first_packet` is true, where it is OR'd into the status byte.
+5. **`src/connection/tds_client.rs`** — add a public
+   `prepare_reset_connection(&mut self, preserve_transaction: bool)` method that
+   maps the flag to `ResetConnectionMode::ResetSkipTran` / `Reset` and stores it
+   on the transport via `set_reset_mode`. One-shot semantics are handled by the
+   transport clearing the field when `PacketWriter::new` consumes it.
+6. **Tests** — `packet_writer` tests verifying the first packet of single- and
+   multi-packet messages carries `EOM | 0x08` / `EOM | 0x10` while later packets
+   do not, and that the mode is not consumed for non-request packet types; a
+   `tds_client` test confirming the mode is routed to the transport.
 
 ## Verification
 
-- `cargo fmt --check`, `cargo clippy`, and `cargo test` in `mssql-tds`
-  (the repo's PR validation gates on all three).
+- `cargo bfmt`, `cargo bclippy`, and `cargo btest` (the repo's aliases from
+  `.cargo/config.toml` for `fmt --check`, workspace clippy with warnings denied,
+  and the nextest + coverage test run) — the repo's PR validation gates on all
+  three.
 - Unit tests assert the header status byte on the first vs. subsequent packets.
 - Integration test: set a session option / create a temp table,
   `prepare_reset_connection(false)`, re-execute and confirm the state is gone;
