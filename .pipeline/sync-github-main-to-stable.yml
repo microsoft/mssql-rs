@@ -106,7 +106,7 @@ steps:
       --target-branch "$TARGET_BRANCH" \
       --title "Sync GitHub main to $TARGET_BRANCH" \
       --description $'Sync of GitHub microsoft/mssql-rs main into the '"$TARGET_BRANCH"$' branch.\n\nBefore merging, ensure CI has had a good run on GitHub main.'
-  displayName: Sync GitHub main to stable
+  displayName: Sync GitHub main to target branch
   env:
     TARGET_BRANCH: ${{ parameters.targetBranch }}
     SYNC_BRANCH: ${{ parameters.syncBranch }}
