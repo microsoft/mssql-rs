@@ -494,6 +494,10 @@ pub(crate) struct NetworkTransport {
     /// Pending connection-reset request to apply to the next SQL Batch, RPC, or
     /// Transaction Manager request. Consumed by the packet writer.
     pending_reset: ResetConnectionMode,
+    /// Cached liveness status. Set to `true` once the connection is explicitly
+    /// closed or an I/O operation observes it broken. Surfaced by
+    /// `connection_known_dead()` as a cheap, socket-free liveness check.
+    known_dead: bool,
 }
 
 impl std::fmt::Debug for NetworkTransport {
@@ -544,7 +548,12 @@ impl NetworkWriter for NetworkTransport {
                 "Cannot send: connection has been closed".to_string(),
             )
         })?;
-        stream.write_all(data).await?;
+        if let Err(e) = stream.write_all(data).await {
+            // A write failure means the socket is broken; record it so the cached
+            // liveness check reports the connection as dead.
+            self.known_dead = true;
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -584,6 +593,7 @@ impl NetworkTransport {
             use_tds74_tls_wrapping,
             extractable_stream_handle: None,
             pending_reset: ResetConnectionMode::None,
+            known_dead: false,
         }
     }
 
@@ -601,17 +611,26 @@ impl NetworkTransport {
                 "Buffer length must be greater than 0".to_string(),
             ));
         }
-        let bytes_read = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| {
-                crate::error::Error::ConnectionClosed(
+        let bytes_read = match self.stream.as_mut() {
+            Some(stream) => match stream.read(buffer).await {
+                Ok(n) => n,
+                Err(e) => {
+                    // A read failure means the socket is broken; record it so the
+                    // cached liveness check reports the connection as dead.
+                    self.known_dead = true;
+                    return Err(e.into());
+                }
+            },
+            None => {
+                self.known_dead = true;
+                return Err(crate::error::Error::ConnectionClosed(
                     "Cannot receive: connection has been closed".to_string(),
-                )
-            })?
-            .read(buffer)
-            .await?;
+                ));
+            }
+        };
         if bytes_read == 0 {
+            // EOF — the server closed the connection.
+            self.known_dead = true;
             Err(crate::error::Error::from(std::io::Error::from(
                 UnexpectedEof,
             )))
@@ -717,10 +736,12 @@ impl NetworkTransport {
         if let Some(stream) = self.stream.as_mut() {
             stream.shutdown().await?;
         }
-        // Drop the stream so the transport reports the connection as dead
-        // (`is_connection_dead()`), which connection pools rely on to avoid
-        // handing out a closed connection.
+        // Drop the stream and record the closed state. `connection_known_dead()`
+        // surfaces this to connection pools so they don't reuse a closed
+        // connection; the live `is_connection_dead()` poll also reports dead
+        // once the stream is gone.
         self.stream = None;
+        self.known_dead = true;
         Ok(())
     }
 
@@ -862,10 +883,20 @@ impl NetworkTransport {
 
         // Read more data if we don't have enough for the header
         while bytes_available < PacketWriter::PACKET_HEADER_SIZE {
-            let bytes_read = stream
+            let bytes_read = match stream
                 .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
-                .await?;
+                .await
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    // A read failure means the socket is broken; record it so the
+                    // cached liveness check reports the connection as dead.
+                    self.known_dead = true;
+                    return Err(e.into());
+                }
+            };
             if bytes_read == 0 {
+                self.known_dead = true;
                 return Err(crate::error::Error::ConnectionClosed(
                     "Connection closed by server while reading TDS packet header".to_string(),
                 ));
@@ -1387,10 +1418,12 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
         if let Some(stream) = self.stream.as_mut() {
             stream.shutdown().await?;
         }
-        // Drop the stream so the transport reports the connection as dead
-        // (`is_connection_dead()`), which connection pools rely on to avoid
-        // handing out a closed connection.
+        // Drop the stream and record the closed state. `connection_known_dead()`
+        // surfaces this to connection pools so they don't reuse a closed
+        // connection; the live `is_connection_dead()` poll also reports dead
+        // once the stream is gone.
         self.stream = None;
+        self.known_dead = true;
         Ok(())
     }
 
@@ -1419,6 +1452,10 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
             Some(stream) => stream.is_connection_dead(),
             None => true,
         }
+    }
+
+    fn connection_known_dead(&self) -> bool {
+        self.known_dead
     }
 }
 

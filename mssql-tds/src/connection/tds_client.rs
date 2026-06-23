@@ -306,15 +306,23 @@ impl TdsClient {
         self.negotiated_settings.session_settings.packet_size
     }
 
-    /// Returns `true` if the underlying connection is known to be dead.
+    /// Returns `true` if the connection is known to be dead.
     ///
-    /// Performs a cheap, non-blocking socket poll. A `false` result means the
-    /// connection is alive or its state is unknown; a `true` result means the
-    /// connection has been closed or broken. This is intended for connection
-    /// pools that need to validate an idle connection before handing it out for
-    /// reuse, without sending a round-trip to the server.
+    /// This surfaces the connection's last-known liveness status, updated
+    /// whenever the connection is explicitly closed or an I/O operation observes
+    /// it broken. It is a cached read: it never touches the socket, so it is
+    /// always safe to call regardless of connection state and never consumes
+    /// in-flight protocol data.
+    ///
+    /// A `true` result means the connection is definitively dead. A `false`
+    /// result means it has not been observed dead — it may still have failed
+    /// silently while idle. That case is handled transparently by idle
+    /// connection resiliency, which detects and recovers a dead connection on
+    /// the next operation. This makes the method suitable for connection pools
+    /// that want a cheap, always-safe liveness check before handing out a
+    /// connection.
     pub fn is_connection_dead(&self) -> bool {
-        self.transport.is_connection_dead()
+        self.transport.connection_known_dead()
     }
 
     pub(crate) fn get_current_metadata(&self) -> Option<&ColMetadataToken> {
