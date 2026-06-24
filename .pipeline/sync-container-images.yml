@@ -12,10 +12,10 @@
 trigger: none
 
 parameters:
-# STAGE 1 (Import) is gated on Docker Hub credentials (dockerHubUsername +
-# dockerHubPat) below: the import stage runs ONLY when both are provided, and
-# is skipped entirely when either is empty. The per-image toggles here let you
-# skip individual image groups within the import stage.
+# STAGE 1 (Import) is gated on the queue-time Docker Hub credential variables
+# (DOCKERHUB_USERNAME + DOCKERHUB_PAT): the import stage runs ONLY when
+# DOCKERHUB_USERNAME is set, and is skipped entirely otherwise. The per-image
+# toggles here let you skip individual image groups within the import stage.
 - name: syncManylinux
   displayName: 'Import: PyPA manylinux (quay.io)'
   type: boolean
@@ -51,8 +51,15 @@ parameters:
   type: boolean
   default: true
 
-# Docker Hub authentication (optional - for higher rate limits)
-# To generate a Docker Hub PAT:
+# Docker Hub authentication (optional - for higher rate limits during Import).
+# These are queue-time pipeline VARIABLES (not parameters), so they never show
+# up as required fields in the run panel:
+#   - DOCKERHUB_USERNAME (plain)  - Docker Hub username
+#   - DOCKERHUB_PAT      (secret) - Docker Hub access token
+# Setup: in the pipeline UI add variables named DOCKERHUB_USERNAME and
+# DOCKERHUB_PAT (mark the PAT secret), settable at queue time. The Import stage
+# runs ONLY when DOCKERHUB_USERNAME is set; leave it unset to skip the import
+# phase entirely. To generate a Docker Hub PAT:
 #   1. Log in to https://hub.docker.com
 #   2. Click your profile icon → Account Settings → Security
 #   3. Click "New Access Token"
@@ -62,16 +69,6 @@ parameters:
 #   - Anonymous: 100 pulls per 6 hours (per IP)
 #   - Authenticated (free): 200 pulls per 6 hours
 #   - Authenticated (Pro/Team): Much higher limits
-- name: dockerHubUsername
-  displayName: 'Docker Hub Username (optional - leave empty for anonymous)'
-  type: string
-  default: ''
-
-- name: dockerHubPat
-  displayName: 'Docker Hub PAT (optional - leave empty for anonymous)'
-  type: string
-  default: ''
-
 - name: buildPythonImages
   displayName: 'Build custom Python images with Rust pre-installed'
   type: boolean
@@ -114,8 +111,8 @@ variables:
 
 # =============================================================================
 # STAGE 1 (Import): Sync base images from public registries (incl. Docker Hub) to ACR
-# Runs ONLY when Docker Hub credentials are provided (dockerHubUsername +
-# dockerHubPat). Leave either empty to SKIP the entire import phase.
+# Runs ONLY when the DOCKERHUB_USERNAME queue-time variable is set. Leave it
+# unset to SKIP the entire import phase.
 # Each image group runs as its own parallel job on a separate agent to spread
 # Docker Hub pulls and avoid rate limits. Individual groups can be skipped via
 # the per-image toggle parameters.
@@ -125,7 +122,7 @@ stages:
 - stage: Import_Base_Images
   displayName: 'Import base images (Docker/public -> ACR)'
   dependsOn: []
-  condition: and(ne('${{ parameters.dockerHubUsername }}', ''), ne('${{ parameters.dockerHubPat }}', ''))
+  condition: ne(variables['DOCKERHUB_USERNAME'], '')
   jobs:
   # PyPA manylinux images (quay.io - no Docker Hub rate limit)
   - job: Manylinux
@@ -258,8 +255,8 @@ stages:
             $AUTH_ARGS \
             --force
       env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
       retryCountOnTaskFailure: 3
     - task: AzureCLI@2
       displayName: 'Import Ubuntu 24.04'
@@ -282,8 +279,8 @@ stages:
             $AUTH_ARGS \
             --force
       env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
       retryCountOnTaskFailure: 3
 
   # Alpine 3.18 & 3.19 (Docker Hub - rate limited)
@@ -317,8 +314,8 @@ stages:
             $AUTH_ARGS \
             --force
       env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
       retryCountOnTaskFailure: 3
     - task: AzureCLI@2
       displayName: 'Import Alpine 3.19'
@@ -341,8 +338,8 @@ stages:
             $AUTH_ARGS \
             --force
       env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
       retryCountOnTaskFailure: 3
 
   # Alpine 3.20 & 3.21 (Docker Hub - rate limited)
@@ -376,8 +373,8 @@ stages:
             $AUTH_ARGS \
             --force
       env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
       retryCountOnTaskFailure: 3
     - task: AzureCLI@2
       displayName: 'Import Alpine 3.21'
@@ -400,8 +397,8 @@ stages:
             $AUTH_ARGS \
             --force
       env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
       retryCountOnTaskFailure: 3
 
   # Debian & RHEL (Docker Hub - rate limited)
@@ -435,8 +432,8 @@ stages:
             $AUTH_ARGS \
             --force
       env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
       retryCountOnTaskFailure: 3
     - task: AzureCLI@2
       displayName: 'Import Red Hat UBI9'
@@ -459,8 +456,8 @@ stages:
             $AUTH_ARGS \
             --force
       env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
       retryCountOnTaskFailure: 3
 
   # Oracle Linux (Docker Hub - rate limited)
@@ -494,8 +491,8 @@ stages:
             $AUTH_ARGS \
             --force
       env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
       retryCountOnTaskFailure: 3
 
 # =============================================================================
