@@ -91,10 +91,14 @@ impl HandlerFactory {
 pub(crate) struct NegotiatedSettings {
     pub session_settings: SessionSettings,
     pub database_collation: SqlCollation,
-    #[allow(dead_code)] // populated during login, consumed by future env-change tracking
     pub language: String,
-    #[allow(dead_code)] // populated during login, consumed by future env-change tracking
     pub database: String,
+    /// The database / language / collation negotiated at login. Captured once at
+    /// construction and never mutated, so a connection reset (RESETCONNECTION)
+    /// can restore the current values back to these login defaults.
+    login_database: String,
+    login_language: String,
+    login_database_collation: SqlCollation,
     #[allow(dead_code)] // populated during login, consumed by future env-change tracking
     pub char_set: Option<String>,
     /// TDS version from LoginAckToken, captured for session recovery validation.
@@ -116,12 +120,25 @@ impl NegotiatedSettings {
         NegotiatedSettings {
             session_settings,
             database_collation,
+            login_database: database.clone(),
+            login_language: language.clone(),
+            login_database_collation: database_collation,
             language,
             database,
             char_set,
             login_ack_tds_version,
             login_ack_server_version,
         }
+    }
+
+    /// Restores the current database / language / collation to the values
+    /// negotiated at login. Called when the server acknowledges a connection
+    /// reset (RESETCONNECTION / RESETCONNECTIONSKIPTRAN), which returns the
+    /// session to its login defaults.
+    pub(crate) fn restore_login_defaults(&mut self) {
+        self.database = self.login_database.clone();
+        self.language = self.login_language.clone();
+        self.database_collation = self.login_database_collation;
     }
 
     /// Check if session recovery was acknowledged by the server in FEATUREEXTACK.
@@ -182,16 +199,20 @@ pub(crate) fn create_test_negotiated_settings_internal() -> NegotiatedSettings {
         negotiated_encryption_settings: NegotiatedEncryptionSetting::NoEncryption,
     };
 
+    let database_collation = SqlCollation {
+        info: 0,
+        lcid_language_id: 0x0409,
+        col_flags: 0,
+        sort_id: 0,
+    };
     NegotiatedSettings {
         session_settings,
-        database_collation: SqlCollation {
-            info: 0,
-            lcid_language_id: 0x0409,
-            col_flags: 0,
-            sort_id: 0,
-        },
+        database_collation,
         language: "us_english".to_string(),
         database: "master".to_string(),
+        login_database: "master".to_string(),
+        login_language: "us_english".to_string(),
+        login_database_collation: database_collation,
         char_set: None,
         login_ack_tds_version: None,
         login_ack_server_version: None,

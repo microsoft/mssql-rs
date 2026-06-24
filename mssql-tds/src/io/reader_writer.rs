@@ -4,6 +4,7 @@
 use crate::connection::transport::network_transport::TransportSslHandler;
 use crate::core::{NegotiatedEncryptionSetting, TdsResult};
 use crate::handler::handler_factory::SessionSettings;
+use crate::message::messages::ResetConnectionMode;
 use async_trait::async_trait;
 
 #[async_trait]
@@ -11,6 +12,21 @@ pub(crate) trait NetworkWriter: Send + Sync + TransportSslHandler {
     async fn send(&mut self, data: &[u8]) -> TdsResult<()>;
     fn packet_size(&self) -> u32;
     fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting;
+
+    /// Records that the next SQL Batch, RPC, or Transaction Manager request
+    /// sent on this connection should carry a connection-reset request in its
+    /// packet header. Connection-level state, consumed by the packet writer.
+    ///
+    /// The default implementation is a no-op so that transports which do not
+    /// support connection pooling (e.g. test mocks) need not implement it.
+    fn set_reset_mode(&mut self, _mode: ResetConnectionMode) {}
+
+    /// Atomically reads and clears any pending connection-reset request set via
+    /// [`set_reset_mode`](Self::set_reset_mode). Returns
+    /// [`ResetConnectionMode::None`] when no reset is pending.
+    fn take_reset_mode(&mut self) -> ResetConnectionMode {
+        ResetConnectionMode::None
+    }
 }
 
 #[async_trait]

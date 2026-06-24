@@ -19,7 +19,7 @@ use crate::error::Error::UsageError;
 use crate::error::SqlErrorInfo;
 use crate::io::packet_writer::PacketWriter;
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
-use crate::message::messages::PacketType;
+use crate::message::messages::{PacketType, ResetConnectionMode};
 use crate::message::parameters::rpc_parameters::{
     RpcParameter, StatusFlags, build_parameter_list_string,
 };
@@ -261,9 +261,62 @@ impl TdsClient {
         })
     }
 
-    /// Returns the database collation negotiated during login.
+    /// Returns the current database collation.
+    ///
+    /// If the collation changed after login (via an ENVCHANGE token), the
+    /// updated value is returned; otherwise the collation negotiated at login.
     pub fn get_collation(&self) -> SqlCollation {
         self.negotiated_settings.database_collation
+    }
+
+    /// Returns the name of the database the connection is currently using.
+    ///
+    /// Reflects any change made after login (e.g. a `USE` statement, surfaced
+    /// via an ENVCHANGE token); otherwise the database negotiated at login.
+    ///
+    /// Intended for connection-pool consumers that need to match a pooled
+    /// connection to a request or decide whether a reset is required.
+    pub fn database(&self) -> &str {
+        &self.negotiated_settings.database
+    }
+
+    /// Returns the language the connection is currently using.
+    ///
+    /// Reflects any change made after login (e.g. `SET LANGUAGE`, surfaced via
+    /// an ENVCHANGE token); otherwise the language negotiated at login.
+    ///
+    /// Intended for connection-pool consumers that need to match a pooled
+    /// connection to a request or decide whether a reset is required.
+    pub fn language(&self) -> &str {
+        &self.negotiated_settings.language
+    }
+
+    /// Returns the negotiated TDS packet size, in bytes.
+    ///
+    /// The packet size is fixed for the lifetime of the connection (the server
+    /// rejects mid-session packet-size changes), so this always reflects the
+    /// value negotiated at login.
+    pub fn packet_size(&self) -> u32 {
+        self.negotiated_settings.session_settings.packet_size
+    }
+
+    /// Returns `true` if the connection is known to be dead.
+    ///
+    /// This surfaces the connection's last-known liveness status, updated
+    /// whenever the connection is explicitly closed or an I/O operation observes
+    /// it broken. It is a cached read: it never touches the socket, so it is
+    /// always safe to call regardless of connection state and never consumes
+    /// in-flight protocol data.
+    ///
+    /// A `true` result means the connection is definitively dead. A `false`
+    /// result means it has not been observed dead — it may still have failed
+    /// silently while idle. That case is handled transparently by idle
+    /// connection resiliency, which detects and recovers a dead connection on
+    /// the next operation. This makes the method suitable for connection pools
+    /// that want a cheap, always-safe liveness check before handing out a
+    /// connection.
+    pub fn is_connection_dead(&self) -> bool {
+        self.transport.connection_known_dead()
     }
 
     pub(crate) fn get_current_metadata(&self) -> Option<&ColMetadataToken> {
@@ -384,6 +437,31 @@ impl TdsClient {
             .unwrap_or(u32::MAX);
             t.saturating_sub(elapsed_secs)
         })
+    }
+
+    /// Requests that the connection be reset before the next request is
+    /// processed by the server, to support connection pooling.
+    ///
+    /// This sets the RESETCONNECTION (or RESETCONNECTIONSKIPTRAN) status bit on
+    /// the first packet of the next SQL Batch, RPC, or Transaction Manager
+    /// request sent on this connection (MS-TDS section 2.2.3.1.2). The server
+    /// resets the session state back to its login defaults — equivalent to
+    /// `sp_reset_connection` — before processing that request. The request is
+    /// one-shot: it is cleared once the next such request has been sent.
+    ///
+    /// # Parameters
+    /// - `preserve_transaction` — when `true`, the reset preserves the current
+    ///   transaction state (a local or enlisted/distributed transaction survives
+    ///   the reset) by using RESETCONNECTIONSKIPTRAN instead of RESETCONNECTION.
+    ///   Callers (typically a connection pool) should pass `true` only when the
+    ///   pooled connection is enlisted in a transaction that must outlive the
+    ///   reset.
+    pub fn prepare_reset_connection(&mut self, preserve_transaction: bool) {
+        let mode = match preserve_transaction {
+            true => ResetConnectionMode::ResetSkipTran,
+            false => ResetConnectionMode::Reset,
+        };
+        self.transport.as_writer().set_reset_mode(mode);
     }
 
     /// Sends a SQL batch to the server for execution.
@@ -716,7 +794,7 @@ impl TdsClient {
                         self.recovery_context.session_state_table.reset();
                     }
                     self.execution_context
-                        .capture_change_property(&env_change)?;
+                        .capture_change_property(&env_change, &mut self.negotiated_settings)?;
                     continue;
                 }
                 Tokens::SessionState(session_state) => {
@@ -1924,7 +2002,8 @@ impl TdsClient {
                     if t1.sub_type == EnvChangeTokenSubType::ResetConnection {
                         self.recovery_context.session_state_table.reset();
                     }
-                    self.execution_context.capture_change_property(&t1)?;
+                    self.execution_context
+                        .capture_change_property(&t1, &mut self.negotiated_settings)?;
                 }
                 Tokens::SessionState(session_state) => {
                     self.recovery_context
@@ -2034,7 +2113,7 @@ impl TdsClient {
                         self.recovery_context.session_state_table.reset();
                     }
                     self.execution_context
-                        .capture_change_property(&env_change)?;
+                        .capture_change_property(&env_change, &mut self.negotiated_settings)?;
                 }
                 Tokens::SessionState(session_state) => {
                     self.recovery_context
@@ -2158,7 +2237,7 @@ impl TdsClient {
                             self.recovery_context.session_state_table.reset();
                         }
                         self.execution_context
-                            .capture_change_property(&env_change)?;
+                            .capture_change_property(&env_change, &mut self.negotiated_settings)?;
                         continue;
                     }
                     Tokens::SessionState(session_state) => {
@@ -2513,7 +2592,7 @@ impl TdsClient {
                         self.recovery_context.session_state_table.reset();
                     }
                     self.execution_context
-                        .capture_change_property(&env_change)?;
+                        .capture_change_property(&env_change, &mut self.negotiated_settings)?;
                     continue;
                 }
                 Tokens::SessionState(session_state) => {
@@ -2681,6 +2760,7 @@ mod tests {
     struct TestTransport {
         closed: bool,
         pending_tokens: VecDeque<Tokens>,
+        reset_mode: ResetConnectionMode,
     }
 
     impl TestTransport {
@@ -2688,6 +2768,7 @@ mod tests {
             Self {
                 closed: false,
                 pending_tokens: VecDeque::new(),
+                reset_mode: ResetConnectionMode::None,
             }
         }
 
@@ -2695,6 +2776,7 @@ mod tests {
             Self {
                 closed: false,
                 pending_tokens: VecDeque::from(tokens),
+                reset_mode: ResetConnectionMode::None,
             }
         }
     }
@@ -2745,6 +2827,12 @@ mod tests {
         fn get_encryption_setting(&self) -> crate::core::NegotiatedEncryptionSetting {
             crate::core::NegotiatedEncryptionSetting::NoEncryption
         }
+        fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
+            self.reset_mode = mode;
+        }
+        fn take_reset_mode(&mut self) -> ResetConnectionMode {
+            std::mem::replace(&mut self.reset_mode, ResetConnectionMode::None)
+        }
     }
 
     #[async_trait]
@@ -2791,6 +2879,36 @@ mod tests {
             execution_context,
             client_context,
         )
+    }
+
+    #[test]
+    fn prepare_reset_connection_routes_mode_to_transport() {
+        let mut client = create_test_client();
+
+        // Default: no reset pending.
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::None
+        );
+
+        // Plain reset.
+        client.prepare_reset_connection(false);
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::Reset
+        );
+        // take_reset_mode is one-shot.
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::None
+        );
+
+        // Preserve transaction => SKIPTRAN.
+        client.prepare_reset_connection(true);
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::ResetSkipTran
+        );
     }
 
     fn create_test_client_with_tokens(tokens: Vec<Tokens>) -> TdsClient {

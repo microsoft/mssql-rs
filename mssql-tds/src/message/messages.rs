@@ -67,13 +67,46 @@ pub(crate) enum PacketStatusFlags {
     /// Packet/Message to be ignored.
     Ignore = 0x02,
 
-    #[allow(dead_code)] // Not used currently.
     /// Reset connection.
     ResetConnection = 0x08,
 
-    #[allow(dead_code)] // Not used currently.
     /// Reset connection but keep transaction state.
     ResetConnectionSkipTran = 0x10,
+}
+
+/// Requests that the server reset the session state of a pooled connection
+/// before processing the next request.
+///
+/// This maps to the TDS packet-header status bits RESETCONNECTION (0x08) and
+/// RESETCONNECTIONSKIPTRAN (0x10) described in MS-TDS section 2.2.3.1.2. The
+/// bit is only valid on the first packet of a SQL Batch, RPC, or Transaction
+/// Manager request, and the two bits are mutually exclusive.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) enum ResetConnectionMode {
+    /// Do not request a connection reset.
+    #[default]
+    None,
+
+    /// Reset the connection to its login defaults before processing the next
+    /// request (equivalent to `sp_reset_connection`).
+    Reset,
+
+    /// Reset the connection before processing the next request but preserve the
+    /// transaction state (local or enlisted/distributed transaction survives).
+    ResetSkipTran,
+}
+
+impl From<ResetConnectionMode> for u8 {
+    /// Converts a [`ResetConnectionMode`] into the TDS packet-header status bits
+    /// (RESETCONNECTION `0x08` / RESETCONNECTIONSKIPTRAN `0x10`). The two bits
+    /// are mutually exclusive (MS-TDS 2.2.3.1.2).
+    fn from(mode: ResetConnectionMode) -> Self {
+        match mode {
+            ResetConnectionMode::None => 0,
+            ResetConnectionMode::Reset => PacketStatusFlags::ResetConnection as u8,
+            ResetConnectionMode::ResetSkipTran => PacketStatusFlags::ResetConnectionSkipTran as u8,
+        }
+    }
 }
 
 #[async_trait]
