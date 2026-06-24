@@ -1,51 +1,53 @@
-# Weekly scheduled pipeline to sync and build Python wheel build images
-# This pipeline:
-# 1. Imports vanilla base images from public registries to ACR (distributed across parallel stages to avoid rate limits)
-# 2. Builds custom images with Rust and maturin pre-installed
-# 3. Pushes custom images to ACR for use in CI/CD
-# Runs every Monday at 3:00 AM UTC
+# Pipeline to sync base images, build custom CI images, and mirror them to GHCR.
+# Three independent, skippable stages:
+#   1. Import  - sync vanilla base images from public registries to ACR.
+#                Runs only when Docker Hub credentials are provided.
+#   2. Build   - build custom images (Rust/maturin pre-installed) on top of the
+#                base images already in ACR, and push them to ACR.
+#   3. Mirror  - mirror the current ACR images to GHCR. Runs only when the
+#                GHCR_TOKEN secret variable is set; if stages 1 & 2 are skipped,
+#                it just mirrors whatever is currently in ACR.
+# Weekly schedule runs Monday at 3:00 AM UTC.
 
 trigger: none
 
 parameters:
-- name: importBaseImages
-  displayName: 'Import base images from public registries to ACR'
-  type: boolean
-  default: false
-
-# Fine-grained sync controls (only used when importBaseImages=true)
+# STAGE 1 (Import) is gated on Docker Hub credentials (dockerHubUsername +
+# dockerHubPat) below: the import stage runs ONLY when both are provided, and
+# is skipped entirely when either is empty. The per-image toggles here let you
+# skip individual image groups within the import stage.
 - name: syncManylinux
-  displayName: '  ├─ Sync PyPA manylinux (quay.io)'
+  displayName: 'Import: PyPA manylinux (quay.io)'
   type: boolean
   default: true
 
 - name: syncMusllinux
-  displayName: '  ├─ Sync PyPA musllinux (quay.io)'
+  displayName: 'Import: PyPA musllinux (quay.io)'
   type: boolean
   default: true
 
 - name: syncUbuntu
-  displayName: '  ├─ Sync Ubuntu (docker.io)'
+  displayName: 'Import: Ubuntu (docker.io)'
   type: boolean
   default: true
 
 - name: syncAlpine1
-  displayName: '  ├─ Sync Alpine 3.18-3.19 (docker.io)'
+  displayName: 'Import: Alpine 3.18-3.19 (docker.io)'
   type: boolean
   default: true
 
 - name: syncAlpine2
-  displayName: '  ├─ Sync Alpine 3.20-3.21 (docker.io)'
+  displayName: 'Import: Alpine 3.20-3.21 (docker.io)'
   type: boolean
   default: true
 
 - name: syncDebianRHEL
-  displayName: '  ├─ Sync Debian & RHEL (docker.io)'
+  displayName: 'Import: Debian & RHEL (docker.io)'
   type: boolean
   default: true
 
 - name: syncOracle
-  displayName: '  └─ Sync Oracle Linux (docker.io)'
+  displayName: 'Import: Oracle Linux (docker.io)'
   type: boolean
   default: true
 
@@ -111,22 +113,24 @@ variables:
   GHCR_NAMESPACE: 'ghcr.io/${{ parameters.ghcrOrg }}'
 
 # =============================================================================
-# STAGE 1: Import base images from public registries (distributed to avoid rate limits)
-# Each stage runs on a separate agent and imports max 2 images
-# All sync stages run in parallel
+# STAGE 1 (Import): Sync base images from public registries (incl. Docker Hub) to ACR
+# Runs ONLY when Docker Hub credentials are provided (dockerHubUsername +
+# dockerHubPat). Leave either empty to SKIP the entire import phase.
+# Each image group runs as its own parallel job on a separate agent to spread
+# Docker Hub pulls and avoid rate limits. Individual groups can be skipped via
+# the per-image toggle parameters.
 # =============================================================================
 
 stages:
-# -----------------------------------------------------------------------------
-# Sync Stage 1: PyPA manylinux images (quay.io - no Docker Hub rate limit)
-# -----------------------------------------------------------------------------
-- stage: Sync_PyPA_Manylinux
-  displayName: 'Sync: PyPA Manylinux'
+- stage: Import_Base_Images
+  displayName: 'Import base images (Docker/public -> ACR)'
   dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncManylinux }}', 'true'))
+  condition: and(ne('${{ parameters.dockerHubUsername }}', ''), ne('${{ parameters.dockerHubPat }}', ''))
   jobs:
-  - job: SyncImages
+  # PyPA manylinux images (quay.io - no Docker Hub rate limit)
+  - job: Manylinux
     displayName: 'Import manylinux x64 & arm64'
+    condition: eq('${{ parameters.syncManylinux }}', 'true')
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:
@@ -186,16 +190,10 @@ stages:
             --force
       retryCountOnTaskFailure: 3
 
-# -----------------------------------------------------------------------------
-# Sync Stage 2: PyPA musllinux images (quay.io - no Docker Hub rate limit)
-# -----------------------------------------------------------------------------
-- stage: Sync_PyPA_Musllinux
-  displayName: 'Sync: PyPA Musllinux'
-  dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncMusllinux }}', 'true'))
-  jobs:
-  - job: SyncImages
+  # PyPA musllinux images (quay.io - no Docker Hub rate limit)
+  - job: Musllinux
     displayName: 'Import musllinux x64 & arm64'
+    condition: eq('${{ parameters.syncMusllinux }}', 'true')
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:
@@ -229,16 +227,10 @@ stages:
             --force
       retryCountOnTaskFailure: 3
 
-# -----------------------------------------------------------------------------
-# Sync Stage 3: Ubuntu images (Docker Hub - rate limited)
-# -----------------------------------------------------------------------------
-- stage: Sync_Ubuntu
-  displayName: 'Sync: Ubuntu'
-  dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncUbuntu }}', 'true'))
-  jobs:
-  - job: SyncImages
+  # Ubuntu images (Docker Hub - rate limited)
+  - job: Ubuntu
     displayName: 'Import Ubuntu 22.04 & 24.04'
+    condition: eq('${{ parameters.syncUbuntu }}', 'true')
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:
@@ -294,16 +286,10 @@ stages:
         DOCKER_PAT: ${{ parameters.dockerHubPat }}
       retryCountOnTaskFailure: 3
 
-# -----------------------------------------------------------------------------
-# Sync Stage 4: Alpine 3.18 & 3.19 (Docker Hub - rate limited)
-# -----------------------------------------------------------------------------
-- stage: Sync_Alpine_1
-  displayName: 'Sync: Alpine 3.18-3.19'
-  dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncAlpine1 }}', 'true'))
-  jobs:
-  - job: SyncImages
+  # Alpine 3.18 & 3.19 (Docker Hub - rate limited)
+  - job: Alpine1
     displayName: 'Import Alpine 3.18 & 3.19'
+    condition: eq('${{ parameters.syncAlpine1 }}', 'true')
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:
@@ -359,16 +345,10 @@ stages:
         DOCKER_PAT: ${{ parameters.dockerHubPat }}
       retryCountOnTaskFailure: 3
 
-# -----------------------------------------------------------------------------
-# Sync Stage 5: Alpine 3.20 & 3.21 (Docker Hub - rate limited)
-# -----------------------------------------------------------------------------
-- stage: Sync_Alpine_2
-  displayName: 'Sync: Alpine 3.20-3.21'
-  dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncAlpine2 }}', 'true'))
-  jobs:
-  - job: SyncImages
+  # Alpine 3.20 & 3.21 (Docker Hub - rate limited)
+  - job: Alpine2
     displayName: 'Import Alpine 3.20 & 3.21'
+    condition: eq('${{ parameters.syncAlpine2 }}', 'true')
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:
@@ -424,16 +404,10 @@ stages:
         DOCKER_PAT: ${{ parameters.dockerHubPat }}
       retryCountOnTaskFailure: 3
 
-# -----------------------------------------------------------------------------
-# Sync Stage 6: Debian & RHEL (Docker Hub - rate limited)
-# -----------------------------------------------------------------------------
-- stage: Sync_Debian_RHEL
-  displayName: 'Sync: Debian & RHEL'
-  dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncDebianRHEL }}', 'true'))
-  jobs:
-  - job: SyncImages
+  # Debian & RHEL (Docker Hub - rate limited)
+  - job: DebianRHEL
     displayName: 'Import Debian & RHEL UBI9'
+    condition: eq('${{ parameters.syncDebianRHEL }}', 'true')
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:
@@ -489,16 +463,10 @@ stages:
         DOCKER_PAT: ${{ parameters.dockerHubPat }}
       retryCountOnTaskFailure: 3
 
-# -----------------------------------------------------------------------------
-# Sync Stage 7: Oracle Linux (Docker Hub - rate limited)
-# -----------------------------------------------------------------------------
-- stage: Sync_Oracle
-  displayName: 'Sync: Oracle Linux'
-  dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncOracle }}', 'true'))
-  jobs:
-  - job: SyncImages
+  # Oracle Linux (Docker Hub - rate limited)
+  - job: Oracle
     displayName: 'Import Oracle Linux 9'
+    condition: eq('${{ parameters.syncOracle }}', 'true')
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:
@@ -531,24 +499,16 @@ stages:
       retryCountOnTaskFailure: 3
 
 # =============================================================================
-# STAGE 2: Build and Push Custom Images
-# Depends on sync stages completing (when importBaseImages is true)
+# STAGE 2 (Build): Build and Push Custom Images
+# Builds custom images on top of base images that ALREADY exist in ACR (synced
+# by a previous run of Stage 1 or imported manually). This stage is independent
+# of Stage 1 and can be skipped via the buildPythonImages / buildUbuntuImages
+# parameters.
 # =============================================================================
 
 - stage: BuildAndPushImages
   displayName: Build and Push Custom Images
-  # Depend on sync stages only when importBaseImages is true
-  ${{ if eq(parameters.importBaseImages, true) }}:
-    dependsOn:
-      - Sync_PyPA_Manylinux
-      - Sync_PyPA_Musllinux
-      - Sync_Ubuntu
-      - Sync_Alpine_1
-      - Sync_Alpine_2
-      - Sync_Debian_RHEL
-      - Sync_Oracle
-  ${{ else }}:
-    dependsOn: []
+  dependsOn: []
   condition: or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true'))
   jobs:
   - job: BuildX64Images
@@ -962,8 +922,12 @@ stages:
 - stage: Mirror_To_GHCR
   displayName: 'Mirror images to GHCR'
   dependsOn:
+    - Import_Base_Images
     - BuildAndPushImages
-  condition: succeeded()
+  # Run after Import/Build whether they ran or were skipped (skipped != failed),
+  # so this stage can mirror the current ACR images on its own. The actual GHCR
+  # publish is further gated at runtime on the GHCR_TOKEN secret being set.
+  condition: not(or(failed(), canceled()))
   jobs:
   - job: MirrorImages
     displayName: 'Mirror ACR -> GHCR'
