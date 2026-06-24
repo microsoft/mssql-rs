@@ -10,7 +10,10 @@ use super::super::tokens::{RowToken, Tokens};
 use super::common::TokenParser;
 use crate::{core::TdsResult, io::packet_reader::TdsPacketReader};
 use crate::{
-    datatypes::{column_values::ColumnValues, decoder::SqlTypeDecode},
+    datatypes::{
+        column_values::ColumnValues,
+        decoder::{SqlTypeDecode, decrypt_encrypted_column},
+    },
     io::token_stream::ParserContext,
 };
 
@@ -41,10 +44,10 @@ impl<T: SqlTypeDecode + Sync, P: TdsPacketReader + Send + Sync> TokenParser<P>
     for NbcRowTokenParser<T>
 {
     async fn parse(&self, reader: &mut P, context: &ParserContext) -> TdsResult<Tokens> {
-        let column_metadata_token = match context {
-            ParserContext::ColumnMetadata(metadata) => {
+        let (column_metadata_token, decryptor) = match context {
+            ParserContext::ColumnMetadata(metadata, decryptor) => {
                 trace!("Metadata during Row Parsing: {:?}", metadata);
-                metadata
+                (metadata, decryptor.as_ref())
             }
             _ => {
                 return Err(crate::error::Error::from(Error::new(
@@ -60,7 +63,7 @@ impl<T: SqlTypeDecode + Sync, P: TdsPacketReader + Send + Sync> TokenParser<P>
         let col_count = all_metadata.len();
 
         let bitmap_length = col_count.div_ceil(8);
-        let mut bitmap: Vec<u8> = vec![0; bitmap_length as usize];
+        let mut bitmap: Vec<u8> = vec![0; bitmap_length];
         reader.read_bytes(bitmap.as_mut_slice()).await?;
         // let mut index = 0;
 
@@ -70,6 +73,10 @@ impl<T: SqlTypeDecode + Sync, P: TdsPacketReader + Send + Sync> TokenParser<P>
 
             if is_null {
                 all_values.push(ColumnValues::Null);
+            } else if metadata.crypto_metadata.is_some() {
+                all_values.push(
+                    decrypt_encrypted_column(&self.decoder, reader, metadata, decryptor).await?,
+                );
             } else {
                 let column_value = self.decoder.decode(reader, metadata).await?;
                 all_values.push(column_value);
@@ -128,11 +135,14 @@ mod tests {
     }
 
     fn make_context(columns: Vec<ColumnMetadata>) -> ParserContext {
-        ParserContext::ColumnMetadata(Arc::new(ColMetadataToken {
-            column_count: columns.len() as u16,
-            columns,
-            cek_table: Vec::new(),
-        }))
+        ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: columns.len() as u16,
+                columns,
+                cek_table: Vec::new(),
+            }),
+            None,
+        )
     }
 
     // --- is_null_value_in_column tests ---

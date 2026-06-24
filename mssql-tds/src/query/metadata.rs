@@ -32,7 +32,8 @@ pub struct ColumnMetadata {
     /// When set, `data_type`/`type_info` describe the on-the-wire (ciphertext)
     /// type, while the contained [`CryptoMetadata`] carries the underlying
     /// plaintext type and the key/algorithm needed to decrypt the column.
-    #[allow(dead_code)] // Populated during COLMETADATA parsing; consumed by result-set decryption in a later phase.
+    #[allow(dead_code)]
+    // Populated during COLMETADATA parsing; consumed by result-set decryption in a later phase.
     pub(crate) crypto_metadata: Option<CryptoMetadata>,
 }
 

@@ -58,6 +58,14 @@ pub(in crate::connection) enum ReturnStatus {
     Received(i32),
 }
 
+/// Memoized cell decryptor paired with the column metadata it was built for, so
+/// it can be rebuilt when the result set changes.
+#[cfg(feature = "column-encryption")]
+type MemoizedCellDecryptor = (
+    Arc<ColMetadataToken>,
+    Option<Arc<dyn crate::security::cell_decryptor::CellDecryptor>>,
+);
+
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -71,6 +79,11 @@ pub struct TdsClient {
 
     // pub(crate) batch_result: Option<BatchResult<'static>>,
     pub(crate) current_metadata: Option<Arc<ColMetadataToken>>,
+    /// Memoized cell decryptor for `current_metadata`'s CEK table, paired with
+    /// the metadata it was built for so it is rebuilt when the result set
+    /// changes. `None` until the first encrypted result set is seen.
+    #[cfg(feature = "column-encryption")]
+    current_decryptor: Option<MemoizedCellDecryptor>,
     count_map: HashMap<CurrentCommand, u64>,
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
@@ -113,6 +126,8 @@ impl TdsClient {
             execution_context,
             recovery_context: Box::new(recovery_context),
             current_metadata: None,
+            #[cfg(feature = "column-encryption")]
+            current_decryptor: None,
             count_map: HashMap::new(),
             return_values: Vec::new(),
             last_return_status: ReturnStatus::NotReceived,
@@ -1476,6 +1491,63 @@ impl TdsClient {
         }
     }
 
+    /// Resolves (and memoizes) the cell decryptor for the current result set's
+    /// CEK table, used to decrypt Always Encrypted columns while decoding rows.
+    ///
+    /// Returns `None` when the result set has no encrypted columns. The
+    /// decryptor is rebuilt only when the result set (column metadata) changes,
+    /// so the CEK table is resolved at most once per result set.
+    #[cfg(feature = "column-encryption")]
+    async fn resolve_cell_decryptor(
+        &mut self,
+        metadata: &Arc<ColMetadataToken>,
+    ) -> TdsResult<Option<Arc<dyn crate::security::cell_decryptor::CellDecryptor>>> {
+        use crate::security::cell_decryptor::CellDecryptor;
+        use crate::security::keystore::ResolvedCekDecryptor;
+
+        // No CEK table means no encrypted columns in this result set.
+        if metadata.cek_table.is_empty() {
+            return Ok(None);
+        }
+
+        // Reuse the decryptor if it was built for this exact result set.
+        if let Some((built_for, decryptor)) = &self.current_decryptor
+            && Arc::ptr_eq(built_for, metadata)
+        {
+            return Ok(decryptor.clone());
+        }
+
+        let client_context = self
+            .recovery_context
+            .client_context
+            .as_ref()
+            .ok_or_else(|| {
+                crate::error::Error::ColumnEncryptionError(
+                    "Cannot decrypt encrypted columns without a client context".to_string(),
+                )
+            })?;
+
+        let resolved = ResolvedCekDecryptor::resolve(
+            &client_context.column_encryption_key_store_providers,
+            &client_context.cek_cache,
+            &metadata.cek_table,
+        )
+        .await;
+        let decryptor: Arc<dyn CellDecryptor> = Arc::new(resolved);
+        self.current_decryptor = Some((Arc::clone(metadata), Some(decryptor.clone())));
+        Ok(Some(decryptor))
+    }
+
+    /// Without the `column-encryption` feature there is no decryptor; encrypted
+    /// columns (if any) surface an error from the row decode path.
+    #[cfg(not(feature = "column-encryption"))]
+    async fn resolve_cell_decryptor(
+        &mut self,
+        _metadata: &Arc<ColMetadataToken>,
+    ) -> TdsResult<Option<Arc<dyn crate::security::cell_decryptor::CellDecryptor>>> {
+        Ok(None)
+    }
+
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
     ///
@@ -1491,8 +1563,9 @@ impl TdsClient {
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
             ));
         }
-        let parser_context =
-            ParserContext::ColumnMetadata(Arc::clone(self.current_metadata.as_ref().unwrap()));
+        let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
+        let decryptor = self.resolve_cell_decryptor(&metadata).await?;
+        let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
         loop {
             let start = Instant::now();
             let result = self

@@ -16,9 +16,12 @@
 //! - `sspi`: Enables Windows SSPI support
 //! - `gssapi`: Enables Unix GSSAPI/Kerberos support
 
-mod error;
+pub(crate) mod cell_decryptor;
 #[cfg(feature = "column-encryption")]
 pub(crate) mod encryption;
+mod error;
+#[cfg(feature = "column-encryption")]
+pub(crate) mod keystore;
 pub mod mock;
 mod security_context;
 mod spn;

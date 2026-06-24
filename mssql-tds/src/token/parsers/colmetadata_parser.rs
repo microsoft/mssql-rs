@@ -274,8 +274,7 @@ where
     reader.read_bytes(&mut cek_md_version).await?;
 
     let value_count = reader.read_byte().await?;
-    let mut encrypted_cek_values: Vec<EncryptedCekValue> =
-        Vec::with_capacity(value_count as usize);
+    let mut encrypted_cek_values: Vec<EncryptedCekValue> = Vec::with_capacity(value_count as usize);
     for _ in 0..value_count {
         // Encrypted CEK blob (length-prefixed by a u16 byte count).
         let encrypted_len = reader.read_uint16().await? as usize;
@@ -317,10 +316,7 @@ where
 /// Layout: `CekTableOrdinal(u16, only when a CEK table is present)`, base
 /// `TYPE_INFO`, `CipherAlgorithmId(u8)` (+ optional custom algorithm name),
 /// `EncryptionType(u8)`, `NormalizationRuleVersion(u8)`.
-async fn parse_crypto_metadata<T>(
-    reader: &mut T,
-    has_cek_table: bool,
-) -> TdsResult<CryptoMetadata>
+async fn parse_crypto_metadata<T>(reader: &mut T, has_cek_table: bool) -> TdsResult<CryptoMetadata>
 where
     T: TdsPacketReader + Send + Sync,
 {

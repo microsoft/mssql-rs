@@ -51,8 +51,7 @@ const ALGORITHM_VERSION: u8 = 0x01;
 const VERSION_SIZE_BYTE: u8 = 0x01;
 
 /// Minimum valid cell-blob length: version + tag + iv + one cipher block.
-const MIN_CIPHERTEXT_LEN: usize =
-    1 + TAG_SIZE_IN_BYTES + BLOCK_SIZE_IN_BYTES + BLOCK_SIZE_IN_BYTES;
+const MIN_CIPHERTEXT_LEN: usize = 1 + TAG_SIZE_IN_BYTES + BLOCK_SIZE_IN_BYTES + BLOCK_SIZE_IN_BYTES;
 
 /// Salt used to derive the encryption key from the root key.
 const ENCRYPTION_KEY_SALT: &str = "Microsoft SQL Server cell encryption key with encryption algorithm:AEAD_AES_256_CBC_HMAC_SHA256 and key length:256";
@@ -378,9 +377,18 @@ mod tests {
     #[test]
     fn derived_keys_are_pinned() {
         let c = cipher();
-        assert_eq!(hex(&c.encryption_key), "a95fcb709ee9984771c647c765f5351c3bc77fbf91d0e13c699289d143a4d4d7");
-        assert_eq!(hex(&c.mac_key), "5e63796429de42ebd1a886f948ff46d898a153262c54ee4ac52c338062c05bda");
-        assert_eq!(hex(&c.iv_key), "cc7f08850c91bd6515d404140272116039cfdac80c19cb10def7f25d40661548");
+        assert_eq!(
+            hex(&c.encryption_key),
+            "a95fcb709ee9984771c647c765f5351c3bc77fbf91d0e13c699289d143a4d4d7"
+        );
+        assert_eq!(
+            hex(&c.mac_key),
+            "5e63796429de42ebd1a886f948ff46d898a153262c54ee4ac52c338062c05bda"
+        );
+        assert_eq!(
+            hex(&c.iv_key),
+            "cc7f08850c91bd6515d404140272116039cfdac80c19cb10def7f25d40661548"
+        );
     }
 
     /// Pins a full deterministic cell blob for fixed inputs. Deterministic
@@ -391,6 +399,9 @@ mod tests {
         let blob = c
             .encrypt(b"pinned", ColumnEncryptionType::Deterministic)
             .unwrap();
-        assert_eq!(hex(&blob), "019dac660c4165242f51d710f8596605a1617825f2089614c621012369280c2364f3fd11c3adb0c685e19a7c6046bc330d64fe00eb7a744ec7ac22966e4946a040");
+        assert_eq!(
+            hex(&blob),
+            "019dac660c4165242f51d710f8596605a1617825f2089614c621012369280c2364f3fd11c3adb0c685e19a7c6046bc330d64fe00eb7a744ec7ac22966e4946a040"
+        );
     }
 }

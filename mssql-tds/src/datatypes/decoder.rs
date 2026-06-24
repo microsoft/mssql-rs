@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use core::fmt;
+use std::sync::Arc;
 use std::{fmt::Debug, io::Error, vec};
 
 use super::{
@@ -10,6 +11,7 @@ use super::{
     sqldatatypes::{TdsDataType, TypeInfoVariant},
 };
 use crate::datatypes::sqldatatypes::TypeInfo;
+use crate::security::cell_decryptor::CellDecryptor;
 use crate::{
     core::TdsResult,
     datatypes::{sql_json::SqlJson, sql_string::EncodingType, sqldatatypes::FixedLengthTypes},
@@ -24,6 +26,55 @@ use crate::{
 use crate::{query::metadata::ColumnMetadata, token::tokens::SqlCollation};
 
 use super::row_writer::{RowWriter, write_column_value};
+
+/// Reads an encrypted column's cipher bytes from the wire and turns them back
+/// into a plaintext [`ColumnValues`].
+///
+/// An Always Encrypted column is transmitted as `varbinary`, so the cipher blob
+/// is decoded through the normal value path before being decrypted. A NULL cell
+/// decrypts to [`ColumnValues::Null`]. When `decryptor` is `None` (column
+/// encryption is not enabled, or no key store providers are available) an
+/// encrypted column cannot be decrypted, so an error is returned rather than
+/// surfacing ciphertext to the caller.
+pub(crate) async fn decrypt_encrypted_column<D, T>(
+    decoder: &D,
+    reader: &mut T,
+    metadata: &ColumnMetadata,
+    decryptor: Option<&Arc<dyn CellDecryptor>>,
+) -> TdsResult<ColumnValues>
+where
+    D: SqlTypeDecode,
+    T: TdsPacketReader + Send + Sync,
+{
+    let cipher = match decoder.decode(reader, metadata).await? {
+        ColumnValues::Null => return Ok(ColumnValues::Null),
+        ColumnValues::Bytes(bytes) => bytes,
+        other => {
+            return Err(crate::error::Error::ColumnEncryptionError(format!(
+                "Encrypted column '{}' was expected to arrive as varbinary cipher bytes, but \
+                 decoded as {other:?}",
+                metadata.column_name
+            )));
+        }
+    };
+
+    let crypto_metadata = metadata.crypto_metadata.as_ref().ok_or_else(|| {
+        crate::error::Error::ColumnEncryptionError(format!(
+            "decrypt_encrypted_column called for non-encrypted column '{}'",
+            metadata.column_name
+        ))
+    })?;
+
+    let decryptor = decryptor.ok_or_else(|| {
+        crate::error::Error::ColumnEncryptionError(format!(
+            "Column '{}' is encrypted but no column encryption key store providers are \
+             available to decrypt it",
+            metadata.column_name
+        ))
+    })?;
+
+    decryptor.decrypt(crypto_metadata, &cipher)
+}
 
 // Maximum reasonable allocation size for a single value (100MB)
 // This prevents fuzzer-induced capacity overflow panics
