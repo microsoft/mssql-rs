@@ -941,20 +941,23 @@ stages:
 
     # Detect whether the GHCR_TOKEN secret was supplied at queue time. Secret
     # variables are not mapped into the environment automatically, so map it
-    # explicitly via env. The '$(GHCR_TOKEN)' literal guard covers the case
-    # where the variable was never defined and the macro is left unexpanded.
+    # explicitly via env and read only the $GHCR_TOKEN env var below. Never
+    # reference the $(...) macro inside the script body: the agent expands it
+    # before bash runs, which previously made the "unexpanded macro" guard match
+    # the real token and wrongly skip publishing.
     - script: |
         set -euo pipefail
         TOKEN="${GHCR_TOKEN:-}"
         # Debug: never print the token, only its length and a presence summary.
         echo "GHCR_TOKEN char length: ${#TOKEN}"
-        if [ "$TOKEN" = '$(GHCR_TOKEN)' ]; then
-          echo "GHCR_TOKEN resolved to the literal macro '\$(GHCR_TOKEN)' (variable not defined)."
-        fi
         echo "ghcrUsername char length: ${#GHCR_USER_INPUT}"
+        # Treat empty, or an unexpanded "$(...)" macro (contains '$' or '('), as
+        # "not set". A real GitHub PAT only contains [A-Za-z0-9_], so these
+        # patterns never match a valid token. Do NOT reference $(GHCR_TOKEN)
+        # here: the agent macro-expands it into the script body before bash runs.
         case "$TOKEN" in
-          ''|'$(GHCR_TOKEN)')
-            echo "GHCR_TOKEN not set; skipping GHCR publish."
+          ''|*'$'*|*'('*)
+            echo "GHCR_TOKEN not set (empty or unexpanded macro); skipping GHCR publish."
             echo "##vso[task.setvariable variable=GHCR_ENABLED]false"
             exit 0
             ;;
