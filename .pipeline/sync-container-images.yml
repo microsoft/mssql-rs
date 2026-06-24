@@ -946,6 +946,12 @@ stages:
     - script: |
         set -euo pipefail
         TOKEN="${GHCR_TOKEN:-}"
+        # Debug: never print the token, only its length and a presence summary.
+        echo "GHCR_TOKEN char length: ${#TOKEN}"
+        if [ "$TOKEN" = '$(GHCR_TOKEN)' ]; then
+          echo "GHCR_TOKEN resolved to the literal macro '\$(GHCR_TOKEN)' (variable not defined)."
+        fi
+        echo "ghcrUsername char length: ${#GHCR_USER_INPUT}"
         case "$TOKEN" in
           ''|'$(GHCR_TOKEN)')
             echo "GHCR_TOKEN not set; skipping GHCR publish."
@@ -963,6 +969,7 @@ stages:
       displayName: 'Check for GHCR_TOKEN'
       env:
         GHCR_TOKEN: $(GHCR_TOKEN)
+        GHCR_USER_INPUT: ${{ parameters.ghcrUsername }}
         GHCR_USER_INPUT: ${{ parameters.ghcrUsername }}
 
     - script: |
