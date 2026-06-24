@@ -80,6 +80,21 @@ pub enum VectorVersion {
     V2,
 }
 
+/// Controls the Always Encrypted (column encryption) behavior for a connection.
+///
+/// When `Enabled`, the client negotiates the Column Encryption (TCE) feature during
+/// login, transparently encrypts parameters targeting encrypted columns, and decrypts
+/// encrypted result columns. When `Disabled` (the default), the feature is not
+/// negotiated and the connection behaves as if Always Encrypted is unavailable.
+#[derive(PartialEq, Eq, Copy, Clone, Debug, Default)]
+pub enum ColumnEncryptionSetting {
+    /// Always Encrypted is disabled. The TCE feature is not requested. (Default.)
+    #[default]
+    Disabled,
+    /// Always Encrypted is enabled. The TCE feature is negotiated during login.
+    Enabled,
+}
+
 /// Provides a trait for creating Entra ID tokens.
 #[async_trait]
 pub trait EntraIdTokenFactory: Send + Sync {
@@ -253,6 +268,9 @@ pub struct ClientContext {
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
     pub vector_version: VectorVersion,
+    /// Always Encrypted (column encryption) setting for the connection.
+    /// Default: [`ColumnEncryptionSetting::Disabled`].
+    pub column_encryption_setting: ColumnEncryptionSetting,
     /// UserAgent telemetry payload components.
     pub user_agent: UserAgent,
 }
@@ -352,6 +370,7 @@ impl ClientContext {
             },
             // TODO: make V2 as default when full V2 support is added
             vector_version: VectorVersion::V1,
+            column_encryption_setting: ColumnEncryptionSetting::Disabled,
             user_agent: UserAgent::default(),
         }
     }
@@ -408,6 +427,7 @@ impl ClientContext {
             },
             // TODO: make V2 as default when full V2 support is added
             vector_version: VectorVersion::V1,
+            column_encryption_setting: ColumnEncryptionSetting::Disabled,
             user_agent: UserAgent::default(),
         }
     }
@@ -639,6 +659,7 @@ impl Clone for ClientContext {
             access_token: self.access_token.clone(),
             transport_context: self.transport_context.clone(),
             vector_version: self.vector_version,
+            column_encryption_setting: self.column_encryption_setting,
             user_agent: self.user_agent.clone(),
         }
     }

@@ -2,7 +2,8 @@
 // Licensed under the MIT License.
 
 use crate::connection::client_context::{
-    ClientContext, TdsAuthenticationMethod, TransportContext, VectorVersion,
+    ClientContext, ColumnEncryptionSetting, TdsAuthenticationMethod, TransportContext,
+    VectorVersion,
 };
 use crate::message::features::jsonfeature::JsonFeature;
 use crate::message::login_options::{
@@ -21,6 +22,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
+use super::features::always_encrypted::AlwaysEncryptedFeature;
 use super::features::fedauth::FedAuthFeature;
 use super::features::session_recovery::SessionRecoveryFeature;
 use super::features::useragent::UserAgentFeature;
@@ -147,6 +149,7 @@ impl FeaturesRequest {
         access_token: Option<String>,
         prelogin_fedauth_response: bool,
         vector_version: VectorVersion,
+        column_encryption_setting: ColumnEncryptionSetting,
         user_agent_feature: UserAgentFeature,
     ) -> Self {
         let mut features: HashMap<FeatureExtension, Box<dyn Feature>> = HashMap::new();
@@ -160,6 +163,13 @@ impl FeaturesRequest {
         features.insert(FeatureExtension::UserAgent, Box::new(user_agent_feature));
         if let Some(vector_feature) = Option::<VectorFeature>::from(vector_version) {
             features.insert(FeatureExtension::Vector, Box::new(vector_feature));
+        }
+
+        if column_encryption_setting == ColumnEncryptionSetting::Enabled {
+            features.insert(
+                FeatureExtension::AlwaysEncrypted,
+                Box::new(AlwaysEncryptedFeature::default()),
+            );
         }
 
         if authentication_options != TdsAuthenticationMethod::SSPI
@@ -261,6 +271,7 @@ impl From<(&ClientContext, bool)> for FeaturesRequest {
             context.access_token.clone(),
             context_and_prelogin_fedauth_flag.1,
             context.vector_version,
+            context.column_encryption_setting,
             UserAgentFeature::new(context),
         );
 
@@ -289,6 +300,7 @@ impl FeaturesRequest {
             context.access_token.clone(),
             prelogin_fedauth_response,
             context.vector_version,
+            context.column_encryption_setting,
             UserAgentFeature::new(context),
         );
 
