@@ -72,7 +72,7 @@ jobs:
       
       - template: install-ubuntu-dependency.yaml
         parameters:
-          installAzCli: true
+          installAzCli: false
           installDocker: true
       
       - script: |

@@ -20,7 +20,7 @@ jobs:
           dockerVersion: '29.0.0'
       - template: install-ubuntu-dependency.yaml
         parameters:
-          installAzCli: true
+          installAzCli: false
           installDocker: true
 
       - task: DownloadPipelineArtifact@2
