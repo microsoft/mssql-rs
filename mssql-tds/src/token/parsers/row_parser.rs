@@ -194,6 +194,7 @@ mod tests {
             data_type: TdsDataType::Int4,
             column_name: name.to_string(),
             multi_part_name: None,
+            crypto_metadata: None,
         }
     }
 
@@ -201,6 +202,7 @@ mod tests {
         ParserContext::ColumnMetadata(Arc::new(ColMetadataToken {
             column_count: columns.len() as u16,
             columns,
+            cek_table: Vec::new(),
         }))
     }
 

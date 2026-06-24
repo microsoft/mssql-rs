@@ -59,6 +59,7 @@ impl<T: SqlTypeDecode + Sync, P: TdsPacketReader + Send + Sync> TokenParser<P>
             type_info,
             column_name: param_name.clone(),
             multi_part_name: None,
+            crypto_metadata: None,
         };
         let value = self.decoder.decode(reader, &column_metadata).await?;
 

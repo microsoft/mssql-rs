@@ -195,6 +195,7 @@ impl GenericDecoder {
                     data_type: tds_type,
                     column_name: "".to_string(),
                     multi_part_name: None,
+                    crypto_metadata: None,
                 };
                 self.decode(reader, &variant_actual_type_md).await
             }
@@ -2863,6 +2864,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             }
         }
 
@@ -2882,6 +2884,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             }
         }
 
@@ -3172,6 +3175,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             };
             // length byte = 0 → NULL
             let val = assert_decode_equivalence(vec![0], &md).await;
@@ -3196,6 +3200,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             };
             // length=5, sign=1 (positive), one i32 part = 12345
             let mut buf = vec![5u8, 1u8];
@@ -3231,6 +3236,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             }
         }
 
@@ -3250,6 +3256,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             }
         }
 
@@ -3268,6 +3275,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             }
         }
 

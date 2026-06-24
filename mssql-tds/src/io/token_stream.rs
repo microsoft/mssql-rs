@@ -104,6 +104,10 @@ where
 #[cfg(not(fuzzing))]
 pub(crate) enum ParserContext {
     ColumnMetadata(Arc<ColMetadataToken>),
+    /// Carries whether Always Encrypted (TCE) was negotiated for the connection.
+    /// Consumed by the COLMETADATA parser to decide whether to parse the CEK
+    /// table and per-column crypto metadata.
+    ColumnEncryption(bool),
     None(()),
 }
 
@@ -112,12 +116,25 @@ pub(crate) enum ParserContext {
 #[allow(private_interfaces)]
 pub enum ParserContext {
     ColumnMetadata(Arc<ColMetadataToken>),
+    /// Carries whether Always Encrypted (TCE) was negotiated for the connection.
+    /// Consumed by the COLMETADATA parser to decide whether to parse the CEK
+    /// table and per-column crypto metadata.
+    ColumnEncryption(bool),
     None(()),
 }
 
 impl Default for ParserContext {
     fn default() -> Self {
         ParserContext::None(())
+    }
+}
+
+impl ParserContext {
+    /// Returns `true` when this context indicates Always Encrypted was
+    /// negotiated, instructing the COLMETADATA parser to parse encryption
+    /// metadata.
+    pub(crate) fn is_column_encryption_supported(&self) -> bool {
+        matches!(self, ParserContext::ColumnEncryption(true))
     }
 }
 
@@ -385,7 +402,7 @@ impl Default for GenericTokenParserRegistry {
         );
         internal_registry.insert(
             TokenType::ColMetadata,
-            TokenParsers::from(ColMetadataTokenParser::default()),
+            TokenParsers::from(ColMetadataTokenParser),
         );
         internal_registry.insert(
             TokenType::Row,

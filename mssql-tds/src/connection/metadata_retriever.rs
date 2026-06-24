@@ -449,6 +449,7 @@ mod tests {
             data_type: tds_type,
             column_name: name.to_string(),
             multi_part_name: None,
+            crypto_metadata: None,
         }
     }
 
@@ -460,6 +461,7 @@ mod tests {
             col_metadata: ColMetadataToken {
                 column_count: columns.len() as u16,
                 columns,
+                cek_table: Vec::new(),
             },
             collation_names,
         }

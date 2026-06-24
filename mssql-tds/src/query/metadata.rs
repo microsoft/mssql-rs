@@ -26,6 +26,14 @@ pub struct ColumnMetadata {
     /// Optional four-part name (`server.catalog.schema.table`) when the server
     /// includes table-name metadata (e.g., browse-mode queries).
     pub multi_part_name: Option<MultiPartName>,
+    /// Always Encrypted cryptographic metadata, present only for encrypted
+    /// columns when column encryption has been negotiated for the connection.
+    ///
+    /// When set, `data_type`/`type_info` describe the on-the-wire (ciphertext)
+    /// type, while the contained [`CryptoMetadata`] carries the underlying
+    /// plaintext type and the key/algorithm needed to decrypt the column.
+    #[allow(dead_code)] // Populated during COLMETADATA parsing; consumed by result-set decryption in a later phase.
+    pub(crate) crypto_metadata: Option<CryptoMetadata>,
 }
 
 impl ColumnMetadata {
@@ -162,22 +170,61 @@ impl MultiPartName {
     }
 }
 
-#[derive(Debug)]
-#[allow(dead_code)] // For column encryption metadata which is not implemented yet.
-pub(crate) struct ColumnEncryptionMetadata {
-    pub key_count: u8,
-    pub key_details: Vec<ColumnEncryptionKeyDetails>,
-    pub db_id: u32,
-    pub key_id: u32,
+/// A single encrypted value of a column encryption key (CEK), as carried in the
+/// COLMETADATA CEK table.
+///
+/// A CEK may have more than one encrypted value (one per column master key that
+/// wraps it) to support key rotation; any one of them can be used to recover the
+/// plaintext CEK.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields consumed by CEK decryption in a later phase.
+pub(crate) struct EncryptedCekValue {
+    /// The encrypted CEK bytes (ciphertext produced by the column master key).
+    pub encrypted_key: Vec<u8>,
+    /// Name of the key store provider (e.g. `MSSQL_CERTIFICATE_STORE`, `AZURE_KEY_VAULT`).
+    pub key_store_name: String,
+    /// Provider-specific path identifying the column master key.
+    pub key_path: String,
+    /// Name of the asymmetric algorithm used to encrypt the CEK (e.g. `RSA_OAEP`).
+    pub algorithm_name: String,
 }
 
-#[derive(Debug)]
-#[allow(dead_code)] // For column encryption metadata which is not implemented yet.
-pub(crate) struct ColumnEncryptionKeyDetails {
-    pub encrypted_cek: Vec<u8>,
-    pub algo: String,
-    pub key_path: String,
-    pub key_store_name: String,
+/// One entry in the COLMETADATA CEK table, describing a column encryption key
+/// and the encrypted values from which its plaintext can be recovered.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields consumed by CEK decryption in a later phase.
+pub(crate) struct CekTableEntry {
+    /// Database identifier the CEK belongs to.
+    pub database_id: i32,
+    /// CEK identifier.
+    pub cek_id: i32,
+    /// CEK version.
+    pub cek_version: i32,
+    /// CEK metadata version (8 bytes).
+    pub cek_md_version: [u8; 8],
+    /// Encrypted CEK values, one per column master key that wraps this CEK.
+    pub encrypted_cek_values: Vec<EncryptedCekValue>,
+}
+
+/// Per-column cryptographic metadata for an Always Encrypted column, parsed from
+/// the COLMETADATA token when column encryption has been negotiated.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields consumed by result-set decryption in a later phase.
+pub(crate) struct CryptoMetadata {
+    /// Ordinal into the result set's CEK table identifying the wrapping key.
+    pub cek_table_ordinal: u16,
+    /// Underlying SQL Server data type of the column before encryption.
+    pub base_data_type: TdsDataType,
+    /// Wire descriptor for the underlying (plaintext) type.
+    pub base_type_info: TypeInfo,
+    /// Cipher algorithm identifier (`0x01` = AEAD_AES_256_CBC_HMAC_SHA256, `0x00` = custom).
+    pub cipher_algorithm_id: u8,
+    /// Custom cipher algorithm name; present only when `cipher_algorithm_id` is `0`.
+    pub cipher_algorithm_name: Option<String>,
+    /// Encryption type byte (`1` = deterministic, `2` = randomized).
+    pub encryption_type: u8,
+    /// Normalization rule version byte.
+    pub normalization_rule_version: u8,
 }
 
 #[cfg(test)]
@@ -204,6 +251,7 @@ mod tests {
             data_type: TdsDataType::IntN,
             column_name: "test_column".to_string(),
             multi_part_name: None,
+            crypto_metadata: None,
         }
     }
 

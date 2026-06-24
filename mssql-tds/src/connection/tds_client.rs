@@ -1329,7 +1329,11 @@ impl TdsClient {
     pub(crate) async fn move_to_column_metadata(
         &mut self,
     ) -> TdsResult<Option<Arc<ColMetadataToken>>> {
-        let parser_context = ParserContext::None(());
+        // Tell the COLMETADATA parser whether Always Encrypted was negotiated so
+        // it can parse the CEK table and per-column crypto metadata.
+        let parser_context = ParserContext::ColumnEncryption(
+            self.negotiated_settings.is_column_encryption_supported(),
+        );
         let mut col_metadata: Option<Arc<ColMetadataToken>> = None;
         let mut loop_count = 0u32;
 
