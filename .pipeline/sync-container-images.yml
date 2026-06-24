@@ -970,7 +970,6 @@ stages:
       env:
         GHCR_TOKEN: $(GHCR_TOKEN)
         GHCR_USER_INPUT: ${{ parameters.ghcrUsername }}
-        GHCR_USER_INPUT: ${{ parameters.ghcrUsername }}
 
     - script: |
         set -euo pipefail
