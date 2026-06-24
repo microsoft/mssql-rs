@@ -1,771 +1,78 @@
-# Weekly scheduled pipeline to sync and build Python wheel build images
-# This pipeline:
-# 1. Imports vanilla base images from public registries to ACR (distributed across parallel stages to avoid rate limits)
-# 2. Builds custom images with Rust and maturin pre-installed
-# 3. Pushes custom images to ACR for use in CI/CD
-# Runs every Monday at 3:00 AM UTC
+# =============================================================================
+# SCRATCH pipeline: validate the ACR -> GHCR mirror approach
+# =============================================================================
+# This is a throwaway validation pipeline used to prove out the design in ADO
+# task #45942 (mirror CI container images from ACR to GHCR so the PR/validation
+# pipeline can pull anonymously, without authenticating to ACR).
+#
+# What it does:
+#   1. Logs in to ACR (existing 'Magnitude Test' service connection).
+#   2. Logs in to GHCR using EITHER a PAT or a GitHub App installation token.
+#        - For the App path it prints the *granted* permissions returned by the
+#          installation-token API. That is the authoritative, UI-independent way
+#          to confirm the App has `packages: write`.
+#   3. Mirrors the full set of images the validation pipeline consumes from
+#      ACR -> GHCR using `docker buildx imagetools create` (multi-arch safe).
+#   4. Verifies anonymous (credential-less) pulls from GHCR. This only succeeds
+#      once each GHCR package has been made PUBLIC in the org UI/API, so it is
+#      informational on the first run (continueOnError).
+#
+# -----------------------------------------------------------------------------
+# REQUIRED secret pipeline variables (set in the ADO pipeline UI, not here):
+#   When ghcrAuthMethod = 'pat':
+#     GHCR_TOKEN              - a PAT with write:packages (scratch / short-lived)
+#   When ghcrAuthMethod = 'app':
+#     GHCR_APP_ID             - GitHub App ID
+#     GHCR_APP_PEM            - GitHub App private key (full PEM contents)
+#     GHCR_APP_INSTALLATION_ID- (optional) installation id; auto-discovered from
+#                               the org owner of ghcrOrg if left unset
+# =============================================================================
 
 trigger: none
 
 parameters:
-- name: importBaseImages
-  displayName: 'Import base images from public registries to ACR'
-  type: boolean
-  default: false
-
-# Fine-grained sync controls (only used when importBaseImages=true)
-- name: syncManylinux
-  displayName: '  ├─ Sync PyPA manylinux (quay.io)'
-  type: boolean
-  default: true
-
-- name: syncMusllinux
-  displayName: '  ├─ Sync PyPA musllinux (quay.io)'
-  type: boolean
-  default: true
-
-- name: syncUbuntu
-  displayName: '  ├─ Sync Ubuntu (docker.io)'
-  type: boolean
-  default: true
-
-- name: syncAlpine1
-  displayName: '  ├─ Sync Alpine 3.18-3.19 (docker.io)'
-  type: boolean
-  default: true
-
-- name: syncAlpine2
-  displayName: '  ├─ Sync Alpine 3.20-3.21 (docker.io)'
-  type: boolean
-  default: true
-
-- name: syncDebianRHEL
-  displayName: '  ├─ Sync Debian & RHEL (docker.io)'
-  type: boolean
-  default: true
-
-- name: syncOracle
-  displayName: '  └─ Sync Oracle Linux (docker.io)'
-  type: boolean
-  default: true
-
-# Docker Hub authentication (optional - for higher rate limits)
-# To generate a Docker Hub PAT:
-#   1. Log in to https://hub.docker.com
-#   2. Click your profile icon → Account Settings → Security
-#   3. Click "New Access Token"
-#   4. Give it a description (e.g., "ACR Import") and select "Read-only" access
-#   5. Click "Generate" and copy the token
-# Rate limits:
-#   - Anonymous: 100 pulls per 6 hours (per IP)
-#   - Authenticated (free): 200 pulls per 6 hours
-#   - Authenticated (Pro/Team): Much higher limits
-- name: dockerHubUsername
-  displayName: 'Docker Hub Username (optional - leave empty for anonymous)'
+- name: ghcrOrg
+  displayName: 'GHCR namespace (owner or owner/repo)'
   type: string
-  default: ''
+  default: 'microsoft/mssql-rs'
 
-- name: dockerHubPat
-  displayName: 'Docker Hub PAT (optional - leave empty for anonymous)'
+- name: ghcrAuthMethod
+  displayName: 'GHCR auth method'
   type: string
-  default: ''
+  default: 'pat'
+  values:
+  - pat
+  - app
 
-- name: buildPythonImages
-  displayName: 'Build custom Python images with Rust pre-installed'
+- name: ghcrUsername
+  displayName: 'GHCR username (PAT auth only; App uses x-access-token)'
+  type: string
+  default: 'x-access-token'
+
+- name: doMirror
+  displayName: 'Mirror images ACR -> GHCR'
   type: boolean
   default: true
 
-- name: buildUbuntuImages
-  displayName: 'Build Rust build images'
+- name: verifyAnonymousPull
+  displayName: 'Verify anonymous pull from GHCR (needs packages set Public)'
   type: boolean
   default: true
-
-schedules:
-- cron: "0 3 * * 1"
-  displayName: Weekly Python image build (Monday 3 AM UTC)
-  branches:
-    include:
-    - development
-    exclude:
-    - main
-  always: true
 
 variables:
   ACR_NAME: 'tdslibrs'
   ACR_REGISTRY: 'tdslibrs.azurecr.io'
-
-# =============================================================================
-# STAGE 1: Import base images from public registries (distributed to avoid rate limits)
-# Each stage runs on a separate agent and imports max 2 images
-# All sync stages run in parallel
-# =============================================================================
+  GHCR_REGISTRY: 'ghcr.io'
+  GHCR_NAMESPACE: 'ghcr.io/${{ parameters.ghcrOrg }}'
 
 stages:
-# -----------------------------------------------------------------------------
-# Sync Stage 1: PyPA manylinux images (quay.io - no Docker Hub rate limit)
-# -----------------------------------------------------------------------------
-- stage: Sync_PyPA_Manylinux
-  displayName: 'Sync: PyPA Manylinux'
+- stage: Mirror_To_GHCR
+  displayName: 'Validate ACR -> GHCR mirror'
   dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncManylinux }}', 'true'))
   jobs:
-  - job: SyncImages
-    displayName: 'Import manylinux x64 & arm64'
-    pool:
-      name: RUST-1ES-POOL-WUS3
-      demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
-    steps:
-    - checkout: none
-    - task: AzureCLI@2
-      displayName: 'Import manylinux_2_34 x64'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          az acr import \
-            --name $(ACR_NAME) \
-            --source quay.io/pypa/manylinux_2_34_x86_64:latest \
-            --image import/python-build/manylinux_2_34_x86_64:latest \
-            --force
-      retryCountOnTaskFailure: 3
-    - task: AzureCLI@2
-      displayName: 'Import manylinux_2_34 arm64'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          az acr import \
-            --name $(ACR_NAME) \
-            --source quay.io/pypa/manylinux_2_34_aarch64:latest \
-            --image import/python-build/manylinux_2_34_aarch64:latest \
-            --force
-      retryCountOnTaskFailure: 3
-    - task: AzureCLI@2
-      displayName: 'Import manylinux_2_28 x64'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          az acr import \
-            --name $(ACR_NAME) \
-            --source quay.io/pypa/manylinux_2_28_x86_64:latest \
-            --image import/python-build/manylinux_2_28_x86_64:latest \
-            --force
-      retryCountOnTaskFailure: 3
-    - task: AzureCLI@2
-      displayName: 'Import manylinux_2_28 arm64'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          az acr import \
-            --name $(ACR_NAME) \
-            --source quay.io/pypa/manylinux_2_28_aarch64:latest \
-            --image import/python-build/manylinux_2_28_aarch64:latest \
-            --force
-      retryCountOnTaskFailure: 3
-
-# -----------------------------------------------------------------------------
-# Sync Stage 2: PyPA musllinux images (quay.io - no Docker Hub rate limit)
-# -----------------------------------------------------------------------------
-- stage: Sync_PyPA_Musllinux
-  displayName: 'Sync: PyPA Musllinux'
-  dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncMusllinux }}', 'true'))
-  jobs:
-  - job: SyncImages
-    displayName: 'Import musllinux x64 & arm64'
-    pool:
-      name: RUST-1ES-POOL-WUS3
-      demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
-    steps:
-    - checkout: none
-    - task: AzureCLI@2
-      displayName: 'Import musllinux x64'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          az acr import \
-            --name $(ACR_NAME) \
-            --source quay.io/pypa/musllinux_1_2_x86_64:latest \
-            --image import/python-build/musllinux_1_2_x86_64:latest \
-            --force
-      retryCountOnTaskFailure: 3
-    - task: AzureCLI@2
-      displayName: 'Import musllinux arm64'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          az acr import \
-            --name $(ACR_NAME) \
-            --source quay.io/pypa/musllinux_1_2_aarch64:latest \
-            --image import/python-build/musllinux_1_2_aarch64:latest \
-            --force
-      retryCountOnTaskFailure: 3
-
-# -----------------------------------------------------------------------------
-# Sync Stage 3: Ubuntu images (Docker Hub - rate limited)
-# -----------------------------------------------------------------------------
-- stage: Sync_Ubuntu
-  displayName: 'Sync: Ubuntu'
-  dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncUbuntu }}', 'true'))
-  jobs:
-  - job: SyncImages
-    displayName: 'Import Ubuntu 22.04 & 24.04'
-    pool:
-      name: RUST-1ES-POOL-WUS3
-      demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
-    steps:
-    - checkout: none
-    - task: AzureCLI@2
-      displayName: 'Import Ubuntu 22.04'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          AUTH_ARGS=""
-          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
-            echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
-          else
-            echo "Using anonymous Docker Hub access"
-          fi
-          az acr import \
-            --name $(ACR_NAME) \
-            --source docker.io/library/ubuntu:22.04 \
-            --image import/ubuntu:22.04 \
-            $AUTH_ARGS \
-            --force
-      env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
-      retryCountOnTaskFailure: 3
-    - task: AzureCLI@2
-      displayName: 'Import Ubuntu 24.04'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          AUTH_ARGS=""
-          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
-            echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
-          else
-            echo "Using anonymous Docker Hub access"
-          fi
-          az acr import \
-            --name $(ACR_NAME) \
-            --source docker.io/library/ubuntu:24.04 \
-            --image import/ubuntu:24.04 \
-            $AUTH_ARGS \
-            --force
-      env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
-      retryCountOnTaskFailure: 3
-
-# -----------------------------------------------------------------------------
-# Sync Stage 4: Alpine 3.18 & 3.19 (Docker Hub - rate limited)
-# -----------------------------------------------------------------------------
-- stage: Sync_Alpine_1
-  displayName: 'Sync: Alpine 3.18-3.19'
-  dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncAlpine1 }}', 'true'))
-  jobs:
-  - job: SyncImages
-    displayName: 'Import Alpine 3.18 & 3.19'
-    pool:
-      name: RUST-1ES-POOL-WUS3
-      demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
-    steps:
-    - checkout: none
-    - task: AzureCLI@2
-      displayName: 'Import Alpine 3.18'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          AUTH_ARGS=""
-          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
-            echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
-          else
-            echo "Using anonymous Docker Hub access"
-          fi
-          az acr import \
-            --name $(ACR_NAME) \
-            --source docker.io/library/alpine:3.18 \
-            --image import/alpine:3.18 \
-            $AUTH_ARGS \
-            --force
-      env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
-      retryCountOnTaskFailure: 3
-    - task: AzureCLI@2
-      displayName: 'Import Alpine 3.19'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          AUTH_ARGS=""
-          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
-            echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
-          else
-            echo "Using anonymous Docker Hub access"
-          fi
-          az acr import \
-            --name $(ACR_NAME) \
-            --source docker.io/library/alpine:3.19 \
-            --image import/alpine:3.19 \
-            $AUTH_ARGS \
-            --force
-      env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
-      retryCountOnTaskFailure: 3
-
-# -----------------------------------------------------------------------------
-# Sync Stage 5: Alpine 3.20 & 3.21 (Docker Hub - rate limited)
-# -----------------------------------------------------------------------------
-- stage: Sync_Alpine_2
-  displayName: 'Sync: Alpine 3.20-3.21'
-  dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncAlpine2 }}', 'true'))
-  jobs:
-  - job: SyncImages
-    displayName: 'Import Alpine 3.20 & 3.21'
-    pool:
-      name: RUST-1ES-POOL-WUS3
-      demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
-    steps:
-    - checkout: none
-    - task: AzureCLI@2
-      displayName: 'Import Alpine 3.20'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          AUTH_ARGS=""
-          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
-            echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
-          else
-            echo "Using anonymous Docker Hub access"
-          fi
-          az acr import \
-            --name $(ACR_NAME) \
-            --source docker.io/library/alpine:3.20 \
-            --image import/alpine:3.20 \
-            $AUTH_ARGS \
-            --force
-      env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
-      retryCountOnTaskFailure: 3
-    - task: AzureCLI@2
-      displayName: 'Import Alpine 3.21'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          AUTH_ARGS=""
-          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
-            echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
-          else
-            echo "Using anonymous Docker Hub access"
-          fi
-          az acr import \
-            --name $(ACR_NAME) \
-            --source docker.io/library/alpine:3.21 \
-            --image import/alpine:3.21 \
-            $AUTH_ARGS \
-            --force
-      env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
-      retryCountOnTaskFailure: 3
-
-# -----------------------------------------------------------------------------
-# Sync Stage 6: Debian & RHEL (Docker Hub - rate limited)
-# -----------------------------------------------------------------------------
-- stage: Sync_Debian_RHEL
-  displayName: 'Sync: Debian & RHEL'
-  dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncDebianRHEL }}', 'true'))
-  jobs:
-  - job: SyncImages
-    displayName: 'Import Debian & RHEL UBI9'
-    pool:
-      name: RUST-1ES-POOL-WUS3
-      demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
-    steps:
-    - checkout: none
-    - task: AzureCLI@2
-      displayName: 'Import Debian Bookworm'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          AUTH_ARGS=""
-          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
-            echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
-          else
-            echo "Using anonymous Docker Hub access"
-          fi
-          az acr import \
-            --name $(ACR_NAME) \
-            --source docker.io/library/debian:bookworm \
-            --image import/debian:bookworm \
-            $AUTH_ARGS \
-            --force
-      env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
-      retryCountOnTaskFailure: 3
-    - task: AzureCLI@2
-      displayName: 'Import Red Hat UBI9'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          AUTH_ARGS=""
-          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
-            echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
-          else
-            echo "Using anonymous Docker Hub access"
-          fi
-          az acr import \
-            --name $(ACR_NAME) \
-            --source docker.io/redhat/ubi9:latest \
-            --image import/redhat/ubi9:latest \
-            $AUTH_ARGS \
-            --force
-      env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
-      retryCountOnTaskFailure: 3
-
-# -----------------------------------------------------------------------------
-# Sync Stage 7: Oracle Linux (Docker Hub - rate limited)
-# -----------------------------------------------------------------------------
-- stage: Sync_Oracle
-  displayName: 'Sync: Oracle Linux'
-  dependsOn: []
-  condition: and(eq('${{ parameters.importBaseImages }}', 'true'), eq('${{ parameters.syncOracle }}', 'true'))
-  jobs:
-  - job: SyncImages
-    displayName: 'Import Oracle Linux 9'
-    pool:
-      name: RUST-1ES-POOL-WUS3
-      demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
-    steps:
-    - checkout: none
-    - task: AzureCLI@2
-      displayName: 'Import Oracle Linux 9'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          AUTH_ARGS=""
-          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
-            echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
-          else
-            echo "Using anonymous Docker Hub access"
-          fi
-          az acr import \
-            --name $(ACR_NAME) \
-            --source docker.io/library/oraclelinux:9 \
-            --image import/oraclelinux:9 \
-            $AUTH_ARGS \
-            --force
-      env:
-        DOCKER_USER: ${{ parameters.dockerHubUsername }}
-        DOCKER_PAT: ${{ parameters.dockerHubPat }}
-      retryCountOnTaskFailure: 3
-
-# =============================================================================
-# STAGE 2: Build and Push Custom Images
-# Depends on sync stages completing (when importBaseImages is true)
-# =============================================================================
-
-- stage: BuildAndPushImages
-  displayName: Build and Push Custom Images
-  # Depend on sync stages only when importBaseImages is true
-  ${{ if eq(parameters.importBaseImages, true) }}:
-    dependsOn:
-      - Sync_PyPA_Manylinux
-      - Sync_PyPA_Musllinux
-      - Sync_Ubuntu
-      - Sync_Alpine_1
-      - Sync_Alpine_2
-      - Sync_Debian_RHEL
-      - Sync_Oracle
-  ${{ else }}:
-    dependsOn: []
-  condition: or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true'))
-  jobs:
-  - job: BuildX64Images
-    displayName: Build x64 Images
-    pool:
-      name: RUST-1ES-POOL-WUS3
-      demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
-    steps:
-    - checkout: self
-      displayName: Checkout repository
-
-    - task: AzureCLI@2
-      displayName: 'Build custom x64 Python build images with Rust pre-installed'
-      condition: eq('${{ parameters.buildPythonImages }}', 'true')
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          cd $(Build.SourcesDirectory)/containers
-          
-          # Login to ACR
-          echo "==> Logging into Azure Container Registry..."
-          az acr login --name tdslibrs
-          
-          # Build manylinux x64 image
-          echo "==> Building manylinux x64 image..."
-          docker build \
-              -f Dockerfile.PythonBuild.manylinux.x64 \
-              -t tdslibrs.azurecr.io/python-build/manylinux_2_34_x86_64_rust:latest \
-              .
-          echo "✅ manylinux x64 image built successfully"
-          
-          # Build musllinux x64 image
-          echo "==> Building musllinux x64 image..."
-          docker build \
-              -f Dockerfile.PythonBuild.musllinux.x64 \
-              -t tdslibrs.azurecr.io/python-build/musllinux_1_2_x86_64_rust:latest \
-              .
-          echo "✅ musllinux x64 image built successfully"
-
-    - task: AzureCLI@2
-      displayName: 'Build Ubuntu x64 build image with Rust and tooling'
-      condition: eq('${{ parameters.buildUbuntuImages }}', 'true')
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          cd $(Build.SourcesDirectory)/containers
-          
-          # Login to ACR
-          echo "==> Logging into Azure Container Registry..."
-          az acr login --name tdslibrs
-          
-          # Build Ubuntu x64 image
-          echo "==> Building Ubuntu x64 build image..."
-          docker build \
-              -f Dockerfile.Ubuntu.Build \
-              -t tdslibrs.azurecr.io/build/ubuntu:22.04-x64 \
-              -t tdslibrs.azurecr.io/build/ubuntu:latest-x64 \
-              .
-          echo "✅ Ubuntu x64 build image built successfully"
-
-    - task: AzureCLI@2
-      displayName: 'Build Alpine x64 build image with Rust and tooling'
-      condition: eq('${{ parameters.buildUbuntuImages }}', 'true')
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          cd $(Build.SourcesDirectory)/containers
-          
-          # Login to ACR
-          echo "==> Logging into Azure Container Registry..."
-          az acr login --name tdslibrs
-          
-          # Build Alpine x64 image
-          echo "==> Building Alpine x64 build image..."
-          docker build \
-              -f Dockerfile.Alpine.Build \
-              -t tdslibrs.azurecr.io/build/alpine:3.18-amd64 \
-              .
-          echo "✅ Alpine x64 build image built successfully"
-
-    - task: AzureCLI@2
-      displayName: 'Push x64 images to ACR'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          az acr login --name tdslibrs
-          
-          # Push Python images if enabled
-          if [ "${{ parameters.buildPythonImages }}" == "True" ]; then
-            docker push tdslibrs.azurecr.io/python-build/manylinux_2_34_x86_64_rust:latest
-            docker push tdslibrs.azurecr.io/python-build/musllinux_1_2_x86_64_rust:latest
-          fi
-          
-          # Push Ubuntu images if enabled
-          if [ "${{ parameters.buildUbuntuImages }}" == "True" ]; then
-            docker push tdslibrs.azurecr.io/build/ubuntu:22.04-x64
-            docker push tdslibrs.azurecr.io/build/ubuntu:latest-x64
-            docker push tdslibrs.azurecr.io/build/alpine:3.18-amd64
-          fi
-
-  - job: BuildARM64Images
-    displayName: Build ARM64 Images
-    dependsOn: BuildX64Images
-    pool:
-      name: RUST-1ES-POOL-ARM-WUS3
-      demands:
-        - imageOverride -equals RUST-UBUNTU-ARM64
-    steps:
-    - checkout: self
-      displayName: Checkout repository
-
-    - task: DockerInstaller@0
-      displayName: 'Install Docker'
-      inputs:
-        dockerVersion: '29.0.0'
-
-    - template: templates/install-ubuntu-dependency.yaml
-      parameters:
-        installAzCli: false
-        installDocker: true
-
-    - task: AzureCLI@2
-      displayName: 'Build custom ARM64 Python build images with Rust pre-installed'
-      condition: eq('${{ parameters.buildPythonImages }}', 'true')
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          cd $(Build.SourcesDirectory)/containers
-          
-          # Login to ACR
-          echo "==> Logging into Azure Container Registry..."
-          az acr login --name tdslibrs
-          
-          # Build manylinux ARM64 image
-          echo "==> Building manylinux ARM64 image..."
-          docker build \
-              -f Dockerfile.PythonBuild.manylinux.arm64 \
-              -t tdslibrs.azurecr.io/python-build/manylinux_2_34_aarch64_rust:latest \
-              .
-          echo "✅ manylinux ARM64 image built successfully"
-          
-          # Build musllinux ARM64 image
-          echo "==> Building musllinux ARM64 image..."
-          docker build \
-              -f Dockerfile.PythonBuild.musllinux.arm64 \
-              -t tdslibrs.azurecr.io/python-build/musllinux_1_2_aarch64_rust:latest \
-              .
-          echo "✅ musllinux ARM64 image built successfully"
-
-    - task: AzureCLI@2
-      displayName: 'Build Ubuntu ARM64 build image with Rust and tooling'
-      condition: eq('${{ parameters.buildUbuntuImages }}', 'true')
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          cd $(Build.SourcesDirectory)/containers
-          
-          # Login to ACR
-          echo "==> Logging into Azure Container Registry..."
-          az acr login --name tdslibrs
-          
-          # Build Ubuntu ARM64 image
-          echo "==> Building Ubuntu ARM64 build image..."
-          docker build \
-              -f Dockerfile.Ubuntu.Build \
-              -t tdslibrs.azurecr.io/build/ubuntu:22.04-arm64 \
-              -t tdslibrs.azurecr.io/build/ubuntu:latest-arm64 \
-              .
-          echo "✅ Ubuntu ARM64 build image built successfully"
-
-    - task: AzureCLI@2
-      displayName: 'Build Alpine ARM64 build image with Rust and tooling'
-      condition: eq('${{ parameters.buildUbuntuImages }}', 'true')
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          cd $(Build.SourcesDirectory)/containers
-          
-          # Login to ACR
-          echo "==> Logging into Azure Container Registry..."
-          az acr login --name tdslibrs
-          
-          # Build Alpine ARM64 image
-          echo "==> Building Alpine ARM64 build image..."
-          docker build \
-              -f Dockerfile.Alpine.Build \
-              -t tdslibrs.azurecr.io/build/alpine:3.18-arm64 \
-              .
-          echo "✅ Alpine ARM64 build image built successfully"
-
-    - task: AzureCLI@2
-      displayName: 'Push ARM64 images to ACR'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          az acr login --name tdslibrs
-          
-          # Push Python images if enabled
-          if [ "${{ parameters.buildPythonImages }}" == "True" ]; then
-            docker push tdslibrs.azurecr.io/python-build/manylinux_2_34_aarch64_rust:latest
-            docker push tdslibrs.azurecr.io/python-build/musllinux_1_2_aarch64_rust:latest
-          fi
-          
-          # Push Ubuntu images if enabled
-          if [ "${{ parameters.buildUbuntuImages }}" == "True" ]; then
-            docker push tdslibrs.azurecr.io/build/ubuntu:22.04-arm64
-            docker push tdslibrs.azurecr.io/build/ubuntu:latest-arm64
-            docker push tdslibrs.azurecr.io/build/alpine:3.18-arm64
-          fi
-
-  - job: CreateMultiArchManifests
-    displayName: Create Multi-Arch Manifests
-    dependsOn:
-    - BuildX64Images
-    - BuildARM64Images
-    condition: eq('${{ parameters.buildUbuntuImages }}', 'true')
+  - job: MirrorImages
+    displayName: 'Mirror images and verify anonymous pull'
+    timeoutInMinutes: 60
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:
@@ -773,159 +80,191 @@ stages:
     steps:
     - checkout: none
 
+    # -------------------------------------------------------------------------
+    # Shared image list. Source path == target path; only the registry host
+    # differs:  tdslibrs.azurecr.io/<path>:<tag>  ->  ghcr.io/<org>/<path>:<tag>
+    # -------------------------------------------------------------------------
+    - script: |
+        set -euo pipefail
+        mkdir -p "$(Pipeline.Workspace)/ghcr"
+        cat > "$(Pipeline.Workspace)/ghcr/images.txt" <<'EOF'
+        python-build/manylinux_2_34_x86_64_rust:latest
+        python-build/manylinux_2_34_aarch64_rust:latest
+        python-build/musllinux_1_2_x86_64_rust:latest
+        python-build/musllinux_1_2_aarch64_rust:latest
+        build/ubuntu:22.04
+        build/alpine:3.18
+        import/debian:bookworm
+        import/alpine:3.18
+        import/alpine:3.19
+        import/alpine:3.20
+        import/alpine:3.21
+        import/ubuntu:22.04
+        import/ubuntu:24.04
+        import/redhat/ubi9:latest
+        import/oraclelinux:9
+        EOF
+        echo "Images to mirror:"
+        sed 's/^/  /' "$(Pipeline.Workspace)/ghcr/images.txt"
+      displayName: 'Define image list'
+
+    # -------------------------------------------------------------------------
+    # Log in to ACR so buildx imagetools can READ the source images.
+    # -------------------------------------------------------------------------
     - task: AzureCLI@2
-      displayName: 'Create multi-arch manifest for Ubuntu build image'
+      displayName: 'Login to ACR (read source images)'
       inputs:
         azureSubscription: 'Magnitude Test'
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          set -e
-          az acr login --name tdslibrs
-          
-          echo "==> Creating multi-arch manifest for Ubuntu 22.04 build image..."
-          # Use buildx imagetools create to properly handle manifest lists as inputs
-          docker buildx imagetools create -t tdslibrs.azurecr.io/build/ubuntu:22.04 \
-            tdslibrs.azurecr.io/build/ubuntu:22.04-x64 \
-            tdslibrs.azurecr.io/build/ubuntu:22.04-arm64
-          
-          echo "✅ Multi-arch Ubuntu build image created"
-          echo "   Image: tdslibrs.azurecr.io/build/ubuntu:22.04 (amd64, arm64)"
-          
-          echo "==> Verifying manifest..."
-          docker manifest inspect tdslibrs.azurecr.io/build/ubuntu:22.04
+          set -euo pipefail
+          az acr login --name $(ACR_NAME)
 
-    - task: AzureCLI@2
-      displayName: 'Create multi-arch manifest for Alpine build image'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          set -e
-          az acr login --name tdslibrs
-          
-          echo "==> Creating multi-arch manifest for Alpine 3.18 build image..."
-          # Use buildx imagetools create to properly handle manifest lists as inputs
-          docker buildx imagetools create -t tdslibrs.azurecr.io/build/alpine:3.18 \
-            tdslibrs.azurecr.io/build/alpine:3.18-amd64 \
-            tdslibrs.azurecr.io/build/alpine:3.18-arm64
-          
-          echo "✅ Multi-arch Alpine build image created"
-          echo "   Image: tdslibrs.azurecr.io/build/alpine:3.18 (amd64, arm64)"
-          
-          echo "==> Verifying manifest..."
-          docker manifest inspect tdslibrs.azurecr.io/build/alpine:3.18
+    # -------------------------------------------------------------------------
+    # GHCR login via GitHub App installation token.
+    # Prints the granted permissions so you can confirm packages:write without
+    # access to the App settings UI.
+    # -------------------------------------------------------------------------
+    - ${{ if eq(parameters.ghcrAuthMethod, 'app') }}:
+      - script: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check pyjwt cryptography requests \
+            || python3 -m pip install --quiet --disable-pip-version-check --break-system-packages pyjwt cryptography requests
 
-  - job: VerifyAllImages
-    displayName: Verify All Images in ACR
-    dependsOn:
-    - BuildX64Images
-    - BuildARM64Images
-    - CreateMultiArchManifests
-    condition: always()
-    pool:
-      name: RUST-1ES-POOL-WUS3
-      demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
-    steps:
-    - checkout: none
+          OWNER="$(echo "${{ parameters.ghcrOrg }}" | cut -d/ -f1)"
 
-    - task: AzureCLI@2
-      displayName: 'Verify all images in ACR'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          echo "======================================================"
-          echo "Listing all Python build images in ACR"
-          echo "======================================================"
-          az acr repository list --name $(ACR_NAME) --output table | grep python-build || true
-          
-          echo ""
-          echo "======================================================"
-          echo "Vanilla PyPA Base Images:"
-          echo "======================================================"
-          for image in import/python-build/manylinux_2_34_x86_64 import/python-build/manylinux_2_34_aarch64 import/python-build/manylinux_2_28_x86_64 import/python-build/manylinux_2_28_aarch64 import/python-build/musllinux_1_2_x86_64 import/python-build/musllinux_1_2_aarch64; do
+          TOKEN=$(python3 - "$OWNER" <<'PY'
+          import os, sys, time, json
+          import jwt, requests
+
+          owner = sys.argv[1]
+          app_id = os.environ["GHCR_APP_ID"].strip()
+          pem = os.environ["GHCR_APP_PEM"]
+          inst_id = os.environ.get("GHCR_APP_INSTALLATION_ID", "").strip()
+
+          now = int(time.time())
+          assertion = jwt.encode(
+              {"iat": now - 60, "exp": now + 540, "iss": app_id},
+              pem, algorithm="RS256")
+          h = {"Authorization": f"Bearer {assertion}",
+               "Accept": "application/vnd.github+json"}
+
+          app = requests.get("https://api.github.com/app", headers=h)
+          app.raise_for_status()
+          sys.stderr.write(f"APP slug={app.json().get('slug')} "
+                           f"default_perms={app.json().get('permissions')}\n")
+
+          if not inst_id:
+              insts = requests.get("https://api.github.com/app/installations", headers=h)
+              insts.raise_for_status()
+              sys.stderr.write("Installations visible to this App:\n")
+              for i in insts.json():
+                  acct = i["account"]["login"]
+                  sys.stderr.write(f"  install_id={i['id']} account={acct} "
+                                   f"packages={i['permissions'].get('packages')}\n")
+                  if acct.lower() == owner.lower():
+                      inst_id = str(i["id"])
+              if not inst_id:
+                  sys.stderr.write(f"ERROR: no installation found for owner '{owner}'\n")
+                  sys.exit(1)
+
+          r = requests.post(
+              f"https://api.github.com/app/installations/{inst_id}/access_tokens",
+              headers=h, data=json.dumps({"permissions": {"packages": "write"}}))
+          if r.status_code >= 300:
+              sys.stderr.write(f"ERROR minting token ({r.status_code}): {r.text}\n")
+              sys.exit(1)
+          body = r.json()
+          sys.stderr.write(f"GRANTED token permissions: {body.get('permissions')}\n")
+          print(body["token"])
+          PY
+          )
+
+          echo "$TOKEN" | docker login $(GHCR_REGISTRY) -u x-access-token --password-stdin
+          echo "Logged in to GHCR via GitHub App installation token."
+        displayName: 'Login to GHCR (GitHub App) + print granted permissions'
+        env:
+          GHCR_APP_ID: $(GHCR_APP_ID)
+          GHCR_APP_PEM: $(GHCR_APP_PEM)
+          GHCR_APP_INSTALLATION_ID: $(GHCR_APP_INSTALLATION_ID)
+
+    # -------------------------------------------------------------------------
+    # GHCR login via PAT (scratch / short-lived).
+    # -------------------------------------------------------------------------
+    - ${{ if eq(parameters.ghcrAuthMethod, 'pat') }}:
+      - script: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login $(GHCR_REGISTRY) -u "${{ parameters.ghcrUsername }}" --password-stdin
+          echo "Logged in to GHCR via PAT."
+        displayName: 'Login to GHCR (PAT)'
+        env:
+          GHCR_TOKEN: $(GHCR_TOKEN)
+
+    # -------------------------------------------------------------------------
+    # Mirror ACR -> GHCR. buildx imagetools copies manifest lists as-is, so
+    # multi-arch images (build/ubuntu, build/alpine) keep amd64 + arm64.
+    # -------------------------------------------------------------------------
+    - ${{ if eq(parameters.doMirror, true) }}:
+      - script: |
+          set -euo pipefail
+          FAIL=0
+          while read -r img; do
+            [ -z "$img" ] && continue
+            src="$(ACR_REGISTRY)/${img}"
+            dst="$(GHCR_NAMESPACE)/${img}"
+            echo "==> mirroring ${src} -> ${dst}"
+            if docker buildx imagetools create -t "$dst" "$src"; then
+              echo "    OK"
+            else
+              echo "    FAILED: ${src}"
+              FAIL=1
+            fi
+          done < "$(Pipeline.Workspace)/ghcr/images.txt"
+          if [ "$FAIL" -ne 0 ]; then
+            echo "One or more images failed to mirror."
+            exit 1
+          fi
+          echo "All images mirrored to GHCR."
+        displayName: 'Mirror images ACR -> GHCR'
+        retryCountOnTaskFailure: 3
+
+    # -------------------------------------------------------------------------
+    # Verify anonymous pulls. Uses an empty DOCKER_CONFIG so NO credentials are
+    # present. Succeeds only for packages whose visibility is Public.
+    # -------------------------------------------------------------------------
+    - ${{ if eq(parameters.verifyAnonymousPull, true) }}:
+      - script: |
+          set -uo pipefail
+          ANON_CFG="$(mktemp -d)"
+          echo "Pulling with empty docker config (no credentials): $ANON_CFG"
+          NOTPUBLIC=0
+          while read -r img; do
+            [ -z "$img" ] && continue
+            dst="$(GHCR_NAMESPACE)/${img}"
+            echo "==> anonymous pull ${dst}"
+            if DOCKER_CONFIG="$ANON_CFG" docker pull "$dst" >/dev/null 2>&1; then
+              echo "    PUBLIC (anonymous pull OK)"
+            else
+              echo "    NOT PUBLIC yet (set this package's visibility to Public)"
+              NOTPUBLIC=1
+            fi
+          done < "$(Pipeline.Workspace)/ghcr/images.txt"
+          if [ "$NOTPUBLIC" -ne 0 ]; then
             echo ""
-            echo "==> $image"
-            az acr repository show-tags --name $(ACR_NAME) --repository $image --output table --orderby time_desc --top 3 || echo "  (not found)"
-          done
-          
-          echo ""
-          echo "======================================================"
-          echo "Custom Images with Rust Pre-installed (Recommended):"
-          echo "======================================================"
-          for image in python-build/manylinux_2_34_x86_64_rust python-build/manylinux_2_34_aarch64_rust python-build/musllinux_1_2_x86_64_rust python-build/musllinux_1_2_aarch64_rust; do
-            echo ""
-            echo "==> $image"
-            az acr repository show-tags --name $(ACR_NAME) --repository $image --output table --orderby time_desc --top 3 || echo "  (not found)"
-          done
-          
-          echo ""
-          echo "======================================================"
-          echo "Ubuntu Build Images:"
-          echo "======================================================"
-          echo ""
-          echo "==> build/ubuntu"
-          az acr repository show-tags --name $(ACR_NAME) --repository build/ubuntu --output table --orderby time_desc --top 5 || echo "  (not found)"
-          
-          echo ""
-          echo "======================================================"
-          echo "Alpine Build Images:"
-          echo "======================================================"
-          echo ""
-          echo "==> build/alpine"
-          az acr repository show-tags --name $(ACR_NAME) --repository build/alpine --output table --orderby time_desc --top 5 || echo "  (not found)"
-          
-          echo ""
-          echo "======================================================"
-          echo "Imported Base Images:"
-          echo "======================================================"
-          for repo in import/ubuntu import/alpine import/debian import/redhat/ubi9 import/oraclelinux; do
-            echo ""
-            echo "==> $repo"
-            az acr repository show-tags --name $(ACR_NAME) --repository $repo --output table --orderby time_desc --top 5 2>/dev/null || echo "  (not found)"
-          done
+            echo "Some packages are not public. Make each package Public at:"
+            echo "  https://github.com/orgs/$(echo '${{ parameters.ghcrOrg }}' | cut -d/ -f1)/packages"
+          fi
+        displayName: 'Verify anonymous pull from GHCR'
+        continueOnError: true
 
     - script: |
-        echo ""
         echo "======================================================"
-        echo "All build images updated successfully"
+        echo "GHCR mirror validation summary"
         echo "======================================================"
+        echo "Target namespace: $(GHCR_NAMESPACE)"
+        echo "Auth method:      ${{ parameters.ghcrAuthMethod }}"
         echo ""
-        echo "Available images in ACR:"
-        echo "  Vanilla PyPA base images:"
-        echo "    - $(ACR_REGISTRY)/import/python-build/manylinux_2_34_x86_64:latest"
-        echo "    - $(ACR_REGISTRY)/import/python-build/manylinux_2_34_aarch64:latest"
-        echo "    - $(ACR_REGISTRY)/import/python-build/manylinux_2_28_x86_64:latest"
-        echo "    - $(ACR_REGISTRY)/import/python-build/manylinux_2_28_aarch64:latest"
-        echo "    - $(ACR_REGISTRY)/import/python-build/musllinux_1_2_x86_64:latest"
-        echo "    - $(ACR_REGISTRY)/import/python-build/musllinux_1_2_aarch64:latest"
-        echo ""
-        echo "  Custom images with Rust (RECOMMENDED FOR CI/CD):"
-        echo "    - $(ACR_REGISTRY)/python-build/manylinux_2_34_x86_64_rust:latest"
-        echo "    - $(ACR_REGISTRY)/python-build/manylinux_2_34_aarch64_rust:latest"
-        echo "    - $(ACR_REGISTRY)/python-build/musllinux_1_2_x86_64_rust:latest"
-        echo "    - $(ACR_REGISTRY)/python-build/musllinux_1_2_aarch64_rust:latest"
-        echo ""
-        echo "  Ubuntu build images (RECOMMENDED FOR GENERAL BUILDS):"
-        echo "    - $(ACR_REGISTRY)/build/ubuntu:22.04 (multi-arch: amd64, arm64)"
-        echo "    - $(ACR_REGISTRY)/build/ubuntu:22.04-x64"
-        echo "    - $(ACR_REGISTRY)/build/ubuntu:latest-x64"
-        echo "    - $(ACR_REGISTRY)/build/ubuntu:22.04-arm64"
-        echo "    - $(ACR_REGISTRY)/build/ubuntu:latest-arm64"
-        echo ""
-        echo "  Alpine build images (RECOMMENDED FOR MUSL/STATIC BUILDS):"
-        echo "    - $(ACR_REGISTRY)/build/alpine:3.18 (multi-arch: amd64, arm64)"
-        echo ""
-        echo "  Imported base images (from public registries):"
-        echo "    - $(ACR_REGISTRY)/import/ubuntu:22.04, 24.04"
-        echo "    - $(ACR_REGISTRY)/import/alpine:3.18, 3.19, 3.20, 3.21"
-        echo "    - $(ACR_REGISTRY)/import/debian:bookworm"
-        echo "    - $(ACR_REGISTRY)/import/redhat/ubi9:latest"
-        echo "    - $(ACR_REGISTRY)/import/oraclelinux:9"
-        echo ""
-        echo "Next scheduled build: Next Monday at 3:00 AM UTC"
+        echo "Mirrored images:"
+        sed 's#^#  $(GHCR_NAMESPACE)/#' "$(Pipeline.Workspace)/ghcr/images.txt"
       displayName: 'Summary'
