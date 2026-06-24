@@ -391,16 +391,16 @@ stages:
         artifactName: 'Build_Linux'
         matrix:
           Alpine3_18:
-            container: tdslibrs.azurecr.io/import/alpine:3.18
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
             entry: alpine.sh
           Alpine3_19:
-            container: tdslibrs.azurecr.io/import/alpine:3.19
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
             entry: alpine.sh
           Alpine3_20:
-            container: tdslibrs.azurecr.io/import/alpine:3.20
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
             entry: alpine.sh
           Alpine3_21:
-            container: tdslibrs.azurecr.io/import/alpine:3.21
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
             entry: alpine.sh
 
 - stage: Test_alpine_arm64
@@ -416,16 +416,16 @@ stages:
         poolImageOverride: imageOverride -equals RUST-UBUNTU-ARM64
         matrix:
           Alpine3_18:
-            container: tdslibrs.azurecr.io/import/alpine:3.18
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
             entry: alpine.sh
           Alpine3_19:
-            container: tdslibrs.azurecr.io/import/alpine:3.19
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
             entry: alpine.sh
           Alpine3_20:
-            container: tdslibrs.azurecr.io/import/alpine:3.20
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
             entry: alpine.sh
           Alpine3_21:
-            container: tdslibrs.azurecr.io/import/alpine:3.21
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
             entry: alpine.sh
 
 - stage: Test_amd64
@@ -438,25 +438,25 @@ stages:
       parameters:
         matrix:
           DebianBookworm:
-            container: tdslibrs.azurecr.io/import/debian:bookworm
+            container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
             entry: deb-bookworm.sh
           AzLinux3:
             container: mcr.microsoft.com/azurelinux/base/core:3.0
             entry: azlinux3.sh
           RHEL9:
-            container: tdslibrs.azurecr.io/import/redhat/ubi9:latest
+            container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi9:latest
             entry: rhel.sh
           OracleLinux9:
-            container: tdslibrs.azurecr.io/import/oraclelinux:9
+            container: ghcr.io/microsoft/mssql-rs/import/oraclelinux:9
             entry: rhel.sh
           SLES15:
             container: registry.suse.com/suse/sle15
             entry: sles.sh
           Ubuntu22:
-            container: tdslibrs.azurecr.io/import/ubuntu:22.04
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
             entry: deb-bookworm.sh
           Ubuntu24:
-            container: tdslibrs.azurecr.io/import/ubuntu:24.04
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
             entry: deb-bookworm.sh
 
 
@@ -470,25 +470,25 @@ stages:
       parameters:
         matrix:
           DebianBookworm:
-            container: tdslibrs.azurecr.io/import/debian:bookworm
+            container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
             entry: deb-bookworm.sh
           AzLinux3:
             container: mcr.microsoft.com/azurelinux/base/core:3.0
             entry: azlinux3.sh
           RHEL9:
-            container: tdslibrs.azurecr.io/import/redhat/ubi9:latest
+            container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi9:latest
             entry: rhel.sh
           OracleLinux9:
-            container: tdslibrs.azurecr.io/import/oraclelinux:9
+            container: ghcr.io/microsoft/mssql-rs/import/oraclelinux:9
             entry: rhel.sh
           SLES15:
             container: registry.suse.com/suse/sle15
             entry: sles.sh
           Ubuntu22:
-            container: tdslibrs.azurecr.io/import/ubuntu:22.04
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
             entry: deb-bookworm.sh
           Ubuntu24:
-            container: tdslibrs.azurecr.io/import/ubuntu:24.04
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
             entry: deb-bookworm.sh
 
 - ${{ if eq(parameters.includeInfraStages, true) }}:

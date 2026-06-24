@@ -29,7 +29,6 @@ jobs:
         parameters:
           installAzCli: true
           installDocker: true  
-      - template: azure-cli-login-template.yml
 
       - script: |
           echo $(container)

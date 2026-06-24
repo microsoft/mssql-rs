@@ -22,7 +22,6 @@ jobs:
         parameters:
           installAzCli: true
           installDocker: true
-      - template: azure-cli-login-template.yml
 
       - task: DownloadPipelineArtifact@2
         inputs:
@@ -30,7 +29,6 @@ jobs:
           artifactName: 'Build_Linux_ARM'
         displayName: 'Download Pipeline Artifacts'
       - script: |
-          az acr login -n tdslibrs
           echo $(container)
           echo $(entry)
           echo $container

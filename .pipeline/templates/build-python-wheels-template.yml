@@ -24,10 +24,6 @@ parameters:
   displayName: 'Publish wheel artifacts (disable for OneBranch pipeline)'
 
 steps:
-# Login to Azure Container Registry for container-based builds
-- ${{ if or(eq(parameters.osType, 'Linux'), eq(parameters.osType, 'Alpine')) }}:
-  - template: azure-cli-login-template.yml
-
 # Container-based builds for Linux (glibc - manylinux)
 - ${{ if eq(parameters.osType, 'Linux') }}:
   - script: |
@@ -36,9 +32,9 @@ steps:
       # Determine container image based on architecture
       # Using pre-built images with Rust and maturin pre-installed for faster builds
       if [ "${{ parameters.architecture }}" = "x64" ]; then
-        CONTAINER_IMAGE="tdslibrs.azurecr.io/python-build/manylinux_2_34_x86_64_rust:latest"
+        CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest"
       elif [ "${{ parameters.architecture }}" = "ARM64" ] || [ "${{ parameters.architecture }}" = "arm64" ]; then
-        CONTAINER_IMAGE="tdslibrs.azurecr.io/python-build/manylinux_2_34_aarch64_rust:latest"
+        CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest"
       else
         echo "ERROR: Unsupported architecture: ${{ parameters.architecture }}"
         exit 1
@@ -124,9 +120,9 @@ steps:
       # Determine container image based on architecture
       # Using pre-built images with Rust and maturin pre-installed for faster builds
       if [ "${{ parameters.architecture }}" = "x64" ]; then
-        CONTAINER_IMAGE="tdslibrs.azurecr.io/python-build/musllinux_1_2_x86_64_rust:latest"
+        CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest"
       elif [ "${{ parameters.architecture }}" = "ARM64" ] || [ "${{ parameters.architecture }}" = "arm64" ]; then
-        CONTAINER_IMAGE="tdslibrs.azurecr.io/python-build/musllinux_1_2_aarch64_rust:latest"
+        CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest"
       else
         echo "ERROR: Unsupported architecture: ${{ parameters.architecture }}"
         exit 1

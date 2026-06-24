@@ -17,17 +17,10 @@ steps:
     installAzCli: false
     installDocker: true
 
-- template: azure-cli-login-template.yml
-
-- task: AzureCLI@2
-  displayName: Login to ACR and pull build image
-  inputs:
-    azureSubscription: 'ACR-Tdslibrs'
-    scriptType: 'bash'
-    scriptLocation: 'inlineScript'
-    inlineScript: |
-      az acr login --name tdslibrs
-      docker pull tdslibrs.azurecr.io/build/ubuntu:22.04
+- script: |
+    set -euo pipefail
+    docker pull ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04
+  displayName: Pull build image
 
 - script: |
     set -euo pipefail
@@ -106,7 +99,7 @@ steps:
 
 # Run test-python.sh --mssql-python (builds ddbc + py-core, runs tests)
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     # Build connection string for mssql-python tests (expects DB_CONNECTION_STRING env var)
     # Format matches mssql-python's pr-validation-pipeline.yml: Uid/Pwd (not User Id/Password)
@@ -152,7 +145,7 @@ steps:
 
 # Build wheel artifact (reuse already-built .so files from test step)
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     docker run --rm \
       -v $PWD:/workspace \

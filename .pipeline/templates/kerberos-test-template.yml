@@ -75,18 +75,11 @@ jobs:
           installAzCli: true
           installDocker: true
       
-      - template: azure-cli-login-template.yml
-
-      - task: AzureCLI@2
-        displayName: 'Login to ACR and pull images'
-        inputs:
-          azureSubscription: 'ACR-Tdslibrs'
-          scriptType: 'bash'
-          scriptLocation: 'inlineScript'
-          inlineScript: |
-            az acr login -n tdslibrs
-            # Pull base images needed for Kerberos tests
-            docker pull tdslibrs.azurecr.io/import/debian:bookworm
+      - script: |
+          set -euo pipefail
+          # Pull base images needed for Kerberos tests
+          docker pull ghcr.io/microsoft/mssql-rs/import/debian:bookworm
+        displayName: 'Pull base images'
 
       # Download nextest archives (for --archive mode)
       # Both glibc and musl archives are in Build_Linux artifact

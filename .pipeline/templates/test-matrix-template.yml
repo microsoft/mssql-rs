@@ -21,15 +21,12 @@ jobs:
       - template: install-ubuntu-dependency.yaml
         parameters:
           installAzCli: true
-      - template: azure-cli-login-template.yml
-
       - task: DownloadPipelineArtifact@2
         inputs:
           buildType: 'current'
           artifactName: 'Build_Linux'
         displayName: 'Download Pipeline Artifacts'
       - script: |
-          az acr login -n tdslibrs
           echo $(container)
           echo $(entry)
           echo $container
