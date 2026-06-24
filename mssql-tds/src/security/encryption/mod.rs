@@ -15,3 +15,4 @@ mod cell;
 pub(crate) use aead_aes_256_cbc_hmac_sha256::{AeadAes256CbcHmacSha256, ColumnEncryptionType};
 #[allow(unused_imports)]
 pub(crate) use cell::decrypt_cell;
+pub(crate) use cell::encrypt_parameter;

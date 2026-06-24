@@ -40,8 +40,10 @@ use crate::datatypes::column_values::{
 use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sql_string::{EncodingType, SqlString};
 use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo, TypeInfoVariant, is_unicode_type};
+use crate::datatypes::sqltypes::SqlType;
 use crate::error::Error;
 use crate::query::metadata::CryptoMetadata;
+use crate::security::encryption::ColumnEncryptionType;
 
 /// Cipher algorithm id for `AEAD_AES_256_CBC_HMAC_SHA256`.
 const AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID: u8 = 0x01;
@@ -432,6 +434,203 @@ fn read_datetime(bytes: &[u8]) -> TdsResult<SqlDateTime> {
     let days = i32::from_le_bytes(bytes[0..4].try_into().expect("slice is exactly 4 bytes"));
     let time = u32::from_le_bytes(bytes[4..8].try_into().expect("slice is exactly 4 bytes"));
     Ok(SqlDateTime { days, time })
+}
+
+/// Encrypts a plaintext parameter value for Always Encrypted.
+///
+/// Normalizes `value` into the canonical plaintext byte form, then encrypts it
+/// with the column encryption key using `AEAD_AES_256_CBC_HMAC_SHA256`.
+/// Returns `Ok(None)` when the parameter value is SQL `NULL` (a NULL parameter
+/// is sent with no ciphertext).
+///
+/// # Errors
+///
+/// Returns [`Error::ColumnEncryptionError`] if the cipher algorithm, encryption
+/// type, or normalization rule version is unsupported, if the value's type is
+/// not normalizable, or if encryption fails.
+pub(crate) fn encrypt_parameter(
+    value: &SqlType,
+    plaintext_cek: &[u8],
+    cipher_algorithm_id: u8,
+    encryption_type: u8,
+    normalization_rule_version: u8,
+) -> TdsResult<Option<Vec<u8>>> {
+    if cipher_algorithm_id != AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID {
+        return Err(Error::ColumnEncryptionError(format!(
+            "Unsupported parameter cipher algorithm id {cipher_algorithm_id:#04x} (expected \
+             {AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID:#04x})"
+        )));
+    }
+    if normalization_rule_version != SUPPORTED_NORMALIZATION_VERSION {
+        return Err(Error::ColumnEncryptionError(format!(
+            "Unsupported Always Encrypted normalization rule version {normalization_rule_version} \
+             (expected {SUPPORTED_NORMALIZATION_VERSION})"
+        )));
+    }
+
+    let column_encryption_type = match encryption_type {
+        1 => ColumnEncryptionType::Deterministic,
+        2 => ColumnEncryptionType::Randomized,
+        other => {
+            return Err(Error::ColumnEncryptionError(format!(
+                "Unsupported Always Encrypted encryption type {other} (expected 1 or 2)"
+            )));
+        }
+    };
+
+    let Some(normalized) = normalize(value)? else {
+        return Ok(None);
+    };
+
+    let cipher = AeadAes256CbcHmacSha256::new(plaintext_cek)?;
+    Ok(Some(cipher.encrypt(&normalized, column_encryption_type)?))
+}
+
+/// Normalizes a plaintext parameter value into the canonical byte form that
+/// SQL Server encrypts (the inverse of [`denormalize`]).
+///
+/// Returns `Ok(None)` when the value is SQL `NULL`.
+pub(crate) fn normalize(value: &SqlType) -> TdsResult<Option<Vec<u8>>> {
+    let bytes = match value {
+        // Integer family: an 8-byte little-endian bigint.
+        SqlType::Bit(v) => v.map(|b| i64::from(b).to_le_bytes().to_vec()),
+        SqlType::TinyInt(v) => v.map(|n| i64::from(n).to_le_bytes().to_vec()),
+        SqlType::SmallInt(v) => v.map(|n| i64::from(n).to_le_bytes().to_vec()),
+        SqlType::Int(v) => v.map(|n| i64::from(n).to_le_bytes().to_vec()),
+        SqlType::BigInt(v) => v.map(|n| n.to_le_bytes().to_vec()),
+
+        // Floating point: native IEEE form.
+        SqlType::Real(v) => v.map(|f| f.to_le_bytes().to_vec()),
+        SqlType::Float(v) => v.map(|f| f.to_le_bytes().to_vec()),
+
+        // Money: the 8-byte money form (high dword then low dword).
+        SqlType::Money(v) => v.as_ref().map(normalize_money),
+        SqlType::SmallMoney(v) => v.as_ref().map(normalize_small_money),
+
+        // Decimal/numeric: sign byte followed by the little-endian magnitude.
+        SqlType::Decimal(v) | SqlType::Numeric(v) => v.as_ref().map(normalize_decimal),
+
+        // uniqueidentifier: 16 little-endian bytes.
+        SqlType::Uuid(v) => v.map(|u| u.to_bytes_le().to_vec()),
+
+        // Binary: raw bytes.
+        SqlType::Binary(v, _) | SqlType::VarBinary(v, _) | SqlType::VarBinaryMax(v) => v.clone(),
+
+        // Character types: the already-encoded bytes (UTF-16LE for `n` types,
+        // the collation code page otherwise).
+        SqlType::NVarchar(v, _)
+        | SqlType::NVarcharMax(v)
+        | SqlType::NChar(v, _)
+        | SqlType::NText(v)
+        | SqlType::Varchar(v, _)
+        | SqlType::VarcharMax(v)
+        | SqlType::Char(v, _)
+        | SqlType::Text(v) => v.as_ref().map(|s| s.bytes.clone()),
+
+        // Temporal types: the row-value layout (without the length prefix).
+        SqlType::Date(v) => v.as_ref().map(normalize_date),
+        SqlType::Time(v) => return v.as_ref().map(normalize_time).transpose(),
+        SqlType::DateTime2(v) => return v.as_ref().map(normalize_datetime2).transpose(),
+        SqlType::DateTimeOffset(v) => {
+            return v.as_ref().map(normalize_datetime_offset).transpose();
+        }
+        SqlType::SmallDateTime(v) => v.as_ref().map(normalize_small_datetime),
+        SqlType::DateTime(v) => v.as_ref().map(normalize_datetime),
+
+        other => {
+            return Err(Error::ColumnEncryptionError(format!(
+                "Always Encrypted normalization is not implemented for parameter type {other:?}"
+            )));
+        }
+    };
+    Ok(bytes)
+}
+
+/// Normalizes a `money` value to the 8-byte form (high dword then low dword).
+fn normalize_money(m: &SqlMoney) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&m.msb_part.to_le_bytes());
+    out.extend_from_slice(&m.lsb_part.to_le_bytes());
+    out
+}
+
+/// Normalizes a `smallmoney` value to the 8-byte money form (value in low dword).
+fn normalize_small_money(m: &SqlSmallMoney) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&0i32.to_le_bytes());
+    out.extend_from_slice(&m.int_val.to_le_bytes());
+    out
+}
+
+/// Normalizes a `decimal`/`numeric` value: a sign byte (`1` = positive) followed
+/// by the little-endian magnitude in 32-bit groups.
+fn normalize_decimal(d: &DecimalParts) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + d.int_parts.len() * 4);
+    out.push(u8::from(d.is_positive));
+    for part in &d.int_parts {
+        out.extend_from_slice(&part.to_le_bytes());
+    }
+    out
+}
+
+/// Returns the on-wire byte width of a `time(scale)` value.
+fn time_byte_width(scale: u8) -> usize {
+    match scale {
+        0..=2 => 3,
+        3..=4 => 4,
+        _ => 5,
+    }
+}
+
+/// Normalizes a `date` value to a 3-byte little-endian day count.
+fn normalize_date(d: &SqlDate) -> Vec<u8> {
+    d.get_days().to_le_bytes()[..3].to_vec()
+}
+
+/// Normalizes a `time(scale)` value to its 3/4/5-byte scaled form.
+fn normalize_time(t: &SqlTime) -> TdsResult<Vec<u8>> {
+    let scale = t.scale;
+    if scale > 7 {
+        return Err(Error::ColumnEncryptionError(format!(
+            "Invalid time scale {scale} (expected 0..=7)"
+        )));
+    }
+    let multiplier = 10u64.pow(u32::from(7 - scale));
+    let scaled = t.time_nanoseconds / multiplier;
+    Ok(scaled.to_le_bytes()[..time_byte_width(scale)].to_vec())
+}
+
+/// Normalizes a `datetime2(scale)` value: the time component followed by the
+/// 3-byte date.
+fn normalize_datetime2(dt: &SqlDateTime2) -> TdsResult<Vec<u8>> {
+    let mut out = normalize_time(&dt.time)?;
+    out.extend_from_slice(&dt.days.to_le_bytes()[..3]);
+    Ok(out)
+}
+
+/// Normalizes a `datetimeoffset(scale)` value: the `datetime2` form followed by
+/// a 2-byte signed UTC offset in minutes.
+fn normalize_datetime_offset(dto: &SqlDateTimeOffset) -> TdsResult<Vec<u8>> {
+    let mut out = normalize_datetime2(&dto.datetime2)?;
+    out.extend_from_slice(&dto.offset.to_le_bytes());
+    Ok(out)
+}
+
+/// Normalizes a `smalldatetime` value: 2-byte day count and 2-byte minute count.
+fn normalize_small_datetime(sdt: &SqlSmallDateTime) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4);
+    out.extend_from_slice(&sdt.days.to_le_bytes());
+    out.extend_from_slice(&sdt.time.to_le_bytes());
+    out
+}
+
+/// Normalizes a legacy `datetime` value: 4-byte signed day count and 4-byte
+/// tick count.
+fn normalize_datetime(dt: &SqlDateTime) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&dt.days.to_le_bytes());
+    out.extend_from_slice(&dt.time.to_le_bytes());
+    out
 }
 
 #[cfg(test)]
@@ -827,6 +1026,161 @@ mod tests {
                 days: 45_000,
                 time: 720,
             })
+        );
+    }
+
+    #[test]
+    fn normalize_integer_is_8_byte_bigint() {
+        assert_eq!(
+            normalize(&SqlType::Int(Some(1234))).unwrap().unwrap(),
+            1234i64.to_le_bytes().to_vec()
+        );
+        assert_eq!(
+            normalize(&SqlType::TinyInt(Some(200))).unwrap().unwrap(),
+            200i64.to_le_bytes().to_vec()
+        );
+        assert_eq!(
+            normalize(&SqlType::Bit(Some(true))).unwrap().unwrap(),
+            1i64.to_le_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn normalize_null_returns_none() {
+        assert!(normalize(&SqlType::Int(None)).unwrap().is_none());
+        assert!(normalize(&SqlType::NVarcharMax(None)).unwrap().is_none());
+    }
+
+    #[test]
+    fn normalize_string_keeps_encoded_bytes() {
+        let s = SqlString::from_utf8_string("hi".to_string());
+        let expected = s.bytes.clone();
+        let normalized = normalize(&SqlType::NVarchar(Some(s), 10)).unwrap().unwrap();
+        assert_eq!(normalized, expected);
+    }
+
+    #[test]
+    fn normalize_money_layout() {
+        let m = SqlMoney {
+            msb_part: 1,
+            lsb_part: 2,
+        };
+        let mut expected = 1i32.to_le_bytes().to_vec();
+        expected.extend_from_slice(&2i32.to_le_bytes());
+        assert_eq!(
+            normalize(&SqlType::Money(Some(m))).unwrap().unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn normalize_decimal_layout() {
+        let d = DecimalParts {
+            is_positive: false,
+            scale: 2,
+            precision: 10,
+            int_parts: vec![1, 2],
+        };
+        let mut expected = vec![0u8];
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.extend_from_slice(&2i32.to_le_bytes());
+        assert_eq!(
+            normalize(&SqlType::Decimal(Some(d))).unwrap().unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn encrypt_parameter_null_returns_none() {
+        assert!(
+            encrypt_parameter(&SqlType::Int(None), &CEK, 1, 1, 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn encrypt_parameter_rejects_unknown_algorithm() {
+        let error = encrypt_parameter(&SqlType::Int(Some(1)), &CEK, 0, 1, 1).unwrap_err();
+        assert!(matches!(error, Error::ColumnEncryptionError(_)));
+    }
+
+    #[test]
+    fn encrypt_parameter_rejects_unknown_encryption_type() {
+        let error = encrypt_parameter(&SqlType::Int(Some(1)), &CEK, 1, 9, 1).unwrap_err();
+        assert!(matches!(error, Error::ColumnEncryptionError(_)));
+    }
+
+    #[test]
+    fn encrypt_parameter_roundtrip_int() {
+        let cipher = encrypt_parameter(&SqlType::Int(Some(987654)), &CEK, 1, 2, 1)
+            .unwrap()
+            .unwrap();
+        let info = type_info(
+            TdsDataType::IntN,
+            4,
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+        );
+        let mut meta = crypto(TdsDataType::IntN, info);
+        meta.encryption_type = 2;
+        assert_eq!(
+            decrypt_cell(&meta, &CEK, &cipher).unwrap(),
+            ColumnValues::Int(987654)
+        );
+    }
+
+    #[test]
+    fn encrypt_parameter_roundtrip_binary() {
+        let cipher = encrypt_parameter(&SqlType::VarBinary(Some(vec![9, 8, 7]), 10), &CEK, 1, 2, 1)
+            .unwrap()
+            .unwrap();
+        let info = type_info(
+            TdsDataType::BigVarBinary,
+            10,
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+        );
+        let mut meta = crypto(TdsDataType::BigVarBinary, info);
+        meta.encryption_type = 2;
+        assert_eq!(
+            decrypt_cell(&meta, &CEK, &cipher).unwrap(),
+            ColumnValues::Bytes(vec![9, 8, 7])
+        );
+    }
+
+    #[test]
+    fn encrypt_parameter_roundtrip_guid() {
+        let value = uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        let cipher = encrypt_parameter(&SqlType::Uuid(Some(value)), &CEK, 1, 1, 1)
+            .unwrap()
+            .unwrap();
+        let info = type_info(
+            TdsDataType::Guid,
+            16,
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+        );
+        let meta = crypto(TdsDataType::Guid, info);
+        assert_eq!(
+            decrypt_cell(&meta, &CEK, &cipher).unwrap(),
+            ColumnValues::Uuid(value)
+        );
+    }
+
+    #[test]
+    fn encrypt_parameter_roundtrip_date() {
+        let date = SqlDate::unchecked_create(739_251);
+        let cipher = encrypt_parameter(&SqlType::Date(Some(date)), &CEK, 1, 2, 1)
+            .unwrap()
+            .unwrap();
+        let info = type_info(
+            TdsDataType::DateN,
+            3,
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+        );
+        let mut meta = crypto(TdsDataType::DateN, info);
+        meta.encryption_type = 2;
+        assert_eq!(
+            decrypt_cell(&meta, &CEK, &cipher).unwrap(),
+            ColumnValues::Date(SqlDate::unchecked_create(739_251))
         );
     }
 }

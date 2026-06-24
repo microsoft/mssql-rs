@@ -564,10 +564,11 @@ impl TdsClient {
     /// - `named_params` — parameter values. Build with [`RpcParameter::new`].
     /// - `timeout_sec` / `cancel_handle` — see [`execute()`](Self::execute).
     #[instrument(skip(self, named_params), level = "info")]
+    #[cfg_attr(not(feature = "column-encryption"), allow(unused_mut))]
     pub async fn execute_sp_executesql(
         &mut self,
         sql: String,
-        named_params: Vec<RpcParameter>,
+        mut named_params: Vec<RpcParameter>,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
@@ -595,6 +596,25 @@ impl TdsClient {
         let mut params_list_as_string = String::new();
 
         build_parameter_list_string(&named_params, &mut params_list_as_string)?;
+
+        // Always Encrypted: when the connection enabled column encryption and the
+        // server acknowledged the feature, ask the server which parameters need
+        // encryption and encrypt them in place before sending the real RPC.
+        #[cfg(feature = "column-encryption")]
+        if self.should_encrypt_parameters() && !named_params.is_empty() {
+            self.encrypt_parameters(
+                &sql,
+                &params_list_as_string,
+                &mut named_params,
+                timeout_sec,
+                cancel_handle,
+            )
+            .await?;
+            // The describe round-trip closes its own batch, which clears the
+            // per-operation timeout/cancel state; restore it for the real RPC.
+            self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+            self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        }
 
         let params_as_sql_string = SqlType::NVarcharMax(Some(SqlString::from_utf8_string(
             params_list_as_string.clone(),
@@ -1489,6 +1509,196 @@ impl TdsClient {
         } else {
             Ok(None)
         }
+    }
+
+    /// Returns `true` when transparent parameter encryption should be attempted:
+    /// the connection requested Always Encrypted and the server acknowledged the
+    /// feature during login.
+    #[cfg(feature = "column-encryption")]
+    fn should_encrypt_parameters(&self) -> bool {
+        use crate::connection::client_context::ColumnEncryptionSetting;
+
+        let enabled = self
+            .recovery_context
+            .client_context
+            .as_ref()
+            .map(|c| c.column_encryption_setting == ColumnEncryptionSetting::Enabled)
+            .unwrap_or(false);
+        enabled && self.negotiated_settings.is_column_encryption_supported()
+    }
+
+    /// Calls `sp_describe_parameter_encryption` for the given statement and
+    /// parameter declaration, parsing the two result sets into a
+    /// [`DescribeParameterEncryptionResult`](crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult).
+    ///
+    /// The first result set carries the CEK table (keyed by ordinal); the second
+    /// describes, per parameter, whether and how it must be encrypted.
+    #[cfg(feature = "column-encryption")]
+    async fn describe_parameter_encryption(
+        &mut self,
+        tsql: &str,
+        params_decl: &str,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult>
+    {
+        use crate::security::describe_parameter_encryption::{
+            DescribeParameterEncryptionResult, accumulate_cek_entry, parse_parameter_info,
+        };
+
+        self.transport.reset_reader();
+        let database_collation = self.negotiated_settings.database_collation;
+
+        let tsql_param = RpcParameter::new(
+            Some("@tsql".to_string()),
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(tsql.to_string()))),
+        );
+        let params_param = RpcParameter::new(
+            Some("@params".to_string()),
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_decl.to_string()))),
+        );
+
+        let rpc = SqlRpc::new(
+            RpcType::Named("sp_describe_parameter_encryption".to_string()),
+            None,
+            Some(vec![tsql_param, params_param]),
+            &database_collation,
+            &self.execution_context,
+        );
+        let mut packet_writer =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut packet_writer).await?;
+
+        let mut result = DescribeParameterEncryptionResult::new();
+
+        // Result set 1: CEK table metadata.
+        match self.move_to_column_metadata().await? {
+            Some(metadata) => {
+                self.current_metadata = Some(metadata);
+                self.execution_context.set_has_open_batch(true);
+                self.current_result_set_has_been_read_till_end = false;
+            }
+            None => {
+                self.execution_context.set_has_open_batch(false);
+                self.current_metadata = None;
+                self.current_result_set_has_been_read_till_end = true;
+                return Err(crate::error::Error::ColumnEncryptionError(
+                    "sp_describe_parameter_encryption returned no result sets".to_string(),
+                ));
+            }
+        }
+        while let Some(row) = self.get_next_row().await? {
+            accumulate_cek_entry(&mut result.cek_entries, &row)?;
+        }
+
+        // Result set 2: per-parameter encryption info.
+        if self.move_to_next().await? {
+            while let Some(row) = self.get_next_row().await? {
+                result.parameters.push(parse_parameter_info(&row)?);
+            }
+        }
+
+        self.close_query().await?;
+        Ok(result)
+    }
+
+    /// Encrypts, in place, the parameters that `sp_describe_parameter_encryption`
+    /// reports as requiring encryption: each flagged parameter's CEK is unwrapped
+    /// through the registered key store providers, its plaintext value is
+    /// normalized and encrypted, and the resulting ciphertext plus cipher
+    /// metadata are stored on the [`RpcParameter`] for serialization.
+    #[cfg(feature = "column-encryption")]
+    async fn encrypt_parameters(
+        &mut self,
+        sql: &str,
+        params_decl: &str,
+        named_params: &mut [RpcParameter],
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
+        use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
+        use crate::security::encryption::encrypt_parameter;
+        use crate::security::keystore::decrypt_cek;
+
+        let describe = self
+            .describe_parameter_encryption(sql, params_decl, timeout_sec, cancel_handle)
+            .await?;
+
+        // Nothing to do when the server reports no encrypted parameters.
+        if !describe.parameters.iter().any(|p| p.is_encrypted()) {
+            return Ok(());
+        }
+
+        let (providers, cek_cache) = {
+            let client_context =
+                self.recovery_context
+                    .client_context
+                    .as_ref()
+                    .ok_or_else(|| {
+                        crate::error::Error::ColumnEncryptionError(
+                            "Cannot encrypt parameters without a client context".to_string(),
+                        )
+                    })?;
+            (
+                client_context.column_encryption_key_store_providers.clone(),
+                client_context.cek_cache.clone(),
+            )
+        };
+
+        for info in &describe.parameters {
+            if !info.is_encrypted() {
+                continue;
+            }
+
+            let cek_entry = describe.cek_entry_for(info.cek_ordinal).ok_or_else(|| {
+                crate::error::Error::ColumnEncryptionError(format!(
+                    "sp_describe_parameter_encryption referenced unknown CEK ordinal {} for parameter {}",
+                    info.cek_ordinal, info.parameter_name
+                ))
+            })?;
+
+            let plaintext_cek = decrypt_cek(&providers, &cek_cache, cek_entry).await?;
+
+            // Parameter names are matched case-insensitively, like T-SQL identifiers.
+            let param = named_params
+                .iter_mut()
+                .find(|p| {
+                    p.name
+                        .as_deref()
+                        .map(|n| n.eq_ignore_ascii_case(&info.parameter_name))
+                        .unwrap_or(false)
+                })
+                .ok_or_else(|| {
+                    crate::error::Error::ColumnEncryptionError(format!(
+                        "sp_describe_parameter_encryption returned encryption info for unknown parameter {}",
+                        info.parameter_name
+                    ))
+                })?;
+
+            let ciphertext = encrypt_parameter(
+                param.value(),
+                plaintext_cek.as_slice(),
+                info.cipher_algorithm_id,
+                info.encryption_type,
+                info.normalization_rule_version,
+            )?;
+
+            param.set_encrypted(
+                ciphertext,
+                RpcEncryptionMetadata {
+                    cipher_algorithm_id: info.cipher_algorithm_id,
+                    encryption_type: info.encryption_type,
+                    database_id: cek_entry.database_id,
+                    cek_id: cek_entry.cek_id,
+                    cek_version: cek_entry.cek_version,
+                    cek_md_version: cek_entry.cek_md_version,
+                    normalization_rule_version: info.normalization_rule_version,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// Resolves (and memoizes) the cell decryptor for the current result set's
