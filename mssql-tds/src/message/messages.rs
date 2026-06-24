@@ -96,6 +96,19 @@ pub(crate) enum ResetConnectionMode {
     ResetSkipTran,
 }
 
+impl From<ResetConnectionMode> for u8 {
+    /// Converts a [`ResetConnectionMode`] into the TDS packet-header status bits
+    /// (RESETCONNECTION `0x08` / RESETCONNECTIONSKIPTRAN `0x10`). The two bits
+    /// are mutually exclusive (MS-TDS 2.2.3.1.2).
+    fn from(mode: ResetConnectionMode) -> Self {
+        match mode {
+            ResetConnectionMode::None => 0,
+            ResetConnectionMode::Reset => PacketStatusFlags::ResetConnection as u8,
+            ResetConnectionMode::ResetSkipTran => PacketStatusFlags::ResetConnectionSkipTran as u8,
+        }
+    }
+}
+
 #[async_trait]
 pub(crate) trait Request {
     fn packet_type(&self) -> PacketType;

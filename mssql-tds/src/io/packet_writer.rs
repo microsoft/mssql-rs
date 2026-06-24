@@ -302,11 +302,7 @@ impl<'a> PacketWriter<'a> {
         // RESETCONNECTION (0x08) and RESETCONNECTIONSKIPTRAN (0x10) are mutually
         // exclusive (MS-TDS 2.2.3.1.2); the caller guarantees this is only set
         // on the first packet of a Batch/RPC/Transaction Manager message.
-        status |= match reset_mode {
-            ResetConnectionMode::None => 0,
-            ResetConnectionMode::Reset => PacketStatusFlags::ResetConnection as u8,
-            ResetConnectionMode::ResetSkipTran => PacketStatusFlags::ResetConnectionSkipTran as u8,
-        };
+        status |= u8::from(reset_mode);
 
         let _ = WriteBytesExt::write_u8(writer, status);
 

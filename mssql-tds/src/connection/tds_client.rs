@@ -266,9 +266,7 @@ impl TdsClient {
     /// If the collation changed after login (via an ENVCHANGE token), the
     /// updated value is returned; otherwise the collation negotiated at login.
     pub fn get_collation(&self) -> SqlCollation {
-        self.execution_context
-            .current_collation()
-            .unwrap_or(self.negotiated_settings.database_collation)
+        self.negotiated_settings.database_collation
     }
 
     /// Returns the name of the database the connection is currently using.
@@ -279,9 +277,7 @@ impl TdsClient {
     /// Intended for connection-pool consumers that need to match a pooled
     /// connection to a request or decide whether a reset is required.
     pub fn database(&self) -> &str {
-        self.execution_context
-            .current_database()
-            .unwrap_or(&self.negotiated_settings.database)
+        &self.negotiated_settings.database
     }
 
     /// Returns the language the connection is currently using.
@@ -292,9 +288,7 @@ impl TdsClient {
     /// Intended for connection-pool consumers that need to match a pooled
     /// connection to a request or decide whether a reset is required.
     pub fn language(&self) -> &str {
-        self.execution_context
-            .current_language()
-            .unwrap_or(&self.negotiated_settings.language)
+        &self.negotiated_settings.language
     }
 
     /// Returns the negotiated TDS packet size, in bytes.
@@ -800,7 +794,7 @@ impl TdsClient {
                         self.recovery_context.session_state_table.reset();
                     }
                     self.execution_context
-                        .capture_change_property(&env_change)?;
+                        .capture_change_property(&env_change, &mut self.negotiated_settings)?;
                     continue;
                 }
                 Tokens::SessionState(session_state) => {
@@ -2008,7 +2002,8 @@ impl TdsClient {
                     if t1.sub_type == EnvChangeTokenSubType::ResetConnection {
                         self.recovery_context.session_state_table.reset();
                     }
-                    self.execution_context.capture_change_property(&t1)?;
+                    self.execution_context
+                        .capture_change_property(&t1, &mut self.negotiated_settings)?;
                 }
                 Tokens::SessionState(session_state) => {
                     self.recovery_context
@@ -2118,7 +2113,7 @@ impl TdsClient {
                         self.recovery_context.session_state_table.reset();
                     }
                     self.execution_context
-                        .capture_change_property(&env_change)?;
+                        .capture_change_property(&env_change, &mut self.negotiated_settings)?;
                 }
                 Tokens::SessionState(session_state) => {
                     self.recovery_context
@@ -2242,7 +2237,7 @@ impl TdsClient {
                             self.recovery_context.session_state_table.reset();
                         }
                         self.execution_context
-                            .capture_change_property(&env_change)?;
+                            .capture_change_property(&env_change, &mut self.negotiated_settings)?;
                         continue;
                     }
                     Tokens::SessionState(session_state) => {
@@ -2597,7 +2592,7 @@ impl TdsClient {
                         self.recovery_context.session_state_table.reset();
                     }
                     self.execution_context
-                        .capture_change_property(&env_change)?;
+                        .capture_change_property(&env_change, &mut self.negotiated_settings)?;
                     continue;
                 }
                 Tokens::SessionState(session_state) => {

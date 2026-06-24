@@ -91,9 +91,7 @@ impl HandlerFactory {
 pub(crate) struct NegotiatedSettings {
     pub session_settings: SessionSettings,
     pub database_collation: SqlCollation,
-    #[allow(dead_code)] // populated during login, consumed by future env-change tracking
     pub language: String,
-    #[allow(dead_code)] // populated during login, consumed by future env-change tracking
     pub database: String,
     #[allow(dead_code)] // populated during login, consumed by future env-change tracking
     pub char_set: Option<String>,
