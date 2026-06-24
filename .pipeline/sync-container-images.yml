@@ -945,9 +945,6 @@ stages:
     - script: |
         set -euo pipefail
         TOKEN="${GHCR_TOKEN:-}"
-        # Debug: never print the token, only its length and a presence summary.
-        echo "GHCR_TOKEN char length: ${#TOKEN}"
-        echo "ghcrUsername char length: ${#GHCR_USER_INPUT}"
         # Treat empty, or an unexpanded "$(...)" macro (contains '$' or '('), as
         # "not set". A real GitHub PAT only contains [A-Za-z0-9_], so these
         # patterns never match a valid token. Do NOT reference $(GHCR_TOKEN)
