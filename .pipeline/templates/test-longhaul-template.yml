@@ -27,17 +27,10 @@ steps:
     installAzCli: false
     installDocker: true
 
-- template: azure-cli-login-template.yml
-
-- task: AzureCLI@2
-  displayName: Login to ACR and pull build image
-  inputs:
-    azureSubscription: 'Magnitude Test'
-    scriptType: 'bash'
-    scriptLocation: 'inlineScript'
-    inlineScript: |
-      az acr login --name tdslibrs
-      docker pull tdslibrs.azurecr.io/build/ubuntu:22.04
+- script: |
+    set -euo pipefail
+    docker pull ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04
+  displayName: Pull build image
 
 - script: |
     set -euo pipefail
@@ -69,7 +62,7 @@ steps:
     SQL_PASSWORD: $(SQL_PASSWORD)
 
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     docker run --rm \
       --network testnet \

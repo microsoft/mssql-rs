@@ -27,9 +27,8 @@ jobs:
         displayName: 'Download Pipeline Artifacts'
       - template: install-ubuntu-dependency.yaml
         parameters:
-          installAzCli: true
+          installAzCli: false
           installDocker: true  
-      - template: azure-cli-login-template.yml
 
       - script: |
           echo $(container)

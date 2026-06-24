@@ -79,17 +79,10 @@ steps:
     df -h "$WORK_DISK"
   displayName: Relocate Docker storage to work folder disk
 
-- template: azure-cli-login-template.yml
-
-- task: AzureCLI@2
-  displayName: Login to ACR and pull build image
-  inputs:
-    azureSubscription: 'ACR-Tdslibrs'
-    scriptType: 'bash'
-    scriptLocation: 'inlineScript'
-    inlineScript: |
-      az acr login --name tdslibrs
-      docker pull tdslibrs.azurecr.io/build/ubuntu:22.04
+- script: |
+    set -euo pipefail
+    docker pull ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04
+  displayName: Pull build image
 
 - script: |
     set -euo pipefail
@@ -120,7 +113,7 @@ steps:
     SQL_PASSWORD: $(SQL_PASSWORD)
 
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     # Set IS_PR_BUILD flag
     if [ "$(Build.Reason)" = "PullRequest" ]; then
@@ -157,7 +150,7 @@ steps:
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     bash .pipeline/scripts/docker-cargo-run.sh --rm \
       -v $PWD:/workspace \
@@ -173,7 +166,7 @@ steps:
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     bash .pipeline/scripts/docker-cargo-run.sh --rm \
       -v $PWD:/workspace \
@@ -189,7 +182,7 @@ steps:
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     bash .pipeline/scripts/docker-cargo-run.sh --rm \
       --network testnet \
@@ -258,7 +251,7 @@ steps:
 
 - ${{ if eq(parameters.enableJsBuild, true) }}:
   - script: |
-      BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+      BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
       
       bash .pipeline/scripts/docker-cargo-run.sh --rm \
         -v $PWD:/workspace \
@@ -275,7 +268,7 @@ steps:
 
 - ${{ if eq(parameters.enableJsTest, true) }}:
   - script: |
-      BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+      BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
       
       bash .pipeline/scripts/docker-cargo-run.sh --rm \
         --network testnet \
@@ -303,7 +296,7 @@ steps:
       testRunTitle: $(System.PhaseName)-Js
 
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     bash .pipeline/scripts/docker-cargo-run.sh --rm \
       --network testnet \
