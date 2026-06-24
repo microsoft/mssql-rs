@@ -81,16 +81,11 @@ parameters:
   default: true
 
 # GitHub Container Registry (GHCR) mirror.
-# Provide a GitHub PAT with write:packages to also publish the images to GHCR so
-# the PR/validation pipeline can pull them anonymously (once the packages are
-# made Public). Leave ghcrPat empty to SKIP the GHCR sync entirely.
-- name: ghcrPat
-  displayName: 'GitHub PAT (write:packages) — leave EMPTY to skip GHCR sync'
-  type: string
-  default: ''
-
+# To also publish images to GHCR, define a SECRET pipeline variable named
+# GHCR_TOKEN (a GitHub PAT with write:packages), settable at queue time. If
+# GHCR_TOKEN is not set, the GHCR publish steps are skipped entirely.
 - name: ghcrUsername
-  displayName: 'GitHub username for the PAT (required only when ghcrPat is set)'
+  displayName: 'GitHub username for the PAT (required only when GHCR_TOKEN is set)'
   type: string
   default: ''
 
@@ -953,125 +948,135 @@ stages:
 
 # =============================================================================
 # STAGE 3: Mirror images to GitHub Container Registry (GHCR)
-# Only runs when a GitHub PAT (ghcrPat) is supplied. With no PAT this stage is
-# omitted entirely and nothing is synced to GHCR.
+# Gated on the queue-time SECRET variable GHCR_TOKEN (a GitHub PAT with
+# write:packages). When GHCR_TOKEN is not set, every publish step is skipped
+# and nothing is synced to GHCR.
 # Reads the freshly built/imported images from ACR and publishes them to
 # ghcr.io/<ghcrOrg>/... so the PR/validation pipeline can pull anonymously
 # (after each GHCR package is made Public).
+#
+# Setup: in the pipeline UI add a variable named GHCR_TOKEN, mark it secret and
+# "Let users override this value when running this pipeline", with an empty
+# default. Leave it blank to skip GHCR; set it at queue time to publish.
 # =============================================================================
-- ${{ if ne(parameters.ghcrPat, '') }}:
-  - stage: Mirror_To_GHCR
-    displayName: 'Mirror images to GHCR'
-    dependsOn:
-      - BuildAndPushImages
-    condition: succeeded()
-    jobs:
-    - job: MirrorImages
-      displayName: 'Mirror ACR -> GHCR'
-      timeoutInMinutes: 60
-      pool:
-        name: RUST-1ES-POOL-WUS3
-        demands:
-          - imageOverride -equals RUST-1ES-UBUSLIM
-      steps:
-      - checkout: none
+- stage: Mirror_To_GHCR
+  displayName: 'Mirror images to GHCR'
+  dependsOn:
+    - BuildAndPushImages
+  condition: succeeded()
+  jobs:
+  - job: MirrorImages
+    displayName: 'Mirror ACR -> GHCR'
+    timeoutInMinutes: 60
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - checkout: none
 
-      # Move the PAT into a masked secret variable. The token is passed via env
-      # (not inlined into the script body) so it never appears in the build log.
-      - script: |
-          set -euo pipefail
-          if [ -z "${GHCR_PAT_INPUT:-}" ]; then
-            echo "No GitHub PAT provided; skipping GHCR mirror."
+    # Detect whether the GHCR_TOKEN secret was supplied at queue time. Secret
+    # variables are not mapped into the environment automatically, so map it
+    # explicitly via env. The '$(GHCR_TOKEN)' literal guard covers the case
+    # where the variable was never defined and the macro is left unexpanded.
+    - script: |
+        set -euo pipefail
+        TOKEN="${GHCR_TOKEN:-}"
+        case "$TOKEN" in
+          ''|'$(GHCR_TOKEN)')
+            echo "GHCR_TOKEN not set; skipping GHCR publish."
             echo "##vso[task.setvariable variable=GHCR_ENABLED]false"
             exit 0
-          fi
-          if [ -z "${GHCR_USER_INPUT:-}" ]; then
-            echo "ERROR: ghcrPat was provided but ghcrUsername is empty."
-            echo "Set the 'GitHub username for the PAT' parameter and re-run."
-            exit 1
-          fi
-          echo "##vso[task.setvariable variable=GHCR_TOKEN;issecret=true]$GHCR_PAT_INPUT"
-          echo "##vso[task.setvariable variable=GHCR_ENABLED]true"
-          echo "GHCR mirror enabled for namespace: $(GHCR_NAMESPACE)"
-        displayName: 'Prepare GHCR credentials'
-        env:
-          GHCR_PAT_INPUT: ${{ parameters.ghcrPat }}
-          GHCR_USER_INPUT: ${{ parameters.ghcrUsername }}
+            ;;
+        esac
+        if [ -z "${GHCR_USER_INPUT:-}" ]; then
+          echo "ERROR: GHCR_TOKEN is set but the ghcrUsername parameter is empty."
+          echo "Set the 'GitHub username for the PAT' parameter and re-run."
+          exit 1
+        fi
+        echo "##vso[task.setvariable variable=GHCR_ENABLED]true"
+        echo "GHCR publish enabled for namespace: $(GHCR_NAMESPACE)"
+      displayName: 'Check for GHCR_TOKEN'
+      env:
+        GHCR_TOKEN: $(GHCR_TOKEN)
+        GHCR_USER_INPUT: ${{ parameters.ghcrUsername }}
 
-      - script: |
+    - script: |
+        set -euo pipefail
+        mkdir -p "$(Pipeline.Workspace)/ghcr"
+        cat > "$(Pipeline.Workspace)/ghcr/images.txt" <<'EOF'
+        python-build/manylinux_2_34_x86_64_rust:latest
+        python-build/manylinux_2_34_aarch64_rust:latest
+        python-build/musllinux_1_2_x86_64_rust:latest
+        python-build/musllinux_1_2_aarch64_rust:latest
+        build/ubuntu:22.04
+        build/alpine:3.18
+        import/debian:bookworm
+        import/alpine:3.18
+        import/alpine:3.19
+        import/alpine:3.20
+        import/alpine:3.21
+        import/ubuntu:22.04
+        import/ubuntu:24.04
+        import/redhat/ubi9:latest
+        import/oraclelinux:9
+        EOF
+        echo "Images to mirror to GHCR:"
+        sed 's/^/  /' "$(Pipeline.Workspace)/ghcr/images.txt"
+      displayName: 'Define image list'
+      condition: eq(variables['GHCR_ENABLED'], 'true')
+
+    - task: AzureCLI@2
+      displayName: 'Login to ACR (read source images)'
+      condition: eq(variables['GHCR_ENABLED'], 'true')
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
           set -euo pipefail
-          mkdir -p "$(Pipeline.Workspace)/ghcr"
-          cat > "$(Pipeline.Workspace)/ghcr/images.txt" <<'EOF'
-          python-build/manylinux_2_34_x86_64_rust:latest
-          python-build/manylinux_2_34_aarch64_rust:latest
-          python-build/musllinux_1_2_x86_64_rust:latest
-          python-build/musllinux_1_2_aarch64_rust:latest
-          build/ubuntu:22.04
-          build/alpine:3.18
-          import/debian:bookworm
-          import/alpine:3.18
-          import/alpine:3.19
-          import/alpine:3.20
-          import/alpine:3.21
-          import/ubuntu:22.04
-          import/ubuntu:24.04
-          import/redhat/ubi9:latest
-          import/oraclelinux:9
-          EOF
-          echo "Images to mirror to GHCR:"
-          sed 's/^/  /' "$(Pipeline.Workspace)/ghcr/images.txt"
-        displayName: 'Define image list'
-        condition: eq(variables['GHCR_ENABLED'], 'true')
+          az acr login --name $(ACR_NAME)
 
-      - task: AzureCLI@2
-        displayName: 'Login to ACR (read source images)'
-        condition: eq(variables['GHCR_ENABLED'], 'true')
-        inputs:
-          azureSubscription: 'Magnitude Test'
-          scriptType: 'bash'
-          scriptLocation: 'inlineScript'
-          inlineScript: |
-            set -euo pipefail
-            az acr login --name $(ACR_NAME)
+    - script: |
+        set -euo pipefail
+        echo "$GHCR_TOKEN" | docker login $(GHCR_REGISTRY) -u "${{ parameters.ghcrUsername }}" --password-stdin
+        echo "Logged in to GHCR."
+      displayName: 'Login to GHCR (PAT)'
+      condition: eq(variables['GHCR_ENABLED'], 'true')
+      env:
+        GHCR_TOKEN: $(GHCR_TOKEN)
 
-      - script: |
-          set -euo pipefail
-          echo "$(GHCR_TOKEN)" | docker login $(GHCR_REGISTRY) -u "${{ parameters.ghcrUsername }}" --password-stdin
-          echo "Logged in to GHCR."
-        displayName: 'Login to GHCR (PAT)'
-        condition: eq(variables['GHCR_ENABLED'], 'true')
-
-      - script: |
-          set -euo pipefail
-          FAIL=0
-          while read -r img; do
-            [ -z "$img" ] && continue
-            src="$(ACR_REGISTRY)/${img}"
-            dst="$(GHCR_NAMESPACE)/${img}"
-            echo "==> mirroring ${src} -> ${dst}"
-            if docker buildx imagetools create -t "$dst" "$src"; then
-              echo "    OK"
-            else
-              echo "    FAILED: ${src}"
-              FAIL=1
-            fi
-          done < "$(Pipeline.Workspace)/ghcr/images.txt"
-          if [ "$FAIL" -ne 0 ]; then
-            echo "One or more images failed to mirror to GHCR."
-            exit 1
+    - script: |
+        set -euo pipefail
+        FAIL=0
+        while read -r img; do
+          [ -z "$img" ] && continue
+          src="$(ACR_REGISTRY)/${img}"
+          dst="$(GHCR_NAMESPACE)/${img}"
+          echo "==> mirroring ${src} -> ${dst}"
+          if docker buildx imagetools create -t "$dst" "$src"; then
+            echo "    OK"
+          else
+            echo "    FAILED: ${src}"
+            FAIL=1
           fi
-          echo "All images mirrored to GHCR."
-        displayName: 'Mirror images ACR -> GHCR'
-        condition: eq(variables['GHCR_ENABLED'], 'true')
-        retryCountOnTaskFailure: 3
+        done < "$(Pipeline.Workspace)/ghcr/images.txt"
+        if [ "$FAIL" -ne 0 ]; then
+          echo "One or more images failed to mirror to GHCR."
+          exit 1
+        fi
+        echo "All images mirrored to GHCR."
+      displayName: 'Mirror images ACR -> GHCR'
+      condition: eq(variables['GHCR_ENABLED'], 'true')
+      retryCountOnTaskFailure: 3
 
-      - script: |
-          echo "======================================================"
-          echo "Mirrored to GHCR namespace: $(GHCR_NAMESPACE)"
-          echo "======================================================"
-          sed 's#^#  $(GHCR_NAMESPACE)/#' "$(Pipeline.Workspace)/ghcr/images.txt"
-          echo ""
-          echo "NOTE: each GHCR package must be set to Public for anonymous pulls:"
-          echo "  https://github.com/orgs/$(echo '${{ parameters.ghcrOrg }}' | cut -d/ -f1)/packages"
-        displayName: 'GHCR summary'
-        condition: eq(variables['GHCR_ENABLED'], 'true')
+    - script: |
+        echo "======================================================"
+        echo "Mirrored to GHCR namespace: $(GHCR_NAMESPACE)"
+        echo "======================================================"
+        sed 's#^#  $(GHCR_NAMESPACE)/#' "$(Pipeline.Workspace)/ghcr/images.txt"
+        echo ""
+        echo "NOTE: each GHCR package must be set to Public for anonymous pulls:"
+        echo "  https://github.com/orgs/$(echo '${{ parameters.ghcrOrg }}' | cut -d/ -f1)/packages"
+      displayName: 'GHCR summary'
+      condition: eq(variables['GHCR_ENABLED'], 'true')
