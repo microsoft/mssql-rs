@@ -26,6 +26,20 @@ tls-schannel-direct = []
 # unconditionally — useful as an escape hatch if the rewrite needs to
 # be temporarily disabled in production.
 tls-schannel-direct-on-windows = ["tls-schannel-direct"]
+# Always Encrypted column-encryption data path. Off by default to keep the
+# cryptography crates out of builds that do not need them. Uses pure-Rust
+# RustCrypto crates (no native/system dependency), so it builds on every target
+# including default Windows (Schannel) builds. Enable to encrypt parameters and
+# decrypt encrypted result columns.
+column-encryption = [
+    "dep:aes",
+    "dep:cbc",
+    "dep:hmac",
+    "dep:sha2",
+    "dep:sha1",
+    "dep:rsa",
+    "dep:rand_core",
+]
 
 
 [lints]
@@ -58,6 +72,18 @@ x509-parser = "0.18.0"
 dns-lookup = "2.0"
 # Required to deserialize Vector(Float16) values from the TDS stream (Vector feature v2)
 half = "2.7.1"
+# AEAD_AES_256_CBC_HMAC_SHA256 cell encryption and RSA-OAEP CEK wrapping for
+# Always Encrypted. Pure-Rust RustCrypto crates, all optional and enabled only
+# via the `column-encryption` feature. Chosen over the native `openssl` crate so
+# the feature builds with no system OpenSSL on any target (notably default
+# Windows/Schannel builds, where OpenSSL is otherwise absent).
+aes = { version = "0.8", optional = true }
+cbc = { version = "0.1", features = ["alloc"], optional = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", features = ["oid"], optional = true }
+sha1 = { version = "0.10", optional = true }
+rsa = { version = "0.9", features = ["pem"], optional = true }
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 
 
 

@@ -17,6 +17,8 @@
 //! - `gssapi`: Enables Unix GSSAPI/Kerberos support
 
 mod error;
+#[cfg(feature = "column-encryption")]
+pub(crate) mod encryption;
 pub mod mock;
 mod security_context;
 mod spn;
