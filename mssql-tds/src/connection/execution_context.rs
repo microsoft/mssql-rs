@@ -180,9 +180,12 @@ impl ExecutionContext {
             EnvChangeTokenSubType::ResetConnection => {
                 // Server acknowledgement that the connection was reset to login
                 // defaults (in response to a RESETCONNECTION / RESETCONNECTIONSKIPTRAN
-                // request). It carries no property for the execution context to
-                // capture; the session-state reset is handled by the caller.
+                // request). The server does not emit individual Database/Language
+                // ENVCHANGE tokens for the revert, so restore the cached session
+                // state to the login defaults here to keep the pool-facing getters
+                // accurate.
                 info!("Connection reset acknowledged by server");
+                negotiated_settings.restore_login_defaults();
                 Ok(())
             }
             EnvChangeTokenSubType::UserInstanceName => {

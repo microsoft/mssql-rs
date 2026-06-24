@@ -938,10 +938,18 @@ impl NetworkTransport {
 
         // Keep reading until we have the complete packet in memory.
         while bytes_available < packet_size_from_header {
-            let bytes_read = stream
+            let bytes_read = match stream
                 .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
-                .await?;
+                .await
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    self.known_dead = true;
+                    return Err(e.into());
+                }
+            };
             if bytes_read == 0 {
+                self.known_dead = true;
                 return Err(crate::error::Error::ConnectionClosed(
                     "Connection closed by server while reading TDS packet payload".to_string(),
                 ));
@@ -2351,6 +2359,53 @@ pub(crate) mod tests {
 
             // Dead
             assert!(boxed.is_connection_dead());
+        }
+    }
+
+    mod payload_eof_marks_dead_tests {
+        use super::*;
+        use crate::connection::transport::tds_transport::TdsTransport;
+        use tokio::io::AsyncWriteExt;
+
+        /// A packet whose header declares more bytes than are delivered before
+        /// the peer closes the socket must mark the connection known-dead, so the
+        /// cached liveness check (`connection_known_dead`) reports it without a
+        /// fresh socket probe.
+        #[tokio::test]
+        async fn partial_packet_then_eof_sets_known_dead() {
+            let (client_side, mut server_side) = duplex(MAX_BUFFER_SIZE);
+
+            let ssl_handler = SslHandler {
+                server_host_name: "test".to_string(),
+                encryption_options: EncryptionOptions::new(),
+            };
+
+            let mut transport = NetworkTransport::new(
+                Box::new(client_side),
+                ssl_handler,
+                4096,
+                EncryptionSetting::On,
+                false,
+            );
+
+            // Send a complete 8-byte TDS header that declares a 16-byte packet,
+            // then close the writer without sending the 8-byte payload. The header
+            // loop completes; the payload loop hits EOF.
+            let header = [0x04u8, 0x01, 0x00, 0x10, 0x00, 0x00, 0x01, 0x00];
+            server_side.write_all(&header).await.unwrap();
+            server_side.flush().await.unwrap();
+            drop(server_side); // signal EOF to the reader
+
+            let result = transport.read_tds_packet().await;
+
+            assert!(
+                result.is_err(),
+                "reading a truncated packet must return an error"
+            );
+            assert!(
+                transport.connection_known_dead(),
+                "payload EOF must mark the connection known-dead"
+            );
         }
     }
 }

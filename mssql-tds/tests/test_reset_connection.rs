@@ -183,4 +183,27 @@ mod reset_connection {
         )
         .await;
     }
+
+    /// After a reset, the pool-facing session-state getters must fall back to
+    /// the login defaults. The server resets the session but does not emit
+    /// individual Database/Language ENVCHANGE tokens for the revert, so the
+    /// client restores the cached state on the ResetConnection acknowledgement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_restores_database_getter_to_login_default() {
+        let mut conn = begin_connection(&build_tcp_datasource()).await;
+        assert_eq!(conn.database(), "master");
+
+        exec_drain(&mut conn, "USE tempdb").await;
+        assert_eq!(conn.database(), "tempdb", "USE should update the getter");
+
+        conn.prepare_reset_connection(false);
+        // Run a trivial request that carries the reset bit and drain its response.
+        let _ = select_int(&mut conn, "SELECT 1").await;
+
+        assert_eq!(
+            conn.database(),
+            "master",
+            "after reset the database getter should fall back to the login default"
+        );
+    }
 }
