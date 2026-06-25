@@ -453,6 +453,17 @@ impl LoginResponseModel {
                     self.change_properties.char_set = Some(string_change.new_value().clone());
                     Ok(())
                 }
+                EnvChangeTokenSubType::DatabaseMirroringPartner => {
+                    // The server advertises the mirroring/failover partner during
+                    // login for mirrored or AlwaysOn databases. We do not act on it
+                    // yet, but it must be consumed so login can proceed.
+                    event!(
+                        Level::DEBUG,
+                        "Ignoring database mirroring partner: {:?}",
+                        string_change.new_value()
+                    );
+                    Ok(())
+                }
                 _ => {
                     event!(
                         Level::ERROR,
