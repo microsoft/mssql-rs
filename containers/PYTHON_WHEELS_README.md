@@ -18,11 +18,24 @@ All images are hosted in your Azure Container Registry (`tdslibrs.azurecr.io`) t
 ### 🚀 Pre-built Images with Rust (Recommended for CI/CD)
 These custom images extend official PyPA images with **Rust toolchain and maturin pre-installed** for faster builds.
 
-#### Linux (glibc-based - Ubuntu, RHEL, Debian, etc.)
+We maintain **two manylinux flavors** so we can ship a `.so` whose ABI honestly
+matches the wheel tag. mssql-py-core wheels are repackaged into mssql-python,
+which targets both OpenSSL 1.1 and OpenSSL 3 deployments, so we build for both:
+
+#### Linux glibc 2.28 / OpenSSL 1.1 (AlmaLinux 8 base)
+Wheel tag: `manylinux_2_28_<arch>`. Links to `libssl.so.1.1`, requires GLIBC ≤ 2.28.
+Targets RHEL 8, Ubuntu 20.04, Debian 11, Amazon Linux 2.
 - **x64**: `tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64_rust:latest`
 - **ARM64**: `tdslibrs.azurecr.io/python-build/manylinux_2_28_aarch64_rust:latest`
 
+#### Linux glibc 2.34 / OpenSSL 3 (AlmaLinux 9 base)
+Wheel tag: `manylinux_2_34_<arch>`. Links to `libssl.so.3`, requires GLIBC ≤ 2.34.
+Targets RHEL 9+, Ubuntu 22.04+, Debian 12+, Fedora 36+, Amazon Linux 2023.
+- **x64**: `tdslibrs.azurecr.io/python-build/manylinux_2_34_x86_64_rust:latest`
+- **ARM64**: `tdslibrs.azurecr.io/python-build/manylinux_2_34_aarch64_rust:latest`
+
 #### Alpine (musl-based)
+Wheel tag: `musllinux_1_2_<arch>`.
 - **x64**: `tdslibrs.azurecr.io/python-build/musllinux_1_2_x86_64_rust:latest`
 - **ARM64**: `tdslibrs.azurecr.io/python-build/musllinux_1_2_aarch64_rust:latest`
 
@@ -130,9 +143,15 @@ The Azure DevOps pipeline automatically builds wheels in containers:
 ```yaml
 - template: templates/build-python-wheels-template.yml
   parameters:
-    osType: Linux        # Linux, Alpine, or MacOS
-    architecture: x64    # x64 or ARM64
+    osType: Linux           # Linux, Alpine, MacOS, or Windows
+    architecture: x64       # x64 or ARM64
+    manylinuxFlavor: '2_28' # Only honored for osType=Linux: '2_28' or '2_34'
 ```
+
+For Linux, call the template **twice** per arch (once with `manylinuxFlavor: '2_28'`,
+once with `'2_34'`) to produce both flavors. The published artifacts include the
+flavor in their name (`wheels_Linux_<arch>_manylinux_2_28`,
+`wheels_Linux_<arch>_manylinux_2_34`) so they don't collide.
 
 **What it does**:
 1. Logs into ACR
@@ -148,7 +167,8 @@ The Azure DevOps pipeline automatically builds wheels in containers:
 
 - **Purpose**: Build portable binary wheels that work across many Linux distributions
 - **Standards**: 
-  - `manylinux_2_28`: Compatible with glibc 2.28+ (Ubuntu 20.04+, RHEL 8+, Debian 10+)
+  - `manylinux_2_28`: Compatible with glibc 2.28+ (RHEL 8, Ubuntu 20.04, Debian 11, Amazon Linux 2). Links against OpenSSL 1.1.
+  - `manylinux_2_34`: Compatible with glibc 2.34+ (RHEL 9+, Ubuntu 22.04+, Debian 12+). Links against OpenSSL 3.
   - `musllinux_1_2`: Compatible with musl 1.2+ (Alpine 3.13+)
 - **Pre-installed**: Multiple Python versions (3.8-3.14), compilers, build tools
 - **Official**: Maintained by PyPA at https://github.com/pypa/manylinux

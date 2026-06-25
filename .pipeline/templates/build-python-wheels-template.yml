@@ -22,6 +22,17 @@ parameters:
   type: boolean
   default: true
   displayName: 'Publish wheel artifacts (disable for OneBranch pipeline)'
+- name: manylinuxFlavor
+  # Which manylinux glibc/OpenSSL ABI to target. Only consumed when osType=Linux.
+  # 2_28 -> AlmaLinux 8 base, libssl.so.1.1, glibc <= 2.28 (matches mssql-python's
+  # published Linux wheel tag and the RHEL 8 / Ubuntu 20.04 / Debian 11 family).
+  # 2_34 -> AlmaLinux 9 base, libssl.so.3,   glibc <= 2.34 (RHEL 9+, Ubuntu 22.04+,
+  # Debian 12+).
+  default: '2_28'
+  type: string
+  values:
+  - '2_28'
+  - '2_34'
 
 steps:
 # Container-based builds for Linux (glibc - manylinux)
@@ -29,18 +40,23 @@ steps:
   - script: |
       set -euo pipefail
       
-      # Determine container image based on architecture
-      # Using pre-built images with Rust and maturin pre-installed for faster builds
+      MANYLINUX_FLAVOR="${{ parameters.manylinuxFlavor }}"
+
+      # Determine container image based on architecture and manylinux flavor.
+      # Using pre-built images with Rust and maturin pre-installed for faster builds.
       if [ "${{ parameters.architecture }}" = "x64" ]; then
-        CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest"
+        CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/manylinux_${MANYLINUX_FLAVOR}_x86_64_rust:latest"
+        MATURIN_COMPATIBILITY="manylinux_${MANYLINUX_FLAVOR}_x86_64"
       elif [ "${{ parameters.architecture }}" = "ARM64" ] || [ "${{ parameters.architecture }}" = "arm64" ]; then
-        CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest"
+        CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/manylinux_${MANYLINUX_FLAVOR}_aarch64_rust:latest"
+        MATURIN_COMPATIBILITY="manylinux_${MANYLINUX_FLAVOR}_aarch64"
       else
         echo "ERROR: Unsupported architecture: ${{ parameters.architecture }}"
         exit 1
       fi
       
       echo "Building Python wheels in container: $CONTAINER_IMAGE"
+      echo "Maturin compatibility tag: $MATURIN_COMPATIBILITY"
       
       mkdir -p "$(ob_outputDirectory)/wheels"
       
@@ -49,6 +65,7 @@ steps:
         -v "$(ob_outputDirectory)/wheels:/workspace/target/wheels" \
         -e "WORKSPACE_DIR=/workspace" \
         -e "OUTPUT_DIR=/workspace/target/wheels" \
+        -e "MATURIN_COMPATIBILITY=$MATURIN_COMPATIBILITY" \
         "$CONTAINER_IMAGE" \
         bash /workspace/scripts/build-python-wheels-in-container.sh
       
@@ -63,7 +80,7 @@ steps:
       fi
       echo "✅ $WHEEL_COUNT wheels built successfully!"
       ls -lh "$(ob_outputDirectory)/wheels"
-    displayName: 'Build Python wheels in manylinux container (${{ parameters.architecture }})'
+    displayName: 'Build Python wheels in manylinux_${{ parameters.manylinuxFlavor }} container (${{ parameters.architecture }})'
     env:
       CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
       CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
@@ -121,14 +138,17 @@ steps:
       # Using pre-built images with Rust and maturin pre-installed for faster builds
       if [ "${{ parameters.architecture }}" = "x64" ]; then
         CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest"
+        MATURIN_COMPATIBILITY="musllinux_1_2_x86_64"
       elif [ "${{ parameters.architecture }}" = "ARM64" ] || [ "${{ parameters.architecture }}" = "arm64" ]; then
         CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest"
+        MATURIN_COMPATIBILITY="musllinux_1_2_aarch64"
       else
         echo "ERROR: Unsupported architecture: ${{ parameters.architecture }}"
         exit 1
       fi
       
       echo "Building Python wheels in container: $CONTAINER_IMAGE"
+      echo "Maturin compatibility tag: $MATURIN_COMPATIBILITY"
       
       mkdir -p "$(ob_outputDirectory)/wheels"
       
@@ -137,6 +157,7 @@ steps:
         -v "$(ob_outputDirectory)/wheels:/workspace/target/wheels" \
         -e "WORKSPACE_DIR=/workspace" \
         -e "OUTPUT_DIR=/workspace/target/wheels" \
+        -e "MATURIN_COMPATIBILITY=$MATURIN_COMPATIBILITY" \
         "$CONTAINER_IMAGE" \
         bash /workspace/scripts/build-python-wheels-in-container.sh
       
@@ -189,11 +210,21 @@ steps:
       Get-ChildItem "$(ob_outputDirectory)\wheels" | Format-Table Name, Length
     displayName: List all wheels
 
-# Publish artifacts for CI/PR pipelines (not needed for OneBranch which uses ob_outputDirectory)
+# Publish artifacts for CI/PR pipelines (not needed for OneBranch which uses ob_outputDirectory).
+# Include the manylinux flavor in the artifact name on Linux so calling this template twice
+# per arch (once per flavor) produces two distinct artifacts instead of colliding.
 - ${{ if eq(parameters.publishArtifacts, true) }}:
-  - task: PublishPipelineArtifact@1
-    displayName: 'Publish Python wheels'
-    inputs:
-      targetPath: '$(ob_outputDirectory)/wheels'
-      artifact: 'wheels_${{ parameters.osType }}_${{ parameters.architecture }}'
-      publishLocation: 'pipeline'
+  - ${{ if eq(parameters.osType, 'Linux') }}:
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Python wheels'
+      inputs:
+        targetPath: '$(ob_outputDirectory)/wheels'
+        artifact: 'wheels_${{ parameters.osType }}_${{ parameters.architecture }}_manylinux_${{ parameters.manylinuxFlavor }}'
+        publishLocation: 'pipeline'
+  - ${{ if ne(parameters.osType, 'Linux') }}:
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Python wheels'
+      inputs:
+        targetPath: '$(ob_outputDirectory)/wheels'
+        artifact: 'wheels_${{ parameters.osType }}_${{ parameters.architecture }}'
+        publishLocation: 'pipeline'

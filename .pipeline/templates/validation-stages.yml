@@ -129,6 +129,12 @@ stages:
         parameters:
           osType: Linux
           architecture: x64
+          manylinuxFlavor: '2_28'
+      - template: build-python-wheels-template.yml
+        parameters:
+          osType: Linux
+          architecture: x64
+          manylinuxFlavor: '2_34'
       - template: build-python-wheels-template.yml
         parameters:
           osType: Alpine
@@ -166,6 +172,12 @@ stages:
         parameters:
           osType: Linux
           architecture: ARM64
+          manylinuxFlavor: '2_28'
+      - template: build-python-wheels-template.yml
+        parameters:
+          osType: Linux
+          architecture: ARM64
+          manylinuxFlavor: '2_34'
       - template: build-python-wheels-template.yml
         parameters:
           osType: Alpine

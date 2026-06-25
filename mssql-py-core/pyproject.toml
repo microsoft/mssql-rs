@@ -15,9 +15,21 @@ classifiers = [
 [tool.maturin]
 module-name = "mssql_py_core"
 # Don't vendor shared libraries (libssl, libcrypto) into the wheel.
-# Built on manylinux_2_34 (AlmaLinux 9) so the native extension links against
-# libssl.so.3 / libcrypto.so.3 and expects the OS to provide OpenSSL 3.x at runtime.
-# On macOS (Security.framework) and Windows (SChannel) there is no OpenSSL dep.
+#
+# Two manylinux flavors are built so the extension's ABI honestly matches the
+# wheel tag and so mssql-python can repackage either depending on the target
+# environment:
+#   - manylinux_2_28 (AlmaLinux 8): links libssl.so.1.1 / libcrypto.so.1.1,
+#     GLIBC <= 2.28. For RHEL 8, Ubuntu 20.04, Debian 11, Amazon Linux 2.
+#   - manylinux_2_34 (AlmaLinux 9): links libssl.so.3 / libcrypto.so.3,
+#     GLIBC <= 2.34. For RHEL 9+, Ubuntu 22.04+, Debian 12+.
+#
+# OpenSSL is intentionally a runtime OS dependency in both flavors; the host
+# is expected to provide it. The wheel filename tag is set explicitly via
+# `maturin build --compatibility manylinux_2_<N>_<arch>` from CI.
+#
+# macOS uses Security.framework and Windows uses SChannel, so neither has an
+# OpenSSL dependency.
 auditwheel = "skip"
 
 [project.optional-dependencies]
