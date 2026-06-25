@@ -1598,7 +1598,9 @@ impl TdsClient {
     #[instrument(skip(self), level = "info")]
     pub async fn next_cursor_row(&mut self) -> TdsResult<Option<(Vec<ColumnValues>, FetchStatus)>> {
         // Guard: only valid on an sp_cursorfetch result, whose last column is the
-        // hidden `rowstat`. Refuse to strip a real column from a normal result.
+        // trailing `rowstat`. The server names it `rowstat` but does NOT set the
+        // hidden flag on it, so it is identified by name. Refuse to strip a real
+        // column from a normal result.
         let has_rowstat = self
             .get_metadata()
             .last()

@@ -55,6 +55,11 @@ impl ColumnMetadata {
     pub fn is_encrypted(&self) -> bool {
         (self.flags & 0x0800) != 0x00
     }
+    /// Column is hidden (`fHidden`, bit 13 of the COLMETADATA Flags word), for
+    /// example a `FOR BROWSE` key column.
+    pub fn is_hidden(&self) -> bool {
+        (self.flags & 0x2000) != 0x00
+    }
     /// Column is a key column used in cursor operations (`fKey`, bit 14 of the
     /// COLMETADATA Flags word). A driver uses this to build positioned-update
     /// predicates (`WHERE` clauses) for updatable server cursors.
@@ -276,6 +281,17 @@ mod tests {
         let metadata =
             create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
         assert!(!metadata.is_encrypted());
+    }
+
+    #[test]
+    fn test_is_hidden() {
+        let metadata =
+            create_test_column_metadata(0x2000, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert!(metadata.is_hidden());
+
+        let metadata =
+            create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert!(!metadata.is_hidden());
     }
 
     #[test]
