@@ -92,8 +92,9 @@ stages:
                 break
 
         if matching_run:
+            matching_run_id = matching_run.get("id", "unknown")
             print(
-                f"PR head {source_commit} already validated by run {matching_run['id']}; skipping duplicate stages."
+                f"PR head {source_commit} already validated by run {matching_run_id}; skipping duplicate stages."
             )
             print("##vso[task.setvariable variable=skipDuplicate;isOutput=true]true")
         else:
@@ -107,6 +108,8 @@ stages:
 
 - stage: Build
   displayName: Build Stage
+  dependsOn:
+    - EvaluateDuplicate
   condition: and(succeeded(), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), or(ne(variables['Build.Reason'], 'PullRequest'), ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true')))
   jobs:
   - job: Build_Windows
