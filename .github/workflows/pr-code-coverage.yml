@@ -9,6 +9,14 @@ name: PR Code Coverage
 # published by that build, and runs `diff-cover` to compute coverage for the
 # lines changed in the PR. The result is posted as a sticky PR comment.
 #
+# Triggers:
+#   - Same-repo PRs run automatically on pull_request.
+#   - Forked PRs do NOT run automatically (their head code is untrusted and the
+#     pull_request token is read-only). Instead, a maintainer runs the check by
+#     commenting `/coverage` on the PR. The issue_comment event runs in the
+#     base-repo context with a write token, and we only run diff-cover over a
+#     downloaded artifact (never execute PR code), so this is safe.
+#
 # Reporting-only: diff-cover is run WITHOUT --fail-under, so this never blocks
 # a merge. It is informational.
 
@@ -16,10 +24,17 @@ on:
   pull_request:
     branches:
       - main
+  issue_comment:
+    types:
+      - created
 
 # Least-privilege default: grant no permissions at the workflow level.
 # Each job opts into only the scopes it needs.
 permissions: {}
+
+concurrency:
+  group: pr-coverage-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
 
 env:
   ADO_ORG: sqlclientdrivers
@@ -30,18 +45,36 @@ env:
 jobs:
   coverage-report:
     runs-on: ubuntu-latest
-    # Minimum scope: read the repo for checkout, write PR comments. No other
-    # GITHUB_TOKEN access is granted. Forked PRs receive a read-only token
-    # regardless and post their comment via forked-pr-coverage.yml.
+    # Run automatically for same-repo PRs; for forked PRs, only when a
+    # maintainer (write access => OWNER/MEMBER/COLLABORATOR) comments `/coverage`.
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       startsWith(github.event.comment.body, '/coverage') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    # Minimum scope: read the repo for checkout, write the PR comment.
     permissions:
       contents: read
       pull-requests: write
     # Build runs ~45 min in ADO; the artifact wait can take up to 1h15m.
     timeout-minutes: 120
     steps:
-      - name: Checkout repo
+      - name: Determine PR context
+        id: prctx
+        run: |
+          if [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            echo "pr_number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout PR head
         uses: actions/checkout@v4
         with:
+          # refs/pull/<n>/head resolves for both same-repo and forked PRs.
+          ref: refs/pull/${{ steps.prctx.outputs.pr_number }}/head
           fetch-depth: 0
 
       - name: Setup git for diff-cover
@@ -51,7 +84,7 @@ jobs:
 
       - name: Wait for ADO build to start
         run: |
-          PR_NUMBER=${{ github.event.pull_request.number }}
+          PR_NUMBER=${{ steps.prctx.outputs.pr_number }}
           API_URL="https://dev.azure.com/${ADO_ORG}/${ADO_PROJECT}/_apis/build/builds?definitions=${ADO_DEFINITION_ID}&queryOrder=queueTimeDescending&\$top=10&api-version=7.1-preview.7"
 
           echo "Waiting for Azure DevOps build to start for PR #$PR_NUMBER ..."
@@ -195,39 +228,10 @@ jobs:
             echo "PATCH_COVERAGE_SUMMARY=Patch coverage report could not be generated." >> $GITHUB_ENV
           fi
 
-      - name: Save coverage data for comment
-        run: |
-          mkdir -p coverage-comment-data
-          jq -n \
-            --arg pr_number "${{ github.event.pull_request.number }}" \
-            --arg coverage_percentage "${{ env.COVERAGE_PERCENTAGE }}" \
-            --arg patch_coverage_pct "${{ env.PATCH_COVERAGE_PCT }}" \
-            --arg patch_coverage_summary "${{ env.PATCH_COVERAGE_SUMMARY }}" \
-            --arg ado_url "${{ env.ADO_URL }}" \
-            '{
-              pr_number: $pr_number,
-              coverage_percentage: $coverage_percentage,
-              patch_coverage_pct: $patch_coverage_pct,
-              patch_coverage_summary: $patch_coverage_summary,
-              ado_url: $ado_url
-            }' > coverage-comment-data/pr-info.json
-          cat coverage-comment-data/pr-info.json
-
-      - name: Upload coverage comment data
-        # Forked PRs have restricted tokens and post via forked-pr-coverage.yml.
-        if: github.event.pull_request.head.repo.full_name != github.repository
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-comment-data
-          path: coverage-comment-data/
-          retention-days: 7
-
       - name: Comment coverage summary on PR
-        # Same-repo PRs post directly (forked PRs handled by forked-pr-coverage.yml).
-        if: github.event.pull_request.head.repo.full_name == github.repository
         uses: ./.github/actions/post-coverage-comment
         with:
-          pr_number: ${{ github.event.pull_request.number }}
+          pr_number: ${{ steps.prctx.outputs.pr_number }}
           coverage_percentage: ${{ env.COVERAGE_PERCENTAGE }}
           patch_coverage_pct: ${{ env.PATCH_COVERAGE_PCT }}
           patch_coverage_summary: ${{ env.PATCH_COVERAGE_SUMMARY }}
