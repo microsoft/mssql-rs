@@ -64,13 +64,19 @@ impl CertificateKeyStoreProvider {
     /// Registers the PEM-encoded RSA private key that backs the column master
     /// key identified by `master_key_path`. The key pair is used to verify the
     /// encrypted CEK signature and to RSA-OAEP unwrap the CEK.
+    ///
+    /// Both PKCS#1 (`-----BEGIN RSA PRIVATE KEY-----`) and PKCS#8
+    /// (`-----BEGIN PRIVATE KEY-----`) PEM encodings are accepted.
     pub fn add_key_from_pem(
         &mut self,
         master_key_path: impl AsRef<str>,
         private_key_pem: &[u8],
     ) -> TdsResult<()> {
-        let rsa = Rsa::private_key_from_pem(private_key_pem).map_err(openssl_err)?;
-        let pkey = PKey::from_rsa(rsa).map_err(openssl_err)?;
+        // Accept either a PKCS#1 RSA key or a PKCS#8 wrapped key.
+        let pkey = match Rsa::private_key_from_pem(private_key_pem) {
+            Ok(rsa) => PKey::from_rsa(rsa).map_err(openssl_err)?,
+            Err(_) => PKey::private_key_from_pem(private_key_pem).map_err(openssl_err)?,
+        };
         self.keys
             .insert(master_key_path.as_ref().to_ascii_lowercase(), pkey);
         Ok(())
@@ -80,6 +86,17 @@ impl CertificateKeyStoreProvider {
     pub fn add_key(&mut self, master_key_path: impl AsRef<str>, key: PKey<Private>) {
         self.keys
             .insert(master_key_path.as_ref().to_ascii_lowercase(), key);
+    }
+
+    /// Generates a fresh RSA-2048 key pair and registers it as the column
+    /// master key for `master_key_path`. The key material lives only in memory
+    /// for the lifetime of this provider; it is never persisted. Useful for
+    /// provisioning a throwaway column master key in tests and tooling.
+    pub fn generate_and_add_key(&mut self, master_key_path: impl AsRef<str>) -> TdsResult<()> {
+        let rsa = Rsa::generate(2048).map_err(openssl_err)?;
+        let pkey = PKey::from_rsa(rsa).map_err(openssl_err)?;
+        self.add_key(master_key_path, pkey);
+        Ok(())
     }
 
     /// Wraps a plaintext column encryption key (CEK) with the master key at
@@ -333,6 +350,25 @@ mod tests {
         let mut provider = CertificateKeyStoreProvider::new();
         let pem = pkey.rsa().unwrap().private_key_to_pem().unwrap();
         provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
+
+        let plaintext = provider
+            .decrypt_column_encryption_key(MASTER_KEY_PATH, "RSA_OAEP", &blob)
+            .await
+            .unwrap();
+        assert_eq!(plaintext, CEK);
+    }
+
+    #[tokio::test]
+    async fn loads_pkcs8_pem_key() {
+        // Newer OpenSSL emits PKCS#8 (`BEGIN PRIVATE KEY`); ensure that loads too.
+        let pkey = generate_keypair();
+        let blob = wrap_cek(&pkey, MASTER_KEY_PATH, &CEK);
+
+        let mut provider = CertificateKeyStoreProvider::new();
+        let pkcs8_pem = pkey.private_key_to_pem_pkcs8().unwrap();
+        provider
+            .add_key_from_pem(MASTER_KEY_PATH, &pkcs8_pem)
+            .unwrap();
 
         let plaintext = provider
             .decrypt_column_encryption_key(MASTER_KEY_PATH, "RSA_OAEP", &blob)
