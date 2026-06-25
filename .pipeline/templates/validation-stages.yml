@@ -27,9 +27,87 @@ parameters:
   default: true
 
 stages:
+- stage: EvaluateDuplicate
+  displayName: Evaluate PR duplicate
+  condition: and(eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  jobs:
+  - job: Evaluate
+    displayName: Check prior successful PR validation
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - bash: |
+        set -euo pipefail
+
+        if [ -z "${SYSTEM_ACCESSTOKEN:-}" ]; then
+          echo "System.AccessToken is unavailable; continuing with full validation."
+          echo "##vso[task.setvariable variable=skipDuplicate;isOutput=true]false"
+          exit 0
+        fi
+
+        python3 - <<'PY'
+        import json
+        import os
+        import urllib.parse
+        import urllib.request
+
+        collection_uri = os.environ["SYSTEM_COLLECTIONURI"]
+        team_project = os.environ["SYSTEM_TEAMPROJECT"]
+        definition_id = os.environ["SYSTEM_DEFINITIONID"]
+        current_build_id = int(os.environ["BUILD_BUILDID"])
+        source_branch = os.environ["SYSTEM_PULLREQUEST_SOURCEBRANCH"]
+        source_commit = os.environ["SYSTEM_PULLREQUEST_SOURCECOMMITID"]
+        token = os.environ["SYSTEM_ACCESSTOKEN"]
+
+        query = urllib.parse.urlencode(
+            {
+                "definitions": definition_id,
+                "reasonFilter": "pullRequest",
+                "statusFilter": "completed",
+                "resultFilter": "succeeded",
+                "branchName": source_branch,
+                "queryOrder": "finishTimeDescending",
+                "$top": "100",
+                "api-version": "7.1",
+            }
+        )
+        url = f"{collection_uri}{team_project}/_apis/build/builds?{query}"
+        headers = {"Authorization": "Bearer " + token}
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request) as response:
+            payload = json.load(response)
+
+        matching_run = None
+        for build in payload.get("value", []):
+            build_id = int(build.get("id", 0))
+            if build_id == current_build_id:
+                continue
+
+            trigger_info = build.get("triggerInfo") or {}
+            prior_source_commit = trigger_info.get("pr.sourceSha")
+            if prior_source_commit == source_commit and build.get("result") == "succeeded":
+                matching_run = build
+                break
+
+        if matching_run:
+            print(
+                f"PR head {source_commit} already validated by run {matching_run['id']}; skipping duplicate stages."
+            )
+            print("##vso[task.setvariable variable=skipDuplicate;isOutput=true]true")
+        else:
+            print(f"No successful prior validation run found for PR head {source_commit}; continuing.")
+            print("##vso[task.setvariable variable=skipDuplicate;isOutput=true]false")
+        PY
+      name: SetDuplicateState
+      displayName: Check duplicate PR head commit
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
 - stage: Build
   displayName: Build Stage
-  condition: and(eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  condition: and(succeeded(), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), or(ne(variables['Build.Reason'], 'PullRequest'), ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true')))
   jobs:
   - job: Build_Windows
     displayName: Build Windows
@@ -228,8 +306,9 @@ stages:
 # Kerberos tests for PRs (fast - 2 distros: ubuntu22 + alpine318)
 - stage: Kerberos_Test_PR
   displayName: Kerberos Test (PR)
-  dependsOn: []  # Run in parallel with Build stage
-  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  dependsOn:
+    - EvaluateDuplicate
+  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true'))
   jobs:
     - template: kerberos-test-template.yml
       parameters:
@@ -355,8 +434,9 @@ stages:
           fuzzTarget: fuzz_bulk_copy
 
 - stage: Build_mssql_python
-  dependsOn: []
-  condition: and(eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  dependsOn:
+    - EvaluateDuplicate
+  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true'))
   displayName: Build mssql-python
   jobs:
   - job: Build_mssql_python_Linux
