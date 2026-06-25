@@ -888,14 +888,19 @@ impl GenericDecoder {
             // === Binary types ===
             TdsDataType::BigBinary => {
                 let length = reader.read_uint16().await?;
-                if length as usize > MAX_ALLOC_SIZE {
-                    return Err(crate::error::Error::ProtocolError(format!(
-                        "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
-                    )));
+                // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
+                if length == 0xFFFF {
+                    writer.write_null(col);
+                } else {
+                    if length as usize > MAX_ALLOC_SIZE {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
+                        )));
+                    }
+                    let mut bytes = vec![0u8; length as usize];
+                    reader.read_bytes(&mut bytes).await?;
+                    writer.write_bytes(col, bytes);
                 }
-                let mut bytes = vec![0u8; length as usize];
-                reader.read_bytes(&mut bytes).await?;
-                writer.write_bytes(col, bytes);
             }
             TdsDataType::BigVarBinary => {
                 if metadata.is_plp() {
@@ -905,14 +910,19 @@ impl GenericDecoder {
                     }
                 } else {
                     let length = reader.read_uint16().await?;
-                    if length as usize > MAX_ALLOC_SIZE {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
-                        )));
+                    // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
+                    if length == 0xFFFF {
+                        writer.write_null(col);
+                    } else {
+                        if length as usize > MAX_ALLOC_SIZE {
+                            return Err(crate::error::Error::ProtocolError(format!(
+                                "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
+                            )));
+                        }
+                        let mut bytes = vec![0u8; length as usize];
+                        reader.read_bytes(&mut bytes).await?;
+                        writer.write_bytes(col, bytes);
                     }
-                    let mut bytes = vec![0u8; length as usize];
-                    reader.read_bytes(&mut bytes).await?;
-                    writer.write_bytes(col, bytes);
                 }
             }
 
@@ -1122,14 +1132,19 @@ impl SqlTypeDecode for GenericDecoder {
             }
             TdsDataType::BigBinary => {
                 let length = reader.read_uint16().await?;
-                if length as usize > MAX_ALLOC_SIZE {
-                    return Err(crate::error::Error::ProtocolError(format!(
-                        "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
-                    )));
+                // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
+                if length == 0xFFFF {
+                    ColumnValues::Null
+                } else {
+                    if length as usize > MAX_ALLOC_SIZE {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
+                        )));
+                    }
+                    let mut bytes = vec![0u8; length as usize];
+                    reader.read_bytes(&mut bytes).await?;
+                    ColumnValues::Bytes(bytes)
                 }
-                let mut bytes = vec![0u8; length as usize];
-                reader.read_bytes(&mut bytes).await?;
-                ColumnValues::Bytes(bytes)
             }
             TdsDataType::BigVarBinary => {
                 if metadata.is_plp() {
@@ -1140,14 +1155,19 @@ impl SqlTypeDecode for GenericDecoder {
                     }
                 } else {
                     let length = reader.read_uint16().await?;
-                    if length as usize > MAX_ALLOC_SIZE {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
-                        )));
+                    // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
+                    if length == 0xFFFF {
+                        ColumnValues::Null
+                    } else {
+                        if length as usize > MAX_ALLOC_SIZE {
+                            return Err(crate::error::Error::ProtocolError(format!(
+                                "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
+                            )));
+                        }
+                        let mut bytes = vec![0u8; length as usize];
+                        reader.read_bytes(&mut bytes).await?;
+                        ColumnValues::Bytes(bytes)
                     }
-                    let mut bytes = vec![0u8; length as usize];
-                    reader.read_bytes(&mut bytes).await?;
-                    ColumnValues::Bytes(bytes)
                 }
             }
             TdsDataType::Xml => {
