@@ -350,6 +350,38 @@ impl UserAgent {
 }
 
 impl ClientContext {
+    /// Registers a column master key store provider used to unwrap column
+    /// encryption keys for Always Encrypted.
+    ///
+    /// `name` is matched case-insensitively against the `key_store_name`
+    /// carried in the result-set CEK table (for example
+    /// `MSSQL_CERTIFICATE_STORE`). Register providers before creating the
+    /// client so they are available for the first encrypted query or bulk copy.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use mssql_tds::security::CertificateKeyStoreProvider;
+    ///
+    /// let mut provider = CertificateKeyStoreProvider::new();
+    /// provider.add_key_from_pem("CurrentUser/My/<thumbprint>", pem_bytes)?;
+    ///
+    /// let mut context = ClientContext::with_data_source("tcp:localhost,1433");
+    /// context.register_column_encryption_key_store_provider(
+    ///     "MSSQL_CERTIFICATE_STORE",
+    ///     Arc::new(provider),
+    /// );
+    /// ```
+    #[cfg(feature = "column-encryption")]
+    pub fn register_column_encryption_key_store_provider(
+        &mut self,
+        name: impl AsRef<str>,
+        provider: std::sync::Arc<dyn crate::security::ColumnEncryptionKeyStoreProvider>,
+    ) {
+        std::sync::Arc::make_mut(&mut self.column_encryption_key_store_providers)
+            .register(name, provider);
+    }
+
     /// Creates a new ClientContext with the specified data source.
     /// The data source is mandatory for establishing a connection.
     ///

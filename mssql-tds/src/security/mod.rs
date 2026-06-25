@@ -33,6 +33,10 @@ pub use error::SecurityError;
 pub use security_context::{IntegratedAuthConfig, SecurityContext, SecurityPackage, SspiAuthToken};
 pub use spn::{canonicalize_hostname, is_loopback_address, make_spn, make_spn_canonicalized};
 
+// Always Encrypted key store provider API.
+#[cfg(feature = "column-encryption")]
+pub use keystore::{CertificateKeyStoreProvider, ColumnEncryptionKeyStoreProvider};
+
 // Platform-specific implementations
 #[cfg(windows)]
 pub mod windows;

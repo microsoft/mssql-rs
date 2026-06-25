@@ -29,6 +29,10 @@
 // phases that build on this module.
 #![allow(dead_code)]
 
+mod certificate;
+
+pub use certificate::CertificateKeyStoreProvider;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -48,7 +52,7 @@ use crate::security::encryption::decrypt_cell;
 /// [`ColumnEncryptionKeyStoreProviderRegistry`]; the name corresponds to the
 /// `key_store_name` carried in the COLMETADATA CEK table.
 #[async_trait]
-pub(crate) trait ColumnEncryptionKeyStoreProvider: Send + Sync {
+pub trait ColumnEncryptionKeyStoreProvider: Send + Sync {
     /// Decrypts an encrypted column encryption key (CEK) using the column master
     /// key (CMK) identified by `master_key_path`.
     ///
