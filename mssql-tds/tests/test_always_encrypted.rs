@@ -93,12 +93,11 @@ mod always_encrypted {
     /// End-to-end check: a value inserted through an encrypted parameter is read
     /// back through an encrypted result set, transparently decrypted.
     ///
-    /// Ignored by default because it requires a SQL Server instance that permits
-    /// Always Encrypted column DDL (`CREATE TABLE ... ENCRYPTED WITH (...)`).
-    /// Run explicitly against such a server with:
-    /// `cargo test --features column-encryption --test test_always_encrypted -- --ignored`.
+    /// Requires a reachable SQL Server (see the module docs). Note the T-SQL
+    /// column DDL algorithm name is `AEAD_AES_256_CBC_HMAC_SHA_256` (with the
+    /// underscore before `256`), which differs from the wire/internal algorithm
+    /// identifier `AEAD_AES_256_CBC_HMAC_SHA256` used in the protocol.
     #[tokio::test]
-    #[ignore = "requires a SQL Server that supports Always Encrypted column DDL"]
     async fn always_encrypted_parameter_and_result_roundtrip() {
         init_tracing();
 
@@ -159,7 +158,7 @@ mod always_encrypted {
             &format!(
                 "CREATE TABLE {TABLE_NAME} (id INT IDENTITY(1,1) PRIMARY KEY, secret INT \
                  ENCRYPTED WITH (COLUMN_ENCRYPTION_KEY = {CEK_NAME}, ENCRYPTION_TYPE = \
-                 DETERMINISTIC, ALGORITHM = 'AEAD_AES_256_CBC_HMAC_SHA256') NOT NULL);"
+                 DETERMINISTIC, ALGORITHM = 'AEAD_AES_256_CBC_HMAC_SHA_256') NOT NULL);"
             ),
         )
         .await

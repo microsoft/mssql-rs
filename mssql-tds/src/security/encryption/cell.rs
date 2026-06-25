@@ -46,7 +46,11 @@ use crate::query::metadata::CryptoMetadata;
 use crate::security::encryption::ColumnEncryptionType;
 
 /// Cipher algorithm id for `AEAD_AES_256_CBC_HMAC_SHA256`.
-const AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID: u8 = 0x01;
+///
+/// This is the value SQL Server uses to identify the algorithm both in the
+/// COLMETADATA crypto metadata and in the `sp_describe_parameter_encryption`
+/// result set (`TdsEnums.AEAD_AES_256_CBC_HMAC_SHA256` in the other drivers).
+const AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID: u8 = 0x02;
 /// The only cell-normalization rule version defined by SQL Server today.
 const SUPPORTED_NORMALIZATION_VERSION: u8 = 0x01;
 
@@ -1192,7 +1196,7 @@ mod tests {
     #[test]
     fn encrypt_parameter_null_returns_none() {
         assert!(
-            encrypt_parameter(&SqlType::Int(None), &CEK, 1, 1, 1)
+            encrypt_parameter(&SqlType::Int(None), &CEK, 2, 1, 1)
                 .unwrap()
                 .is_none()
         );
@@ -1206,13 +1210,13 @@ mod tests {
 
     #[test]
     fn encrypt_parameter_rejects_unknown_encryption_type() {
-        let error = encrypt_parameter(&SqlType::Int(Some(1)), &CEK, 1, 9, 1).unwrap_err();
+        let error = encrypt_parameter(&SqlType::Int(Some(1)), &CEK, 2, 9, 1).unwrap_err();
         assert!(matches!(error, Error::ColumnEncryptionError(_)));
     }
 
     #[test]
     fn encrypt_parameter_roundtrip_int() {
-        let cipher = encrypt_parameter(&SqlType::Int(Some(987654)), &CEK, 1, 2, 1)
+        let cipher = encrypt_parameter(&SqlType::Int(Some(987654)), &CEK, 2, 2, 1)
             .unwrap()
             .unwrap();
         let info = type_info(
@@ -1230,7 +1234,7 @@ mod tests {
 
     #[test]
     fn encrypt_parameter_roundtrip_binary() {
-        let cipher = encrypt_parameter(&SqlType::VarBinary(Some(vec![9, 8, 7]), 10), &CEK, 1, 2, 1)
+        let cipher = encrypt_parameter(&SqlType::VarBinary(Some(vec![9, 8, 7]), 10), &CEK, 2, 2, 1)
             .unwrap()
             .unwrap();
         let info = type_info(
@@ -1249,7 +1253,7 @@ mod tests {
     #[test]
     fn encrypt_parameter_roundtrip_guid() {
         let value = uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
-        let cipher = encrypt_parameter(&SqlType::Uuid(Some(value)), &CEK, 1, 1, 1)
+        let cipher = encrypt_parameter(&SqlType::Uuid(Some(value)), &CEK, 2, 1, 1)
             .unwrap()
             .unwrap();
         let info = type_info(
@@ -1267,7 +1271,7 @@ mod tests {
     #[test]
     fn encrypt_parameter_roundtrip_date() {
         let date = SqlDate::unchecked_create(739_251);
-        let cipher = encrypt_parameter(&SqlType::Date(Some(date)), &CEK, 1, 2, 1)
+        let cipher = encrypt_parameter(&SqlType::Date(Some(date)), &CEK, 2, 2, 1)
             .unwrap()
             .unwrap();
         let info = type_info(
@@ -1311,7 +1315,7 @@ mod tests {
     #[test]
     fn encrypt_cell_value_null_returns_none() {
         assert!(
-            encrypt_cell_value(&ColumnValues::Null, &CEK, 1, 1, 1)
+            encrypt_cell_value(&ColumnValues::Null, &CEK, 2, 1, 1)
                 .unwrap()
                 .is_none()
         );
@@ -1325,13 +1329,13 @@ mod tests {
 
     #[test]
     fn encrypt_cell_value_rejects_unknown_encryption_type() {
-        let error = encrypt_cell_value(&ColumnValues::Int(1), &CEK, 1, 9, 1).unwrap_err();
+        let error = encrypt_cell_value(&ColumnValues::Int(1), &CEK, 2, 9, 1).unwrap_err();
         assert!(matches!(error, Error::ColumnEncryptionError(_)));
     }
 
     #[test]
     fn encrypt_cell_value_roundtrip_int() {
-        let cipher = encrypt_cell_value(&ColumnValues::Int(987654), &CEK, 1, 2, 1)
+        let cipher = encrypt_cell_value(&ColumnValues::Int(987654), &CEK, 2, 2, 1)
             .unwrap()
             .unwrap();
         let info = type_info(
@@ -1349,7 +1353,7 @@ mod tests {
 
     #[test]
     fn encrypt_cell_value_roundtrip_binary() {
-        let cipher = encrypt_cell_value(&ColumnValues::Bytes(vec![9, 8, 7]), &CEK, 1, 2, 1)
+        let cipher = encrypt_cell_value(&ColumnValues::Bytes(vec![9, 8, 7]), &CEK, 2, 2, 1)
             .unwrap()
             .unwrap();
         let info = type_info(
@@ -1368,7 +1372,7 @@ mod tests {
     #[test]
     fn encrypt_cell_value_roundtrip_guid() {
         let value = uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
-        let cipher = encrypt_cell_value(&ColumnValues::Uuid(value), &CEK, 1, 1, 1)
+        let cipher = encrypt_cell_value(&ColumnValues::Uuid(value), &CEK, 2, 1, 1)
             .unwrap()
             .unwrap();
         let info = type_info(
@@ -1386,7 +1390,7 @@ mod tests {
     #[test]
     fn encrypt_cell_value_roundtrip_date() {
         let date = SqlDate::unchecked_create(739_251);
-        let cipher = encrypt_cell_value(&ColumnValues::Date(date), &CEK, 1, 2, 1)
+        let cipher = encrypt_cell_value(&ColumnValues::Date(date), &CEK, 2, 2, 1)
             .unwrap()
             .unwrap();
         let info = type_info(

@@ -442,7 +442,7 @@ mod tests {
                 length: 4,
                 type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
             },
-            cipher_algorithm_id: 0x01,
+            cipher_algorithm_id: 0x02,
             cipher_algorithm_name: None,
             encryption_type: 1,
             normalization_rule_version: 1,

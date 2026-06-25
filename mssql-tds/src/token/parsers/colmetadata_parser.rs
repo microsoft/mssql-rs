@@ -328,6 +328,11 @@ where
         0
     };
 
+    // User type of the base column (4 bytes). It is always 0 for built-in types
+    // and is read and discarded here because the base data type is recovered
+    // from the TYPE_INFO that follows.
+    let _user_type = reader.read_uint32().await?;
+
     // Base (plaintext) TYPE_INFO: a data-type byte followed by type-specific info.
     let raw_base_type = reader.read_byte().await?;
     let base_data_type = TdsDataType::try_from(raw_base_type).map_err(|_| {
@@ -682,8 +687,9 @@ mod tests {
         data.push(TdsDataType::Int4 as u8); // outer data type (no type info)
         // CryptoMetadata.
         data.extend_from_slice(&[0x00, 0x00]); // cek_table_ordinal = 0
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // base column user_type
         data.push(TdsDataType::Int4 as u8); // base data type (no type info)
-        data.push(0x01); // cipher_algorithm_id (AEAD_AES_256_CBC_HMAC_SHA256)
+        data.push(0x02); // cipher_algorithm_id (AEAD_AES_256_CBC_HMAC_SHA256)
         data.push(0x01); // encryption_type (deterministic)
         data.push(0x01); // normalization_rule_version
         // Column name.
@@ -722,7 +728,7 @@ mod tests {
                 let crypto = col.crypto_metadata.as_ref().expect("crypto metadata");
                 assert_eq!(crypto.cek_table_ordinal, 0);
                 assert_eq!(crypto.base_data_type, TdsDataType::Int4);
-                assert_eq!(crypto.cipher_algorithm_id, 0x01);
+                assert_eq!(crypto.cipher_algorithm_id, 0x02);
                 assert!(crypto.cipher_algorithm_name.is_none());
                 assert_eq!(crypto.encryption_type, 1);
                 assert_eq!(crypto.normalization_rule_version, 1);

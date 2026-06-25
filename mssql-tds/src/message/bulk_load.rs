@@ -857,6 +857,9 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         let ordinal = self.cek_table_ordinal_for(&enc.cek_entry);
         self.packet_writer.write_u16_async(ordinal).await?;
 
+        // User type of the base column (4 bytes); 0 for built-in types.
+        self.packet_writer.write_u32_async(0).await?;
+
         // Base (plaintext) TYPE_INFO.
         let base_data_type = crypto.base_data_type;
         let base_type_info = crypto.base_type_info.clone();
@@ -1151,7 +1154,7 @@ mod ae_colmetadata_tests {
                     TdsDataType::Int4,
                 )
                 .unwrap(),
-                cipher_algorithm_id: 1,
+                cipher_algorithm_id: 2,
                 cipher_algorithm_name: None,
                 encryption_type: 1,
                 normalization_rule_version: 1,
@@ -1240,7 +1243,7 @@ mod ae_colmetadata_tests {
                 let crypto = col.crypto_metadata.as_ref().expect("crypto metadata");
                 assert_eq!(crypto.cek_table_ordinal, 0);
                 assert_eq!(crypto.base_data_type, TdsDataType::Int4);
-                assert_eq!(crypto.cipher_algorithm_id, 1);
+                assert_eq!(crypto.cipher_algorithm_id, 2);
                 assert!(crypto.cipher_algorithm_name.is_none());
                 assert_eq!(crypto.encryption_type, 1);
                 assert_eq!(crypto.normalization_rule_version, 1);
@@ -1298,7 +1301,7 @@ mod ae_colmetadata_tests {
 
         // Deterministic encryption produces a stable blob for the same input, so
         // we can compute the expected ciphertext independently.
-        let expected_blob = encrypt_cell_value(&value, &TEST_CEK, 1, 1, 1)
+        let expected_blob = encrypt_cell_value(&value, &TEST_CEK, 2, 1, 1)
             .unwrap()
             .expect("non-null ciphertext");
 

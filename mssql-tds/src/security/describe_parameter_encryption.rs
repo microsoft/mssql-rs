@@ -285,10 +285,10 @@ mod tests {
 
     #[test]
     fn parses_encrypted_parameter() {
-        let info = parse_parameter_info(&rs2_row(1, "@p1", 1, 1, 0, 1)).unwrap();
+        let info = parse_parameter_info(&rs2_row(1, "@p1", 2, 1, 0, 1)).unwrap();
         assert_eq!(info.parameter_ordinal, 1);
         assert_eq!(info.parameter_name, "@p1");
-        assert_eq!(info.cipher_algorithm_id, 1);
+        assert_eq!(info.cipher_algorithm_id, 2);
         assert_eq!(info.encryption_type, 1);
         assert_eq!(info.cek_ordinal, 0);
         assert_eq!(info.normalization_rule_version, 1);
