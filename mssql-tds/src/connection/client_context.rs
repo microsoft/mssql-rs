@@ -95,6 +95,30 @@ pub enum ColumnEncryptionSetting {
     Enabled,
 }
 
+/// Per-command override of the connection's Always Encrypted behavior.
+///
+/// A command may override the connection-level [`ColumnEncryptionSetting`] for a
+/// single execution. The default, [`UseConnectionSetting`](Self::UseConnectionSetting),
+/// inherits the connection's behavior. The override only has effect when the
+/// server acknowledged the Column Encryption feature during login (which only
+/// happens when the connection requested [`ColumnEncryptionSetting::Enabled`]).
+#[derive(PartialEq, Eq, Copy, Clone, Debug, Default)]
+pub enum SqlCommandColumnEncryptionSetting {
+    /// Inherit the connection's [`ColumnEncryptionSetting`]. (Default.)
+    #[default]
+    UseConnectionSetting,
+    /// Encrypt parameters targeting encrypted columns and decrypt encrypted
+    /// result columns for this command.
+    Enabled,
+    /// Decrypt encrypted result columns but send parameters unencrypted. Useful
+    /// when a command reads encrypted columns but its parameters do not target
+    /// any encrypted column.
+    ResultSetOnly,
+    /// Disable Always Encrypted for this command: parameters are sent
+    /// unencrypted and result columns are not decrypted.
+    Disabled,
+}
+
 /// Provides a trait for creating Entra ID tokens.
 #[async_trait]
 pub trait EntraIdTokenFactory: Send + Sync {
