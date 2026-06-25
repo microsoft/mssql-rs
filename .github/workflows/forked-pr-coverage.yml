@@ -15,13 +15,16 @@ on:
     types:
       - completed
 
-permissions:
-  pull-requests: write
-  contents: read
+# Least-privilege default: grant no permissions at the workflow level.
+permissions: {}
 
 jobs:
   post-comment:
     runs-on: ubuntu-latest
+    # Minimum scope: read the repo for checkout, write the PR comment.
+    permissions:
+      contents: read
+      pull-requests: write
     if: >
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'

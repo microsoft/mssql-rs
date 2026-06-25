@@ -17,9 +17,9 @@ on:
     branches:
       - main
 
-permissions:
-  pull-requests: write
-  contents: read
+# Least-privilege default: grant no permissions at the workflow level.
+# Each job opts into only the scopes it needs.
+permissions: {}
 
 env:
   ADO_ORG: sqlclientdrivers
@@ -30,6 +30,14 @@ env:
 jobs:
   coverage-report:
     runs-on: ubuntu-latest
+    # Minimum scope: read the repo for checkout, write PR comments. No other
+    # GITHUB_TOKEN access is granted. Forked PRs receive a read-only token
+    # regardless and post their comment via forked-pr-coverage.yml.
+    permissions:
+      contents: read
+      pull-requests: write
+    # Build runs ~45 min in ADO; the artifact wait can take up to 1h15m.
+    timeout-minutes: 120
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -95,38 +103,42 @@ jobs:
           ARTIFACTS_URL="https://dev.azure.com/${ADO_ORG}/${ADO_PROJECT}/_apis/build/builds/${BUILD_ID}/artifacts?api-version=7.1-preview.5"
 
           echo "📥 Polling for '$COVERAGE_ARTIFACT_NAME' artifact for build $BUILD_ID..."
+          # PR builds run ~45 min, so wait up to 1h15m for the coverage artifact,
+          # polling at a random interval between 5 and 10 minutes.
           DOWNLOAD_URL=""
-          for i in $(seq 1 60); do
-            echo "Attempt $i/60: checking for coverage artifact..."
+          DEADLINE=$(( $(date +%s) + 75 * 60 ))
+          attempt=0
+          while :; do
+            attempt=$((attempt + 1))
+            echo "Attempt $attempt: checking for coverage artifact..."
             ARTIFACTS_RESPONSE=$(curl -s "$ARTIFACTS_URL")
 
-            if ! echo "$ARTIFACTS_RESPONSE" | jq . >/dev/null 2>&1; then
-              echo "⚠️ Invalid JSON from artifacts API (attempt $i/60)"
-              if [[ $i -eq 60 ]]; then
-                echo "❌ Persistent API issues after 60 attempts"
-                exit 1
+            if echo "$ARTIFACTS_RESPONSE" | jq . >/dev/null 2>&1; then
+              DOWNLOAD_URL=$(echo "$ARTIFACTS_RESPONSE" | jq -r \
+                --arg NAME "$COVERAGE_ARTIFACT_NAME" \
+                '.value[]? | select(.name == $NAME) | .resource.downloadUrl // empty')
+
+              if [[ -n "$DOWNLOAD_URL" && "$DOWNLOAD_URL" != "null" ]]; then
+                echo "✅ Found coverage artifact on attempt $attempt"
+                break
               fi
-              sleep 30
-              continue
+
+              echo "⏳ Coverage artifact not ready yet (attempt $attempt)..."
+              echo "Available artifacts:"
+              echo "$ARTIFACTS_RESPONSE" | jq -r '.value[]?.name // "none"'
+            else
+              echo "⚠️ Invalid JSON from artifacts API (attempt $attempt)"
             fi
 
-            DOWNLOAD_URL=$(echo "$ARTIFACTS_RESPONSE" | jq -r \
-              --arg NAME "$COVERAGE_ARTIFACT_NAME" \
-              '.value[]? | select(.name == $NAME) | .resource.downloadUrl // empty')
-
-            if [[ -n "$DOWNLOAD_URL" && "$DOWNLOAD_URL" != "null" ]]; then
-              echo "✅ Found coverage artifact on attempt $i"
-              break
-            fi
-
-            echo "⏳ Coverage artifact not ready yet (attempt $i/60)..."
-            echo "Available artifacts:"
-            echo "$ARTIFACTS_RESPONSE" | jq -r '.value[]?.name // "none"'
-            if [[ $i -eq 60 ]]; then
-              echo "❌ Timeout: coverage artifact not found after 60 attempts"
+            if [[ $(date +%s) -ge $DEADLINE ]]; then
+              echo "❌ Timeout: coverage artifact not found within 75 minutes"
               exit 1
             fi
-            sleep 30
+
+            # Random sleep between 5 and 10 minutes (300-600 seconds).
+            SLEEP=$(( (RANDOM % 301) + 300 ))
+            echo "💤 Sleeping ${SLEEP}s (~$((SLEEP / 60)) min) before next poll..."
+            sleep "$SLEEP"
           done
 
           echo "📦 Downloading coverage artifact..."
