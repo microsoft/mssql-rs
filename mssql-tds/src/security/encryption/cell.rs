@@ -546,6 +546,105 @@ pub(crate) fn normalize(value: &SqlType) -> TdsResult<Option<Vec<u8>>> {
     Ok(bytes)
 }
 
+/// Normalizes and encrypts a plaintext bulk-copy cell value for an encrypted
+/// destination column. This is the bulk-copy counterpart to
+/// [`encrypt_parameter`]: bulk copy works with [`ColumnValues`] rather than the
+/// RPC [`SqlType`] representation.
+///
+/// Returns `Ok(None)` when the value is SQL `NULL`.
+pub(crate) fn encrypt_cell_value(
+    value: &ColumnValues,
+    plaintext_cek: &[u8],
+    cipher_algorithm_id: u8,
+    encryption_type: u8,
+    normalization_rule_version: u8,
+) -> TdsResult<Option<Vec<u8>>> {
+    if cipher_algorithm_id != AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID {
+        return Err(Error::ColumnEncryptionError(format!(
+            "Unsupported cell cipher algorithm id {cipher_algorithm_id:#04x} (expected \
+             {AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID:#04x})"
+        )));
+    }
+    if normalization_rule_version != SUPPORTED_NORMALIZATION_VERSION {
+        return Err(Error::ColumnEncryptionError(format!(
+            "Unsupported Always Encrypted normalization rule version {normalization_rule_version} \
+             (expected {SUPPORTED_NORMALIZATION_VERSION})"
+        )));
+    }
+
+    let column_encryption_type = match encryption_type {
+        1 => ColumnEncryptionType::Deterministic,
+        2 => ColumnEncryptionType::Randomized,
+        other => {
+            return Err(Error::ColumnEncryptionError(format!(
+                "Unsupported Always Encrypted encryption type {other} (expected 1 or 2)"
+            )));
+        }
+    };
+
+    let Some(normalized) = normalize_column_value(value)? else {
+        return Ok(None);
+    };
+
+    let cipher = AeadAes256CbcHmacSha256::new(plaintext_cek)?;
+    Ok(Some(cipher.encrypt(&normalized, column_encryption_type)?))
+}
+
+/// Normalizes a plaintext bulk-copy cell value into the canonical byte form that
+/// SQL Server encrypts. This is the bulk-copy counterpart to [`normalize`]
+/// (which operates on RPC [`SqlType`] values) and the inverse of the
+/// denormalization performed by [`denormalize`].
+///
+/// Returns `Ok(None)` when the value is SQL `NULL`.
+pub(crate) fn normalize_column_value(value: &ColumnValues) -> TdsResult<Option<Vec<u8>>> {
+    let bytes = match value {
+        ColumnValues::Null => None,
+
+        // Integer family: an 8-byte little-endian bigint.
+        ColumnValues::Bit(v) => Some(i64::from(*v).to_le_bytes().to_vec()),
+        ColumnValues::TinyInt(v) => Some(i64::from(*v).to_le_bytes().to_vec()),
+        ColumnValues::SmallInt(v) => Some(i64::from(*v).to_le_bytes().to_vec()),
+        ColumnValues::Int(v) => Some(i64::from(*v).to_le_bytes().to_vec()),
+        ColumnValues::BigInt(v) => Some(v.to_le_bytes().to_vec()),
+
+        // Floating point: native IEEE form.
+        ColumnValues::Real(v) => Some(v.to_le_bytes().to_vec()),
+        ColumnValues::Float(v) => Some(v.to_le_bytes().to_vec()),
+
+        // Money: the 8-byte money form (high dword then low dword).
+        ColumnValues::Money(v) => Some(normalize_money(v)),
+        ColumnValues::SmallMoney(v) => Some(normalize_small_money(v)),
+
+        // Decimal/numeric: sign byte followed by the little-endian magnitude.
+        ColumnValues::Decimal(v) | ColumnValues::Numeric(v) => Some(normalize_decimal(v)),
+
+        // uniqueidentifier: 16 little-endian bytes.
+        ColumnValues::Uuid(v) => Some(v.to_bytes_le().to_vec()),
+
+        // Binary: raw bytes.
+        ColumnValues::Bytes(v) => Some(v.clone()),
+
+        // Character types: the already-encoded bytes (UTF-16LE for `n` types,
+        // the collation code page otherwise).
+        ColumnValues::String(s) => Some(s.bytes.clone()),
+
+        // Temporal types: the row-value layout (without the length prefix).
+        ColumnValues::Date(v) => Some(normalize_date(v)),
+        ColumnValues::Time(v) => Some(normalize_time(v)?),
+        ColumnValues::DateTime2(v) => Some(normalize_datetime2(v)?),
+        ColumnValues::DateTimeOffset(v) => Some(normalize_datetime_offset(v)?),
+        ColumnValues::SmallDateTime(v) => Some(normalize_small_datetime(v)),
+        ColumnValues::DateTime(v) => Some(normalize_datetime(v)),
+
+        other => {
+            return Err(Error::ColumnEncryptionError(format!(
+                "Always Encrypted normalization is not implemented for bulk-copy value {other:?}"
+            )));
+        }
+    };
+    Ok(bytes)
+}
+
 /// Normalizes a `money` value to the 8-byte form (high dword then low dword).
 fn normalize_money(m: &SqlMoney) -> Vec<u8> {
     let mut out = Vec::with_capacity(8);
@@ -1169,6 +1268,125 @@ mod tests {
     fn encrypt_parameter_roundtrip_date() {
         let date = SqlDate::unchecked_create(739_251);
         let cipher = encrypt_parameter(&SqlType::Date(Some(date)), &CEK, 1, 2, 1)
+            .unwrap()
+            .unwrap();
+        let info = type_info(
+            TdsDataType::DateN,
+            3,
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+        );
+        let mut meta = crypto(TdsDataType::DateN, info);
+        meta.encryption_type = 2;
+        assert_eq!(
+            decrypt_cell(&meta, &CEK, &cipher).unwrap(),
+            ColumnValues::Date(SqlDate::unchecked_create(739_251))
+        );
+    }
+
+    #[test]
+    fn normalize_column_value_null_returns_none() {
+        assert!(
+            normalize_column_value(&ColumnValues::Null)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn normalize_column_value_integer_is_8_byte_bigint() {
+        assert_eq!(
+            normalize_column_value(&ColumnValues::Int(1234)).unwrap(),
+            Some(1234i64.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            normalize_column_value(&ColumnValues::TinyInt(200)).unwrap(),
+            Some(200i64.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            normalize_column_value(&ColumnValues::Bit(true)).unwrap(),
+            Some(1i64.to_le_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn encrypt_cell_value_null_returns_none() {
+        assert!(
+            encrypt_cell_value(&ColumnValues::Null, &CEK, 1, 1, 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn encrypt_cell_value_rejects_unknown_algorithm() {
+        let error = encrypt_cell_value(&ColumnValues::Int(1), &CEK, 0, 1, 1).unwrap_err();
+        assert!(matches!(error, Error::ColumnEncryptionError(_)));
+    }
+
+    #[test]
+    fn encrypt_cell_value_rejects_unknown_encryption_type() {
+        let error = encrypt_cell_value(&ColumnValues::Int(1), &CEK, 1, 9, 1).unwrap_err();
+        assert!(matches!(error, Error::ColumnEncryptionError(_)));
+    }
+
+    #[test]
+    fn encrypt_cell_value_roundtrip_int() {
+        let cipher = encrypt_cell_value(&ColumnValues::Int(987654), &CEK, 1, 2, 1)
+            .unwrap()
+            .unwrap();
+        let info = type_info(
+            TdsDataType::IntN,
+            4,
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+        );
+        let mut meta = crypto(TdsDataType::IntN, info);
+        meta.encryption_type = 2;
+        assert_eq!(
+            decrypt_cell(&meta, &CEK, &cipher).unwrap(),
+            ColumnValues::Int(987654)
+        );
+    }
+
+    #[test]
+    fn encrypt_cell_value_roundtrip_binary() {
+        let cipher = encrypt_cell_value(&ColumnValues::Bytes(vec![9, 8, 7]), &CEK, 1, 2, 1)
+            .unwrap()
+            .unwrap();
+        let info = type_info(
+            TdsDataType::BigVarBinary,
+            10,
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+        );
+        let mut meta = crypto(TdsDataType::BigVarBinary, info);
+        meta.encryption_type = 2;
+        assert_eq!(
+            decrypt_cell(&meta, &CEK, &cipher).unwrap(),
+            ColumnValues::Bytes(vec![9, 8, 7])
+        );
+    }
+
+    #[test]
+    fn encrypt_cell_value_roundtrip_guid() {
+        let value = uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        let cipher = encrypt_cell_value(&ColumnValues::Uuid(value), &CEK, 1, 1, 1)
+            .unwrap()
+            .unwrap();
+        let info = type_info(
+            TdsDataType::Guid,
+            16,
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+        );
+        let meta = crypto(TdsDataType::Guid, info);
+        assert_eq!(
+            decrypt_cell(&meta, &CEK, &cipher).unwrap(),
+            ColumnValues::Uuid(value)
+        );
+    }
+
+    #[test]
+    fn encrypt_cell_value_roundtrip_date() {
+        let date = SqlDate::unchecked_create(739_251);
+        let cipher = encrypt_cell_value(&ColumnValues::Date(date), &CEK, 1, 2, 1)
             .unwrap()
             .unwrap();
         let info = type_info(

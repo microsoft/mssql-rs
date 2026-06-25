@@ -794,6 +794,48 @@ impl TdsClient {
         // STEP 3: Create streaming writer and begin
         let default_collation = self.get_collation();
 
+        // Always Encrypted: when column encryption is negotiated and enabled,
+        // resolve the plaintext CEK for each encrypted destination column so the
+        // writer can encrypt row values and emit the encrypted COLMETADATA.
+        #[cfg(feature = "column-encryption")]
+        let plaintext_ceks: Vec<Option<std::sync::Arc<Vec<u8>>>> = if self
+            .should_encrypt_bulk_copy()
+            && mapped_column_metadata.iter().any(|c| c.is_encrypted)
+        {
+            use crate::security::keystore::decrypt_cek;
+
+            let (providers, cek_cache) = {
+                let client_context =
+                    self.recovery_context
+                        .client_context
+                        .as_ref()
+                        .ok_or_else(|| {
+                            crate::error::Error::ColumnEncryptionError(
+                                "Cannot encrypt bulk copy values without a client context"
+                                    .to_string(),
+                            )
+                        })?;
+                (
+                    client_context.column_encryption_key_store_providers.clone(),
+                    client_context.cek_cache.clone(),
+                )
+            };
+
+            let mut ceks = Vec::with_capacity(mapped_column_metadata.len());
+            for col in &mapped_column_metadata {
+                match &col.encryption {
+                    Some(enc) => {
+                        let cek = decrypt_cek(&providers, &cek_cache, &enc.cek_entry).await?;
+                        ceks.push(Some(cek));
+                    }
+                    None => ceks.push(None),
+                }
+            }
+            ceks
+        } else {
+            Vec::new()
+        };
+
         let mut packet_writer = PacketWriter::new(
             PacketType::BulkLoad,
             self.transport.as_writer(),
@@ -807,6 +849,14 @@ impl TdsClient {
             mapped_column_metadata,
             default_collation,
         );
+
+        // Enable Always Encrypted serialization before writing metadata so the
+        // COLMETADATA carries the CEK table and per-column crypto metadata.
+        #[cfg(feature = "column-encryption")]
+        if !plaintext_ceks.is_empty() {
+            writer.set_column_encryption_enabled(true);
+            writer.set_plaintext_ceks(plaintext_ceks);
+        }
 
         // Begin streaming (write metadata)
         writer.begin().await?;
@@ -1581,6 +1631,23 @@ impl TdsClient {
     fn should_encrypt_parameters(&self) -> bool {
         self.negotiated_settings.is_column_encryption_supported()
             && self.effective_command_ce_setting() == SqlCommandColumnEncryptionSetting::Enabled
+    }
+
+    /// Returns `true` when bulk copy row values should be encrypted: the server
+    /// acknowledged Always Encrypted during login and the connection enabled
+    /// column encryption. Bulk copy has no per-command override, so this folds
+    /// directly against the connection setting.
+    #[cfg(feature = "column-encryption")]
+    fn should_encrypt_bulk_copy(&self) -> bool {
+        use crate::connection::client_context::ColumnEncryptionSetting;
+
+        self.negotiated_settings.is_column_encryption_supported()
+            && self
+                .recovery_context
+                .client_context
+                .as_ref()
+                .map(|c| c.column_encryption_setting == ColumnEncryptionSetting::Enabled)
+                .unwrap_or(false)
     }
 
     /// Resolves the effective Column Encryption setting for the current command,

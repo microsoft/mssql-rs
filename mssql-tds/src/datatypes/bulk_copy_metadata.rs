@@ -433,6 +433,8 @@ impl TypeLength {
 /// ```
 #[derive(Debug, Clone)]
 pub struct BulkCopyColumnMetadata {
+    // NOTE: see also the gated `encryption` field at the end of this struct,
+    // which carries Always Encrypted material for encrypted destination columns.
     /// Column name
     pub column_name: String,
 
@@ -476,6 +478,26 @@ pub struct BulkCopyColumnMetadata {
 
     /// Table name (for long/LOB types in some TDS versions)
     pub table_name: Option<String>,
+
+    /// Always Encrypted material for this column, populated from the destination
+    /// table metadata when column encryption is negotiated. `None` for plaintext
+    /// columns (and whenever the `column-encryption` feature is disabled).
+    #[cfg(feature = "column-encryption")]
+    #[allow(dead_code)]
+    pub(crate) encryption: Option<BulkCopyColumnEncryption>,
+}
+
+/// Always Encrypted material captured for an encrypted bulk-copy destination
+/// column: the per-column crypto metadata plus the CEK table entry it references.
+#[cfg(feature = "column-encryption")]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct BulkCopyColumnEncryption {
+    /// Per-column crypto metadata (base type, cipher algorithm id, encryption
+    /// type, normalization rule version, CEK table ordinal).
+    pub crypto_metadata: crate::query::metadata::CryptoMetadata,
+    /// The CEK table entry referenced by `crypto_metadata.cek_table_ordinal`.
+    pub cek_entry: crate::query::metadata::CekTableEntry,
 }
 
 impl BulkCopyColumnMetadata {
@@ -496,6 +518,8 @@ impl BulkCopyColumnMetadata {
             is_identity: false,
             is_encrypted: false,
             table_name: None,
+            #[cfg(feature = "column-encryption")]
+            encryption: None,
         }
     }
 
@@ -729,6 +753,8 @@ impl Default for BulkCopyColumnMetadata {
             is_identity: false,
             is_encrypted: false,
             table_name: None,
+            #[cfg(feature = "column-encryption")]
+            encryption: None,
         }
     }
 }
@@ -901,6 +927,10 @@ impl From<&ColumnMetadata> for BulkCopyColumnMetadata {
 
         if col.is_identity() {
             metadata = metadata.with_identity(true);
+        }
+
+        if col.is_encrypted() {
+            metadata = metadata.with_encrypted(true);
         }
 
         metadata
