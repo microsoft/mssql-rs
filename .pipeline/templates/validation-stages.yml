@@ -42,7 +42,7 @@ stages:
         set -euo pipefail
 
         if [ -z "${SYSTEM_ACCESSTOKEN:-}" ]; then
-          echo "System.AccessToken is unavailable; continuing with full validation."
+          echo "##vso[task.logissue type=warning]System.AccessToken is unavailable; continuing with full validation."
           echo "##vso[task.setvariable variable=skipDuplicate;isOutput=true]false"
           exit 0
         fi
@@ -60,6 +60,7 @@ stages:
         source_branch = os.environ["SYSTEM_PULLREQUEST_SOURCEBRANCH"]
         source_commit = os.environ["SYSTEM_PULLREQUEST_SOURCECOMMITID"]
         token = os.environ["SYSTEM_ACCESSTOKEN"]
+        max_candidates = "200"
 
         query = urllib.parse.urlencode(
             {
@@ -69,15 +70,22 @@ stages:
                 "resultFilter": "succeeded",
                 "branchName": source_branch,
                 "queryOrder": "finishTimeDescending",
-                "$top": "100",
+                "$top": max_candidates,
                 "api-version": "7.1",
             }
         )
         url = f"{collection_uri}{team_project}/_apis/build/builds?{query}"
         headers = {"Authorization": "Bearer " + token}
         request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request) as response:
-            payload = json.load(response)
+        try:
+            with urllib.request.urlopen(request) as response:
+                payload = json.load(response)
+        except Exception as exc:
+            print(
+                f"##vso[task.logissue type=warning]Failed to query prior PR validation runs: {exc}. Continuing with full validation."
+            )
+            print("##vso[task.setvariable variable=skipDuplicate;isOutput=true]false")
+            raise SystemExit(0)
 
         matching_run = None
         for build in payload.get("value", []):
@@ -110,7 +118,16 @@ stages:
   displayName: Build Stage
   dependsOn:
     - EvaluateDuplicate
-  condition: and(succeeded(), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), or(ne(variables['Build.Reason'], 'PullRequest'), ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true')))
+  condition: >-
+    and(
+      succeeded(),
+      eq('${{ parameters.RunFuzz }}', 'false'),
+      eq('${{ parameters.RunLongHaul }}', 'false'),
+      or(
+        ne(variables['Build.Reason'], 'PullRequest'),
+        ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true')
+      )
+    )
   jobs:
   - job: Build_Windows
     displayName: Build Windows
