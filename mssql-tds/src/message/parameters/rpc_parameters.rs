@@ -334,10 +334,26 @@ impl RpcParameter {
         Self::write_encrypted_value(packet_writer, encrypted.ciphertext.as_deref()).await?;
 
         // The CryptoMetaData is preceded by the plaintext base TYPE_INFO so the
-        // server knows the underlying type of the encrypted value.
-        self.value
-            .write_type_info(packet_writer, db_collation, None, None)
-            .await?;
+        // server knows the underlying type of the encrypted value. Always
+        // Encrypted requires this base type to match the encrypted column
+        // exactly (the server performs no implicit conversion for encrypted
+        // operands). On the normal RPC path a `bit` value is sent as `INTN(1)`,
+        // which the server reads as `tinyint`; for an encrypted `bit` parameter
+        // that mismatch raises an "operand type clash" against a `bit` column,
+        // so `bit` must be written as `BITN` here instead.
+        match &self.value {
+            SqlType::Bit(_) => {
+                packet_writer
+                    .write_byte_async(TdsDataType::BitN as u8)
+                    .await?;
+                packet_writer.write_byte_async(1u8).await?;
+            }
+            other => {
+                other
+                    .write_type_info(packet_writer, db_collation, None, None)
+                    .await?;
+            }
+        }
         Self::write_crypto_metadata(packet_writer, &encrypted.metadata).await?;
         Ok(())
     }
@@ -578,6 +594,31 @@ mod tests {
         expected.extend_from_slice(&4u16.to_le_bytes()); // actual length
         expected.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // ciphertext
         expected.extend_from_slice(&type_info_bytes(&SqlType::Int(Some(5)))); // base TYPE_INFO
+        expected.extend_from_slice(&sample_metadata_bytes());
+
+        assert_eq!(serialize_param(&param), expected);
+    }
+
+    /// An encrypted `bit` parameter writes its base TYPE_INFO as `BITN(1)`
+    /// (0x68, 0x01), not the `INTN(1)` (0x26, 0x01 = tinyint) the normal RPC
+    /// path uses. Always Encrypted does no implicit conversion, so an `INTN(1)`
+    /// base type clashes with a `bit` column ("operand type clash").
+    #[test]
+    fn serialize_encrypted_bit_writes_bitn_base_type() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Bit(Some(true)),
+        );
+        param.set_encrypted(Some(vec![0xAA, 0xBB]), sample_metadata());
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
+        expected.push(0x08); // status: ENCRYPTED
+        expected.push(0xA5); // type: BIGVARBINARY
+        expected.extend_from_slice(&8000u16.to_le_bytes()); // max length
+        expected.extend_from_slice(&2u16.to_le_bytes()); // actual length
+        expected.extend_from_slice(&[0xAA, 0xBB]); // ciphertext
+        expected.extend_from_slice(&[0x68, 0x01]); // base TYPE_INFO: BITN, length 1
         expected.extend_from_slice(&sample_metadata_bytes());
 
         assert_eq!(serialize_param(&param), expected);
