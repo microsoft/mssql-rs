@@ -175,6 +175,19 @@ steps:
         summaryFileLocation: "$(Build.SourcesDirectory)/target/lcov.info"
         pathToSources: "$(Build.SourcesDirectory)"
 
+    # Cobertura report consumed by the GitHub PR diff-coverage workflow (diff-cover).
+    - script: cargo llvm-cov report --package mssql-tds --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
+      condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+      workingDirectory: "$(Build.SourcesDirectory)"
+      displayName: Save code coverage in Cobertura format (mssql-tds package only)
+
+    - task: PublishPipelineArtifact@1
+      condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+      displayName: "Publish Cobertura coverage artifact"
+      inputs:
+        targetPath: "$(Build.SourcesDirectory)/target/cobertura.xml"
+        artifactName: "CoberturaCoverage"
+
 - ${{ if eq(parameters.enableRustBuild, true) }}:
   - task: CopyFiles@2
     displayName: Copy Rust Debug Build

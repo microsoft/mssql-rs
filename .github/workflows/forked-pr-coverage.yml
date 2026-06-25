@@ -1,0 +1,71 @@
+name: Post Coverage Comment
+
+# Posts the coverage comment for FORKED PRs.
+#
+# Forked PRs run with a restricted GITHUB_TOKEN and cannot write comments on the
+# base repository. The "PR Code Coverage" workflow uploads the comment data as an
+# artifact; this workflow_run-triggered job runs in the base-repo context with
+# full permissions and posts the comment.
+#
+# Same-repo PRs post their comment directly in pr-code-coverage.yml.
+
+on:
+  workflow_run:
+    workflows: ["PR Code Coverage"]
+    types:
+      - completed
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  post-comment:
+    runs-on: ubuntu-latest
+    if: >
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download coverage data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh run download ${{ github.event.workflow_run.id }} \
+            --repo ${{ github.repository }} \
+            --name coverage-comment-data 2>&1; then
+            echo "⚠️ No coverage-comment-data artifact found (expected for same-repo PRs)."
+            echo "Exiting gracefully..."
+            exit 0
+          fi
+
+          if [[ ! -f pr-info.json ]]; then
+            echo "❌ Artifact downloaded but pr-info.json not found"
+            exit 1
+          fi
+
+      - name: Read coverage data
+        run: |
+          [[ -f pr-info.json ]] || { echo "❌ pr-info.json not found"; exit 1; }
+          cat pr-info.json
+
+          echo "PR_NUMBER=$(jq -r '.pr_number' pr-info.json)" >> $GITHUB_ENV
+          echo "COVERAGE_PERCENTAGE=$(jq -r '.coverage_percentage' pr-info.json)" >> $GITHUB_ENV
+          echo "PATCH_COVERAGE_PCT=$(jq -r '.patch_coverage_pct' pr-info.json)" >> $GITHUB_ENV
+          echo "ADO_URL=$(jq -r '.ado_url' pr-info.json)" >> $GITHUB_ENV
+          {
+            echo "PATCH_COVERAGE_SUMMARY<<EOF"
+            jq -r '.patch_coverage_summary' pr-info.json
+            echo "EOF"
+          } >> $GITHUB_ENV
+
+      - name: Comment coverage summary on PR
+        uses: ./.github/actions/post-coverage-comment
+        with:
+          pr_number: ${{ env.PR_NUMBER }}
+          coverage_percentage: ${{ env.COVERAGE_PERCENTAGE }}
+          patch_coverage_pct: ${{ env.PATCH_COVERAGE_PCT }}
+          patch_coverage_summary: ${{ env.PATCH_COVERAGE_SUMMARY }}
+          ado_url: ${{ env.ADO_URL }}
