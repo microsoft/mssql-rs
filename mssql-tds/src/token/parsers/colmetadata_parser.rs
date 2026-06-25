@@ -30,15 +30,20 @@
 //! └───────────┴───────┴──────────┴─────────────┴──────────────┴────────────┘
 //!     0-3       4-5       6         7 ... M      M+1 ... P     P+1 ... Q
 //!
-//! Flags (bitmask):
-//!   0x01 = Nullable
-//!   0x08 = Identity column
-//!   0x10 = Computed column
-//!   0x20 = Fixed length CLR type
-//!   0x40 = Hidden (e.g., FOR BROWSE)
-//!   0x80 = Key column (used in cursor operations)
-//!   0x100= Nullable unknown
-//!   0x200= Column is encrypted (Always Encrypted feature)
+//! Flags (bitmask, per MS-TDS COLMETADATA, least-significant-bit order):
+//!   0x0001 = Nullable (fNullable)
+//!   0x0002 = Case-sensitive collation (fCaseSen)
+//!   0x000C = Updateable (2-bit: 0=read-only, 1=read/write, 2=unknown)
+//!   0x0010 = Identity column (fIdentity)
+//!   0x0020 = Computed column (fComputed)
+//!   0x00C0 = usReservedODBC (2-bit, reserved)
+//!   0x0100 = Fixed-length CLR type (fFixedLenCLRType)
+//!   0x0200 = Default value, used for table-valued parameters (fIsDefault)
+//!   0x0400 = Sparse column set (fSparseColumnSet)
+//!   0x0800 = Encrypted, Always Encrypted (fEncrypted)
+//!   0x2000 = Hidden, e.g. FOR BROWSE (fHidden)
+//!   0x4000 = Key column, used in cursor operations (fKey)
+//!   0x8000 = Nullable unknown (fNullableUnknown)
 //!
 //! TypeInfo varies by DataType:
 //!   - INT/BIGINT:    No additional info
