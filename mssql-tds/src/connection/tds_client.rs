@@ -1712,6 +1712,16 @@ impl TdsClient {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
 
+        // The column values are sent as named (@column) RPC parameters, so each
+        // must carry a name; an unnamed parameter would panic during
+        // serialization. Reject it as a usage error before any I/O.
+        if values.iter().any(|p| p.name.is_none()) {
+            return Err(UsageError(
+                "perform_cursor_operation values must be named parameters (column names prefixed with `@`)"
+                    .to_string(),
+            ));
+        }
+
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 

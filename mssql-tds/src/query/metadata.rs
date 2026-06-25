@@ -45,13 +45,15 @@ impl ColumnMetadata {
     pub fn is_computed(&self) -> bool {
         (self.flags & 0x20) != 0x00
     }
-    /// Column is a sparse column set (`xml COLUMN_SET FOR ALL_SPARSE_COLUMNS`).
+    /// Column is a sparse column set (`xml COLUMN_SET FOR ALL_SPARSE_COLUMNS`),
+    /// `fSparseColumnSet`, bit 10 of the COLMETADATA Flags word.
     pub fn is_sparse_column_set(&self) -> bool {
-        (self.flags & 0x1000) != 0x00
+        (self.flags & 0x0400) != 0x00
     }
-    /// Column is protected by Always Encrypted.
+    /// Column is protected by Always Encrypted (`fEncrypted`, bit 11 of the
+    /// COLMETADATA Flags word).
     pub fn is_encrypted(&self) -> bool {
-        (self.flags & 0x2000) != 0x00
+        (self.flags & 0x0800) != 0x00
     }
     /// Column is a key column used in cursor operations (`fKey`, bit 14 of the
     /// COLMETADATA Flags word). A driver uses this to build positioned-update
@@ -247,8 +249,13 @@ mod tests {
     #[test]
     fn test_is_sparse_column_set() {
         let metadata =
-            create_test_column_metadata(0x1000, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+            create_test_column_metadata(0x0400, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
         assert!(metadata.is_sparse_column_set());
+
+        // 0x1000 is fUnused1, not fSparseColumnSet.
+        let metadata =
+            create_test_column_metadata(0x1000, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert!(!metadata.is_sparse_column_set());
 
         let metadata =
             create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
@@ -258,8 +265,13 @@ mod tests {
     #[test]
     fn test_is_encrypted() {
         let metadata =
-            create_test_column_metadata(0x2000, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+            create_test_column_metadata(0x0800, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
         assert!(metadata.is_encrypted());
+
+        // 0x2000 is fHidden (FOR BROWSE), not fEncrypted.
+        let metadata =
+            create_test_column_metadata(0x2000, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert!(!metadata.is_encrypted());
 
         let metadata =
             create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));

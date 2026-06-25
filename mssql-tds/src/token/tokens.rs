@@ -962,7 +962,7 @@ pub(crate) struct ReturnStatusToken {
 
 impl Token for ReturnStatusToken {
     fn token_type(&self) -> TokenType {
-        TokenType::ReturnValue
+        TokenType::ReturnStatus
     }
 }
 
