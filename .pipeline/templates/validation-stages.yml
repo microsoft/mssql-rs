@@ -58,7 +58,7 @@ stages:
         definition_id = os.environ["SYSTEM_DEFINITIONID"]
         current_build_id = int(os.environ["BUILD_BUILDID"])
         build_branch = os.environ.get("BUILD_SOURCEBRANCH", "")
-        source_commit = os.environ["SYSTEM_PULLREQUEST_SOURCECOMMITID"]
+        source_commit = os.environ["SYSTEM_PULLREQUEST_SOURCECOMMITID"].lower()
         pull_request_id = os.environ.get("SYSTEM_PULLREQUEST_PULLREQUESTID", "")
         token = os.environ["SYSTEM_ACCESSTOKEN"]
         # 200 keeps API payloads small while covering repeated draft/ready transitions on busy PRs.
@@ -106,10 +106,10 @@ stages:
             )
             if pull_request_id:
                 prior_pr_id = trigger_info.get("pr.number") or trigger_info.get("pr.pullRequestId")
-                if prior_pr_id and str(prior_pr_id) != pull_request_id:
+                if pull_request_id and prior_pr_id and str(prior_pr_id) != pull_request_id:
                     continue
 
-            if prior_source_commit and prior_source_commit.lower() == source_commit.lower():
+            if prior_source_commit and prior_source_commit.lower() == source_commit:
                 matching_run = build
                 break
 
