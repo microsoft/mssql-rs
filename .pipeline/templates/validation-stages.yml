@@ -70,6 +70,9 @@ stages:
             f"pullRequestId={pull_request_id or '<empty>'}, "
             f"pullRequestNumber={pull_request_number or '<empty>'}"
         )
+        current_pr_identifiers = {
+            value for value in (pull_request_id, pull_request_number) if value
+        }
         if not source_commit:
             print(
                 "##vso[task.logissue type=warning]System.PullRequest.SourceCommitId is unavailable; continuing with full validation."
@@ -129,28 +132,29 @@ stages:
             )
             if prior_source_sha:
                 prior_source_sha = prior_source_sha.lower()
-            if pull_request_id:
-                # PR identifier field names can vary by provider/API revision:
-                # - pr.number: GitHub-backed PR triggers
-                # - pr.pullRequestId: Azure Repos PR triggers
-                prior_pr_id = trigger_info.get("pr.number")
-                if prior_pr_id is None:
-                    prior_pr_id = trigger_info.get("pr.pullRequestId")
-                # A mismatched PR identifier means this run belongs to a different PR and must not be treated as duplicate.
-                if prior_pr_id and str(prior_pr_id) != pull_request_id:
-                    # Without branch scope in the REST query, PR id mismatch is the only safe discriminator
-                    # to avoid treating runs from other PRs as duplicates.
-                    if not build_source_branch:
-                        skipped_for_pr_mismatch += 1
-                        continue
-                    print(
-                        f"Candidate run {build_id} has trigger PR id {prior_pr_id}, "
-                        f"which differs from SYSTEM_PULLREQUEST_PULLREQUESTID={pull_request_id}; "
-                        "continuing with commit comparison because the API query is already branch-scoped."
-                    )
             if not prior_source_sha:
                 skipped_for_missing_sha += 1
                 continue
+            prior_pr_identifiers = []
+            for key in ("pr.number", "pr.pullRequestId"):
+                value = trigger_info.get(key)
+                if value is not None:
+                    prior_pr_identifiers.append(str(value))
+            # Without branch scope in the REST query, PR identifier mismatch is the only safe discriminator
+            # to avoid treating runs from other PRs as duplicates.
+            if (
+                current_pr_identifiers
+                and prior_pr_identifiers
+                and set(prior_pr_identifiers).isdisjoint(current_pr_identifiers)
+            ):
+                if not build_source_branch:
+                    skipped_for_pr_mismatch += 1
+                    continue
+                print(
+                    f"Candidate run {build_id} has trigger PR identifiers {prior_pr_identifiers}, "
+                    f"which do not overlap with current PR identifiers {sorted(current_pr_identifiers)}; "
+                    "continuing with commit comparison because the API query is already branch-scoped."
+                )
 
             if prior_source_sha == source_commit:
                 matching_run = build
