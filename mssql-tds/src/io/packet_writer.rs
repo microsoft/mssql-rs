@@ -103,6 +103,11 @@ pub struct PacketWriter<'a> {
     /// Connection-reset request to set on the first packet of this message.
     /// Only honored for SQL Batch, RPC, and Transaction Manager messages.
     reset_mode: ResetConnectionMode,
+    /// Whether a non-final (Normal) packet has already been flushed for the
+    /// current message. When the payload ends exactly on a packet boundary the
+    /// buffer is flushed empty, so `finalize` must still emit a trailing EOM
+    /// packet even though no buffered data remains (issue #73).
+    partial_packet_sent: bool,
 }
 
 impl<'a> PacketWriter<'a> {
@@ -148,6 +153,7 @@ impl<'a> PacketWriter<'a> {
             max_timeout_sec: effective_timeout,
             cancel_handle: cancel_handle.map(|handle| handle.child_handle()),
             reset_mode,
+            partial_packet_sent: false,
         }
     }
 
@@ -276,6 +282,12 @@ impl<'a> PacketWriter<'a> {
         // Add the counter for the packet and increment by 1 for the next packet.
         self.packet_id = self.packet_id.wrapping_add(1);
 
+        // Remember whether a non-final packet was flushed so that `finalize`
+        // can still send a trailing EOM packet when the buffer ends empty.
+        if !is_last_packet {
+            self.partial_packet_sent = true;
+        }
+
         // Restore the cursor position.
         self.payload_cursor.set_position(saved_position);
         Ok(())
@@ -323,10 +335,17 @@ impl<'a> PacketWriter<'a> {
 #[async_trait]
 impl TdsPacketWriter for PacketWriter<'_> {
     async fn finalize(&mut self) -> TdsResult<()> {
-        if (self.payload_cursor.position()) > Self::PACKET_HEADER_SIZE as u64 {
+        // Send a final EOM packet when there is buffered payload, or when a
+        // non-final packet was already flushed but the EOM packet has not been
+        // sent yet. The latter happens when the payload ends exactly on a
+        // packet boundary, leaving the buffer empty after the flush (issue #73).
+        if self.payload_cursor.position() > Self::PACKET_HEADER_SIZE as u64
+            || self.partial_packet_sent
+        {
             self.populate_header_and_send(true, false).await?;
             self.payload_cursor
                 .set_position(Self::PACKET_HEADER_SIZE as u64);
+            self.partial_packet_sent = false;
         }
         Ok(())
     }
@@ -716,6 +735,61 @@ pub(crate) mod tests {
         );
         // And the connection's pending reset has been cleared (one-shot).
         assert_eq!(mock.take_reset_mode(), ResetConnectionMode::None);
+    }
+
+    /// Splits the raw network bytes into individual TDS packets, returning the
+    /// status byte of each packet in order.
+    fn packet_statuses(data: &[u8]) -> Vec<u8> {
+        let mut statuses = Vec::new();
+        let mut offset = 0;
+        while offset + PacketWriter::PACKET_HEADER_SIZE <= data.len() {
+            let status = data[offset + 1];
+            let length = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+            assert!(
+                length >= PacketWriter::PACKET_HEADER_SIZE,
+                "invalid packet length"
+            );
+            statuses.push(status);
+            offset += length;
+        }
+        assert_eq!(offset, data.len(), "packets do not cover the whole stream");
+        statuses
+    }
+
+    /// Regression test for issue #73: when the payload ends exactly on a packet
+    /// boundary, `handle_overflow_if_needed` flushes the buffer as a non-EOM
+    /// packet and leaves it empty. `finalize` must still emit a trailing EOM
+    /// packet, otherwise the server waits forever for the end of the message and
+    /// the request (e.g. a bulk copy) hangs until the timeout fires.
+    ///
+    /// The byte-at-a-time write path used here mirrors the row encoder that
+    /// surfaced the bug.
+    #[test]
+    fn test_finalize_sends_eom_when_payload_ends_on_packet_boundary() {
+        // packet_size 16 => max_payload_size 8. Writing exactly 8 payload bytes
+        // fills the packet precisely and triggers an empty flush.
+        let mut mock = MockNetworkWriter::new(16);
+        let mut writer = PacketWriter::new(PacketType::BulkLoad, &mut mock, None, None);
+
+        for _ in 0..8 {
+            block_on(writer.write_byte_async(0xAB)).unwrap();
+        }
+        block_on(writer.finalize()).unwrap();
+
+        let statuses = packet_statuses(&mock.data);
+        // The boundary-filling packet is sent as Normal, followed by an empty EOM packet.
+        assert_eq!(
+            statuses,
+            vec![
+                PacketStatusFlags::Normal as u8,
+                PacketStatusFlags::Eom as u8
+            ]
+        );
+        assert_eq!(
+            *statuses.last().unwrap() & PacketStatusFlags::Eom as u8,
+            PacketStatusFlags::Eom as u8,
+            "the final packet must carry the EOM flag"
+        );
     }
 
     #[test]
