@@ -61,6 +61,7 @@ stages:
         source_commit = os.environ["SYSTEM_PULLREQUEST_SOURCECOMMITID"]
         token = os.environ["SYSTEM_ACCESSTOKEN"]
         # 200 keeps API payloads small while covering repeated draft/ready transitions on busy PRs.
+        # If a PR exceeds this window, the guard falls back to full validation (safe false negative).
         max_candidates = "200"
 
         query = urllib.parse.urlencode(
@@ -95,6 +96,7 @@ stages:
                 continue
 
             trigger_info = build.get("triggerInfo", {})
+            # Azure DevOps Build API reports the PR head commit SHA under triggerInfo.pr.sourceSha.
             prior_source_commit = trigger_info.get("pr.sourceSha")
             if prior_source_commit == source_commit:
                 matching_run = build
