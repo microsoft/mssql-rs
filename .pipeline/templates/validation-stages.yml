@@ -100,19 +100,20 @@ stages:
 
             trigger_info = build.get("triggerInfo", {})
             # Field names can vary across providers/API revisions; prefer known PR head SHA keys in order.
-            prior_source_commit = (
+            prior_source_sha = (
                 trigger_info.get("pr.sourceSha")
                 or trigger_info.get("pr.sourceCommitId")
                 or trigger_info.get("pr.headSha")
             )
-            if prior_source_commit:
-                prior_source_commit = prior_source_commit.lower()
+            if prior_source_sha:
+                prior_source_sha = prior_source_sha.lower()
             if pull_request_id:
+                # PR identifier field names can vary by provider/API revision, similar to source SHA keys above.
                 prior_pr_id = trigger_info.get("pr.number") or trigger_info.get("pr.pullRequestId")
                 if prior_pr_id and str(prior_pr_id) != pull_request_id:
                     continue
 
-            if prior_source_commit and prior_source_commit == source_commit:
+            if prior_source_sha and prior_source_sha == source_commit:
                 matching_run = build
                 break
 
