@@ -58,9 +58,15 @@ stages:
         definition_id = os.environ["SYSTEM_DEFINITIONID"]
         current_build_id = int(os.environ["BUILD_BUILDID"])
         build_source_branch = os.environ.get("BUILD_SOURCEBRANCH", "")
-        source_commit = os.environ["SYSTEM_PULLREQUEST_SOURCECOMMITID"].lower()
+        source_commit = os.environ.get("SYSTEM_PULLREQUEST_SOURCECOMMITID", "").lower()
         pull_request_id = os.environ.get("SYSTEM_PULLREQUEST_PULLREQUESTID", "")
         token = os.environ["SYSTEM_ACCESSTOKEN"]
+        if not source_commit:
+            print(
+                "##vso[task.logissue type=warning]System.PullRequest.SourceCommitId is unavailable; continuing with full validation."
+            )
+            print("##vso[task.setvariable variable=skipDuplicate;isOutput=true]false")
+            raise SystemExit(0)
         # 200 keeps API payloads small while covering repeated draft/ready transitions on busy PRs.
         # If a PR exceeds this window, the guard falls back to full validation (safe false negative).
         max_candidates = "200"
@@ -99,10 +105,10 @@ stages:
                 continue
 
             trigger_info = build.get("triggerInfo", {})
-            # Field names vary across providers/API revisions:
+            # Field names vary across providers/API revisions; prefer provider-specific canonical keys first.
             # - pr.sourceSha: Azure Repos PR triggers
             # - pr.sourceCommitId: GitHub-backed PR triggers
-            # - pr.headSha: alternate PR trigger payloads
+            # - pr.headSha: alternate/legacy PR trigger payloads
             prior_source_sha = (
                 trigger_info.get("pr.sourceSha")
                 or trigger_info.get("pr.sourceCommitId")
@@ -114,7 +120,9 @@ stages:
                 # PR identifier field names can vary by provider/API revision:
                 # - pr.number: GitHub-backed PR triggers
                 # - pr.pullRequestId: Azure Repos PR triggers
-                prior_pr_id = trigger_info.get("pr.number") or trigger_info.get("pr.pullRequestId")
+                prior_pr_id = trigger_info.get("pr.number")
+                if prior_pr_id is None:
+                    prior_pr_id = trigger_info.get("pr.pullRequestId")
                 # A mismatched PR identifier means this run belongs to a different PR and must not be treated as duplicate.
                 if prior_pr_id and str(prior_pr_id) != pull_request_id:
                     continue
