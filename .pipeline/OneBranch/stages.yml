@@ -161,6 +161,13 @@ stages:
         parameters:
           osType: Linux
           architecture: x64
+          manylinuxFlavor: '2_28'
+          publishArtifacts: false
+      - template: /.pipeline/templates/build-python-wheels-template.yml
+        parameters:
+          osType: Linux
+          architecture: x64
+          manylinuxFlavor: '2_34'
           publishArtifacts: false
       - template: /.pipeline/templates/build-python-wheels-template.yml
         parameters:
@@ -208,6 +215,13 @@ stages:
           parameters:
             osType: Linux
             architecture: arm64
+            manylinuxFlavor: '2_28'
+            publishArtifacts: false
+        - template: /.pipeline/templates/build-python-wheels-template.yml
+          parameters:
+            osType: Linux
+            architecture: arm64
+            manylinuxFlavor: '2_34'
             publishArtifacts: false
         - template: /.pipeline/templates/build-python-wheels-template.yml
           parameters:

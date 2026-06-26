@@ -21,6 +21,24 @@ echo ""
 
 cd "$SCRIPT_DIR"
 
+# Build manylinux_2_28 x64 image (glibc 2.28, OpenSSL 1.1)
+echo "==> Building manylinux_2_28 x64 image..."
+docker build \
+    -f Dockerfile.PythonBuild.manylinux_2_28.x64 \
+    -t "${ACR_REGISTRY}/python-build/manylinux_2_28_x86_64_rust:latest" \
+    .
+echo "✅ manylinux_2_28 x64 image built successfully"
+echo ""
+
+# Build manylinux_2_28 ARM64 image (glibc 2.28, OpenSSL 1.1)
+echo "==> Building manylinux_2_28 ARM64 image..."
+docker build \
+    -f Dockerfile.PythonBuild.manylinux_2_28.arm64 \
+    -t "${ACR_REGISTRY}/python-build/manylinux_2_28_aarch64_rust:latest" \
+    .
+echo "✅ manylinux_2_28 ARM64 image built successfully"
+echo ""
+
 # Build manylinux x64 image
 echo "==> Building manylinux x64 image..."
 docker build \
@@ -62,6 +80,8 @@ echo "✅ All images built successfully!"
 echo "======================================================"
 echo ""
 echo "Built images:"
+echo "  - ${ACR_REGISTRY}/python-build/manylinux_2_28_x86_64_rust:latest"
+echo "  - ${ACR_REGISTRY}/python-build/manylinux_2_28_aarch64_rust:latest"
 echo "  - ${ACR_REGISTRY}/python-build/manylinux_2_34_x86_64_rust:latest"
 echo "  - ${ACR_REGISTRY}/python-build/manylinux_2_34_aarch64_rust:latest"
 echo "  - ${ACR_REGISTRY}/python-build/musllinux_1_2_x86_64_rust:latest"
