@@ -60,7 +60,7 @@ stages:
         source_branch = os.environ["SYSTEM_PULLREQUEST_SOURCEBRANCH"]
         source_commit = os.environ["SYSTEM_PULLREQUEST_SOURCECOMMITID"]
         token = os.environ["SYSTEM_ACCESSTOKEN"]
-        # Scan a bounded recent window to keep the REST call lightweight.
+        # 200 keeps API payloads small while covering repeated draft/ready transitions on busy PRs.
         max_candidates = "200"
 
         query = urllib.parse.urlencode(
@@ -83,7 +83,7 @@ stages:
                 payload = json.load(response)
         except Exception as exc:
             print(
-                f"##vso[task.logissue type=warning]Failed to query prior PR validation runs ({type(exc).__name__}). Continuing with full validation."
+                f"##vso[task.logissue type=warning]Failed to query prior PR validation runs ({type(exc).__name__}: {exc}). Continuing with full validation."
             )
             print("##vso[task.setvariable variable=skipDuplicate;isOutput=true]false")
             raise SystemExit(0)
@@ -96,7 +96,7 @@ stages:
 
             trigger_info = build.get("triggerInfo", {})
             prior_source_commit = trigger_info.get("pr.sourceSha")
-            if prior_source_commit == source_commit and build.get("result") == "succeeded":
+            if prior_source_commit == source_commit:
                 matching_run = build
                 break
 
