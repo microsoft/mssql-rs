@@ -103,11 +103,12 @@ pub struct PacketWriter<'a> {
     /// Connection-reset request to set on the first packet of this message.
     /// Only honored for SQL Batch, RPC, and Transaction Manager messages.
     reset_mode: ResetConnectionMode,
-    /// Whether a non-final (Normal) packet has already been flushed for the
-    /// current message. When the payload ends exactly on a packet boundary the
-    /// buffer is flushed empty, so `finalize` must still emit a trailing EOM
-    /// packet even though no buffered data remains (issue #73).
-    partial_packet_sent: bool,
+    /// Whether the server is still owed an End-Of-Message packet for the
+    /// current message. A non-final flush sets it; sending the final packet
+    /// clears it. This lets `finalize` emit a trailing EOM packet even when the
+    /// payload ended exactly on a packet boundary, leaving the buffer empty
+    /// (issue #73).
+    eom_pending: bool,
 }
 
 impl<'a> PacketWriter<'a> {
@@ -153,7 +154,7 @@ impl<'a> PacketWriter<'a> {
             max_timeout_sec: effective_timeout,
             cancel_handle: cancel_handle.map(|handle| handle.child_handle()),
             reset_mode,
-            partial_packet_sent: false,
+            eom_pending: false,
         }
     }
 
@@ -282,11 +283,10 @@ impl<'a> PacketWriter<'a> {
         // Add the counter for the packet and increment by 1 for the next packet.
         self.packet_id = self.packet_id.wrapping_add(1);
 
-        // Remember whether a non-final packet was flushed so that `finalize`
-        // can still send a trailing EOM packet when the buffer ends empty.
-        if !is_last_packet {
-            self.partial_packet_sent = true;
-        }
+        // A non-final flush leaves the message unterminated; a final packet
+        // terminates it. `finalize` uses this to know whether it still needs to
+        // send a trailing EOM packet when the buffer ends empty.
+        self.eom_pending = !is_last_packet;
 
         // Restore the cursor position.
         self.payload_cursor.set_position(saved_position);
@@ -335,17 +335,15 @@ impl<'a> PacketWriter<'a> {
 #[async_trait]
 impl TdsPacketWriter for PacketWriter<'_> {
     async fn finalize(&mut self) -> TdsResult<()> {
-        // Send a final EOM packet when there is buffered payload, or when a
-        // non-final packet was already flushed but the EOM packet has not been
-        // sent yet. The latter happens when the payload ends exactly on a
-        // packet boundary, leaving the buffer empty after the flush (issue #73).
-        if self.payload_cursor.position() > Self::PACKET_HEADER_SIZE as u64
-            || self.partial_packet_sent
-        {
+        // Send a final EOM packet when there is buffered payload, or when the
+        // server is still owed an EOM after a non-final flush. The latter
+        // happens when the payload ends exactly on a packet boundary, leaving
+        // the buffer empty after the flush (issue #73). `populate_header_and_send`
+        // clears `eom_pending` once the EOM packet goes out.
+        if self.payload_cursor.position() > Self::PACKET_HEADER_SIZE as u64 || self.eom_pending {
             self.populate_header_and_send(true, false).await?;
             self.payload_cursor
                 .set_position(Self::PACKET_HEADER_SIZE as u64);
-            self.partial_packet_sent = false;
         }
         Ok(())
     }
