@@ -8,14 +8,15 @@ use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::ClientContext;
 use crate::connection::session_recovery::RecoveryContext;
 use crate::cursor::{
-    CursorConcurrency, CursorOpenResponse, CursorPrepExecResponse, CursorPrepareResponse,
-    CursorScrollOption, FetchDirection,
+    CursorConcurrency, CursorOpenResponse, CursorOperation, CursorOptionCode, CursorOptionValue,
+    CursorPrepExecResponse, CursorPrepareResponse, CursorScrollOption, CursorStatus,
+    FetchDirection, FetchStatus,
 };
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sqltypes::SqlType;
-use crate::error::Error::UsageError;
+use crate::error::Error::{ProtocolError, UsageError};
 use crate::error::SqlErrorInfo;
 use crate::io::packet_writer::PacketWriter;
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
@@ -51,6 +52,17 @@ use crate::{
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// State of the `ReturnStatus` token observed while draining the most recent
+/// cursor RPC response. Distinguishes "no token was sent" from an actual raw
+/// status value, so neither case is silently collapsed at interpretation time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReturnStatus {
+    /// No `ReturnStatus` token was sent for the most recent RPC.
+    NotReceived,
+    /// The server sent a `ReturnStatus` token carrying this raw value.
+    Received(i32),
+}
+
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -67,6 +79,9 @@ pub struct TdsClient {
     count_map: HashMap<CurrentCommand, u64>,
 
     return_values: Vec<ReturnValue>,
+    /// State of the most recent `ReturnStatus` token, captured while draining a
+    /// cursor RPC response and interpreted as a [`CursorStatus`].
+    last_return_status: ReturnStatus,
     current_result_set_has_been_read_till_end: bool,
 
     /// The remaining request timeout for operations. This is updated after each token read.
@@ -105,6 +120,7 @@ impl TdsClient {
             current_metadata: None,
             count_map: HashMap::new(),
             return_values: Vec::new(),
+            last_return_status: ReturnStatus::NotReceived,
             current_result_set_has_been_read_till_end: false,
             remaining_request_timeout: None,
             cancel_handle: None,
@@ -1441,6 +1457,7 @@ impl TdsClient {
     /// rest and collects the OUTPUT parameters.
     async fn consume_cursor_open_response(&mut self) -> TdsResult<CursorOpenResponse> {
         self.drain_cursor_response().await?;
+        let status = self.captured_cursor_status()?;
 
         Ok(CursorOpenResponse {
             cursor_id: self.extract_return_value_int(0)?,
@@ -1451,7 +1468,25 @@ impl TdsClient {
                 self.extract_return_value_int(2)? as u32,
             ),
             row_count: self.extract_return_value_int(3)?,
+            status,
         })
+    }
+
+    /// Interprets the most recently captured `ReturnStatus` token as a
+    /// [`CursorStatus`] for the open-family RPCs.
+    ///
+    /// A missing token (`NotReceived`) maps to [`CursorStatus::Succeeded`]; an
+    /// unrecognized raw value is surfaced as a protocol error rather than being
+    /// silently treated as success.
+    fn captured_cursor_status(&self) -> TdsResult<CursorStatus> {
+        match self.last_return_status {
+            ReturnStatus::NotReceived => Ok(CursorStatus::Succeeded),
+            ReturnStatus::Received(raw) => CursorStatus::from_raw(raw).ok_or_else(|| {
+                ProtocolError(format!(
+                    "server returned an unrecognized cursor status: {raw}"
+                ))
+            }),
+        }
     }
 
     /// Shared response tail for the cursor open-family RPCs (`sp_cursoropen`,
@@ -1465,6 +1500,9 @@ impl TdsClient {
         // Clear any stale metadata up-front so an error here cannot leak columns
         // from a previous result set through get_metadata().
         self.current_metadata = None;
+        // Clear any stale return status so a missing ReturnStatus token surfaces
+        // as Succeeded rather than the previous RPC's status.
+        self.last_return_status = ReturnStatus::NotReceived;
         let metadata = self.move_to_column_metadata().await?;
         self.current_metadata = metadata;
         let server_errors = self.drain_stream().await?;
@@ -1542,6 +1580,58 @@ impl TdsClient {
         Ok(())
     }
 
+    /// Reads the next row from an open cursor's fetch buffer, splitting off the
+    /// hidden trailing `rowstat` column and decoding it as a [`FetchStatus`].
+    ///
+    /// `sp_cursorfetch` appends a hidden `int` `rowstat` column to every row
+    /// (see [`cursor_fetch`](Self::cursor_fetch)). This method strips that
+    /// column from the returned data and decodes it, so a driver can report
+    /// per-row state (`SQL_ROW_DELETED` / `UPDATED` / `ADDED`) for keyset and
+    /// dynamic cursors. Use it instead of [`next_row`](ResultSet::next_row) when
+    /// consuming a cursor fetch.
+    ///
+    /// Returns `Ok(None)` at the end of the fetch buffer. The data columns are
+    /// returned without the `rowstat`, though
+    /// [`get_metadata`](ResultSet::get_metadata) still includes its descriptor.
+    /// Returns a usage error if the current result set is not a cursor fetch
+    /// (no trailing `rowstat` column).
+    #[instrument(skip(self), level = "info")]
+    pub async fn next_cursor_row(&mut self) -> TdsResult<Option<(Vec<ColumnValues>, FetchStatus)>> {
+        // Guard: only valid on an sp_cursorfetch result, whose last column is the
+        // trailing `rowstat`. The server names it `rowstat` but does NOT set the
+        // hidden flag on it, so it is identified by name. Refuse to strip a real
+        // column from a normal result.
+        let has_rowstat = self
+            .get_metadata()
+            .last()
+            .map(|c| c.column_name.eq_ignore_ascii_case("rowstat"))
+            .unwrap_or(false);
+        if !has_rowstat {
+            return Err(UsageError(
+                "next_cursor_row requires a cursor fetch result with a trailing rowstat column"
+                    .to_string(),
+            ));
+        }
+
+        let Some(mut row) = self.next_row().await? else {
+            return Ok(None);
+        };
+        let rowstat = row.pop().ok_or_else(|| {
+            crate::error::Error::ProtocolError(
+                "cursor fetch row is missing its trailing rowstat column".to_string(),
+            )
+        })?;
+        let bits = match rowstat {
+            ColumnValues::Int(v) => v as u32,
+            other => {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "expected an INT rowstat column at the end of a cursor fetch row, got {other:?}"
+                )));
+            }
+        };
+        Ok(Some((row, FetchStatus::from_bits_truncate(bits))))
+    }
+
     /// Closes a server cursor and releases server resources (`sp_cursorclose`, RPC ID 9).
     ///
     /// After this call the `cursor_id` is invalid and must not be reused.
@@ -1575,6 +1665,183 @@ impl TdsClient {
 
         let rpc = SqlRpc::new(
             RpcType::ProcId(RpcProcs::CursorClose),
+            Some(params),
+            None,
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        let server_errors = self.drain_stream().await?;
+        self.execution_context.set_has_open_batch(false);
+        if !server_errors.is_empty() {
+            return Err(crate::error::Error::from_sql_errors(server_errors));
+        }
+        Ok(())
+    }
+
+    /// Performs a positioned operation on the current fetch buffer of an open
+    /// cursor (`sp_cursor`, RPC ID 1).
+    ///
+    /// Supports positioned `UPDATE` / `DELETE` / `INSERT` (and `LOCK`,
+    /// `REFRESH`, `SETPOSITION`) via [`CursorOperation`]. The `values` are the
+    /// column values for `UPDATE` / `INSERT`, supplied as **named** parameters
+    /// whose names are the target columns prefixed with `@` (e.g. `@Name`);
+    /// pass an empty vector for `DELETE` / `LOCK`. `rownum` selects the 1-based
+    /// row within the fetch buffer (`0` targets all rows). `table` names the
+    /// target table when the cursor's SELECT joins multiple tables; pass `""`
+    /// to default to the first table in the FROM clause.
+    ///
+    /// Requires an updatable cursor (non-`READONLY` concurrency). A concurrency
+    /// conflict or constraint violation is surfaced as an
+    /// [`Error`](crate::error::Error) carrying the server message.
+    #[allow(clippy::too_many_arguments)] // Matches sp_cursor's positional parameters
+    #[instrument(skip(self, values), level = "info")]
+    pub async fn perform_cursor_operation(
+        &mut self,
+        cursor_id: i32,
+        optype: CursorOperation,
+        rownum: i32,
+        table: &str,
+        values: Vec<RpcParameter>,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        // The column values are sent as named (@column) RPC parameters, so each
+        // must carry a name; an unnamed parameter would panic during
+        // serialization. Reject it as a usage error before any I/O.
+        if values.iter().any(|p| p.name.is_none()) {
+            return Err(UsageError(
+                "perform_cursor_operation values must be named parameters (column names prefixed with `@`)"
+                    .to_string(),
+            ));
+        }
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        // sp_cursor positional params: cursor, optype, rownum, table. The column
+        // values follow as named (@column) RPC parameters, so no parameter
+        // declaration string is sent (unlike sp_cursoropen).
+        let positional_params = vec![
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(cursor_id))),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::Int(Some(optype.bits() as i32)),
+            ),
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(rownum))),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(table.to_string()))),
+            ),
+        ];
+
+        let user_params = if values.is_empty() {
+            None
+        } else {
+            Some(values)
+        };
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::Cursor),
+            Some(positional_params),
+            user_params,
+            &db_collation,
+            &self.execution_context,
+        );
+
+        let mut pw =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        rpc.serialize(&mut pw).await?;
+
+        let server_errors = self.drain_stream().await?;
+        self.execution_context.set_has_open_batch(false);
+        if !server_errors.is_empty() {
+            return Err(crate::error::Error::from_sql_errors(server_errors));
+        }
+        Ok(())
+    }
+
+    /// Sets an option on an open cursor (`sp_cursoroption`, RPC ID 8).
+    ///
+    /// Most commonly used to assign a **name** to the cursor
+    /// ([`CursorOptionCode::CursorName`]) so Transact-SQL `WHERE CURRENT OF`
+    /// positioned statements can target it, or to toggle text-pointer handling.
+    /// The `value` variant must match what `code` expects: only
+    /// [`CursorOptionCode::CursorName`] takes a [`CursorOptionValue::String`];
+    /// every other code takes a [`CursorOptionValue::Int`]. A mismatch returns
+    /// a usage error without contacting the server.
+    #[instrument(skip(self), level = "info")]
+    pub async fn set_cursor_option(
+        &mut self,
+        cursor_id: i32,
+        code: CursorOptionCode,
+        value: CursorOptionValue,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        // Validate the value type matches the option code before any server
+        // round-trip, so bad input fails fast.
+        let value_param = match (&value, code.expects_string()) {
+            (CursorOptionValue::String(s), true) => RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(s.clone()))),
+            ),
+            (CursorOptionValue::Int(i), false) => {
+                RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(*i)))
+            }
+            _ => {
+                return Err(UsageError(format!(
+                    "sp_cursoroption code {code:?} expects a {} value",
+                    if code.expects_string() {
+                        "string"
+                    } else {
+                        "integer"
+                    }
+                )));
+            }
+        };
+
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.return_values.clear();
+        self.transport.reset_reader();
+
+        let db_collation = self.negotiated_settings.database_collation;
+
+        // sp_cursoroption positional params: cursor, code, value.
+        let params = vec![
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(cursor_id))),
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(code as i32))),
+            value_param,
+        ];
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::CursorOption),
             Some(params),
             None,
             &db_collation,
@@ -1704,6 +1971,7 @@ impl TdsClient {
         rpc.serialize(&mut pw).await?;
 
         self.drain_cursor_response().await?;
+        let status = self.captured_cursor_status()?;
 
         // OUTPUT ordinals: 0=prepared_handle, 1=cursor, 2=scrollopt, 3=ccopt, 4=rowcount
         Ok(CursorPrepExecResponse {
@@ -1717,6 +1985,7 @@ impl TdsClient {
                     self.extract_return_value_int(3)? as u32,
                 ),
                 row_count: self.extract_return_value_int(4)?,
+                status,
             },
         })
     }
@@ -1895,6 +2164,7 @@ impl TdsClient {
         rpc.serialize(&mut pw).await?;
 
         self.drain_cursor_response().await?;
+        let status = self.captured_cursor_status()?;
 
         // OUTPUT ordinals: 0=prepared_handle, 1=scrollopt, 2=ccopt (no rowcount).
         Ok(CursorPrepareResponse {
@@ -1905,6 +2175,7 @@ impl TdsClient {
             negotiated_concurrency: CursorConcurrency::from_bits_truncate(
                 self.extract_return_value_int(2)? as u32,
             ),
+            status,
         })
     }
 
@@ -2013,8 +2284,9 @@ impl TdsClient {
                     let return_value = return_value_token.into();
                     self.return_values.push(return_value);
                 }
-                Tokens::ReturnStatus(_return_status) => {
-                    info!(?_return_status);
+                Tokens::ReturnStatus(return_status) => {
+                    self.last_return_status = ReturnStatus::Received(return_status.value);
+                    info!(?return_status);
                 }
                 _ => {
                     info!(?token);
@@ -2124,6 +2396,7 @@ impl TdsClient {
                     self.return_values.push(return_value);
                 }
                 Tokens::ReturnStatus(return_status) => {
+                    self.last_return_status = ReturnStatus::Received(return_status.value);
                     info!("Received return_status token: {:?}", return_status);
                     continue;
                 }

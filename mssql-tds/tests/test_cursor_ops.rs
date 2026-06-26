@@ -10,8 +10,13 @@ mod common;
 
 use common::{begin_connection, build_tcp_datasource};
 use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
-use mssql_tds::cursor::{CursorConcurrency, CursorScrollOption, FetchDirection};
+use mssql_tds::cursor::{
+    CursorConcurrency, CursorOperation, CursorOptionCode, CursorOptionValue, CursorScrollOption,
+    CursorStatus, FetchDirection, FetchStatus,
+};
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::sqltypes::SqlType;
+use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 
 /// Set up a temp table with the given number of rows.
 async fn setup_temp_table(
@@ -1342,6 +1347,358 @@ async fn cursor_unprepare_invalid_handle() {
         .execute("SELECT 1".to_string(), None, None)
         .await
         .unwrap();
+    client.close_query().await.unwrap();
+    client.close_connection().await.unwrap();
+}
+
+// --- Positioned operations (sp_cursor) and cursor options (sp_cursoroption) ---
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_positioned_update() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 5).await;
+
+    // Updatable cursor: keyset-driven with optimistic concurrency.
+    let resp = client
+        .cursor_open(
+            "SELECT id, name, value FROM #ct ORDER BY id",
+            CursorScrollOption::KEYSET_DRIVEN,
+            CursorConcurrency::OPTCC,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let cursor_id = resp.cursor_id;
+    assert_ne!(cursor_id, 0);
+
+    // Fetch the first row into the fetch buffer, then drain the rowset so the
+    // connection is free for the positioned operation.
+    client
+        .cursor_fetch(cursor_id, FetchDirection::NEXT, 0, 1, None, None)
+        .await
+        .unwrap();
+    let rows = read_all_rows(&mut client).await;
+    assert_eq!(rows.len(), 1);
+    let first_id = match rows[0][0] {
+        ColumnValues::Int(v) => v,
+        ref other => panic!("expected INT id, got {other:?}"),
+    };
+
+    // Positioned UPDATE of row 1 in the fetch buffer: value = 999. The column
+    // value is supplied as a named @value parameter.
+    client
+        .perform_cursor_operation(
+            cursor_id,
+            CursorOperation::UPDATE,
+            1,
+            "",
+            vec![RpcParameter::new(
+                Some("@value".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(999)),
+            )],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    client.cursor_close(cursor_id, None, None).await.unwrap();
+
+    // Verify the row was modified.
+    client
+        .execute(
+            format!("SELECT value FROM #ct WHERE id = {first_id}"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let verify = read_all_rows(&mut client).await;
+    assert_eq!(verify.len(), 1);
+    assert_eq!(verify[0][0], ColumnValues::Int(999));
+
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_positioned_delete() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 5).await;
+
+    let resp = client
+        .cursor_open(
+            "SELECT id, name, value FROM #ct ORDER BY id",
+            CursorScrollOption::KEYSET_DRIVEN,
+            CursorConcurrency::OPTCC,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let cursor_id = resp.cursor_id;
+
+    client
+        .cursor_fetch(cursor_id, FetchDirection::NEXT, 0, 1, None, None)
+        .await
+        .unwrap();
+    let rows = read_all_rows(&mut client).await;
+    assert_eq!(rows.len(), 1);
+    let first_id = match rows[0][0] {
+        ColumnValues::Int(v) => v,
+        ref other => panic!("expected INT id, got {other:?}"),
+    };
+
+    // Positioned DELETE of row 1 in the fetch buffer (no value params).
+    client
+        .perform_cursor_operation(
+            cursor_id,
+            CursorOperation::DELETE,
+            1,
+            "",
+            vec![],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    client.cursor_close(cursor_id, None, None).await.unwrap();
+
+    // Verify the row is gone.
+    client
+        .execute(
+            format!("SELECT COUNT(*) FROM #ct WHERE id = {first_id}"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let verify = read_all_rows(&mut client).await;
+    assert_eq!(verify.len(), 1);
+    assert_eq!(verify[0][0], ColumnValues::Int(0));
+
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_option_set_name() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 3).await;
+
+    let resp = client
+        .cursor_open(
+            "SELECT id, name, value FROM #ct ORDER BY id",
+            CursorScrollOption::KEYSET_DRIVEN,
+            CursorConcurrency::OPTCC,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let cursor_id = resp.cursor_id;
+
+    // Assign a Transact-SQL cursor name (used by WHERE CURRENT OF). The string
+    // value matches CursorOptionCode::CursorName's expectation.
+    client
+        .set_cursor_option(
+            cursor_id,
+            CursorOptionCode::CursorName,
+            CursorOptionValue::String("my_named_cursor".to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    client.cursor_close(cursor_id, None, None).await.unwrap();
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_option_rejects_type_mismatch() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+
+    // CursorName expects a string; passing an Int must fail fast with a usage
+    // error before any server round-trip.
+    let result = client
+        .set_cursor_option(
+            1,
+            CursorOptionCode::CursorName,
+            CursorOptionValue::Int(7),
+            None,
+            None,
+        )
+        .await;
+    assert!(result.is_err(), "type mismatch should be rejected");
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("expects a string value"),
+        "error should mention expected type: {err_msg}"
+    );
+
+    client.close_connection().await.unwrap();
+}
+
+// --- Status surfacing (Gap 2): CursorStatus on open-family responses ---
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_open_reports_succeeded_status() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 5).await;
+
+    let resp = client
+        .cursor_open(
+            "SELECT id FROM #ct ORDER BY id",
+            CursorScrollOption::KEYSET_DRIVEN,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // A normal open is neither auto-closed nor asynchronously populated.
+    assert_eq!(resp.status, CursorStatus::Succeeded);
+
+    client
+        .cursor_close(resp.cursor_id, None, None)
+        .await
+        .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_prepexec_reports_succeeded_status() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 3).await;
+
+    let resp = client
+        .cursor_prepexec(
+            "SELECT id FROM #ct ORDER BY id",
+            vec![],
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.cursor.status, CursorStatus::Succeeded);
+
+    client
+        .cursor_close(resp.cursor.cursor_id, None, None)
+        .await
+        .unwrap();
+    client
+        .cursor_unprepare(resp.prepared_handle, None, None)
+        .await
+        .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_prepare_reports_succeeded_status() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 3).await;
+
+    let resp = client
+        .cursor_prepare(
+            "SELECT id FROM #ct ORDER BY id",
+            "",
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // Prepare opens no cursor, so the status is always success.
+    assert_eq!(resp.status, CursorStatus::Succeeded);
+
+    client
+        .cursor_unprepare(resp.prepared_handle, None, None)
+        .await
+        .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+// --- Per-row rowstat / FetchStatus (Gap 3) ---
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_rowstat_succeeded() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 5).await;
+
+    let resp = client
+        .cursor_open(
+            "SELECT id, name, value FROM #ct ORDER BY id",
+            CursorScrollOption::KEYSET_DRIVEN,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let cursor_id = resp.cursor_id;
+
+    client
+        .cursor_fetch(cursor_id, FetchDirection::NEXT, 0, 5, None, None)
+        .await
+        .unwrap();
+
+    // next_cursor_row splits the hidden trailing rowstat column off each row.
+    let mut ids = Vec::new();
+    while let Some((row, status)) = client.next_cursor_row().await.unwrap() {
+        // Unchanged keyset rows fetch successfully.
+        assert!(
+            status.contains(FetchStatus::SUCCEEDED),
+            "expected SUCCEEDED rowstat, got {status:?}"
+        );
+        // Only id, name, value remain after the rowstat is stripped.
+        assert_eq!(
+            row.len(),
+            3,
+            "rowstat column should be stripped from the row"
+        );
+        if let ColumnValues::Int(id) = row[0] {
+            ids.push(id);
+        }
+    }
+    client.close_query().await.unwrap();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+
+    client.cursor_close(cursor_id, None, None).await.unwrap();
+    client.close_connection().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn next_cursor_row_rejects_non_cursor_result() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 2).await;
+
+    // An ordinary query result has no trailing rowstat column, so next_cursor_row
+    // must refuse to strip a real data column.
+    client
+        .execute("SELECT id FROM #ct ORDER BY id".to_string(), None, None)
+        .await
+        .unwrap();
+    let result = client.next_cursor_row().await;
+    assert!(
+        result.is_err(),
+        "next_cursor_row on a normal result set must error"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("rowstat"),
+        "error should mention rowstat: {err_msg}"
+    );
     client.close_query().await.unwrap();
     client.close_connection().await.unwrap();
 }

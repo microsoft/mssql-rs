@@ -957,12 +957,12 @@ impl DoneToken {
 pub(crate) struct ReturnStatusToken {
     /// Return value from the stored procedure's RETURN statement
     /// Convention: 0 = success, negative = error, positive = application-specific
-    pub _value: i32,
+    pub value: i32,
 }
 
 impl Token for ReturnStatusToken {
     fn token_type(&self) -> TokenType {
-        TokenType::ReturnValue
+        TokenType::ReturnStatus
     }
 }
 
