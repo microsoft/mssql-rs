@@ -138,6 +138,8 @@ stages:
                     prior_pr_id = trigger_info.get("pr.pullRequestId")
                 # A mismatched PR identifier means this run belongs to a different PR and must not be treated as duplicate.
                 if prior_pr_id and str(prior_pr_id) != pull_request_id:
+                    # Without branch scope in the REST query, PR id mismatch is the only safe discriminator
+                    # to avoid treating runs from other PRs as duplicates.
                     if not build_source_branch:
                         skipped_for_pr_mismatch += 1
                         continue
@@ -163,8 +165,8 @@ stages:
         else:
             print(
                 "Duplicate guard summary: "
-                f"skippedForPrMismatch={skipped_for_pr_mismatch}, "
-                f"skippedForMissingSourceSha={skipped_for_missing_sha}"
+                f"skipped_for_pr_mismatch={skipped_for_pr_mismatch}, "
+                f"skipped_for_missing_source_sha={skipped_for_missing_sha}"
             )
             print(f"No successful prior validation run found for PR head {source_commit}; continuing.")
             print("##vso[task.setvariable variable=skipDuplicate;isOutput=true]false")
