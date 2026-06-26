@@ -1023,8 +1023,11 @@ impl TdsClient {
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
         // Stored-procedure execution uses the connection's Always Encrypted
-        // setting; per-command parameter encryption is not applied here.
+        // setting; there is no per-command override on this path.
         self.current_command_ce_setting = SqlCommandColumnEncryptionSetting::UseConnectionSetting;
+
+        #[cfg_attr(not(feature = "column-encryption"), allow(unused_mut))]
+        let mut named_parameters = named_parameters;
 
         if self.execution_context.has_open_batch() {
             return Err(crate::error::Error::UsageError(
@@ -1041,6 +1044,30 @@ impl TdsClient {
 
         self.return_values.clear();
         self.transport.reset_reader();
+
+        // Always Encrypted: when the connection enabled column encryption and the
+        // server acknowledged the feature, ask the server which named parameters
+        // need encryption (via `sp_describe_parameter_encryption` against an
+        // `EXEC` form of the call) and encrypt them in place before sending the
+        // real stored-procedure RPC. Positional parameters cannot be referenced
+        // by name in the describe request and are sent unchanged.
+        #[cfg(feature = "column-encryption")]
+        if self.should_encrypt_parameters()
+            && let Some(named) = named_parameters.as_mut()
+            && named.iter().any(|p| p.name.is_some())
+        {
+            let (tsql, params_decl) =
+                Self::build_stored_procedure_describe_request(&stored_procedure_name, named)?;
+            self.encrypt_parameters(&tsql, &params_decl, named, timeout_sec, cancel_handle)
+                .await?;
+            // The describe round-trip closes its own batch, which clears
+            // the per-operation timeout/cancel state; restore it for the
+            // real RPC.
+            self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+            self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+            self.transport.reset_reader();
+        }
+
         let database_collation = self.negotiated_settings.database_collation;
 
         let rpc = SqlRpc::new(
@@ -1850,6 +1877,51 @@ impl TdsClient {
             );
         }
         Ok(())
+    }
+
+    /// Builds the `@tsql` and `@params` arguments for
+    /// `sp_describe_parameter_encryption` when the original call is a stored
+    /// procedure (rather than an `sp_executesql` statement).
+    ///
+    /// `@tsql` is an `EXEC` form that names every parameter so the server can
+    /// resolve per-parameter encryption metadata:
+    /// `EXEC <proc> @p1=@p1, @p2=@p2 OUTPUT, ...`. `@params` is the matching
+    /// declaration list (`@p1 int, @p2 nvarchar(10) OUTPUT, ...`). Only named
+    /// parameters participate; positional parameters cannot be referenced by
+    /// name and are omitted. Mirrors dotnet
+    /// `BuildStoredProcedureStatementForColumnEncryption`.
+    #[cfg(feature = "column-encryption")]
+    fn build_stored_procedure_describe_request(
+        stored_procedure_name: &str,
+        named_params: &[RpcParameter],
+    ) -> TdsResult<(String, String)> {
+        use std::fmt::Write as _;
+
+        let mut tsql = format!("EXEC {stored_procedure_name}");
+        let mut params_decl = String::new();
+        let mut first = true;
+
+        for param in named_params {
+            let Some(name) = param.name.as_deref() else {
+                continue;
+            };
+            let type_name = RpcParameter::get_sql_name(param.value())?;
+            let output = if param.is_output() { " OUTPUT" } else { "" };
+
+            if first {
+                tsql.push(' ');
+                first = false;
+            } else {
+                tsql.push_str(", ");
+                params_decl.push_str(", ");
+            }
+
+            // `write!` into a String is infallible.
+            let _ = write!(tsql, "{name}={name}{output}");
+            let _ = write!(params_decl, "{name} {type_name}{output}");
+        }
+
+        Ok((tsql, params_decl))
     }
 
     /// Resolves (and memoizes) the cell decryptor for the current result set's
@@ -3091,5 +3163,62 @@ mod tests {
         // parameter encryption must not be attempted even when enabled.
         client.current_command_ce_setting = S::Enabled;
         assert!(!client.should_encrypt_parameters());
+    }
+
+    #[cfg(feature = "column-encryption")]
+    #[test]
+    fn build_sp_describe_request_names_params_and_marks_output() {
+        use crate::datatypes::sqltypes::SqlType;
+        use crate::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let params = vec![
+            RpcParameter::new(
+                Some("@id".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(1)),
+            ),
+            RpcParameter::new(
+                Some("@count".to_string()),
+                StatusFlags::BY_REF_VALUE,
+                SqlType::BigInt(None),
+            ),
+        ];
+
+        let (tsql, params_decl) =
+            TdsClient::build_stored_procedure_describe_request("dbo.my_proc", &params)
+                .expect("building the describe request should succeed");
+
+        assert_eq!(tsql, "EXEC dbo.my_proc @id=@id, @count=@count OUTPUT");
+        assert_eq!(params_decl, "@id int, @count bigint OUTPUT");
+    }
+
+    #[cfg(feature = "column-encryption")]
+    #[test]
+    fn build_sp_describe_request_skips_positional_params() {
+        use crate::datatypes::sqltypes::SqlType;
+        use crate::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        // A positional (unnamed) parameter cannot be referenced by name in the
+        // describe request and must be omitted without disturbing the commas.
+        let params = vec![
+            RpcParameter::new(
+                Some("@a".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(1)),
+            ),
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(2))),
+            RpcParameter::new(
+                Some("@b".to_string()),
+                StatusFlags::NONE,
+                SqlType::BigInt(Some(3)),
+            ),
+        ];
+
+        let (tsql, params_decl) =
+            TdsClient::build_stored_procedure_describe_request("proc", &params)
+                .expect("building the describe request should succeed");
+
+        assert_eq!(tsql, "EXEC proc @a=@a, @b=@b");
+        assert_eq!(params_decl, "@a int, @b bigint");
     }
 }

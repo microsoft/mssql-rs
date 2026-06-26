@@ -310,6 +310,16 @@ impl RpcParameter {
         &self.value
     }
 
+    /// Returns `true` when the parameter is passed by reference (an output or
+    /// input/output parameter). Used when building the
+    /// `sp_describe_parameter_encryption` request for a stored procedure, where
+    /// output parameters must be marked `OUTPUT` in both the `EXEC` statement
+    /// and the parameter declaration.
+    #[cfg(feature = "column-encryption")]
+    pub(crate) fn is_output(&self) -> bool {
+        self.options.contains(StatusFlags::BY_REF_VALUE)
+    }
+
     /// Serializes the parameter's value in its encrypted form: the ENCRYPTED
     /// status flag, a BIGVARBINARY TYPE_INFO carrying the ciphertext, the
     /// plaintext base TYPE_INFO, and the trailing CryptoMetaData block.

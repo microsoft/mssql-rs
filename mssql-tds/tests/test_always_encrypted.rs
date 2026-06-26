@@ -114,6 +114,7 @@ mod always_encrypted {
         suffix: String,
         table_seq: u32,
         created_tables: Vec<String>,
+        created_procs: Vec<String>,
     }
 
     impl AeHarness {
@@ -173,6 +174,7 @@ mod always_encrypted {
                 suffix,
                 table_seq: 0,
                 created_tables: Vec::new(),
+                created_procs: Vec::new(),
             }
         }
 
@@ -181,6 +183,13 @@ mod always_encrypted {
             let name = format!("dbo.ae_t{}_{}", self.table_seq, self.suffix);
             self.table_seq += 1;
             self.created_tables.push(name.clone());
+            name
+        }
+
+        /// Reserves and records a unique stored-procedure name for this run.
+        fn next_proc(&mut self) -> String {
+            let name = format!("dbo.ae_p{}_{}", self.created_procs.len(), self.suffix);
+            self.created_procs.push(name.clone());
             name
         }
 
@@ -245,6 +254,13 @@ mod always_encrypted {
         /// Drops every object this run created, ignoring errors so cleanup is
         /// best-effort even if the connection is unhealthy.
         async fn teardown(mut self) {
+            for proc in self.created_procs.clone() {
+                let _ = run_statement(
+                    &mut self.client,
+                    &format!("IF OBJECT_ID('{proc}','P') IS NOT NULL DROP PROCEDURE {proc};"),
+                )
+                .await;
+            }
             for table in self.created_tables.clone() {
                 let _ = run_statement(
                     &mut self.client,
@@ -683,6 +699,49 @@ mod always_encrypted {
                 |v| assert!(matches!(v, ColumnValues::Null), "null datetime2, got {v:?}"),
             )
             .await;
+        });
+    }
+
+    // ----- Stored-procedure parameter encryption -----
+
+    /// A named parameter passed to [`TdsClient::execute_stored_procedure`] that
+    /// flows into an encrypted column is encrypted transparently: the driver
+    /// runs `sp_describe_parameter_encryption` against the `EXEC` form of the
+    /// call, learns the parameter must be encrypted, and sends ciphertext.
+    #[tokio::test]
+    async fn stored_procedure_encrypts_named_parameter() {
+        ae_test!(|h| {
+            let table = h.create_encrypted_table("INT", "DETERMINISTIC").await;
+            let proc = h.next_proc();
+            run_statement(
+                &mut h.client,
+                &format!(
+                    "CREATE PROCEDURE {proc} @val INT AS BEGIN \
+                     INSERT INTO {table} (val) VALUES (@val); END"
+                ),
+            )
+            .await
+            .expect("create stored procedure");
+
+            let param = RpcParameter::new(
+                Some("@val".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(321)),
+            );
+            h.client
+                .execute_stored_procedure(proc.clone(), None, Some(vec![param]), None, None)
+                .await
+                .expect("execute stored procedure with encrypted parameter");
+            while h.client.move_to_next().await.unwrap() {}
+            h.client.close_query().await.unwrap();
+
+            let got = select_val(&mut h.client, &table)
+                .await
+                .expect("read back value inserted via stored procedure");
+            assert!(
+                matches!(got, ColumnValues::Int(321)),
+                "stored-procedure encrypted insert round-trip, got {got:?}"
+            );
         });
     }
 
