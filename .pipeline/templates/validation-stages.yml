@@ -57,7 +57,7 @@ stages:
         team_project = os.environ["SYSTEM_TEAMPROJECT"]
         definition_id = os.environ["SYSTEM_DEFINITIONID"]
         current_build_id = int(os.environ["BUILD_BUILDID"])
-        build_branch = os.environ.get("BUILD_SOURCEBRANCH", "")
+        pr_merge_branch = os.environ.get("BUILD_SOURCEBRANCH", "")
         source_commit = os.environ["SYSTEM_PULLREQUEST_SOURCECOMMITID"].lower()
         pull_request_id = os.environ.get("SYSTEM_PULLREQUEST_PULLREQUESTID", "")
         token = os.environ["SYSTEM_ACCESSTOKEN"]
@@ -74,10 +74,10 @@ stages:
             "$top": max_candidates,
             "api-version": "7.1",
         }
-        if build_branch:
+        if pr_merge_branch:
             # PR validation runs are indexed by the synthetic PR branch (for example refs/pull/<id>/merge),
             # not by System.PullRequest.SourceBranch (refs/heads/<branch>).
-            query_params["branchName"] = build_branch
+            query_params["branchName"] = pr_merge_branch
         query = urllib.parse.urlencode(query_params)
         url = f"{collection_uri}{team_project}/_apis/build/builds?{query}"
         headers = {"Authorization": "Bearer " + token}
@@ -99,7 +99,9 @@ stages:
                 continue
 
             trigger_info = build.get("triggerInfo", {})
-            # Field names can vary across providers/API revisions; prefer known PR head SHA keys in order.
+            # Field names vary across providers/API revisions:
+            # - pr.sourceSha: Azure Repos PR triggers
+            # - pr.sourceCommitId / pr.headSha: alternate PR trigger payloads
             prior_source_sha = (
                 trigger_info.get("pr.sourceSha")
                 or trigger_info.get("pr.sourceCommitId")
@@ -110,6 +112,7 @@ stages:
             if pull_request_id:
                 # PR identifier field names can vary by provider/API revision, similar to source SHA keys above.
                 prior_pr_id = trigger_info.get("pr.number") or trigger_info.get("pr.pullRequestId")
+                # A mismatched PR identifier means this run belongs to a different PR and must not be treated as duplicate.
                 if prior_pr_id and str(prior_pr_id) != pull_request_id:
                     continue
 
