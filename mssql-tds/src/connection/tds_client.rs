@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 /// cursor RPC response. Distinguishes "no token was sent" from an actual raw
 /// status value, so neither case is silently collapsed at interpretation time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReturnStatus {
+pub(in crate::connection) enum ReturnStatus {
     /// No `ReturnStatus` token was sent for the most recent RPC.
     NotReceived,
     /// The server sent a `ReturnStatus` token carrying this raw value.
@@ -73,17 +73,17 @@ pub struct TdsClient {
     pub(crate) current_metadata: Option<Arc<ColMetadataToken>>,
     count_map: HashMap<CurrentCommand, u64>,
 
-    pub(crate) return_values: Vec<ReturnValue>,
+    pub(in crate::connection) return_values: Vec<ReturnValue>,
     /// State of the most recent `ReturnStatus` token, captured while draining a
     /// cursor RPC response and interpreted as a [`CursorStatus`](crate::cursor::CursorStatus).
-    pub(crate) last_return_status: ReturnStatus,
-    pub(crate) current_result_set_has_been_read_till_end: bool,
+    pub(in crate::connection) last_return_status: ReturnStatus,
+    pub(in crate::connection) current_result_set_has_been_read_till_end: bool,
 
     /// The remaining request timeout for operations. This is updated after each token read.
-    pub(crate) remaining_request_timeout: Option<Duration>,
+    pub(in crate::connection) remaining_request_timeout: Option<Duration>,
 
     /// The cancel handle for this client. Used to cancel operations.
-    pub(crate) cancel_handle: Option<CancelHandle>,
+    pub(in crate::connection) cancel_handle: Option<CancelHandle>,
 
     /// Empty metadata vector for returning when no metadata is available
     empty_metadata: Vec<ColumnMetadata>,
@@ -338,7 +338,7 @@ impl TdsClient {
     ///
     /// The bulk copy API uses `0` to mean "no timeout" (infinite). This helper
     /// normalises that convention so `Some(0)` becomes `None` (no deadline).
-    pub(crate) fn timeout_to_duration(timeout_sec: Option<u32>) -> Option<Duration> {
+    pub(in crate::connection) fn timeout_to_duration(timeout_sec: Option<u32>) -> Option<Duration> {
         timeout_sec.and_then(|secs| {
             if secs == 0 {
                 None
@@ -380,7 +380,7 @@ impl TdsClient {
     /// `SAVE`) intentionally skip this — `is_recovery_possible()` returns
     /// `false` when a transaction is active, matching SqlClient's
     /// `RestoreBrokenConnection` flag behavior.
-    pub(crate) async fn check_and_reconnect(
+    pub(in crate::connection) async fn check_and_reconnect(
         &mut self,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
@@ -438,7 +438,10 @@ impl TdsClient {
     /// Returns `Some(0)` (immediate timeout) if recovery consumed the entire budget.
     /// Passes through `None` (no timeout) unchanged.
     /// Rounds up to avoid exceeding the caller's timeout budget on sub-second elapsed times.
-    pub(crate) fn deduct_timeout(timeout_sec: Option<u32>, elapsed: Duration) -> Option<u32> {
+    pub(in crate::connection) fn deduct_timeout(
+        timeout_sec: Option<u32>,
+        elapsed: Duration,
+    ) -> Option<u32> {
         timeout_sec.map(|t| {
             let elapsed_secs = u32::try_from(
                 elapsed
@@ -1269,7 +1272,7 @@ impl TdsClient {
 
     /// Drains all remaining tokens from the stream until a terminal DONE token.
     /// Collects any ERROR tokens encountered and returns them.
-    pub(crate) async fn drain_stream(&mut self) -> TdsResult<Vec<SqlErrorInfo>> {
+    pub(in crate::connection) async fn drain_stream(&mut self) -> TdsResult<Vec<SqlErrorInfo>> {
         let mut collected_errors: Vec<SqlErrorInfo> = Vec::new();
         loop {
             let start = Instant::now();
