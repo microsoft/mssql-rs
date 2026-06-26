@@ -810,7 +810,14 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         Ok(())
     }
 
-    /// Writes a single CEK table entry (mirrors `parse_cek_table_entry`).
+    /// Writes a single CEK table entry for bulk copy.
+    ///
+    /// Unlike the server-sent CEK table (which carries the encrypted CEK
+    /// values, key-store names and paths), the client-sent bulk-copy CEK table
+    /// only needs to identify each key by `(database_id, cek_id, cek_version,
+    /// cek_md_version)`; the server already holds the encrypted key material and
+    /// reconciles by those identifiers. Accordingly the encrypted-CEK-value
+    /// count is written as `0`, matching .NET's `WriteEncryptionEntries`.
     #[cfg(feature = "column-encryption")]
     async fn write_cek_table_entry(&mut self, entry: &CekTableEntry) -> TdsResult<()> {
         self.packet_writer
@@ -823,22 +830,8 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         self.packet_writer
             .write_async(&entry.cek_md_version)
             .await?;
-        self.packet_writer
-            .write_byte_async(entry.encrypted_cek_values.len() as u8)
-            .await?;
-        for value in &entry.encrypted_cek_values {
-            // Encrypted CEK blob (u16 byte count + bytes).
-            self.packet_writer
-                .write_u16_async(value.encrypted_key.len() as u16)
-                .await?;
-            self.packet_writer.write_async(&value.encrypted_key).await?;
-            // Key store provider name (u8 char count + UTF-16).
-            self.write_b_varchar(&value.key_store_name).await?;
-            // Column master key path (u16 char count + UTF-16).
-            self.write_us_varchar(&value.key_path).await?;
-            // Asymmetric key-wrapping algorithm name (u8 char count + UTF-16).
-            self.write_b_varchar(&value.algorithm_name).await?;
-        }
+        // Encrypted CEK value count: always 0 for client-sent CEK tables.
+        self.packet_writer.write_byte_async(0x00).await?;
         Ok(())
     }
 
@@ -976,19 +969,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         let utf16: Vec<u16> = value.encode_utf16().collect();
         self.packet_writer
             .write_byte_async(utf16.len() as u8)
-            .await?;
-        for c in utf16 {
-            self.packet_writer.write_u16_async(c).await?;
-        }
-        Ok(())
-    }
-
-    /// Writes a `US_VARCHAR` (2-byte UTF-16 char count followed by the string).
-    #[cfg(feature = "column-encryption")]
-    async fn write_us_varchar(&mut self, value: &str) -> TdsResult<()> {
-        let utf16: Vec<u16> = value.encode_utf16().collect();
-        self.packet_writer
-            .write_u16_async(utf16.len() as u16)
             .await?;
         for c in utf16 {
             self.packet_writer.write_u16_async(c).await?;
@@ -1222,19 +1202,16 @@ mod ae_colmetadata_tests {
             Tokens::ColMetadata(t) => {
                 assert_eq!(t.column_count, 1);
 
-                // CEK table round-trips exactly.
+                // CEK table round-trips: the client-written entry identifies
+                // the key by (database_id, cek_id, cek_version, cek_md_version)
+                // and carries no encrypted CEK values (count 0), matching .NET.
                 assert_eq!(t.cek_table.len(), 1);
                 let entry = &t.cek_table[0];
                 assert_eq!(entry.database_id, 5);
                 assert_eq!(entry.cek_id, 7);
                 assert_eq!(entry.cek_version, 1);
                 assert_eq!(entry.cek_md_version, [1, 2, 3, 4, 5, 6, 7, 8]);
-                assert_eq!(entry.encrypted_cek_values.len(), 1);
-                let value = &entry.encrypted_cek_values[0];
-                assert_eq!(value.encrypted_key, vec![0xDE, 0xAD, 0xBE, 0xEF]);
-                assert_eq!(value.key_store_name, "AKV");
-                assert_eq!(value.key_path, "https://vault/key");
-                assert_eq!(value.algorithm_name, "RSA_OAEP");
+                assert!(entry.encrypted_cek_values.is_empty());
 
                 // Encrypted column + crypto metadata round-trip exactly.
                 let col = &t.columns[0];

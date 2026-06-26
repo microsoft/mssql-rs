@@ -32,9 +32,12 @@ mod always_encrypted {
     use rand::RngCore;
     use uuid::Uuid;
 
+    use async_trait::async_trait;
+
     use crate::common::{build_tcp_datasource, create_context, get_first_row, init_tracing};
+    use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
     use mssql_tds::connection::client_context::ColumnEncryptionSetting;
-    use mssql_tds::connection::tds_client::{ResultSetClient, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::{
@@ -360,9 +363,9 @@ mod always_encrypted {
             h.roundtrip(
                 "REAL",
                 "DETERMINISTIC",
-                SqlType::Real(Some(3.14_f32)),
+                SqlType::Real(Some(3.5_f32)),
                 |v| match v {
-                    ColumnValues::Real(value) => assert_eq!(*value, 3.14_f32),
+                    ColumnValues::Real(value) => assert_eq!(*value, 3.5_f32),
                     other => panic!("expected real, got {other:?}"),
                 },
             )
@@ -370,9 +373,9 @@ mod always_encrypted {
             h.roundtrip(
                 "FLOAT",
                 "DETERMINISTIC",
-                SqlType::Float(Some(2.718281828_f64)),
+                SqlType::Float(Some(2.5009_f64)),
                 |v| match v {
-                    ColumnValues::Float(value) => assert_eq!(*value, 2.718281828_f64),
+                    ColumnValues::Float(value) => assert_eq!(*value, 2.5009_f64),
                     other => panic!("expected float, got {other:?}"),
                 },
             )
@@ -742,6 +745,122 @@ mod always_encrypted {
                 matches!(got, ColumnValues::Int(321)),
                 "stored-procedure encrypted insert round-trip, got {got:?}"
             );
+        });
+    }
+
+    // ----- Bulk copy parameter encryption -----
+
+    /// A row written through the streaming bulk-copy writer. The `id` column is
+    /// plaintext; the `val` column lands in an encrypted column, so the writer
+    /// encrypts it transparently before the data goes on the wire.
+    struct EncBulkRow {
+        id: i32,
+        val: i32,
+    }
+
+    #[async_trait]
+    impl BulkLoadRow for EncBulkRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            writer
+                .write_column_value(*column_index, &ColumnValues::Int(self.id))
+                .await?;
+            *column_index += 1;
+            writer
+                .write_column_value(*column_index, &ColumnValues::Int(self.val))
+                .await?;
+            *column_index += 1;
+            Ok(())
+        }
+    }
+
+    /// Bulk-copying rows into a table whose `val` column is encrypted encrypts
+    /// each value on the client: the destination metadata (fetched over the
+    /// Always Encrypted-enabled connection) reports the column as encrypted, the
+    /// driver resolves the CEK, and the streaming writer emits ciphertext. The
+    /// values round-trip back transparently decrypted and are stored as
+    /// `varbinary` ciphertext at rest.
+    #[tokio::test]
+    async fn bulk_copy_encrypts_values() {
+        ae_test!(|h| {
+            let table = h.next_table();
+            run_statement(
+                &mut h.client,
+                &format!(
+                    "CREATE TABLE {table} (id INT NOT NULL, val INT ENCRYPTED WITH \
+                     (COLUMN_ENCRYPTION_KEY = {cek}, ENCRYPTION_TYPE = DETERMINISTIC, \
+                     ALGORITHM = '{COLUMN_ALGORITHM}') NOT NULL);",
+                    cek = h.cek_name,
+                ),
+            )
+            .await
+            .expect("create encrypted bulk-copy table");
+
+            let rows = vec![
+                EncBulkRow { id: 1, val: 111 },
+                EncBulkRow { id: 2, val: 222 },
+                EncBulkRow { id: 3, val: 333 },
+            ];
+            let result = BulkCopy::new(&mut h.client, table.as_str())
+                .batch_size(100)
+                .write_to_server_zerocopy(rows)
+                .await
+                .expect("bulk copy into encrypted column");
+            assert_eq!(result.rows_affected, 3, "expected three rows copied");
+
+            // Read back over the AE-enabled connection: values are decrypted.
+            h.client
+                .execute(
+                    format!("SELECT id, val FROM {table} ORDER BY id;"),
+                    None,
+                    None,
+                )
+                .await
+                .expect("select decrypted values");
+            let mut got = Vec::new();
+            if let Some(resultset) = h.client.get_current_resultset() {
+                while let Some(row) = resultset.next_row().await.expect("read row") {
+                    got.push((row[0].clone(), row[1].clone()));
+                }
+            }
+            h.client.close_query().await.unwrap();
+            assert_eq!(
+                got,
+                vec![
+                    (ColumnValues::Int(1), ColumnValues::Int(111)),
+                    (ColumnValues::Int(2), ColumnValues::Int(222)),
+                    (ColumnValues::Int(3), ColumnValues::Int(333)),
+                ],
+                "bulk-copied encrypted values must round-trip"
+            );
+
+            // The column is stored as ciphertext: an AE-disabled connection sees
+            // raw varbinary, not the plaintext int.
+            let mut plain = connect_disabled().await;
+            plain
+                .execute(format!("SELECT val FROM {table} WHERE id = 1;"), None, None)
+                .await
+                .expect("select ciphertext with AE disabled");
+            let (_metadata, row) = get_first_row(&mut plain).await.expect("ciphertext row");
+            let _ = plain.close_query().await;
+            match &row[0] {
+                ColumnValues::Bytes(bytes) => {
+                    assert!(
+                        bytes.len() > 4,
+                        "expected AEAD ciphertext larger than the plaintext, got {} bytes",
+                        bytes.len()
+                    );
+                    assert_ne!(
+                        *bytes,
+                        111_i32.to_le_bytes().to_vec(),
+                        "ciphertext must not equal the plaintext bytes"
+                    );
+                }
+                other => panic!("expected varbinary ciphertext at rest, got {other:?}"),
+            }
         });
     }
 
