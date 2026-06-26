@@ -57,25 +57,28 @@ stages:
         team_project = os.environ["SYSTEM_TEAMPROJECT"]
         definition_id = os.environ["SYSTEM_DEFINITIONID"]
         current_build_id = int(os.environ["BUILD_BUILDID"])
-        source_branch = os.environ["SYSTEM_PULLREQUEST_SOURCEBRANCH"]
+        build_branch = os.environ.get("BUILD_SOURCEBRANCH", "")
         source_commit = os.environ["SYSTEM_PULLREQUEST_SOURCECOMMITID"]
+        pull_request_id = os.environ.get("SYSTEM_PULLREQUEST_PULLREQUESTID", "")
         token = os.environ["SYSTEM_ACCESSTOKEN"]
         # 200 keeps API payloads small while covering repeated draft/ready transitions on busy PRs.
         # If a PR exceeds this window, the guard falls back to full validation (safe false negative).
         max_candidates = "200"
 
-        query = urllib.parse.urlencode(
-            {
-                "definitions": definition_id,
-                "reasonFilter": "pullRequest",
-                "statusFilter": "completed",
-                "resultFilter": "succeeded",
-                "branchName": source_branch,
-                "queryOrder": "finishTimeDescending",
-                "$top": max_candidates,
-                "api-version": "7.1",
-            }
-        )
+        query_params = {
+            "definitions": definition_id,
+            "reasonFilter": "pullRequest",
+            "statusFilter": "completed",
+            "resultFilter": "succeeded",
+            "queryOrder": "finishTimeDescending",
+            "$top": max_candidates,
+            "api-version": "7.1",
+        }
+        if build_branch:
+            # PR validation runs are indexed by the synthetic PR branch (for example refs/pull/<id>/merge),
+            # not by System.PullRequest.SourceBranch (refs/heads/<branch>).
+            query_params["branchName"] = build_branch
+        query = urllib.parse.urlencode(query_params)
         url = f"{collection_uri}{team_project}/_apis/build/builds?{query}"
         headers = {"Authorization": "Bearer " + token}
         request = urllib.request.Request(url, headers=headers)
@@ -96,9 +99,17 @@ stages:
                 continue
 
             trigger_info = build.get("triggerInfo", {})
-            # Azure DevOps Build API reports the PR head commit SHA under triggerInfo.pr.sourceSha.
-            prior_source_commit = trigger_info.get("pr.sourceSha")
-            if prior_source_commit == source_commit:
+            prior_source_commit = (
+                trigger_info.get("pr.sourceSha")
+                or trigger_info.get("pr.sourceCommitId")
+                or trigger_info.get("pr.headSha")
+            )
+            if pull_request_id:
+                prior_pr_id = trigger_info.get("pr.number") or trigger_info.get("pr.pullRequestId")
+                if prior_pr_id and str(prior_pr_id) != pull_request_id:
+                    continue
+
+            if prior_source_commit and prior_source_commit.lower() == source_commit.lower():
                 matching_run = build
                 break
 
@@ -123,7 +134,7 @@ stages:
     - EvaluateDuplicate
   condition: >-
     and(
-      succeeded(),
+      not(canceled()),
       eq('${{ parameters.RunFuzz }}', 'false'),
       eq('${{ parameters.RunLongHaul }}', 'false'),
       or(
@@ -331,7 +342,7 @@ stages:
   displayName: Kerberos Test (PR)
   dependsOn:
     - EvaluateDuplicate
-  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true'))
+  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true'))
   jobs:
     - template: kerberos-test-template.yml
       parameters:
@@ -459,7 +470,7 @@ stages:
 - stage: Build_mssql_python
   dependsOn:
     - EvaluateDuplicate
-  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true'))
+  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true'))
   displayName: Build mssql-python
   jobs:
   - job: Build_mssql_python_Linux
