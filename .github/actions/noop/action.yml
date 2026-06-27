@@ -1,0 +1,7 @@
+name: No-op
+description: No-op composite action used for repository tooling.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: echo "No-op"
