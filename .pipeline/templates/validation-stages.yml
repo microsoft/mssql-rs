@@ -191,7 +191,7 @@ stages:
       eq('${{ parameters.RunLongHaul }}', 'false'),
       or(
         ne(variables['Build.Reason'], 'PullRequest'),
-        ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true')
+        ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true')
       )
     )
   jobs:
@@ -394,7 +394,7 @@ stages:
   displayName: Kerberos Test (PR)
   dependsOn:
     - EvaluateDuplicate
-  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true'))
+  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
   jobs:
     - template: kerberos-test-template.yml
       parameters:
@@ -522,7 +522,7 @@ stages:
 - stage: Build_mssql_python
   dependsOn:
     - EvaluateDuplicate
-  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(stageDependencies.EvaluateDuplicate.Evaluate.outputs['SetDuplicateState.skipDuplicate'], 'true'))
+  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
   displayName: Build mssql-python
   jobs:
   - job: Build_mssql_python_Linux
