@@ -13,6 +13,9 @@ pub(crate) mod bulk_copy_state;
 /// Client connection context and authentication factories.
 pub mod client_context;
 pub(crate) mod connection_actions;
+/// Server cursor RPCs (`sp_cursor*`) via the
+/// [`CursorClient`](crate::connection::cursor_ops::CursorClient) trait.
+pub mod cursor_ops;
 pub(crate) mod datasource_parser;
 pub(crate) mod execution_context;
 pub(crate) mod instance_cache;
