@@ -79,9 +79,9 @@ extends:
     # abi3-py39 => ONE wheel per (OS, arch) covering Python >= 3.9. No loop over
     # Python versions (unlike mssql-py-core).
     #
-    # SANDBOX matrix is intentionally small: Linux x64 (manylinux_2_34) and
-    # Windows x64. macOS / ARM64 / musllinux can be added later by copying the
-    # Linux/Windows jobs and adjusting pools + container images.
+    # SANDBOX matrix: Linux x64/ARM64 (manylinux_2_34), Windows x64/ARM64, and
+    # macOS universal2. musllinux can be added later by copying a Linux job and
+    # swapping the container image.
     ###########################################################################
     - stage: PublishMockPython
       displayName: 'Publish Mock Python (sandbox)'
@@ -163,6 +163,80 @@ extends:
             publishLocation: 'pipeline'
 
       #####################################################################
+      # Linux ARM64 — manylinux_2_34 aarch64 container build
+      #####################################################################
+      - job: BuildLinux_arm64
+        displayName: 'Build mock wheel (Linux ARM64)'
+        pool:
+          type: linux
+          isCustom: true
+          name: RUST-1ES-POOL-ARM-WUS3
+          demands:
+            - imageOverride -equals RUST-UBUNTU-ARM64
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+          ob_artifactSuffix: '_mock_linux_arm64'
+          CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+        steps:
+        - template: /.pipeline/templates/cargo-authenticate-template.yml
+          parameters:
+            osType: Linux
+        - script: .pipeline/scripts/install-rustup.sh
+          displayName: 'Install Rustup'
+        - task: DockerInstaller@0
+          inputs:
+            dockerVersion: '29.0.0'
+          displayName: 'Install Docker'
+        - template: /.pipeline/templates/install-ubuntu-dependency.yaml
+          parameters:
+            installDocker: true
+        # Stamp a PEP 440 prerelease version into BOTH the pyproject.toml and the
+        # Cargo.toml so maturin bakes the right version into the wheel. The mounted
+        # workspace is what the container builds, so we patch on the host first.
+        - script: |
+            set -euo pipefail
+            BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+            DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
+            VER="${BASE}.dev${DEV}"
+            echo "Sandbox wheel version: ${VER}"
+            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
+            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
+            echo "##vso[task.setvariable variable=mockWheelVersion]${VER}"
+          displayName: 'Stamp sandbox wheel version'
+          env:
+            BUILD_BUILDID: $(Build.BuildId)
+        - script: |
+            set -euo pipefail
+            CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest"
+            echo "Building mock wheel in container: $CONTAINER_IMAGE"
+            mkdir -p "$(ob_outputDirectory)/wheels"
+            bash .pipeline/scripts/docker-cargo-run.sh --rm \
+              -v "$(Build.SourcesDirectory):/workspace" \
+              -v "$(ob_outputDirectory)/wheels:/workspace/target/wheels" \
+              -e "WORKSPACE_DIR=/workspace" \
+              -e "OUTPUT_DIR=/workspace/target/wheels" \
+              "$CONTAINER_IMAGE" \
+              bash /workspace/scripts/build-mock-python-wheel-in-container.sh
+            sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/target" || true
+            WHEEL_COUNT=$(find "$(ob_outputDirectory)/wheels" -type f -name '*.whl' | wc -l)
+            if [ "$WHEEL_COUNT" -eq 0 ]; then
+              echo "ERROR: No mock wheels were produced!"
+              exit 1
+            fi
+            echo "$WHEEL_COUNT wheel(s) built."
+            ls -lh "$(ob_outputDirectory)/wheels"
+          displayName: 'Build mock abi3 wheel (manylinux_2_34 aarch64)'
+          env:
+            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish Linux ARM64 mock wheel'
+          inputs:
+            targetPath: '$(ob_outputDirectory)/wheels'
+            artifact: 'mock_wheels_linux_arm64'
+            publishLocation: 'pipeline'
+
+      #####################################################################
       # Windows x64 — native maturin build
       #####################################################################
       - job: BuildWindows_x64
@@ -233,13 +307,178 @@ extends:
             publishLocation: 'pipeline'
 
       #####################################################################
+      # Windows ARM64 — native maturin build
+      #####################################################################
+      - job: BuildWindows_arm64
+        displayName: 'Build mock wheel (Windows ARM64)'
+        pool:
+          type: windows
+          isCustom: true
+          name: RUST-1ES-POOL-ARM-WUS3
+          demands:
+            - imageOverride -equals RUST-WINSRV-ARM
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+          ob_artifactSuffix: '_mock_windows_arm64'
+          CARGO_TARGET_DIR: C:\cargo_target_dir
+        steps:
+        # Node.js workaround for ARM64 ADO tasks (UsePythonVersion etc. need Node).
+        - pwsh: ./scripts/setup-nodejs-path.ps1
+          displayName: 'Add Node.js to PATH for ADO tasks'
+        - pwsh: ./scripts/install-nodejs-to-agent.ps1
+          displayName: 'Install Node.js to agent externals folder'
+        - template: /.pipeline/templates/cargo-authenticate-template.yml
+          parameters:
+            osType: Windows
+        - template: /.pipeline/templates/install-dependencies.yml
+          parameters:
+            osType: Windows
+            skipPythonSetup: true
+            skipRustupInstall: false
+            enableJsDeps: false
+        - task: UsePythonVersion@0
+          displayName: 'Use Python 3.12'
+          inputs:
+            versionSpec: '3.12'
+            architecture: 'arm64'
+            addToPath: true
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+            $py = Get-Content 'mssql-mock-tds-py/pyproject.toml' -Raw
+            if ($py -match '(?m)^version\s*=\s*"([^"]+)"') { $base = $Matches[1] }
+            else { Write-Error 'Could not read version from pyproject.toml'; exit 1 }
+            $dev = "$(Get-Date -Format 'yyyyMMdd')$(Build.BuildId)"
+            $ver = "$base.dev$dev"
+            Write-Host "Sandbox wheel version: $ver"
+            (Get-Content 'mssql-mock-tds-py/pyproject.toml' -Raw) `
+              -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$ver`"" |
+              Set-Content 'mssql-mock-tds-py/pyproject.toml' -NoNewline
+            (Get-Content 'mssql-mock-tds-py/Cargo.toml' -Raw) `
+              -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$ver`"" |
+              Set-Content 'mssql-mock-tds-py/Cargo.toml' -NoNewline
+            Write-Host "##vso[task.setvariable variable=mockWheelVersion]$ver"
+          displayName: 'Stamp sandbox wheel version'
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+            python --version
+            pip install maturin
+            New-Item -ItemType Directory -Force -Path "$(ob_outputDirectory)\wheels" | Out-Null
+            maturin build --release --auditwheel skip `
+              --interpreter python `
+              --manifest-path mssql-mock-tds-py\Cargo.toml `
+              --out "$(ob_outputDirectory)\wheels"
+            Get-ChildItem "$(ob_outputDirectory)\wheels" | Format-Table Name, Length
+          displayName: 'Build mock abi3 wheel (Windows ARM64)'
+          env:
+            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish Windows ARM64 mock wheel'
+          inputs:
+            targetPath: '$(ob_outputDirectory)/wheels'
+            artifact: 'mock_wheels_windows_arm64'
+            publishLocation: 'pipeline'
+
+      #####################################################################
+      # macOS universal2 (x86_64 + ARM64) — native maturin build
+      # Governed templates don't support a macOS pool type natively, so we use
+      # type: linux + isCustom with the Azure Pipelines macOS image (same trick
+      # as stages.yml's MacOS_universal2 job).
+      #
+      # OpenSSL: mssql-mock-tds pulls the openssl crate on cfg(not(windows)) to
+      # build the PKCS#12 identity. To keep the wheel portable we build with
+      # --features vendored-openssl so OpenSSL is statically linked instead of
+      # dynamically linking Homebrew's libssl.
+      #####################################################################
+      - job: BuildMacOS_universal2
+        displayName: 'Build mock wheel (macOS universal2)'
+        pool:
+          type: linux
+          isCustom: true
+          name: 'Azure Pipelines'
+          vmImage: macOS-14
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+          ob_artifactSuffix: '_mock_macos_universal2'
+          CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+        steps:
+        - template: /.pipeline/templates/cargo-authenticate-template.yml
+          parameters:
+            osType: MacOS
+        - template: /.pipeline/templates/install-dependencies.yml
+          parameters:
+            osType: MacOS
+        - script: |
+            set -euo pipefail
+            echo "Installing maturin via pipx..."
+            python3 -m pip install --user pipx
+            python3 -m pipx ensurepath
+            export PATH="$HOME/.local/bin:$PATH"
+            pipx install maturin
+            echo "Installing Rust targets for universal2 build..."
+            rustup target add x86_64-apple-darwin
+            rustup target add aarch64-apple-darwin
+          displayName: 'Install maturin and Rust targets'
+        - script: |
+            set -euo pipefail
+            BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+            DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
+            VER="${BASE}.dev${DEV}"
+            echo "Sandbox wheel version: ${VER}"
+            sed -i '' -E "1,/^version[[:space:]]*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
+            sed -i '' -E "1,/^version[[:space:]]*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
+            echo "##vso[task.setvariable variable=mockWheelVersion]${VER}"
+          displayName: 'Stamp sandbox wheel version'
+          env:
+            BUILD_BUILDID: $(Build.BuildId)
+        - script: |
+            set -euo pipefail
+            export PATH="$HOME/.local/bin:$PATH"
+            export MACOSX_DEPLOYMENT_TARGET=15.0
+            mkdir -p "$(ob_outputDirectory)/wheels"
+            # ONE universal2 abi3 wheel. vendored-openssl statically links OpenSSL
+            # so the wheel doesn't depend on Homebrew's libssl. --manifest-path
+            # because the Cargo package is still mssql-mock-tds-py.
+            maturin build --release \
+              --target universal2-apple-darwin \
+              --auditwheel skip \
+              --features vendored-openssl \
+              --manifest-path mssql-mock-tds-py/Cargo.toml \
+              --out "$(ob_outputDirectory)/wheels"
+            ls -lh "$(ob_outputDirectory)/wheels"
+          displayName: 'Build mock universal2 wheel (macOS)'
+          env:
+            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+        - script: |
+            set -euo pipefail
+            export PATH="$HOME/.local/bin:$PATH"
+            pip install wheel
+            for whl in "$(ob_outputDirectory)"/wheels/*.whl; do
+              echo "Re-tagging: $(basename "$whl")"
+              wheel tags --platform-tag macosx_15_0_universal2 --remove "$whl"
+            done
+            echo "Re-tagged wheels:"
+            ls -lh "$(ob_outputDirectory)/wheels"
+          displayName: 'Re-tag macOS wheel to uniform universal2 platform tag'
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish macOS universal2 mock wheel'
+          inputs:
+            targetPath: '$(ob_outputDirectory)/wheels'
+            artifact: 'mock_wheels_macos_universal2'
+            publishLocation: 'pipeline'
+
+      #####################################################################
       # Upload — collect wheels and (opt-in) twine upload to the feed.
       #####################################################################
       - job: UploadPython
         displayName: 'Upload mock wheels to feed'
         dependsOn:
         - BuildLinux_x64
+        - BuildLinux_arm64
         - BuildWindows_x64
+        - BuildWindows_arm64
+        - BuildMacOS_universal2
         # Never upload from PR runs (defence in depth; this pipeline has pr: none).
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
         pool:
