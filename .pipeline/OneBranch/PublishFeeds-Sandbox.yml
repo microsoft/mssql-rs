@@ -102,7 +102,7 @@ extends:
           ob_artifactSuffix: '_mock_linux_x64'
           CARGO_TARGET_DIR: $(Build.SourcesDirectory)
         steps:
-        - template: /.pipeline/templates/cargo-authenticate-template.yml
+        - template: /.pipeline/templates/cargo-authenticate-template.yml@self
           parameters:
             osType: Linux
         - script: .pipeline/scripts/install-rustup.sh
@@ -111,7 +111,7 @@ extends:
           inputs:
             dockerVersion: '29.0.0'
           displayName: 'Install Docker'
-        - template: /.pipeline/templates/install-ubuntu-dependency.yaml
+        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
           parameters:
             installDocker: true
         # Stamp a PEP 440 prerelease version into BOTH the pyproject.toml and the
@@ -178,7 +178,7 @@ extends:
           ob_artifactSuffix: '_mock_linux_arm64'
           CARGO_TARGET_DIR: $(Build.SourcesDirectory)
         steps:
-        - template: /.pipeline/templates/cargo-authenticate-template.yml
+        - template: /.pipeline/templates/cargo-authenticate-template.yml@self
           parameters:
             osType: Linux
         - script: .pipeline/scripts/install-rustup.sh
@@ -187,7 +187,7 @@ extends:
           inputs:
             dockerVersion: '29.0.0'
           displayName: 'Install Docker'
-        - template: /.pipeline/templates/install-ubuntu-dependency.yaml
+        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
           parameters:
             installDocker: true
         # Stamp a PEP 440 prerelease version into BOTH the pyproject.toml and the
@@ -252,10 +252,10 @@ extends:
           ob_artifactSuffix: '_mock_windows_x64'
           CARGO_TARGET_DIR: C:\cargo_target_dir
         steps:
-        - template: /.pipeline/templates/cargo-authenticate-template.yml
+        - template: /.pipeline/templates/cargo-authenticate-template.yml@self
           parameters:
             osType: Windows
-        - template: /.pipeline/templates/install-dependencies.yml
+        - template: /.pipeline/templates/install-dependencies.yml@self
           parameters:
             osType: Windows
             skipPythonSetup: true
@@ -327,10 +327,10 @@ extends:
           displayName: 'Add Node.js to PATH for ADO tasks'
         - pwsh: ./scripts/install-nodejs-to-agent.ps1
           displayName: 'Install Node.js to agent externals folder'
-        - template: /.pipeline/templates/cargo-authenticate-template.yml
+        - template: /.pipeline/templates/cargo-authenticate-template.yml@self
           parameters:
             osType: Windows
-        - template: /.pipeline/templates/install-dependencies.yml
+        - template: /.pipeline/templates/install-dependencies.yml@self
           parameters:
             osType: Windows
             skipPythonSetup: true
@@ -402,10 +402,10 @@ extends:
           ob_artifactSuffix: '_mock_macos_universal2'
           CARGO_TARGET_DIR: $(Build.SourcesDirectory)
         steps:
-        - template: /.pipeline/templates/cargo-authenticate-template.yml
+        - template: /.pipeline/templates/cargo-authenticate-template.yml@self
           parameters:
             osType: MacOS
-        - template: /.pipeline/templates/install-dependencies.yml
+        - template: /.pipeline/templates/install-dependencies.yml@self
           parameters:
             osType: MacOS
         - script: |
@@ -555,10 +555,10 @@ extends:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           CARGO_TARGET_DIR: C:\cargo_target_dir
         steps:
-        - template: /.pipeline/templates/cargo-authenticate-template.yml
+        - template: /.pipeline/templates/cargo-authenticate-template.yml@self
           parameters:
             osType: Windows
-        - template: /.pipeline/templates/install-dependencies.yml
+        - template: /.pipeline/templates/install-dependencies.yml@self
           parameters:
             osType: Windows
             skipPythonSetup: true
