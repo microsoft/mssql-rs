@@ -1,0 +1,81 @@
+# mssql-tds-bench
+
+A **fixed Criterion harness** for benchmarking [`mssql-tds`](../mssql-tds) with a
+**swappable dependency**, so a stable baseline build and a candidate build can be
+compared on the same host with `mssql-tds` as the only variable.
+
+See [`../mssql-tds/docs/perf-testing-plan.md`](../mssql-tds/docs/perf-testing-plan.md)
+for the full design and rationale.
+
+## How isolation works
+
+The harness code, Criterion version, and toolchain stay byte-for-byte identical
+across runs. Only the `mssql-tds` dependency in [`Cargo.toml`](Cargo.toml) is
+swapped:
+
+```toml
+# candidate run (default, committed state)
+mssql-tds = { path = "../mssql-tds" }
+
+# baseline run (CI swaps to this)
+mssql-tds = { git = "<repo>", tag = "perf-baseline" }
+```
+
+Any statistically significant delta is therefore attributable to `mssql-tds`
+itself. The baseline is pinned by the **`perf-baseline` git tag**, which is moved
+manually in the repository when the baseline should advance.
+
+## Benchmarks
+
+| Bench file | Scenarios |
+|------------|-----------|
+| `connection` | single connect/close; N concurrent connects (50/100/500) |
+| `query` | simple SELECT; N-row reads (100/1k/10k); single INSERT; `sp_executesql`; stored procedure; batched statements |
+| `datatypes` | primitives; VARCHAR/NVARCHAR; temporal types; LOB (1 MB/20 MB, byte throughput) |
+| `bulk` | `BulkCopy` insert across batch sizes 50/500/5,000 |
+| `tds_specific` | packet-size sensitivity (4096/8192/32768); zero-copy `next_row` row-iteration throughput |
+
+Each benchmark creates its own session temp tables / temp procedures, so **no
+server-side setup script is required** — the objects vanish when the connection
+closes.
+
+## Running locally
+
+```sh
+# Run everything (real SQL Server required)
+cargo bench -p mssql-tds-bench
+
+# A single bench file
+cargo bench -p mssql-tds-bench --bench query
+
+# Save a named baseline, then compare
+cargo bench -p mssql-tds-bench -- --save-baseline base
+# (swap the mssql-tds dependency, re-run)
+cargo bench -p mssql-tds-bench -- --save-baseline candidate
+critcmp base candidate
+```
+
+When no server is reachable, each benchmark probes the connection once and skips
+gracefully (this is what lets the bench binaries run as tests in CI without a DB).
+
+## Environment contract
+
+Shared with `mssql-tds/benches/perf.rs`:
+
+| Variable | Purpose |
+|----------|---------|
+| `DB_HOST`, `DB_PORT` | connection target |
+| `DB_USERNAME`, `SQL_PASSWORD` | credentials (`SQL_PASSWORD` falls back to `/tmp/password`) |
+| `TRUST_SERVER_CERTIFICATE`, `CERT_HOST_NAME` | TLS validation |
+| `BENCH_ENCRYPT` (`strict`\|`on`\|`off`, default `on`) | encryption setting |
+
+Criterion tuning knobs (defaults chosen for noisy, network-bound runs):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `BENCH_SECS` | `15` | measurement time per benchmark (seconds) |
+| `BENCH_SAMPLES` | `10` | sample size |
+| `BENCH_SIGNIFICANCE` | `0.05` | significance level |
+| `BENCH_NOISE` | `0.05` | noise threshold |
+| `BENCH_BULK_ROWS` | `10000` | rows for the bulk-insert bench |
+| `BENCH_ITER_ROWS` | `50000` | rows for the row-iteration bench |
