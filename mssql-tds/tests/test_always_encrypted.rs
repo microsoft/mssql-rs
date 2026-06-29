@@ -57,6 +57,13 @@ mod always_encrypted {
     /// A `_BIN2` collation is required for DETERMINISTIC encryption of character
     /// columns.
     const BIN2_COLLATION: &str = "Latin1_General_BIN2";
+    /// A `_BIN2_UTF8` collation: required for DETERMINISTIC encryption of a UTF-8
+    /// (`varchar`/`char`) character column so multi-byte UTF-8 bytes are stored.
+    const BIN2_UTF8_COLLATION: &str = "Latin1_General_100_BIN2_UTF8";
+    /// A rich Unicode sample exercising Latin diacritics, CJK, Cyrillic, Arabic,
+    /// an em dash, and two supplementary-plane emoji (UTF-16 surrogate pairs /
+    /// 4-byte UTF-8 sequences).
+    const UNICODE_SAMPLE: &str = "Ünïcödé café — 日本語 Привет مرحبا 😀🔐";
 
     fn hex(bytes: &[u8]) -> String {
         let mut s = String::with_capacity(bytes.len() * 2);
@@ -252,6 +259,77 @@ mod always_encrypted {
                 .await
                 .expect("read back encrypted column");
             expect(&got);
+        }
+
+        /// Builds the `ENCRYPTED WITH (...)` column clause for this run's CEK.
+        fn enc_clause(&self, encryption_type: &str) -> String {
+            format!(
+                "ENCRYPTED WITH (COLUMN_ENCRYPTION_KEY = {cek}, ENCRYPTION_TYPE = \
+                 {encryption_type}, ALGORITHM = '{COLUMN_ALGORITHM}')",
+                cek = self.cek_name,
+            )
+        }
+
+        /// Creates a table (recorded for teardown) whose column list is `columns`
+        /// (everything between the parentheses of `CREATE TABLE name (...)`).
+        async fn create_table(&mut self, columns: &str) -> String {
+            let table = self.next_table();
+            run_statement(
+                &mut self.client,
+                &format!("CREATE TABLE {table} ({columns});"),
+            )
+            .await
+            .expect("create table");
+            table
+        }
+
+        /// Creates `(id INT NOT NULL, val <column_ddl> ENCRYPTED ... <null_ddl>)`
+        /// and bulk-copies one row per value (id = 1..=n), returning the table.
+        async fn bulk_copy_vals(
+            &mut self,
+            column_ddl: &str,
+            encryption_type: &str,
+            null_ddl: &str,
+            vals: Vec<ColumnValues>,
+        ) -> String {
+            let enc = self.enc_clause(encryption_type);
+            let table = self
+                .create_table(&format!(
+                    "id INT NOT NULL, val {column_ddl} {enc} {null_ddl}"
+                ))
+                .await;
+            let n = vals.len();
+            let rows: Vec<GenericBulkRow> = vals
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| GenericBulkRow {
+                    values: vec![ColumnValues::Int((i + 1) as i32), v],
+                })
+                .collect();
+            let result = BulkCopy::new(&mut self.client, table.as_str())
+                .batch_size(100)
+                .write_to_server_zerocopy(rows)
+                .await
+                .expect("bulk copy into encrypted column");
+            assert_eq!(result.rows_affected, n as u64, "expected {n} rows copied");
+            table
+        }
+
+        /// Runs `select_sql` over the AE-enabled connection and returns every row
+        /// as a vector of its first `ncols` (transparently decrypted) values.
+        async fn query_rows(&mut self, select_sql: &str, ncols: usize) -> Vec<Vec<ColumnValues>> {
+            self.client
+                .execute(select_sql.to_string(), None, None)
+                .await
+                .expect("select rows");
+            let mut rows = Vec::new();
+            if let Some(resultset) = self.client.get_current_resultset() {
+                while let Some(row) = resultset.next_row().await.expect("read row") {
+                    rows.push((0..ncols).map(|i| row[i].clone()).collect());
+                }
+            }
+            self.client.close_query().await.unwrap();
+            rows
         }
 
         /// Drops every object this run created, ignoring errors so cleanup is
@@ -593,6 +671,46 @@ mod always_encrypted {
         });
     }
 
+    /// `nvarchar` columns round-trip arbitrary Unicode through encryption,
+    /// including non-Latin scripts and supplementary-plane characters (UTF-16
+    /// surrogate pairs), under both DETERMINISTIC and RANDOMIZED encryption.
+    #[tokio::test]
+    async fn roundtrip_unicode_nvarchar() {
+        ae_test!(|h| {
+            h.roundtrip(
+                &format!("NVARCHAR(256) COLLATE {BIN2_COLLATION}"),
+                "DETERMINISTIC",
+                SqlType::NVarchar(
+                    Some(SqlString::from_utf8_string(UNICODE_SAMPLE.to_string())),
+                    256,
+                ),
+                |v| match v {
+                    ColumnValues::String(value) => {
+                        assert_eq!(value.to_utf8_string(), UNICODE_SAMPLE);
+                    }
+                    other => panic!("expected nvarchar string, got {other:?}"),
+                },
+            )
+            .await;
+
+            h.roundtrip(
+                "NVARCHAR(256)",
+                "RANDOMIZED",
+                SqlType::NVarchar(
+                    Some(SqlString::from_utf8_string(UNICODE_SAMPLE.to_string())),
+                    256,
+                ),
+                |v| match v {
+                    ColumnValues::String(value) => {
+                        assert_eq!(value.to_utf8_string(), UNICODE_SAMPLE);
+                    }
+                    other => panic!("expected nvarchar string, got {other:?}"),
+                },
+            )
+            .await;
+        });
+    }
+
     #[tokio::test]
     async fn roundtrip_binary_and_guid_types() {
         ae_test!(|h| {
@@ -861,6 +979,477 @@ mod always_encrypted {
                 }
                 other => panic!("expected varbinary ciphertext at rest, got {other:?}"),
             }
+        });
+    }
+
+    /// A bulk-copy row holding an arbitrary column layout; each value is written
+    /// in order. Encrypted destination columns are encrypted transparently.
+    struct GenericBulkRow {
+        values: Vec<ColumnValues>,
+    }
+
+    #[async_trait]
+    impl BulkLoadRow for GenericBulkRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            for value in &self.values {
+                writer.write_column_value(*column_index, value).await?;
+                *column_index += 1;
+            }
+            Ok(())
+        }
+    }
+
+    /// Reads the raw `varbinary` ciphertext stored for `table.val WHERE id = {id}`
+    /// over an Always Encrypted-disabled connection (no decryption).
+    async fn read_ciphertext(table: &str, id: i32) -> Vec<u8> {
+        let mut plain = connect_disabled().await;
+        plain
+            .execute(
+                format!("SELECT val FROM {table} WHERE id = {id};"),
+                None,
+                None,
+            )
+            .await
+            .expect("select ciphertext with AE disabled");
+        let (_metadata, row) = get_first_row(&mut plain).await.expect("ciphertext row");
+        let _ = plain.close_query().await;
+        match row.into_iter().next().expect("one column") {
+            ColumnValues::Bytes(bytes) => bytes,
+            other => panic!("expected varbinary ciphertext at rest, got {other:?}"),
+        }
+    }
+
+    /// Bulk-copying string and binary values into encrypted columns encrypts each
+    /// one on the client and round-trips it back transparently decrypted.
+    #[tokio::test]
+    async fn bulk_copy_roundtrips_string_and_binary_types() {
+        ae_test!(|h| {
+            // nvarchar: UTF-16 round-trip including a non-ASCII codepoint.
+            let nvarchar_text = "Bulk \u{2726} copy";
+            let table = h
+                .bulk_copy_vals(
+                    &format!("NVARCHAR(50) COLLATE {BIN2_COLLATION}"),
+                    "DETERMINISTIC",
+                    "NOT NULL",
+                    vec![ColumnValues::String(SqlString::from_utf8_string(
+                        nvarchar_text.to_string(),
+                    ))],
+                )
+                .await;
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            match &rows[0][0] {
+                ColumnValues::String(v) => assert_eq!(v.to_utf8_string(), nvarchar_text),
+                other => panic!("expected nvarchar string, got {other:?}"),
+            }
+
+            // varchar: single-byte (code page) round-trip with ASCII content.
+            let varchar_text = "bulk-ae-varchar";
+            let table = h
+                .bulk_copy_vals(
+                    &format!("VARCHAR(50) COLLATE {BIN2_COLLATION}"),
+                    "DETERMINISTIC",
+                    "NOT NULL",
+                    vec![ColumnValues::String(SqlString::new(
+                        varchar_text.as_bytes().to_vec(),
+                        EncodingType::Utf8,
+                    ))],
+                )
+                .await;
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            match &rows[0][0] {
+                ColumnValues::String(v) => assert_eq!(v.to_utf8_string(), varchar_text),
+                other => panic!("expected varchar string, got {other:?}"),
+            }
+
+            // varbinary: raw bytes round-trip.
+            let varbinary = vec![0x01_u8, 0x02, 0x03, 0xFE, 0xFF];
+            let table = h
+                .bulk_copy_vals(
+                    "VARBINARY(16)",
+                    "DETERMINISTIC",
+                    "NOT NULL",
+                    vec![ColumnValues::Bytes(varbinary.clone())],
+                )
+                .await;
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            match &rows[0][0] {
+                ColumnValues::Bytes(v) => assert_eq!(v, &varbinary),
+                other => panic!("expected varbinary, got {other:?}"),
+            }
+
+            // uniqueidentifier round-trip.
+            let guid = Uuid::new_v4();
+            let table = h
+                .bulk_copy_vals(
+                    "UNIQUEIDENTIFIER",
+                    "DETERMINISTIC",
+                    "NOT NULL",
+                    vec![ColumnValues::Uuid(guid)],
+                )
+                .await;
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            match &rows[0][0] {
+                ColumnValues::Uuid(v) => assert_eq!(*v, guid),
+                other => panic!("expected uniqueidentifier, got {other:?}"),
+            }
+        });
+    }
+
+    /// Bulk copy round-trips Unicode `nvarchar` (UTF-16) and UTF-8-collated
+    /// `varchar` values through encrypted columns, including non-Latin scripts
+    /// and supplementary-plane characters.
+    #[tokio::test]
+    async fn bulk_copy_unicode_and_utf8_strings() {
+        ae_test!(|h| {
+            // nvarchar (UTF-16) carrying rich Unicode.
+            let table = h
+                .bulk_copy_vals(
+                    &format!("NVARCHAR(256) COLLATE {BIN2_COLLATION}"),
+                    "DETERMINISTIC",
+                    "NOT NULL",
+                    vec![ColumnValues::String(SqlString::from_utf8_string(
+                        UNICODE_SAMPLE.to_string(),
+                    ))],
+                )
+                .await;
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            match &rows[0][0] {
+                ColumnValues::String(v) => assert_eq!(v.to_utf8_string(), UNICODE_SAMPLE),
+                other => panic!("expected nvarchar, got {other:?}"),
+            }
+
+            // varchar with a UTF-8 collation carrying multi-byte UTF-8 content.
+            let table = h
+                .bulk_copy_vals(
+                    &format!("VARCHAR(256) COLLATE {BIN2_UTF8_COLLATION}"),
+                    "DETERMINISTIC",
+                    "NOT NULL",
+                    vec![ColumnValues::String(SqlString::new(
+                        UNICODE_SAMPLE.as_bytes().to_vec(),
+                        EncodingType::Utf8,
+                    ))],
+                )
+                .await;
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            match &rows[0][0] {
+                ColumnValues::String(v) => assert_eq!(v.to_utf8_string(), UNICODE_SAMPLE),
+                other => panic!("expected varchar, got {other:?}"),
+            }
+        });
+    }
+
+    /// Bulk-copying numeric and temporal values into encrypted columns encrypts
+    /// each one on the client and round-trips it back transparently decrypted.
+    #[tokio::test]
+    async fn bulk_copy_roundtrips_numeric_and_temporal_types() {
+        ae_test!(|h| {
+            // bigint round-trip.
+            let table = h
+                .bulk_copy_vals(
+                    "BIGINT",
+                    "DETERMINISTIC",
+                    "NOT NULL",
+                    vec![ColumnValues::BigInt(9_000_000_000_000_i64)],
+                )
+                .await;
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            assert_eq!(rows[0][0], ColumnValues::BigInt(9_000_000_000_000_i64));
+
+            // decimal(18,4) round-trip (1234.5678).
+            let decimal = DecimalParts {
+                is_positive: true,
+                int_parts: vec![12_345_678],
+                scale: 4,
+                precision: 18,
+            };
+            let table = h
+                .bulk_copy_vals(
+                    "DECIMAL(18,4)",
+                    "DETERMINISTIC",
+                    "NOT NULL",
+                    vec![ColumnValues::Decimal(decimal.clone())],
+                )
+                .await;
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            match &rows[0][0] {
+                ColumnValues::Decimal(v) => assert_eq!(v, &decimal),
+                other => panic!("expected decimal, got {other:?}"),
+            }
+
+            // money round-trip (123.4567 stored as value * 10^4).
+            let money = SqlMoney {
+                lsb_part: 1_234_567,
+                msb_part: 0,
+            };
+            let table = h
+                .bulk_copy_vals(
+                    "MONEY",
+                    "DETERMINISTIC",
+                    "NOT NULL",
+                    vec![ColumnValues::Money(money.clone())],
+                )
+                .await;
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            match &rows[0][0] {
+                ColumnValues::Money(v) => {
+                    assert_eq!(v.lsb_part, money.lsb_part);
+                    assert_eq!(v.msb_part, money.msb_part);
+                }
+                other => panic!("expected money, got {other:?}"),
+            }
+
+            // datetime2(7) round-trip.
+            let datetime2 = SqlDateTime2 {
+                days: 730_119,
+                time: SqlTime {
+                    time_nanoseconds: 123_456_700,
+                    scale: 7,
+                },
+            };
+            let table = h
+                .bulk_copy_vals(
+                    "DATETIME2(7)",
+                    "DETERMINISTIC",
+                    "NOT NULL",
+                    vec![ColumnValues::DateTime2(datetime2.clone())],
+                )
+                .await;
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            match &rows[0][0] {
+                ColumnValues::DateTime2(v) => assert_eq!(v, &datetime2),
+                other => panic!("expected datetime2, got {other:?}"),
+            }
+        });
+    }
+
+    /// Bulk-copying a NULL into a nullable encrypted column stores SQL NULL (not
+    /// an encrypted value), and it round-trips back as `Null`.
+    #[tokio::test]
+    async fn bulk_copy_encrypts_null_values() {
+        ae_test!(|h| {
+            let table = h
+                .bulk_copy_vals(
+                    "INT",
+                    "DETERMINISTIC",
+                    "NULL",
+                    vec![
+                        ColumnValues::Int(5),
+                        ColumnValues::Null,
+                        ColumnValues::Int(7),
+                    ],
+                )
+                .await;
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            assert_eq!(
+                rows.into_iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+                vec![
+                    ColumnValues::Int(5),
+                    ColumnValues::Null,
+                    ColumnValues::Int(7),
+                ],
+                "NULL must round-trip through an encrypted bulk-copy column"
+            );
+        });
+    }
+
+    /// With RANDOMIZED encryption, two identical plaintext values bulk-copied
+    /// into the same encrypted column still decrypt correctly, but their stored
+    /// ciphertext differs (a fresh IV is used per cell).
+    #[tokio::test]
+    async fn bulk_copy_randomized_encryption() {
+        ae_test!(|h| {
+            let table = h
+                .bulk_copy_vals(
+                    "INT",
+                    "RANDOMIZED",
+                    "NOT NULL",
+                    vec![ColumnValues::Int(42), ColumnValues::Int(42)],
+                )
+                .await;
+
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            assert_eq!(
+                rows.into_iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+                vec![ColumnValues::Int(42), ColumnValues::Int(42)],
+                "randomized values must still decrypt to the same plaintext"
+            );
+
+            let first = read_ciphertext(&table, 1).await;
+            let second = read_ciphertext(&table, 2).await;
+            assert_ne!(
+                first, second,
+                "randomized encryption must produce distinct ciphertext for equal plaintext"
+            );
+        });
+    }
+
+    /// A table with multiple encrypted columns (plus a plaintext key) bulk-copies
+    /// correctly: every encrypted column is encrypted independently and all
+    /// values round-trip.
+    #[tokio::test]
+    async fn bulk_copy_multiple_encrypted_columns() {
+        ae_test!(|h| {
+            let enc = h.enc_clause("DETERMINISTIC");
+            let table = h
+                .create_table(&format!(
+                    "id INT NOT NULL, a INT {enc} NOT NULL, \
+                     b NVARCHAR(50) COLLATE {BIN2_COLLATION} {enc} NULL"
+                ))
+                .await;
+
+            let rows = vec![
+                GenericBulkRow {
+                    values: vec![
+                        ColumnValues::Int(1),
+                        ColumnValues::Int(100),
+                        ColumnValues::String(SqlString::from_utf8_string("alpha".to_string())),
+                    ],
+                },
+                GenericBulkRow {
+                    values: vec![
+                        ColumnValues::Int(2),
+                        ColumnValues::Int(200),
+                        ColumnValues::Null,
+                    ],
+                },
+            ];
+            let result = BulkCopy::new(&mut h.client, table.as_str())
+                .batch_size(100)
+                .write_to_server_zerocopy(rows)
+                .await
+                .expect("bulk copy into multiple encrypted columns");
+            assert_eq!(result.rows_affected, 2);
+
+            let got = h
+                .query_rows(&format!("SELECT a, b FROM {table} ORDER BY id;"), 2)
+                .await;
+            assert_eq!(got[0][0], ColumnValues::Int(100));
+            match &got[0][1] {
+                ColumnValues::String(v) => assert_eq!(v.to_utf8_string(), "alpha"),
+                other => panic!("expected nvarchar, got {other:?}"),
+            }
+            assert_eq!(got[1][0], ColumnValues::Int(200));
+            assert_eq!(got[1][1], ColumnValues::Null);
+        });
+    }
+
+    /// Bulk-copying more rows than the batch size into an encrypted column copies
+    /// every row across multiple batches and each value round-trips.
+    #[tokio::test]
+    async fn bulk_copy_batches_multiple_rows() {
+        ae_test!(|h| {
+            let enc = h.enc_clause("DETERMINISTIC");
+            let table = h
+                .create_table(&format!("id INT NOT NULL, val INT {enc} NOT NULL"))
+                .await;
+
+            const ROW_COUNT: i32 = 250;
+            let rows: Vec<GenericBulkRow> = (1..=ROW_COUNT)
+                .map(|i| GenericBulkRow {
+                    values: vec![ColumnValues::Int(i), ColumnValues::Int(i * 7)],
+                })
+                .collect();
+            let result = BulkCopy::new(&mut h.client, table.as_str())
+                .batch_size(50)
+                .write_to_server_zerocopy(rows)
+                .await
+                .expect("bulk copy across multiple batches");
+            assert_eq!(result.rows_affected, ROW_COUNT as u64);
+
+            let got = h
+                .query_rows(&format!("SELECT id, val FROM {table} ORDER BY id;"), 2)
+                .await;
+            assert_eq!(got.len(), ROW_COUNT as usize);
+            assert_eq!(got[0], vec![ColumnValues::Int(1), ColumnValues::Int(7)]);
+            assert_eq!(
+                got[ROW_COUNT as usize - 1],
+                vec![
+                    ColumnValues::Int(ROW_COUNT),
+                    ColumnValues::Int(ROW_COUNT * 7),
+                ],
+            );
+        });
+    }
+
+    /// Bulk-copying into an encrypted column over an Always Encrypted-disabled
+    /// connection must fail: without encryption negotiated the client cannot
+    /// produce ciphertext, and the server rejects the plaintext payload.
+    #[tokio::test]
+    async fn bulk_copy_with_ae_disabled_fails() {
+        ae_test!(|h| {
+            let enc = h.enc_clause("DETERMINISTIC");
+            let table = h
+                .create_table(&format!("id INT NOT NULL, val INT {enc} NOT NULL"))
+                .await;
+
+            let mut plain = connect_disabled().await;
+            let rows = vec![GenericBulkRow {
+                values: vec![ColumnValues::Int(1), ColumnValues::Int(111)],
+            }];
+            let result = BulkCopy::new(&mut plain, table.as_str())
+                .batch_size(100)
+                .write_to_server_zerocopy(rows)
+                .await;
+            let _ = plain.close_query().await;
+            assert!(
+                result.is_err(),
+                "bulk copy into an encrypted column must fail with AE disabled, got {result:?}"
+            );
+        });
+    }
+
+    /// Bulk-copying into an encrypted column with a provider that cannot unwrap
+    /// the CEK must fail while resolving the column encryption key.
+    #[tokio::test]
+    async fn bulk_copy_with_unregistered_key_fails() {
+        ae_test!(|h| {
+            let enc = h.enc_clause("DETERMINISTIC");
+            let table = h
+                .create_table(&format!("id INT NOT NULL, val INT {enc} NOT NULL"))
+                .await;
+
+            // Empty provider: no master key registered for the recorded path.
+            let mut client = connect_enabled(Arc::new(CertificateKeyStoreProvider::new())).await;
+            let rows = vec![GenericBulkRow {
+                values: vec![ColumnValues::Int(1), ColumnValues::Int(111)],
+            }];
+            let result = BulkCopy::new(&mut client, table.as_str())
+                .batch_size(100)
+                .write_to_server_zerocopy(rows)
+                .await;
+            let _ = client.close_query().await;
+            assert!(
+                result.is_err(),
+                "bulk copy must fail when the CEK cannot be unwrapped, got {result:?}"
+            );
         });
     }
 
