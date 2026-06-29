@@ -77,8 +77,7 @@ critcmp base candidate                                       # side-by-side comp
 ### Practical constraints
 
 - **Same machine, same run.** Criterion comparison is only meaningful when both runs
-  happen back-to-back on the same isolated host (the `RUST-1ES-POOL-WUS3` pool / SQL
-  2025 container used by the existing pipeline). Archived baseline *numbers* from a
+  happen back-to-back on the same isolated host (the `PerfLabWestUS2` pool). Archived baseline *numbers* from a
   different VM/run are rejected: these benchmarks are network-bound, so cross-run drift
   (machine, network, SQL Server state) dwarfs the code delta. Version A must be rebuilt
   live on the same host each run.
@@ -94,7 +93,7 @@ critcmp base candidate                                       # side-by-side comp
 ## 3. Benchmark Scenarios
 
 End-to-end against a real SQL Server. Where only execution should be measured,
-connection setup is moved to Criterion's setup phase.
+database setup is moved to Criterion's setup phase.
 
 ### Connection
 - Single connect/close (non-pooled). *(Pooled connection excluded — mssql-tds has no pool.)*
@@ -136,10 +135,11 @@ connection setup is moved to Criterion's setup phase.
 3. **Test data & config.** `setup.sql` for the benchmark table/proc and seed rows. Reuse
    the existing env contract (`DB_HOST`, `DB_PORT`, `DB_USERNAME`, `SQL_PASSWORD`,
    `TRUST_SERVER_CERTIFICATE`, `CERT_HOST_NAME`).
-4. **Baseline-pin mechanism.** Pin version A as a git tag consumed via the Cargo git
-   dependency. Store the baseline pointer in one place (pipeline variable or a small
-   committed manifest in the harness crate) so advancing it is explicit and reviewable.
-   Tune noise thresholds. Compare via `critcmp`.
+4. **Baseline-pin mechanism.** Pin version A as the `perf-baseline` git tag consumed via
+   the Cargo git dependency. The tag name is **hard-coded into the pipeline script**; the
+   `perf-baseline` tag is **moved manually in the git repo** when the baseline should
+   advance (per release or when an intentional perf change lands). Tune noise thresholds.
+   Compare via `critcmp`.
 5. **New pipeline (complementary).** On the same `RUST-1ES-POOL-WUS3` VM in one run:
    build the baseline-tag harness (`--save-baseline base`), then the candidate
    (`--save-baseline candidate`), then `critcmp`, publishing the comparison artifact.
@@ -162,7 +162,10 @@ connection setup is moved to Criterion's setup phase.
 - The fixed-baseline mechanism **complements** the existing PR-vs-target pipeline
   (`.pipeline/benchmark-pipeline.yml`).
 - Baseline pinned via **git tag + Cargo git dependency** (not whole-repo checkout) so
-  mssql-tds is the only variable; advance the tag deliberately.
+  mssql-tds is the only variable.
+- Baseline tag name is **`perf-baseline`, hard-coded in the pipeline script**. The tag is
+  **moved manually in the git repo** to advance the baseline (no committed manifest or
+  pipeline variable).
 - End-to-end (real SQL Server) only.
 - **Out of scope:** cross-driver spec-compliant JSON (P50/P95/P99), mock-TDS
   microbenchmarks, pooled-connection scenario, Always Encrypted / Entra ID auth.
