@@ -58,9 +58,10 @@
   "packageManager": "yarn@4.9.2",
   "resolutions": {
     "js-yaml": "4.2.0",
-    "tar": "7.5.11"
+    "tar": "7.5.16"
   },
   "overrides": {
-    "js-yaml": "4.2.0"
+    "js-yaml": "4.2.0",
+    "tar": "7.5.16"
   }
 }

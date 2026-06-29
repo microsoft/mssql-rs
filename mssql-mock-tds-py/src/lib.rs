@@ -53,7 +53,7 @@ fn load_test_identity() -> Result<native_tls::Identity, Box<dyn std::error::Erro
 }
 
 /// Information about a connection received by the mock server
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyConnectionInfo {
     /// Client address as string

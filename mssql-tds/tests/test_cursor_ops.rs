@@ -9,6 +9,7 @@
 mod common;
 
 use common::{begin_connection, build_tcp_datasource};
+use mssql_tds::connection::cursor_ops::CursorClient;
 use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
 use mssql_tds::cursor::{
     CursorConcurrency, CursorOperation, CursorOptionCode, CursorOptionValue, CursorScrollOption,
