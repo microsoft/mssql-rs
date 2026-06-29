@@ -1,169 +1,71 @@
-# Fixed-baseline performance pipeline
+# Fixed-baseline performance pipeline (dedicated perf lab)
 #
-# Complements benchmark-pipeline.yml (which compares a PR against its target
-# branch). This pipeline instead compares the current commit against a fixed,
-# manually-advanced baseline pinned by the `perf-baseline` git tag, using the
-# mssql-tds-bench harness whose ONLY swapped input is the mssql-tds dependency.
+# Compares the current commit against a fixed, manually-advanced baseline
+# pinned by the `perf-baseline` git tag, using the mssql-tds-bench harness whose
+# ONLY swapped input is the mssql-tds dependency. The harness code, Criterion
+# version, and toolchain are identical across both runs, so any significant
+# delta is attributable to mssql-tds itself.
 #
-# The harness code, Criterion version, and toolchain are identical across both
-# runs, so any significant delta is attributable to mssql-tds itself.
+# This pipeline consumes the shared PerfTest lab template, which runs the
+# benchmarks on a dedicated host VM (not on shared/noisy build agents):
+#   select region -> generate SSH key -> deploy VM -> copy repo -> run the
+#   testScript on the VM -> collect results -> tear down.
 #
-# Runs on Linux x64 only. Trigger manually or on a schedule.
+# The build happens ON the VM (the lab's documented model): the testScript
+# bootstraps the toolchain, builds the candidate from the working tree and the
+# baseline from a local `git worktree` of the perf-baseline tag, then compares
+# with critcmp. See mssql-tds-bench/perf-lab/run-benchmarks.{sh,ps1}.
+#
+# Complements benchmark-pipeline.yml (PR vs target branch). Trigger manually or
+# on the weekly schedule below.
 
 trigger: none
 pr: none
 
 schedules:
-  - cron: '0 6 * * 1'
+  - cron: '0 8 * * 1'
     displayName: Weekly baseline comparison
     branches:
       include:
         - main
     always: true
 
-variables:
-  # Hard-coded baseline pointer. Move the `perf-baseline` tag manually in the
-  # git repo when the baseline should advance (per release, or when an
-  # intentional perf change lands). No pipeline variable or committed manifest.
-  BASELINE_TAG: perf-baseline
+parameters:
+  - name: platform
+    displayName: 'Target platform'
+    type: string
+    default: linux
+    values:
+      - linux
+      - windows
 
-stages:
-  - stage: BaselineBenchmark
-    displayName: Fixed-Baseline Benchmark
-    jobs:
-      - job: Benchmark
-        displayName: 'mssql-tds-bench vs perf-baseline'
-        timeoutInMinutes: 60
-        pool:
-          name: RUST-1ES-POOL-WUS3
-          demands:
-            - imageOverride -equals RUST-1ES-UBUSLIM
-        variables:
-          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-          # Let Cargo use the git CLI (and thus the persisted checkout creds)
-          # when fetching the perf-baseline tag for the swapped dependency.
-          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+resources:
+  repositories:
+    - repository: PerfTemplates
+      type: git
+      name: InternalDriverTools/PerfTest
+      ref: refs/heads/main
 
-        steps:
-          - checkout: self
-            fetchDepth: 0
-            persistCredentials: true
-
-          - template: templates/install-dependencies.yml
-            parameters:
-              osType: Linux
-              enableJsDeps: false
-
-          - template: templates/cargo-authenticate-template.yml
-            parameters:
-              osType: Linux
-
-          - template: templates/sql-setup-template.yml
-            parameters:
-              buildTarget: Linux
-
-          - script: |
-              set -euo pipefail
-              CONTAINER_ID=$(docker ps -q --filter ancestor=mcr.microsoft.com/mssql/server:2025-latest)
-              if [ -z "$CONTAINER_ID" ]; then
-                echo "##vso[task.logissue type=error]No SQL Server container found"
-                exit 1
-              fi
-              if [ "$(echo "$CONTAINER_ID" | wc -l)" -ne 1 ]; then
-                echo "##vso[task.logissue type=error]Multiple SQL Server containers found"
-                exit 1
-              fi
-              echo "SQL Server container: $CONTAINER_ID"
-              for i in $(seq 1 30); do
-                if docker exec "$CONTAINER_ID" /opt/mssql-tools18/bin/sqlcmd \
-                  -S localhost -U sa -P "$SQL_PASSWORD" -C -Q "SELECT 1" > /dev/null 2>&1; then
-                  echo "SQL Server ready after $((i * 2))s"
-                  exit 0
-                fi
-                echo "Waiting for SQL Server... ($i/30)"
-                sleep 2
-              done
-              echo "##vso[task.logissue type=error]SQL Server did not become ready in time"
-              exit 1
-            displayName: Wait for SQL Server
-            env:
-              SQL_PASSWORD: $(SQL_PASSWORD)
-
-          - script: cargo install critcmp --version 0.1.8 --locked
-            displayName: Install critcmp
-
-          - script: |
-              set -euo pipefail
-              echo "Verifying baseline tag '$(BASELINE_TAG)' exists..."
-              git fetch origin "refs/tags/$(BASELINE_TAG):refs/tags/$(BASELINE_TAG)" --no-tags
-              git rev-parse "$(BASELINE_TAG)^{commit}"
-            displayName: 'Verify baseline tag'
-
-          - script: |
-              set -euo pipefail
-              echo "=== Candidate run (mssql-tds = path, committed state) ==="
-              cargo bench -p mssql-tds-bench -- --save-baseline candidate
-            displayName: 'Candidate benchmarks'
-            env:
-              SQL_PASSWORD: $(SQL_PASSWORD)
-              DB_HOST: localhost
-              DB_PORT: '1433'
-              DB_USERNAME: sa
-              TRUST_SERVER_CERTIFICATE: 'true'
-              CERT_HOST_NAME: sql1
-
-          - script: |
-              set -euo pipefail
-              REPO_URL=$(git config --get remote.origin.url)
-              echo "Swapping mssql-tds dependency to git tag '$(BASELINE_TAG)' from $REPO_URL"
-              # Repoint the single mssql-tds dependency line to the baseline tag.
-              python3 - "$REPO_URL" "$(BASELINE_TAG)" <<'PY'
-              import re, sys
-              repo_url, tag = sys.argv[1], sys.argv[2]
-              path = "mssql-tds-bench/Cargo.toml"
-              text = open(path).read()
-              new = f'mssql-tds = {{ git = "{repo_url}", tag = "{tag}" }}'
-              text, n = re.subn(r'^mssql-tds = \{ path = "\.\./mssql-tds" \}$', new, text, flags=re.M)
-              assert n == 1, f"expected exactly 1 dependency line to rewrite, found {n}"
-              open(path, "w").write(text)
-              print("Rewrote dependency to:", new)
-              PY
-            displayName: 'Swap dependency to baseline tag'
-
-          - script: |
-              set -euo pipefail
-              echo "=== Baseline run (mssql-tds = git tag $(BASELINE_TAG)) ==="
-              cargo bench -p mssql-tds-bench -- --save-baseline base
-            displayName: 'Baseline benchmarks ($(BASELINE_TAG))'
-            env:
-              SQL_PASSWORD: $(SQL_PASSWORD)
-              DB_HOST: localhost
-              DB_PORT: '1433'
-              DB_USERNAME: sa
-              TRUST_SERVER_CERTIFICATE: 'true'
-              CERT_HOST_NAME: sql1
-
-          - script: |
-              set -euo pipefail
-              # Restore the committed dependency so the checkout is left clean.
-              git checkout -- mssql-tds-bench/Cargo.toml
-            displayName: 'Restore committed dependency'
-            condition: always()
-
-          - script: |
-              set -euo pipefail
-              echo ""
-              echo "============================================"
-              echo "  Benchmark Comparison: base ($(BASELINE_TAG)) -> candidate"
-              echo "============================================"
-              echo ""
-              mkdir -p "$(Build.ArtifactStagingDirectory)/benchmarks"
-              critcmp base candidate | tee "$(Build.ArtifactStagingDirectory)/benchmarks/comparison.txt"
-            displayName: Compare results
-
-          - task: PublishPipelineArtifact@1
-            inputs:
-              targetPath: '$(Build.ArtifactStagingDirectory)/benchmarks'
-              artifactName: baseline-benchmark-results
-            displayName: Publish benchmark results
-            condition: always()
+extends:
+  template: v1/Perf.Test.Job.yml@PerfTemplates
+  parameters:
+    platform: ${{ parameters.platform }}
+    # Ship the whole repo (including .git) so the testScript can create a local
+    # worktree of the perf-baseline tag with no VM-side ADO authentication.
+    testRootDir: $(Build.SourcesDirectory)/mssql-rs
+    # Relative to testRootDir. The template auto-swaps .sh -> .ps1 on Windows.
+    testScript: mssql-tds-bench/perf-lab/run-benchmarks.sh
+    testScriptArgs: none
+    testResultsSubDir: results
+    testTimeoutMinutes: 120
+    steps:
+      - bash: |
+          set -euo pipefail
+          report="$(Build.ArtifactStagingDirectory)/results/comparison.txt"
+          echo "=== Benchmark comparison (base -> candidate) ==="
+          if [ -f "$report" ]; then
+            cat "$report"
+          else
+            echo "comparison.txt not found"
+          fi
+        displayName: 'Show benchmark comparison'
