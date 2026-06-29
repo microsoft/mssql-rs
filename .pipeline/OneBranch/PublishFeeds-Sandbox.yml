@@ -121,7 +121,7 @@ extends:
             set -euo pipefail
             BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
             DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
-            VER="${BASE}.dev${DEV}"
+            VER="${BASE}-dev${DEV}"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
             echo "Sandbox wheel version: ${VER}"
             # pyproject.toml [project].version
             sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
@@ -197,7 +197,7 @@ extends:
             set -euo pipefail
             BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
             DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
-            VER="${BASE}.dev${DEV}"
+            VER="${BASE}-dev${DEV}"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
             echo "Sandbox wheel version: ${VER}"
             sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
             sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
@@ -273,7 +273,7 @@ extends:
             if ($py -match '(?m)^version\s*=\s*"([^"]+)"') { $base = $Matches[1] }
             else { Write-Error 'Could not read version from pyproject.toml'; exit 1 }
             $dev = "$(Get-Date -Format 'yyyyMMdd')$(Build.BuildId)"
-            $ver = "$base.dev$dev"
+            $ver = "$base-dev$dev"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
             Write-Host "Sandbox wheel version: $ver"
             (Get-Content 'mssql-mock-tds-py/pyproject.toml' -Raw) `
               -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$ver`"" |
@@ -348,7 +348,7 @@ extends:
             if ($py -match '(?m)^version\s*=\s*"([^"]+)"') { $base = $Matches[1] }
             else { Write-Error 'Could not read version from pyproject.toml'; exit 1 }
             $dev = "$(Get-Date -Format 'yyyyMMdd')$(Build.BuildId)"
-            $ver = "$base.dev$dev"
+            $ver = "$base-dev$dev"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
             Write-Host "Sandbox wheel version: $ver"
             (Get-Content 'mssql-mock-tds-py/pyproject.toml' -Raw) `
               -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$ver`"" |
@@ -423,7 +423,7 @@ extends:
             set -euo pipefail
             BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
             DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
-            VER="${BASE}.dev${DEV}"
+            VER="${BASE}-dev${DEV}"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
             echo "Sandbox wheel version: ${VER}"
             sed -i '' -E "1,/^version[[:space:]]*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
             sed -i '' -E "1,/^version[[:space:]]*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
