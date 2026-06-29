@@ -254,15 +254,13 @@ fn push_protocol(
                 });
             }
         }
-        "np" => {
-            if !value.is_empty() {
-                protocols.push(SsrpInstanceInfo {
-                    instance_name: instance_name.to_string(),
-                    protocol: "np".to_string(),
-                    tcp_port: None,
-                    pipe_path: Some(value.to_string()),
-                });
-            }
+        "np" if !value.is_empty() => {
+            protocols.push(SsrpInstanceInfo {
+                instance_name: instance_name.to_string(),
+                protocol: "np".to_string(),
+                tcp_port: None,
+                pipe_path: Some(value.to_string()),
+            });
         }
         _ => {} // via, rpc, spx, adsp, sm — skip
     }
