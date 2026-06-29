@@ -3,7 +3,7 @@ requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "mssql-mock-tds-py"
+name = "mssql-mock-tds"
 version = "0.1.0"
 description = "Python bindings for the mock TDS server for testing SQL Server clients"
 requires-python = ">=3.9"
@@ -18,4 +18,5 @@ classifiers = [
 ]
 
 [tool.maturin]
+module-name = "mssql_mock_tds"
 features = ["pyo3/extension-module"]
