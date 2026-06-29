@@ -159,7 +159,7 @@ extends:
           displayName: 'Publish Linux x64 mock wheel'
           inputs:
             targetPath: '$(ob_outputDirectory)/wheels'
-            artifact: 'mock_wheels_linux_x64'
+            artifact: 'drop_PublishMockPython_BuildLinux_x64_mock_linux_x64'
             publishLocation: 'pipeline'
 
       #####################################################################
@@ -233,7 +233,7 @@ extends:
           displayName: 'Publish Linux ARM64 mock wheel'
           inputs:
             targetPath: '$(ob_outputDirectory)/wheels'
-            artifact: 'mock_wheels_linux_arm64'
+            artifact: 'drop_PublishMockPython_BuildLinux_arm64_mock_linux_arm64'
             publishLocation: 'pipeline'
 
       #####################################################################
@@ -303,7 +303,7 @@ extends:
           displayName: 'Publish Windows x64 mock wheel'
           inputs:
             targetPath: '$(ob_outputDirectory)/wheels'
-            artifact: 'mock_wheels_windows_x64'
+            artifact: 'drop_PublishMockPython_BuildWindows_x64_mock_windows_x64'
             publishLocation: 'pipeline'
 
       #####################################################################
@@ -376,7 +376,7 @@ extends:
           displayName: 'Publish Windows ARM64 mock wheel'
           inputs:
             targetPath: '$(ob_outputDirectory)/wheels'
-            artifact: 'mock_wheels_windows_arm64'
+            artifact: 'drop_PublishMockPython_BuildWindows_arm64_mock_windows_arm64'
             publishLocation: 'pipeline'
 
       #####################################################################
@@ -465,7 +465,7 @@ extends:
           displayName: 'Publish macOS universal2 mock wheel'
           inputs:
             targetPath: '$(ob_outputDirectory)/wheels'
-            artifact: 'mock_wheels_macos_universal2'
+            artifact: 'drop_PublishMockPython_BuildMacOS_universal2_mock_macos_universal2'
             publishLocation: 'pipeline'
 
       #####################################################################
