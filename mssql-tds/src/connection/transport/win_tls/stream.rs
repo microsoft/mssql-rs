@@ -74,6 +74,10 @@ enum Mode {
 pub(crate) struct SchannelTlsStream<S> {
     socket: S,
     mode: Mode,
+    /// Cached `tls-unique` channel binding token (full `SEC_CHANNEL_BINDINGS`
+    /// blob) captured at the end of the handshake. `None` when extraction was
+    /// suppressed or failed. Surfaced via [`SchannelTlsStream::channel_binding_token`].
+    channel_binding: Option<Vec<u8>>,
 }
 
 impl<S> SchannelTlsStream<S>
@@ -138,6 +142,9 @@ where
                     // would fail to decrypt the duplicated copy.
                     log_negotiated_alpn(handshake.ctx_handle(), alpn_requested);
                     let ctx = handshake.into_ctx();
+                    // Capture the tls-unique channel binding token before the
+                    // context is moved into the record layer.
+                    let channel_binding = extract_channel_binding(&ctx);
                     debug!(
                         elapsed_ms = connect_started.elapsed().as_millis() as u64,
                         socket_reads = read_count,
@@ -163,6 +170,7 @@ where
                             pending_out_written: 0,
                             pending_plain_len: 0,
                         },
+                        channel_binding,
                     });
                 }
                 StepOutcome::DoneWithFlush { out, sizes } => {
@@ -174,6 +182,9 @@ where
                     // SECBUFFER_EXTRA tail; do not re-append `extra`.
                     log_negotiated_alpn(handshake.ctx_handle(), alpn_requested);
                     let ctx = handshake.into_ctx();
+                    // Capture the tls-unique channel binding token before the
+                    // context is moved into the record layer.
+                    let channel_binding = extract_channel_binding(&ctx);
                     debug!(
                         elapsed_ms = connect_started.elapsed().as_millis() as u64,
                         socket_reads = read_count,
@@ -199,6 +210,7 @@ where
                             pending_out_written: 0,
                             pending_plain_len: 0,
                         },
+                        channel_binding,
                     });
                 }
                 StepOutcome::WantWriteThenRead(out) => {
@@ -255,6 +267,40 @@ where
     pub(crate) fn ctx(&self) -> &super::handshake::SecCtx {
         match &self.mode {
             Mode::Streaming { record, .. } => record.ctx(),
+        }
+    }
+
+    /// The `tls-unique` channel binding token (full `SEC_CHANNEL_BINDINGS`
+    /// blob) captured at handshake completion, if extraction succeeded and
+    /// was not suppressed.
+    pub(crate) fn channel_binding_token(&self) -> Option<Vec<u8>> {
+        self.channel_binding.clone()
+    }
+}
+
+/// Extract the `tls-unique` channel binding token from a freshly completed
+/// security context, honoring the diagnostic suppression flag.
+///
+/// Logs and returns `None` on failure rather than aborting the connection:
+/// a missing channel binding only matters when the server enforces Extended
+/// Protection, in which case the login itself will fail with a clear server
+/// error. Mirrors the non-fatal ALPN-query handling above.
+fn extract_channel_binding(ctx: &super::handshake::SecCtx) -> Option<Vec<u8>> {
+    if super::bindings::channel_bindings_suppressed() {
+        debug!("win_tls: channel binding extraction suppressed via env var");
+        return None;
+    }
+    match super::bindings::query_unique_bindings(ctx) {
+        Ok(token) => {
+            debug!(
+                token_len = token.len(),
+                "win_tls: extracted tls-unique channel binding token"
+            );
+            Some(token)
+        }
+        Err(e) => {
+            debug!(error = %e, "win_tls: failed to extract channel binding token");
+            None
         }
     }
 }

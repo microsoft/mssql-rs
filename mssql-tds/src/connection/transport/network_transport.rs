@@ -436,6 +436,21 @@ pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + Sync {
     fn is_connection_dead(&self) -> bool {
         false
     }
+
+    /// Returns this connection's TLS channel binding token (`tls-unique`,
+    /// RFC 5929 §3) if one is available.
+    ///
+    /// Used by integrated authentication (SSPI/GSSAPI) to participate in SQL
+    /// Server Extended Protection for Authentication. The returned bytes are
+    /// the full `SEC_CHANNEL_BINDINGS` structure produced by the TLS engine,
+    /// ready to be passed verbatim to the platform auth provider.
+    ///
+    /// Returns `None` for plaintext streams and for TLS engines that do not
+    /// expose the token (today, every engine except the Windows
+    /// Schannel-direct one).
+    fn channel_binding_token(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 impl Stream for TcpStream {
@@ -477,6 +492,10 @@ impl Stream for Box<dyn Stream> {
 
     fn is_connection_dead(&self) -> bool {
         (**self).is_connection_dead()
+    }
+
+    fn channel_binding_token(&self) -> Option<Vec<u8>> {
+        (**self).channel_binding_token()
     }
 }
 
@@ -572,6 +591,14 @@ impl NetworkWriter for NetworkTransport {
 
     fn take_reset_mode(&mut self) -> ResetConnectionMode {
         std::mem::replace(&mut self.pending_reset, ResetConnectionMode::None)
+    }
+
+    fn channel_binding_token(&self) -> Option<Vec<u8>> {
+        // After a successful TLS handshake `self.stream` holds the encrypted
+        // stream; the call forwards through `Box<dyn Stream>` to the TLS
+        // engine, which returns its `tls-unique` token (Windows Schannel-direct
+        // only today). Plaintext / unencrypted connections return `None`.
+        self.stream.as_ref()?.channel_binding_token()
     }
 }
 

@@ -468,7 +468,10 @@ impl ClientContext {
         IntegratedAuthConfig {
             server_spn: self.server_spn.clone(),
             security_package: Default::default(),
-            channel_bindings: None, // Set during TLS handshake
+            // Populated post-handshake in `send_login7_request` from the TLS
+            // engine's channel binding token (see
+            // `NetworkWriter::channel_binding_token`).
+            channel_bindings: None,
             is_loopback,
         }
     }
