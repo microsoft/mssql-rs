@@ -411,8 +411,14 @@ extends:
         - script: |
             set -euo pipefail
             echo "Installing maturin via pipx..."
-            python3 -m pip install --user pipx
-            python3 -m pipx ensurepath
+            # macOS hosted agents ship an externally-managed (PEP 668) Homebrew
+            # Python, so a plain `pip install --user pipx` aborts with
+            # "externally-managed-environment". pipx is preinstalled on the macOS
+            # image; only bootstrap it (with --break-system-packages) if missing.
+            if ! command -v pipx >/dev/null 2>&1; then
+              python3 -m pip install --user --break-system-packages pipx
+              python3 -m pipx ensurepath
+            fi
             export PATH="$HOME/.local/bin:$PATH"
             pipx install maturin
             echo "Installing Rust targets for universal2 build..."
@@ -453,7 +459,8 @@ extends:
         - script: |
             set -euo pipefail
             export PATH="$HOME/.local/bin:$PATH"
-            pip install wheel
+            # --break-system-packages: the macOS image Python is externally managed (PEP 668).
+            python3 -m pip install --user --break-system-packages wheel
             for whl in "$(ob_outputDirectory)"/wheels/*.whl; do
               echo "Re-tagging: $(basename "$whl")"
               wheel tags --platform-tag macosx_15_0_universal2 --remove "$whl"
@@ -564,13 +571,29 @@ extends:
             skipPythonSetup: true
             skipRustupInstall: false
             enableJsDeps: false
-        # Stamp prerelease versions into mssql-tds + mssql-mock-tds [package].version.
+        # Stamp a PEP 440 / SemVer prerelease into ONLY the [package].version of
+        # mssql-tds and mssql-mock-tds. We do this inline instead of the shared
+        # .pipeline/scripts/stamp-crate-versions.ps1 because that script's global
+        # `^version = "..."` regex also rewrites table-style dependency versions
+        # such as [dependencies.uuid] version = "1.19.0", which corrupts the
+        # dependency requirement and makes `cargo publish` fail. Replacing only
+        # the first ^version line per file targets the package version.
         - pwsh: |
-            .pipeline/scripts/stamp-crate-versions.ps1 `
-              -BuildReason "$(Build.Reason)" `
-              -BuildId "$(Build.BuildId)" `
-              -IsOfficial $false
-          displayName: 'Stamp crate versions'
+            $ErrorActionPreference = 'Stop'
+            $date = Get-Date -Format 'yyyyMMdd'
+            $rx = [regex]'(?m)^(version\s*=\s*)"[^"]+"'
+            $baseVer = ([regex]'(?m)^version\s*=\s*"([^"]+)"').Match((Get-Content 'mssql-tds/Cargo.toml' -Raw)).Groups[1].Value
+            if ([string]::IsNullOrWhiteSpace($baseVer)) { Write-Error 'Could not read base version from mssql-tds/Cargo.toml'; exit 1 }
+            $ver = "$baseVer-dev.$date.$(Build.BuildId)"
+            Write-Host "Sandbox crate version: $ver"
+            foreach ($f in 'mssql-tds/Cargo.toml','mssql-mock-tds/Cargo.toml') {
+              $c = Get-Content $f -Raw
+              $c = $rx.Replace($c, ('${1}"' + $ver + '"'), 1)
+              Set-Content $f $c -NoNewline
+              Write-Host "Stamped $f -> version = `"$ver`""
+            }
+            Write-Host "##vso[task.setvariable variable=crateVersion]$ver"
+          displayName: 'Stamp crate versions (sandbox, package-only)'
         # The mssql-tds path dependency in mssql-mock-tds/Cargo.toml has no version,
         # which cargo publish rejects ("all dependencies must have a version"). Add
         # the stamped version while keeping the path (cargo uses the version on
