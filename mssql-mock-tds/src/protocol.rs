@@ -33,6 +33,7 @@ pub enum ProtocolError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketType {
     SqlBatch = 0x01,
+    FedAuthToken = 0x08,
     PreLogin = 0x12,
     TabularResult = 0x04,
     Attention = 0x06,
@@ -46,6 +47,7 @@ impl TryFrom<u8> for PacketType {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0x01 => Ok(PacketType::SqlBatch),
+            0x08 => Ok(PacketType::FedAuthToken),
             0x12 => Ok(PacketType::PreLogin),
             0x04 => Ok(PacketType::TabularResult),
             0x06 => Ok(PacketType::Attention),
@@ -149,6 +151,7 @@ pub enum TokenType {
     Done = 0xFD,
     DoneProc = 0xFE,
     DoneInProc = 0xFF,
+    FedAuthInfo = 0xEE,
     EnvChange = 0xE3,
     LoginAck = 0xAD,
     Error = 0xAA,
@@ -475,6 +478,78 @@ pub fn build_feature_ext_ack_fedauth() -> BytesMut {
 
     // Terminator
     token_data.put_u8(FEATURE_EXT_TERMINATOR);
+
+    token_data
+}
+
+/// Parse a FedAuthToken packet payload and extract the raw token bytes.
+pub fn parse_fedauth_token(packet_data: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if packet_data.len() < 8 {
+        return Err(ProtocolError::Protocol(
+            "FedAuthToken packet too short".to_string(),
+        ));
+    }
+
+    let total_length =
+        u32::from_le_bytes(packet_data[0..4].try_into().expect("slice with known size")) as usize;
+    let token_length =
+        u32::from_le_bytes(packet_data[4..8].try_into().expect("slice with known size")) as usize;
+
+    if total_length + size_of::<u32>() != packet_data.len() {
+        return Err(ProtocolError::Protocol(format!(
+            "FedAuthToken payload length mismatch: declared {total_length}, actual {}",
+            packet_data.len()
+        )));
+    }
+
+    if total_length != token_length + size_of::<u32>() {
+        return Err(ProtocolError::Protocol(format!(
+            "FedAuthToken inner length mismatch: declared {token_length} token bytes inside {total_length} byte payload"
+        )));
+    }
+
+    Ok(packet_data[8..].to_vec())
+}
+
+/// Build a TabularResult packet containing a FedAuth challenge.
+pub fn build_fedauth_challenge_response(sts_url: &str, spn: &str) -> BytesMut {
+    let mut response = build_feature_ext_ack_fedauth();
+    response.extend_from_slice(&build_fedauth_info_token(sts_url, spn));
+    wrap_in_packet(PacketType::TabularResult, response)
+}
+
+fn build_fedauth_info_token(sts_url: &str, spn: &str) -> BytesMut {
+    let options = [(0x01_u8, sts_url), (0x02_u8, spn)];
+    let mut token_data = BytesMut::new();
+    token_data.put_u8(TokenType::FedAuthInfo as u8);
+
+    let option_headers_len = options.len() * 9;
+    let encoded_values: Vec<Vec<u8>> = options
+        .iter()
+        .map(|(_, value)| {
+            value
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect::<Vec<u8>>()
+        })
+        .collect();
+    let string_bytes_len: usize = encoded_values.iter().map(Vec::len).sum();
+    let payload_len = size_of::<u32>() + option_headers_len + string_bytes_len;
+
+    token_data.put_i32_le(payload_len as i32);
+    token_data.put_u32_le(options.len() as u32);
+
+    let mut current_offset = (size_of::<u32>() + option_headers_len) as u32;
+    for ((option_id, _), encoded) in options.iter().zip(encoded_values.iter()) {
+        token_data.put_u8(*option_id);
+        token_data.put_u32_le(encoded.len() as u32);
+        token_data.put_u32_le(current_offset);
+        current_offset += encoded.len() as u32;
+    }
+
+    for encoded in encoded_values {
+        token_data.extend_from_slice(&encoded);
+    }
 
     token_data
 }
