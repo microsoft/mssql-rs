@@ -79,3 +79,20 @@ Criterion tuning knobs (defaults chosen for noisy, network-bound runs):
 | `BENCH_NOISE` | `0.05` | noise threshold |
 | `BENCH_BULK_ROWS` | `10000` | rows for the bulk-insert bench |
 | `BENCH_ITER_ROWS` | `50000` | rows for the row-iteration bench |
+
+## Fixed-baseline comparison on the perf lab
+
+`perf-lab/run-benchmarks.sh` (Linux) and `perf-lab/run-benchmarks.ps1` (Windows)
+are the testScripts run by the shared `PerfTest` lab template
+(`.pipeline/perf-baseline-pipeline.yml`). They run on a dedicated perf-lab VM and:
+
+1. Build and run the candidate (`mssql-tds` = working tree) with `--save-baseline candidate`.
+2. Create a local `git worktree` of the `perf-baseline` tag, swap the harness's
+   `mssql-tds` path dependency to that worktree, and run it with `--save-baseline base`.
+3. `critcmp base candidate` into `results/comparison.txt`.
+
+The harness is always built from the candidate tree (it does not exist at the
+baseline tag); only the `mssql-tds` *source* is swapped, so the harness, Criterion
+version, and toolchain stay constant. `SQL_SERVER` and `SQL_PASSWORD` are injected
+by the lab template. The `perf-baseline` tag is moved manually in the git repo to
+advance the baseline.
