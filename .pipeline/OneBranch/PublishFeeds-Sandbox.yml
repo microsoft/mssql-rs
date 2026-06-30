@@ -466,7 +466,9 @@ extends:
             python3 -m pip install --user --break-system-packages wheel
             for whl in "$(ob_outputDirectory)"/wheels/*.whl; do
               echo "Re-tagging: $(basename "$whl")"
-              wheel tags --platform-tag macosx_15_0_universal2 --remove "$whl"
+              # Invoke as a module: the --user/Homebrew install does not put the
+              # `wheel` console script on PATH (exit 127 "command not found").
+              python3 -m wheel tags --platform-tag macosx_15_0_universal2 --remove "$whl"
             done
             echo "Re-tagged wheels:"
             ls -lh "$(ob_outputDirectory)/wheels"
