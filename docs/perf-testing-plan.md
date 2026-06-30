@@ -48,30 +48,36 @@ version, and the toolchain along with the library — so a difference can't be c
 attributed to library code. The existing PR pipeline does a whole-repo checkout of the
 target branch, which has this limitation.
 
-### The fix: a fixed harness crate with a swappable dependency
+### The fix: a fixed harness crate with a swapped dependency *source*
 
-Add `mssql-tds-bench`, a new workspace member whose benchmark code stays fixed. Only
-its `mssql-tds` dependency is swapped between runs:
+Add `mssql-tds-bench`, a new workspace member whose benchmark code stays fixed. Its
+`mssql-tds` dependency always points at `../mssql-tds`; the *source* at that path is
+what changes between runs:
 
 ```toml
-# mssql-tds-bench/Cargo.toml — candidate run
+# mssql-tds-bench/Cargo.toml — constant across both runs
 mssql-tds = { path = "../mssql-tds" }
-# baseline run (swap to a local worktree of the perf-baseline tag):
-mssql-tds = { path = "/tmp/perf-baseline/mssql-tds" }
 ```
+
+- **candidate run** — `../mssql-tds` is the current working tree.
+- **baseline run** — `../mssql-tds` is replaced in place with a checkout of the
+  `perf-baseline` tag.
 
 Because the harness crate, Criterion version, and benchmark code are byte-for-byte
 identical across both runs, any statistically significant delta is attributable to
 `mssql-tds`. The harness is **always built from the candidate tree** (it is brand new
-and does not exist at the baseline tag); only its `mssql-tds` *source* changes. On the
+and does not exist at the baseline tag); only the `mssql-tds` *source* changes. On the
 perf VM the baseline source is materialized with a local `git worktree` of the
-`perf-baseline` tag from the shipped `.git`, so no VM-side ADO authentication is needed.
+`perf-baseline` tag from the shipped `.git`, then copied over `../mssql-tds` for the
+baseline run — so no VM-side ADO authentication is needed. (Swapping the source in
+place, rather than re-pointing the dependency at the worktree, keeps a single
+`mssql-tds` in the workspace and avoids a Cargo lockfile package collision.)
 
 ### Criterion baseline commands
 
 ```sh
-cargo bench -p mssql-tds-bench -- --save-baseline base       # baseline (version A)
-# swap mssql-tds dependency to candidate
+cargo bench -p mssql-tds-bench -- --save-baseline base       # baseline (version A source at ../mssql-tds)
+# swap the ../mssql-tds source to the candidate, then:
 cargo bench -p mssql-tds-bench -- --save-baseline candidate  # candidate (version B)
 critcmp base candidate                                       # side-by-side comparison
 ```
@@ -140,8 +146,9 @@ database setup is moved to Criterion's setup phase.
    `TRUST_SERVER_CERTIFICATE`, `CERT_HOST_NAME`).
 4. **Baseline-pin mechanism.** Pin version A as the `perf-baseline` git tag. On the perf
    VM the baseline `mssql-tds` source is materialized via a local `git worktree` of that
-   tag (from the shipped `.git`), and the harness's `mssql-tds` path dependency is swapped
-   to it. The tag name is **hard-coded into the testScript**; the `perf-baseline` tag is
+   tag (from the shipped `.git`) and copied over `../mssql-tds` in place for the baseline
+   run, leaving the harness and its `path = "../mssql-tds"` dependency untouched. The tag
+   name is **hard-coded into the testScript**; the `perf-baseline` tag is
    **moved manually in the git repo** when the baseline should advance (per release or when
    an intentional perf change lands). Tune noise thresholds. Compare via `critcmp`.
 5. **Perf-lab pipeline (complementary).** Consume the shared `PerfTest` lab template

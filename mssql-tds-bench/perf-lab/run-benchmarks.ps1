@@ -18,7 +18,6 @@ $BaselineTag = 'perf-baseline'
 
 $RepoRoot   = (Get-Location).Path
 $ResultsDir = Join-Path $RepoRoot 'results'
-$Manifest   = Join-Path $RepoRoot 'mssql-tds-bench/Cargo.toml'
 New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
 
 # --- Connection (SQL_SERVER / SQL_PASSWORD injected by run-remote) ---
@@ -78,23 +77,28 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host '>>> Candidate benchmarks...'
 cargo bench -p mssql-tds-bench -- --save-baseline candidate
 
-# --- Baseline run (mssql-tds = perf-baseline tag via a local worktree) ---
+# --- Baseline run (mssql-tds source swapped to the perf-baseline tag) ---
+# Materialize the baseline mssql-tds via a local worktree, then replace the
+# workspace's mssql-tds source in place. The harness (mssql-tds-bench) and its
+# `path = "../mssql-tds"` dependency are unchanged, so mssql-tds is the only
+# variable. Swapping the source keeps a single mssql-tds in the workspace and
+# avoids a Cargo lockfile package collision.
 $BaselineTree = Join-Path ([System.IO.Path]::GetTempPath()) "perf-baseline-$([System.Guid]::NewGuid().ToString('N'))"
 Write-Host ">>> Adding baseline worktree for tag '$BaselineTag' at $BaselineTree..."
 & git worktree add --detach $BaselineTree "refs/tags/$BaselineTag"
 
-Write-Host '>>> Swapping mssql-tds dependency to the baseline source...'
-Copy-Item $Manifest "$Manifest.bak"
-$baselineMssqlTds = (Join-Path $BaselineTree 'mssql-tds') -replace '\\', '/'
-(Get-Content $Manifest -Raw).Replace(
-    'mssql-tds = { path = "../mssql-tds" }',
-    "mssql-tds = { path = `"$baselineMssqlTds`" }") | Set-Content $Manifest -NoNewline
+Write-Host '>>> Swapping mssql-tds source to the baseline...'
+$CandidateSrc = Join-Path $RepoRoot 'mssql-tds'
+$StashedSrc   = Join-Path $RepoRoot '.mssql-tds-candidate'
+Move-Item $CandidateSrc $StashedSrc
+Copy-Item -Recurse (Join-Path $BaselineTree 'mssql-tds') $CandidateSrc
 
 Write-Host '>>> Baseline benchmarks...'
 cargo bench -p mssql-tds-bench -- --save-baseline base
 
-# Restore the committed manifest and remove the worktree.
-Move-Item -Force "$Manifest.bak" $Manifest
+# Restore the candidate source and remove the worktree.
+Remove-Item -Recurse -Force $CandidateSrc
+Move-Item $StashedSrc $CandidateSrc
 & git worktree remove --force $BaselineTree
 
 # --- Compare ---
