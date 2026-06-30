@@ -7,7 +7,8 @@
 #   Artifacts feed. It exists for fast, manual experimentation only.            #
 #                                                                               #
 #   NOTHING produced by this pipeline is a production artifact:                 #
-#     * Python wheels are stamped with PEP 440 *.devN prerelease versions.      #
+#     * Python wheels are stamped with PEP 440 *.devN prerelease versions       #
+#       UNLESS the releaseVersion parameter is set (then BASE is published).    #
 #     * Crates are stamped with -dev.<date>.<buildId> prerelease versions.      #
 #     * Publishing is OPT-IN. With the default parameters this pipeline only    #
 #       BUILDS and runs a DRY RUN — it does NOT upload anything.                #
@@ -36,6 +37,11 @@ parameters:
 
 - name: publishCrate
   displayName: 'Publish mssql-mock-tds crate to feed (false = cargo publish --dry-run)'
+  type: boolean
+  default: false
+
+- name: releaseVersion
+  displayName: 'Publish Python wheels as a RELEASE version (no .dev suffix, e.g. 1.0.0). Unchecked = .dev<date><buildId> prerelease.'
   type: boolean
   default: false
 
@@ -119,8 +125,10 @@ extends:
         - script: |
             set -euo pipefail
             BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-            DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
-            VER="${BASE}-dev${DEV}"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
+            case "${RELEASE_VERSION}" in
+              True|true|TRUE) VER="${BASE}" ;;   # release: publish BASE as-is (e.g. 1.0.0)
+              *) VER="${BASE}-dev$(date -u +%Y%m%d)${BUILD_BUILDID}" ;;   # PEP 440 normalizes -dev -> .dev
+            esac
             echo "Sandbox wheel version: ${VER}"
             # pyproject.toml [project].version
             sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
@@ -130,6 +138,7 @@ extends:
           displayName: 'Stamp sandbox wheel version'
           env:
             BUILD_BUILDID: $(Build.BuildId)
+            RELEASE_VERSION: ${{ parameters.releaseVersion }}
         - script: |
             set -euo pipefail
             CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest"
@@ -195,8 +204,10 @@ extends:
         - script: |
             set -euo pipefail
             BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-            DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
-            VER="${BASE}-dev${DEV}"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
+            case "${RELEASE_VERSION}" in
+              True|true|TRUE) VER="${BASE}" ;;   # release: publish BASE as-is (e.g. 1.0.0)
+              *) VER="${BASE}-dev$(date -u +%Y%m%d)${BUILD_BUILDID}" ;;   # PEP 440 normalizes -dev -> .dev
+            esac
             echo "Sandbox wheel version: ${VER}"
             sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
             sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
@@ -204,6 +215,7 @@ extends:
           displayName: 'Stamp sandbox wheel version'
           env:
             BUILD_BUILDID: $(Build.BuildId)
+            RELEASE_VERSION: ${{ parameters.releaseVersion }}
         - script: |
             set -euo pipefail
             CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest"
@@ -268,8 +280,10 @@ extends:
         - script: |
             set -euo pipefail
             BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-            DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
-            VER="${BASE}-dev${DEV}"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
+            case "${RELEASE_VERSION}" in
+              True|true|TRUE) VER="${BASE}" ;;   # release: publish BASE as-is (e.g. 1.0.0)
+              *) VER="${BASE}-dev$(date -u +%Y%m%d)${BUILD_BUILDID}" ;;   # PEP 440 normalizes -dev -> .dev
+            esac
             echo "Sandbox wheel version: ${VER}"
             sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
             sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
@@ -277,6 +291,7 @@ extends:
           displayName: 'Stamp sandbox wheel version'
           env:
             BUILD_BUILDID: $(Build.BuildId)
+            RELEASE_VERSION: ${{ parameters.releaseVersion }}
         - script: |
             set -euo pipefail
             CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest"
@@ -341,8 +356,10 @@ extends:
         - script: |
             set -euo pipefail
             BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-            DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
-            VER="${BASE}-dev${DEV}"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
+            case "${RELEASE_VERSION}" in
+              True|true|TRUE) VER="${BASE}" ;;   # release: publish BASE as-is (e.g. 1.0.0)
+              *) VER="${BASE}-dev$(date -u +%Y%m%d)${BUILD_BUILDID}" ;;   # PEP 440 normalizes -dev -> .dev
+            esac
             echo "Sandbox wheel version: ${VER}"
             sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
             sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
@@ -350,6 +367,7 @@ extends:
           displayName: 'Stamp sandbox wheel version'
           env:
             BUILD_BUILDID: $(Build.BuildId)
+            RELEASE_VERSION: ${{ parameters.releaseVersion }}
         - script: |
             set -euo pipefail
             CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest"
@@ -418,8 +436,12 @@ extends:
             $py = Get-Content 'mssql-mock-tds-py/pyproject.toml' -Raw
             if ($py -match '(?m)^version\s*=\s*"([^"]+)"') { $base = $Matches[1] }
             else { Write-Error 'Could not read version from pyproject.toml'; exit 1 }
-            $dev = "$(Get-Date -Format 'yyyyMMdd')$(Build.BuildId)"
-            $ver = "$base-dev$dev"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
+            if ('${{ parameters.releaseVersion }}' -eq 'True') {
+              $ver = $base   # release: publish base version as-is (e.g. 1.0.0)
+            } else {
+              $dev = "$(Get-Date -Format 'yyyyMMdd')$(Build.BuildId)"
+              $ver = "$base-dev$dev"   # PEP 440 normalizes -dev -> .dev for the wheel
+            }
             Write-Host "Sandbox wheel version: $ver"
             (Get-Content 'mssql-mock-tds-py/pyproject.toml' -Raw) `
               -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$ver`"" |
@@ -493,8 +515,12 @@ extends:
             $py = Get-Content 'mssql-mock-tds-py/pyproject.toml' -Raw
             if ($py -match '(?m)^version\s*=\s*"([^"]+)"') { $base = $Matches[1] }
             else { Write-Error 'Could not read version from pyproject.toml'; exit 1 }
-            $dev = "$(Get-Date -Format 'yyyyMMdd')$(Build.BuildId)"
-            $ver = "$base-dev$dev"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
+            if ('${{ parameters.releaseVersion }}' -eq 'True') {
+              $ver = $base   # release: publish base version as-is (e.g. 1.0.0)
+            } else {
+              $dev = "$(Get-Date -Format 'yyyyMMdd')$(Build.BuildId)"
+              $ver = "$base-dev$dev"   # PEP 440 normalizes -dev -> .dev for the wheel
+            }
             Write-Host "Sandbox wheel version: $ver"
             (Get-Content 'mssql-mock-tds-py/pyproject.toml' -Raw) `
               -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$ver`"" |
@@ -575,8 +601,10 @@ extends:
         - script: |
             set -euo pipefail
             BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-            DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
-            VER="${BASE}-dev${DEV}"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
+            case "${RELEASE_VERSION}" in
+              True|true|TRUE) VER="${BASE}" ;;   # release: publish BASE as-is (e.g. 1.0.0)
+              *) VER="${BASE}-dev$(date -u +%Y%m%d)${BUILD_BUILDID}" ;;   # PEP 440 normalizes -dev -> .dev
+            esac
             echo "Sandbox wheel version: ${VER}"
             # BSD sed (macOS) rejects the GNU empty-regex reuse `s//.../`, so use an
             # explicit pattern. Each manifest has exactly one line-starting
@@ -587,6 +615,7 @@ extends:
           displayName: 'Stamp sandbox wheel version'
           env:
             BUILD_BUILDID: $(Build.BuildId)
+            RELEASE_VERSION: ${{ parameters.releaseVersion }}
         - script: |
             set -euo pipefail
             export MACOSX_DEPLOYMENT_TARGET=15.0
