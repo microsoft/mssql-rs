@@ -431,8 +431,11 @@ extends:
             DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
             VER="${BASE}-dev${DEV}"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
             echo "Sandbox wheel version: ${VER}"
-            sed -i '' -E "1,/^version[[:space:]]*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
-            sed -i '' -E "1,/^version[[:space:]]*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
+            # BSD sed (macOS) rejects the GNU empty-regex reuse `s//.../`, so use an
+            # explicit pattern. Each manifest has exactly one line-starting
+            # `version =` (the package version), so a plain substitution is safe.
+            sed -i '' -E "s/^version[[:space:]]*=.*/version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
+            sed -i '' -E "s/^version[[:space:]]*=.*/version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
             echo "##vso[task.setvariable variable=mockWheelVersion]${VER}"
           displayName: 'Stamp sandbox wheel version'
           env:
