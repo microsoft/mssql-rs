@@ -37,6 +37,32 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 }
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
+# --- git (needed for the baseline worktree) ---
+# The Windows Server perf image (RUST-Win22-Sql25-1P) normally ships git, but
+# install it if absent: winget first, then Chocolatey as a fallback.
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Write-Host '>>> git not found; installing...'
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        winget install --id Git.Git -e --source winget `
+            --accept-package-agreements --accept-source-agreements
+    } else {
+        if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            Write-Host '>>> Installing Chocolatey...'
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [System.Net.ServicePointManager]::SecurityProtocol = `
+                [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+            Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+        }
+        choco install git -y --no-progress
+    }
+    # Refresh PATH so the freshly installed git resolves in this session.
+    $env:PATH = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                [System.Environment]::GetEnvironmentVariable('Path', 'User')
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        throw 'git installation failed'
+    }
+}
+
 if (-not (Get-Command critcmp -ErrorAction SilentlyContinue)) {
     Write-Host '>>> Installing critcmp...'
     cargo install critcmp --version 0.1.8 --locked
