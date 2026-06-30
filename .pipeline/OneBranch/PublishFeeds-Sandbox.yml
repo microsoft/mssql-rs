@@ -528,8 +528,11 @@ extends:
           - pwsh: |
               $ErrorActionPreference = 'Stop'
               Write-Host "Uploading SANDBOX wheels to $(pythonFeedName) ..."
+              # Azure Artifacts' PyPI endpoint rejects --skip-existing
+              # (UnsupportedConfiguration). Each run stamps a unique
+              # .dev<date><BuildId> version, so there is no collision to skip.
               twine upload -r $(pythonFeedName) --config-file "$(PYPIRC_PATH)" `
-                --skip-existing "$(distDir)\*.whl"
+                "$(distDir)\*.whl"
             displayName: 'twine upload (sandbox)'
         - ${{ if ne(parameters.publishPython, true) }}:
           - pwsh: |
