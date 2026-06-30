@@ -79,9 +79,8 @@ extends:
     # abi3-py39 => ONE wheel per (OS, arch) covering Python >= 3.9. No loop over
     # Python versions (unlike mssql-py-core).
     #
-    # SANDBOX matrix: Linux x64/ARM64 (manylinux_2_34), Windows x64/ARM64, and
-    # macOS universal2. musllinux can be added later by copying a Linux job and
-    # swapping the container image.
+    # SANDBOX matrix: Linux x64/ARM64 (manylinux_2_34), musllinux x64/ARM64
+    # (Alpine, vendored OpenSSL), Windows x64/ARM64, and macOS universal2.
     ###########################################################################
     - stage: PublishMockPython
       displayName: 'Publish Mock Python (sandbox)'
@@ -234,6 +233,153 @@ extends:
           inputs:
             targetPath: '$(ob_outputDirectory)/wheels'
             artifact: 'drop_PublishMockPython_BuildLinux_arm64_mock_linux_arm64'
+            publishLocation: 'pipeline'
+
+      #####################################################################
+      # musllinux x64 — musllinux_1_2 (Alpine) container build.
+      # Built with vendored (static) OpenSSL so the wheel is self-contained
+      # and does not depend on Alpine's libssl at the consumer side.
+      #####################################################################
+      - job: BuildLinuxMusl_x64
+        displayName: 'Build mock wheel (musllinux x64)'
+        pool:
+          type: linux
+          isCustom: true
+          name: RUST-1ES-POOL-WUS3
+          demands:
+            - imageOverride -equals RUST-1ES-UBUSLIM
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+          ob_artifactSuffix: '_mock_linux_musl_x64'
+          CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+        steps:
+        - template: /.pipeline/templates/cargo-authenticate-template.yml@self
+          parameters:
+            osType: Linux
+        - script: .pipeline/scripts/install-rustup.sh
+          displayName: 'Install Rustup'
+        - task: DockerInstaller@0
+          inputs:
+            dockerVersion: '29.0.0'
+          displayName: 'Install Docker'
+        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
+          parameters:
+            installDocker: true
+        - script: |
+            set -euo pipefail
+            BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+            DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
+            VER="${BASE}-dev${DEV}"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
+            echo "Sandbox wheel version: ${VER}"
+            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
+            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
+            echo "##vso[task.setvariable variable=mockWheelVersion]${VER}"
+          displayName: 'Stamp sandbox wheel version'
+          env:
+            BUILD_BUILDID: $(Build.BuildId)
+        - script: |
+            set -euo pipefail
+            CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest"
+            echo "Building mock wheel in container: $CONTAINER_IMAGE"
+            mkdir -p "$(ob_outputDirectory)/wheels"
+            bash .pipeline/scripts/docker-cargo-run.sh --rm \
+              -v "$(Build.SourcesDirectory):/workspace" \
+              -v "$(ob_outputDirectory)/wheels:/workspace/target/wheels" \
+              -e "WORKSPACE_DIR=/workspace" \
+              -e "OUTPUT_DIR=/workspace/target/wheels" \
+              -e "MATURIN_FEATURES=vendored-openssl" \
+              "$CONTAINER_IMAGE" \
+              bash /workspace/scripts/build-mock-python-wheel-in-container.sh
+            sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/target" || true
+            WHEEL_COUNT=$(find "$(ob_outputDirectory)/wheels" -type f -name '*.whl' | wc -l)
+            if [ "$WHEEL_COUNT" -eq 0 ]; then
+              echo "ERROR: No mock wheels were produced!"
+              exit 1
+            fi
+            echo "$WHEEL_COUNT wheel(s) built."
+            ls -lh "$(ob_outputDirectory)/wheels"
+          displayName: 'Build mock abi3 wheel (musllinux_1_2 x86_64)'
+          env:
+            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish musllinux x64 mock wheel'
+          inputs:
+            targetPath: '$(ob_outputDirectory)/wheels'
+            artifact: 'drop_PublishMockPython_BuildLinuxMusl_x64_mock_linux_musl_x64'
+            publishLocation: 'pipeline'
+
+      #####################################################################
+      # musllinux ARM64 — musllinux_1_2 aarch64 (Alpine) container build.
+      # Vendored (static) OpenSSL, same rationale as musllinux x64.
+      #####################################################################
+      - job: BuildLinuxMusl_arm64
+        displayName: 'Build mock wheel (musllinux ARM64)'
+        pool:
+          type: linux
+          isCustom: true
+          name: RUST-1ES-POOL-ARM-WUS3
+          demands:
+            - imageOverride -equals RUST-UBUNTU-ARM64
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+          ob_artifactSuffix: '_mock_linux_musl_arm64'
+          CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+        steps:
+        - template: /.pipeline/templates/cargo-authenticate-template.yml@self
+          parameters:
+            osType: Linux
+        - script: .pipeline/scripts/install-rustup.sh
+          displayName: 'Install Rustup'
+        - task: DockerInstaller@0
+          inputs:
+            dockerVersion: '29.0.0'
+          displayName: 'Install Docker'
+        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
+          parameters:
+            installDocker: true
+        - script: |
+            set -euo pipefail
+            BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+            DEV="$(date -u +%Y%m%d)${BUILD_BUILDID}"
+            VER="${BASE}-dev${DEV}"   # SemVer prerelease; PEP 440 normalizes -dev -> .dev for the wheel
+            echo "Sandbox wheel version: ${VER}"
+            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
+            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
+            echo "##vso[task.setvariable variable=mockWheelVersion]${VER}"
+          displayName: 'Stamp sandbox wheel version'
+          env:
+            BUILD_BUILDID: $(Build.BuildId)
+        - script: |
+            set -euo pipefail
+            CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest"
+            echo "Building mock wheel in container: $CONTAINER_IMAGE"
+            mkdir -p "$(ob_outputDirectory)/wheels"
+            bash .pipeline/scripts/docker-cargo-run.sh --rm \
+              -v "$(Build.SourcesDirectory):/workspace" \
+              -v "$(ob_outputDirectory)/wheels:/workspace/target/wheels" \
+              -e "WORKSPACE_DIR=/workspace" \
+              -e "OUTPUT_DIR=/workspace/target/wheels" \
+              -e "MATURIN_FEATURES=vendored-openssl" \
+              "$CONTAINER_IMAGE" \
+              bash /workspace/scripts/build-mock-python-wheel-in-container.sh
+            sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/target" || true
+            WHEEL_COUNT=$(find "$(ob_outputDirectory)/wheels" -type f -name '*.whl' | wc -l)
+            if [ "$WHEEL_COUNT" -eq 0 ]; then
+              echo "ERROR: No mock wheels were produced!"
+              exit 1
+            fi
+            echo "$WHEEL_COUNT wheel(s) built."
+            ls -lh "$(ob_outputDirectory)/wheels"
+          displayName: 'Build mock abi3 wheel (musllinux_1_2 aarch64)'
+          env:
+            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish musllinux ARM64 mock wheel'
+          inputs:
+            targetPath: '$(ob_outputDirectory)/wheels'
+            artifact: 'drop_PublishMockPython_BuildLinuxMusl_arm64_mock_linux_musl_arm64'
             publishLocation: 'pipeline'
 
       #####################################################################
@@ -485,6 +631,8 @@ extends:
         dependsOn:
         - BuildLinux_x64
         - BuildLinux_arm64
+        - BuildLinuxMusl_x64
+        - BuildLinuxMusl_arm64
         - BuildWindows_x64
         - BuildWindows_arm64
         - BuildMacOS_universal2

@@ -51,13 +51,24 @@ if ! $FIRST_PYTHON -m pip show maturin &> /dev/null; then
     exit 1
 fi
 
-# --auditwheel skip mirrors the mssql-py-core OpenSSL convention: do NOT vendor
-# libssl/libcrypto into the wheel. The native extension links against the OS
-# libssl.so.3 / libcrypto.so.3 at runtime (built on manylinux_2_34 / glibc 2.34).
-# Passed on the CLI so we do not have to edit the (Stage 0) pyproject.toml.
+# Optional cargo features (e.g. vendored-openssl for musllinux, where Alpine's
+# dynamic libssl is not a portable runtime dependency). manylinux builds leave
+# MATURIN_FEATURES unset and link the OS libssl.so.3 at runtime instead.
+FEATURE_ARGS=()
+if [ -n "${MATURIN_FEATURES:-}" ]; then
+    echo "Building with cargo features: $MATURIN_FEATURES"
+    FEATURE_ARGS=(--features "$MATURIN_FEATURES")
+fi
+
+# --auditwheel skip mirrors the mssql-py-core OpenSSL convention: do NOT let
+# maturin repair the wheel. On manylinux the native extension links against the
+# OS libssl.so.3 / libcrypto.so.3 at runtime (manylinux_2_34 / glibc 2.34); on
+# musllinux we instead statically vendor OpenSSL via MATURIN_FEATURES so the
+# wheel is self-contained. Passed on the CLI so we do not edit pyproject.toml.
 $FIRST_PYTHON -m maturin build --release \
     --auditwheel skip \
     --interpreter "$FIRST_PYTHON" \
+    "${FEATURE_ARGS[@]}" \
     --manifest-path "$WORKSPACE_DIR/mssql-mock-tds-py/Cargo.toml" \
     --out "$OUTPUT_DIR"
 
