@@ -26,6 +26,11 @@ tls-schannel-direct = []
 # unconditionally — useful as an escape hatch if the rewrite needs to
 # be temporarily disabled in production.
 tls-schannel-direct-on-windows = ["tls-schannel-direct"]
+# Built-in Entra ID (Azure AD) token factories backed by the Azure SDK for Rust
+# (`azure_identity`). Off by default; the mssql-odbc driver enables it so the
+# ODBC layer can "just specify an auth method" and let mssql-tds acquire the
+# token. Pulls in the optional `azure_identity` / `azure_core` dependencies.
+entra-auth = ["dep:azure_identity", "dep:azure_core"]
 
 
 [lints]
@@ -58,6 +63,12 @@ x509-parser = "0.18.0"
 dns-lookup = "2.0"
 # Required to deserialize Vector(Float16) values from the TDS stream (Vector feature v2)
 half = "2.7.1"
+
+# Optional Azure SDK dependencies for the built-in Entra ID token factories
+# (feature = "entra-auth"). Same versions as the dev-dependencies below so the
+# resolved lockfile stays unified.
+azure_identity = { version = "0.25.0", optional = true }
+azure_core = { version = "0.25.0", optional = true }
 
 
 

@@ -99,6 +99,12 @@ impl TdsConnectionProvider {
         // Validate the ClientContext before attempting connection
         context.validate()?;
 
+        // Install built-in Entra ID token factories for the selected auth method
+        // (unless the caller already injected one). Realizes the "just specify a
+        // method" UX without changing the FedAuth handshake.
+        #[cfg(feature = "entra-auth")]
+        context.register_builtin_entra_factories();
+
         validate_multi_subnet_failover(
             context.multi_subnet_failover,
             &context.failover_partner,

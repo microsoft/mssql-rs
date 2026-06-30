@@ -17,6 +17,14 @@ pub(crate) mod connection_actions;
 /// [`CursorClient`](crate::connection::cursor_ops::CursorClient) trait.
 pub mod cursor_ops;
 pub(crate) mod datasource_parser;
+/// Built-in Entra ID (Azure AD) token factories backed by `azure_identity`.
+///
+/// Compiled for the `entra-auth` feature, and also under `cfg(test)` so the
+/// no-network unit tests run in the default test profile (CI does not pass
+/// `--all-features`). `azure_identity` is already a dev-dependency, so the
+/// `test` arm adds no extra build cost.
+#[cfg(any(feature = "entra-auth", test))]
+pub mod entra_auth;
 pub(crate) mod execution_context;
 pub(crate) mod instance_cache;
 pub(crate) mod metadata_retriever;
