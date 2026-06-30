@@ -26,20 +26,6 @@ tls-schannel-direct = []
 # unconditionally — useful as an escape hatch if the rewrite needs to
 # be temporarily disabled in production.
 tls-schannel-direct-on-windows = ["tls-schannel-direct"]
-# Always Encrypted column-encryption data path. Off by default to keep the
-# cryptography out of builds that do not need it. The underlying primitives are
-# provided by platform-native, compliance-approved crypto: Apple Security.framework
-# plus CommonCrypto on macOS, Windows CNG on Windows (via the in-tree `windows-sys`
-# bindings, so no system OpenSSL — which cannot build on the MSVC toolchain — is
-# required), and OpenSSL elsewhere (the `openssl` crate, already the TLS backend
-# there). Each backend is a target-specific optional dependency, so enabling this
-# feature only pulls in the crate that matches the build target. See
-# `security::crypto`.
-column-encryption = [
-    "dep:openssl",
-    "dep:security-framework",
-    "dep:core-foundation",
-]
 
 
 [lints]
@@ -94,20 +80,18 @@ libc = "0.2"
 
 # OpenSSL backs the Always Encrypted crypto primitives on every target that is
 # neither Windows (which uses CNG) nor macOS (which uses Security.framework) — see
-# `security::crypto`. Optional and pulled in only by the `column-encryption`
-# feature. OpenSSL is already the TLS backend on these platforms, so it adds no
-# new system requirement.
+# `security::crypto`. OpenSSL is already the TLS backend on these platforms (via
+# `native-tls`), so it adds no new system requirement.
 [target.'cfg(all(not(windows), not(target_os = "macos")))'.dependencies]
-openssl = { version = "0.10.66", optional = true }
+openssl = { version = "0.10.66" }
 
 # Apple Security.framework (`SecKey`) backs RSA and key generation for Always
 # Encrypted on macOS; AES/HMAC/SHA/RNG go through CommonCrypto in `libSystem`.
 # Both crates are already present transitively (native-tls links Security.framework
-# on Apple targets). Optional and pulled in only by the `column-encryption`
-# feature.
+# on Apple targets), so they add no new system requirement.
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = { version = "3.7.0", optional = true }
-core-foundation = { version = "0.10.1", optional = true }
+security-framework = { version = "3.7.0" }
+core-foundation = { version = "0.10.1" }
 
 [dependencies.uuid]
 version = "1.19.0"

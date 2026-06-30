@@ -3,7 +3,7 @@
 
 //! Windows CNG-backed crypto primitives for Always Encrypted.
 //!
-//! Used on Windows so the `column-encryption` feature does not pull in
+//! Used on Windows so Always Encrypted does not pull in
 //! `openssl-sys`, which cannot build on the MSVC toolchain without a system
 //! OpenSSL. All primitives go through the Cryptography API: Next Generation
 //! (CNG, `bcrypt.dll`) plus the CryptoAPI ASN.1 helpers (`crypt32.dll`) for

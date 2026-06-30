@@ -190,7 +190,6 @@ impl TryFrom<TableMetadataResult> for Vec<BulkCopyColumnMetadata> {
         // table plus per-column crypto metadata; pair each encrypted column with
         // the CEK table entry it references so the bulk-copy writer can encrypt
         // values and emit the encrypted COLMETADATA.
-        #[cfg(feature = "column-encryption")]
         for (i, col_meta) in metadata.iter_mut().enumerate() {
             let Some(crypto) = result
                 .col_metadata
@@ -606,7 +605,6 @@ mod tests {
         assert!(!metadata[1].is_identity);
     }
 
-    #[cfg(feature = "column-encryption")]
     #[test]
     fn test_try_from_table_metadata_captures_encryption_material() {
         use crate::query::metadata::{CekTableEntry, CryptoMetadata};
@@ -656,7 +654,6 @@ mod tests {
         assert_eq!(enc.cek_entry.cek_id, 11);
     }
 
-    #[cfg(feature = "column-encryption")]
     #[test]
     fn test_try_from_table_metadata_rejects_dangling_cek_ordinal() {
         use crate::query::metadata::CryptoMetadata;

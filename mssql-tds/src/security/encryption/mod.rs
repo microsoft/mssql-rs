@@ -4,8 +4,7 @@
 //! Cryptographic primitives for Always Encrypted (column encryption).
 //!
 //! This module implements the cell-encryption algorithm used by SQL Server's
-//! Always Encrypted feature. It is gated behind the `column-encryption` cargo
-//! feature, which pulls in the platform-selected crypto backend from
+//! Always Encrypted feature. It uses the platform-selected crypto backend from
 //! [`crate::security::crypto`] (Windows CNG, Apple Security.framework +
 //! CommonCrypto, or OpenSSL) for the underlying AES and HMAC primitives.
 

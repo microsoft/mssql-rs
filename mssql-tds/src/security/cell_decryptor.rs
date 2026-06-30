@@ -6,17 +6,15 @@
 //!
 //! Implementations resolve the plaintext column encryption key (CEK) for a
 //! column's [`CryptoMetadata`] and run the AEAD decryption plus
-//! denormalization. The trait is intentionally synchronous and free of the
-//! `column-encryption` feature gate so the always-compiled row parsers and
-//! [`ParserContext`](crate::io::token_stream::ParserContext) can hold a
+//! denormalization. The trait is intentionally synchronous so the row parsers
+//! and [`ParserContext`](crate::io::token_stream::ParserContext) can hold a
 //! `dyn CellDecryptor` without conditional compilation. The concrete
-//! implementation (`ResolvedCekDecryptor`, in [`crate::security::keystore`])
-//! lives behind the `column-encryption` feature and is built once per result
-//! set after the CEKs have been resolved, keeping per-cell decryption free of
-//! `async`, allocation, and lock contention.
+//! implementation (`ResolvedCekDecryptor`, in [`crate::security::keystore`]) is
+//! built once per result set after the CEKs have been resolved, keeping
+//! per-cell decryption free of `async`, allocation, and lock contention.
 
-// The trait is consumed by the result-set decode path; without the
-// `column-encryption` feature it has no implementor and is otherwise unused.
+// The trait is consumed by the result-set decode path and the keystore's
+// `ResolvedCekDecryptor` implementor.
 #![allow(dead_code)]
 
 use crate::core::TdsResult;

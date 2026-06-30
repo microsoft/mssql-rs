@@ -3,11 +3,9 @@
 
 //! End-to-end Always Encrypted integration tests against a live SQL Server.
 //!
-//! These tests require:
-//! * the `column-encryption` cargo feature, and
-//! * a reachable SQL Server (configured through the same `DB_HOST`/`DB_PORT`/
-//!   `DB_USERNAME`/`SQL_PASSWORD` environment variables as the other
-//!   integration tests).
+//! These tests require a reachable SQL Server (configured through the same
+//! `DB_HOST`/`DB_PORT`/`DB_USERNAME`/`SQL_PASSWORD` environment variables as the
+//! other integration tests).
 //!
 //! Each test provisions its own throwaway column master key (CMK), column
 //! encryption key (CEK), and encrypted table(s). No static certificate or key
@@ -19,7 +17,6 @@
 //! Note the T-SQL column DDL algorithm name is `AEAD_AES_256_CBC_HMAC_SHA_256`
 //! (with the underscore before `256`), which differs from the wire/internal
 //! algorithm identifier `AEAD_AES_256_CBC_HMAC_SHA256` used in the protocol.
-#![cfg(feature = "column-encryption")]
 
 #[cfg(test)]
 mod common;

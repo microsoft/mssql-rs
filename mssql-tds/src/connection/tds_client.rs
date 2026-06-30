@@ -60,7 +60,6 @@ pub(in crate::connection) enum ReturnStatus {
 
 /// Memoized cell decryptor paired with the column metadata it was built for, so
 /// it can be rebuilt when the result set changes.
-#[cfg(feature = "column-encryption")]
 type MemoizedCellDecryptor = (
     Arc<ColMetadataToken>,
     Option<Arc<dyn crate::security::cell_decryptor::CellDecryptor>>,
@@ -82,7 +81,6 @@ pub struct TdsClient {
     /// Memoized cell decryptor for `current_metadata`'s CEK table, paired with
     /// the metadata it was built for so it is rebuilt when the result set
     /// changes. `None` until the first encrypted result set is seen.
-    #[cfg(feature = "column-encryption")]
     current_decryptor: Option<MemoizedCellDecryptor>,
     count_map: HashMap<CurrentCommand, u64>,
 
@@ -132,7 +130,6 @@ impl TdsClient {
             execution_context,
             recovery_context: Box::new(recovery_context),
             current_metadata: None,
-            #[cfg(feature = "column-encryption")]
             current_decryptor: None,
             count_map: HashMap::new(),
             return_values: Vec::new(),
@@ -617,10 +614,6 @@ impl TdsClient {
         .await
     }
 
-    #[cfg_attr(
-        not(feature = "column-encryption"),
-        allow(unused_mut, unused_variables)
-    )]
     async fn execute_sp_executesql_core(
         &mut self,
         sql: String,
@@ -659,7 +652,6 @@ impl TdsClient {
         // Always Encrypted: when the connection enabled column encryption and the
         // server acknowledged the feature, ask the server which parameters need
         // encryption and encrypt them in place before sending the real RPC.
-        #[cfg(feature = "column-encryption")]
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
                 &sql,
@@ -797,7 +789,6 @@ impl TdsClient {
         // Always Encrypted: when column encryption is negotiated and enabled,
         // resolve the plaintext CEK for each encrypted destination column so the
         // writer can encrypt row values and emit the encrypted COLMETADATA.
-        #[cfg(feature = "column-encryption")]
         let plaintext_ceks: Vec<Option<std::sync::Arc<Vec<u8>>>> = if self
             .should_encrypt_bulk_copy()
             && mapped_column_metadata.iter().any(|c| c.is_encrypted)
@@ -852,7 +843,6 @@ impl TdsClient {
 
         // Enable Always Encrypted serialization before writing metadata so the
         // COLMETADATA carries the CEK table and per-column crypto metadata.
-        #[cfg(feature = "column-encryption")]
         if !plaintext_ceks.is_empty() {
             writer.set_column_encryption_enabled(true);
             writer.set_plaintext_ceks(plaintext_ceks);
@@ -1026,7 +1016,6 @@ impl TdsClient {
         // setting; there is no per-command override on this path.
         self.current_command_ce_setting = SqlCommandColumnEncryptionSetting::UseConnectionSetting;
 
-        #[cfg_attr(not(feature = "column-encryption"), allow(unused_mut))]
         let mut named_parameters = named_parameters;
 
         if self.execution_context.has_open_batch() {
@@ -1051,7 +1040,6 @@ impl TdsClient {
         // `EXEC` form of the call) and encrypt them in place before sending the
         // real stored-procedure RPC. Positional parameters cannot be referenced
         // by name in the describe request and are sent unchanged.
-        #[cfg(feature = "column-encryption")]
         if self.should_encrypt_parameters()
             && let Some(named) = named_parameters.as_mut()
             && named.iter().any(|p| p.name.is_some())
@@ -1654,7 +1642,6 @@ impl TdsClient {
     /// Returns `true` when transparent parameter encryption should be attempted:
     /// the connection requested Always Encrypted and the server acknowledged the
     /// feature during login.
-    #[cfg(feature = "column-encryption")]
     fn should_encrypt_parameters(&self) -> bool {
         self.negotiated_settings.is_column_encryption_supported()
             && self.effective_command_ce_setting() == SqlCommandColumnEncryptionSetting::Enabled
@@ -1664,7 +1651,6 @@ impl TdsClient {
     /// acknowledged Always Encrypted during login and the connection enabled
     /// column encryption. Bulk copy has no per-command override, so this folds
     /// directly against the connection setting.
-    #[cfg(feature = "column-encryption")]
     fn should_encrypt_bulk_copy(&self) -> bool {
         use crate::connection::client_context::ColumnEncryptionSetting;
 
@@ -1683,7 +1669,6 @@ impl TdsClient {
     /// A command's [`SqlCommandColumnEncryptionSetting::UseConnectionSetting`]
     /// maps to `Enabled` when the connection enabled Always Encrypted, otherwise
     /// `Disabled`. Explicit per-command values are returned as-is.
-    #[cfg(feature = "column-encryption")]
     fn effective_command_ce_setting(&self) -> SqlCommandColumnEncryptionSetting {
         use crate::connection::client_context::ColumnEncryptionSetting;
 
@@ -1711,7 +1696,6 @@ impl TdsClient {
     ///
     /// The first result set carries the CEK table (keyed by ordinal); the second
     /// describes, per parameter, whether and how it must be encrypted.
-    #[cfg(feature = "column-encryption")]
     async fn describe_parameter_encryption(
         &mut self,
         tsql: &str,
@@ -1787,7 +1771,6 @@ impl TdsClient {
     /// through the registered key store providers, its plaintext value is
     /// normalized and encrypted, and the resulting ciphertext plus cipher
     /// metadata are stored on the [`RpcParameter`] for serialization.
-    #[cfg(feature = "column-encryption")]
     async fn encrypt_parameters(
         &mut self,
         sql: &str,
@@ -1890,7 +1873,6 @@ impl TdsClient {
     /// parameters participate; positional parameters cannot be referenced by
     /// name and are omitted. Mirrors dotnet
     /// `BuildStoredProcedureStatementForColumnEncryption`.
-    #[cfg(feature = "column-encryption")]
     fn build_stored_procedure_describe_request(
         stored_procedure_name: &str,
         named_params: &[RpcParameter],
@@ -1930,7 +1912,6 @@ impl TdsClient {
     /// Returns `None` when the result set has no encrypted columns. The
     /// decryptor is rebuilt only when the result set (column metadata) changes,
     /// so the CEK table is resolved at most once per result set.
-    #[cfg(feature = "column-encryption")]
     async fn resolve_cell_decryptor(
         &mut self,
         metadata: &Arc<ColMetadataToken>,
@@ -1976,16 +1957,6 @@ impl TdsClient {
         let decryptor: Arc<dyn CellDecryptor> = Arc::new(resolved);
         self.current_decryptor = Some((Arc::clone(metadata), Some(decryptor.clone())));
         Ok(Some(decryptor))
-    }
-
-    /// Without the `column-encryption` feature there is no decryptor; encrypted
-    /// columns (if any) surface an error from the row decode path.
-    #[cfg(not(feature = "column-encryption"))]
-    async fn resolve_cell_decryptor(
-        &mut self,
-        _metadata: &Arc<ColMetadataToken>,
-    ) -> TdsResult<Option<Arc<dyn crate::security::cell_decryptor::CellDecryptor>>> {
-        Ok(None)
     }
 
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
@@ -3121,7 +3092,6 @@ mod tests {
             .await;
     }
 
-    #[cfg(feature = "column-encryption")]
     #[test]
     fn effective_ce_setting_resolves_against_connection() {
         use crate::connection::client_context::{
@@ -3148,7 +3118,6 @@ mod tests {
         assert_eq!(client.effective_command_ce_setting(), S::Enabled);
     }
 
-    #[cfg(feature = "column-encryption")]
     #[test]
     fn should_not_encrypt_when_feature_not_acknowledged() {
         use crate::connection::client_context::{
@@ -3165,7 +3134,6 @@ mod tests {
         assert!(!client.should_encrypt_parameters());
     }
 
-    #[cfg(feature = "column-encryption")]
     #[test]
     fn build_sp_describe_request_names_params_and_marks_output() {
         use crate::datatypes::sqltypes::SqlType;
@@ -3192,7 +3160,6 @@ mod tests {
         assert_eq!(params_decl, "@id int, @count bigint OUTPUT");
     }
 
-    #[cfg(feature = "column-encryption")]
     #[test]
     fn build_sp_describe_request_skips_positional_params() {
         use crate::datatypes::sqltypes::SqlType;

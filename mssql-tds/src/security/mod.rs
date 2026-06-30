@@ -17,14 +17,10 @@
 //! - `gssapi`: Enables Unix GSSAPI/Kerberos support
 
 pub(crate) mod cell_decryptor;
-#[cfg(feature = "column-encryption")]
 pub(crate) mod crypto;
-#[cfg(feature = "column-encryption")]
 pub(crate) mod describe_parameter_encryption;
-#[cfg(feature = "column-encryption")]
 pub(crate) mod encryption;
 mod error;
-#[cfg(feature = "column-encryption")]
 pub(crate) mod keystore;
 pub mod mock;
 mod security_context;
@@ -36,7 +32,6 @@ pub use security_context::{IntegratedAuthConfig, SecurityContext, SecurityPackag
 pub use spn::{canonicalize_hostname, is_loopback_address, make_spn, make_spn_canonicalized};
 
 // Always Encrypted key store provider API.
-#[cfg(feature = "column-encryption")]
 pub use keystore::{CertificateKeyStoreProvider, ColumnEncryptionKeyStoreProvider};
 
 // Platform-specific implementations

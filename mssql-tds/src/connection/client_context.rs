@@ -297,12 +297,10 @@ pub struct ClientContext {
     pub column_encryption_setting: ColumnEncryptionSetting,
     /// Registry of column master key store providers used to unwrap column
     /// encryption keys for Always Encrypted. Empty by default.
-    #[cfg(feature = "column-encryption")]
     pub(crate) column_encryption_key_store_providers:
         std::sync::Arc<crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry>,
     /// Cache of decrypted column encryption keys, shared across the connection
     /// (and its session-recovery clones) so a CMK only unwraps a CEK once.
-    #[cfg(feature = "column-encryption")]
     pub(crate) cek_cache: std::sync::Arc<crate::security::keystore::CekCache>,
     /// UserAgent telemetry payload components.
     pub user_agent: UserAgent,
@@ -372,7 +370,6 @@ impl ClientContext {
     ///     Arc::new(provider),
     /// );
     /// ```
-    #[cfg(feature = "column-encryption")]
     pub fn register_column_encryption_key_store_provider(
         &mut self,
         name: impl AsRef<str>,
@@ -436,11 +433,9 @@ impl ClientContext {
             // TODO: make V2 as default when full V2 support is added
             vector_version: VectorVersion::V1,
             column_encryption_setting: ColumnEncryptionSetting::Disabled,
-            #[cfg(feature = "column-encryption")]
             column_encryption_key_store_providers: std::sync::Arc::new(
                 crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),
             ),
-            #[cfg(feature = "column-encryption")]
             cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
             user_agent: UserAgent::default(),
         }
@@ -499,11 +494,9 @@ impl ClientContext {
             // TODO: make V2 as default when full V2 support is added
             vector_version: VectorVersion::V1,
             column_encryption_setting: ColumnEncryptionSetting::Disabled,
-            #[cfg(feature = "column-encryption")]
             column_encryption_key_store_providers: std::sync::Arc::new(
                 crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),
             ),
-            #[cfg(feature = "column-encryption")]
             cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
             user_agent: UserAgent::default(),
         }
@@ -737,11 +730,9 @@ impl Clone for ClientContext {
             transport_context: self.transport_context.clone(),
             vector_version: self.vector_version,
             column_encryption_setting: self.column_encryption_setting,
-            #[cfg(feature = "column-encryption")]
             column_encryption_key_store_providers: self
                 .column_encryption_key_store_providers
                 .clone(),
-            #[cfg(feature = "column-encryption")]
             cek_cache: self.cek_cache.clone(),
             user_agent: self.user_agent.clone(),
         }

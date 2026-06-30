@@ -315,7 +315,6 @@ impl RpcParameter {
     /// `sp_describe_parameter_encryption` request for a stored procedure, where
     /// output parameters must be marked `OUTPUT` in both the `EXEC` statement
     /// and the parameter declaration.
-    #[cfg(feature = "column-encryption")]
     pub(crate) fn is_output(&self) -> bool {
         self.options.contains(StatusFlags::BY_REF_VALUE)
     }

@@ -18,13 +18,9 @@ use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
 use crate::token::tokens::SqlCollation;
 use tracing::{debug, trace};
 
-#[cfg(feature = "column-encryption")]
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnEncryption;
-#[cfg(feature = "column-encryption")]
 use crate::datatypes::sqldatatypes::{TypeInfo, TypeInfoVariant, VariableLengthTypes};
-#[cfg(feature = "column-encryption")]
 use crate::query::metadata::CekTableEntry;
-#[cfg(feature = "column-encryption")]
 use crate::security::encryption::encrypt_cell_value;
 
 // TDS Token types
@@ -76,20 +72,17 @@ pub struct StreamingBulkLoadWriter<'a> {
     /// Whether Always Encrypted was negotiated for the connection. When set, the
     /// BCP COLMETADATA carries a CEK table and per-encrypted-column crypto
     /// metadata, mirroring what the server sends on the read side.
-    #[cfg(feature = "column-encryption")]
     column_encryption_enabled: bool,
 
     /// The deduplicated CEK table emitted in the COLMETADATA, built from the
     /// per-column encryption material during `begin()`. Column crypto metadata
     /// references entries here by ordinal.
-    #[cfg(feature = "column-encryption")]
     emitted_cek_table: Vec<CekTableEntry>,
 
     /// Per-column plaintext (decrypted) column encryption keys, aligned with
     /// `column_metadata`. `None` for plaintext columns. Populated by the caller
     /// before `begin()` when column encryption is enabled; used to encrypt cell
     /// values on the write path.
-    #[cfg(feature = "column-encryption")]
     plaintext_ceks: Vec<Option<std::sync::Arc<Vec<u8>>>>,
 }
 
@@ -117,11 +110,8 @@ impl<'a> StreamingBulkLoadWriter<'a> {
             rows_written: 0,
             column_contexts: Vec::new(),  // Will be populated in begin()
             first_row_column_count: None, // Will be set when first row is written
-            #[cfg(feature = "column-encryption")]
             column_encryption_enabled: false,
-            #[cfg(feature = "column-encryption")]
             emitted_cek_table: Vec::new(),
-            #[cfg(feature = "column-encryption")]
             plaintext_ceks: Vec::new(),
         }
     }
@@ -133,7 +123,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// the COLMETADATA layout the server uses on the read side. The caller must
     /// only enable this when column encryption has been negotiated for the
     /// connection.
-    #[cfg(feature = "column-encryption")]
     pub(crate) fn set_column_encryption_enabled(&mut self, enabled: bool) {
         self.column_encryption_enabled = enabled;
     }
@@ -142,7 +131,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// aligned with the column metadata. Entries are `None` for plaintext
     /// columns. Must be called before `begin()` when column encryption is
     /// enabled and any column is encrypted.
-    #[cfg(feature = "column-encryption")]
     pub(crate) fn set_plaintext_ceks(&mut self, ceks: Vec<Option<std::sync::Arc<Vec<u8>>>>) {
         self.plaintext_ceks = ceks;
     }
@@ -249,7 +237,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         // Always Encrypted: encrypt the plaintext cell value and emit the
         // ciphertext as a varbinary, matching the encrypted COLMETADATA wire
         // type. NULL values stay NULL (no ciphertext).
-        #[cfg(feature = "column-encryption")]
         if self.column_encryption_enabled
             && let Some(encrypted) = self.try_encrypt_cell(column_index, value)?
         {
@@ -282,7 +269,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// wrapped as `ColumnValues::Bytes` (or `ColumnValues::Null` for NULL
     /// input). Returns `Ok(None)` when the column is not encrypted, so the
     /// caller falls through to the plaintext serialization path.
-    #[cfg(feature = "column-encryption")]
     fn try_encrypt_cell(
         &self,
         column_index: usize,
@@ -483,7 +469,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         // is emitted right after the column count and before any column
         // descriptors (mirroring the read-side COLMETADATA layout). It is empty
         // when none of the columns are encrypted.
-        #[cfg(feature = "column-encryption")]
         if self.column_encryption_enabled {
             self.emitted_cek_table = self.collect_cek_table();
             self.write_cek_table().await?;
@@ -518,7 +503,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         if col_meta.is_identity {
             flags |= 0x0010; // Identity
         }
-        #[cfg(feature = "column-encryption")]
         if self.column_encryption_enabled && col_meta.encryption.is_some() {
             flags |= 0x0800; // fEncrypted
         }
@@ -534,7 +518,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
 
         // Always Encrypted: encrypted columns carry a CryptoMetadata blob after
         // the (ciphertext) TYPE_INFO and before the column name.
-        #[cfg(feature = "column-encryption")]
         if self.column_encryption_enabled
             && let Some(enc) = &col_meta.encryption
         {
@@ -773,7 +756,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// the distinct CEK entries referenced by the encrypted columns. Two entries
     /// are considered the same key when their identity tuple (database id, CEK
     /// id, version, metadata version) matches.
-    #[cfg(feature = "column-encryption")]
     fn collect_cek_table(&self) -> Vec<CekTableEntry> {
         let mut table: Vec<CekTableEntry> = Vec::new();
         for col in &self.column_metadata {
@@ -788,7 +770,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     }
 
     /// Returns the ordinal of `entry` within the emitted CEK table.
-    #[cfg(feature = "column-encryption")]
     fn cek_table_ordinal_for(&self, entry: &CekTableEntry) -> u16 {
         self.emitted_cek_table
             .iter()
@@ -797,7 +778,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     }
 
     /// Writes the CEK table: a `u16` entry count followed by each entry.
-    #[cfg(feature = "column-encryption")]
     async fn write_cek_table(&mut self) -> TdsResult<()> {
         let table = std::mem::take(&mut self.emitted_cek_table);
         self.packet_writer
@@ -818,7 +798,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// cek_md_version)`; the server already holds the encrypted key material and
     /// reconciles by those identifiers. Accordingly the encrypted-CEK-value
     /// count is written as `0`, matching .NET's `WriteEncryptionEntries`.
-    #[cfg(feature = "column-encryption")]
     async fn write_cek_table_entry(&mut self, entry: &CekTableEntry) -> TdsResult<()> {
         self.packet_writer
             .write_i32_async(entry.database_id)
@@ -838,7 +817,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// Writes the per-column CryptoMetadata that follows the ciphertext TYPE_INFO
     /// of an encrypted column (mirrors `parse_crypto_metadata` with a CEK table
     /// present).
-    #[cfg(feature = "column-encryption")]
     async fn write_crypto_metadata_colmetadata(
         &mut self,
         enc: &BulkCopyColumnEncryption,
@@ -881,7 +859,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// Writes a base TYPE_INFO (type byte + type-specific metadata) for the
     /// plaintext type of an encrypted column. This is the inverse of
     /// `read_type_info` for the data types Always Encrypted supports.
-    #[cfg(feature = "column-encryption")]
     async fn write_base_type_info(
         &mut self,
         base_data_type: TdsDataType,
@@ -932,7 +909,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
 
     /// Writes a variable-length type's length declarator using the byte width
     /// the type uses on the wire (1, 2, or 4 bytes).
-    #[cfg(feature = "column-encryption")]
     async fn write_type_length(&mut self, t: &VariableLengthTypes, length: usize) -> TdsResult<()> {
         match t.get_len_byte_count() {
             1 => self.packet_writer.write_byte_async(length as u8).await?,
@@ -949,7 +925,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
 
     /// Writes a 5-byte collation block (4-byte info + sort id), or five zero
     /// bytes when no collation is present.
-    #[cfg(feature = "column-encryption")]
     async fn write_collation_bytes(&mut self, collation: &Option<SqlCollation>) -> TdsResult<()> {
         match collation {
             Some(c) => {
@@ -964,7 +939,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     }
 
     /// Writes a `B_VARCHAR` (1-byte UTF-16 char count followed by the string).
-    #[cfg(feature = "column-encryption")]
     async fn write_b_varchar(&mut self, value: &str) -> TdsResult<()> {
         let utf16: Vec<u16> = value.encode_utf16().collect();
         self.packet_writer
@@ -979,7 +953,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
 
 /// Returns whether two CEK table entries describe the same key (matching
 /// identity: database id, CEK id, version, and metadata version).
-#[cfg(feature = "column-encryption")]
 fn cek_entry_matches(a: &CekTableEntry, b: &CekTableEntry) -> bool {
     a.database_id == b.database_id
         && a.cek_id == b.cek_id
@@ -1067,7 +1040,7 @@ mod bulk_load_tests;
 /// These round-trip the encrypted COLMETADATA the bulk-load writer emits back
 /// through the production `ColMetadataTokenParser`, verifying the CEK table and
 /// per-column crypto metadata are byte-compatible with the read side.
-#[cfg(all(test, feature = "column-encryption"))]
+#[cfg(test)]
 mod ae_colmetadata_tests {
     use super::*;
     use crate::connection::transport::network_transport::TransportSslHandler;
