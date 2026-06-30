@@ -30,10 +30,34 @@ def main():
         set_skip_duplicate("false")
         return
 
-    collection_uri = os.environ["SYSTEM_COLLECTIONURI"]
-    team_project = os.environ["SYSTEM_TEAMPROJECT"]
-    definition_id = os.environ["SYSTEM_DEFINITIONID"]
-    current_build_id = int(os.environ["BUILD_BUILDID"])
+    collection_uri = os.environ.get("SYSTEM_COLLECTIONURI", "")
+    team_project = os.environ.get("SYSTEM_TEAMPROJECT", "")
+    definition_id = os.environ.get("SYSTEM_DEFINITIONID", "")
+    current_build_id_raw = os.environ.get("BUILD_BUILDID", "")
+    missing = [
+        name
+        for name, value in (
+            ("SYSTEM_COLLECTIONURI", collection_uri),
+            ("SYSTEM_TEAMPROJECT", team_project),
+            ("SYSTEM_DEFINITIONID", definition_id),
+            ("BUILD_BUILDID", current_build_id_raw),
+        )
+        if not value
+    ]
+    if missing:
+        print(
+            f"##vso[task.logissue type=warning]Required pipeline variables unavailable ({', '.join(missing)}); continuing with full validation."
+        )
+        set_skip_duplicate("false")
+        return
+    try:
+        current_build_id = int(current_build_id_raw)
+    except ValueError:
+        print(
+            f"##vso[task.logissue type=warning]Build.BuildId is not numeric ('{current_build_id_raw}'); continuing with full validation."
+        )
+        set_skip_duplicate("false")
+        return
     build_source_branch = os.environ.get("BUILD_SOURCEBRANCH", "")
     source_commit = os.environ.get("SYSTEM_PULLREQUEST_SOURCECOMMITID", "").lower()
     pull_request_id = os.environ.get("SYSTEM_PULLREQUEST_PULLREQUESTID", "")
@@ -77,7 +101,8 @@ def main():
     headers = {"Authorization": "Bearer " + token}
     request = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(request) as response:
+        # Bound the call so a stalled ADO API can't hang the stage and block downstream validation.
+        with urllib.request.urlopen(request, timeout=30) as response:
             payload = json.load(response)
     except Exception as exc:
         print(
@@ -153,4 +178,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Safety net: the guard is best-effort, so any unexpected failure must fall back
+    # to full validation (skipDuplicate=false) rather than failing the stage and
+    # blocking the pipeline.
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001 - deliberate catch-all for safe fallback
+        print(
+            f"##vso[task.logissue type=warning]Duplicate guard failed unexpectedly ({type(exc).__name__}: {exc}); continuing with full validation."
+        )
+        set_skip_duplicate("false")
