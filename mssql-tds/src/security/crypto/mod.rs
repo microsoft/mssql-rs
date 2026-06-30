@@ -15,6 +15,10 @@
 //!   system OpenSSL. The required `windows-sys` `Win32_Security_Cryptography`
 //!   bindings are already pulled in by the Schannel-direct TLS engine, so no new
 //!   dependency is introduced.
+//! * **macOS** → Apple Security.framework (`SecKey`, for RSA and key generation)
+//!   plus CommonCrypto (AES-256-CBC, HMAC-SHA256, and the secure RNG, reached via
+//!   `libSystem`). This matches the TLS layer, which uses Apple's Secure
+//!   Transport rather than OpenSSL on this platform.
 //! * **All other targets** → OpenSSL via the `openssl` crate, which is already
 //!   the TLS backend on those platforms. OpenSSL is an approved provider on
 //!   every platform.
@@ -34,9 +38,18 @@
 #[path = "cng.rs"]
 mod imp;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[path = "apple.rs"]
+mod imp;
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 #[path = "openssl.rs"]
 mod imp;
+
+// PEM/DER framing helpers for the Apple backend. They contain no cryptography,
+// so they are also compiled (and unit-tested) on other platforms under `test`.
+#[cfg(any(target_os = "macos", test))]
+mod der;
 
 pub(crate) use imp::RsaKey;
 
