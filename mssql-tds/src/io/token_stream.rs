@@ -229,7 +229,11 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
             let (columns, decryptor) = extract_row_context(context)?;
             let decoder = GenericDecoder::default();
             for (col, meta) in columns.iter().enumerate() {
-                if meta.crypto_metadata.is_some() {
+                // Only decrypt when a decryptor is available. When column
+                // encryption is disabled for this command the decryptor is
+                // `None`, so the ciphertext varbinary is decoded normally
+                // instead of erroring.
+                if meta.crypto_metadata.is_some() && decryptor.is_some() {
                     let value = decrypt_encrypted_column(&decoder, reader, meta, decryptor).await?;
                     write_column_value(writer, col, value);
                 } else {
@@ -247,7 +251,7 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
             for (col, meta) in columns.iter().enumerate() {
                 if bitmap[col / 8] & (1 << (col % 8)) != 0 {
                     writer.write_null(col);
-                } else if meta.crypto_metadata.is_some() {
+                } else if meta.crypto_metadata.is_some() && decryptor.is_some() {
                     let value = decrypt_encrypted_column(&decoder, reader, meta, decryptor).await?;
                     write_column_value(writer, col, value);
                 } else {

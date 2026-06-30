@@ -144,8 +144,11 @@ impl<D: SqlTypeDecode + Default + Send + Sync, P: TdsPacketReader + Send + Sync>
             // - Fixed vs variable length types
             // - Type-specific encoding (collation, precision, scale, etc.)
             // Encrypted columns arrive as varbinary cipher bytes and are
-            // decrypted into their plaintext base type via the decryptor.
-            let column_value = if metadata.crypto_metadata.is_some() {
+            // decrypted into their plaintext base type via the decryptor. When
+            // no decryptor is available (column encryption disabled for this
+            // command) the ciphertext varbinary is decoded as-is instead of
+            // erroring.
+            let column_value = if metadata.crypto_metadata.is_some() && decryptor.is_some() {
                 decrypt_encrypted_column(&self.decoder, reader, metadata, decryptor).await?
             } else {
                 self.decoder.decode(reader, metadata).await?

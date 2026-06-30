@@ -73,7 +73,7 @@ impl<T: SqlTypeDecode + Sync, P: TdsPacketReader + Send + Sync> TokenParser<P>
 
             if is_null {
                 all_values.push(ColumnValues::Null);
-            } else if metadata.crypto_metadata.is_some() {
+            } else if metadata.crypto_metadata.is_some() && decryptor.is_some() {
                 all_values.push(
                     decrypt_encrypted_column(&self.decoder, reader, metadata, decryptor).await?,
                 );

@@ -140,7 +140,12 @@ where
         } else {
             Vec::new()
         };
-        let has_cek_table = !cek_table.is_empty();
+        // The CEK table is present on the wire — and therefore each encrypted
+        // column's CryptoMetadata carries a CekTableOrdinal — whenever Always
+        // Encrypted is negotiated, regardless of how many entries the table
+        // holds. Deriving presence from emptiness would skip the ordinal field
+        // for an (empty) table and desynchronize the token stream.
+        let has_cek_table = is_column_encryption_supported;
 
         // Pre-allocate vector for column metadata
         let mut column_metadata: Vec<ColumnMetadata> = Vec::with_capacity(col_count as usize);
