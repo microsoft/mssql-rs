@@ -408,19 +408,20 @@ extends:
         - template: /.pipeline/templates/install-dependencies.yml@self
           parameters:
             osType: MacOS
+        - task: UsePythonVersion@0
+          displayName: 'Use Python 3.12'
+          inputs:
+            versionSpec: '3.12'
+            addToPath: true
         - script: |
             set -euo pipefail
-            echo "Installing maturin via pipx..."
-            # macOS hosted agents ship an externally-managed (PEP 668) Homebrew
-            # Python, so a plain `pip install --user pipx` aborts with
-            # "externally-managed-environment". pipx is preinstalled on the macOS
-            # image; only bootstrap it (with --break-system-packages) if missing.
-            if ! command -v pipx >/dev/null 2>&1; then
-              python3 -m pip install --user --break-system-packages pipx
-              python3 -m pipx ensurepath
-            fi
-            export PATH="$HOME/.local/bin:$PATH"
-            pipx install maturin
+            # Target the UsePythonVersion-selected interpreter explicitly. It is a
+            # managed, writable, on-PATH Python, so there is no PEP 668
+            # externally-managed-environment problem (no --break-system-packages) and
+            # the maturin/wheel console scripts land on PATH. abi3 needs only one
+            # interpreter regardless of the wheel's >=3.9 compatibility.
+            python -m pip install --upgrade pip
+            python -m pip install maturin wheel
             echo "Installing Rust targets for universal2 build..."
             rustup target add x86_64-apple-darwin
             rustup target add aarch64-apple-darwin
@@ -442,7 +443,6 @@ extends:
             BUILD_BUILDID: $(Build.BuildId)
         - script: |
             set -euo pipefail
-            export PATH="$HOME/.local/bin:$PATH"
             export MACOSX_DEPLOYMENT_TARGET=15.0
             mkdir -p "$(ob_outputDirectory)/wheels"
             # ONE universal2 abi3 wheel. vendored-openssl statically links OpenSSL
@@ -461,14 +461,11 @@ extends:
             CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
         - script: |
             set -euo pipefail
-            export PATH="$HOME/.local/bin:$PATH"
-            # --break-system-packages: the macOS image Python is externally managed (PEP 668).
-            python3 -m pip install --user --break-system-packages wheel
+            # wheel was installed against the selected interpreter above; -m avoids
+            # any reliance on the console script's location on PATH.
             for whl in "$(ob_outputDirectory)"/wheels/*.whl; do
               echo "Re-tagging: $(basename "$whl")"
-              # Invoke as a module: the --user/Homebrew install does not put the
-              # `wheel` console script on PATH (exit 127 "command not found").
-              python3 -m wheel tags --platform-tag macosx_15_0_universal2 --remove "$whl"
+              python -m wheel tags --platform-tag macosx_15_0_universal2 --remove "$whl"
             done
             echo "Re-tagged wheels:"
             ls -lh "$(ob_outputDirectory)/wheels"
