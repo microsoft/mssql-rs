@@ -10,16 +10,13 @@ for the full design and rationale.
 ## How isolation works
 
 The harness code, Criterion version, and toolchain stay byte-for-byte identical
-across runs. Only the `mssql-tds` dependency in [`Cargo.toml`](Cargo.toml) is
-swapped:
+across runs. The `mssql-tds` dependency in [`Cargo.toml`](Cargo.toml) always points
+at `../mssql-tds`; isolation comes from swapping the **source** at that path between
+runs rather than building a different harness:
 
-```toml
-# candidate run (default, committed state)
-mssql-tds = { path = "../mssql-tds" }
-
-# baseline run (CI swaps to this)
-mssql-tds = { git = "<repo>", tag = "perf-baseline" }
-```
+- **candidate** — `../mssql-tds` is the current working tree.
+- **baseline** — `../mssql-tds` is replaced in place with a checkout of the
+  `perf-baseline` git tag (see [`perf-lab/run-benchmarks.sh`](perf-lab/run-benchmarks.sh)).
 
 Any statistically significant delta is therefore attributable to `mssql-tds`
 itself. The baseline is pinned by the **`perf-baseline` git tag**, which is moved
@@ -50,7 +47,7 @@ cargo bench -p mssql-tds-bench --bench query
 
 # Save a named baseline, then compare
 cargo bench -p mssql-tds-bench -- --save-baseline base
-# (swap the mssql-tds dependency, re-run)
+# (swap the ../mssql-tds source to the candidate, re-run — see perf-lab/run-benchmarks.sh)
 cargo bench -p mssql-tds-bench -- --save-baseline candidate
 critcmp base candidate
 ```
@@ -87,8 +84,8 @@ are the testScripts run by the shared `PerfTest` lab template
 (`.pipeline/perf-baseline-pipeline.yml`). They run on a dedicated perf-lab VM and:
 
 1. Build and run the candidate (`mssql-tds` = working tree) with `--save-baseline candidate`.
-2. Create a local `git worktree` of the `perf-baseline` tag, swap the harness's
-   `mssql-tds` path dependency to that worktree, and run it with `--save-baseline base`.
+2. Replace the `mssql-tds` source at `../mssql-tds` in place with a local
+   `git worktree` checkout of the `perf-baseline` tag, and run `--save-baseline base`.
 3. `critcmp base candidate` into `results/comparison.txt`.
 
 The harness is always built from the candidate tree (it does not exist at the

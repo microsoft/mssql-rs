@@ -9,15 +9,20 @@ description = "Fixed Criterion harness for benchmarking mssql-tds with a swappab
 license = "MIT"
 publish = false
 
+# Exclude the library target from `cargo bench` so its (empty) libtest harness
+# does not intercept Criterion's `--save-baseline` argument. Only the
+# `[[bench]]` targets below (harness = false) should run under `cargo bench`.
+[lib]
+bench = false
+
 [lints]
 workspace = true
 
 [dependencies]
-# The library under test. This is the ONLY dependency that is swapped between a
-# baseline run and a candidate run so that mssql-tds is the only variable:
-#
-#   candidate (default): path = "../mssql-tds"
-#   baseline (CI swap):  git = "https://.../mssql-rs", tag = "perf-baseline"
+# The library under test. This dependency line always points at ../mssql-tds.
+# The perf-lab testScript holds the harness constant and swaps only the SOURCE
+# at ../mssql-tds in place between runs — candidate = the working tree, baseline =
+# a checkout of the perf-baseline tag — so mssql-tds is the only variable.
 #
 # The harness code, Criterion version, and toolchain stay byte-for-byte identical
 # across both runs, so any statistically significant delta is attributable to

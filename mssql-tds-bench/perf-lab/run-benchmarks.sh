@@ -23,7 +23,6 @@ BASELINE_TAG="perf-baseline"
 
 REPO_ROOT="$(pwd)"
 RESULTS_DIR="$REPO_ROOT/results"
-MANIFEST="$REPO_ROOT/mssql-tds-bench/Cargo.toml"
 mkdir -p "$RESULTS_DIR"
 
 # --- Connection (SQL_SERVER / SQL_PASSWORD injected by run-remote.sh) ---
@@ -44,6 +43,8 @@ ensure_packages() {
     command -v curl >/dev/null 2>&1 || missing+=(curl)
     command -v cc >/dev/null 2>&1 || missing+=(build-essential)
     command -v pkg-config >/dev/null 2>&1 || missing+=(pkg-config)
+    [ -f /usr/include/openssl/ssl.h ] || missing+=(libssl-dev)
+    [ -f /etc/ssl/certs/ca-certificates.crt ] || missing+=(ca-certificates)
     [ ${#missing[@]} -eq 0 ] && return 0
 
     local sudo=""
@@ -79,22 +80,27 @@ fi
 echo ">>> Candidate benchmarks..."
 cargo bench -p mssql-tds-bench -- --save-baseline candidate
 
-# --- Baseline run (mssql-tds = perf-baseline tag via a local worktree) ---
+# --- Baseline run (mssql-tds source swapped to the perf-baseline tag) ---
+# Materialize the baseline mssql-tds via a local worktree, then replace the
+# workspace's mssql-tds source in place. The harness (mssql-tds-bench) and its
+# `path = "../mssql-tds"` dependency are unchanged, so mssql-tds is the only
+# variable. Swapping the source (rather than re-pointing the dependency at the
+# worktree) keeps a single mssql-tds in the workspace and avoids a Cargo lockfile
+# package collision.
 BASELINE_TREE="$(mktemp -d)/perf-baseline"
 echo ">>> Adding baseline worktree for tag '${BASELINE_TAG}' at ${BASELINE_TREE}..."
 git worktree add --detach "$BASELINE_TREE" "refs/tags/${BASELINE_TAG}"
 
-echo ">>> Swapping mssql-tds dependency to the baseline source..."
-cp "$MANIFEST" "$MANIFEST.bak"
-sed -i "s|mssql-tds = { path = \"../mssql-tds\" }|mssql-tds = { path = \"${BASELINE_TREE}/mssql-tds\" }|" "$MANIFEST"
-grep -q "path = \"${BASELINE_TREE}/mssql-tds\"" "$MANIFEST" \
-    || { echo "ERROR: failed to swap mssql-tds dependency" >&2; exit 1; }
+echo ">>> Swapping mssql-tds source to the baseline..."
+mv "$REPO_ROOT/mssql-tds" "$REPO_ROOT/.mssql-tds-candidate"
+cp -r "$BASELINE_TREE/mssql-tds" "$REPO_ROOT/mssql-tds"
 
 echo ">>> Baseline benchmarks..."
 cargo bench -p mssql-tds-bench -- --save-baseline base
 
-# Restore the committed manifest and remove the worktree.
-mv "$MANIFEST.bak" "$MANIFEST"
+# Restore the candidate source and remove the worktree.
+rm -rf "$REPO_ROOT/mssql-tds"
+mv "$REPO_ROOT/.mssql-tds-candidate" "$REPO_ROOT/mssql-tds"
 git worktree remove --force "$BASELINE_TREE" || true
 
 # --- Compare (both baselines live in the shared target/criterion) ---
