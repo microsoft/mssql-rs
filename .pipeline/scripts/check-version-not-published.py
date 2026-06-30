@@ -9,9 +9,10 @@ exact version is already published to the Azure Artifacts PyPI feed. This lets
 the pipeline fail in seconds instead of building seven wheels and only hitting
 the duplicate-version rejection at ``twine upload``.
 
-Authentication: PipAuthenticate@1 exports ``PIP_INDEX_URL`` with the feed's
-credentials embedded (``https://user:token@.../pypi/simple/``). We reuse that
-to query the feed's PEP 503 simple index for the package.
+The ``mssql-rs_Public`` feed allows anonymous reads, so the simple index URL is
+passed in directly (no credentials). For convenience an embedded-credential URL
+(``https://user:token@.../pypi/simple/``) is still accepted, as is a fallback to
+the ``PIP_INDEX_URL`` environment variable.
 
 Best-effort: if the feed cannot be reached or the index URL is missing, we WARN
 and exit 0. The duplicate-version rejection at upload time remains the
@@ -107,8 +108,10 @@ def fetch_simple_page(index_url: str, package: str) -> str | None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        sys.exit("usage: check-version-not-published.py <pyproject.toml> <package-name>")
+    if len(argv) not in (3, 4):
+        sys.exit(
+            "usage: check-version-not-published.py <pyproject.toml> <package-name> [simple-index-url]"
+        )
     pyproject_path, package = argv[1], argv[2]
 
     base = read_base_version(pyproject_path)
@@ -117,9 +120,9 @@ def main(argv: list[str]) -> int:
 
     import os
 
-    index_url = os.environ.get("PIP_INDEX_URL", "").strip()
+    index_url = (argv[3] if len(argv) == 4 else os.environ.get("PIP_INDEX_URL", "")).strip()
     if not index_url:
-        print("WARNING: PIP_INDEX_URL not set; skipping preflight (upload still guards).")
+        print("WARNING: no simple index URL provided; skipping preflight (upload still guards).")
         return 0
 
     page = fetch_simple_page(index_url, package)

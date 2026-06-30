@@ -9,7 +9,8 @@
 #   NOTHING produced by this pipeline is a production artifact:                 #
 #     * Python wheels are stamped with PEP 440 *.devN prerelease versions       #
 #       UNLESS the releaseVersion parameter is set (then BASE is published).    #
-#     * Crates are stamped with -dev.<date>.<buildId> prerelease versions.      #
+#     * Crates are stamped with -dev.<date>.<buildId> prerelease versions       #
+#       UNLESS the releaseVersion parameter is set (then BASE is published).    #
 #     * Publishing is OPT-IN. With the default parameters this pipeline only    #
 #       BUILDS and runs a DRY RUN — it does NOT upload anything.                #
 #                                                                               #
@@ -57,6 +58,9 @@ variables:
   pythonArtifactFeed: 'public/mssql-rs_Public'
   # Cargo registry name defined in .cargo/config.ci.toml.
   cargoRegistry: 'mssql-rs_Public'
+  # Public (anonymous-read) index URLs for the release preflight checks.
+  pythonSimpleIndex: 'https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/pypi/simple/'
+  cargoSparseIndex: 'https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/Cargo/index/'
 
 resources:
   repositories:
@@ -116,14 +120,10 @@ extends:
               versionSpec: '3.12'
               architecture: 'x64'
               addToPath: true
-          - task: PipAuthenticate@1
-            displayName: 'Authenticate pip to feed (read)'
-            inputs:
-              artifactFeed: '$(pythonArtifactFeed)'
           - pwsh: |
               $ErrorActionPreference = 'Stop'
               python .pipeline/scripts/check-version-not-published.py `
-                mssql-mock-tds-py/pyproject.toml mssql-mock-tds
+                mssql-mock-tds-py/pyproject.toml mssql-mock-tds '$(pythonSimpleIndex)'
             displayName: 'Fail if release version already on feed'
         - ${{ if not(and(eq(parameters.releaseVersion, true), eq(parameters.publishPython, true))) }}:
           - pwsh: |
@@ -795,6 +795,15 @@ extends:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           CARGO_TARGET_DIR: C:\cargo_target_dir
         steps:
+        - ${{ if and(eq(parameters.releaseVersion, true), eq(parameters.publishCrate, true)) }}:
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $baseVer = ([regex]'(?m)^version\s*=\s*"([^"]+)"').Match((Get-Content 'mssql-tds/Cargo.toml' -Raw)).Groups[1].Value
+              if ([string]::IsNullOrWhiteSpace($baseVer)) { Write-Error 'Could not read base version from mssql-tds/Cargo.toml'; exit 1 }
+              & .pipeline/scripts/check-crate-version-not-published.ps1 `
+                -IndexBaseUrl '$(cargoSparseIndex)' -Version $baseVer `
+                -Crates mssql-tds,mssql-mock-tds
+            displayName: 'Preflight: release crate versions not already published'
         - template: /.pipeline/templates/cargo-authenticate-template.yml@self
           parameters:
             osType: Windows
@@ -817,7 +826,11 @@ extends:
             $rx = [regex]'(?m)^(version\s*=\s*)"[^"]+"'
             $baseVer = ([regex]'(?m)^version\s*=\s*"([^"]+)"').Match((Get-Content 'mssql-tds/Cargo.toml' -Raw)).Groups[1].Value
             if ([string]::IsNullOrWhiteSpace($baseVer)) { Write-Error 'Could not read base version from mssql-tds/Cargo.toml'; exit 1 }
-            $ver = "$baseVer-dev.$date.$(Build.BuildId)"
+            if ('${{ parameters.releaseVersion }}' -eq 'True') {
+              $ver = $baseVer   # release: publish base version as-is (e.g. 1.0.0)
+            } else {
+              $ver = "$baseVer-dev.$date.$(Build.BuildId)"
+            }
             Write-Host "Sandbox crate version: $ver"
             foreach ($f in 'mssql-tds/Cargo.toml','mssql-mock-tds/Cargo.toml') {
               $c = Get-Content $f -Raw
