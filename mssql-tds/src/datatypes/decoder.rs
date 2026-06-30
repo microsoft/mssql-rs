@@ -3006,6 +3006,69 @@ mod test {
         }
 
         #[tokio::test]
+        async fn decode_into_bigbinary_null() {
+            // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
+            let md = varlen_metadata(TdsDataType::BigBinary, 8);
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(vec![0xFF, 0xFF]);
+            let mut writer = DefaultRowWriter::new(1);
+            decoder
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await
+                .unwrap();
+            assert_eq!(writer.take_row()[0], ColumnValues::Null);
+        }
+
+        #[tokio::test]
+        async fn decode_into_bigbinary_value() {
+            let md = varlen_metadata(TdsDataType::BigBinary, 8);
+            let decoder = GenericDecoder::default();
+            let mut bytes = vec![4, 0]; // USHORTLEN length = 4
+            bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            let mut reader = ByteReader::new(bytes);
+            let mut writer = DefaultRowWriter::new(1);
+            decoder
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await
+                .unwrap();
+            assert_eq!(
+                writer.take_row()[0],
+                ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])
+            );
+        }
+
+        #[tokio::test]
+        async fn decode_into_bigvarbinary_null_non_plp() {
+            let md = varlen_metadata(TdsDataType::BigVarBinary, 8);
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(vec![0xFF, 0xFF]);
+            let mut writer = DefaultRowWriter::new(1);
+            decoder
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await
+                .unwrap();
+            assert_eq!(writer.take_row()[0], ColumnValues::Null);
+        }
+
+        #[tokio::test]
+        async fn decode_into_bigvarbinary_value_non_plp() {
+            let md = varlen_metadata(TdsDataType::BigVarBinary, 8);
+            let decoder = GenericDecoder::default();
+            let mut bytes = vec![3, 0]; // USHORTLEN length = 3
+            bytes.extend_from_slice(&[0x01, 0x02, 0x03]);
+            let mut reader = ByteReader::new(bytes);
+            let mut writer = DefaultRowWriter::new(1);
+            decoder
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await
+                .unwrap();
+            assert_eq!(
+                writer.take_row()[0],
+                ColumnValues::Bytes(vec![0x01, 0x02, 0x03])
+            );
+        }
+
+        #[tokio::test]
         async fn decode_into_int4() {
             let md = fixed_metadata(TdsDataType::Int4, 4);
             let mut buf = [0u8; 4];

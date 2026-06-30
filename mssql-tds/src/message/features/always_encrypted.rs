@@ -207,4 +207,17 @@ mod tests {
         let mut feature = AlwaysEncryptedFeature::default();
         assert!(feature.deserialize(&[1, 2]).is_err());
     }
+
+    #[test]
+    fn test_clone_box_preserves_state() {
+        let mut feature = AlwaysEncryptedFeature::default();
+        feature.set_acknowledged(true);
+
+        let cloned = feature.clone_box();
+        assert_eq!(
+            cloned.feature_identifier(),
+            FeatureExtension::AlwaysEncrypted
+        );
+        assert!(cloned.is_acknowledged());
+    }
 }

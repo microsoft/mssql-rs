@@ -1516,6 +1516,34 @@ mod tests {
         assert!(meta.is_nullable);
         assert!(!meta.is_identity);
     }
+
+    /// A `ColumnMetadata` with the Always Encrypted flag set (`fEncrypted`,
+    /// bit 11) produces bulk-copy metadata marked encrypted.
+    #[test]
+    fn from_column_metadata_marks_encrypted() {
+        use crate::datatypes::sqldatatypes::{
+            FixedLengthTypes, TdsDataType, TypeInfo, TypeInfoVariant,
+        };
+        use crate::query::metadata::ColumnMetadata;
+
+        let col = ColumnMetadata {
+            user_type: 0,
+            flags: 0x0800, // fEncrypted
+            type_info: TypeInfo {
+                tds_type: TdsDataType::Int4,
+                length: 4,
+                type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+            },
+            data_type: TdsDataType::Int4,
+            column_name: "secret".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+
+        let meta: BulkCopyColumnMetadata = (&col).into();
+        assert!(meta.is_encrypted);
+        assert_eq!(meta.column_name, "secret");
+    }
 }
 
 // Include additional unit tests from separate test file

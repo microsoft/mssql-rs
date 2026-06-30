@@ -805,4 +805,16 @@ mod tests {
         let value = SqlType::Table(TvpTypeName::new(None, "OrderList".to_string()), None);
         assert_eq!(TdsDataType::from(&value), TdsDataType::SqlTable);
     }
+
+    /// `value()` returns a reference to the parameter's plaintext value, which
+    /// the parameter-encryption path uses before encrypting.
+    #[test]
+    fn value_returns_plaintext() {
+        let param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(42)),
+        );
+        assert_eq!(param.value(), &SqlType::Int(Some(42)));
+    }
 }

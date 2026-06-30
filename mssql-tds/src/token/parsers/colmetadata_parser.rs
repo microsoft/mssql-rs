@@ -763,4 +763,40 @@ mod tests {
             _ => panic!("Expected ColMetadata token"),
         }
     }
+
+    /// `parse_crypto_metadata` reads a custom cipher-algorithm name when the
+    /// algorithm id is the custom marker (0x00).
+    #[tokio::test]
+    async fn parse_crypto_metadata_reads_custom_cipher_name() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u32.to_le_bytes()); // user_type
+        data.push(TdsDataType::Int4 as u8); // base TYPE_INFO (Int4 carries no extra info)
+        data.push(CUSTOM_CIPHER_ALGORITHM_ID); // cipher_algorithm_id = custom
+        data.push(3); // algorithm name length (UTF-16 code units)
+        data.extend_from_slice(&MockReader::encode_utf16("AES"));
+        data.push(1); // encryption_type
+        data.push(1); // normalization_rule_version
+
+        let mut reader = MockReader::new(data);
+        let md = parse_crypto_metadata(&mut reader, false).await.unwrap();
+
+        assert_eq!(md.cek_table_ordinal, 0);
+        assert_eq!(md.base_data_type, TdsDataType::Int4);
+        assert_eq!(md.cipher_algorithm_id, CUSTOM_CIPHER_ALGORITHM_ID);
+        assert_eq!(md.cipher_algorithm_name.as_deref(), Some("AES"));
+        assert_eq!(md.encryption_type, 1);
+        assert_eq!(md.normalization_rule_version, 1);
+    }
+
+    /// An unrecognized base data-type byte in crypto metadata is rejected.
+    #[tokio::test]
+    async fn parse_crypto_metadata_rejects_invalid_base_type() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u32.to_le_bytes()); // user_type
+        data.push(0x01); // invalid base data type
+
+        let mut reader = MockReader::new(data);
+        let result = parse_crypto_metadata(&mut reader, false).await;
+        assert!(result.is_err());
+    }
 }
