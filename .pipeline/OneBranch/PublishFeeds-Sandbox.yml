@@ -492,6 +492,10 @@ extends:
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
         pool:
           type: windows
+          isCustom: true
+          name: RUST-1ES-POOL-WUS3
+          demands:
+            - imageOverride -equals RUST-Win22-Sql25-1P
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
         steps:
@@ -501,6 +505,7 @@ extends:
           displayName: 'Use Python 3.12'
           inputs:
             versionSpec: '3.12'
+            architecture: 'x64'
             addToPath: true
         - pwsh: |
             $ErrorActionPreference = 'Stop'
