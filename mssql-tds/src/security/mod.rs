@@ -18,6 +18,8 @@
 
 pub(crate) mod cell_decryptor;
 #[cfg(feature = "column-encryption")]
+pub(crate) mod crypto;
+#[cfg(feature = "column-encryption")]
 pub(crate) mod describe_parameter_encryption;
 #[cfg(feature = "column-encryption")]
 pub(crate) mod encryption;

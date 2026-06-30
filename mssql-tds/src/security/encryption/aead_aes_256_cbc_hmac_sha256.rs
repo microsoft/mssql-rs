@@ -23,21 +23,9 @@
 // result-set decryption) land in later Always Encrypted phases.
 #![allow(dead_code)]
 
-use cbc::cipher::block_padding::Pkcs7;
-use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use hmac::{Hmac, Mac};
-use rand_core::{OsRng, RngCore};
-use sha2::Sha256;
-
 use crate::core::TdsResult;
 use crate::error::Error;
-
-/// HMAC-SHA256 used for key derivation and the cell authentication tag.
-type HmacSha256 = Hmac<Sha256>;
-/// AES-256 in CBC mode with PKCS7 padding (encryption side).
-type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
-/// AES-256 in CBC mode with PKCS7 padding (decryption side).
-type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+use crate::security::crypto;
 
 /// Size in bytes of the column encryption key and each derived key (256-bit).
 const KEY_SIZE_IN_BYTES: usize = 32;
@@ -98,9 +86,9 @@ impl AeadAes256CbcHmacSha256 {
         }
 
         Ok(Self {
-            encryption_key: derive_key(root_key, ENCRYPTION_KEY_SALT),
-            mac_key: derive_key(root_key, MAC_KEY_SALT),
-            iv_key: derive_key(root_key, IV_KEY_SALT),
+            encryption_key: derive_key(root_key, ENCRYPTION_KEY_SALT)?,
+            mac_key: derive_key(root_key, MAC_KEY_SALT)?,
+            iv_key: derive_key(root_key, IV_KEY_SALT)?,
         })
     }
 
@@ -115,24 +103,24 @@ impl AeadAes256CbcHmacSha256 {
         plaintext: &[u8],
         encryption_type: ColumnEncryptionType,
     ) -> TdsResult<Vec<u8>> {
-        let iv = match encryption_type {
+        let iv: [u8; BLOCK_SIZE_IN_BYTES] = match encryption_type {
             ColumnEncryptionType::Deterministic => {
                 // Synthetic IV: HMAC-SHA256(iv_key, plaintext) truncated to one block.
-                let full = hmac_sha256(&self.iv_key, &[plaintext]);
-                full[..BLOCK_SIZE_IN_BYTES].to_vec()
+                let full = crypto::hmac_sha256(&self.iv_key, plaintext)?;
+                full[..BLOCK_SIZE_IN_BYTES]
+                    .try_into()
+                    .expect("HMAC output is at least one AES block")
             }
             ColumnEncryptionType::Randomized => {
-                let mut iv = vec![0u8; BLOCK_SIZE_IN_BYTES];
-                OsRng.fill_bytes(&mut iv);
+                let mut iv = [0u8; BLOCK_SIZE_IN_BYTES];
+                crypto::fill_random(&mut iv)?;
                 iv
             }
         };
 
-        let ciphertext = Aes256CbcEnc::new_from_slices(&self.encryption_key, &iv)
-            .map_err(|e| crypto_err(format!("invalid AES key/IV length: {e}")))?
-            .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+        let ciphertext = crypto::aes_256_cbc_encrypt(&self.encryption_key, &iv, plaintext)?;
 
-        let tag = self.authentication_tag(&iv, &ciphertext);
+        let tag = self.authentication_tag(&iv, &ciphertext)?;
 
         let mut blob = Vec::with_capacity(1 + TAG_SIZE_IN_BYTES + iv.len() + ciphertext.len());
         blob.push(ALGORITHM_VERSION);
@@ -172,9 +160,9 @@ impl AeadAes256CbcHmacSha256 {
         let iv = &blob[1 + TAG_SIZE_IN_BYTES..1 + TAG_SIZE_IN_BYTES + BLOCK_SIZE_IN_BYTES];
         let ciphertext = &blob[1 + TAG_SIZE_IN_BYTES + BLOCK_SIZE_IN_BYTES..];
 
-        // Constant-time tag verification (HMAC `verify_slice`) to avoid leaking
-        // tag bytes via timing.
-        if !self.verify_authentication_tag(iv, ciphertext, tag) {
+        // Constant-time tag verification to avoid leaking tag bytes via timing.
+        let expected_tag = self.authentication_tag(iv, ciphertext)?;
+        if !crypto::constant_time_eq(&expected_tag, tag) {
             return Err(Error::ColumnEncryptionError(
                 "Authentication tag mismatch; the ciphertext may have been tampered with or the \
                  wrong column encryption key was used"
@@ -182,58 +170,35 @@ impl AeadAes256CbcHmacSha256 {
             ));
         }
 
-        Aes256CbcDec::new_from_slices(&self.encryption_key, iv)
-            .map_err(|e| crypto_err(format!("invalid AES key/IV length: {e}")))?
-            .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
-            .map_err(|e| crypto_err(format!("AES-CBC decryption failed: {e}")))
+        let iv: [u8; BLOCK_SIZE_IN_BYTES] = iv
+            .try_into()
+            .expect("IV slice is exactly one AES block by construction");
+        crypto::aes_256_cbc_decrypt(&self.encryption_key, &iv, ciphertext)
     }
 
     /// Computes the authentication tag over `version || iv || ciphertext || version_size`.
-    fn authentication_tag(&self, iv: &[u8], ciphertext: &[u8]) -> Vec<u8> {
-        hmac_sha256(
-            &self.mac_key,
-            &[&[ALGORITHM_VERSION], iv, ciphertext, &[VERSION_SIZE_BYTE]],
-        )
-    }
-
-    /// Recomputes the authentication tag and compares it against `tag` in
-    /// constant time, returning whether they match.
-    fn verify_authentication_tag(&self, iv: &[u8], ciphertext: &[u8], tag: &[u8]) -> bool {
-        let mut mac =
-            HmacSha256::new_from_slice(&self.mac_key).expect("HMAC accepts keys of any length");
-        mac.update(&[ALGORITHM_VERSION]);
-        mac.update(iv);
-        mac.update(ciphertext);
-        mac.update(&[VERSION_SIZE_BYTE]);
-        mac.verify_slice(tag).is_ok()
+    fn authentication_tag(
+        &self,
+        iv: &[u8],
+        ciphertext: &[u8],
+    ) -> TdsResult<[u8; TAG_SIZE_IN_BYTES]> {
+        let mut data = Vec::with_capacity(1 + iv.len() + ciphertext.len() + 1);
+        data.push(ALGORITHM_VERSION);
+        data.extend_from_slice(iv);
+        data.extend_from_slice(ciphertext);
+        data.push(VERSION_SIZE_BYTE);
+        crypto::hmac_sha256(&self.mac_key, &data)
     }
 }
 
 /// Derives a 256-bit key as `HMAC-SHA256(root_key, utf16le(salt))`.
-fn derive_key(root_key: &[u8], salt: &str) -> [u8; KEY_SIZE_IN_BYTES] {
-    let derived = hmac_sha256(root_key, &[&utf16le(salt)]);
-    let mut key = [0u8; KEY_SIZE_IN_BYTES];
-    key.copy_from_slice(&derived);
-    key
-}
-
-/// Computes `HMAC-SHA256(key, segments[0] || segments[1] || ...)`.
-fn hmac_sha256(key: &[u8], segments: &[&[u8]]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any length");
-    for segment in segments {
-        mac.update(segment);
-    }
-    mac.finalize().into_bytes().to_vec()
+fn derive_key(root_key: &[u8], salt: &str) -> TdsResult<[u8; KEY_SIZE_IN_BYTES]> {
+    crypto::hmac_sha256(root_key, &utf16le(salt))
 }
 
 /// Encodes a string as little-endian UTF-16 bytes (matching .NET `Encoding.Unicode`).
 fn utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(u16::to_le_bytes).collect()
-}
-
-/// Maps a low-level cryptographic failure into a [`ColumnEncryptionError`](Error::ColumnEncryptionError).
-fn crypto_err(msg: impl std::fmt::Display) -> Error {
-    Error::ColumnEncryptionError(format!("AEAD cipher error: {msg}"))
 }
 
 #[cfg(test)]

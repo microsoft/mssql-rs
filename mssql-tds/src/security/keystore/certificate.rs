@@ -26,16 +26,11 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use rand_core::OsRng;
-use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::{Oaep, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
-use sha1::Sha1;
-use sha2::{Digest, Sha256};
 
 use super::ColumnEncryptionKeyStoreProvider;
 use crate::core::TdsResult;
 use crate::error::Error;
+use crate::security::crypto::RsaKey;
 
 /// The only encrypted CEK version byte the format defines.
 const SUPPORTED_VERSION: u8 = 0x01;
@@ -50,7 +45,7 @@ const RSA_OAEP_ALGORITHM: &str = "RSA_OAEP";
 /// carried in the COLMETADATA CEK table.
 pub struct CertificateKeyStoreProvider {
     /// Master key path (lowercased) → RSA key pair that wraps CEKs for that CMK.
-    keys: HashMap<String, RsaPrivateKey>,
+    keys: HashMap<String, RsaKey>,
 }
 
 impl CertificateKeyStoreProvider {
@@ -72,24 +67,19 @@ impl CertificateKeyStoreProvider {
         master_key_path: impl AsRef<str>,
         private_key_pem: &[u8],
     ) -> TdsResult<()> {
-        // Accept either a PKCS#1 RSA key or a PKCS#8 wrapped key.
-        let pem = std::str::from_utf8(private_key_pem).map_err(|e| {
-            Error::ColumnEncryptionError(format!("Private key PEM is not valid UTF-8: {e}"))
-        })?;
-        let key = RsaPrivateKey::from_pkcs1_pem(pem)
-            .or_else(|_| RsaPrivateKey::from_pkcs8_pem(pem))
-            .map_err(|e| {
-                Error::ColumnEncryptionError(format!(
-                    "Failed to parse RSA private key from PEM (tried PKCS#1 and PKCS#8): {e}"
-                ))
-            })?;
+        // `RsaKey::from_pem` accepts either a PKCS#1 RSA key or a PKCS#8 key.
+        let key = RsaKey::from_pem(private_key_pem)?;
         self.keys
             .insert(master_key_path.as_ref().to_ascii_lowercase(), key);
         Ok(())
     }
 
     /// Registers an already-parsed RSA key pair for `master_key_path`.
-    pub fn add_key(&mut self, master_key_path: impl AsRef<str>, key: RsaPrivateKey) {
+    ///
+    /// Internal: callers outside the crate register keys via
+    /// [`Self::add_key_from_pem`] or [`Self::generate_and_add_key`], since
+    /// [`RsaKey`] is a crate-private wrapper over the platform crypto backend.
+    pub(crate) fn add_key(&mut self, master_key_path: impl AsRef<str>, key: RsaKey) {
         self.keys
             .insert(master_key_path.as_ref().to_ascii_lowercase(), key);
     }
@@ -102,7 +92,7 @@ impl CertificateKeyStoreProvider {
     /// useful for provisioning a throwaway column master key in tests and
     /// tooling without persisting (or committing) static key material.
     pub fn generate_and_add_key(&mut self, master_key_path: impl AsRef<str>) -> TdsResult<()> {
-        let key = RsaPrivateKey::new(&mut OsRng, 2048).map_err(rsa_err)?;
+        let key = RsaKey::generate(2048)?;
         self.add_key(master_key_path, key);
         Ok(())
     }
@@ -130,7 +120,7 @@ impl CertificateKeyStoreProvider {
         encrypt_rsa_oaep_cek(pkey, master_key_path, plaintext_cek)
     }
 
-    fn key_for(&self, master_key_path: &str) -> TdsResult<&RsaPrivateKey> {
+    fn key_for(&self, master_key_path: &str) -> TdsResult<&RsaKey> {
         self.keys
             .get(&master_key_path.to_ascii_lowercase())
             .ok_or_else(|| {
@@ -169,11 +159,7 @@ impl ColumnEncryptionKeyStoreProvider for CertificateKeyStoreProvider {
 
 /// Parses the encrypted CEK blob, verifies its signature, and RSA-OAEP unwraps
 /// the wrapped column encryption key.
-fn decrypt_rsa_oaep_cek(
-    pkey: &RsaPrivateKey,
-    master_key_path: &str,
-    blob: &[u8],
-) -> TdsResult<Vec<u8>> {
+fn decrypt_rsa_oaep_cek(pkey: &RsaKey, master_key_path: &str, blob: &[u8]) -> TdsResult<Vec<u8>> {
     // version (1) + keyPathLength (2) + cipherTextLength (2)
     const HEADER_LEN: usize = 5;
     if blob.len() < HEADER_LEN {
@@ -219,11 +205,11 @@ fn decrypt_rsa_oaep_cek(
 /// (SHA-1) ciphertext framed by a version byte, the lowercased master key path,
 /// and a SHA256withRSA signature. Inverse of [`decrypt_rsa_oaep_cek`].
 fn encrypt_rsa_oaep_cek(
-    pkey: &RsaPrivateKey,
+    pkey: &RsaKey,
     master_key_path: &str,
     plaintext_cek: &[u8],
 ) -> TdsResult<Vec<u8>> {
-    let cipher_text = rsa_oaep_encrypt(pkey, plaintext_cek)?;
+    let cipher_text = pkey.oaep_sha1_encrypt(plaintext_cek)?;
 
     let key_path_bytes: Vec<u8> = master_key_path
         .to_ascii_lowercase()
@@ -238,38 +224,21 @@ fn encrypt_rsa_oaep_cek(
     signed_portion.extend_from_slice(&key_path_bytes);
     signed_portion.extend_from_slice(&cipher_text);
 
-    let digest = Sha256::digest(&signed_portion);
-    let signature = pkey
-        .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
-        .map_err(rsa_err)?;
+    let signature = pkey.pkcs1_sha256_sign(&signed_portion)?;
 
     let mut blob = signed_portion;
     blob.extend_from_slice(&signature);
     Ok(blob)
 }
 
-/// RSA-OAEP (SHA-1 / MGF1-SHA-1) encryption of the plaintext CEK.
-fn rsa_oaep_encrypt(pkey: &RsaPrivateKey, plaintext: &[u8]) -> TdsResult<Vec<u8>> {
-    let public_key = RsaPublicKey::from(pkey);
-    let padding = Oaep::new::<Sha1>();
-    public_key
-        .encrypt(&mut OsRng, padding, plaintext)
-        .map_err(rsa_err)
-}
-
 /// Verifies the RSASSA-PKCS1v1_5 / SHA-256 signature over `signed_portion`.
 fn verify_signature(
-    pkey: &RsaPrivateKey,
+    pkey: &RsaKey,
     signed_portion: &[u8],
     signature: &[u8],
     master_key_path: &str,
 ) -> TdsResult<()> {
-    let public_key = RsaPublicKey::from(pkey);
-    let digest = Sha256::digest(signed_portion);
-    if public_key
-        .verify(Pkcs1v15Sign::new::<Sha256>(), &digest, signature)
-        .is_err()
-    {
+    if !pkey.pkcs1_sha256_verify(signed_portion, signature)? {
         return Err(Error::ColumnEncryptionError(format!(
             "Signature verification failed for the column encryption key wrapped by master key \
              '{master_key_path}'. The encrypted value may have been tampered with, or the wrong \
@@ -280,11 +249,10 @@ fn verify_signature(
 }
 
 /// RSA-OAEP (SHA-1 / MGF1-SHA-1) decryption of the wrapped CEK.
-fn rsa_oaep_decrypt(pkey: &RsaPrivateKey, cipher_text: &[u8]) -> TdsResult<Vec<u8>> {
+fn rsa_oaep_decrypt(pkey: &RsaKey, cipher_text: &[u8]) -> TdsResult<Vec<u8>> {
     // Always Encrypted wraps CEKs with RSA-OAEP using SHA-1 for both the OAEP
     // digest and the MGF1 mask generation function.
-    let padding = Oaep::new::<Sha1>();
-    pkey.decrypt(padding, cipher_text).map_err(rsa_err)
+    pkey.oaep_sha1_decrypt(cipher_text)
 }
 
 fn length_error(master_key_path: &str) -> Error {
@@ -294,15 +262,9 @@ fn length_error(master_key_path: &str) -> Error {
     ))
 }
 
-fn rsa_err(err: rsa::Error) -> Error {
-    Error::ColumnEncryptionError(format!("RSA error during CEK wrap/unwrap: {err}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsa::pkcs1::EncodeRsaPrivateKey;
-    use rsa::pkcs8::EncodePrivateKey;
 
     const MASTER_KEY_PATH: &str = "CurrentUser/My/0123456789ABCDEF";
     const CEK: [u8; 32] = [
@@ -311,15 +273,18 @@ mod tests {
         0x2E, 0x2F,
     ];
 
-    fn generate_keypair() -> RsaPrivateKey {
-        RsaPrivateKey::new(&mut OsRng, 2048).unwrap()
+    /// Generates a fresh RSA key serialized as PKCS#8 PEM. Returning PEM lets a
+    /// test build several independent provider instances from the same key
+    /// material without requiring the (deliberately non-`Clone`) [`RsaKey`].
+    fn generate_key_pem() -> Vec<u8> {
+        RsaKey::generate(2048).unwrap().to_pkcs8_pem().unwrap()
     }
 
-    /// Wraps a CEK using the provider's own wrapping (the inverse of unwrap),
+    /// Wraps a CEK using a provider built from `pem` (the inverse of unwrap),
     /// producing a blob the provider must be able to unwrap again.
-    fn wrap_cek(pkey: &RsaPrivateKey, master_key_path: &str, cek: &[u8]) -> Vec<u8> {
+    fn wrap_cek(pem: &[u8], master_key_path: &str, cek: &[u8]) -> Vec<u8> {
         let mut provider = CertificateKeyStoreProvider::new();
-        provider.add_key(master_key_path, pkey.clone());
+        provider.add_key_from_pem(master_key_path, pem).unwrap();
         provider
             .encrypt_column_encryption_key(master_key_path, "RSA_OAEP", cek)
             .unwrap()
@@ -327,14 +292,11 @@ mod tests {
 
     #[tokio::test]
     async fn unwraps_a_faithfully_wrapped_cek() {
-        let pkey = generate_keypair();
-        let blob = wrap_cek(&pkey, MASTER_KEY_PATH, &CEK);
+        let pem = generate_key_pem();
+        let blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
 
         let mut provider = CertificateKeyStoreProvider::new();
-        let pem = pkey.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap();
-        provider
-            .add_key_from_pem(MASTER_KEY_PATH, pem.as_bytes())
-            .unwrap();
+        provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         let plaintext = provider
             .decrypt_column_encryption_key(MASTER_KEY_PATH, "RSA_OAEP", &blob)
@@ -345,15 +307,12 @@ mod tests {
 
     #[tokio::test]
     async fn loads_pkcs8_pem_key() {
-        // Newer OpenSSL emits PKCS#8 (`BEGIN PRIVATE KEY`); ensure that loads too.
-        let pkey = generate_keypair();
-        let blob = wrap_cek(&pkey, MASTER_KEY_PATH, &CEK);
+        // `generate_key_pem` emits PKCS#8 (`BEGIN PRIVATE KEY`); ensure it loads.
+        let pem = generate_key_pem();
+        let blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
 
         let mut provider = CertificateKeyStoreProvider::new();
-        let pkcs8_pem = pkey.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
-        provider
-            .add_key_from_pem(MASTER_KEY_PATH, pkcs8_pem.as_bytes())
-            .unwrap();
+        provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         let plaintext = provider
             .decrypt_column_encryption_key(MASTER_KEY_PATH, "RSA_OAEP", &blob)
@@ -364,11 +323,12 @@ mod tests {
 
     #[tokio::test]
     async fn master_key_path_is_matched_case_insensitively() {
-        let pkey = generate_keypair();
-        let blob = wrap_cek(&pkey, MASTER_KEY_PATH, &CEK);
+        let pem = generate_key_pem();
+        let blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
 
+        // Exercise the parsed-key registration path (`add_key`).
         let mut provider = CertificateKeyStoreProvider::new();
-        provider.add_key(MASTER_KEY_PATH, pkey);
+        provider.add_key(MASTER_KEY_PATH, RsaKey::from_pem(&pem).unwrap());
 
         let plaintext = provider
             .decrypt_column_encryption_key(&MASTER_KEY_PATH.to_uppercase(), "rsa_oaep", &blob)
@@ -379,10 +339,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unknown_algorithm() {
-        let pkey = generate_keypair();
-        let blob = wrap_cek(&pkey, MASTER_KEY_PATH, &CEK);
+        let pem = generate_key_pem();
+        let blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
         let mut provider = CertificateKeyStoreProvider::new();
-        provider.add_key(MASTER_KEY_PATH, pkey);
+        provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         let err = provider
             .decrypt_column_encryption_key(MASTER_KEY_PATH, "RSA_OAEP_256", &blob)
@@ -393,10 +353,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unknown_master_key_path() {
-        let pkey = generate_keypair();
-        let blob = wrap_cek(&pkey, MASTER_KEY_PATH, &CEK);
+        let pem = generate_key_pem();
+        let blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
         let mut provider = CertificateKeyStoreProvider::new();
-        provider.add_key(MASTER_KEY_PATH, pkey);
+        provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         let err = provider
             .decrypt_column_encryption_key("CurrentUser/My/other", "RSA_OAEP", &blob)
@@ -407,14 +367,14 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_tampered_signature() {
-        let pkey = generate_keypair();
-        let mut blob = wrap_cek(&pkey, MASTER_KEY_PATH, &CEK);
+        let pem = generate_key_pem();
+        let mut blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
         // Flip a bit in the trailing signature.
         let last = blob.len() - 1;
         blob[last] ^= 0x01;
 
         let mut provider = CertificateKeyStoreProvider::new();
-        provider.add_key(MASTER_KEY_PATH, pkey);
+        provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         let err = provider
             .decrypt_column_encryption_key(MASTER_KEY_PATH, "RSA_OAEP", &blob)
@@ -425,12 +385,12 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unsupported_version() {
-        let pkey = generate_keypair();
-        let mut blob = wrap_cek(&pkey, MASTER_KEY_PATH, &CEK);
+        let pem = generate_key_pem();
+        let mut blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
         blob[0] = 0x02; // bump the version byte
 
         let mut provider = CertificateKeyStoreProvider::new();
-        provider.add_key(MASTER_KEY_PATH, pkey);
+        provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         let err = provider
             .decrypt_column_encryption_key(MASTER_KEY_PATH, "RSA_OAEP", &blob)
@@ -445,11 +405,11 @@ mod tests {
         use crate::query::metadata::{CekTableEntry, EncryptedCekValue};
         use std::sync::Arc;
 
-        let pkey = generate_keypair();
-        let blob = wrap_cek(&pkey, MASTER_KEY_PATH, &CEK);
+        let pem = generate_key_pem();
+        let blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
 
         let mut provider = CertificateKeyStoreProvider::new();
-        provider.add_key(MASTER_KEY_PATH, pkey);
+        provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         // Register under the standard certificate-store provider name and
         // resolve a CEK table entry end-to-end through `decrypt_cek`.
