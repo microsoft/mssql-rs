@@ -1,10 +1,10 @@
 # Fixed-baseline performance pipeline (dedicated perf lab)
 #
-# Compares the current commit against a fixed, manually-advanced baseline
-# pinned by the `perf-baseline` git tag, using the mssql-tds-bench harness whose
-# ONLY swapped input is the mssql-tds dependency. The harness code, Criterion
-# version, and toolchain are identical across both runs, so any significant
-# delta is attributable to mssql-tds itself.
+# Compares the current commit against a fixed baseline pinned by a commit SHA
+# committed to mssql-tds-bench/perf-lab/baseline-commit.txt (advanced via PR),
+# using the mssql-tds-bench harness whose ONLY swapped input is the mssql-tds
+# source. The harness code, Criterion version, and toolchain are identical across
+# both runs, so any significant delta is attributable to mssql-tds itself.
 #
 # This pipeline consumes the shared PerfTest lab template, which runs the
 # benchmarks on a dedicated host VM (not on shared/noisy build agents):
@@ -13,8 +13,8 @@
 #
 # The build happens ON the VM (the lab's documented model): the testScript
 # bootstraps the toolchain, builds the candidate from the working tree and the
-# baseline from a local `git worktree` of the perf-baseline tag, then compares
-# with critcmp. See mssql-tds-bench/perf-lab/run-benchmarks.{sh,ps1}.
+# baseline from a local `git worktree` of the commit in baseline-commit.txt, then
+# compares with critcmp. See mssql-tds-bench/perf-lab/run-benchmarks.{sh,ps1}.
 #
 # Complements benchmark-pipeline.yml (PR vs target branch). Trigger manually or
 # on the weekly schedule below.
@@ -51,7 +51,8 @@ extends:
   parameters:
     platform: ${{ parameters.platform }}
     # Ship the whole repo (including .git) so the testScript can create a local
-    # worktree of the perf-baseline tag with no VM-side ADO authentication.
+    # worktree of the baseline commit with no VM-side ADO authentication. The
+    # baseline commit must be present in the shipped history (full checkout).
     testRootDir: $(Build.SourcesDirectory)/mssql-rs
     # Relative to testRootDir. The template auto-swaps .sh -> .ps1 on Windows.
     testScript: mssql-tds-bench/perf-lab/run-benchmarks.sh

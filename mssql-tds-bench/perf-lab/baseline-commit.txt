@@ -1,0 +1,10 @@
+# Performance baseline commit for mssql-tds.
+#
+# The perf-lab benchmarks compare the current commit (candidate) against the
+# mssql-tds source at the commit below (baseline). To advance the baseline,
+# change this hash in a pull request — so every baseline move is reviewed,
+# recorded in git history, and attributable, rather than an untracked tag move.
+#
+# Exactly one full 40-character commit SHA on its own line. Lines starting with
+# '#' and blank lines are ignored.
+fad13a1c4124208353d5d0f9cc17742544aab26a

@@ -8,16 +8,17 @@
 # with SQL_SERVER and SQL_PASSWORD injected as environment variables.
 #
 # Builds the mssql-tds-bench harness TWICE from the SAME (candidate) working
-# tree, swapping ONLY the mssql-tds dependency (working tree vs a local
-# `git worktree` of the perf-baseline tag), then compares with critcmp.
+# tree, swapping ONLY the mssql-tds source (working tree vs a local
+# `git worktree` checkout of the commit pinned in baseline-commit.txt), then
+# compares with critcmp.
 
 $ErrorActionPreference = 'Stop'
 
-# Baseline pointer — hard-coded; the tag is moved manually in the git repo.
-$BaselineTag = 'perf-baseline'
-
 $RepoRoot   = (Get-Location).Path
 $ResultsDir = Join-Path $RepoRoot 'results'
+# Baseline pointer — a committed commit SHA. Advancing the baseline requires a
+# PR that edits this file, so every move is reviewed and recorded in history.
+$BaselineFile = Join-Path $RepoRoot 'mssql-tds-bench/perf-lab/baseline-commit.txt'
 New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
 
 # --- Connection (SQL_SERVER / SQL_PASSWORD injected by run-remote) ---
@@ -67,25 +68,35 @@ if (-not (Get-Command critcmp -ErrorAction SilentlyContinue)) {
     cargo install critcmp --version 0.1.8 --locked
 }
 
-# --- Verify the baseline tag is present in the shipped .git ---
-& git rev-parse "refs/tags/$BaselineTag^{commit}" *> $null
-if ($LASTEXITCODE -ne 0) {
-    throw "Baseline tag '$BaselineTag' not found in the shipped repository. Ensure the checkout fetches tags."
+# --- Resolve and verify the baseline commit (from baseline-commit.txt) ---
+if (-not (Test-Path $BaselineFile)) {
+    throw "Baseline file not found: $BaselineFile"
 }
+$BaselineCommit = (Get-Content $BaselineFile |
+    Where-Object { $_ -notmatch '^\s*(#|$)' } |
+    Select-Object -First 1).Trim()
+if ($BaselineCommit -notmatch '^[0-9a-fA-F]{7,40}$') {
+    throw "$BaselineFile does not contain a valid commit SHA (got: '$BaselineCommit')"
+}
+& git rev-parse --verify --quiet "$BaselineCommit^{commit}" *> $null
+if ($LASTEXITCODE -ne 0) {
+    throw "Baseline commit '$BaselineCommit' not found in the shipped repository. Ensure the checkout fetches full history."
+}
+Write-Host ">>> Baseline commit: $BaselineCommit"
 
 # --- Candidate run (mssql-tds = working tree) ---
 Write-Host '>>> Candidate benchmarks...'
 cargo bench -p mssql-tds-bench -- --save-baseline candidate
 
-# --- Baseline run (mssql-tds source swapped to the perf-baseline tag) ---
+# --- Baseline run (mssql-tds source swapped to the baseline commit) ---
 # Materialize the baseline mssql-tds via a local worktree, then replace the
 # workspace's mssql-tds source in place. The harness (mssql-tds-bench) and its
 # `path = "../mssql-tds"` dependency are unchanged, so mssql-tds is the only
 # variable. Swapping the source keeps a single mssql-tds in the workspace and
 # avoids a Cargo lockfile package collision.
 $BaselineTree = Join-Path ([System.IO.Path]::GetTempPath()) "perf-baseline-$([System.Guid]::NewGuid().ToString('N'))"
-Write-Host ">>> Adding baseline worktree for tag '$BaselineTag' at $BaselineTree..."
-& git worktree add --detach $BaselineTree "refs/tags/$BaselineTag"
+Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree..."
+& git worktree add --detach $BaselineTree $BaselineCommit
 
 Write-Host '>>> Swapping mssql-tds source to the baseline...'
 $CandidateSrc = Join-Path $RepoRoot 'mssql-tds'
