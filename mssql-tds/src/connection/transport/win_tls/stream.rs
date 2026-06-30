@@ -682,6 +682,7 @@ mod tests {
                 pending_out_written: 0,
                 pending_plain_len,
             },
+            channel_binding: None,
         }
     }
 
