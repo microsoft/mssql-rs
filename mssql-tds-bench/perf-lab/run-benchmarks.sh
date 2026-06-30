@@ -34,6 +34,26 @@ export TRUST_SERVER_CERTIFICATE="${TRUST_SERVER_CERTIFICATE:-true}"
 # SQL_PASSWORD is already exported into this session by run-remote.sh.
 : "${SQL_PASSWORD:?SQL_PASSWORD not set}"
 
+# --- System prerequisites (Ubuntu) ---
+# The perf VM may be a minimal image without git or a C toolchain. Install what
+# the run needs up front: git (for the baseline worktree), curl (for rustup),
+# and a C linker (to compile the benches).
+ensure_packages() {
+    local missing=()
+    command -v git >/dev/null 2>&1 || missing+=(git)
+    command -v curl >/dev/null 2>&1 || missing+=(curl)
+    command -v cc >/dev/null 2>&1 || missing+=(build-essential)
+    command -v pkg-config >/dev/null 2>&1 || missing+=(pkg-config)
+    [ ${#missing[@]} -eq 0 ] && return 0
+
+    local sudo=""
+    [ "$(id -u)" -ne 0 ] && sudo="sudo"
+    echo ">>> Installing system packages: ${missing[*]}"
+    $sudo apt-get update -y
+    $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+}
+ensure_packages
+
 # --- Toolchain ---
 if ! command -v cargo >/dev/null 2>&1; then
     echo ">>> Installing Rust toolchain via rustup..."
