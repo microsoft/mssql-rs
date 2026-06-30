@@ -10,19 +10,18 @@
 #
 # It builds the mssql-tds-bench harness TWICE from the SAME (candidate) working
 # tree — so the harness code, Criterion version, and toolchain are identical —
-# swapping ONLY the mssql-tds dependency:
-#   * candidate: mssql-tds = path ../mssql-tds (the working tree)
-#   * baseline:  mssql-tds = path to a local `git worktree` of the
-#                `perf-baseline` tag (no ADO auth needed on the VM)
+# swapping ONLY the mssql-tds source:
+#   * candidate: ../mssql-tds is the working tree
+#   * baseline:  ../mssql-tds is replaced with a local `git worktree` checkout of
+#                the commit pinned in baseline-commit.txt (no ADO auth on the VM)
 # Any statistically significant delta is therefore attributable to mssql-tds.
 set -euo pipefail
 
-# Baseline pointer — hard-coded. The `perf-baseline` tag is moved manually in
-# the git repo when the baseline should advance.
-BASELINE_TAG="perf-baseline"
-
 REPO_ROOT="$(pwd)"
 RESULTS_DIR="$REPO_ROOT/results"
+# Baseline pointer — a committed commit SHA. Advancing the baseline requires a
+# PR that edits this file, so every move is reviewed and recorded in history.
+BASELINE_FILE="$REPO_ROOT/mssql-tds-bench/perf-lab/baseline-commit.txt"
 mkdir -p "$RESULTS_DIR"
 
 # --- Connection (SQL_SERVER / SQL_PASSWORD injected by run-remote.sh) ---
@@ -69,18 +68,28 @@ if ! command -v critcmp >/dev/null 2>&1; then
     cargo install critcmp --version 0.1.8 --locked
 fi
 
-# --- Verify the baseline tag is present in the shipped .git ---
-if ! git rev-parse "refs/tags/${BASELINE_TAG}^{commit}" >/dev/null 2>&1; then
-    echo "ERROR: baseline tag '${BASELINE_TAG}' not found in the shipped repository." >&2
-    echo "       Ensure the pipeline checkout fetches tags and the tag exists." >&2
+# --- Resolve and verify the baseline commit (from baseline-commit.txt) ---
+if [ ! -f "$BASELINE_FILE" ]; then
+    echo "ERROR: baseline file not found: ${BASELINE_FILE}" >&2
     exit 1
 fi
+BASELINE_COMMIT="$(grep -vE '^[[:space:]]*(#|$)' "$BASELINE_FILE" | head -n1 | tr -d '[:space:]')"
+if ! printf '%s' "$BASELINE_COMMIT" | grep -qE '^[0-9a-fA-F]{7,40}$'; then
+    echo "ERROR: ${BASELINE_FILE} does not contain a valid commit SHA (got: '${BASELINE_COMMIT}')" >&2
+    exit 1
+fi
+if ! git rev-parse --verify --quiet "${BASELINE_COMMIT}^{commit}" >/dev/null; then
+    echo "ERROR: baseline commit '${BASELINE_COMMIT}' not found in the shipped repository." >&2
+    echo "       Ensure the pipeline checkout fetches full history (the commit must be present)." >&2
+    exit 1
+fi
+echo ">>> Baseline commit: ${BASELINE_COMMIT}"
 
 # --- Candidate run (mssql-tds = working tree) ---
 echo ">>> Candidate benchmarks..."
 cargo bench -p mssql-tds-bench -- --save-baseline candidate
 
-# --- Baseline run (mssql-tds source swapped to the perf-baseline tag) ---
+# --- Baseline run (mssql-tds source swapped to the baseline commit) ---
 # Materialize the baseline mssql-tds via a local worktree, then replace the
 # workspace's mssql-tds source in place. The harness (mssql-tds-bench) and its
 # `path = "../mssql-tds"` dependency are unchanged, so mssql-tds is the only
@@ -88,8 +97,8 @@ cargo bench -p mssql-tds-bench -- --save-baseline candidate
 # worktree) keeps a single mssql-tds in the workspace and avoids a Cargo lockfile
 # package collision.
 BASELINE_TREE="$(mktemp -d)/perf-baseline"
-echo ">>> Adding baseline worktree for tag '${BASELINE_TAG}' at ${BASELINE_TREE}..."
-git worktree add --detach "$BASELINE_TREE" "refs/tags/${BASELINE_TAG}"
+echo ">>> Adding baseline worktree for ${BASELINE_COMMIT} at ${BASELINE_TREE}..."
+git worktree add --detach "$BASELINE_TREE" "$BASELINE_COMMIT"
 
 echo ">>> Swapping mssql-tds source to the baseline..."
 mv "$REPO_ROOT/mssql-tds" "$REPO_ROOT/.mssql-tds-candidate"

@@ -15,12 +15,14 @@ at `../mssql-tds`; isolation comes from swapping the **source** at that path bet
 runs rather than building a different harness:
 
 - **candidate** — `../mssql-tds` is the current working tree.
-- **baseline** — `../mssql-tds` is replaced in place with a checkout of the
-  `perf-baseline` git tag (see [`perf-lab/run-benchmarks.sh`](perf-lab/run-benchmarks.sh)).
+- **baseline** — `../mssql-tds` is replaced in place with a checkout of the commit
+  pinned in [`perf-lab/baseline-commit.txt`](perf-lab/baseline-commit.txt) (see
+  [`perf-lab/run-benchmarks.sh`](perf-lab/run-benchmarks.sh)).
 
 Any statistically significant delta is therefore attributable to `mssql-tds`
-itself. The baseline is pinned by the **`perf-baseline` git tag**, which is moved
-manually in the repository when the baseline should advance.
+itself. The baseline is pinned by a **commit SHA committed to
+`perf-lab/baseline-commit.txt`**; advancing it requires a pull request that edits
+that file, so every move is reviewed and recorded in git history.
 
 ## Benchmarks
 
@@ -85,11 +87,12 @@ are the testScripts run by the shared `PerfTest` lab template
 
 1. Build and run the candidate (`mssql-tds` = working tree) with `--save-baseline candidate`.
 2. Replace the `mssql-tds` source at `../mssql-tds` in place with a local
-   `git worktree` checkout of the `perf-baseline` tag, and run `--save-baseline base`.
+   `git worktree` checkout of the commit in `perf-lab/baseline-commit.txt`, and run
+   `--save-baseline base`.
 3. `critcmp base candidate` into `results/comparison.txt`.
 
 The harness is always built from the candidate tree (it does not exist at the
-baseline tag); only the `mssql-tds` *source* is swapped, so the harness, Criterion
+baseline commit); only the `mssql-tds` *source* is swapped, so the harness, Criterion
 version, and toolchain stay constant. `SQL_SERVER` and `SQL_PASSWORD` are injected
-by the lab template. The `perf-baseline` tag is moved manually in the git repo to
-advance the baseline.
+by the lab template. The baseline commit is advanced via a pull request that edits
+`perf-lab/baseline-commit.txt`.

@@ -61,14 +61,14 @@ mssql-tds = { path = "../mssql-tds" }
 
 - **candidate run** — `../mssql-tds` is the current working tree.
 - **baseline run** — `../mssql-tds` is replaced in place with a checkout of the
-  `perf-baseline` tag.
+  commit pinned in `mssql-tds-bench/perf-lab/baseline-commit.txt`.
 
 Because the harness crate, Criterion version, and benchmark code are byte-for-byte
 identical across both runs, any statistically significant delta is attributable to
 `mssql-tds`. The harness is **always built from the candidate tree** (it is brand new
-and does not exist at the baseline tag); only the `mssql-tds` *source* changes. On the
+and does not exist at the baseline commit); only the `mssql-tds` *source* changes. On the
 perf VM the baseline source is materialized with a local `git worktree` of the
-`perf-baseline` tag from the shipped `.git`, then copied over `../mssql-tds` for the
+baseline commit from the shipped `.git`, then copied over `../mssql-tds` for the
 baseline run — so no VM-side ADO authentication is needed. (Swapping the source in
 place, rather than re-pointing the dependency at the worktree, keeps a single
 `mssql-tds` in the workspace and avoids a Cargo lockfile package collision.)
@@ -95,7 +95,7 @@ critcmp base candidate                                       # side-by-side comp
   `sample_size` / `measurement_time` to avoid false regression alarms.
 - **Rust reality.** `mssql-tds` is a static `rlib`, not a redistributable shared binary.
   There is no prebuilt binary to consume; the "published artifact" analog is a published
-  crate version (still compiled from source) — deferred in favor of a git tag.
+  crate version (still compiled from source) — deferred in favor of a pinned git commit.
 
 ---
 
@@ -144,13 +144,14 @@ database setup is moved to Criterion's setup phase.
 3. **Test data & config.** `setup.sql` for the benchmark table/proc and seed rows. Reuse
    the existing env contract (`DB_HOST`, `DB_PORT`, `DB_USERNAME`, `SQL_PASSWORD`,
    `TRUST_SERVER_CERTIFICATE`, `CERT_HOST_NAME`).
-4. **Baseline-pin mechanism.** Pin version A as the `perf-baseline` git tag. On the perf
-   VM the baseline `mssql-tds` source is materialized via a local `git worktree` of that
-   tag (from the shipped `.git`) and copied over `../mssql-tds` in place for the baseline
-   run, leaving the harness and its `path = "../mssql-tds"` dependency untouched. The tag
-   name is **hard-coded into the testScript**; the `perf-baseline` tag is
-   **moved manually in the git repo** when the baseline should advance (per release or when
-   an intentional perf change lands). Tune noise thresholds. Compare via `critcmp`.
+4. **Baseline-pin mechanism.** Pin version A as a commit SHA committed to the repo in
+   `mssql-tds-bench/perf-lab/baseline-commit.txt`. On the perf VM the baseline `mssql-tds`
+   source is materialized via a local `git worktree` of that commit (from the shipped
+   `.git`) and copied over `../mssql-tds` in place for the baseline run, leaving the
+   harness and its `path = "../mssql-tds"` dependency untouched. The testScript **reads
+   the SHA from that file**; advancing the baseline is a **pull request that edits the
+   file**, so every move is reviewed, recorded in git history, and attributable (rather
+   than an untracked `git tag -f`). Tune noise thresholds. Compare via `critcmp`.
 5. **Perf-lab pipeline (complementary).** Consume the shared `PerfTest` lab template
    (`v1/Perf.Test.Job.yml@PerfTemplates`) as a pure `extends`, so benchmarks run on a
    **dedicated host VM** instead of a shared build agent. The pipeline only passes
@@ -165,7 +166,7 @@ database setup is moved to Criterion's setup phase.
 
 ### Verification
 1. `cargo bench -p mssql-tds-bench` runs all scenarios against a real SQL Server.
-2. Swap the dependency to the baseline tag, run, and `critcmp base candidate` confirms
+2. Swap the dependency to the baseline commit, run, and `critcmp base candidate` confirms
    identical scenario IDs compare.
 3. Deliberately slowing a candidate build flags a regression only on affected scenarios.
 4. New pipeline dry-run produces the comparison artifact on a dedicated perf-lab VM; the
@@ -178,12 +179,12 @@ database setup is moved to Criterion's setup phase.
 - Existing `mssql-tds/benches/perf.rs` stays in place (delete later); the new harness is additive.
 - The fixed-baseline mechanism **complements** the existing PR-vs-target pipeline
   (`.pipeline/benchmark-pipeline.yml`).
-- Baseline pinned via a **git tag materialized as a local worktree on the perf VM** (not a
+- Baseline pinned via a **commit SHA materialized as a local worktree on the perf VM** (not a
   whole-repo checkout or a Cargo git dependency) so mssql-tds is the only variable and no
   VM-side ADO auth is required.
-- Baseline tag name is **`perf-baseline`, hard-coded in the testScript**. The tag is
-  **moved manually in the git repo** to advance the baseline (no committed manifest or
-  pipeline variable).
+- Baseline commit is stored in **`mssql-tds-bench/perf-lab/baseline-commit.txt`, read by the
+  testScript**. The baseline is advanced via a **pull request that edits that file**, so the
+  change is reviewed and recorded in git history (no untracked tag move or pipeline variable).
 - Perf-lab pipeline runs on a **dedicated host VM** via the shared `PerfTest` lab
   `extends` template; the build happens on the VM (the lab's documented model).
 - End-to-end (real SQL Server) only.
