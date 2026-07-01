@@ -86,6 +86,47 @@ stages:
           osType: Windows
           buildType: ${{ parameters.buildType }}
           testFilter: -E "not (test(connectivity))"
+      # Extended Protection (EPA) channel-binding enforcement test.
+      # Runs AFTER the main test pass (which leaves EPA off). Configures
+      # EPA=Required + Force Encryption on the local MSSQLSERVER instance, runs
+      # the gated EPA tests (accept-valid-CBT + reject-suppressed-CBT), then
+      # reverts in `finally` so a failure still restores the instance. Each
+      # registry change requires a SQL service restart, handled by the script.
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          $spns = @("MSSQLSvc/localhost:1433", "MSSQLSvc/$($env:COMPUTERNAME):1433")
+          $configured = $false
+          try {
+            ./.pipeline/scripts/Configure-ExtendedProtection.ps1 `
+              -InstanceName 'MSSQLSERVER' -Level 'Required' -ForceEncryption 'Yes' `
+              -AcceptedNtlmSpns $spns -RestartService $true
+            $configured = $true
+
+            cargo nextest run --frozen --package mssql-tds `
+              -E 'test(epa_required)' --no-fail-fast --profile ci
+            if ($LASTEXITCODE -ne 0) { throw "EPA channel-binding tests failed (exit $LASTEXITCODE)" }
+          }
+          finally {
+            if ($configured) {
+              Write-Host 'Reverting Extended Protection to Off...'
+              ./.pipeline/scripts/Configure-ExtendedProtection.ps1 `
+                -InstanceName 'MSSQLSERVER' -Level 'Off' -ForceEncryption 'No' -RestartService $true
+            }
+          }
+        displayName: 'Extended Protection (EPA) channel-binding test'
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+        env:
+          EPA_TEST: '1'
+          SSPI_TEST: '1'
+          SQL_PASSWORD: $(SQL_PASSWORD)
+          RUST_BACKTRACE: full
+      - task: PublishTestResults@2
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+        displayName: 'Publish EPA test results'
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
+          testRunTitle: 'Extended Protection (EPA)'
       - template: build-python-wheels-template.yml
         parameters:
           osType: Windows

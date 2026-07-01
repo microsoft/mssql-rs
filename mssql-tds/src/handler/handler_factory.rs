@@ -572,7 +572,21 @@ impl LoginHandler<'_> {
 
         // If using integrated security, create SSPI handler and get initial token
         let (sspi_token, sspi_handler) = if is_integrated_security {
-            let config = context.integrated_auth_config();
+            let mut config = context.integrated_auth_config();
+
+            // Bind the authentication exchange to the TLS channel (Extended
+            // Protection for Authentication). The token is only present when
+            // the connection is encrypted and the TLS engine exposes it
+            // (Windows Schannel-direct today); plaintext or engines without
+            // support return `None`, leaving channel bindings unset.
+            if let Some(token) = reader_writer.channel_binding_token() {
+                debug!(
+                    "Applying TLS channel binding token ({} bytes) for Extended Protection",
+                    token.len()
+                );
+                config = config.with_channel_bindings(token);
+            }
+
             let server = transport_context.get_server_name();
             let port = transport_context.get_port();
 

@@ -30,6 +30,7 @@
 //! Windows TLS engine.
 
 pub(crate) mod alpn;
+pub(crate) mod bindings;
 pub(crate) mod cred;
 #[cfg(feature = "tls-schannel-direct")]
 pub(crate) mod engine;
