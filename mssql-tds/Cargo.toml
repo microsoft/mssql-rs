@@ -91,6 +91,7 @@ openssl = { version = "0.10.66" }
 # on Apple targets), so they add no new system requirement.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "3.7.0" }
+security-framework-sys = { version = "2.17.0" }
 core-foundation = { version = "0.10.1" }
 
 [dependencies.uuid]

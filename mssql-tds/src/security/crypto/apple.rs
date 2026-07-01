@@ -15,14 +15,19 @@
 // surface so the cell cipher and CEK wrapping paths share one backend.
 #![allow(dead_code)]
 
+use core_foundation::base::TCFType;
 use core_foundation::data::CFData;
+use core_foundation::dictionary::CFDictionary;
+use core_foundation::string::CFString;
 use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey};
 // `SecKeyExt::from_data` is the crate's only safe RSA-key import entry point.
 // Apple marks it deprecated with a note aimed at symmetric keys; it remains the
 // supported way to import an RSA private key from DER, so the deprecation is
 // allowed here deliberately.
-#[allow(deprecated)]
-use security_framework::os::macos::key::SecKeyExt;
+use security_framework_sys::item::{
+    kSecAttrKeyClass, kSecAttrKeyClassPrivate, kSecAttrKeyType, kSecAttrKeyTypeRSA,
+};
+use security_framework_sys::key::SecKeyCreateWithData;
 
 use super::der;
 use crate::core::TdsResult;
@@ -81,6 +86,35 @@ mod cc {
 /// Maps a Security.framework `CFError` into a column-encryption error.
 fn sec_err(context: &str, err: core_foundation::error::CFError) -> Error {
     Error::ColumnEncryptionError(format!("{context}: {err}"))
+}
+
+/// Imports a PKCS#1 DER-encoded RSA private key into Security.framework.
+fn import_rsa_private_key(pkcs1: &[u8]) -> TdsResult<SecKey> {
+    let cf_data = CFData::from_buffer(pkcs1);
+    let attrs = CFDictionary::from_CFType_pairs(&[
+        (
+            unsafe { CFString::wrap_under_get_rule(kSecAttrKeyType) },
+            unsafe { CFString::wrap_under_get_rule(kSecAttrKeyTypeRSA) },
+        ),
+        (
+            unsafe { CFString::wrap_under_get_rule(kSecAttrKeyClass) },
+            unsafe { CFString::wrap_under_get_rule(kSecAttrKeyClassPrivate) },
+        ),
+    ]);
+
+    let mut err = core::ptr::null_mut();
+    let key_ref = unsafe {
+        SecKeyCreateWithData(
+            cf_data.as_concrete_TypeRef(),
+            attrs.as_concrete_TypeRef(),
+            &mut err,
+        )
+    };
+    if key_ref.is_null() {
+        let cf_err = unsafe { core_foundation::error::CFError::wrap_under_create_rule(err) };
+        return Err(sec_err("failed to import RSA private key", cf_err));
+    }
+    Ok(unsafe { SecKey::wrap_under_create_rule(key_ref) })
 }
 
 /// Fills `buf` with cryptographically secure random bytes.
@@ -185,14 +219,11 @@ impl RsaKey {
     /// Parses an RSA private key from PEM, accepting both PKCS#8
     /// (`-----BEGIN PRIVATE KEY-----`) and PKCS#1
     /// (`-----BEGIN RSA PRIVATE KEY-----`) encodings.
-    #[allow(deprecated)]
     pub(crate) fn from_pem(pem: &[u8]) -> TdsResult<Self> {
         let der_bytes = der::pem_to_der(pem)?;
-        // `SecKey::from_data` expects a bare PKCS#1 RSAPrivateKey for RSA keys.
+        // `SecKeyCreateWithData` expects a bare PKCS#1 RSAPrivateKey for RSA keys.
         let pkcs1 = der::rsa_private_key_to_pkcs1(&der_bytes)?;
-        let cf_data = CFData::from_buffer(&pkcs1);
-        let key = SecKey::from_data(KeyType::rsa(), &cf_data)
-            .map_err(|e| sec_err("failed to import RSA private key", e))?;
+        let key = import_rsa_private_key(&pkcs1)?;
         Ok(Self { key })
     }
 
