@@ -9,6 +9,13 @@ publish = false
 name = "mssql_mock_tds_py"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+# Statically link OpenSSL into the extension. Used for portable macOS wheels so
+# the build doesn't dynamically link Homebrew's libssl. Passes through to the
+# mssql-mock-tds crate's own vendored-openssl feature (openssl/vendored).
+vendored-openssl = ["mssql-mock-tds/vendored-openssl"]
+
 [dependencies]
 pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py39"] }
 mssql-mock-tds = { path = "../mssql-mock-tds" }
