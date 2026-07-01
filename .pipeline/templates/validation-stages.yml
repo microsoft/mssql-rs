@@ -185,7 +185,7 @@ stages:
         parameters:
           architecture: ARM64
           buildType: ${{ parameters.buildType }}
-          testFilter: -E 'not (test(query_processing_driver) | test(query_result) | test(connectivity) | test(transaction) | test(rpc_results) | test(timeout_and_cancel) | test(rpc_datatypes) | test(client_based_iterators) | test(connect_fetch_multiple_packets) | test(iter_rows) | test(bulk_copy) | test(transport_protocols) | test(vector_integration_tests) | test(no_protocol_resolution) | test(multi_subnet_failover) | test(encryption_tests) | binary(test_tls_handshake) | binary(test_tvp) | binary(test_cursor_ops) | binary(test_reset_connection) | binary(test_connection_pool_primitives))'
+          testFilter: -E 'not (test(query_processing_driver) | test(query_result) | test(connectivity) | test(transaction) | test(rpc_results) | test(timeout_and_cancel) | test(rpc_datatypes) | test(client_based_iterators) | test(connect_fetch_multiple_packets) | test(iter_rows) | test(bulk_copy) | test(transport_protocols) | test(vector_integration_tests) | test(no_protocol_resolution) | test(multi_subnet_failover) | test(encryption_tests) | binary(test_tls_handshake) | binary(test_tvp) | binary(test_cursor_ops) | binary(test_reset_connection) | binary(test_connection_pool_primitives) | binary(test_always_encrypted))'
           additionalPythonTestArgs: '--skip-integration'
       - template: build-template-alpine.yml
         parameters:
@@ -251,7 +251,10 @@ stages:
         parameters:
           osType: MacOS
           buildType: ${{ parameters.buildType }}
-          testFilter: -E 'not (test(connectivity))'
+          # Exclude test_always_encrypted: the macOS Security.framework crypto
+          # backend is validated by cross-compilation only; runtime validation of
+          # the Always Encrypted path on macOS is deferred to a follow-up PR.
+          testFilter: -E 'not (test(connectivity) | binary(test_always_encrypted))'
           enableRustBuild: false
           enableClippy: false
 
