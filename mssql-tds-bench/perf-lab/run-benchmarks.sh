@@ -68,6 +68,23 @@ if ! command -v critcmp >/dev/null 2>&1; then
     cargo install critcmp --version 0.1.8 --locked
 fi
 
+# --- Kernel network tuning for high connection churn ---
+# The concurrent_connects benchmark opens tens of thousands of short-lived TCP
+# connections. On a default Ubuntu image the ephemeral port range plus TIME_WAIT
+# accumulation exhausts local ports, so connect() fails with EADDRNOTAVAIL
+# (errno 99, "Cannot assign requested address"). Widen the port range and allow
+# reusing TIME_WAIT sockets for new outbound connections. Best-effort: skip
+# quietly if sysctl is unavailable or not permitted.
+tune_network() {
+    command -v sysctl >/dev/null 2>&1 || return 0
+    local sudo=""
+    [ "$(id -u)" -ne 0 ] && sudo="sudo"
+    echo ">>> Tuning ephemeral ports / TIME_WAIT reuse for connection benchmarks..."
+    $sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" || true
+    $sudo sysctl -w net.ipv4.tcp_tw_reuse=1 || true
+}
+tune_network
+
 # --- Resolve and verify the baseline commit (from baseline-commit.txt) ---
 if [ ! -f "$BASELINE_FILE" ]; then
     echo "ERROR: baseline file not found: ${BASELINE_FILE}" >&2
