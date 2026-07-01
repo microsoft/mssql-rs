@@ -27,9 +27,39 @@ parameters:
   default: true
 
 stages:
+- stage: EvaluateDuplicate
+  displayName: Evaluate PR duplicate
+  condition: and(eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  jobs:
+  - job: Evaluate
+    displayName: Check prior successful PR validation
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - bash: |
+        set -euo pipefail
+        python3 .pipeline/scripts/evaluate-duplicate-pr.py
+      name: SetDuplicateState
+      displayName: Check duplicate PR head commit
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
 - stage: Build
   displayName: Build Stage
-  condition: and(eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  dependsOn:
+    - EvaluateDuplicate
+  condition: >-
+    and(
+      not(canceled()),
+      eq('${{ parameters.RunFuzz }}', 'false'),
+      eq('${{ parameters.RunLongHaul }}', 'false'),
+      or(
+        ne(variables['Build.Reason'], 'PullRequest'),
+        ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true')
+      )
+    )
   jobs:
   - job: Build_Windows
     displayName: Build Windows
@@ -228,8 +258,9 @@ stages:
 # Kerberos tests for PRs (fast - 2 distros: ubuntu22 + alpine318)
 - stage: Kerberos_Test_PR
   displayName: Kerberos Test (PR)
-  dependsOn: []  # Run in parallel with Build stage
-  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  dependsOn:
+    - EvaluateDuplicate
+  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
   jobs:
     - template: kerberos-test-template.yml
       parameters:
@@ -244,7 +275,10 @@ stages:
   displayName: Kerberos Test (Full Matrix)
   dependsOn:
     - Build
-  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  # Scope success to the Build stage explicitly. Bare succeeded() evaluates the
+  # whole dependency graph, so the PR-only EvaluateDuplicate stage (skipped on
+  # non-PR CI runs) would otherwise make this stage skip in CI.
+  condition: and(succeeded('Build'), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
   jobs:
     - template: kerberos-test-template.yml
       parameters:
@@ -355,8 +389,9 @@ stages:
           fuzzTarget: fuzz_bulk_copy
 
 - stage: Build_mssql_python
-  dependsOn: []
-  condition: and(eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  dependsOn:
+    - EvaluateDuplicate
+  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
   displayName: Build mssql-python
   jobs:
   - job: Build_mssql_python_Linux
@@ -518,6 +553,9 @@ stages:
     displayName: Private Link Smoke Test
     dependsOn:
       - Build
-    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+    # Scope success to the Build stage explicitly. Bare succeeded() evaluates the
+    # whole dependency graph, so the PR-only EvaluateDuplicate stage (skipped on
+    # non-PR CI runs) would otherwise make this stage skip in CI.
+    condition: and(succeeded('Build'), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
     jobs:
       - template: private-link-smoke-template.yml

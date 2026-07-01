@@ -5,9 +5,10 @@
 
 use crate::protocol::{
     PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError, build_done_token,
-    build_error_response, build_feature_ext_ack_fedauth, build_login_ack, build_prelogin_response,
-    build_prelogin_response_with_fedauth, build_query_result, build_routing_response,
-    parse_login7_auth, parse_sql_batch,
+    build_error_response, build_feature_ext_ack_fedauth, build_fedauth_challenge_response,
+    build_login_ack, build_prelogin_response, build_prelogin_response_with_fedauth,
+    build_query_result, build_routing_response, build_transaction_manager_response,
+    parse_fedauth_token, parse_login7_auth, parse_sql_batch, parse_transaction_manager_request,
 };
 use crate::query_response::QueryRegistry;
 use bytes::BytesMut;
@@ -20,6 +21,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_native_tls::{TlsAcceptor, TlsStream};
 use tracing::{debug, error, info, warn};
+
+const FEDAUTH_CHALLENGE_STS_URL: &str = "https://login.microsoftonline.com/test-tenant/";
+const FEDAUTH_CHALLENGE_SPN: &str = "https://database.windows.net/";
 
 /// Configuration for connection redirection
 ///
@@ -57,6 +61,8 @@ pub struct ConnectionProcessor {
     pub user_agent: Option<String>,
     /// ServerName received in the Login7 packet
     received_server_name: Option<String>,
+    /// Whether the server is waiting for a follow-up FedAuthToken packet
+    awaiting_fedauth_token: bool,
     /// Reference to the shared query registry
     query_registry: Arc<Mutex<QueryRegistry>>,
     /// Packet buffer for this connection
@@ -74,6 +80,7 @@ impl ConnectionProcessor {
             received_token: None,
             user_agent: None,
             received_server_name: None,
+            awaiting_fedauth_token: false,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
             redirection: None,
@@ -92,6 +99,7 @@ impl ConnectionProcessor {
             received_token: None,
             user_agent: None,
             received_server_name: None,
+            awaiting_fedauth_token: false,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
             redirection,
@@ -194,34 +202,10 @@ impl ConnectionProcessor {
                 // Store the server name for test verification
                 self.received_server_name = auth_info.server_name.clone();
 
-                // FedAuth is always supported - check if client used it
-                if auth_info.has_fedauth {
-                    let token_len = auth_info
-                        .access_token_bytes
-                        .as_ref()
-                        .map(|v| v.len())
-                        .unwrap_or(0);
-                    debug!(
-                        "FedAuth detected with {} byte token from {}",
-                        token_len, self.addr
-                    );
-
-                    // Store the received token for verification
-                    if let Some(token_bytes) = auth_info.access_token_bytes {
-                        debug!(
-                            "Stored access token ({} bytes) from {} for verification",
-                            token_bytes.len(),
-                            self.addr
-                        );
-                        self.received_token = Some(token_bytes);
-                    }
-                }
-
-                // Always authenticate (both FedAuth and username/password are supported)
-                self.is_authenticated = true;
-
                 // Check if redirection is configured
                 if let Some(ref redir) = self.redirection {
+                    self.awaiting_fedauth_token = false;
+                    self.is_authenticated = true;
                     // Redirect the client to a different server
                     info!(
                         "Redirecting client {} to {}:{}",
@@ -231,7 +215,42 @@ impl ConnectionProcessor {
                         &redir.redirect_host,
                         redir.redirect_port,
                     ))
+                } else if auth_info.has_fedauth && auth_info.access_token_bytes.is_none() {
+                    self.awaiting_fedauth_token = true;
+                    self.is_authenticated = false;
+                    debug!(
+                        "FedAuth login without inline token from {}; sending challenge",
+                        self.addr
+                    );
+                    Some(build_fedauth_challenge_response(
+                        FEDAUTH_CHALLENGE_STS_URL,
+                        FEDAUTH_CHALLENGE_SPN,
+                    ))
                 } else {
+                    self.awaiting_fedauth_token = false;
+                    self.is_authenticated = true;
+
+                    if auth_info.has_fedauth {
+                        let token_len = auth_info
+                            .access_token_bytes
+                            .as_ref()
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        debug!(
+                            "FedAuth detected with {} byte token from {}",
+                            token_len, self.addr
+                        );
+
+                        if let Some(token_bytes) = auth_info.access_token_bytes {
+                            debug!(
+                                "Stored access token ({} bytes) from {} for verification",
+                                token_bytes.len(),
+                                self.addr
+                            );
+                            self.received_token = Some(token_bytes);
+                        }
+                    }
+
                     // Build response with LoginAck + optional FeatureExtAck + Done
                     let mut response = build_login_ack();
 
@@ -251,6 +270,49 @@ impl ConnectionProcessor {
                     packet.extend_from_slice(&response);
 
                     Some(packet)
+                }
+            }
+
+            PacketType::FedAuthToken => {
+                if !self.awaiting_fedauth_token {
+                    warn!(
+                        "Received unexpected FedAuthToken packet from {} without challenge",
+                        self.addr
+                    );
+                    Some(build_error_response("Unexpected FedAuth token"))
+                } else {
+                    debug!("Handling FedAuthToken from {}", self.addr);
+                    let packet_body = &packet_data[PACKET_HEADER_SIZE..];
+
+                    match parse_fedauth_token(packet_body) {
+                        Ok(token_bytes) => {
+                            debug!(
+                                "Stored challenged access token ({} bytes) from {}",
+                                token_bytes.len(),
+                                self.addr
+                            );
+                            self.received_token = Some(token_bytes);
+                            self.awaiting_fedauth_token = false;
+                            self.is_authenticated = true;
+
+                            let mut response = build_login_ack();
+                            response.extend_from_slice(&build_done_token(0));
+
+                            let total_length = (PACKET_HEADER_SIZE + response.len()) as u16;
+                            let mut packet = BytesMut::with_capacity(total_length as usize);
+                            let resp_header =
+                                PacketHeader::new(PacketType::TabularResult, total_length, 1);
+                            resp_header.write(&mut packet);
+                            packet.extend_from_slice(&response);
+
+                            Some(packet)
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse FedAuthToken from {}: {}", self.addr, e);
+                            self.awaiting_fedauth_token = false;
+                            Some(build_error_response(&format!("FedAuth parse error: {}", e)))
+                        }
+                    }
                 }
             }
 
@@ -312,6 +374,29 @@ impl ConnectionProcessor {
                 let resp_header = PacketHeader::new(PacketType::TabularResult, total_length, 1);
                 resp_header.write(&mut packet);
                 packet.extend_from_slice(&response);
+
+                Some(packet)
+            }
+
+            PacketType::TransactionManager => {
+                // Clients that connect with autocommit disabled (the default for
+                // Python DB-API drivers) issue a TransactionManager request to
+                // begin a transaction right after login. Answer it so their
+                // connection setup can complete instead of blocking forever.
+                let packet_body = &packet_data[PACKET_HEADER_SIZE..];
+                let request_type = parse_transaction_manager_request(packet_body).unwrap_or(0);
+                debug!(
+                    "Handling TransactionManager request (type {}) from {}",
+                    request_type, self.addr
+                );
+
+                let tokens = build_transaction_manager_response(request_type);
+
+                let total_length = (PACKET_HEADER_SIZE + tokens.len()) as u16;
+                let mut packet = BytesMut::with_capacity(total_length as usize);
+                let resp_header = PacketHeader::new(PacketType::TabularResult, total_length, 1);
+                resp_header.write(&mut packet);
+                packet.extend_from_slice(&tokens);
 
                 Some(packet)
             }
@@ -1127,6 +1212,25 @@ async fn handle_connection(
                     let resp_header = PacketHeader::new(PacketType::TabularResult, total_length, 1);
                     resp_header.write(&mut packet);
                     packet.extend_from_slice(&response);
+
+                    Some(packet)
+                }
+
+                PacketType::TransactionManager => {
+                    let packet_body = &packet_data[PACKET_HEADER_SIZE..];
+                    let request_type = parse_transaction_manager_request(packet_body).unwrap_or(0);
+                    debug!(
+                        "Handling TransactionManager request (type {})",
+                        request_type
+                    );
+
+                    let tokens = build_transaction_manager_response(request_type);
+
+                    let total_length = (PACKET_HEADER_SIZE + tokens.len()) as u16;
+                    let mut packet = BytesMut::with_capacity(total_length as usize);
+                    let resp_header = PacketHeader::new(PacketType::TabularResult, total_length, 1);
+                    resp_header.write(&mut packet);
+                    packet.extend_from_slice(&tokens);
 
                     Some(packet)
                 }
