@@ -68,6 +68,21 @@ if (-not (Get-Command critcmp -ErrorAction SilentlyContinue)) {
     cargo install critcmp --version 0.1.8 --locked
 }
 
+# --- Kernel network tuning for high connection churn ---
+# The concurrent_connects benchmark opens tens of thousands of short-lived TCP
+# connections, which can exhaust the dynamic port range and fail new connects
+# with WSAEADDRNOTAVAIL. Widen the IPv4/IPv6 dynamic port range and shorten the
+# TIME_WAIT delay. Best-effort: ignore failures (e.g. insufficient privilege).
+Write-Host '>>> Tuning dynamic ports / TIME_WAIT for connection benchmarks...'
+try {
+    netsh int ipv4 set dynamicport tcp start=1024 num=64511 | Out-Null
+    netsh int ipv6 set dynamicport tcp start=1024 num=64511 | Out-Null
+    New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+        -Name 'TcpTimedWaitDelay' -Value 30 -PropertyType DWord -Force | Out-Null
+} catch {
+    Write-Host ">>> Network tuning skipped: $($_.Exception.Message)"
+}
+
 # --- Resolve and verify the baseline commit (from baseline-commit.txt) ---
 if (-not (Test-Path $BaselineFile)) {
     throw "Baseline file not found: $BaselineFile"
