@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use core::fmt;
+use std::sync::Arc;
 use std::{fmt::Debug, io::Error, vec};
 
 use super::{
@@ -10,6 +11,7 @@ use super::{
     sqldatatypes::{TdsDataType, TypeInfoVariant},
 };
 use crate::datatypes::sqldatatypes::TypeInfo;
+use crate::security::cell_decryptor::CellDecryptor;
 use crate::{
     core::TdsResult,
     datatypes::{sql_json::SqlJson, sql_string::EncodingType, sqldatatypes::FixedLengthTypes},
@@ -24,6 +26,55 @@ use crate::{
 use crate::{query::metadata::ColumnMetadata, token::tokens::SqlCollation};
 
 use super::row_writer::{RowWriter, write_column_value};
+
+/// Reads an encrypted column's cipher bytes from the wire and turns them back
+/// into a plaintext [`ColumnValues`].
+///
+/// An Always Encrypted column is transmitted as `varbinary`, so the cipher blob
+/// is decoded through the normal value path before being decrypted. A NULL cell
+/// decrypts to [`ColumnValues::Null`]. When `decryptor` is `None` (column
+/// encryption is not enabled, or no key store providers are available) an
+/// encrypted column cannot be decrypted, so an error is returned rather than
+/// surfacing ciphertext to the caller.
+pub(crate) async fn decrypt_encrypted_column<D, T>(
+    decoder: &D,
+    reader: &mut T,
+    metadata: &ColumnMetadata,
+    decryptor: Option<&Arc<dyn CellDecryptor>>,
+) -> TdsResult<ColumnValues>
+where
+    D: SqlTypeDecode,
+    T: TdsPacketReader + Send + Sync,
+{
+    let cipher = match decoder.decode(reader, metadata).await? {
+        ColumnValues::Null => return Ok(ColumnValues::Null),
+        ColumnValues::Bytes(bytes) => bytes,
+        other => {
+            return Err(crate::error::Error::ColumnEncryptionError(format!(
+                "Encrypted column '{}' was expected to arrive as varbinary cipher bytes, but \
+                 decoded as {other:?}",
+                metadata.column_name
+            )));
+        }
+    };
+
+    let crypto_metadata = metadata.crypto_metadata.as_ref().ok_or_else(|| {
+        crate::error::Error::ColumnEncryptionError(format!(
+            "decrypt_encrypted_column called for non-encrypted column '{}'",
+            metadata.column_name
+        ))
+    })?;
+
+    let decryptor = decryptor.ok_or_else(|| {
+        crate::error::Error::ColumnEncryptionError(format!(
+            "Column '{}' is encrypted but no column encryption key store providers are \
+             available to decrypt it",
+            metadata.column_name
+        ))
+    })?;
+
+    decryptor.decrypt(crypto_metadata, &cipher)
+}
 
 // Maximum reasonable allocation size for a single value (100MB)
 // This prevents fuzzer-induced capacity overflow panics
@@ -195,6 +246,7 @@ impl GenericDecoder {
                     data_type: tds_type,
                     column_name: "".to_string(),
                     multi_part_name: None,
+                    crypto_metadata: None,
                 };
                 self.decode(reader, &variant_actual_type_md).await
             }
@@ -836,14 +888,19 @@ impl GenericDecoder {
             // === Binary types ===
             TdsDataType::BigBinary => {
                 let length = reader.read_uint16().await?;
-                if length as usize > MAX_ALLOC_SIZE {
-                    return Err(crate::error::Error::ProtocolError(format!(
-                        "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
-                    )));
+                // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
+                if length == 0xFFFF {
+                    writer.write_null(col);
+                } else {
+                    if length as usize > MAX_ALLOC_SIZE {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
+                        )));
+                    }
+                    let mut bytes = vec![0u8; length as usize];
+                    reader.read_bytes(&mut bytes).await?;
+                    writer.write_bytes(col, bytes);
                 }
-                let mut bytes = vec![0u8; length as usize];
-                reader.read_bytes(&mut bytes).await?;
-                writer.write_bytes(col, bytes);
             }
             TdsDataType::BigVarBinary => {
                 if metadata.is_plp() {
@@ -853,14 +910,19 @@ impl GenericDecoder {
                     }
                 } else {
                     let length = reader.read_uint16().await?;
-                    if length as usize > MAX_ALLOC_SIZE {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
-                        )));
+                    // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
+                    if length == 0xFFFF {
+                        writer.write_null(col);
+                    } else {
+                        if length as usize > MAX_ALLOC_SIZE {
+                            return Err(crate::error::Error::ProtocolError(format!(
+                                "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
+                            )));
+                        }
+                        let mut bytes = vec![0u8; length as usize];
+                        reader.read_bytes(&mut bytes).await?;
+                        writer.write_bytes(col, bytes);
                     }
-                    let mut bytes = vec![0u8; length as usize];
-                    reader.read_bytes(&mut bytes).await?;
-                    writer.write_bytes(col, bytes);
                 }
             }
 
@@ -1070,14 +1132,19 @@ impl SqlTypeDecode for GenericDecoder {
             }
             TdsDataType::BigBinary => {
                 let length = reader.read_uint16().await?;
-                if length as usize > MAX_ALLOC_SIZE {
-                    return Err(crate::error::Error::ProtocolError(format!(
-                        "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
-                    )));
+                // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
+                if length == 0xFFFF {
+                    ColumnValues::Null
+                } else {
+                    if length as usize > MAX_ALLOC_SIZE {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
+                        )));
+                    }
+                    let mut bytes = vec![0u8; length as usize];
+                    reader.read_bytes(&mut bytes).await?;
+                    ColumnValues::Bytes(bytes)
                 }
-                let mut bytes = vec![0u8; length as usize];
-                reader.read_bytes(&mut bytes).await?;
-                ColumnValues::Bytes(bytes)
             }
             TdsDataType::BigVarBinary => {
                 if metadata.is_plp() {
@@ -1088,14 +1155,19 @@ impl SqlTypeDecode for GenericDecoder {
                     }
                 } else {
                     let length = reader.read_uint16().await?;
-                    if length as usize > MAX_ALLOC_SIZE {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
-                        )));
+                    // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
+                    if length == 0xFFFF {
+                        ColumnValues::Null
+                    } else {
+                        if length as usize > MAX_ALLOC_SIZE {
+                            return Err(crate::error::Error::ProtocolError(format!(
+                                "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
+                            )));
+                        }
+                        let mut bytes = vec![0u8; length as usize];
+                        reader.read_bytes(&mut bytes).await?;
+                        ColumnValues::Bytes(bytes)
                     }
-                    let mut bytes = vec![0u8; length as usize];
-                    reader.read_bytes(&mut bytes).await?;
-                    ColumnValues::Bytes(bytes)
                 }
             }
             TdsDataType::Xml => {
@@ -2863,6 +2935,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             }
         }
 
@@ -2882,6 +2955,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             }
         }
 
@@ -2929,6 +3003,69 @@ mod test {
             LittleEndian::write_i16(&mut buf, -1234);
             let val = assert_decode_equivalence(buf.to_vec(), &md).await;
             assert_eq!(val, ColumnValues::SmallInt(-1234));
+        }
+
+        #[tokio::test]
+        async fn decode_into_bigbinary_null() {
+            // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
+            let md = varlen_metadata(TdsDataType::BigBinary, 8);
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(vec![0xFF, 0xFF]);
+            let mut writer = DefaultRowWriter::new(1);
+            decoder
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await
+                .unwrap();
+            assert_eq!(writer.take_row()[0], ColumnValues::Null);
+        }
+
+        #[tokio::test]
+        async fn decode_into_bigbinary_value() {
+            let md = varlen_metadata(TdsDataType::BigBinary, 8);
+            let decoder = GenericDecoder::default();
+            let mut bytes = vec![4, 0]; // USHORTLEN length = 4
+            bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            let mut reader = ByteReader::new(bytes);
+            let mut writer = DefaultRowWriter::new(1);
+            decoder
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await
+                .unwrap();
+            assert_eq!(
+                writer.take_row()[0],
+                ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])
+            );
+        }
+
+        #[tokio::test]
+        async fn decode_into_bigvarbinary_null_non_plp() {
+            let md = varlen_metadata(TdsDataType::BigVarBinary, 8);
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(vec![0xFF, 0xFF]);
+            let mut writer = DefaultRowWriter::new(1);
+            decoder
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await
+                .unwrap();
+            assert_eq!(writer.take_row()[0], ColumnValues::Null);
+        }
+
+        #[tokio::test]
+        async fn decode_into_bigvarbinary_value_non_plp() {
+            let md = varlen_metadata(TdsDataType::BigVarBinary, 8);
+            let decoder = GenericDecoder::default();
+            let mut bytes = vec![3, 0]; // USHORTLEN length = 3
+            bytes.extend_from_slice(&[0x01, 0x02, 0x03]);
+            let mut reader = ByteReader::new(bytes);
+            let mut writer = DefaultRowWriter::new(1);
+            decoder
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await
+                .unwrap();
+            assert_eq!(
+                writer.take_row()[0],
+                ColumnValues::Bytes(vec![0x01, 0x02, 0x03])
+            );
         }
 
         #[tokio::test]
@@ -3172,6 +3309,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             };
             // length byte = 0 → NULL
             let val = assert_decode_equivalence(vec![0], &md).await;
@@ -3196,6 +3334,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             };
             // length=5, sign=1 (positive), one i32 part = 12345
             let mut buf = vec![5u8, 1u8];
@@ -3231,6 +3370,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             }
         }
 
@@ -3250,6 +3390,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             }
         }
 
@@ -3268,6 +3409,7 @@ mod test {
                 },
                 column_name: String::new(),
                 multi_part_name: None,
+                crypto_metadata: None,
             }
         }
 

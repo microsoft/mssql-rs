@@ -12,7 +12,7 @@ use crate::datatypes::column_values::ColumnValues;
 use crate::{
     error::Error,
     message::login::{FeatureExtension, RoutingInfo},
-    query::metadata::ColumnMetadata,
+    query::metadata::{CekTableEntry, ColumnMetadata},
 };
 
 /// TDS token type identifiers as defined by the protocol specification.
@@ -306,6 +306,11 @@ impl Token for SessionStateToken {
 pub(crate) struct ColMetadataToken {
     pub column_count: u16,
     pub columns: Vec<ColumnMetadata>,
+    /// Column encryption key table, populated only when Always Encrypted is
+    /// negotiated. Per-column [`crate::query::metadata::CryptoMetadata`]
+    /// references entries here by ordinal.
+    #[allow(dead_code)] // Consumed by CEK decryption in a later phase.
+    pub cek_table: Vec<CekTableEntry>,
 }
 
 impl Token for ColMetadataToken {

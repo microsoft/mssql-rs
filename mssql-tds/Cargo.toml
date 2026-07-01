@@ -78,6 +78,22 @@ windows-sys = { version = "0.59", features = [
 # For runtime GSSAPI library detection using dlopen/dlsym
 libc = "0.2"
 
+# OpenSSL backs the Always Encrypted crypto primitives on every target that is
+# neither Windows (which uses CNG) nor macOS (which uses Security.framework) — see
+# `security::crypto`. OpenSSL is already the TLS backend on these platforms (via
+# `native-tls`), so it adds no new system requirement.
+[target.'cfg(all(not(windows), not(target_os = "macos")))'.dependencies]
+openssl = { version = "0.10.66" }
+
+# Apple Security.framework (`SecKey`) backs RSA and key generation for Always
+# Encrypted on macOS; AES/HMAC/SHA/RNG go through CommonCrypto in `libSystem`.
+# Both crates are already present transitively (native-tls links Security.framework
+# on Apple targets), so they add no new system requirement.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7.0" }
+security-framework-sys = { version = "2.17.0" }
+core-foundation = { version = "0.10.1" }
+
 [dependencies.uuid]
 version = "1.19.0"
 features = [

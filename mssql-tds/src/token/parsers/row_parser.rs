@@ -80,7 +80,10 @@ use super::super::tokens::{RowToken, Tokens};
 use super::common::TokenParser;
 use crate::{core::TdsResult, io::packet_reader::TdsPacketReader};
 use crate::{
-    datatypes::{column_values::ColumnValues, decoder::SqlTypeDecode},
+    datatypes::{
+        column_values::ColumnValues,
+        decoder::{SqlTypeDecode, decrypt_encrypted_column},
+    },
     io::token_stream::ParserContext,
 };
 
@@ -108,10 +111,10 @@ impl<D: SqlTypeDecode + Default + Send + Sync, P: TdsPacketReader + Send + Sync>
     async fn parse(&self, reader: &mut P, context: &ParserContext) -> TdsResult<Tokens> {
         // Extract column metadata from parser context
         // This metadata was set when COLMETADATA token was parsed
-        let column_metadata_token = match context {
-            ParserContext::ColumnMetadata(metadata) => {
+        let (column_metadata_token, decryptor) = match context {
+            ParserContext::ColumnMetadata(metadata, decryptor) => {
                 trace!("Metadata during Row Parsing: {:?}", metadata);
-                metadata
+                (metadata, decryptor.as_ref())
             }
             _ => {
                 // ROW tokens MUST be preceded by COLMETADATA
@@ -140,7 +143,16 @@ impl<D: SqlTypeDecode + Default + Send + Sync, P: TdsPacketReader + Send + Sync>
             // - NULL values
             // - Fixed vs variable length types
             // - Type-specific encoding (collation, precision, scale, etc.)
-            let column_value = self.decoder.decode(reader, metadata).await?;
+            // Encrypted columns arrive as varbinary cipher bytes and are
+            // decrypted into their plaintext base type via the decryptor. When
+            // no decryptor is available (column encryption disabled for this
+            // command) the ciphertext varbinary is decoded as-is instead of
+            // erroring.
+            let column_value = if metadata.crypto_metadata.is_some() && decryptor.is_some() {
+                decrypt_encrypted_column(&self.decoder, reader, metadata, decryptor).await?
+            } else {
+                self.decoder.decode(reader, metadata).await?
+            };
 
             all_values.push(column_value);
         }
@@ -194,14 +206,19 @@ mod tests {
             data_type: TdsDataType::Int4,
             column_name: name.to_string(),
             multi_part_name: None,
+            crypto_metadata: None,
         }
     }
 
     fn make_context(columns: Vec<ColumnMetadata>) -> ParserContext {
-        ParserContext::ColumnMetadata(Arc::new(ColMetadataToken {
-            column_count: columns.len() as u16,
-            columns,
-        }))
+        ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: columns.len() as u16,
+                columns,
+                cek_table: Vec::new(),
+            }),
+            None,
+        )
     }
 
     #[tokio::test]

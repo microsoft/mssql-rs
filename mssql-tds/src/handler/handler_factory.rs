@@ -148,6 +148,15 @@ impl NegotiatedSettings {
             .iter()
             .any(|f| f.feature_identifier() == FeatureExtension::SRecovery && f.is_acknowledged())
     }
+
+    /// Check if Always Encrypted (column encryption) was acknowledged by the
+    /// server in FEATUREEXTACK.
+    #[allow(dead_code)] // populated during login, consumed by result-set decryption in a later phase
+    pub(crate) fn is_column_encryption_supported(&self) -> bool {
+        self.session_settings.supported_features.iter().any(|f| {
+            f.feature_identifier() == FeatureExtension::AlwaysEncrypted && f.is_acknowledged()
+        })
+    }
 }
 
 // The settings of the session that are negotiated during the login process. They dont change after login.
@@ -551,8 +560,18 @@ impl LoginHandler<'_> {
 
         let response_status = login_response.get_status();
 
+        // Capture the features the server acknowledged in FEATUREEXTACK so the
+        // negotiated state (e.g. session recovery, Always Encrypted) is observable
+        // on the resulting NegotiatedSettings.
+        let supported_features = login_response
+            .features
+            .get_acknowledged_features()
+            .iter()
+            .map(|f| f.clone_box())
+            .collect();
+
         Ok(LoginResult {
-            supported_features: vec![],
+            supported_features,
             change_properties: login_response.change_properties,
             status: response_status,
             login_ack: login_response.success_token,
@@ -640,5 +659,41 @@ impl LoginHandler<'_> {
         } else {
             Ok(response_model)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NegotiatedSettings, create_test_negotiated_settings_internal};
+    use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
+    use crate::message::login::Feature;
+
+    fn settings_with_ae(acknowledged: bool) -> NegotiatedSettings {
+        let mut settings = create_test_negotiated_settings_internal();
+        let mut feature = AlwaysEncryptedFeature::default();
+        feature.set_acknowledged(acknowledged);
+        settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+        settings
+    }
+
+    #[test]
+    fn is_column_encryption_supported_true_when_acknowledged() {
+        let settings = settings_with_ae(true);
+        assert!(settings.is_column_encryption_supported());
+    }
+
+    #[test]
+    fn is_column_encryption_supported_false_when_feature_present_but_unacknowledged() {
+        let settings = settings_with_ae(false);
+        assert!(!settings.is_column_encryption_supported());
+    }
+
+    #[test]
+    fn is_column_encryption_supported_false_when_feature_absent() {
+        let settings = create_test_negotiated_settings_internal();
+        assert!(!settings.is_column_encryption_supported());
     }
 }

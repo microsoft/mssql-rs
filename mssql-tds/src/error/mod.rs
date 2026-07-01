@@ -235,6 +235,10 @@ pub enum Error {
     /// Reconnected server properties don't match original.
     #[error("Reconnection validation failed: {0}")]
     ReconnectionValidationFailed(String),
+
+    /// Cryptographic failure in the Always Encrypted column-encryption data path.
+    #[error("Column encryption error: {0}")]
+    ColumnEncryptionError(String),
 }
 
 /// Helper for `SqlServerError` display formatting.

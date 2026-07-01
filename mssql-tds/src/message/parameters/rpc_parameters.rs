@@ -15,6 +15,15 @@ use crate::{
     token::tokens::SqlCollation,
 };
 
+/// Maximum byte length sent inline (non-PLP) for a BIGVARBINARY value; longer
+/// ciphertexts use PLP chunked encoding. Mirrors JDBC
+/// `DataTypes.SHORT_VARTYPE_MAX_BYTES`.
+const SHORT_VARTYPE_MAX_BYTES: usize = 8000;
+
+/// PLP length sentinel written as the BIGVARBINARY max length for values that
+/// exceed [`SHORT_VARTYPE_MAX_BYTES`]. Mirrors JDBC `DataTypes.SQL_USHORTVARMAXLEN`.
+const SQL_USHORTVARMAXLEN: u16 = 0xFFFF;
+
 bitflags! {
     /// TDS RPC parameter status flags.
     ///
@@ -37,6 +46,40 @@ bitflags! {
     }
 }
 
+/// Cipher metadata for an encrypted RPC parameter.
+///
+/// Written as the `CryptoMetaData` block following an encrypted parameter's
+/// value in an RPC request (MS-TDS 2.2.6.6). These fields are populated from
+/// the results of `sp_describe_parameter_encryption`. Mirrors JDBC
+/// `writeCryptoMetaData`.
+#[derive(Debug, Clone)]
+pub(crate) struct RpcEncryptionMetadata {
+    /// Cipher algorithm id (`0x01` = AEAD_AES_256_CBC_HMAC_SHA256).
+    pub(crate) cipher_algorithm_id: u8,
+    /// Encryption type (`1` = deterministic, `2` = randomized).
+    pub(crate) encryption_type: u8,
+    /// Database id of the column encryption key.
+    pub(crate) database_id: i32,
+    /// Column encryption key id.
+    pub(crate) cek_id: i32,
+    /// Column encryption key version.
+    pub(crate) cek_version: i32,
+    /// Column encryption key metadata version (8 bytes).
+    pub(crate) cek_md_version: [u8; 8],
+    /// Normalization rule version (currently `1`).
+    pub(crate) normalization_rule_version: u8,
+}
+
+/// An encrypted RPC parameter value: the ciphertext (or `None` for an encrypted
+/// NULL) plus the cipher metadata the server needs to decrypt it.
+#[derive(Debug, Clone)]
+pub(crate) struct EncryptedRpcValue {
+    /// Ciphertext bytes, or `None` for a NULL value.
+    pub(crate) ciphertext: Option<Vec<u8>>,
+    /// Cipher metadata describing how the value was encrypted.
+    pub(crate) metadata: RpcEncryptionMetadata,
+}
+
 /// A single parameter in a TDS RPC request.
 ///
 /// Construct with [`RpcParameter::new`], supplying an optional name, status
@@ -56,6 +99,11 @@ pub struct RpcParameter {
     /// The data type and value of the parameter.
     ///  This is used to determine how to serialize the value.
     value: SqlType,
+
+    /// When present, the parameter is sent encrypted (Always Encrypted): the
+    /// ciphertext is serialized as a BIGVARBINARY with the ENCRYPTED status flag
+    /// and a trailing CryptoMetaData block, bypassing the plaintext `value`.
+    encrypted: Option<EncryptedRpcValue>,
 }
 
 impl RpcParameter {
@@ -65,6 +113,7 @@ impl RpcParameter {
             name,
             options,
             value,
+            encrypted: None,
         }
     }
 
@@ -220,11 +269,163 @@ impl RpcParameter {
             }
         }
 
+        // Encrypted parameters bypass the normal value encoder: the ciphertext
+        // is sent as a BIGVARBINARY with the ENCRYPTED status flag and a
+        // trailing CryptoMetaData block (Always Encrypted).
+        if let Some(encrypted) = &self.encrypted {
+            self.write_encrypted(packet_writer, db_collation, encrypted)
+                .await?;
+            return Ok(());
+        }
+
         // Write the options byte.
         packet_writer.write_byte_async(self.options.bits()).await?;
 
         encoder
             .encode_sqlvalue(packet_writer, &self.value, db_collation)
+            .await?;
+        Ok(())
+    }
+
+    /// Marks this parameter as encrypted, supplying the ciphertext (or `None`
+    /// for an encrypted NULL) and the cipher metadata. When set, [`serialize`]
+    /// writes the value as a BIGVARBINARY with the ENCRYPTED status flag and a
+    /// trailing CryptoMetaData block instead of encoding the plaintext value.
+    #[allow(dead_code)]
+    pub(crate) fn set_encrypted(
+        &mut self,
+        ciphertext: Option<Vec<u8>>,
+        metadata: RpcEncryptionMetadata,
+    ) {
+        self.encrypted = Some(EncryptedRpcValue {
+            ciphertext,
+            metadata,
+        });
+    }
+
+    /// Returns the parameter's plaintext value. Used by the parameter-encryption
+    /// path to normalize and encrypt the value before sending.
+    #[allow(dead_code)]
+    pub(crate) fn value(&self) -> &SqlType {
+        &self.value
+    }
+
+    /// Returns `true` when the parameter is passed by reference (an output or
+    /// input/output parameter). Used when building the
+    /// `sp_describe_parameter_encryption` request for a stored procedure, where
+    /// output parameters must be marked `OUTPUT` in both the `EXEC` statement
+    /// and the parameter declaration.
+    pub(crate) fn is_output(&self) -> bool {
+        self.options.contains(StatusFlags::BY_REF_VALUE)
+    }
+
+    /// Serializes the parameter's value in its encrypted form: the ENCRYPTED
+    /// status flag, a BIGVARBINARY TYPE_INFO carrying the ciphertext, the
+    /// plaintext base TYPE_INFO, and the trailing CryptoMetaData block.
+    /// Encrypted values carry no collation. Mirrors JDBC
+    /// `writeEncryptedRPCByteArray` + `writeCryptoMetaData` and dotnet
+    /// `WriteEncryptionMetadata` (MS-TDS 2.2.6.6).
+    async fn write_encrypted(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        db_collation: &SqlCollation,
+        encrypted: &EncryptedRpcValue,
+    ) -> TdsResult<()> {
+        // Always mark the parameter encrypted, preserving any output flag.
+        let status = self.options | StatusFlags::ENCRYPTED;
+        packet_writer.write_byte_async(status.bits()).await?;
+
+        // The ciphertext is transmitted as BIGVARBINARY.
+        packet_writer
+            .write_byte_async(TdsDataType::BigVarBinary as u8)
+            .await?;
+
+        Self::write_encrypted_value(packet_writer, encrypted.ciphertext.as_deref()).await?;
+
+        // The CryptoMetaData is preceded by the plaintext base TYPE_INFO so the
+        // server knows the underlying type of the encrypted value. Always
+        // Encrypted requires this base type to match the encrypted column
+        // exactly (the server performs no implicit conversion for encrypted
+        // operands). On the normal RPC path a `bit` value is sent as `INTN(1)`,
+        // which the server reads as `tinyint`; for an encrypted `bit` parameter
+        // that mismatch raises an "operand type clash" against a `bit` column,
+        // so `bit` must be written as `BITN` here instead.
+        match &self.value {
+            SqlType::Bit(_) => {
+                packet_writer
+                    .write_byte_async(TdsDataType::BitN as u8)
+                    .await?;
+                packet_writer.write_byte_async(1u8).await?;
+            }
+            other => {
+                other
+                    .write_type_info(packet_writer, db_collation, None, None)
+                    .await?;
+            }
+        }
+        Self::write_crypto_metadata(packet_writer, &encrypted.metadata).await?;
+        Ok(())
+    }
+
+    /// Writes the BIGVARBINARY max-length, actual-length, and value bytes for an
+    /// encrypted parameter. Short values (<= 8000 bytes) are written inline;
+    /// longer values use PLP chunked encoding. A `None` value is written as a
+    /// NULL (actual length `-1`).
+    async fn write_encrypted_value(
+        packet_writer: &mut PacketWriter<'_>,
+        value: Option<&[u8]>,
+    ) -> TdsResult<()> {
+        let len = value.map_or(0, <[u8]>::len);
+        let is_short = len <= SHORT_VARTYPE_MAX_BYTES;
+
+        // Declared max length: 8000 for short values, PLP sentinel otherwise.
+        if is_short {
+            packet_writer
+                .write_u16_async(SHORT_VARTYPE_MAX_BYTES as u16)
+                .await?;
+        } else {
+            packet_writer.write_u16_async(SQL_USHORTVARMAXLEN).await?;
+        }
+
+        match value {
+            // NULL value: actual length of -1.
+            None => packet_writer.write_i16_async(-1).await?,
+            Some(bytes) if is_short => {
+                packet_writer.write_u16_async(len as u16).await?;
+                if len > 0 {
+                    packet_writer.write_async(bytes).await?;
+                }
+            }
+            Some(bytes) => {
+                // PLP: 8-byte total length, then a single length-prefixed chunk,
+                // then the PLP terminator (4 zero bytes).
+                packet_writer.write_u64_async(len as u64).await?;
+                packet_writer.write_u32_async(len as u32).await?;
+                packet_writer.write_async(bytes).await?;
+                packet_writer.write_u32_async(0).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the CryptoMetaData block for an encrypted parameter. Mirrors JDBC
+    /// `writeCryptoMetaData` (MS-TDS 2.2.6.6).
+    async fn write_crypto_metadata(
+        packet_writer: &mut PacketWriter<'_>,
+        metadata: &RpcEncryptionMetadata,
+    ) -> TdsResult<()> {
+        packet_writer
+            .write_byte_async(metadata.cipher_algorithm_id)
+            .await?;
+        packet_writer
+            .write_byte_async(metadata.encryption_type)
+            .await?;
+        packet_writer.write_i32_async(metadata.database_id).await?;
+        packet_writer.write_i32_async(metadata.cek_id).await?;
+        packet_writer.write_i32_async(metadata.cek_version).await?;
+        packet_writer.write_async(&metadata.cek_md_version).await?;
+        packet_writer
+            .write_byte_async(metadata.normalization_rule_version)
             .await?;
         Ok(())
     }
@@ -321,6 +522,198 @@ mod tests {
     use crate::datatypes::sqltypes::SqlType;
     use crate::error::Error;
     use crate::message::parameters::rpc_parameters::RpcParameter;
+    use crate::message::parameters::rpc_parameters::{
+        EncryptedRpcValue, RpcEncryptionMetadata, StatusFlags,
+    };
+
+    use crate::datatypes::encoder::GenericEncoder;
+    use crate::io::packet_writer::PacketWriter;
+    use crate::io::packet_writer::tests::MockNetworkWriter;
+    use crate::message::messages::PacketType;
+    use crate::token::tokens::SqlCollation;
+    use futures::executor::block_on;
+
+    /// Returns the RPC payload bytes written to the packet writer, stripping the
+    /// 8-byte packet header.
+    fn payload(writer: &PacketWriter) -> Vec<u8> {
+        writer.get_payload().into_inner()[8..].to_vec()
+    }
+
+    /// Sample cipher metadata for encrypted-parameter serialization tests.
+    fn sample_metadata() -> RpcEncryptionMetadata {
+        RpcEncryptionMetadata {
+            cipher_algorithm_id: 2,
+            encryption_type: 1,
+            database_id: 7,
+            cek_id: 11,
+            cek_version: 3,
+            cek_md_version: [1, 2, 3, 4, 5, 6, 7, 8],
+            normalization_rule_version: 1,
+        }
+    }
+
+    /// The CryptoMetaData block bytes for [`sample_metadata`].
+    fn sample_metadata_bytes() -> Vec<u8> {
+        let mut b = vec![0x02, 0x01]; // cipher_algorithm_id, encryption_type
+        b.extend_from_slice(&7i32.to_le_bytes()); // database_id
+        b.extend_from_slice(&11i32.to_le_bytes()); // cek_id
+        b.extend_from_slice(&3i32.to_le_bytes()); // cek_version
+        b.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // cek_md_version
+        b.push(0x01); // normalization_rule_version
+        b
+    }
+
+    fn serialize_param(param: &RpcParameter) -> Vec<u8> {
+        // Use a packet size large enough that even the PLP test stays within a
+        // single packet, so the payload is contiguous (no interspersed headers).
+        let mut mock = MockNetworkWriter::new(16384);
+        let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let encoder = GenericEncoder {};
+        block_on(param.serialize(&mut w, &collation, false, &encoder)).unwrap();
+        payload(&w)
+    }
+
+    /// Serializes just the TYPE_INFO for a value (the plaintext base type info
+    /// written before the CryptoMetaData of an encrypted parameter).
+    fn type_info_bytes(value: &SqlType) -> Vec<u8> {
+        let mut mock = MockNetworkWriter::new(16384);
+        let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        block_on(value.write_type_info(&mut w, &collation, None, None)).unwrap();
+        payload(&w)
+    }
+
+    /// A short encrypted value is serialized as a BIGVARBINARY with the
+    /// ENCRYPTED status flag, an inline length-prefixed value, and the trailing
+    /// CryptoMetaData block.
+    #[test]
+    fn serialize_encrypted_short_value() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(5)),
+        );
+        param.set_encrypted(Some(vec![0xAA, 0xBB, 0xCC, 0xDD]), sample_metadata());
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
+        expected.push(0x08); // status: ENCRYPTED
+        expected.push(0xA5); // type: BIGVARBINARY
+        expected.extend_from_slice(&8000u16.to_le_bytes()); // max length
+        expected.extend_from_slice(&4u16.to_le_bytes()); // actual length
+        expected.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // ciphertext
+        expected.extend_from_slice(&type_info_bytes(&SqlType::Int(Some(5)))); // base TYPE_INFO
+        expected.extend_from_slice(&sample_metadata_bytes());
+
+        assert_eq!(serialize_param(&param), expected);
+    }
+
+    /// An encrypted `bit` parameter writes its base TYPE_INFO as `BITN(1)`
+    /// (0x68, 0x01), not the `INTN(1)` (0x26, 0x01 = tinyint) the normal RPC
+    /// path uses. Always Encrypted does no implicit conversion, so an `INTN(1)`
+    /// base type clashes with a `bit` column ("operand type clash").
+    #[test]
+    fn serialize_encrypted_bit_writes_bitn_base_type() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Bit(Some(true)),
+        );
+        param.set_encrypted(Some(vec![0xAA, 0xBB]), sample_metadata());
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
+        expected.push(0x08); // status: ENCRYPTED
+        expected.push(0xA5); // type: BIGVARBINARY
+        expected.extend_from_slice(&8000u16.to_le_bytes()); // max length
+        expected.extend_from_slice(&2u16.to_le_bytes()); // actual length
+        expected.extend_from_slice(&[0xAA, 0xBB]); // ciphertext
+        expected.extend_from_slice(&[0x68, 0x01]); // base TYPE_INFO: BITN, length 1
+        expected.extend_from_slice(&sample_metadata_bytes());
+
+        assert_eq!(serialize_param(&param), expected);
+    }
+
+    /// An encrypted NULL value writes an actual length of -1 and no value bytes,
+    /// still followed by the CryptoMetaData block.
+    #[test]
+    fn serialize_encrypted_null_value() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(None),
+        );
+        param.set_encrypted(None, sample_metadata());
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00];
+        expected.push(0x08); // status: ENCRYPTED
+        expected.push(0xA5); // type: BIGVARBINARY
+        expected.extend_from_slice(&8000u16.to_le_bytes()); // max length
+        expected.extend_from_slice(&(-1i16).to_le_bytes()); // NULL actual length
+        expected.extend_from_slice(&type_info_bytes(&SqlType::Int(None))); // base TYPE_INFO
+        expected.extend_from_slice(&sample_metadata_bytes());
+
+        assert_eq!(serialize_param(&param), expected);
+    }
+
+    /// A value longer than 8000 bytes uses PLP chunked encoding: a PLP max-length
+    /// sentinel, an 8-byte total length, a single length-prefixed chunk, and the
+    /// PLP terminator, then the CryptoMetaData block.
+    #[test]
+    fn serialize_encrypted_plp_value() {
+        let ciphertext = vec![0x55u8; 8001];
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::VarBinaryMax(None),
+        );
+        param.set_encrypted(Some(ciphertext.clone()), sample_metadata());
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00];
+        expected.push(0x08); // status: ENCRYPTED
+        expected.push(0xA5); // type: BIGVARBINARY
+        expected.extend_from_slice(&0xFFFFu16.to_le_bytes()); // PLP max-length sentinel
+        expected.extend_from_slice(&8001u64.to_le_bytes()); // total length
+        expected.extend_from_slice(&8001u32.to_le_bytes()); // chunk length
+        expected.extend_from_slice(&ciphertext); // chunk data
+        expected.extend_from_slice(&0u32.to_le_bytes()); // PLP terminator
+        expected.extend_from_slice(&type_info_bytes(&SqlType::VarBinaryMax(None))); // base TYPE_INFO
+        expected.extend_from_slice(&sample_metadata_bytes());
+
+        assert_eq!(serialize_param(&param), expected);
+    }
+
+    /// The ENCRYPTED status flag is forced on even when the parameter's options
+    /// did not include it, preserving the BY_REF (output) flag.
+    #[test]
+    fn serialize_encrypted_preserves_output_flag() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::BY_REF_VALUE,
+            SqlType::Int(Some(5)),
+        );
+        param.set_encrypted(Some(vec![0x01]), sample_metadata());
+
+        let bytes = serialize_param(&param);
+        // Status byte follows the 5-byte name prefix.
+        assert_eq!(
+            bytes[5],
+            StatusFlags::BY_REF_VALUE.bits() | StatusFlags::ENCRYPTED.bits()
+        );
+    }
+
+    /// `EncryptedRpcValue` round-trips through `set_encrypted`.
+    #[test]
+    fn set_encrypted_stores_value() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(5)),
+        );
+        param.set_encrypted(Some(vec![9, 9]), sample_metadata());
+        let stored: &EncryptedRpcValue = param.encrypted.as_ref().expect("encrypted set");
+        assert_eq!(stored.ciphertext.as_deref(), Some(&[9u8, 9][..]));
+        assert_eq!(stored.metadata.cek_id, 11);
+    }
 
     #[test]
     fn test_get_sql_names() {
@@ -410,5 +803,17 @@ mod tests {
 
         let value = SqlType::Table(TvpTypeName::new(None, "OrderList".to_string()), None);
         assert_eq!(TdsDataType::from(&value), TdsDataType::SqlTable);
+    }
+
+    /// `value()` returns a reference to the parameter's plaintext value, which
+    /// the parameter-encryption path uses before encrypting.
+    #[test]
+    fn value_returns_plaintext() {
+        let param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(42)),
+        );
+        assert_eq!(param.value(), &SqlType::Int(Some(42)));
     }
 }

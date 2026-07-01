@@ -16,7 +16,12 @@
 //! - `sspi`: Enables Windows SSPI support
 //! - `gssapi`: Enables Unix GSSAPI/Kerberos support
 
+pub(crate) mod cell_decryptor;
+pub(crate) mod crypto;
+pub(crate) mod describe_parameter_encryption;
+pub(crate) mod encryption;
 mod error;
+pub(crate) mod keystore;
 pub mod mock;
 mod security_context;
 mod spn;
@@ -25,6 +30,9 @@ mod spn;
 pub use error::SecurityError;
 pub use security_context::{IntegratedAuthConfig, SecurityContext, SecurityPackage, SspiAuthToken};
 pub use spn::{canonicalize_hostname, is_loopback_address, make_spn, make_spn_canonicalized};
+
+// Always Encrypted key store provider API.
+pub use keystore::{CertificateKeyStoreProvider, ColumnEncryptionKeyStoreProvider};
 
 // Platform-specific implementations
 #[cfg(windows)]
