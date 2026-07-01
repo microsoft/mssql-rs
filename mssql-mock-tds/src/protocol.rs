@@ -39,6 +39,7 @@ pub enum PacketType {
     Attention = 0x06,
     Login7 = 0x10,
     RpcRequest = 0x03,
+    TransactionManager = 0x0E,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -53,6 +54,7 @@ impl TryFrom<u8> for PacketType {
             0x06 => Ok(PacketType::Attention),
             0x10 => Ok(PacketType::Login7),
             0x03 => Ok(PacketType::RpcRequest),
+            0x0E => Ok(PacketType::TransactionManager),
             _ => Err(ProtocolError::InvalidPacketType(value)),
         }
     }
@@ -689,6 +691,85 @@ pub fn build_done_token(row_count: u64) -> BytesMut {
     token_data
 }
 
+/// Transaction Manager request types (MS-TDS SQLTransactionManagerRequest).
+pub const TM_BEGIN_XACT: u16 = 5;
+pub const TM_COMMIT_XACT: u16 = 7;
+pub const TM_ROLLBACK_XACT: u16 = 8;
+
+/// Parse the RequestType field from a TransactionManager (0x0E) packet body.
+///
+/// The body begins with an ALL_HEADERS block (a u32 little-endian total length
+/// followed by that many bytes of headers), after which comes the u16
+/// little-endian RequestType. Returns `None` if the body is too short.
+pub fn parse_transaction_manager_request(packet_body: &[u8]) -> Option<u16> {
+    if packet_body.len() < 4 {
+        return None;
+    }
+
+    let all_headers_len = u32::from_le_bytes([
+        packet_body[0],
+        packet_body[1],
+        packet_body[2],
+        packet_body[3],
+    ]) as usize;
+
+    // RequestType is a u16 immediately after the ALL_HEADERS block.
+    if packet_body.len() < all_headers_len + 2 {
+        return None;
+    }
+
+    Some(u16::from_le_bytes([
+        packet_body[all_headers_len],
+        packet_body[all_headers_len + 1],
+    ]))
+}
+
+/// Build the token stream (EnvChange + Done) that answers a TransactionManager
+/// request. Begin/commit/rollback requests get a matching transaction EnvChange
+/// so the client's connection setup can complete; any other request just gets a
+/// Done token. The returned bytes are the raw tokens and still need to be
+/// wrapped in a TabularResult packet by the caller.
+pub fn build_transaction_manager_response(request_type: u16) -> BytesMut {
+    let mut tokens = BytesMut::new();
+
+    // Fixed 8-byte transaction descriptor handed to the client. Any non-zero
+    // value works for the mock; the client only echoes it back in the
+    // ALL_HEADERS of subsequent requests.
+    const XACT_DESCRIPTOR: [u8; 8] = [1, 0, 0, 0, 0, 0, 0, 0];
+
+    // EnvChange transaction sub-types.
+    let env_type = match request_type {
+        TM_BEGIN_XACT => Some(8u8),     // Begin Transaction
+        TM_COMMIT_XACT => Some(9u8),    // Commit Transaction
+        TM_ROLLBACK_XACT => Some(10u8), // Rollback Transaction
+        _ => None,
+    };
+
+    if let Some(env_type) = env_type {
+        // Build the EnvChange payload first so we can prefix its length.
+        let mut payload = BytesMut::new();
+        payload.put_u8(env_type);
+        if env_type == 8 {
+            // Begin: NewValue = descriptor, OldValue = empty.
+            payload.put_u8(XACT_DESCRIPTOR.len() as u8);
+            payload.put_slice(&XACT_DESCRIPTOR);
+            payload.put_u8(0);
+        } else {
+            // Commit/Rollback: NewValue = empty, OldValue = descriptor.
+            payload.put_u8(0);
+            payload.put_u8(XACT_DESCRIPTOR.len() as u8);
+            payload.put_slice(&XACT_DESCRIPTOR);
+        }
+
+        tokens.put_u8(TokenType::EnvChange as u8);
+        tokens.put_u16_le(payload.len() as u16);
+        tokens.extend_from_slice(&payload);
+    }
+
+    tokens.extend_from_slice(&build_done_token(0));
+    tokens
+}
+
 /// Build an INFO token (0xAB) matching the TDS wire format.
 ///
 /// Wire layout (all integers little-endian):
@@ -1096,5 +1177,61 @@ mod tests {
 
         let result = parse_login7_auth(&payload);
         assert_eq!(result.user_agent, None);
+    }
+
+    #[test]
+    fn test_parse_transaction_manager_request() {
+        // ALL_HEADERS block: u32 LE length (covers itself), then RequestType u16 LE.
+        let mut body = BytesMut::new();
+        let all_headers_len: u32 = 18;
+        body.put_u32_le(all_headers_len);
+        body.put_slice(&vec![0u8; all_headers_len as usize - 4]);
+        body.put_u16_le(TM_BEGIN_XACT);
+
+        assert_eq!(
+            parse_transaction_manager_request(&body),
+            Some(TM_BEGIN_XACT)
+        );
+    }
+
+    #[test]
+    fn test_parse_transaction_manager_request_too_short() {
+        assert_eq!(parse_transaction_manager_request(&[0u8; 2]), None);
+
+        // Declares a header length but the RequestType is missing.
+        let mut body = BytesMut::new();
+        body.put_u32_le(8);
+        body.put_slice(&[0u8; 4]);
+        assert_eq!(parse_transaction_manager_request(&body), None);
+    }
+
+    #[test]
+    fn test_build_transaction_manager_response_begin() {
+        let tokens = build_transaction_manager_response(TM_BEGIN_XACT);
+
+        // Starts with an EnvChange token whose sub-type is Begin (8).
+        assert_eq!(tokens[0], TokenType::EnvChange as u8);
+        let payload_len = u16::from_le_bytes([tokens[1], tokens[2]]) as usize;
+        assert_eq!(tokens[3], 8);
+
+        // A Done token follows the EnvChange block.
+        let done_start = 3 + payload_len;
+        assert_eq!(tokens[done_start], TokenType::Done as u8);
+    }
+
+    #[test]
+    fn test_build_transaction_manager_response_commit_and_rollback() {
+        for (req, sub_type) in [(TM_COMMIT_XACT, 9u8), (TM_ROLLBACK_XACT, 10u8)] {
+            let tokens = build_transaction_manager_response(req);
+            assert_eq!(tokens[0], TokenType::EnvChange as u8);
+            assert_eq!(tokens[3], sub_type);
+        }
+    }
+
+    #[test]
+    fn test_build_transaction_manager_response_unknown() {
+        // An unrecognized request type yields just a Done token (no EnvChange).
+        let tokens = build_transaction_manager_response(0);
+        assert_eq!(tokens[0], TokenType::Done as u8);
     }
 }

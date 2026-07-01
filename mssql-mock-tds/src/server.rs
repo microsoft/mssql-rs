@@ -7,8 +7,8 @@ use crate::protocol::{
     PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError, build_done_token,
     build_error_response, build_feature_ext_ack_fedauth, build_fedauth_challenge_response,
     build_login_ack, build_prelogin_response, build_prelogin_response_with_fedauth,
-    build_query_result, build_routing_response, parse_fedauth_token, parse_login7_auth,
-    parse_sql_batch,
+    build_query_result, build_routing_response, build_transaction_manager_response,
+    parse_fedauth_token, parse_login7_auth, parse_sql_batch, parse_transaction_manager_request,
 };
 use crate::query_response::QueryRegistry;
 use bytes::BytesMut;
@@ -374,6 +374,29 @@ impl ConnectionProcessor {
                 let resp_header = PacketHeader::new(PacketType::TabularResult, total_length, 1);
                 resp_header.write(&mut packet);
                 packet.extend_from_slice(&response);
+
+                Some(packet)
+            }
+
+            PacketType::TransactionManager => {
+                // Clients that connect with autocommit disabled (the default for
+                // Python DB-API drivers) issue a TransactionManager request to
+                // begin a transaction right after login. Answer it so their
+                // connection setup can complete instead of blocking forever.
+                let packet_body = &packet_data[PACKET_HEADER_SIZE..];
+                let request_type = parse_transaction_manager_request(packet_body).unwrap_or(0);
+                debug!(
+                    "Handling TransactionManager request (type {}) from {}",
+                    request_type, self.addr
+                );
+
+                let tokens = build_transaction_manager_response(request_type);
+
+                let total_length = (PACKET_HEADER_SIZE + tokens.len()) as u16;
+                let mut packet = BytesMut::with_capacity(total_length as usize);
+                let resp_header = PacketHeader::new(PacketType::TabularResult, total_length, 1);
+                resp_header.write(&mut packet);
+                packet.extend_from_slice(&tokens);
 
                 Some(packet)
             }
@@ -1189,6 +1212,25 @@ async fn handle_connection(
                     let resp_header = PacketHeader::new(PacketType::TabularResult, total_length, 1);
                     resp_header.write(&mut packet);
                     packet.extend_from_slice(&response);
+
+                    Some(packet)
+                }
+
+                PacketType::TransactionManager => {
+                    let packet_body = &packet_data[PACKET_HEADER_SIZE..];
+                    let request_type = parse_transaction_manager_request(packet_body).unwrap_or(0);
+                    debug!(
+                        "Handling TransactionManager request (type {})",
+                        request_type
+                    );
+
+                    let tokens = build_transaction_manager_response(request_type);
+
+                    let total_length = (PACKET_HEADER_SIZE + tokens.len()) as u16;
+                    let mut packet = BytesMut::with_capacity(total_length as usize);
+                    let resp_header = PacketHeader::new(PacketType::TabularResult, total_length, 1);
+                    resp_header.write(&mut packet);
+                    packet.extend_from_slice(&tokens);
 
                     Some(packet)
                 }
