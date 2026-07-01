@@ -88,6 +88,12 @@ fn sec_err(context: &str, err: core_foundation::error::CFError) -> Error {
     Error::ColumnEncryptionError(format!("{context}: {err}"))
 }
 
+/// `errSecVerifyFailed` (-67808): the OSStatus Security.framework reports when a
+/// signature simply does not match the data. This is a routine, expected
+/// outcome (e.g. a tampered message), not an operational failure, so it must be
+/// mapped to `Ok(false)` rather than propagated as an error.
+const ERR_SEC_VERIFY_FAILED: i32 = -67808;
+
 /// Imports a PKCS#1 DER-encoded RSA private key into Security.framework.
 fn import_rsa_private_key(pkcs1: &[u8]) -> TdsResult<SecKey> {
     let cf_data = CFData::from_buffer(pkcs1);
@@ -270,12 +276,18 @@ impl RsaKey {
 
     /// Verifies an RSASSA-PKCS1v1.5 / SHA-256 signature over `data`.
     pub(crate) fn pkcs1_sha256_verify(&self, data: &[u8], signature: &[u8]) -> TdsResult<bool> {
-        self.public_key()?
-            .verify_signature(
-                Algorithm::RSASignatureMessagePKCS1v15SHA256,
-                data,
-                signature,
-            )
-            .map_err(|e| sec_err("RSA verification failed", e))
+        match self.public_key()?.verify_signature(
+            Algorithm::RSASignatureMessagePKCS1v15SHA256,
+            data,
+            signature,
+        ) {
+            Ok(valid) => Ok(valid),
+            // Security.framework reports a simple verification mismatch (e.g. a
+            // tampered message) as a `CFError` with `errSecVerifyFailed`, not as
+            // a `false` return. That is an expected outcome, not an operational
+            // failure, so it must map to `Ok(false)`.
+            Err(e) if e.code() == ERR_SEC_VERIFY_FAILED as isize => Ok(false),
+            Err(e) => Err(sec_err("RSA verification failed", e)),
+        }
     }
 }
