@@ -179,12 +179,10 @@ pub fn parse_multipart_identifier(
                 "Unclosed quoted identifier".to_string(),
             ));
         }
-        State::Init => {
-            if !allow_empty {
-                return Err(crate::error::Error::UsageError(
-                    "Empty identifier is not allowed".to_string(),
-                ));
-            }
+        State::Init if !allow_empty => {
+            return Err(crate::error::Error::UsageError(
+                "Empty identifier is not allowed".to_string(),
+            ));
         }
         _ => {}
     }

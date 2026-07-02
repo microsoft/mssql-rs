@@ -9,16 +9,28 @@ context dict. When present, it is wired into `ClientContext::auth_method_map`
 under the resolved auth method so that mssql-tds can invoke it during the
 FedAuth handshake (workflow 0x02) for methods like ActiveDirectoryServicePrincipal.
 
-These tests cover the plumbing (the dict key is accepted, the factory is
-registered, type errors are reported). End-to-end exercise of the callback
-flow on the wire requires mock TDS support for FedAuthInfo (library_type 0x02)
-which is not yet implemented in mssql-mock-tds.
+These tests cover the dict/plumbing behavior plus wire-level coverage of the
+FedAuth challenge handshake against the mock TDS server. The mock-server test
+(TestServicePrincipalFedAuthOverMockServer) is the regression guard for the
+connection-time GIL release: without it the spawn_blocking token callback
+deadlocks against the GIL held by the connecting thread.
 
 Usage:
     ./dev/test-python.sh
 """
 
+import secrets
+
 import pytest
+
+# The mock TDS server Python bindings (mssql-mock-tds-py) are optional: they are
+# built by dev/test-python.sh but may be absent in other environments.
+try:
+    import mssql_mock_tds_py
+
+    MOCK_TDS_PY_AVAILABLE = True
+except ImportError:
+    MOCK_TDS_PY_AVAILABLE = False
 
 
 class TestEntraIdTokenFactoryDictKey:
@@ -225,3 +237,68 @@ Python callback. These
         assert "non-bytes value" in str(exc_info.value), (
             f"got: {exc_info.value}"
         )
+
+
+@pytest.mark.skipif(
+    not MOCK_TDS_PY_AVAILABLE,
+    reason="mssql_mock_tds_py not available. Build it with: cd mssql-mock-tds-py && maturin develop",
+)
+class TestServicePrincipalFedAuthOverMockServer:
+    """Wire-level coverage of the FedAuth challenge handshake driving the Python
+    entra_id_token_factory. The connect path must release the GIL so the
+    spawn_blocking token callback can acquire it; otherwise this deadlocks."""
+
+    def test_service_principal_uses_entra_id_token_factory(self):
+        import time
+
+        import mssql_py_core
+
+        raw_token = f"service_principal_token_{secrets.token_hex(8)}"
+        callback_calls = []
+
+        def factory(spn, sts_url, auth_method):
+            callback_calls.append((spn, sts_url, auth_method))
+            return raw_token.encode("utf-16-le")
+
+        server = mssql_mock_tds_py.PyMockTdsServer(port=0, tls=True)
+
+        with server:
+            client_context = {
+                "server": server.sql_address,
+                "database": "master",
+                "user_name": "11111111-2222-3333-4444-555555555555",
+                "password": "not" + "real",
+                "authentication": "ActiveDirectoryServicePrincipal",
+                "entra_id_token_factory": factory,
+                "encryption": "Optional",
+                "trust_server_certificate": True,
+            }
+
+            conn = mssql_py_core.PyCoreConnection(client_context)
+            assert conn.is_connected()
+
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            row = cursor.fetchone()
+            assert row is not None
+            assert row[0] == 1
+
+            cursor.close()
+            conn.close()
+
+            del cursor
+            del conn
+
+            time.sleep(0.3)
+
+            assert callback_calls == [
+                (
+                    "https://database.windows.net/",
+                    "https://login.microsoftonline.com/test-tenant/",
+                    "activedirectoryserviceprincipal",
+                )
+            ]
+            assert server.has_received_token(raw_token), (
+                "Server should have received the token returned by entra_id_token_factory"
+            )
+            assert server.get_last_access_token() == raw_token

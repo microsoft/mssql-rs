@@ -35,6 +35,7 @@ impl PyCoreConnection {
     #[new]
     #[pyo3(signature = (client_context_dict, python_logger=None))]
     fn new(
+        py: Python<'_>,
         client_context_dict: &Bound<'_, PyDict>,
         python_logger: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
@@ -68,10 +69,12 @@ impl PyCoreConnection {
         );
         let datasource = client_context.data_source.clone();
         let provider = TdsConnectionProvider {};
-        let tds_client = runtime.block_on(async {
-            provider
-                .create_client(client_context, &datasource, None)
-                .await
+        let tds_client = py.detach(|| {
+            runtime.block_on(async {
+                provider
+                    .create_client(client_context, &datasource, None)
+                    .await
+            })
         });
 
         match tds_client {
