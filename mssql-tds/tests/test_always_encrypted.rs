@@ -45,7 +45,7 @@ mod always_encrypted {
     use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
     use mssql_tds::datatypes::sqltypes::SqlType;
     use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
-    use mssql_tds::security::CertificateKeyStoreProvider;
+    use mssql_tds::security::RsaKeyStoreProvider;
 
     /// The certificate key-store provider name SQL Server records in the CMK.
     const KEY_STORE_PROVIDER_NAME: &str = "MSSQL_CERTIFICATE_STORE";
@@ -80,7 +80,7 @@ mod always_encrypted {
 
     /// Connects with Always Encrypted enabled and the supplied certificate
     /// provider registered under the certificate-store provider name.
-    async fn connect_enabled(provider: Arc<CertificateKeyStoreProvider>) -> TdsClient {
+    async fn connect_enabled(provider: Arc<RsaKeyStoreProvider>) -> TdsClient {
         let mut context = create_context();
         context.column_encryption_setting = ColumnEncryptionSetting::Enabled;
         context.register_column_encryption_key_store_provider(KEY_STORE_PROVIDER_NAME, provider);
@@ -136,7 +136,7 @@ mod always_encrypted {
             let cek_name = format!("ae_cek_{suffix}");
 
             // Generate a throwaway column master key (RSA-2048) for this run only.
-            let mut provider = CertificateKeyStoreProvider::new();
+            let mut provider = RsaKeyStoreProvider::new();
             provider
                 .generate_and_add_key(&master_key_path)
                 .expect("generate throwaway master key");
@@ -1434,7 +1434,7 @@ mod always_encrypted {
                 .await;
 
             // Empty provider: no master key registered for the recorded path.
-            let mut client = connect_enabled(Arc::new(CertificateKeyStoreProvider::new())).await;
+            let mut client = connect_enabled(Arc::new(RsaKeyStoreProvider::new())).await;
             let rows = vec![GenericBulkRow {
                 values: vec![ColumnValues::Int(1), ColumnValues::Int(111)],
             }];
@@ -1500,7 +1500,7 @@ mod always_encrypted {
             let table = h.create_encrypted_table("INT", "DETERMINISTIC").await;
             h.insert_encrypted(&table, SqlType::Int(Some(13))).await;
 
-            let mut wrong_provider = CertificateKeyStoreProvider::new();
+            let mut wrong_provider = RsaKeyStoreProvider::new();
             wrong_provider
                 .generate_and_add_key(&h.master_key_path)
                 .expect("generate wrong master key");
@@ -1524,7 +1524,7 @@ mod always_encrypted {
             h.insert_encrypted(&table, SqlType::Int(Some(7))).await;
 
             // Empty provider: no key registered for any path.
-            let mut client = connect_enabled(Arc::new(CertificateKeyStoreProvider::new())).await;
+            let mut client = connect_enabled(Arc::new(RsaKeyStoreProvider::new())).await;
 
             let result = select_val(&mut client, &table).await;
             let _ = client.close_query().await;

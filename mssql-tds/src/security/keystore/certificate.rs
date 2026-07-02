@@ -1,15 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Certificate-based column master key store provider for Always Encrypted.
+//! In-memory RSA column master key store provider for Always Encrypted.
 //!
-//! This provider unwraps column encryption keys (CEKs) using an RSA key pair
-//! (the column master key) held by the client. It implements the same encrypted
-//! CEK wire format and algorithms as the other Microsoft drivers' certificate /
-//! key-store providers (for example JDBC's `MSSQL_JAVA_KEYSTORE` provider and
-//! the `MSSQL_CERTIFICATE_STORE` provider), so it interoperates with column
-//! master keys created with `KEY_STORE_PROVIDER_NAME = 'MSSQL_CERTIFICATE_STORE'`
-//! (or any provider that uses the standard RSA_OAEP wrapping format).
+//! This provider unwraps column encryption keys (CEKs) using RSA key pairs (the
+//! column master keys) supplied by the client and held in memory. Despite
+//! registering under the wire identifier `MSSQL_CERTIFICATE_STORE`, it does not
+//! read any operating-system certificate store: keys are provided directly via
+//! [`RsaKeyStoreProvider::add_key_from_pem`] / `add_key` and matched by master
+//! key path. It implements the same encrypted CEK wire format and algorithms as
+//! the other Microsoft drivers' certificate / key-store providers (for example
+//! JDBC's `MSSQL_JAVA_KEYSTORE` provider and the `MSSQL_CERTIFICATE_STORE`
+//! provider), so it interoperates with column master keys created with
+//! `KEY_STORE_PROVIDER_NAME = 'MSSQL_CERTIFICATE_STORE'` (or any provider that
+//! uses the standard RSA_OAEP wrapping format).
 //!
 //! Encrypted CEK layout (little-endian lengths):
 //!
@@ -38,17 +42,20 @@ const SUPPORTED_VERSION: u8 = 0x01;
 /// The only key wrapping algorithm Always Encrypted supports.
 const RSA_OAEP_ALGORITHM: &str = "RSA_OAEP";
 
-/// A column master key store provider backed by client-held RSA key pairs.
+/// A column master key store provider backed by client-supplied, in-memory RSA
+/// key pairs.
 ///
-/// Keys are registered by master key path (matched case-insensitively, as the
-/// path is lowercased before signing); the path corresponds to the `key_path`
-/// carried in the COLMETADATA CEK table.
-pub struct CertificateKeyStoreProvider {
+/// This does not read any OS certificate store. Keys are registered directly by
+/// master key path (matched case-insensitively, as the path is lowercased
+/// before signing); the path corresponds to the `key_path` carried in the
+/// COLMETADATA CEK table. The provider registers under the wire identifier
+/// `MSSQL_CERTIFICATE_STORE`.
+pub struct RsaKeyStoreProvider {
     /// Master key path (lowercased) → RSA key pair that wraps CEKs for that CMK.
     keys: HashMap<String, RsaKey>,
 }
 
-impl CertificateKeyStoreProvider {
+impl RsaKeyStoreProvider {
     /// Creates a provider with no keys registered.
     pub fn new() -> Self {
         Self {
@@ -131,14 +138,14 @@ impl CertificateKeyStoreProvider {
     }
 }
 
-impl Default for CertificateKeyStoreProvider {
+impl Default for RsaKeyStoreProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl ColumnEncryptionKeyStoreProvider for CertificateKeyStoreProvider {
+impl ColumnEncryptionKeyStoreProvider for RsaKeyStoreProvider {
     async fn decrypt_column_encryption_key(
         &self,
         master_key_path: &str,
@@ -283,7 +290,7 @@ mod tests {
     /// Wraps a CEK using a provider built from `pem` (the inverse of unwrap),
     /// producing a blob the provider must be able to unwrap again.
     fn wrap_cek(pem: &[u8], master_key_path: &str, cek: &[u8]) -> Vec<u8> {
-        let mut provider = CertificateKeyStoreProvider::new();
+        let mut provider = RsaKeyStoreProvider::new();
         provider.add_key_from_pem(master_key_path, pem).unwrap();
         provider
             .encrypt_column_encryption_key(master_key_path, "RSA_OAEP", cek)
@@ -295,7 +302,7 @@ mod tests {
         let pem = generate_key_pem();
         let blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
 
-        let mut provider = CertificateKeyStoreProvider::new();
+        let mut provider = RsaKeyStoreProvider::new();
         provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         let plaintext = provider
@@ -311,7 +318,7 @@ mod tests {
         let pem = generate_key_pem();
         let blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
 
-        let mut provider = CertificateKeyStoreProvider::new();
+        let mut provider = RsaKeyStoreProvider::new();
         provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         let plaintext = provider
@@ -327,7 +334,7 @@ mod tests {
         let blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
 
         // Exercise the parsed-key registration path (`add_key`).
-        let mut provider = CertificateKeyStoreProvider::new();
+        let mut provider = RsaKeyStoreProvider::new();
         provider.add_key(MASTER_KEY_PATH, RsaKey::from_pem(&pem).unwrap());
 
         let plaintext = provider
@@ -341,7 +348,7 @@ mod tests {
     async fn rejects_unknown_algorithm() {
         let pem = generate_key_pem();
         let blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
-        let mut provider = CertificateKeyStoreProvider::new();
+        let mut provider = RsaKeyStoreProvider::new();
         provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         let err = provider
@@ -355,7 +362,7 @@ mod tests {
     async fn rejects_unknown_master_key_path() {
         let pem = generate_key_pem();
         let blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
-        let mut provider = CertificateKeyStoreProvider::new();
+        let mut provider = RsaKeyStoreProvider::new();
         provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         let err = provider
@@ -373,7 +380,7 @@ mod tests {
         let last = blob.len() - 1;
         blob[last] ^= 0x01;
 
-        let mut provider = CertificateKeyStoreProvider::new();
+        let mut provider = RsaKeyStoreProvider::new();
         provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         let err = provider
@@ -389,7 +396,7 @@ mod tests {
         let mut blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
         blob[0] = 0x02; // bump the version byte
 
-        let mut provider = CertificateKeyStoreProvider::new();
+        let mut provider = RsaKeyStoreProvider::new();
         provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         let err = provider
@@ -408,7 +415,7 @@ mod tests {
         let pem = generate_key_pem();
         let blob = wrap_cek(&pem, MASTER_KEY_PATH, &CEK);
 
-        let mut provider = CertificateKeyStoreProvider::new();
+        let mut provider = RsaKeyStoreProvider::new();
         provider.add_key_from_pem(MASTER_KEY_PATH, &pem).unwrap();
 
         // Register under the standard certificate-store provider name and

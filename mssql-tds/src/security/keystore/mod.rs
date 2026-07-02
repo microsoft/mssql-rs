@@ -31,7 +31,7 @@
 
 mod certificate;
 
-pub use certificate::CertificateKeyStoreProvider;
+pub use certificate::RsaKeyStoreProvider;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

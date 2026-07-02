@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::connection::bulk_copy::{BulkCopyOptions, BulkLoadRow, ResolvedColumnMapping};
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
-use crate::connection::client_context::{ClientContext, SqlCommandColumnEncryptionSetting};
+use crate::connection::client_context::{ClientContext, ExecutionColumnEncryptionSetting};
 use crate::connection::session_recovery::RecoveryContext;
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
@@ -93,8 +93,7 @@ pub struct TdsClient {
     /// Column Encryption setting for the command currently executing. Set by
     /// each execute entry point; consulted by the parameter-encryption and
     /// result-decryption paths to honor per-command overrides.
-    current_command_ce_setting:
-        crate::connection::client_context::SqlCommandColumnEncryptionSetting,
+    current_command_ce_setting: crate::connection::client_context::ExecutionColumnEncryptionSetting,
 
     /// The remaining request timeout for operations. This is updated after each token read.
     pub(in crate::connection) remaining_request_timeout: Option<Duration>,
@@ -136,7 +135,7 @@ impl TdsClient {
             last_return_status: ReturnStatus::NotReceived,
             current_result_set_has_been_read_till_end: false,
             current_command_ce_setting:
-                crate::connection::client_context::SqlCommandColumnEncryptionSetting::default(),
+                crate::connection::client_context::ExecutionColumnEncryptionSetting::default(),
             remaining_request_timeout: None,
             cancel_handle: None,
             empty_metadata: Vec::new(),
@@ -522,7 +521,7 @@ impl TdsClient {
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
         // Batch execution always uses the connection's Always Encrypted setting.
-        self.current_command_ce_setting = SqlCommandColumnEncryptionSetting::UseConnectionSetting;
+        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
 
         if self.execution_context.has_open_batch() {
             return Err(crate::error::Error::UsageError(
@@ -582,7 +581,7 @@ impl TdsClient {
         self.execute_sp_executesql_core(
             sql,
             named_params,
-            SqlCommandColumnEncryptionSetting::UseConnectionSetting,
+            ExecutionColumnEncryptionSetting::UseConnectionSetting,
             timeout_sec,
             cancel_handle,
         )
@@ -590,7 +589,7 @@ impl TdsClient {
     }
 
     /// Executes a parameterized statement via `sp_executesql` with a per-command
-    /// [`SqlCommandColumnEncryptionSetting`] that overrides the connection's
+    /// [`ExecutionColumnEncryptionSetting`] that overrides the connection's
     /// Always Encrypted behavior for this execution only.
     ///
     /// See [`execute_sp_executesql`](Self::execute_sp_executesql) for the common
@@ -600,7 +599,7 @@ impl TdsClient {
         &mut self,
         sql: String,
         named_params: Vec<RpcParameter>,
-        encryption_setting: SqlCommandColumnEncryptionSetting,
+        encryption_setting: ExecutionColumnEncryptionSetting,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
@@ -618,7 +617,7 @@ impl TdsClient {
         &mut self,
         sql: String,
         mut named_params: Vec<RpcParameter>,
-        encryption_setting: SqlCommandColumnEncryptionSetting,
+        encryption_setting: ExecutionColumnEncryptionSetting,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
@@ -1014,7 +1013,7 @@ impl TdsClient {
     ) -> TdsResult<()> {
         // Stored-procedure execution uses the connection's Always Encrypted
         // setting; there is no per-command override on this path.
-        self.current_command_ce_setting = SqlCommandColumnEncryptionSetting::UseConnectionSetting;
+        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
 
         let mut named_parameters = named_parameters;
 
@@ -1644,7 +1643,7 @@ impl TdsClient {
     /// feature during login.
     fn should_encrypt_parameters(&self) -> bool {
         self.negotiated_settings.is_column_encryption_supported()
-            && self.effective_command_ce_setting() == SqlCommandColumnEncryptionSetting::Enabled
+            && self.effective_command_ce_setting() == ExecutionColumnEncryptionSetting::Enabled
     }
 
     /// Returns `true` when bulk copy row values should be encrypted: the server
@@ -1666,14 +1665,14 @@ impl TdsClient {
     /// Resolves the effective Column Encryption setting for the current command,
     /// folding the per-command override against the connection setting.
     ///
-    /// A command's [`SqlCommandColumnEncryptionSetting::UseConnectionSetting`]
+    /// A command's [`ExecutionColumnEncryptionSetting::UseConnectionSetting`]
     /// maps to `Enabled` when the connection enabled Always Encrypted, otherwise
     /// `Disabled`. Explicit per-command values are returned as-is.
-    fn effective_command_ce_setting(&self) -> SqlCommandColumnEncryptionSetting {
+    fn effective_command_ce_setting(&self) -> ExecutionColumnEncryptionSetting {
         use crate::connection::client_context::ColumnEncryptionSetting;
 
         match self.current_command_ce_setting {
-            SqlCommandColumnEncryptionSetting::UseConnectionSetting => {
+            ExecutionColumnEncryptionSetting::UseConnectionSetting => {
                 let connection_enabled = self
                     .recovery_context
                     .client_context
@@ -1681,9 +1680,9 @@ impl TdsClient {
                     .map(|c| c.column_encryption_setting == ColumnEncryptionSetting::Enabled)
                     .unwrap_or(false);
                 if connection_enabled {
-                    SqlCommandColumnEncryptionSetting::Enabled
+                    ExecutionColumnEncryptionSetting::Enabled
                 } else {
-                    SqlCommandColumnEncryptionSetting::Disabled
+                    ExecutionColumnEncryptionSetting::Disabled
                 }
             }
             other => other,
@@ -1925,9 +1924,9 @@ impl TdsClient {
         }
 
         // A per-command `Disabled` override suppresses result decryption: any
-        // encrypted column then surfaces its ciphertext through the normal
-        // decode path (which errors for an encrypted column without a decryptor).
-        if self.effective_command_ce_setting() == SqlCommandColumnEncryptionSetting::Disabled {
+        // encrypted column is then decoded as varbinary and its ciphertext is
+        // returned through the normal decode path.
+        if self.effective_command_ce_setting() == ExecutionColumnEncryptionSetting::Disabled {
             return Ok(None);
         }
 
@@ -2114,7 +2113,7 @@ impl TdsClient {
         self.return_values.clear();
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
-        self.current_command_ce_setting = SqlCommandColumnEncryptionSetting::UseConnectionSetting;
+        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
         Ok(())
     }
@@ -3095,7 +3094,7 @@ mod tests {
     #[test]
     fn effective_ce_setting_resolves_against_connection() {
         use crate::connection::client_context::{
-            ColumnEncryptionSetting, SqlCommandColumnEncryptionSetting as S,
+            ColumnEncryptionSetting, ExecutionColumnEncryptionSetting as S,
         };
 
         let mut client = create_test_client();
@@ -3121,7 +3120,7 @@ mod tests {
     #[test]
     fn should_not_encrypt_when_feature_not_acknowledged() {
         use crate::connection::client_context::{
-            ColumnEncryptionSetting, SqlCommandColumnEncryptionSetting as S,
+            ColumnEncryptionSetting, ExecutionColumnEncryptionSetting as S,
         };
 
         let mut client = create_test_client();

@@ -95,7 +95,7 @@ pub enum ColumnEncryptionSetting {
     Enabled,
 }
 
-/// Per-command override of the connection's Always Encrypted behavior.
+/// Per-execution override of the connection's Always Encrypted behavior.
 ///
 /// A command may override the connection-level [`ColumnEncryptionSetting`] for a
 /// single execution. The default, [`UseConnectionSetting`](Self::UseConnectionSetting),
@@ -103,7 +103,7 @@ pub enum ColumnEncryptionSetting {
 /// server acknowledged the Column Encryption feature during login (which only
 /// happens when the connection requested [`ColumnEncryptionSetting::Enabled`]).
 #[derive(PartialEq, Eq, Copy, Clone, Debug, Default)]
-pub enum SqlCommandColumnEncryptionSetting {
+pub enum ExecutionColumnEncryptionSetting {
     /// Inherit the connection's [`ColumnEncryptionSetting`]. (Default.)
     #[default]
     UseConnectionSetting,
@@ -359,9 +359,9 @@ impl ClientContext {
     /// # Example
     /// ```ignore
     /// use std::sync::Arc;
-    /// use mssql_tds::security::CertificateKeyStoreProvider;
+    /// use mssql_tds::security::RsaKeyStoreProvider;
     ///
-    /// let mut provider = CertificateKeyStoreProvider::new();
+    /// let mut provider = RsaKeyStoreProvider::new();
     /// provider.add_key_from_pem("CurrentUser/My/<thumbprint>", pem_bytes)?;
     ///
     /// let mut context = ClientContext::with_data_source("tcp:localhost,1433");

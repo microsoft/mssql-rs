@@ -32,7 +32,7 @@ pub use security_context::{IntegratedAuthConfig, SecurityContext, SecurityPackag
 pub use spn::{canonicalize_hostname, is_loopback_address, make_spn, make_spn_canonicalized};
 
 // Always Encrypted key store provider API.
-pub use keystore::{CertificateKeyStoreProvider, ColumnEncryptionKeyStoreProvider};
+pub use keystore::{ColumnEncryptionKeyStoreProvider, RsaKeyStoreProvider};
 
 // Platform-specific implementations
 #[cfg(windows)]
