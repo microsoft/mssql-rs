@@ -1918,15 +1918,27 @@ impl TdsClient {
         use crate::security::cell_decryptor::CellDecryptor;
         use crate::security::keystore::ResolvedCekDecryptor;
 
-        // No CEK table means no encrypted columns in this result set.
-        if metadata.cek_table.is_empty() {
-            return Ok(None);
-        }
-
+        // No CEK table normally means no encrypted columns in this result set.
         // A per-command `Disabled` override suppresses result decryption: any
         // encrypted column is then decoded as varbinary and its ciphertext is
         // returned through the normal decode path.
         if self.effective_command_ce_setting() == ExecutionColumnEncryptionSetting::Disabled {
+            return Ok(None);
+        }
+
+        // An empty CEK table normally means the result set has no encrypted
+        // columns. But the table can be empty even when a column carries
+        // `CryptoMetadata` (a protocol/server anomaly); decryption is then
+        // impossible, so fail fast rather than silently surface ciphertext for a
+        // column we were asked to decrypt.
+        if metadata.cek_table.is_empty() {
+            if metadata.columns.iter().any(|c| c.crypto_metadata.is_some()) {
+                return Err(crate::error::Error::ColumnEncryptionError(
+                    "Result set has encrypted column metadata but an empty CEK table; \
+                     cannot resolve column encryption keys"
+                        .to_string(),
+                ));
+            }
             return Ok(None);
         }
 

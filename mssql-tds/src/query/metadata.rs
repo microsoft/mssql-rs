@@ -218,7 +218,8 @@ pub(crate) struct CryptoMetadata {
     pub base_data_type: TdsDataType,
     /// Wire descriptor for the underlying (plaintext) type.
     pub base_type_info: TypeInfo,
-    /// Cipher algorithm identifier (`0x01` = AEAD_AES_256_CBC_HMAC_SHA256, `0x00` = custom).
+    /// Cipher algorithm identifier (`0x02` = `AEAD_AES_256_CBC_HMAC_SHA256`, see
+    /// `AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID`; `0x00` = custom).
     pub cipher_algorithm_id: u8,
     /// Custom cipher algorithm name; present only when `cipher_algorithm_id` is `0`.
     pub cipher_algorithm_name: Option<String>,

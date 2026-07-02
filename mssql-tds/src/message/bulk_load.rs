@@ -770,11 +770,23 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     }
 
     /// Returns the ordinal of `entry` within the emitted CEK table.
-    fn cek_table_ordinal_for(&self, entry: &CekTableEntry) -> u16 {
+    ///
+    /// Errors if the entry is not present. `collect_cek_table` guarantees every
+    /// referenced entry is emitted, so a miss would indicate a bug (or a future
+    /// refactor) that must fail loudly rather than silently emit ordinal `0` —
+    /// i.e. tell the server the value was encrypted under the wrong key.
+    fn cek_table_ordinal_for(&self, entry: &CekTableEntry) -> TdsResult<u16> {
         self.emitted_cek_table
             .iter()
             .position(|e| cek_entry_matches(e, entry))
-            .unwrap_or(0) as u16
+            .map(|pos| pos as u16)
+            .ok_or_else(|| {
+                crate::error::Error::ColumnEncryptionError(format!(
+                    "bulk copy CEK table has no entry for column key \
+                     (database_id={}, cek_id={}, cek_version={})",
+                    entry.database_id, entry.cek_id, entry.cek_version
+                ))
+            })
     }
 
     /// Writes the CEK table: a `u16` entry count followed by each entry.
@@ -825,7 +837,7 @@ impl<'a> StreamingBulkLoadWriter<'a> {
 
         // CekTableOrdinal (u16) - present because the BCP COLMETADATA carries a
         // CEK table.
-        let ordinal = self.cek_table_ordinal_for(&enc.cek_entry);
+        let ordinal = self.cek_table_ordinal_for(&enc.cek_entry)?;
         self.packet_writer.write_u16_async(ordinal).await?;
 
         // User type of the base column (4 bytes); 0 for built-in types.

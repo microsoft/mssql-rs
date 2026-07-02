@@ -51,6 +51,20 @@ impl<T: SqlTypeDecode + Sync, P: TdsPacketReader + Send + Sync> TokenParser<P>
         let tds_type = reader.read_byte().await?;
         let type_info = read_type_info(reader, TdsDataType::try_from(tds_type)?).await?;
 
+        // Per [MS-TDS] an encrypted RETURNVALUE is laid out as
+        // `TYPE_INFO || CryptoMetaData || Value`. Encrypted output-parameter
+        // decryption is not implemented yet, but we must still consume the
+        // `CryptoMetaData` block so the token stream stays aligned — otherwise
+        // those bytes would be decoded as the value and desync the whole stream.
+        const FLAG_ENCRYPTED: u16 = 0x0800;
+        if flags & FLAG_ENCRYPTED != 0 {
+            let _crypto = super::colmetadata_parser::parse_crypto_metadata(reader, false).await?;
+            return Err(crate::error::Error::UnimplementedFeature {
+                feature: "Always Encrypted output parameters".into(),
+                context: "Encrypted RETURNVALUE decryption is not yet implemented".into(),
+            });
+        }
+
         // TODO: Crypto metadata
         let column_metadata = ColumnMetadata {
             user_type,

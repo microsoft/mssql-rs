@@ -63,7 +63,8 @@ pub(crate) struct ParameterEncryptionInfo {
     pub parameter_ordinal: i32,
     /// Parameter name including the leading `@` (e.g. `@p1`).
     pub parameter_name: String,
-    /// Cipher algorithm id (`1` = AEAD_AES_256_CBC_HMAC_SHA256).
+    /// Cipher algorithm id (`2` = `AEAD_AES_256_CBC_HMAC_SHA256`, see
+    /// `AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID`).
     pub cipher_algorithm_id: u8,
     /// Encryption type (`0` = plaintext, `1` = deterministic, `2` = randomized).
     pub encryption_type: u8,

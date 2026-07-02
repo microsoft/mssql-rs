@@ -321,7 +321,10 @@ where
 /// Layout: `CekTableOrdinal(u16, only when a CEK table is present)`, base
 /// `TYPE_INFO`, `CipherAlgorithmId(u8)` (+ optional custom algorithm name),
 /// `EncryptionType(u8)`, `NormalizationRuleVersion(u8)`.
-async fn parse_crypto_metadata<T>(reader: &mut T, has_cek_table: bool) -> TdsResult<CryptoMetadata>
+pub(super) async fn parse_crypto_metadata<T>(
+    reader: &mut T,
+    has_cek_table: bool,
+) -> TdsResult<CryptoMetadata>
 where
     T: TdsPacketReader + Send + Sync,
 {

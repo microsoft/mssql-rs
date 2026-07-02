@@ -54,7 +54,8 @@ bitflags! {
 /// `writeCryptoMetaData`.
 #[derive(Debug, Clone)]
 pub(crate) struct RpcEncryptionMetadata {
-    /// Cipher algorithm id (`0x01` = AEAD_AES_256_CBC_HMAC_SHA256).
+    /// Cipher algorithm id (`0x02` = `AEAD_AES_256_CBC_HMAC_SHA256`, see
+    /// `AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID`).
     pub(crate) cipher_algorithm_id: u8,
     /// Encryption type (`1` = deterministic, `2` = randomized).
     pub(crate) encryption_type: u8,
@@ -398,7 +399,16 @@ impl RpcParameter {
             }
             Some(bytes) => {
                 // PLP: 8-byte total length, then a single length-prefixed chunk,
-                // then the PLP terminator (4 zero bytes).
+                // then the PLP terminator (4 zero bytes). The chunk length is a
+                // `u32`, so a value larger than `u32::MAX` cannot be expressed
+                // as one chunk — guard rather than truncate `len as u32` and
+                // emit a corrupt PLP stream.
+                if len > u32::MAX as usize {
+                    return Err(crate::error::Error::ColumnEncryptionError(format!(
+                        "encrypted value length {len} exceeds the maximum PLP chunk size ({})",
+                        u32::MAX
+                    )));
+                }
                 packet_writer.write_u64_async(len as u64).await?;
                 packet_writer.write_u32_async(len as u32).await?;
                 packet_writer.write_async(bytes).await?;

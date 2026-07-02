@@ -142,7 +142,7 @@ impl CekCache {
     fn get(&self, key: &CekCacheKey) -> Option<Arc<Vec<u8>>> {
         self.entries
             .lock()
-            .expect("CEK cache mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(key)
             .cloned()
     }
@@ -150,7 +150,7 @@ impl CekCache {
     fn insert(&self, key: CekCacheKey, value: Arc<Vec<u8>>) {
         self.entries
             .lock()
-            .expect("CEK cache mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(key, value);
     }
 }
@@ -232,11 +232,32 @@ pub(crate) async fn decrypt_cek(
 /// failures are captured per ordinal and only surfaced if a column that uses
 /// that ordinal is actually read, so an unreadable key for an unused column does
 /// not fail the whole result set.
-#[derive(Debug)]
 pub(crate) struct ResolvedCekDecryptor {
     /// Resolved plaintext CEKs indexed by CEK table ordinal. Each entry is the
     /// resolved key or the error message captured while resolving it.
     ceks: Vec<Result<Arc<Vec<u8>>, String>>,
+}
+
+impl std::fmt::Debug for ResolvedCekDecryptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The resolved entries are plaintext CEKs (AES-256 secrets); never
+        // format the key bytes. Error strings for unresolved entries are safe.
+        struct RedactedCek<'a>(&'a Result<Arc<Vec<u8>>, String>);
+        impl std::fmt::Debug for RedactedCek<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self.0 {
+                    Ok(_) => write!(f, "<resolved>"),
+                    Err(e) => write!(f, "<unresolved: {e}>"),
+                }
+            }
+        }
+        f.debug_struct("ResolvedCekDecryptor")
+            .field(
+                "ceks",
+                &self.ceks.iter().map(RedactedCek).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl ResolvedCekDecryptor {
