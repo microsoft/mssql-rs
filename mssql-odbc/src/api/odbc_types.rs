@@ -10,6 +10,7 @@ pub type SqlSmallInt = i16;
 pub type SqlUSmallInt = u16;
 pub type SqlInteger = i32;
 pub type SqlLen = isize;
+pub type SqlULen = usize;
 pub type SqlReturn = SqlSmallInt;
 pub type SqlHandle = *mut c_void;
 pub type SqlHWnd = *mut c_void;
@@ -117,6 +118,14 @@ pub const SQL_SS_TIMESTAMPOFFSET: SqlSmallInt = -155;
 pub const SQL_C_CHAR: SqlSmallInt = 1;
 pub const SQL_C_WCHAR: SqlSmallInt = -8;
 pub const SQL_C_LONG: SqlSmallInt = 4;
+/// `SQL_C_DEFAULT` — bind using the C type that maps to the SQL type.
+pub const SQL_C_DEFAULT: SqlSmallInt = 99;
+
+// SQLBindParameter InputOutputType values.
+pub const SQL_PARAM_TYPE_UNKNOWN: SqlSmallInt = 0;
+pub const SQL_PARAM_INPUT: SqlSmallInt = 1;
+pub const SQL_PARAM_INPUT_OUTPUT: SqlSmallInt = 2;
+pub const SQL_PARAM_OUTPUT: SqlSmallInt = 4;
 
 // Values of NULLABLE field in descriptor
 pub const SQL_NO_NULLS: SqlSmallInt = 0;
@@ -128,5 +137,17 @@ pub const SQL_DIAG_SQLSTATE: SqlSmallInt = 4;
 pub const SQL_DIAG_NATIVE: SqlSmallInt = 5;
 pub const SQL_DIAG_MESSAGE_TEXT: SqlSmallInt = 6;
 
-// Length/indicator constants.
+// Special length/indicator constants.
 pub const SQL_NULL_DATA: SqlLen = -1;
+pub const SQL_DATA_AT_EXEC: SqlLen = -2;
+
+// SQLBindParameter extensions
+pub const SQL_DEFAULT_PARAM: SqlLen = -5;
+pub const SQL_IGNORE: SqlLen = -6;
+
+pub const fn sql_len_data_at_exec(length: SqlLen) -> SqlLen {
+    -length + SQL_LEN_DATA_AT_EXEC_OFFSET
+}
+/// Indicator values at or below this offset encode a data-at-execution length
+/// via the `SQL_LEN_DATA_AT_EXEC(n)` macro.
+pub const SQL_LEN_DATA_AT_EXEC_OFFSET: SqlLen = -100;

@@ -21,10 +21,8 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 /// Implementation of `SQLPrepareW`.
 ///
 /// Stores the SQL text on the statement for later execution by `SQLExecute`.
-/// The server-side prepare is **deferred** — matching msodbcsql, which bundles
-/// the prepare into the subsequent `SQLExecute` via `sp_prepexec`, or triggers
-/// `sp_prepare` lazily if an intermediate metadata call (e.g. `SQLDescribeCol`)
-/// needs the prepared result-set shape. No network I/O happens here.
+/// The server-side prepare is **deferred** to `SQLExecute`. No network I/O happens
+/// here.
 ///
 /// # Safety
 /// - `statement_handle` must be a valid `StmtHandle` allocated by `SQLAllocHandle`.
@@ -113,6 +111,7 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     // Store the SQL text and defer the server-side prepare to SQLExecute.
     // Re-preparing discards any prior prepared text and stale result metadata.
     stmt_state.prepared_sql = Some(sql);
+    stmt_state.prepared_handle = None;
     stmt_state.column_metadata.clear();
     stmt_state.current_row = None;
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);

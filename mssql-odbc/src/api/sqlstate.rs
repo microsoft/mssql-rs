@@ -10,11 +10,15 @@ use mssql_tds::error::SqlInfoMessage;
 pub(crate) const SQLSTATE_01000: [u8; 5] = *b"01000";
 pub(crate) const SQLSTATE_01004: [u8; 5] = *b"01004";
 pub(crate) const SQLSTATE_01S00: [u8; 5] = *b"01S00";
+pub(crate) const SQLSTATE_07002: [u8; 5] = *b"07002";
+pub(crate) const SQLSTATE_07006: [u8; 5] = *b"07006";
 pub(crate) const SQLSTATE_07009: [u8; 5] = *b"07009";
 pub(crate) const SQLSTATE_08001: [u8; 5] = *b"08001";
 pub(crate) const SQLSTATE_08003: [u8; 5] = *b"08003";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
 pub(crate) const SQLSTATE_HY000: [u8; 5] = *b"HY000";
+pub(crate) const SQLSTATE_HY003: [u8; 5] = *b"HY003";
+pub(crate) const SQLSTATE_HY004: [u8; 5] = *b"HY004";
 pub(crate) const SQLSTATE_HYC00: [u8; 5] = *b"HYC00";
 pub(crate) const SQLSTATE_HY009: [u8; 5] = *b"HY009";
 pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
@@ -61,6 +65,18 @@ pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_DESCRIPTOR_INDEX: DiagMsg = DiagMsg {
     state: SQLSTATE_07009,
     text: "Invalid descriptor index",
+};
+pub(crate) const ERR_INVALID_SQL_DATA_TYPE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY004,
+    text: "Invalid SQL data type",
+};
+pub(crate) const ERR_INVALID_C_DATA_TYPE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY003,
+    text: "Invalid application buffer type",
+};
+pub(crate) const ERR_RESTRICTED_DATA_TYPE: DiagMsg = DiagMsg {
+    state: SQLSTATE_07006,
+    text: "Restricted data type attribute violation",
 };
 pub(crate) const ERR_STRING_RIGHT_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01004,

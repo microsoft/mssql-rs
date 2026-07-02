@@ -2,11 +2,14 @@
 // Licensed under the MIT License.
 
 pub(crate) mod alloc_handle;
+mod bind_param;
 mod close_cursor;
 mod describe_col;
 mod disconnect;
 mod driver_connect;
+mod exec_common;
 mod exec_direct;
+mod execute;
 pub(crate) mod fetch;
 pub(crate) mod free_handle;
 mod get_data;
