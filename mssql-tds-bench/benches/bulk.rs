@@ -4,13 +4,14 @@
 //! Bulk-insert benchmark via the `BulkCopy` builder.
 //!
 //! Inserts `BENCH_BULK_ROWS` rows (default 10,000) into a session temp table
-//! across batch sizes 50 / 500 / 5,000. The table is truncated before each
-//! measured insert so it does not grow across iterations.
+//! across batch sizes 50 / 500 / 5,000. The table is truncated in un-measured
+//! setup before each measured insert, so it does not grow across iterations and
+//! the truncate round-trip is excluded from the timing.
 
 use std::env;
 
 use async_trait::async_trait;
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
 use mssql_tds::core::TdsResult;
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -67,18 +68,20 @@ fn bulk_insert(c: &mut Criterion) {
         return;
     }
     let env = bench_env().expect("env present after successful probe");
-    let mut client = rt.block_on(connect(&env));
+    // RefCell so the un-measured truncate closure and the measured bulk-copy
+    // closure can each borrow the single connection in turn.
+    let client = std::cell::RefCell::new(rt.block_on(connect(&env)));
 
     rt.block_on(async {
-        client
-            .execute(
-                "CREATE TABLE #bulk_target (id BIGINT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
-            )
-            .await
-            .expect("create temp table failed");
-        client.close_query().await.expect("close_query failed");
+        let mut conn = client.borrow_mut();
+        conn.execute(
+            "CREATE TABLE #bulk_target (id BIGINT NOT NULL, value INT NOT NULL)".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect("create temp table failed");
+        conn.close_query().await.expect("close_query failed");
     });
 
     let rows_count = bulk_rows();
@@ -96,22 +99,30 @@ fn bulk_insert(c: &mut Criterion) {
             BenchmarkId::from_parameter(batch_size),
             &batch_size,
             |b, &batch_size| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        client
-                            .execute("TRUNCATE TABLE #bulk_target".to_string(), None, None)
-                            .await
-                            .expect("truncate failed");
-                        client.close_query().await.expect("close_query failed");
-
-                        let bulk_copy = BulkCopy::new(&mut client, "#bulk_target");
-                        bulk_copy
-                            .batch_size(batch_size)
-                            .write_to_server_zerocopy(&rows)
-                            .await
-                            .expect("bulk copy failed");
-                    });
-                });
+                b.iter_batched(
+                    || {
+                        // Un-measured: reset the target so it doesn't grow.
+                        rt.block_on(async {
+                            let mut conn = client.borrow_mut();
+                            conn.execute("TRUNCATE TABLE #bulk_target".to_string(), None, None)
+                                .await
+                                .expect("truncate failed");
+                            conn.close_query().await.expect("close_query failed");
+                        });
+                    },
+                    |_| {
+                        rt.block_on(async {
+                            let mut conn = client.borrow_mut();
+                            let bulk_copy = BulkCopy::new(&mut *conn, "#bulk_target");
+                            bulk_copy
+                                .batch_size(batch_size)
+                                .write_to_server_zerocopy(&rows)
+                                .await
+                                .expect("bulk copy failed");
+                        });
+                    },
+                    BatchSize::PerIteration,
+                );
             },
         );
     }

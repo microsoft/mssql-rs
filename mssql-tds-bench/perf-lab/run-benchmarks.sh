@@ -102,6 +102,15 @@ if ! git rev-parse --verify --quiet "${BASELINE_COMMIT}^{commit}" >/dev/null; th
 fi
 echo ">>> Baseline commit: ${BASELINE_COMMIT}"
 
+# --- Release-grade sampling for the lab ---
+# Heavier than the lighter defaults baked into criterion_config() (which keep a
+# local `cargo bench` fast). More warm-up lets the SQL plan cache / buffer pool /
+# tempdb settle; more measurement time and samples separate small real deltas
+# from run-to-run noise. Pre-set any of these to override.
+export BENCH_WARMUP_SECS="${BENCH_WARMUP_SECS:-10}"
+export BENCH_SECS="${BENCH_SECS:-30}"
+export BENCH_SAMPLES="${BENCH_SAMPLES:-30}"
+
 # --- Optional CPU pinning (avoid contention with a colocated SQL Server) ---
 # When SQL Server runs on the same VM, pin the benchmark client to a core set
 # DISJOINT from the one SQL Server is pinned to, so the two do not fight for the

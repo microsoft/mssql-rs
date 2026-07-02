@@ -5,7 +5,7 @@
 //!
 //! - `connect_close`        — single non-pooled connect + immediate close;
 //!   isolates the TLS handshake / login cost.
-//! - `concurrent_connects`  — N simultaneous connects (N = 50, 100, 500).
+//! - `concurrent_connects`  — N simultaneous connects (N = 50, 100).
 //!
 //! Pooled connections are intentionally excluded — `mssql-tds` has no pool.
 
@@ -37,7 +37,7 @@ fn concurrent_connects(c: &mut Criterion) {
     let env = bench_env().expect("env present after successful probe");
 
     let mut group = c.benchmark_group("concurrent_connects");
-    for n in [50u64, 100, 500] {
+    for n in [50u64, 100] {
         group.throughput(Throughput::Elements(n));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter(|| {

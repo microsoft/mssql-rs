@@ -99,6 +99,16 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host ">>> Baseline commit: $BaselineCommit"
 
+# --- Release-grade sampling for the lab ---
+# Heavier than the lighter defaults baked into criterion_config() (which keep a
+# local `cargo bench` fast). Pre-set any of these to override.
+if (-not $env:BENCH_WARMUP_SECS) { $env:BENCH_WARMUP_SECS = '10' }
+if (-not $env:BENCH_SECS)        { $env:BENCH_SECS = '30' }
+if (-not $env:BENCH_SAMPLES)     { $env:BENCH_SAMPLES = '30' }
+
+# Note: client CPU pinning (PERF_CLIENT_CPUS) is applied on Linux via taskset in
+# run-benchmarks.sh; a Windows equivalent (ProcessorAffinity) is not yet wired up.
+
 # --- Candidate run (mssql-tds = working tree) ---
 Write-Host '>>> Candidate benchmarks...'
 cargo bench -p mssql-tds-bench -- --save-baseline candidate
