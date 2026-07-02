@@ -1,10 +1,5 @@
 # TLS Channel Binding for Extended Protection — Implementation Overview
 
-> Branch: `david/channel-binding` compared against `origin/main`
-> Scope: **11 files, +531 / −2** — adds TLS **channel binding** (`tls-unique`,
-> RFC 5929 §3) extraction and wiring so integrated authentication participates in
-> SQL Server **Extended Protection for Authentication (EPA)**. Closes FeatureGaps #3.
-
 This document is a reviewer-oriented walkthrough: what channel binding is, why it
 matters for EPA, which platforms are in scope, and a guided tour of the code
 changes.
@@ -153,7 +148,7 @@ TLS-version branching in our code.
 ## 5. Testing
 
 - **Unit test** (`bindings.rs`): exercises the extraction error path (query on a
-  dummy context). Runs on any platform.
+  dummy context). Windows-only — the entire `win_tls` module is `#[cfg(windows)]`.
 - **Integration test** (`tests/test_extended_protection.rs`, Windows + `EPA_TEST=1`):
   an encrypted, integrated-auth login that must **succeed**. The CI EPA step runs
   it under two server configurations:

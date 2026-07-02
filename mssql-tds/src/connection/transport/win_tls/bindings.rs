@@ -66,6 +66,15 @@ pub(crate) fn query_unique_bindings(ctx: &SecCtx) -> io::Result<Vec<u8>> {
         ));
     }
     if bindings.Bindings.is_null() || bindings.BindingsLength == 0 {
+        // A non-null pointer with a zero length is still an SSPI-owned
+        // allocation; free it before bailing so we don't leak the buffer.
+        if !bindings.Bindings.is_null() {
+            // SAFETY: `Bindings` is a context buffer returned by
+            // QueryContextAttributesW on SEC_E_OK; release it exactly once.
+            unsafe {
+                Identity::FreeContextBuffer(bindings.Bindings as *mut _);
+            }
+        }
         return Err(io::Error::other(
             "QueryContextAttributesW(UNIQUE_BINDINGS) returned an empty buffer",
         ));

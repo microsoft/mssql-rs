@@ -80,15 +80,27 @@ async fn epa_channel_binding_login_succeeds() -> TdsResult<()> {
     let query = "SELECT auth_scheme, CAST(encrypt_option AS varchar(10)) \
                  FROM sys.dm_exec_connections WHERE session_id = @@SPID";
     connection.execute(query.to_string(), None, None).await?;
-    if let Some(rs) = connection.get_current_resultset()
-        && let Some(row) = rs.next_row().await?
-    {
-        let scheme = format!("{:?}", row.first());
-        assert!(
-            scheme.contains("NTLM") || scheme.contains("Kerberos"),
-            "expected a Windows auth scheme (NTLM/Kerberos), got {scheme}"
-        );
-    }
+    let rs = connection
+        .get_current_resultset()
+        .expect("connection-properties query should produce a result set");
+    let row = rs
+        .next_row()
+        .await?
+        .expect("sys.dm_exec_connections should return a row for the current session");
+
+    let scheme = format!("{:?}", row.first());
+    assert!(
+        scheme.contains("NTLM") || scheme.contains("Kerberos"),
+        "expected a Windows auth scheme (NTLM/Kerberos), got {scheme}"
+    );
+
+    // EPA channel binding requires an encrypted login; confirm the server sees
+    // this connection as encrypted.
+    let encrypt = format!("{:?}", row.get(1));
+    assert!(
+        encrypt.contains("TRUE"),
+        "expected an encrypted login (encrypt_option = TRUE), got {encrypt}"
+    );
     connection.close_query().await?;
     Ok(())
 }
