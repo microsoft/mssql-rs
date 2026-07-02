@@ -75,8 +75,8 @@ pub(crate) struct SchannelTlsStream<S> {
     socket: S,
     mode: Mode,
     /// Cached `tls-unique` channel binding token (full `SEC_CHANNEL_BINDINGS`
-    /// blob) captured at the end of the handshake. `None` when extraction was
-    /// suppressed or failed. Surfaced via [`SchannelTlsStream::channel_binding_token`].
+    /// blob) captured at the end of the handshake. `None` when extraction
+    /// failed. Surfaced via [`SchannelTlsStream::channel_binding_token`].
     channel_binding: Option<Vec<u8>>,
 }
 
@@ -615,6 +615,14 @@ mod tests {
             Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
             other => panic!("expected UnexpectedEof, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_channel_binding_returns_none_when_query_fails() {
+        // A dummy context has a zeroed handle, so QueryContextAttributesW
+        // fails and extraction must degrade gracefully to `None` (the "failed"
+        // path) rather than aborting the connection.
+        assert!(extract_channel_binding(&SecCtx::for_test_only()).is_none());
     }
 
     /// In-memory socket that accepts every write and reports EOF on read.
