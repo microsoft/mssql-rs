@@ -98,11 +98,7 @@ class TestMockServerFedAuth:
             # Clean up
             conn.close()
             assert not conn.is_connected()
-            
-            # Give the server a moment to process the connection info
-            import time
-            time.sleep(0.1)
-            
+
             # Verify the server received the correct token
             assert server.connection_count() >= 1, "Server should have recorded at least one connection"
             assert server.has_received_token(mock_token), \
@@ -121,7 +117,6 @@ class TestMockServerFedAuth:
         properly sent through the TDS protocol and received by the server.
         """
         import mssql_py_core
-        import time
 
         # Generate a unique token for this test
         unique_token = f"unique_token_{secrets.token_hex(16)}"
@@ -141,10 +136,7 @@ class TestMockServerFedAuth:
             assert conn is not None
             assert conn.is_connected()
             conn.close()
-            
-            # Wait for connection info to be stored
-            time.sleep(0.1)
-            
+
             # Verify the unique token was received
             received_token = server.get_last_access_token()
             assert received_token == unique_token, \
@@ -174,7 +166,6 @@ class TestMockServerFedAuth:
         Verifies both the query result and that the token was received.
         """
         import mssql_py_core
-        import time
 
         mock_token = "mock_token_for_query_execution"
 
@@ -209,10 +200,7 @@ class TestMockServerFedAuth:
             # Ensure references are dropped so TdsClient is fully released
             del cursor
             del conn
-            
-            # Wait for connection info to be stored
-            time.sleep(0.3)
-            
+
             # Verify token was received
             assert server.has_received_token(mock_token), \
                 "Server should have received the access token used for query execution"
@@ -220,7 +208,6 @@ class TestMockServerFedAuth:
     def test_get_all_connections(self, mock_server_port):
         """Test retrieving all connection info from the server."""
         import mssql_py_core
-        import time
 
         token = "test_token_for_connection_list"
         
@@ -237,9 +224,7 @@ class TestMockServerFedAuth:
 
             conn = mssql_py_core.PyCoreConnection(client_context)
             conn.close()
-            
-            time.sleep(0.1)
-            
+
             # Get all connections
             connections = server.get_connections()
             assert len(connections) >= 1, "Should have at least one connection"
@@ -252,7 +237,6 @@ class TestMockServerFedAuth:
     def test_clear_connections(self, mock_server_port):
         """Test clearing stored connection info."""
         import mssql_py_core
-        import time
 
         server = mssql_mock_tds_py.PyMockTdsServer(port=mock_server_port, tls=True)
         
@@ -267,9 +251,7 @@ class TestMockServerFedAuth:
 
             conn = mssql_py_core.PyCoreConnection(client_context)
             conn.close()
-            
-            time.sleep(0.1)
-            
+
             # Verify we have a connection
             assert server.connection_count() >= 1
             
@@ -282,7 +264,6 @@ class TestMockServerFedAuth:
     def test_user_agent_format(self, mock_server_port):
         """Test that MS-PYTHON is correctly sent as the driver name in the user agent."""
         import mssql_py_core
-        import time
 
         server = mssql_mock_tds_py.PyMockTdsServer(port=mock_server_port, tls=True)
 
@@ -296,8 +277,6 @@ class TestMockServerFedAuth:
 
             conn = mssql_py_core.PyCoreConnection(client_context)
             conn.close()
-
-            time.sleep(0.1)
 
             connections = server.get_connections()
             assert len(connections) >= 1, "Should have at least one connection" 
