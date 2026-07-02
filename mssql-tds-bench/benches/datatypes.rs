@@ -158,9 +158,36 @@ fn lob(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("lob");
     for bytes in [1_048_576u64, 20_971_520] {
-        let query = format!(
-            "SELECT REPLICATE(CAST('X' AS VARCHAR(MAX)), {bytes}) AS payload"
-        );
+        // Pre-materialize the payload once (un-measured) into a session temp
+        // table so the benchmark times transfer + driver decode, not the
+        // server-side REPLICATE that would otherwise regenerate the LOB (and its
+        // memory grant) on every iteration.
+        let table = format!("#lob_{bytes}");
+        rt.block_on(async {
+            client
+                .execute(
+                    format!("CREATE TABLE {table} (payload VARCHAR(MAX) NOT NULL)"),
+                    None,
+                    None,
+                )
+                .await
+                .expect("create lob table failed");
+            client.close_query().await.expect("close_query failed");
+            client
+                .execute(
+                    format!(
+                        "INSERT INTO {table} (payload) \
+                         SELECT REPLICATE(CAST('X' AS VARCHAR(MAX)), {bytes})"
+                    ),
+                    None,
+                    None,
+                )
+                .await
+                .expect("fill lob table failed");
+            client.close_query().await.expect("close_query failed");
+        });
+
+        let query = format!("SELECT payload FROM {table}");
         group.throughput(Throughput::Bytes(bytes));
         group.bench_with_input(BenchmarkId::from_parameter(bytes), &query, |b, query| {
             b.iter(|| {

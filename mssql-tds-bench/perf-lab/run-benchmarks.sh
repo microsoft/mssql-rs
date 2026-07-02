@@ -111,6 +111,17 @@ export BENCH_WARMUP_SECS="${BENCH_WARMUP_SECS:-10}"
 export BENCH_SECS="${BENCH_SECS:-30}"
 export BENCH_SAMPLES="${BENCH_SAMPLES:-30}"
 
+# --- Allocator tuning (steadier large-buffer / LOB benchmarks) ---
+# The LOB benches decode multi-MB buffers each iteration. With glibc's defaults a
+# 20 MB allocation is served by mmap and returned to the OS on free, so every
+# iteration re-mmaps and re-faults the pages (slow and noisy). Raise the mmap
+# threshold so those allocations come from the heap (brk), and disable heap
+# trimming so the memory is reused instead of handed back. (Setting the mmap
+# threshold high is required: setting only the trim threshold would disable
+# glibc's dynamic mmap threshold and force every large allocation through mmap.)
+export MALLOC_MMAP_THRESHOLD_="${MALLOC_MMAP_THRESHOLD_:-134217728}"  # 128 MB
+export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:--1}"          # never trim
+
 # --- Optional CPU pinning (avoid contention with a colocated SQL Server) ---
 # When SQL Server runs on the same VM, pin the benchmark client to a core set
 # DISJOINT from the one SQL Server is pinned to, so the two do not fight for the
@@ -127,6 +138,16 @@ if [ -n "$BENCH_CPUS" ]; then
         echo ">>> taskset unavailable; running unpinned (requested CPUs: ${BENCH_CPUS})"
     fi
 fi
+
+# --- Warm-up pass (discarded) ---
+# Candidate is measured first and baseline second, so without this the candidate
+# pays a cold-cache penalty (SQL buffer pool, memory grants, OS pages) that the
+# baseline run doesn't — which shows up as a spurious delta on the largest
+# working-set benches (e.g. the 20 MB LOB). Run the whole suite once, fast and
+# discarded, to prime SQL Server and the OS so BOTH measured runs start warm.
+echo ">>> Warm-up pass (discarded)..."
+BENCH_WARMUP_SECS=1 BENCH_SECS=1 BENCH_SAMPLES=10 \
+    "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline warmup >/dev/null 2>&1 || true
 
 # --- Candidate run (mssql-tds = working tree) ---
 echo ">>> Candidate benchmarks..."

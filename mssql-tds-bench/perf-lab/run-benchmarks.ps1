@@ -109,6 +109,16 @@ if (-not $env:BENCH_SAMPLES)     { $env:BENCH_SAMPLES = '30' }
 # Note: client CPU pinning (PERF_CLIENT_CPUS) is applied on Linux via taskset in
 # run-benchmarks.sh; a Windows equivalent (ProcessorAffinity) is not yet wired up.
 
+# --- Warm-up pass (discarded) ---
+# Candidate is measured first and baseline second; prime SQL Server and the OS
+# once (fast, discarded) so both measured runs start warm and the candidate
+# doesn't pay a cold-cache penalty on the largest benches (e.g. the 20 MB LOB).
+Write-Host '>>> Warm-up pass (discarded)...'
+$origWarm = $env:BENCH_WARMUP_SECS; $origSecs = $env:BENCH_SECS; $origSamples = $env:BENCH_SAMPLES
+$env:BENCH_WARMUP_SECS = '1'; $env:BENCH_SECS = '1'; $env:BENCH_SAMPLES = '10'
+cargo bench -p mssql-tds-bench -- --save-baseline warmup *> $null
+$env:BENCH_WARMUP_SECS = $origWarm; $env:BENCH_SECS = $origSecs; $env:BENCH_SAMPLES = $origSamples
+
 # --- Candidate run (mssql-tds = working tree) ---
 Write-Host '>>> Candidate benchmarks...'
 cargo bench -p mssql-tds-bench -- --save-baseline candidate
