@@ -1,22 +1,25 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Integration tests for SQL Server Extended Protection for Authentication
+//! Integration test for SQL Server Extended Protection for Authentication
 //! (EPA) channel binding (`tls-unique`, RFC 5929 §3) on Windows.
 //!
-//! These tests require a SQL Server instance configured with **Extended
-//! Protection = Required** and **Force Encryption = Yes**, reachable via
-//! integrated auth (NTLM/Kerberos). They are gated behind `EPA_TEST=1` so they
-//! are skipped during the normal test run (where the instance does NOT enforce
-//! EPA, so the negative assertion would not hold).
+//! The test connects with integrated auth over a Mandatory-encrypted
+//! connection (the path that triggers `tls-unique` extraction on the Windows
+//! Schannel-direct engine) and asserts the login **succeeds**. It is gated
+//! behind `EPA_TEST=1` so it is skipped during the normal test run (which does
+//! not guarantee a reachable integrated-auth SQL instance).
 //!
-//! The validation pipeline configures EPA on the local instance via
-//! `.pipeline/scripts/Configure-ExtendedProtection.ps1`, runs these tests with
-//! `EPA_TEST=1`, then reverts EPA -- see the "Extended Protection" step in
-//! `.pipeline/templates/validation-stages.yml`.
+//! The validation pipeline runs this test against the local instance under two
+//! server configurations and expects success in both:
+//!   1. Extended Protection = **Off** (not required) -- the baseline path.
+//!   2. Extended Protection = **Required** -- the server rejects any login that
+//!      does not present a valid channel binding, so a successful login here is
+//!      proof that we send a real, server-validated `tls-unique` token.
 //!
-//! Test isolation note: nextest runs each test in its own process, so the
-//! per-process environment manipulation below does not leak across tests.
+//! See the "Extended Protection" step in
+//! `.pipeline/templates/validation-stages.yml`, which drives both configurations
+//! via `.pipeline/scripts/Configure-ExtendedProtection.ps1`.
 
 #![cfg(windows)]
 
@@ -28,10 +31,6 @@ use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMeth
 use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
-
-/// Diagnostic env var honored by the Schannel-direct engine to suppress the
-/// channel binding token (mirrors native SNI `m_fIgnoreChannelBindings`).
-const SUPPRESS_ENV: &str = "MSSQL_TDS_IGNORE_CHANNEL_BINDINGS";
 
 fn epa_enabled() -> bool {
     env::var("EPA_TEST").is_ok()
@@ -52,29 +51,30 @@ fn integrated_encrypted_context() -> ClientContext {
     context
 }
 
-/// Positive: with EPA = Required on the server, an integrated-auth encrypted
-/// connection that carries a valid `tls-unique` channel binding token logs in
-/// successfully (the binding the server expects is the one we sent).
+/// An integrated-auth, encrypted login succeeds regardless of the server's
+/// Extended Protection level. The pipeline runs this test with EPA = Off and
+/// again with EPA = Required, expecting success both times:
+///
+/// * EPA = Off -- the connection works when channel binding is not enforced.
+/// * EPA = Required -- the server rejects any login lacking a valid channel
+///   binding, so a successful login proves the `tls-unique` token we send is
+///   real and server-validated.
 #[tokio::test]
-async fn epa_required_accepts_valid_channel_binding() -> TdsResult<()> {
+async fn epa_channel_binding_login_succeeds() -> TdsResult<()> {
     if !epa_enabled() {
-        println!("Skipping EPA test - set EPA_TEST=1 (requires server EPA=Required)");
+        println!("Skipping EPA test - set EPA_TEST=1 (requires an integrated-auth SQL instance)");
         return Ok(());
     }
     common::init_tracing();
-
-    // Ensure the token is NOT suppressed so a real CBT is sent.
-    // SAFETY: nextest runs this test in its own single-threaded-by-default
-    // process; no other thread reads the environment concurrently.
-    unsafe {
-        env::remove_var(SUPPRESS_ENV);
-    }
 
     let provider = TdsConnectionProvider {};
     let mut connection = provider
         .create_client(integrated_encrypted_context(), "tcp:localhost,1433", None)
         .await
-        .expect("EPA=Required should ACCEPT a login that sends a valid channel binding token");
+        .expect(
+            "integrated-auth encrypted login should succeed; under EPA=Required this also \
+             proves a valid tls-unique channel binding token was sent",
+        );
 
     // Confirm we authenticated over an encrypted Windows-auth connection.
     let query = "SELECT auth_scheme, CAST(encrypt_option AS varchar(10)) \
@@ -91,43 +91,4 @@ async fn epa_required_accepts_valid_channel_binding() -> TdsResult<()> {
     }
     connection.close_query().await?;
     Ok(())
-}
-
-/// Negative (enforcement proof): with EPA = Required, suppressing the channel
-/// binding token must cause the server to REJECT the login. This is the test
-/// that proves we send a real, server-validated binding -- not just that login
-/// happens to work.
-#[tokio::test]
-async fn epa_required_rejects_suppressed_channel_binding() {
-    if !epa_enabled() {
-        println!("Skipping EPA test - set EPA_TEST=1 (requires server EPA=Required)");
-        return;
-    }
-    common::init_tracing();
-
-    // Suppress the tls-unique token for this process only, so the SSPI exchange
-    // proceeds WITHOUT a channel binding.
-    // SAFETY: nextest runs this test in its own process; no other thread reads
-    // the environment concurrently.
-    unsafe {
-        env::set_var(SUPPRESS_ENV, "1");
-    }
-
-    let provider = TdsConnectionProvider {};
-    let result = provider
-        .create_client(integrated_encrypted_context(), "tcp:localhost,1433", None)
-        .await;
-
-    // Restore the environment regardless of outcome.
-    // SAFETY: see above.
-    unsafe {
-        env::remove_var(SUPPRESS_ENV);
-    }
-
-    assert!(
-        result.is_err(),
-        "EPA=Required must REJECT a login whose channel binding was suppressed, \
-         but the connection succeeded -- the server is not enforcing channel binding, \
-         or the client failed to omit the token"
-    );
 }

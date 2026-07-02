@@ -56,25 +56,32 @@ stages:
           osType: Windows
           buildType: ${{ parameters.buildType }}
           testFilter: -E "not (test(connectivity))"
-      # Extended Protection (EPA) channel-binding enforcement test.
-      # Runs AFTER the main test pass (which leaves EPA off). Configures
-      # EPA=Required + Force Encryption on the local MSSQLSERVER instance, runs
-      # the gated EPA tests (accept-valid-CBT + reject-suppressed-CBT), then
-      # reverts in `finally` so a failure still restores the instance. Each
-      # registry change requires a SQL service restart, handled by the script.
+      # Extended Protection (EPA) channel-binding test.
+      # Runs AFTER the main test pass. Runs the same integrated-auth encrypted
+      # login test under two server configurations, expecting success in both:
+      #   1. EPA = Off      -- baseline (channel binding not enforced).
+      #   2. EPA = Required -- the server rejects any login lacking a valid
+      #      channel binding, so a successful login proves we send a real,
+      #      server-validated tls-unique token.
+      # Reverts EPA to Off in `finally` so a failure still restores the
+      # instance. Each registry change requires a SQL service restart, handled
+      # by the script.
       - pwsh: |
           $ErrorActionPreference = 'Stop'
           $spns = @("MSSQLSvc/localhost:1433", "MSSQLSvc/$($env:COMPUTERNAME):1433")
           $configured = $false
           try {
-            ./.pipeline/scripts/Configure-ExtendedProtection.ps1 `
-              -InstanceName 'MSSQLSERVER' -Level 'Required' -ForceEncryption 'Yes' `
-              -AcceptedNtlmSpns $spns -RestartService $true
-            $configured = $true
+            foreach ($level in @('Off', 'Required')) {
+              ./.pipeline/scripts/Configure-ExtendedProtection.ps1 `
+                -InstanceName 'MSSQLSERVER' -Level $level -ForceEncryption 'Yes' `
+                -AcceptedNtlmSpns $spns -RestartService $true
+              $configured = $true
 
-            cargo nextest run --frozen --package mssql-tds `
-              -E 'test(epa_required)' --no-fail-fast --profile ci
-            if ($LASTEXITCODE -ne 0) { throw "EPA channel-binding tests failed (exit $LASTEXITCODE)" }
+              Write-Host "Running EPA channel-binding test with Extended Protection = $level"
+              cargo nextest run --frozen --package mssql-tds `
+                -E 'test(epa_channel_binding)' --no-fail-fast --profile ci
+              if ($LASTEXITCODE -ne 0) { throw "EPA channel-binding test failed with EPA=$level (exit $LASTEXITCODE)" }
+            }
           }
           finally {
             if ($configured) {

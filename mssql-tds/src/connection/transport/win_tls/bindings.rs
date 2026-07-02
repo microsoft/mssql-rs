@@ -91,19 +91,6 @@ pub(crate) fn query_unique_bindings(ctx: &SecCtx) -> io::Result<Vec<u8>> {
     Ok(token)
 }
 
-/// Internal diagnostic opt-out. When the `MSSQL_TDS_IGNORE_CHANNEL_BINDINGS`
-/// environment variable is set to a non-empty value, the Schannel-direct
-/// stream does not extract a channel binding token, so integrated
-/// authentication proceeds without channel bindings.
-///
-/// Mirrors the native SNI `m_fIgnoreChannelBindings` escape hatch. Intended
-/// for diagnostics only — there is no user-facing connection-string keyword.
-pub(crate) fn channel_bindings_suppressed() -> bool {
-    std::env::var_os("MSSQL_TDS_IGNORE_CHANNEL_BINDINGS")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,14 +103,5 @@ mod tests {
         // test).
         let dummy = SecCtx::for_test_only();
         assert!(query_unique_bindings(&dummy).is_err());
-    }
-
-    #[test]
-    fn suppressed_defaults_to_false_when_unset() {
-        // SAFETY: single-threaded test; remove the var to assert the default.
-        unsafe {
-            std::env::remove_var("MSSQL_TDS_IGNORE_CHANNEL_BINDINGS");
-        }
-        assert!(!channel_bindings_suppressed());
     }
 }

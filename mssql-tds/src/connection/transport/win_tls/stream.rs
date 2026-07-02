@@ -271,25 +271,20 @@ where
     }
 
     /// The `tls-unique` channel binding token (full `SEC_CHANNEL_BINDINGS`
-    /// blob) captured at handshake completion, if extraction succeeded and
-    /// was not suppressed.
+    /// blob) captured at handshake completion, if extraction succeeded.
     pub(crate) fn channel_binding_token(&self) -> Option<Vec<u8>> {
         self.channel_binding.clone()
     }
 }
 
 /// Extract the `tls-unique` channel binding token from a freshly completed
-/// security context, honoring the diagnostic suppression flag.
+/// security context.
 ///
 /// Logs and returns `None` on failure rather than aborting the connection:
 /// a missing channel binding only matters when the server enforces Extended
 /// Protection, in which case the login itself will fail with a clear server
 /// error. Mirrors the non-fatal ALPN-query handling above.
 fn extract_channel_binding(ctx: &super::handshake::SecCtx) -> Option<Vec<u8>> {
-    if super::bindings::channel_bindings_suppressed() {
-        debug!("win_tls: channel binding extraction suppressed via env var");
-        return None;
-    }
     match super::bindings::query_unique_bindings(ctx) {
         Ok(token) => {
             debug!(
