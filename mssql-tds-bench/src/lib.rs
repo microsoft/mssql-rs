@@ -15,8 +15,12 @@
 //! - `BENCH_ENCRYPT` (`strict`|`on`|`off`, default `on`) — encryption setting.
 //!
 //! ## Criterion tuning knobs
-//! - `BENCH_SECS` (default `15`) — per-benchmark measurement time, seconds.
-//! - `BENCH_SAMPLES` (default `10`) — sample size.
+//! - `BENCH_WARMUP_SECS` (default `5`) — per-benchmark warm-up time, seconds.
+//!   Longer than Criterion's 3s default so the SQL plan cache, buffer pool, and
+//!   tempdb reach steady state before measurement on a colocated server.
+//! - `BENCH_SECS` (default `20`) — per-benchmark measurement time, seconds.
+//! - `BENCH_SAMPLES` (default `20`) — sample size. More samples tighten the
+//!   confidence interval so small real deltas separate from run noise.
 //! - `BENCH_SIGNIFICANCE` (default `0.05`) — significance level.
 //! - `BENCH_NOISE` (default `0.05`) — noise threshold. These end-to-end,
 //!   network-bound benchmarks are noisier than CPU microbenchmarks, so the
@@ -160,6 +164,55 @@ pub async fn drain(client: &mut TdsClient) -> u64 {
     rows
 }
 
+/// Create a session temp table `table` filled with `rows` deterministic rows of
+/// eight mixed-type columns, using a single set-based `GENERATE_SERIES` insert.
+///
+/// Population is a one-time, un-measured cost. The table is a heap (no indexes,
+/// no sort), so a later `SELECT ... FROM table` is a plain scan whose content is
+/// fixed and whose server-side cost is trivial — isolating driver decode from
+/// database query execution. The columns are:
+/// `c_int, c_bigint, c_bit, c_tinyint, c_smallint, c_nvarchar, c_float, c_datetime2`.
+///
+/// Requires SQL Server 2022+ (database compatibility level 160) for
+/// `GENERATE_SERIES`.
+pub async fn create_mixed_rows_table(client: &mut TdsClient, table: &str, rows: u64) {
+    let ddl = format!(
+        "CREATE TABLE {table} (\
+            c_int INT NOT NULL, \
+            c_bigint BIGINT NOT NULL, \
+            c_bit BIT NOT NULL, \
+            c_tinyint TINYINT NOT NULL, \
+            c_smallint SMALLINT NOT NULL, \
+            c_nvarchar NVARCHAR(128) NOT NULL, \
+            c_float FLOAT NOT NULL, \
+            c_datetime2 DATETIME2 NOT NULL)"
+    );
+    client
+        .execute(ddl, None, None)
+        .await
+        .expect("create rows table failed");
+    client.close_query().await.expect("close_query failed");
+
+    let fill = format!(
+        "INSERT INTO {table} \
+            (c_int, c_bigint, c_bit, c_tinyint, c_smallint, c_nvarchar, c_float, c_datetime2) \
+         SELECT CAST(value AS INT), \
+                CAST(value AS BIGINT), \
+                CAST(value % 2 AS BIT), \
+                CAST(value % 256 AS TINYINT), \
+                CAST(value % 32768 AS SMALLINT), \
+                CONCAT(N'row_', value), \
+                CAST(value AS FLOAT) * 1.5, \
+                DATEADD(SECOND, value % 86400, CAST('2020-01-01T00:00:00' AS DATETIME2)) \
+         FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
+    );
+    client
+        .execute(fill, None, None)
+        .await
+        .expect("fill rows table failed");
+    client.close_query().await.expect("close_query failed");
+}
+
 /// Build a Criterion instance tuned for network-bound, end-to-end benchmarks.
 pub fn criterion_config() -> Criterion {
     fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -170,8 +223,9 @@ pub fn criterion_config() -> Criterion {
     }
 
     Criterion::default()
-        .measurement_time(Duration::from_secs(env_parse("BENCH_SECS", 15)))
-        .sample_size(env_parse("BENCH_SAMPLES", 10usize))
+        .warm_up_time(Duration::from_secs(env_parse("BENCH_WARMUP_SECS", 5)))
+        .measurement_time(Duration::from_secs(env_parse("BENCH_SECS", 20)))
+        .sample_size(env_parse("BENCH_SAMPLES", 20usize))
         .significance_level(env_parse("BENCH_SIGNIFICANCE", 0.05))
         .noise_threshold(env_parse("BENCH_NOISE", 0.05))
 }

@@ -11,28 +11,12 @@
 //! - `stored_procedure`          — a temp stored procedure via RPC.
 //! - `batched_statements`        — three statements in one round-trip.
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
-use mssql_tds_bench::{bench_env, connect, criterion_config, drain, runtime, try_connect};
-
-/// Produce a query returning `rows` rows with 8 mixed-type columns.
-fn mixed_rows_query(rows: u64) -> String {
-    format!(
-        r#"SELECT TOP ({rows})
-    CAST(c1.object_id AS INT)        AS c_int,
-    CAST(c1.column_id AS BIGINT)     AS c_bigint,
-    CAST(c1.is_nullable AS BIT)      AS c_bit,
-    CAST(c1.precision AS TINYINT)    AS c_tinyint,
-    CAST(c1.max_length AS SMALLINT)  AS c_smallint,
-    CAST(c1.name AS NVARCHAR(128))   AS c_nvarchar,
-    CAST(1.5 AS FLOAT)               AS c_float,
-    CAST(SYSDATETIME() AS DATETIME2) AS c_datetime2
-FROM sys.columns c1
-CROSS JOIN sys.columns c2
-ORDER BY c1.object_id, c1.column_id"#
-    )
-}
+use mssql_tds_bench::{
+    bench_env, connect, create_mixed_rows_table, criterion_config, drain, runtime, try_connect,
+};
 
 fn simple_select_one_row(c: &mut Criterion) {
     let rt = runtime();
@@ -63,9 +47,17 @@ fn select_n_rows(c: &mut Criterion) {
     let env = bench_env().expect("env present after successful probe");
     let mut client = rt.block_on(connect(&env));
 
+    // Pre-populate a deterministic heap once (un-measured). Reading it back with
+    // `SELECT TOP (n)` is a plain scan with fixed content, so the benchmark
+    // times driver row decoding rather than server-side query execution.
+    rt.block_on(create_mixed_rows_table(&mut client, "#bench_rows", 10_000));
+
     let mut group = c.benchmark_group("select_n_rows");
     for n in [100u64, 1_000, 10_000] {
-        let query = mixed_rows_query(n);
+        let query = format!(
+            "SELECT TOP ({n}) c_int, c_bigint, c_bit, c_tinyint, c_smallint, \
+             c_nvarchar, c_float, c_datetime2 FROM #bench_rows"
+        );
         group.throughput(Throughput::Elements(n));
         group.bench_with_input(BenchmarkId::from_parameter(n), &query, |b, query| {
             b.iter(|| {
@@ -88,37 +80,52 @@ fn single_insert(c: &mut Criterion) {
         return;
     }
     let env = bench_env().expect("env present after successful probe");
-    let mut client = rt.block_on(connect(&env));
+    // RefCell so the un-measured reset closure and the measured insert closure
+    // can each borrow the single connection in turn (they never run at once).
+    let client = std::cell::RefCell::new(rt.block_on(connect(&env)));
 
     // Session temp table — dropped automatically when the connection closes.
     rt.block_on(async {
-        client
-            .execute(
-                "CREATE TABLE #bench_insert (id INT NOT NULL, name NVARCHAR(100) NOT NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
-            .await
-            .expect("create temp table failed");
-        client.close_query().await.expect("close_query failed");
+        let mut conn = client.borrow_mut();
+        conn.execute(
+            "CREATE TABLE #bench_insert (id INT NOT NULL, name NVARCHAR(100) NOT NULL)".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect("create temp table failed");
+        conn.close_query().await.expect("close_query failed");
     });
 
     c.bench_function("single_insert", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                client
-                    .execute(
-                        "INSERT INTO #bench_insert (id, name) VALUES (1, N'benchmark')"
-                            .to_string(),
+        b.iter_batched(
+            || {
+                // Un-measured: truncate so rows do not accumulate across
+                // iterations (which would otherwise grow the heap and tempdb
+                // and drift the measurement upward).
+                rt.block_on(async {
+                    let mut conn = client.borrow_mut();
+                    conn.execute("TRUNCATE TABLE #bench_insert".to_string(), None, None)
+                        .await
+                        .expect("truncate failed");
+                    conn.close_query().await.expect("close_query failed");
+                });
+            },
+            |_| {
+                rt.block_on(async {
+                    let mut conn = client.borrow_mut();
+                    conn.execute(
+                        "INSERT INTO #bench_insert (id, name) VALUES (1, N'benchmark')".to_string(),
                         None,
                         None,
                     )
                     .await
                     .expect("insert failed");
-                client.close_query().await.expect("close_query failed");
-            });
-        });
+                    conn.close_query().await.expect("close_query failed");
+                });
+            },
+            BatchSize::PerIteration,
+        );
     });
 }
 

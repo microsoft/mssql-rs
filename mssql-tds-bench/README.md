@@ -72,12 +72,20 @@ Criterion tuning knobs (defaults chosen for noisy, network-bound runs):
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `BENCH_SECS` | `15` | measurement time per benchmark (seconds) |
-| `BENCH_SAMPLES` | `10` | sample size |
+| `BENCH_WARMUP_SECS` | `5` | warm-up time per benchmark (seconds); longer than Criterion's 3s default so the SQL plan cache, buffer pool, and tempdb settle before measurement |
+| `BENCH_SECS` | `20` | measurement time per benchmark (seconds) |
+| `BENCH_SAMPLES` | `20` | sample size (more samples → tighter confidence interval) |
 | `BENCH_SIGNIFICANCE` | `0.05` | significance level |
 | `BENCH_NOISE` | `0.05` | noise threshold |
 | `BENCH_BULK_ROWS` | `10000` | rows for the bulk-insert bench |
 | `BENCH_ITER_ROWS` | `50000` | rows for the row-iteration bench |
+
+CPU pinning (used by `perf-lab/run-benchmarks.sh` when SQL Server is colocated):
+
+| Variable | Purpose |
+|----------|---------|
+| `PERF_CLIENT_CPUS` | core set the perf lab reserves for the benchmark client, disjoint from SQL Server's cores (e.g. `16-31`); the testScript pins `cargo bench` to it with `taskset` |
+| `BENCH_CPUS` | local override for `PERF_CLIENT_CPUS` |
 
 ## Fixed-baseline comparison on the perf lab
 

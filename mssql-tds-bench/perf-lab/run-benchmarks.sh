@@ -102,9 +102,26 @@ if ! git rev-parse --verify --quiet "${BASELINE_COMMIT}^{commit}" >/dev/null; th
 fi
 echo ">>> Baseline commit: ${BASELINE_COMMIT}"
 
+# --- Optional CPU pinning (avoid contention with a colocated SQL Server) ---
+# When SQL Server runs on the same VM, pin the benchmark client to a core set
+# DISJOINT from the one SQL Server is pinned to, so the two do not fight for the
+# same CPUs. The perf lab is expected to reserve cores for SQL Server and publish
+# the free set via PERF_CLIENT_CPUS (e.g. "16-31"). BENCH_CPUS overrides locally.
+# If neither is set, or taskset is unavailable, the benchmarks run unpinned.
+BENCH_CPUS="${BENCH_CPUS:-${PERF_CLIENT_CPUS:-}}"
+BENCH_PREFIX=()
+if [ -n "$BENCH_CPUS" ]; then
+    if command -v taskset >/dev/null 2>&1; then
+        echo ">>> Pinning benchmark client to CPUs: ${BENCH_CPUS}"
+        BENCH_PREFIX=(taskset -c "$BENCH_CPUS")
+    else
+        echo ">>> taskset unavailable; running unpinned (requested CPUs: ${BENCH_CPUS})"
+    fi
+fi
+
 # --- Candidate run (mssql-tds = working tree) ---
 echo ">>> Candidate benchmarks..."
-cargo bench -p mssql-tds-bench -- --save-baseline candidate
+"${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline candidate
 
 # --- Baseline run (mssql-tds source swapped to the baseline commit) ---
 # Materialize the baseline mssql-tds via a local worktree, then replace the
@@ -122,7 +139,7 @@ mv "$REPO_ROOT/mssql-tds" "$REPO_ROOT/.mssql-tds-candidate"
 cp -r "$BASELINE_TREE/mssql-tds" "$REPO_ROOT/mssql-tds"
 
 echo ">>> Baseline benchmarks..."
-cargo bench -p mssql-tds-bench -- --save-baseline base
+"${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline base
 
 # Restore the candidate source and remove the worktree.
 rm -rf "$REPO_ROOT/mssql-tds"

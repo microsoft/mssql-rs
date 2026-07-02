@@ -12,7 +12,8 @@ use std::env;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mssql_tds_bench::{
-    bench_env, connect, connect_with_packet_size, criterion_config, drain, runtime, try_connect,
+    bench_env, connect, connect_with_packet_size, create_mixed_rows_table, criterion_config, drain,
+    runtime, try_connect,
 };
 
 /// Approximate payload size (bytes) for the packet-size read.
@@ -62,16 +63,12 @@ fn row_iteration_throughput(c: &mut Criterion) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(50_000);
-    let query = format!(
-        r#"SELECT TOP ({rows})
-    CAST(c1.object_id AS INT)       AS c_int,
-    CAST(c1.column_id AS BIGINT)    AS c_bigint,
-    CAST(c1.name AS NVARCHAR(128))  AS c_name,
-    CAST(c1.is_nullable AS BIT)     AS c_bit
-FROM sys.columns c1
-CROSS JOIN sys.columns c2
-ORDER BY c1.object_id, c1.column_id"#
-    );
+
+    // Pre-populate a deterministic heap once (un-measured), then scan it back so
+    // the benchmark times per-row decode throughput rather than the server-side
+    // cost of generating the rows.
+    rt.block_on(create_mixed_rows_table(&mut client, "#iter_rows", rows));
+    let query = "SELECT c_int, c_bigint, c_nvarchar, c_bit FROM #iter_rows".to_string();
 
     let mut group = c.benchmark_group("row_iteration_throughput");
     group.throughput(Throughput::Elements(rows));
