@@ -482,13 +482,11 @@ pub struct BulkCopyColumnMetadata {
     /// Always Encrypted material for this column, populated from the destination
     /// table metadata when column encryption is negotiated. `None` for plaintext
     /// columns.
-    #[allow(dead_code)]
     pub(crate) encryption: Option<BulkCopyColumnEncryption>,
 }
 
 /// Always Encrypted material captured for an encrypted bulk-copy destination
 /// column: the per-column crypto metadata plus the CEK table entry it references.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct BulkCopyColumnEncryption {
     /// Per-column crypto metadata (base type, cipher algorithm id, encryption

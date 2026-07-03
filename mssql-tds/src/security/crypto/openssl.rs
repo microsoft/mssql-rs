@@ -7,10 +7,6 @@
 //! relies on on these platforms, and is an approved crypto provider under the
 //! compliance policy. See [`super`] for the platform-selection rationale.
 
-// Some primitives are only used by tests or by one consumer; keep the full
-// surface so the cell cipher and CEK wrapping paths share one backend.
-#![allow(dead_code)]
-
 use openssl::encrypt::{Decrypter, Encrypter};
 use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Private};
@@ -93,6 +89,7 @@ impl RsaKey {
     }
 
     /// Generates a fresh RSA key pair of the given modulus size in bits.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn generate(bits: u32) -> TdsResult<Self> {
         let rsa = Rsa::generate(bits).map_err(|e| crypto_err("RSA key generation failed", e))?;
         let pkey = PKey::from_rsa(rsa).map_err(|e| crypto_err("failed to wrap RSA key", e))?;
@@ -100,6 +97,7 @@ impl RsaKey {
     }
 
     /// Serializes the private key to a PKCS#8 PEM document.
+    #[cfg(test)]
     pub(crate) fn to_pkcs8_pem(&self) -> TdsResult<Vec<u8>> {
         self.pkey
             .private_key_to_pem_pkcs8()

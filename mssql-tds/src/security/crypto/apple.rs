@@ -11,19 +11,14 @@
 //! Apple's Secure Transport on this platform instead of OpenSSL. See [`super`]
 //! for the platform-selection rationale.
 
-// Some primitives are only used by tests or by one consumer; keep the full
-// surface so the cell cipher and CEK wrapping paths share one backend.
-#![allow(dead_code)]
-
 use core_foundation::base::TCFType;
 use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::CFString;
-use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey};
-// `SecKeyExt::from_data` is the crate's only safe RSA-key import entry point.
-// Apple marks it deprecated with a note aimed at symmetric keys; it remains the
-// supported way to import an RSA private key from DER, so the deprecation is
-// allowed here deliberately.
+use security_framework::key::{Algorithm, SecKey};
+// `KeyType`/`GenerateKeyOptions` are only used by the (test-gated) key generator.
+#[cfg(any(test, feature = "test-util"))]
+use security_framework::key::{GenerateKeyOptions, KeyType};
 use security_framework_sys::item::{
     kSecAttrKeyClass, kSecAttrKeyClassPrivate, kSecAttrKeyType, kSecAttrKeyTypeRSA,
 };
@@ -234,6 +229,7 @@ impl RsaKey {
     }
 
     /// Generates a fresh RSA key pair of the given modulus size in bits.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn generate(bits: u32) -> TdsResult<Self> {
         let mut options = GenerateKeyOptions::default();
         options.set_key_type(KeyType::rsa()).set_size_in_bits(bits);
@@ -243,6 +239,7 @@ impl RsaKey {
     }
 
     /// Serializes the private key to a PKCS#8 PEM document.
+    #[cfg(test)]
     pub(crate) fn to_pkcs8_pem(&self) -> TdsResult<Vec<u8>> {
         // `external_representation` yields PKCS#1 RSAPrivateKey DER for RSA keys.
         let pkcs1 = self.key.external_representation().ok_or_else(|| {

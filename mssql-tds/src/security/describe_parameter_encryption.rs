@@ -21,8 +21,6 @@
 //! parameter encryption breaks for every driver, so the indices below are
 //! treated as a stable wire contract.
 
-#![allow(dead_code)] // Fully consumed by the parameter-encryption execute path (Phase E pt3).
-
 use std::collections::HashMap;
 
 use crate::core::TdsResult;

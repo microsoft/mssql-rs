@@ -26,6 +26,11 @@ tls-schannel-direct = []
 # unconditionally — useful as an escape hatch if the rewrite needs to
 # be temporarily disabled in production.
 tls-schannel-direct-on-windows = ["tls-schannel-direct"]
+# Exposes in-process key-provisioning helpers used only by tests and tooling
+# (RSA key generation / PKCS#8 export and RsaKeyStoreProvider::generate_and_add_key).
+# Not part of the shipped API surface. Enabled for this crate's own tests via the
+# self dev-dependency below.
+test-util = []
 
 
 [lints]
@@ -123,3 +128,6 @@ criterion = "0.5"
 mssql-mock-tds = { path = "../mssql-mock-tds" }
 tempfile = "3.13"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+# Self dev-dependency: enables the `test-util` feature when building this crate's
+# integration tests (which use the in-process key-provisioning helpers).
+mssql-tds = { path = ".", features = ["test-util"] }

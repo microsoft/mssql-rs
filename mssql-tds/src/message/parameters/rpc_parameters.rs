@@ -292,7 +292,6 @@ impl RpcParameter {
     /// for an encrypted NULL) and the cipher metadata. When set, [`serialize`]
     /// writes the value as a BIGVARBINARY with the ENCRYPTED status flag and a
     /// trailing CryptoMetaData block instead of encoding the plaintext value.
-    #[allow(dead_code)]
     pub(crate) fn set_encrypted(
         &mut self,
         ciphertext: Option<Vec<u8>>,
@@ -306,7 +305,6 @@ impl RpcParameter {
 
     /// Returns the parameter's plaintext value. Used by the parameter-encryption
     /// path to normalize and encrypt the value before sending.
-    #[allow(dead_code)]
     pub(crate) fn value(&self) -> &SqlType {
         &self.value
     }

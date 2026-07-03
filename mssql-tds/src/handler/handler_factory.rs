@@ -151,7 +151,6 @@ impl NegotiatedSettings {
 
     /// Check if Always Encrypted (column encryption) was acknowledged by the
     /// server in FEATUREEXTACK.
-    #[allow(dead_code)] // populated during login, consumed by result-set decryption in a later phase
     pub(crate) fn is_column_encryption_supported(&self) -> bool {
         self.session_settings.supported_features.iter().any(|f| {
             f.feature_identifier() == FeatureExtension::AlwaysEncrypted && f.is_acknowledged()

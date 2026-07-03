@@ -30,10 +30,6 @@
 //! crate stay interoperable with SQL Server and the other Always Encrypted
 //! drivers regardless of which platform produced them.
 
-// Not every primitive is exercised by every consumer or on every platform; the
-// surface is intentionally complete for the cell cipher and CEK wrapping paths.
-#![allow(dead_code)]
-
 #[cfg(windows)]
 #[path = "cng.rs"]
 mod imp;

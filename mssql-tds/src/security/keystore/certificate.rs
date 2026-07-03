@@ -84,8 +84,8 @@ impl RsaKeyStoreProvider {
     /// Registers an already-parsed RSA key pair for `master_key_path`.
     ///
     /// Internal: callers outside the crate register keys via
-    /// [`Self::add_key_from_pem`] or [`Self::generate_and_add_key`], since
-    /// [`RsaKey`] is a crate-private wrapper over the platform crypto backend.
+    /// [`Self::add_key_from_pem`] (or, in tests/tooling, `generate_and_add_key`),
+    /// since [`RsaKey`] is a crate-private wrapper over the platform crypto backend.
     pub(crate) fn add_key(&mut self, master_key_path: impl AsRef<str>, key: RsaKey) {
         self.keys
             .insert(master_key_path.as_ref().to_ascii_lowercase(), key);
@@ -97,7 +97,9 @@ impl RsaKeyStoreProvider {
     /// The key material lives only in memory for the lifetime of this provider;
     /// it is never written to a certificate store or to disk. This is primarily
     /// useful for provisioning a throwaway column master key in tests and
-    /// tooling without persisting (or committing) static key material.
+    /// tooling without persisting (or committing) static key material, so it is
+    /// gated behind `cfg(test)` / the `test-util` feature.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn generate_and_add_key(&mut self, master_key_path: impl AsRef<str>) -> TdsResult<()> {
         let key = RsaKey::generate(2048)?;
         self.add_key(master_key_path, key);

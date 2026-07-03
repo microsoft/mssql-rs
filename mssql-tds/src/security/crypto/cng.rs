@@ -15,10 +15,6 @@
 //! stay interoperable with SQL Server regardless of which platform produced
 //! them.
 
-// Some primitives are only used by tests or by one consumer; keep the full
-// surface so the cell cipher and CEK wrapping paths share one backend.
-#![allow(dead_code)]
-
 use core::ffi::c_void;
 use std::ptr;
 
@@ -29,14 +25,20 @@ use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_PAD_OAEP, BCRYPT_PAD_PKCS1, BCRYPT_PKCS1_PADDING_INFO, BCRYPT_RSA_ALGORITHM,
     BCRYPT_SHA1_ALGORITHM, BCRYPT_SHA256_ALGORITHM, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
     BCryptCloseAlgorithmProvider, BCryptCreateHash, BCryptDecrypt, BCryptDestroyHash,
-    BCryptDestroyKey, BCryptEncrypt, BCryptExportKey, BCryptFinalizeKeyPair, BCryptFinishHash,
-    BCryptGenRandom, BCryptGenerateKeyPair, BCryptGenerateSymmetricKey, BCryptGetProperty,
-    BCryptHashData, BCryptImportKeyPair, BCryptOpenAlgorithmProvider, BCryptSetProperty,
-    BCryptSignHash, BCryptVerifySignature, CRYPT_ALGORITHM_IDENTIFIER, CRYPT_INTEGER_BLOB,
-    CRYPT_PRIVATE_KEY_INFO, CRYPT_STRING_BASE64, CRYPT_STRING_BASE64HEADER, CryptBinaryToStringA,
-    CryptDecodeObjectEx, CryptEncodeObjectEx, CryptStringToBinaryA, LEGACY_RSAPRIVATE_BLOB,
+    BCryptDestroyKey, BCryptEncrypt, BCryptFinishHash, BCryptGenRandom, BCryptGenerateSymmetricKey,
+    BCryptGetProperty, BCryptHashData, BCryptImportKeyPair, BCryptOpenAlgorithmProvider,
+    BCryptSetProperty, BCryptSignHash, BCryptVerifySignature, CRYPT_PRIVATE_KEY_INFO,
+    CRYPT_STRING_BASE64HEADER, CryptDecodeObjectEx, CryptStringToBinaryA, LEGACY_RSAPRIVATE_BLOB,
     PKCS_7_ASN_ENCODING, PKCS_PRIVATE_KEY_INFO, PKCS_RSA_PRIVATE_KEY, X509_ASN_ENCODING,
-    szOID_RSA_RSA,
+};
+// Backs the (test-util-gated) RSA key generator.
+#[cfg(any(test, feature = "test-util"))]
+use windows_sys::Win32::Security::Cryptography::{BCryptFinalizeKeyPair, BCryptGenerateKeyPair};
+// Backs the unit-test-only PKCS#8 exporter.
+#[cfg(test)]
+use windows_sys::Win32::Security::Cryptography::{
+    BCryptExportKey, CRYPT_ALGORITHM_IDENTIFIER, CRYPT_INTEGER_BLOB, CRYPT_STRING_BASE64,
+    CryptBinaryToStringA, CryptEncodeObjectEx, szOID_RSA_RSA,
 };
 
 use crate::core::TdsResult;
@@ -357,6 +359,7 @@ impl RsaKey {
     }
 
     /// Generates a fresh RSA key pair of the given modulus size in bits.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn generate(bits: u32) -> TdsResult<Self> {
         unsafe {
             let alg = open_alg(BCRYPT_RSA_ALGORITHM, 0)?;
@@ -399,6 +402,7 @@ impl RsaKey {
     }
 
     /// Serializes the private key to a PKCS#8 PEM document.
+    #[cfg(test)]
     pub(crate) fn to_pkcs8_pem(&self) -> TdsResult<Vec<u8>> {
         unsafe {
             // Export the legacy CAPI blob, re-encode it as PKCS#1 DER, then wrap
@@ -434,6 +438,7 @@ impl RsaKey {
     }
 
     /// Exports the key as a legacy CAPI RSA private blob.
+    #[cfg(test)]
     unsafe fn export_capi(&self) -> TdsResult<Vec<u8>> {
         let mut needed = 0u32;
         nt_check("BCryptExportKey", unsafe {
@@ -663,6 +668,7 @@ unsafe fn pem_to_der(pem: &[u8]) -> TdsResult<Vec<u8>> {
 }
 
 /// Base64-armors DER bytes into a PEM document with the given label.
+#[cfg(test)]
 unsafe fn der_to_pem(der: &[u8], label: &str) -> TdsResult<Vec<u8>> {
     let mut needed = 0u32;
     if unsafe {
@@ -735,6 +741,7 @@ unsafe fn decode_object(struct_type: windows_sys::core::PCSTR, der: &[u8]) -> Td
 }
 
 /// CryptoAPI `CryptEncodeObjectEx` wrapped with the two-call size pattern.
+#[cfg(test)]
 unsafe fn encode_object(
     struct_type: windows_sys::core::PCSTR,
     structure: *const c_void,

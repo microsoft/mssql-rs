@@ -178,7 +178,6 @@ impl MultiPartName {
 /// wraps it) to support key rotation; any one of them can be used to recover the
 /// plaintext CEK.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields consumed by CEK decryption in a later phase.
 pub(crate) struct EncryptedCekValue {
     /// The encrypted CEK bytes (ciphertext produced by the column master key).
     pub encrypted_key: Vec<u8>,
@@ -193,7 +192,6 @@ pub(crate) struct EncryptedCekValue {
 /// One entry in the COLMETADATA CEK table, describing a column encryption key
 /// and the encrypted values from which its plaintext can be recovered.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields consumed by CEK decryption in a later phase.
 pub(crate) struct CekTableEntry {
     /// Database identifier the CEK belongs to.
     pub database_id: i32,
@@ -210,7 +208,6 @@ pub(crate) struct CekTableEntry {
 /// Per-column cryptographic metadata for an Always Encrypted column, parsed from
 /// the COLMETADATA token when column encryption has been negotiated.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields consumed by result-set decryption in a later phase.
 pub(crate) struct CryptoMetadata {
     /// Ordinal into the result set's CEK table identifying the wrapping key.
     pub cek_table_ordinal: u16,
