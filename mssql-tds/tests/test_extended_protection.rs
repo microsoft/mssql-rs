@@ -31,6 +31,7 @@ use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMeth
 use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
+use mssql_tds::datatypes::column_values::ColumnValues;
 
 fn epa_enabled() -> bool {
     env::var("EPA_TEST").is_ok()
@@ -88,18 +89,26 @@ async fn epa_channel_binding_login_succeeds() -> TdsResult<()> {
         .await?
         .expect("sys.dm_exec_connections should return a row for the current session");
 
-    let scheme = format!("{:?}", row.first());
+    // Extract a column as UTF-8 text regardless of (n)varchar wire encoding.
+    // (`ColumnValues`' `Debug` renders a `varchar` as a raw byte array, so a
+    // string match on the debug output is unreliable -- decode the value.)
+    let column_text = |idx: usize| match row.get(idx) {
+        Some(ColumnValues::String(s)) => s.to_utf8_string(),
+        other => panic!("expected a string column at index {idx}, got {other:?}"),
+    };
+
+    let scheme = column_text(0).to_ascii_uppercase();
     assert!(
-        scheme.contains("NTLM") || scheme.contains("Kerberos"),
-        "expected a Windows auth scheme (NTLM/Kerberos), got {scheme}"
+        scheme.contains("NTLM") || scheme.contains("KERBEROS"),
+        "expected a Windows auth scheme (NTLM/Kerberos), got {scheme:?}"
     );
 
     // EPA channel binding requires an encrypted login; confirm the server sees
     // this connection as encrypted.
-    let encrypt = format!("{:?}", row.get(1));
-    assert!(
-        encrypt.contains("TRUE"),
-        "expected an encrypted login (encrypt_option = TRUE), got {encrypt}"
+    let encrypt = column_text(1);
+    assert_eq!(
+        encrypt, "TRUE",
+        "expected an encrypted login (encrypt_option = TRUE)"
     );
     connection.close_query().await?;
     Ok(())
