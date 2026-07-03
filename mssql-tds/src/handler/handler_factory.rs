@@ -665,6 +665,7 @@ impl LoginHandler<'_> {
 mod tests {
     use super::{NegotiatedSettings, create_test_negotiated_settings_internal};
     use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
+    use crate::message::features::session_recovery::SessionRecoveryFeature;
     use crate::message::login::Feature;
 
     fn settings_with_ae(acknowledged: bool) -> NegotiatedSettings {
@@ -694,5 +695,37 @@ mod tests {
     fn is_column_encryption_supported_false_when_feature_absent() {
         let settings = create_test_negotiated_settings_internal();
         assert!(!settings.is_column_encryption_supported());
+    }
+
+    fn settings_with_session_recovery(acknowledged: bool) -> NegotiatedSettings {
+        let mut settings = create_test_negotiated_settings_internal();
+        let mut feature = SessionRecoveryFeature::new(1);
+        feature.set_acknowledged(acknowledged);
+        settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+        settings
+    }
+
+    #[test]
+    fn is_session_recovery_acknowledged_true_when_acknowledged() {
+        // Regression guard: acknowledged features are now captured into
+        // NegotiatedSettings.session_settings.supported_features (previously
+        // hardcoded empty), so session-recovery detection actually works.
+        let settings = settings_with_session_recovery(true);
+        assert!(settings.is_session_recovery_acknowledged());
+    }
+
+    #[test]
+    fn is_session_recovery_acknowledged_false_when_unacknowledged() {
+        let settings = settings_with_session_recovery(false);
+        assert!(!settings.is_session_recovery_acknowledged());
+    }
+
+    #[test]
+    fn is_session_recovery_acknowledged_false_when_feature_absent() {
+        let settings = create_test_negotiated_settings_internal();
+        assert!(!settings.is_session_recovery_acknowledged());
     }
 }
