@@ -63,6 +63,10 @@ pub(crate) enum ColumnEncryptionType {
 
 /// An `AEAD_AES_256_CBC_HMAC_SHA256` cipher initialized from a column
 /// encryption key (the 32-byte plaintext root key).
+///
+/// The three derived sub-keys are zeroized on drop so the plaintext key material
+/// does not linger in freed memory.
+#[derive(zeroize::ZeroizeOnDrop)]
 pub(crate) struct AeadAes256CbcHmacSha256 {
     encryption_key: [u8; KEY_SIZE_IN_BYTES],
     mac_key: [u8; KEY_SIZE_IN_BYTES],

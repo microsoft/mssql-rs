@@ -49,6 +49,9 @@ tracing = { version = "0.1.43", features = ["log"] }
 bitflags = "2.10.0"
 thiserror = "2.0.17"
 bigdecimal = "0.4"
+# Zeroizes plaintext Always Encrypted key material (derived AEAD sub-keys and
+# resolved column encryption keys) on drop.
+zeroize = { version = "1.8", features = ["alloc", "derive"] }
 # For pretty printing of the packets in the traces.
 pretty-hex = "0.4"
 # Added for setting the keep alives on the socket.

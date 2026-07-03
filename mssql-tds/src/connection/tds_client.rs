@@ -788,7 +788,7 @@ impl TdsClient {
         // Always Encrypted: when column encryption is negotiated and enabled,
         // resolve the plaintext CEK for each encrypted destination column so the
         // writer can encrypt row values and emit the encrypted COLMETADATA.
-        let plaintext_ceks: Vec<Option<std::sync::Arc<Vec<u8>>>> = if self
+        let plaintext_ceks: Vec<Option<std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>>> = if self
             .should_encrypt_bulk_copy()
             && mapped_column_metadata.iter().any(|c| c.is_encrypted)
         {

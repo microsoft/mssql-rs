@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use zeroize::Zeroizing;
 
 use crate::core::TdsResult;
 use crate::datatypes::column_values::ColumnValues;
@@ -130,7 +131,7 @@ struct CekCacheKey {
 /// them.
 #[derive(Default)]
 pub(crate) struct CekCache {
-    entries: Mutex<HashMap<CekCacheKey, Arc<Vec<u8>>>>,
+    entries: Mutex<HashMap<CekCacheKey, Arc<Zeroizing<Vec<u8>>>>>,
 }
 
 impl CekCache {
@@ -139,7 +140,7 @@ impl CekCache {
         Self::default()
     }
 
-    fn get(&self, key: &CekCacheKey) -> Option<Arc<Vec<u8>>> {
+    fn get(&self, key: &CekCacheKey) -> Option<Arc<Zeroizing<Vec<u8>>>> {
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -147,7 +148,7 @@ impl CekCache {
             .cloned()
     }
 
-    fn insert(&self, key: CekCacheKey, value: Arc<Vec<u8>>) {
+    fn insert(&self, key: CekCacheKey, value: Arc<Zeroizing<Vec<u8>>>) {
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -171,7 +172,7 @@ pub(crate) async fn decrypt_cek(
     registry: &ColumnEncryptionKeyStoreProviderRegistry,
     cache: &CekCache,
     entry: &CekTableEntry,
-) -> TdsResult<Arc<Vec<u8>>> {
+) -> TdsResult<Arc<Zeroizing<Vec<u8>>>> {
     if entry.encrypted_cek_values.is_empty() {
         return Err(Error::ColumnEncryptionError(
             "CEK table entry has no encrypted key values".to_string(),
@@ -208,7 +209,7 @@ pub(crate) async fn decrypt_cek(
             .await
         {
             Ok(plaintext) => {
-                let plaintext = Arc::new(plaintext);
+                let plaintext = Arc::new(Zeroizing::new(plaintext));
                 cache.insert(cache_key, plaintext.clone());
                 return Ok(plaintext);
             }
@@ -235,14 +236,14 @@ pub(crate) async fn decrypt_cek(
 pub(crate) struct ResolvedCekDecryptor {
     /// Resolved plaintext CEKs indexed by CEK table ordinal. Each entry is the
     /// resolved key or the error message captured while resolving it.
-    ceks: Vec<Result<Arc<Vec<u8>>, String>>,
+    ceks: Vec<Result<Arc<Zeroizing<Vec<u8>>>, String>>,
 }
 
 impl std::fmt::Debug for ResolvedCekDecryptor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The resolved entries are plaintext CEKs (AES-256 secrets); never
         // format the key bytes. Error strings for unresolved entries are safe.
-        struct RedactedCek<'a>(&'a Result<Arc<Vec<u8>>, String>);
+        struct RedactedCek<'a>(&'a Result<Arc<Zeroizing<Vec<u8>>>, String>);
         impl std::fmt::Debug for RedactedCek<'_> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self.0 {
@@ -400,11 +401,11 @@ mod tests {
         let entry = entry(vec![cek_value("PROVIDER", "path", &[0xAB, 0xCD])]);
 
         let first = decrypt_cek(&registry, &cache, &entry).await.unwrap();
-        assert_eq!(first.as_ref(), &vec![7u8; 32]);
+        assert_eq!(first.as_slice(), vec![7u8; 32].as_slice());
 
         // Second resolution must come from the cache (provider not called again).
         let second = decrypt_cek(&registry, &cache, &entry).await.unwrap();
-        assert_eq!(second.as_ref(), &vec![7u8; 32]);
+        assert_eq!(second.as_slice(), vec![7u8; 32].as_slice());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
@@ -422,7 +423,7 @@ mod tests {
         ]);
 
         let key = decrypt_cek(&registry, &cache, &entry).await.unwrap();
-        assert_eq!(key.as_ref(), &vec![9u8; 32]);
+        assert_eq!(key.as_slice(), vec![9u8; 32].as_slice());
     }
 
     #[tokio::test]

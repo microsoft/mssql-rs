@@ -83,7 +83,7 @@ pub struct StreamingBulkLoadWriter<'a> {
     /// `column_metadata`. `None` for plaintext columns. Populated by the caller
     /// before `begin()` when column encryption is enabled; used to encrypt cell
     /// values on the write path.
-    plaintext_ceks: Vec<Option<std::sync::Arc<Vec<u8>>>>,
+    plaintext_ceks: Vec<Option<std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>>>,
 }
 
 impl<'a> StreamingBulkLoadWriter<'a> {
@@ -131,7 +131,10 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// aligned with the column metadata. Entries are `None` for plaintext
     /// columns. Must be called before `begin()` when column encryption is
     /// enabled and any column is encrypted.
-    pub(crate) fn set_plaintext_ceks(&mut self, ceks: Vec<Option<std::sync::Arc<Vec<u8>>>>) {
+    pub(crate) fn set_plaintext_ceks(
+        &mut self,
+        ceks: Vec<Option<std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>>>,
+    ) {
         self.plaintext_ceks = ceks;
     }
 
@@ -1277,7 +1280,9 @@ mod ae_colmetadata_tests {
                 SqlCollation::default(),
             );
             writer.set_column_encryption_enabled(true);
-            writer.set_plaintext_ceks(vec![Some(Arc::new(TEST_CEK.to_vec()))]);
+            writer.set_plaintext_ceks(vec![Some(Arc::new(zeroize::Zeroizing::new(
+                TEST_CEK.to_vec(),
+            )))]);
             writer.begin().await.unwrap();
             writer.write_column_value(0, &value).await.unwrap();
             let _ = writer.end().await.unwrap();
@@ -1314,7 +1319,9 @@ mod ae_colmetadata_tests {
                 SqlCollation::default(),
             );
             writer.set_column_encryption_enabled(true);
-            writer.set_plaintext_ceks(vec![Some(Arc::new(TEST_CEK.to_vec()))]);
+            writer.set_plaintext_ceks(vec![Some(Arc::new(zeroize::Zeroizing::new(
+                TEST_CEK.to_vec(),
+            )))]);
             writer.begin().await.unwrap();
             writer
                 .write_column_value(0, &ColumnValues::Null)
