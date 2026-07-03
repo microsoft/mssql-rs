@@ -65,39 +65,36 @@ pub(crate) fn query_unique_bindings(ctx: &SecCtx) -> io::Result<Vec<u8>> {
             "QueryContextAttributesW(SECPKG_ATTR_UNIQUE_BINDINGS) failed",
         ));
     }
-    if bindings.Bindings.is_null() || bindings.BindingsLength == 0 {
-        // A non-null pointer with a zero length is still an SSPI-owned
-        // allocation; free it before bailing so we don't leak the buffer.
-        if !bindings.Bindings.is_null() {
-            // SAFETY: `Bindings` is a context buffer returned by
-            // QueryContextAttributesW on SEC_E_OK; release it exactly once.
-            unsafe {
-                Identity::FreeContextBuffer(bindings.Bindings as *mut _);
-            }
-        }
-        return Err(io::Error::other(
+    // Copy the token out (or record the empty-buffer error) *before* freeing,
+    // so the `FreeContextBuffer` below runs on a single shared path and cannot
+    // leak `Bindings` regardless of which branch we took.
+    let result = if bindings.Bindings.is_null() || bindings.BindingsLength == 0 {
+        Err(io::Error::other(
             "QueryContextAttributesW(UNIQUE_BINDINGS) returned an empty buffer",
-        ));
-    }
-
-    // SAFETY: on SEC_E_OK Schannel guarantees `Bindings` points at a single
-    // allocation of `BindingsLength` bytes (SEC_CHANNEL_BINDINGS header plus
-    // application data). Copy it out verbatim.
-    let token = unsafe {
-        std::slice::from_raw_parts(
-            bindings.Bindings as *const u8,
-            bindings.BindingsLength as usize,
-        )
-        .to_vec()
+        ))
+    } else {
+        // SAFETY: on SEC_E_OK Schannel guarantees `Bindings` points at a single
+        // allocation of `BindingsLength` bytes (SEC_CHANNEL_BINDINGS header plus
+        // application data). Copy it out verbatim.
+        let token = unsafe {
+            std::slice::from_raw_parts(
+                bindings.Bindings as *const u8,
+                bindings.BindingsLength as usize,
+            )
+            .to_vec()
+        };
+        Ok(token)
     };
 
-    // SAFETY: `Bindings` is an SSPI-owned context buffer returned by
-    // QueryContextAttributesW; release it exactly once.
-    unsafe {
-        Identity::FreeContextBuffer(bindings.Bindings as *mut _);
+    if !bindings.Bindings.is_null() {
+        // SAFETY: `Bindings` is an SSPI-owned context buffer returned by
+        // QueryContextAttributesW on SEC_E_OK; release it exactly once.
+        unsafe {
+            Identity::FreeContextBuffer(bindings.Bindings as *mut _);
+        }
     }
 
-    Ok(token)
+    result
 }
 
 #[cfg(test)]
