@@ -229,15 +229,27 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
             let (columns, decryptor) = extract_row_context(context)?;
             let decoder = GenericDecoder::default();
             for (col, meta) in columns.iter().enumerate() {
-                // Only decrypt when a decryptor is available. When column
-                // encryption is disabled for this command the decryptor is
-                // `None`, so the ciphertext varbinary is decoded normally
-                // instead of erroring.
-                if meta.crypto_metadata.is_some() && decryptor.is_some() {
-                    let value = decrypt_encrypted_column(&decoder, reader, meta, decryptor).await?;
-                    write_column_value(writer, col, value);
-                } else {
-                    decoder.decode_into(reader, meta, col, writer).await?;
+                // Decrypt only when a decryptor is available. Otherwise decode
+                // the ciphertext varbinary normally, but log the
+                // encrypted-but-undecryptable case so a misconfiguration is
+                // observable rather than silently returning ciphertext.
+                match (meta.crypto_metadata.is_some(), decryptor) {
+                    (true, Some(dec)) => {
+                        let value = decrypt_encrypted_column(&decoder, reader, meta, dec).await?;
+                        write_column_value(writer, col, value);
+                    }
+                    (true, None) => {
+                        tracing::info!(
+                            column = %meta.column_name,
+                            "Encrypted column has no column-encryption decryptor available \
+                             (Always Encrypted disabled for this command, or no key-store \
+                             provider registered); returning the raw ciphertext varbinary"
+                        );
+                        decoder.decode_into(reader, meta, col, writer).await?;
+                    }
+                    (false, _) => {
+                        decoder.decode_into(reader, meta, col, writer).await?;
+                    }
                 }
             }
             Ok(RowReadResult::RowWritten)
@@ -251,11 +263,26 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
             for (col, meta) in columns.iter().enumerate() {
                 if bitmap[col / 8] & (1 << (col % 8)) != 0 {
                     writer.write_null(col);
-                } else if meta.crypto_metadata.is_some() && decryptor.is_some() {
-                    let value = decrypt_encrypted_column(&decoder, reader, meta, decryptor).await?;
-                    write_column_value(writer, col, value);
                 } else {
-                    decoder.decode_into(reader, meta, col, writer).await?;
+                    match (meta.crypto_metadata.is_some(), decryptor) {
+                        (true, Some(dec)) => {
+                            let value =
+                                decrypt_encrypted_column(&decoder, reader, meta, dec).await?;
+                            write_column_value(writer, col, value);
+                        }
+                        (true, None) => {
+                            tracing::info!(
+                                column = %meta.column_name,
+                                "Encrypted column has no column-encryption decryptor available \
+                                 (Always Encrypted disabled for this command, or no key-store \
+                                 provider registered); returning the raw ciphertext varbinary"
+                            );
+                            decoder.decode_into(reader, meta, col, writer).await?;
+                        }
+                        (false, _) => {
+                            decoder.decode_into(reader, meta, col, writer).await?;
+                        }
+                    }
                 }
             }
             Ok(RowReadResult::RowWritten)

@@ -89,6 +89,46 @@ pub(crate) fn decrypt_cell(
     )
 }
 
+/// Narrows a normalized 8-byte integer to a smaller signed/unsigned width.
+///
+/// The upper bytes of the normalized form are expected to be zero (or sign
+/// extension), so the cast is lossless in practice. If a post-HMAC,
+/// server-trusted value does not fit — a wire-format drift or upstream bug — the
+/// cast still truncates (hard-failing trusted data would be too aggressive), but
+/// we emit a `trace!` breadcrumb so the assumption break is not invisible.
+fn narrow_tinyint(value: i64) -> u8 {
+    if u8::try_from(value).is_err() {
+        tracing::trace!(
+            value,
+            target = "tinyint(u8)",
+            "Always Encrypted integer does not fit target width; truncating"
+        );
+    }
+    value as u8
+}
+
+fn narrow_smallint(value: i64) -> i16 {
+    if i16::try_from(value).is_err() {
+        tracing::trace!(
+            value,
+            target = "smallint(i16)",
+            "Always Encrypted integer does not fit target width; truncating"
+        );
+    }
+    value as i16
+}
+
+fn narrow_int(value: i64) -> i32 {
+    if i32::try_from(value).is_err() {
+        tracing::trace!(
+            value,
+            target = "int(i32)",
+            "Always Encrypted integer does not fit target width; truncating"
+        );
+    }
+    value as i32
+}
+
 /// Converts normalized plaintext bytes back into a typed [`ColumnValues`].
 pub(crate) fn denormalize(
     plaintext: &[u8],
@@ -106,16 +146,18 @@ pub(crate) fn denormalize(
     match base_data_type {
         // Integer family: normalized to an 8-byte little-endian bigint.
         TdsDataType::Bit | TdsDataType::BitN => Ok(ColumnValues::Bit(read_i64(plaintext)? != 0)),
-        TdsDataType::Int1 => Ok(ColumnValues::TinyInt(read_i64(plaintext)? as u8)),
-        TdsDataType::Int2 => Ok(ColumnValues::SmallInt(read_i64(plaintext)? as i16)),
-        TdsDataType::Int4 => Ok(ColumnValues::Int(read_i64(plaintext)? as i32)),
+        TdsDataType::Int1 => Ok(ColumnValues::TinyInt(narrow_tinyint(read_i64(plaintext)?))),
+        TdsDataType::Int2 => Ok(ColumnValues::SmallInt(narrow_smallint(read_i64(
+            plaintext,
+        )?))),
+        TdsDataType::Int4 => Ok(ColumnValues::Int(narrow_int(read_i64(plaintext)?))),
         TdsDataType::Int8 => Ok(ColumnValues::BigInt(read_i64(plaintext)?)),
         TdsDataType::IntN => {
             let value = read_i64(plaintext)?;
             match base_type_info.length {
-                1 => Ok(ColumnValues::TinyInt(value as u8)),
-                2 => Ok(ColumnValues::SmallInt(value as i16)),
-                4 => Ok(ColumnValues::Int(value as i32)),
+                1 => Ok(ColumnValues::TinyInt(narrow_tinyint(value))),
+                2 => Ok(ColumnValues::SmallInt(narrow_smallint(value))),
+                4 => Ok(ColumnValues::Int(narrow_int(value))),
                 8 => Ok(ColumnValues::BigInt(value)),
                 other => Err(Error::ColumnEncryptionError(format!(
                     "Invalid IntN base length {other} for encrypted column"

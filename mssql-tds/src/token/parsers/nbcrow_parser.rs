@@ -4,7 +4,7 @@
 use std::{io::Error, vec};
 
 use async_trait::async_trait;
-use tracing::trace;
+use tracing::{info, trace};
 
 use super::super::tokens::{RowToken, Tokens};
 use super::common::TokenParser;
@@ -73,12 +73,26 @@ impl<T: SqlTypeDecode + Sync, P: TdsPacketReader + Send + Sync> TokenParser<P>
 
             if is_null {
                 all_values.push(ColumnValues::Null);
-            } else if metadata.crypto_metadata.is_some() && decryptor.is_some() {
-                all_values.push(
-                    decrypt_encrypted_column(&self.decoder, reader, metadata, decryptor).await?,
-                );
             } else {
-                let column_value = self.decoder.decode(reader, metadata).await?;
+                let column_value = match (metadata.crypto_metadata.is_some(), decryptor) {
+                    (true, Some(dec)) => {
+                        decrypt_encrypted_column(&self.decoder, reader, metadata, dec).await?
+                    }
+                    (true, None) => {
+                        // Encrypted column but no decryptor: AE disabled for this
+                        // command (expected) or enabled-but-misconfigured. Log
+                        // so the misconfigured case is observable, then decode
+                        // the raw ciphertext varbinary.
+                        info!(
+                            column = %metadata.column_name,
+                            "Encrypted column has no column-encryption decryptor available \
+                             (Always Encrypted disabled for this command, or no key-store \
+                             provider registered); returning the raw ciphertext varbinary"
+                        );
+                        self.decoder.decode(reader, metadata).await?
+                    }
+                    (false, _) => self.decoder.decode(reader, metadata).await?,
+                };
                 all_values.push(column_value);
             }
         }

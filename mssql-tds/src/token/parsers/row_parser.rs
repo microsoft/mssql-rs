@@ -74,7 +74,7 @@
 use std::io::Error;
 
 use async_trait::async_trait;
-use tracing::trace;
+use tracing::{info, trace};
 
 use super::super::tokens::{RowToken, Tokens};
 use super::common::TokenParser;
@@ -145,13 +145,27 @@ impl<D: SqlTypeDecode + Default + Send + Sync, P: TdsPacketReader + Send + Sync>
             // - Type-specific encoding (collation, precision, scale, etc.)
             // Encrypted columns arrive as varbinary cipher bytes and are
             // decrypted into their plaintext base type via the decryptor. When
-            // no decryptor is available (column encryption disabled for this
-            // command) the ciphertext varbinary is decoded as-is instead of
-            // erroring.
-            let column_value = if metadata.crypto_metadata.is_some() && decryptor.is_some() {
-                decrypt_encrypted_column(&self.decoder, reader, metadata, decryptor).await?
-            } else {
-                self.decoder.decode(reader, metadata).await?
+            // no decryptor is available the ciphertext varbinary is decoded
+            // as-is instead of erroring — but that can hide a misconfiguration,
+            // so the encrypted-but-undecryptable case is logged.
+            let column_value = match (metadata.crypto_metadata.is_some(), decryptor) {
+                (true, Some(dec)) => {
+                    decrypt_encrypted_column(&self.decoder, reader, metadata, dec).await?
+                }
+                (true, None) => {
+                    // Either AE is disabled for this command (expected) or it is
+                    // enabled but misconfigured (e.g. no key-store provider
+                    // registered). Log so the misconfigured case is observable,
+                    // then decode the raw ciphertext varbinary.
+                    info!(
+                        column = %metadata.column_name,
+                        "Encrypted column has no column-encryption decryptor available \
+                         (Always Encrypted disabled for this command, or no key-store \
+                         provider registered); returning the raw ciphertext varbinary"
+                    );
+                    self.decoder.decode(reader, metadata).await?
+                }
+                (false, _) => self.decoder.decode(reader, metadata).await?,
             };
 
             all_values.push(column_value);

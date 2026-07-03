@@ -263,6 +263,22 @@ impl FeaturesRequest {
 
 use crate::connection::session_recovery::SessionRecoveryData;
 
+/// Emits a warning when Always Encrypted is enabled on the connection but no
+/// column master key store providers are registered. Without a provider, every
+/// encrypt/decrypt later fails with a `ColumnEncryptionError`; warning here turns
+/// that confusing first-query failure into an actionable connection-setup hint.
+fn warn_if_always_encrypted_has_no_providers(context: &ClientContext) {
+    if context.column_encryption_setting == ColumnEncryptionSetting::Enabled
+        && context.column_encryption_key_store_providers.is_empty()
+    {
+        tracing::warn!(
+            "Always Encrypted is enabled on this connection but no column master key store \
+             providers are registered; encrypted columns and parameters cannot resolve their \
+             keys until a provider (e.g. MSSQL_CERTIFICATE_STORE) is registered"
+        );
+    }
+}
+
 impl From<(&ClientContext, bool)> for FeaturesRequest {
     fn from(context_and_prelogin_fedauth_flag: (&ClientContext, bool)) -> Self {
         let context = context_and_prelogin_fedauth_flag.0;
@@ -274,6 +290,8 @@ impl From<(&ClientContext, bool)> for FeaturesRequest {
             context.column_encryption_setting,
             UserAgentFeature::new(context),
         );
+
+        warn_if_always_encrypted_has_no_providers(context);
 
         if context.connect_retry_count > 0 {
             request.features.insert(
@@ -303,6 +321,8 @@ impl FeaturesRequest {
             context.column_encryption_setting,
             UserAgentFeature::new(context),
         );
+
+        warn_if_always_encrypted_has_no_providers(context);
 
         if context.connect_retry_count > 0 {
             let feature = if let Some(recovery_data) = recovery_data {

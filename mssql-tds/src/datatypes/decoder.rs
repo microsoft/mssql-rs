@@ -32,15 +32,17 @@ use super::row_writer::{RowWriter, write_column_value};
 ///
 /// An Always Encrypted column is transmitted as `varbinary`, so the cipher blob
 /// is decoded through the normal value path before being decrypted. A NULL cell
-/// decrypts to [`ColumnValues::Null`]. When `decryptor` is `None` (column
-/// encryption is not enabled, or no key store providers are available) an
-/// encrypted column cannot be decrypted, so an error is returned rather than
-/// surfacing ciphertext to the caller.
+/// decrypts to [`ColumnValues::Null`].
+///
+/// The caller decides whether a column should be decrypted, so this is only
+/// invoked with a live `decryptor`. Callers without one (Always Encrypted
+/// disabled for the command, or no key store providers registered) decode the
+/// raw ciphertext varbinary instead and never reach here.
 pub(crate) async fn decrypt_encrypted_column<D, T>(
     decoder: &D,
     reader: &mut T,
     metadata: &ColumnMetadata,
-    decryptor: Option<&Arc<dyn CellDecryptor>>,
+    decryptor: &Arc<dyn CellDecryptor>,
 ) -> TdsResult<ColumnValues>
 where
     D: SqlTypeDecode,
@@ -61,14 +63,6 @@ where
     let crypto_metadata = metadata.crypto_metadata.as_ref().ok_or_else(|| {
         crate::error::Error::ColumnEncryptionError(format!(
             "decrypt_encrypted_column called for non-encrypted column '{}'",
-            metadata.column_name
-        ))
-    })?;
-
-    let decryptor = decryptor.ok_or_else(|| {
-        crate::error::Error::ColumnEncryptionError(format!(
-            "Column '{}' is encrypted but no column encryption key store providers are \
-             available to decrypt it",
             metadata.column_name
         ))
     })?;
