@@ -43,13 +43,24 @@ mod imp;
 mod imp;
 
 // PEM/DER framing helpers for the Apple backend. They contain no cryptography,
-// so they are also compiled (and unit-tested) on other platforms under `test`.
-#[cfg(any(target_os = "macos", test))]
+// so they are also compiled (and unit-tested) on other platforms under `test`,
+// and compiled under `fuzzing` so the framing parsers can be fuzzed.
+#[cfg(any(target_os = "macos", test, fuzzing))]
 mod der;
 
 pub(crate) use imp::RsaKey;
 
 use crate::core::TdsResult;
+
+/// Fuzz entry point for the hand-rolled DER/PEM framing helpers, which parse
+/// attacker-influenceable key material. Exercises the TLV reader (`read_tlv`,
+/// reached via `rsa_private_key_to_pkcs1`) and the PEM/base64 framing in
+/// `pem_to_der`. Neither performs any cryptography.
+#[cfg(fuzzing)]
+pub fn fuzz_der_framing(data: &[u8]) {
+    let _ = der::pem_to_der(data);
+    let _ = der::rsa_private_key_to_pkcs1(data);
+}
 
 /// Number of bytes in an AES-256 key (and in each Always Encrypted derived key).
 pub(crate) const AES_256_KEY_LEN: usize = 32;

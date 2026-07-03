@@ -12,6 +12,9 @@
 //! lives in safe, portable Rust and is unit-tested on every platform (the Apple
 //! `SecKey` calls that consume the output can only be exercised on macOS).
 
+// Under `fuzzing` only the framing parsers are exercised; the encode-side helpers
+// (only used by the Apple backend / tests) are then unused.
+#![cfg_attr(fuzzing, allow(dead_code))]
 // These helpers are only wired into the macOS backend; on other targets they are
 // still compiled under `cfg(test)` so their round-trips stay covered.
 #![allow(dead_code)]
