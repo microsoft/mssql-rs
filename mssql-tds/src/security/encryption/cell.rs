@@ -20,7 +20,7 @@
 //!   an 8-byte little-endian `bigint`.
 //! * `real`/`float` keep their 4- or 8-byte IEEE form.
 //! * `smallmoney`/`money` are normalized to the 8-byte `money` form (high dword
-//!   then low dword); `smallmoney` uses the low dword.
+//!   then low dword); `smallmoney` is sign-extended into that form.
 //! * `decimal`/`numeric` are a sign byte followed by the little-endian magnitude.
 //! * `binary`/`varbinary` and `uniqueidentifier` keep their raw bytes.
 //! * Character types keep their encoded bytes (UTF-16LE for the `n` types, the
@@ -699,11 +699,15 @@ fn normalize_money(m: &SqlMoney) -> Vec<u8> {
     out
 }
 
-/// Normalizes a `smallmoney` value to the 8-byte money form (value in low dword).
+/// Normalizes a `smallmoney` value to the 8-byte money form. `smallmoney` is a
+/// 4-byte scaled signed integer; the 8-byte money form is `[high dword][low
+/// dword]`, so the value must be sign-extended — negative values fill the high
+/// dword with `0xFFFFFFFF` — to match SQL Server and the other AE clients.
 fn normalize_small_money(m: &SqlSmallMoney) -> Vec<u8> {
+    let value = i64::from(m.int_val);
     let mut out = Vec::with_capacity(8);
-    out.extend_from_slice(&0i32.to_le_bytes());
-    out.extend_from_slice(&m.int_val.to_le_bytes());
+    out.extend_from_slice(&((value >> 32) as i32).to_le_bytes());
+    out.extend_from_slice(&(value as i32).to_le_bytes());
     out
 }
 
@@ -783,6 +787,29 @@ mod tests {
     use super::*;
     use crate::datatypes::sqldatatypes::{FixedLengthTypes, TypeInfoVariant, VariableLengthTypes};
     use crate::security::encryption::ColumnEncryptionType;
+
+    #[test]
+    fn normalize_small_money_sign_extends() {
+        // Positive: high dword is zero, low dword is the scaled integer.
+        let pos = normalize_small_money(&SqlSmallMoney { int_val: 123_450 });
+        assert_eq!(&pos[0..4], &0i32.to_le_bytes());
+        assert_eq!(&pos[4..8], &123_450i32.to_le_bytes());
+
+        // Negative: high dword is 0xFFFFFFFF (sign-extended), not zero. A zero
+        // high dword would produce a bogus large-positive money whose
+        // deterministic ciphertext would not match SQL Server / other AE clients.
+        let neg = normalize_small_money(&SqlSmallMoney { int_val: -123_450 });
+        assert_eq!(&neg[0..4], &(-1i32).to_le_bytes());
+        assert_eq!(&neg[4..8], &(-123_450i32).to_le_bytes());
+
+        // A negative `smallmoney` normalizes to the same 8 bytes as the
+        // equivalent `money` value.
+        let money = normalize_money(&SqlMoney {
+            msb_part: -1,
+            lsb_part: -123_450,
+        });
+        assert_eq!(neg, money);
+    }
 
     /// A fixed 32-byte CEK used to round-trip through the cipher.
     const CEK: [u8; 32] = [

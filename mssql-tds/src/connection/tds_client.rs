@@ -1023,6 +1023,20 @@ impl TdsClient {
             ));
         };
 
+        // Positional stored-procedure parameters cannot be referenced by name in
+        // the `sp_describe_parameter_encryption` request, so they cannot be
+        // transparently encrypted. Fail fast rather than silently sending them
+        // as plaintext on an Always Encrypted connection.
+        if self.column_encryption_enabled_on_connection()
+            && positional_parameters
+                .as_ref()
+                .is_some_and(|p| !p.is_empty())
+        {
+            return Err(Self::ae_params_unsupported(
+                "positional stored-procedure parameters",
+            ));
+        }
+
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -1120,6 +1134,16 @@ impl TdsClient {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
+
+        // The prepared-statement paths do not yet run the AE describe/encrypt
+        // flow, so a prepared statement with parameters cannot be safely used on
+        // an Always Encrypted connection. Fail fast instead of preparing a
+        // statement whose parameters would later be sent as plaintext.
+        if self.column_encryption_enabled_on_connection() && !named_params.is_empty() {
+            return Err(Self::ae_params_unsupported(
+                "prepared statements (sp_prepare)",
+            ));
+        }
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
@@ -1288,6 +1312,15 @@ impl TdsClient {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
+        // The prepared-statement paths do not yet run the AE describe/encrypt
+        // flow, so parameter values here would be sent as plaintext on an
+        // Always Encrypted connection. Fail fast instead.
+        if self.column_encryption_enabled_on_connection() && !named_params.is_empty() {
+            return Err(Self::ae_params_unsupported(
+                "prepared statements (sp_prepexec)",
+            ));
+        }
+
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -1370,6 +1403,20 @@ impl TdsClient {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
+
+        // The prepared-statement paths do not yet run the AE describe/encrypt
+        // flow, so parameter values here would be sent as plaintext on an
+        // Always Encrypted connection. Fail fast instead.
+        if self.column_encryption_enabled_on_connection()
+            && (positional_parameters
+                .as_ref()
+                .is_some_and(|p| !p.is_empty())
+                || named_parameters.as_ref().is_some_and(|p| !p.is_empty()))
+        {
+            return Err(Self::ae_params_unsupported(
+                "prepared statements (sp_execute)",
+            ));
+        }
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
@@ -1646,11 +1693,10 @@ impl TdsClient {
             && self.effective_command_ce_setting() == ExecutionColumnEncryptionSetting::Enabled
     }
 
-    /// Returns `true` when bulk copy row values should be encrypted: the server
-    /// acknowledged Always Encrypted during login and the connection enabled
-    /// column encryption. Bulk copy has no per-command override, so this folds
-    /// directly against the connection setting.
-    fn should_encrypt_bulk_copy(&self) -> bool {
+    /// Returns `true` when the connection negotiated Always Encrypted and
+    /// enabled column encryption, ignoring any per-command override. Used by
+    /// paths that have no per-command setting (bulk copy, prepared statements).
+    fn column_encryption_enabled_on_connection(&self) -> bool {
         use crate::connection::client_context::ColumnEncryptionSetting;
 
         self.negotiated_settings.is_column_encryption_supported()
@@ -1660,6 +1706,28 @@ impl TdsClient {
                 .as_ref()
                 .map(|c| c.column_encryption_setting == ColumnEncryptionSetting::Enabled)
                 .unwrap_or(false)
+    }
+
+    /// Returns `true` when bulk copy row values should be encrypted: the server
+    /// acknowledged Always Encrypted during login and the connection enabled
+    /// column encryption. Bulk copy has no per-command override, so this folds
+    /// directly against the connection setting.
+    fn should_encrypt_bulk_copy(&self) -> bool {
+        self.column_encryption_enabled_on_connection()
+    }
+
+    /// Error for execution paths that cannot yet transparently encrypt their
+    /// parameters under Always Encrypted. Returned instead of silently sending
+    /// plaintext parameter values on an AE-enabled connection.
+    fn ae_params_unsupported(path: &str) -> crate::error::Error {
+        crate::error::Error::UnimplementedFeature {
+            feature: format!("Always Encrypted for {path}"),
+            context: "Column encryption is enabled on this connection but this execution path \
+                      does not run sp_describe_parameter_encryption, so its parameters cannot be \
+                      transparently encrypted. Use execute_sp_executesql or named \
+                      stored-procedure parameters, or disable column encryption for this command."
+                .into(),
+        }
     }
 
     /// Resolves the effective Column Encryption setting for the current command,

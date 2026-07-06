@@ -526,6 +526,18 @@ mod always_encrypted {
                 },
             )
             .await;
+
+            // Negative smallmoney must sign-extend into the 8-byte money form.
+            h.roundtrip(
+                "SMALLMONEY",
+                "DETERMINISTIC",
+                SqlType::SmallMoney(Some(SqlSmallMoney { int_val: -123_450 })),
+                |v| match v {
+                    ColumnValues::SmallMoney(value) => assert_eq!(value.int_val, -123_450),
+                    other => panic!("expected smallmoney, got {other:?}"),
+                },
+            )
+            .await;
         });
     }
 
@@ -859,6 +871,88 @@ mod always_encrypted {
             assert!(
                 matches!(got, ColumnValues::Int(321)),
                 "stored-procedure encrypted insert round-trip, got {got:?}"
+            );
+        });
+    }
+
+    /// Positional stored-procedure parameters cannot be referenced by name in
+    /// the `sp_describe_parameter_encryption` request, so they cannot be
+    /// transparently encrypted. On an Always Encrypted connection the call must
+    /// fail fast rather than silently send the parameter as plaintext.
+    #[tokio::test]
+    async fn positional_stored_proc_params_fail_fast_under_ae() {
+        ae_test!(|h| {
+            let param = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(1)));
+            let err = h
+                .client
+                .execute_stored_procedure(
+                    "sys.sp_who".to_string(),
+                    Some(vec![param]),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("positional sproc params must fail fast under AE");
+            assert!(
+                matches!(err, mssql_tds::error::Error::UnimplementedFeature { .. }),
+                "expected UnimplementedFeature, got {err:?}"
+            );
+        });
+    }
+
+    /// The prepared-statement paths (`sp_prepare` / `sp_prepexec` / `sp_execute`)
+    /// do not yet run the AE describe/encrypt flow, so on an Always Encrypted
+    /// connection they must fail fast with parameters rather than send plaintext.
+    #[tokio::test]
+    async fn prepared_statement_params_fail_fast_under_ae() {
+        ae_test!(|h| {
+            let sql = "SELECT @p".to_string();
+            let mk_param = || {
+                RpcParameter::new(
+                    Some("@p".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(1)),
+                )
+            };
+
+            let prepare_err = h
+                .client
+                .execute_sp_prepare(sql.clone(), vec![mk_param()], None, None)
+                .await
+                .expect_err("sp_prepare with params must fail fast under AE");
+            assert!(
+                matches!(
+                    prepare_err,
+                    mssql_tds::error::Error::UnimplementedFeature { .. }
+                ),
+                "expected UnimplementedFeature for sp_prepare, got {prepare_err:?}"
+            );
+
+            let prepexec_err = h
+                .client
+                .execute_sp_prepexec(sql.clone(), vec![mk_param()], None, None)
+                .await
+                .expect_err("sp_prepexec with params must fail fast under AE");
+            assert!(
+                matches!(
+                    prepexec_err,
+                    mssql_tds::error::Error::UnimplementedFeature { .. }
+                ),
+                "expected UnimplementedFeature for sp_prepexec, got {prepexec_err:?}"
+            );
+
+            let execute_err = h
+                .client
+                .execute_sp_execute(1, None, Some(vec![mk_param()]), None, None)
+                .await
+                .expect_err("sp_execute with params must fail fast under AE");
+            assert!(
+                matches!(
+                    execute_err,
+                    mssql_tds::error::Error::UnimplementedFeature { .. }
+                ),
+                "expected UnimplementedFeature for sp_execute, got {execute_err:?}"
             );
         });
     }
