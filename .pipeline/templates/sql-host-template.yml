@@ -50,10 +50,16 @@ parameters:
   - name: poolImageOverride
     type: string
     default: 'imageOverride -equals RUST-1ES-UBUSLIM'
+  - name: jobCondition
+    # Job-level condition. Defaults to succeeded(); callers that only need the
+    # SQL host on PRs (e.g. the Build stage) pass a Build.Reason check.
+    type: string
+    default: succeeded()
 
 jobs:
   - job: Sql_Host_${{ parameters.instanceId }}
     displayName: 'SQL host (${{ parameters.instanceId }})'
+    condition: ${{ parameters.jobCondition }}
     # Generous ADO-level safety net; the real cap is enforced by the watcher
     # script via MAX_LIFETIME_MINUTES (parameter below) and is always lower.
     timeoutInMinutes: 240

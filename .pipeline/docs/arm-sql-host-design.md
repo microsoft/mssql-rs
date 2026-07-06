@@ -264,20 +264,30 @@ pipeline parameter if a use case appears.
 ## PR vs merge coverage
 
 Because the SQL host is now booted on-demand (no static ACI IP to contend
-for), the ARM test stages also run on pull requests. Following the existing
-Kerberos pattern, coverage is split into reduced PR stages and full merge
-stages:
+for), ARM64 integration tests can run on pull requests. Rather than a
+separate ARM test stage, PR coverage is folded into the existing
+`Build_Linux_ARM` job: it connects cross-pool to an on-demand SQL host booted
+inside the **Build** stage (`Sql_Host_build_arm`), so the ARM64 build's own
+test pass exercises the full integration suite instead of skipping it. The
+full multi-distro ARM test matrices still run on merge.
 
-| Stage                   | Trigger        | Matrix                                  |
-|-------------------------|----------------|-----------------------------------------|
-| `Test_arm64_PR`         | PR             | Ubuntu24, AzLinux3                       |
-| `Test_alpine_arm64_PR`  | PR             | Alpine3_21                              |
-| `Test_arm64`            | non-PR (merge) | full glibc matrix (7 distros)           |
-| `Test_alpine_arm64`     | non-PR (merge) | full musl matrix (Alpine 3.18–3.21)     |
+| Coverage                          | Trigger        | Where                                       |
+|-----------------------------------|----------------|---------------------------------------------|
+| `Build_Linux_ARM` integration pass | PR             | Build stage, vs `Sql_Host_build_arm`        |
+| `Test_arm64`                      | non-PR (merge) | full glibc matrix (7 distros)               |
+| `Test_alpine_arm64`               | non-PR (merge) | full musl matrix (Alpine 3.18–3.21)         |
 
-The `_PR` stages `dependsOn` `Build` (for the `Build_Linux_ARM` artifact) and
-`EvaluateDuplicate`, and are skipped when a prior successful PR validation is
-detected (`skipDuplicate`). Each PR stage boots one shared SQL host by default.
+`Sql_Host_build_arm` is a PR-only instance of `sql-host-template.yml` added to
+the Build stage (`jobCondition: eq(Build.Reason, 'PullRequest')`). It runs
+concurrently with `Build_Linux_ARM` (no `dependsOn`) and the two rendezvous
+via the same `sql-ready-build_arm` / `build_arm` sentinel pair used by the
+test stages. On merge the host job is skipped and the ARM build's test pass
+does not run (its steps are PR-gated), so no x64 agent is idled.
+
+Python integration tests stay `--skip-integration` on ARM: the Python test
+harness builds `Server={host}` with no port, so it cannot target the SQL
+host's non-1433 port without a test-source change. The substantive ARM PR
+coverage is the Rust integration suite.
 
 ## Files
 
@@ -291,7 +301,8 @@ detected (`skipDuplicate`). Each PR stage boots one shared SQL host by default.
 | `.pipeline/scripts/sql-host/teardown.sh`                      | Idempotent docker cleanup for `always()` step.                 |
 | `.pipeline/templates/test-matrix-template-arm64.yml`          | Refactored; targets list + sqlInstanceMode; consumes endpoint. |
 | `.pipeline/templates/test-matrix-template-alpine_arm64.yml`   | Same refactor for the musl/alpine flow.                        |
-| `.pipeline/templates/validation-stages.yml`                   | Converts ARM stage matrices into `targets` lists; threads `sqlInstanceMode` / `sqlImageTag`. |
+| `.pipeline/templates/validation-stages.yml`                   | Converts ARM stage matrices into `targets` lists; threads `sqlInstanceMode` / `sqlImageTag`; adds PR-only `Sql_Host_build_arm` to the Build stage. |
+| `.pipeline/templates/build-template-container.yml`           | ARM64 branch: derive password, poll the cross-pool endpoint, run the integration suite against it, publish the `build_arm` teardown sentinel. x64 path unchanged. |
 | `.pipeline/validation-pipeline.yml`, `.pipeline/validation-pipeline-ci.yml` | Add `sqlInstanceMode` and `sqlImageTag` parameters and pass them to `validation-stages.yml`. |
 
 The amd64 templates and `sql-setup-template.yml` are intentionally left

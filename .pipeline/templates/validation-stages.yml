@@ -74,6 +74,16 @@ stages:
       )
     )
   jobs:
+  # On-demand x64 SQL host for the ARM64 build's integration tests. ARM agents
+  # cannot run the x64 SQL Server image natively, so Build_Linux_ARM connects
+  # cross-pool to this host instead. PR-only: the ARM build only runs its test
+  # pass on PRs, and this job would otherwise idle an x64 agent on every merge.
+  - template: sql-host-template.yml
+    parameters:
+      instanceId: build_arm
+      expectedSentinels: build_arm
+      sqlImageTag: ${{ parameters.sqlImageTag }}
+      jobCondition: eq(variables['Build.Reason'], 'PullRequest')
   - job: Build_Windows
     displayName: Build Windows
     pool:
@@ -246,7 +256,7 @@ stages:
         parameters:
           architecture: ARM64
           buildType: ${{ parameters.buildType }}
-          testFilter: -E 'not (test(query_processing_driver) | test(query_result) | test(connectivity) | test(transaction) | test(rpc_results) | test(timeout_and_cancel) | test(rpc_datatypes) | test(client_based_iterators) | test(connect_fetch_multiple_packets) | test(iter_rows) | test(bulk_copy) | test(transport_protocols) | test(vector_integration_tests) | test(no_protocol_resolution) | test(multi_subnet_failover) | test(encryption_tests) | binary(test_tls_handshake) | binary(test_tvp) | binary(test_cursor_ops) | binary(test_reset_connection) | binary(test_connection_pool_primitives))'
+          testFilter: -E 'not (test(connectivity))'
           additionalPythonTestArgs: '--skip-integration'
       - template: build-template-alpine.yml
         parameters:
@@ -499,27 +509,6 @@ stages:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
             entry: alpine.sh
 
-- stage: Test_alpine_arm64_PR
-  dependsOn:
-    - Build
-    - EvaluateDuplicate
-  # Reduced musl ARM subset on PRs, hosted by the on-demand cross-pool SQL
-  # host (no static ACI IP). Full matrix still runs on merge below.
-  condition: and(not(canceled()), succeeded('Build'), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
-  displayName: Test Alpine arm64 (PR)
-  jobs:
-    - template: test-matrix-template-alpine_arm64.yml
-      parameters:
-        artifactName: 'Build_Linux_ARM'
-        poolName: RUST-1ES-POOL-ARM-WUS3
-        poolImageOverride: imageOverride -equals RUST-UBUNTU-ARM64
-        sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
-        sqlImageTag: ${{ parameters.sqlImageTag }}
-        targets:
-          - name: Alpine3_21
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
-            entry: alpine.sh
-
 - stage: Test_alpine_arm64
   dependsOn: 
     - Build
@@ -578,27 +567,6 @@ stages:
             container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
             entry: deb-bookworm.sh
 
-
-- stage: Test_arm64_PR
-  dependsOn:
-    - Build
-    - EvaluateDuplicate
-  # Reduced glibc ARM subset on PRs, hosted by the on-demand cross-pool SQL
-  # host (no static ACI IP). Full matrix still runs on merge below.
-  condition: and(not(canceled()), succeeded('Build'), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
-  displayName: Test Linux arm64 (PR)
-  jobs:
-    - template: test-matrix-template-arm64.yml
-      parameters:
-        sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
-        sqlImageTag: ${{ parameters.sqlImageTag }}
-        targets:
-          - name: Ubuntu24
-            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
-            entry: deb-bookworm.sh
-          - name: AzLinux3
-            container: mcr.microsoft.com/azurelinux/base/core:3.0
-            entry: azlinux3.sh
 
 - stage: Test_arm64
   dependsOn: 
