@@ -1396,6 +1396,83 @@ mod always_encrypted {
         });
     }
 
+    /// Abandoning a partially-read encrypted result set and then reusing the
+    /// same connection must work. `close_query()` drains (decodes) every
+    /// remaining encrypted row, and the memoized cell decryptor + per-column
+    /// crypto metadata must be rebuilt for the next result set. This is the
+    /// read-path analogue of the encrypted-output-parameter desync concern:
+    /// abandoning a partially-read encrypted stream is exactly where the parser
+    /// could desync.
+    #[tokio::test]
+    async fn abandon_partial_read_then_reuse_connection() {
+        ae_test!(|h| {
+            let enc = h.enc_clause("DETERMINISTIC");
+            let table = h
+                .create_table(&format!("id INT NOT NULL, val INT {enc} NOT NULL"))
+                .await;
+
+            const ROW_COUNT: i32 = 20;
+            let rows: Vec<GenericBulkRow> = (1..=ROW_COUNT)
+                .map(|i| GenericBulkRow {
+                    values: vec![ColumnValues::Int(i), ColumnValues::Int(i * 7)],
+                })
+                .collect();
+            BulkCopy::new(&mut h.client, table.as_str())
+                .batch_size(100)
+                .write_to_server_zerocopy(rows)
+                .await
+                .expect("bulk copy encrypted rows");
+
+            // Read only the FIRST encrypted row of a multi-row result set, then
+            // abandon the rest.
+            h.client
+                .execute(
+                    format!("SELECT id, val FROM {table} ORDER BY id;"),
+                    None,
+                    None,
+                )
+                .await
+                .expect("first select");
+            let first = {
+                let rs = h
+                    .client
+                    .get_current_resultset()
+                    .expect("result set present");
+                let row = rs
+                    .next_row()
+                    .await
+                    .expect("read first row")
+                    .expect("at least one row");
+                vec![row[0].clone(), row[1].clone()]
+            };
+            assert_eq!(first, vec![ColumnValues::Int(1), ColumnValues::Int(7)]);
+
+            // Abandon the partially-read encrypted stream. `close_query()` drains
+            // and decodes every remaining encrypted row; it must stay in sync.
+            h.client
+                .close_query()
+                .await
+                .expect("drain abandoned encrypted stream");
+
+            // Reuse the SAME connection for a second encrypted query and assert
+            // every value still decrypts correctly — proving the decryptor and
+            // per-column crypto metadata were rebuilt for the new COLMETADATA
+            // rather than left over from the abandoned stream.
+            let got = h
+                .query_rows(&format!("SELECT id, val FROM {table} ORDER BY id;"), 2)
+                .await;
+            assert_eq!(got.len(), ROW_COUNT as usize);
+            assert_eq!(got[0], vec![ColumnValues::Int(1), ColumnValues::Int(7)]);
+            assert_eq!(
+                got[ROW_COUNT as usize - 1],
+                vec![
+                    ColumnValues::Int(ROW_COUNT),
+                    ColumnValues::Int(ROW_COUNT * 7),
+                ],
+            );
+        });
+    }
+
     /// Bulk-copying into an encrypted column over an Always Encrypted-disabled
     /// connection must fail: without encryption negotiated the client cannot
     /// produce ciphertext, and the server rejects the plaintext payload.
