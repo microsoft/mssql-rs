@@ -123,7 +123,7 @@ impl ConnectionProcessor {
     }
 
     /// Get the unique connection id
-    pub fn conn_id(&self) -> u64 {
+    pub(crate) fn conn_id(&self) -> u64 {
         self.conn_id
     }
 
