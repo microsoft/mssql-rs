@@ -1,58 +1,279 @@
-# filepath: .pipeline/templates/test-matrix-template.yml
+# Template: test-matrix-template-arm64.yml
+#
+# Runs the glibc Linux ARM64 test matrix against an x64-hosted SQL Server
+# (booted by sql-host-template.yml in the same stage). Two cardinality modes:
+#
+#   sqlInstanceMode = shared
+#     One SQL host, all matrix entries connect to it. Each entry publishes
+#     its own teardown sentinel; the SQL host releases once every expected
+#     sentinel exists.
+#
+#   sqlInstanceMode = per-job
+#     One SQL host per matrix entry. Each test job has its own SQL host and
+#     publishes a single sentinel on completion. Use when shared SQL state
+#     causes test interference.
+#
+# Cross-job sync (see sql-host-template.yml for the rationale):
+#   * No ADO `dependsOn` between SQL host and test jobs (ADO `dependsOn`
+#     would deadlock — SQL host can only finish after sentinels arrive,
+#     sentinels can only be published once tests start).
+#   * SQL host -> test:  sql-ready-<instanceId>  pipeline artifact carries
+#                        the endpoint; resolved at test job start by
+#                        poll-for-endpoint.sh, exporting DB_HOST/DB_PORT.
+#   * Test -> SQL host:  one teardown-sentinel artifact per matrix entry,
+#                        published always() so the SQL host releases on
+#                        success, failure, and cancellation.
+#   * SA password is derived from build context by derive-sql-password.sh
+#     in both jobs so they agree without sharing a secret across jobs.
+
 parameters:
-  matrix: {}
+  - name: targets
+    # Each entry: { name, container, entry }
+    type: object
+  - name: sqlInstanceMode
+    type: string
+    default: shared
+    values:
+      - shared
+      - per-job
+  - name: sqlImageTag
+    type: string
+    default: '2025-latest'
+  - name: maxLifetimeMinutes
+    type: number
+    default: 120
 
 jobs:
-  - job: Test_Matrix_arm64
-    displayName: Linux arm64
-    strategy:
-      matrix: ${{ parameters.matrix }}
-    pool:
-      name: RUST-1ES-POOL-ARM-WUS3
-      demands:
-        - imageOverride -equals RUST-UBUNTU-ARM64
-    steps:
-      - template: generate-sql-password-template.yml
+  # ------------------------------------------------------------------
+  # SHARED MODE: one SQL host + one matrix test job.
+  # ------------------------------------------------------------------
+  - ${{ if eq(parameters.sqlInstanceMode, 'shared') }}:
+    - template: sql-host-template.yml
+      parameters:
+        instanceId: shared
+        sqlImageTag: ${{ parameters.sqlImageTag }}
+        maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
+        expectedSentinels: ${{ join(',', parameters.targets.*.name) }}
+
+    - job: Test_Matrix_arm64
+      displayName: Linux arm64
+      # Intentionally no `dependsOn`: see sql-host-template.yml header.
+      # The endpoint is resolved at runtime via the sql-ready-shared
+      # pipeline artifact (poll-for-endpoint.sh).
+      strategy:
+        matrix:
+          ${{ each target in parameters.targets }}:
+            ${{ target.name }}:
+              container: ${{ target.container }}
+              entry: ${{ target.entry }}
+              sentinelName: ${{ target.name }}
+      pool:
+        name: RUST-1ES-POOL-ARM-WUS3
+        demands:
+          - imageOverride -equals RUST-UBUNTU-ARM64
+      steps:
+        - bash: |
+            set -euo pipefail
+            bash .pipeline/scripts/sql-host/derive-sql-password.sh
+          displayName: 'Derive shared SQL_PASSWORD from build context'
+          workingDirectory: '$(Build.SourcesDirectory)'
+          env:
+            BUILD_BUILDID: $(Build.BuildId)
+            SYSTEM_COLLECTIONID: $(System.CollectionId)
+
+        - task: DockerInstaller@0
+          inputs:
+            dockerVersion: '29.0.0'
+        - template: install-ubuntu-dependency.yaml
+          parameters:
+            installAzCli: false
+            installDocker: true
+
+        - task: DownloadPipelineArtifact@2
+          inputs:
+            buildType: 'current'
+            artifactName: 'Build_Linux_ARM'
+          displayName: 'Download Pipeline Artifacts'
+
+        - bash: |
+            set -euo pipefail
+            bash .pipeline/scripts/sql-host/poll-for-endpoint.sh
+          displayName: 'Wait for SQL host endpoint sentinel'
+          workingDirectory: '$(Build.SourcesDirectory)'
+          env:
+            ARTIFACT_NAME: 'sql-ready-shared'
+            BUILD_BUILDID: $(Build.BuildId)
+            BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+            SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+            SYSTEM_TEAMPROJECT: $(System.TeamProject)
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            AGENT_TEMPDIRECTORY: $(Agent.TempDirectory)
+
+        - script: |
+            set -euo pipefail
+            echo "container=$(container) entry=$(entry)"
+            echo "DB_HOST=$DB_HOST DB_PORT=$DB_PORT"
+
+            # ca.crt + mssql.pem are downloaded by poll-for-endpoint.sh
+            # from the sql-ready artifact; they match the cert chain the
+            # cross-pool SQL host is actually presenting on the wire.
+            scripts/generate_mock_tds_server_certs.sh
+
+            cp $(Pipeline.Workspace)/tdslib-nextest.tar.zst $(Build.SourcesDirectory)
+            docker network create testnet
+
+            bash .pipeline/scripts/docker-cargo-run.sh --entrypoint bash \
+              -v "$PWD:/workspace" \
+              -e "DB_USERNAME=sa" \
+              -e "DB_HOST=$DB_HOST" \
+              -e "DB_PORT=$DB_PORT" \
+              -e "SQL_PASSWORD=$(SQL_PASSWORD)" \
+              -e "ARCHIVE_NAME=tdslib-nextest.tar.zst" \
+              -e "TRUST_SERVER_CERTIFICATE=true" \
+              --network testnet \
+              $(container) /workspace/scripts/dockerentry/$(entry)
+          workingDirectory: "$(Build.SourcesDirectory)"
+          displayName: Run docker test
+          condition: succeeded()
+          env:
+            DB_HOST: $(DB_HOST)
+            DB_PORT: $(DB_PORT)
+            SQL_PASSWORD: $(SQL_PASSWORD)
+            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+        - task: PublishTestResults@2
+          condition: succeededOrFailed()
+          displayName: "Publish test results"
+          inputs:
+            testResultsFormat: "JUnit"
+            testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
+            testRunTitle: $(System.PhaseName)
+
+        - script: |
+            mkdir -p "$(Agent.TempDirectory)/teardown"
+            echo "$(System.JobName) done at $(date -u +%FT%TZ)" \
+              > "$(Agent.TempDirectory)/teardown/done.txt"
+          displayName: 'Stage teardown sentinel'
+          condition: always()
+
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish teardown sentinel (release SQL host)'
+          condition: always()
+          inputs:
+            targetPath: '$(Agent.TempDirectory)/teardown'
+            artifact: '$(sentinelName)'
+            publishLocation: 'pipeline'
+
+  # ------------------------------------------------------------------
+  # PER-JOB MODE: one SQL host + one test job per matrix entry.
+  # ------------------------------------------------------------------
+  - ${{ if eq(parameters.sqlInstanceMode, 'per-job') }}:
+    - ${{ each target in parameters.targets }}:
+      - template: sql-host-template.yml
         parameters:
-          osType: Linux
-      - task: DockerInstaller@0
-        inputs:
-          dockerVersion: '29.0.0'
-      - template: install-ubuntu-dependency.yaml
-        parameters:
-          installAzCli: false
-          installDocker: true
+          instanceId: ${{ target.name }}
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
+          expectedSentinels: ${{ target.name }}
 
-      - task: DownloadPipelineArtifact@2
-        inputs:
-          buildType: 'current'
-          artifactName: 'Build_Linux_ARM'
-        displayName: 'Download Pipeline Artifacts'
-      - script: |
-          echo $(container)
-          echo $(entry)
-          echo $container
+      - job: Test_${{ target.name }}_arm64
+        displayName: 'Linux arm64 ${{ target.name }}'
+        # Intentionally no `dependsOn`: see sql-host-template.yml header.
+        pool:
+          name: RUST-1ES-POOL-ARM-WUS3
+          demands:
+            - imageOverride -equals RUST-UBUNTU-ARM64
+        steps:
+          - bash: |
+              set -euo pipefail
+              bash .pipeline/scripts/sql-host/derive-sql-password.sh
+            displayName: 'Derive shared SQL_PASSWORD from build context'
+            workingDirectory: '$(Build.SourcesDirectory)'
+            env:
+              BUILD_BUILDID: $(Build.BuildId)
+              SYSTEM_COLLECTIONID: $(System.CollectionId)
 
-          scripts/generate_cert.sh
-          scripts/generate_mock_tds_server_certs.sh
-          
-          cp $(Pipeline.Workspace)/tdslib-nextest.tar.zst $(Build.SourcesDirectory)
-          docker network create testnet
-          bash .pipeline/scripts/docker-cargo-run.sh --entrypoint bash -v "$PWD:/workspace" -e "DB_USERNAME=sa" -e "DB_HOST=$(ACI_SQL_HOST_2022)" -e "DB_PORT=14333" -e "SQL_PASSWORD=$(ACI_SQL_PASSWORD)" -e "ARCHIVE_NAME=tdslib-nextest.tar.zst" -e "TRUST_SERVER_CERTIFICATE=true" --network testnet $(container) /workspace/scripts/dockerentry/$(entry)
+          - task: DockerInstaller@0
+            inputs:
+              dockerVersion: '29.0.0'
+          - template: install-ubuntu-dependency.yaml
+            parameters:
+              installAzCli: false
+              installDocker: true
 
-        workingDirectory: "$(Build.SourcesDirectory)"
-        displayName: Run docker test
-        condition: succeeded()
-        env :
-          SQL_PASSWORD: $(SQL_PASSWORD)
-          CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-          CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
-      - task: PublishTestResults@2
-        condition: succeededOrFailed()
-        displayName: "Publish test results"
-        inputs:
-          testResultsFormat: "JUnit"
-          testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
-          testRunTitle: $(System.PhaseName)
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              artifactName: 'Build_Linux_ARM'
+            displayName: 'Download Pipeline Artifacts'
 
-      
+          - bash: |
+              set -euo pipefail
+              bash .pipeline/scripts/sql-host/poll-for-endpoint.sh
+            displayName: 'Wait for SQL host endpoint sentinel'
+            workingDirectory: '$(Build.SourcesDirectory)'
+            env:
+              ARTIFACT_NAME: 'sql-ready-${{ target.name }}'
+              BUILD_BUILDID: $(Build.BuildId)
+              BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+              SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+              SYSTEM_TEAMPROJECT: $(System.TeamProject)
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              AGENT_TEMPDIRECTORY: $(Agent.TempDirectory)
+
+          - script: |
+              set -euo pipefail
+              echo "container=${{ target.container }} entry=${{ target.entry }}"
+              echo "DB_HOST=$DB_HOST DB_PORT=$DB_PORT"
+
+              # ca.crt + mssql.pem are downloaded by poll-for-endpoint.sh
+              # from the sql-ready artifact; they match the cert chain the
+              # cross-pool SQL host is actually presenting on the wire.
+              scripts/generate_mock_tds_server_certs.sh
+
+              cp $(Pipeline.Workspace)/tdslib-nextest.tar.zst $(Build.SourcesDirectory)
+              docker network create testnet
+
+              bash .pipeline/scripts/docker-cargo-run.sh --entrypoint bash \
+                -v "$PWD:/workspace" \
+                -e "DB_USERNAME=sa" \
+                -e "DB_HOST=$DB_HOST" \
+                -e "DB_PORT=$DB_PORT" \
+                -e "SQL_PASSWORD=$(SQL_PASSWORD)" \
+                -e "ARCHIVE_NAME=tdslib-nextest.tar.zst" \
+                -e "TRUST_SERVER_CERTIFICATE=true" \
+                --network testnet \
+                ${{ target.container }} /workspace/scripts/dockerentry/${{ target.entry }}
+            workingDirectory: "$(Build.SourcesDirectory)"
+            displayName: Run docker test
+            condition: succeeded()
+            env:
+              DB_HOST: $(DB_HOST)
+              DB_PORT: $(DB_PORT)
+              SQL_PASSWORD: $(SQL_PASSWORD)
+              CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+              CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            displayName: "Publish test results"
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
+              testRunTitle: $(System.PhaseName)
+
+          - script: |
+              mkdir -p "$(Agent.TempDirectory)/teardown"
+              echo "${{ target.name }} done at $(date -u +%FT%TZ)" \
+                > "$(Agent.TempDirectory)/teardown/done.txt"
+            displayName: 'Stage teardown sentinel'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish teardown sentinel (release SQL host)'
+            condition: always()
+            inputs:
+              targetPath: '$(Agent.TempDirectory)/teardown'
+              artifact: '${{ target.name }}'
+              publishLocation: 'pipeline'

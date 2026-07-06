@@ -26,6 +26,19 @@ parameters:
   type: boolean
   default: true
 
+- name: sqlInstanceMode
+  displayName: SQL host cardinality for ARM test stages (shared = one SQL host per stage; per-job = one per matrix entry)
+  type: string
+  values:
+  - shared
+  - per-job
+  default: shared
+
+- name: sqlImageTag
+  displayName: SQL Server docker image tag for ARM test stages
+  type: string
+  default: '2025-latest'
+
 stages:
 - stage: EvaluateDuplicate
   displayName: Evaluate PR duplicate
@@ -486,6 +499,27 @@ stages:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
             entry: alpine.sh
 
+- stage: Test_alpine_arm64_PR
+  dependsOn:
+    - Build
+    - EvaluateDuplicate
+  # Reduced musl ARM subset on PRs, hosted by the on-demand cross-pool SQL
+  # host (no static ACI IP). Full matrix still runs on merge below.
+  condition: and(not(canceled()), succeeded('Build'), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
+  displayName: Test Alpine arm64 (PR)
+  jobs:
+    - template: test-matrix-template-alpine_arm64.yml
+      parameters:
+        artifactName: 'Build_Linux_ARM'
+        poolName: RUST-1ES-POOL-ARM-WUS3
+        poolImageOverride: imageOverride -equals RUST-UBUNTU-ARM64
+        sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+        sqlImageTag: ${{ parameters.sqlImageTag }}
+        targets:
+          - name: Alpine3_21
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+            entry: alpine.sh
+
 - stage: Test_alpine_arm64
   dependsOn: 
     - Build
@@ -497,17 +531,19 @@ stages:
         artifactName: 'Build_Linux_ARM'
         poolName: RUST-1ES-POOL-ARM-WUS3
         poolImageOverride: imageOverride -equals RUST-UBUNTU-ARM64
-        matrix:
-          Alpine3_18:
+        sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+        sqlImageTag: ${{ parameters.sqlImageTag }}
+        targets:
+          - name: Alpine3_18
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
             entry: alpine.sh
-          Alpine3_19:
+          - name: Alpine3_19
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
             entry: alpine.sh
-          Alpine3_20:
+          - name: Alpine3_20
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
             entry: alpine.sh
-          Alpine3_21:
+          - name: Alpine3_21
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
             entry: alpine.sh
 
@@ -543,6 +579,27 @@ stages:
             entry: deb-bookworm.sh
 
 
+- stage: Test_arm64_PR
+  dependsOn:
+    - Build
+    - EvaluateDuplicate
+  # Reduced glibc ARM subset on PRs, hosted by the on-demand cross-pool SQL
+  # host (no static ACI IP). Full matrix still runs on merge below.
+  condition: and(not(canceled()), succeeded('Build'), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
+  displayName: Test Linux arm64 (PR)
+  jobs:
+    - template: test-matrix-template-arm64.yml
+      parameters:
+        sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+        sqlImageTag: ${{ parameters.sqlImageTag }}
+        targets:
+          - name: Ubuntu24
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+            entry: deb-bookworm.sh
+          - name: AzLinux3
+            container: mcr.microsoft.com/azurelinux/base/core:3.0
+            entry: azlinux3.sh
+
 - stage: Test_arm64
   dependsOn: 
     - Build
@@ -551,26 +608,28 @@ stages:
   jobs:
     - template: test-matrix-template-arm64.yml
       parameters:
-        matrix:
-          DebianBookworm:
+        sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+        sqlImageTag: ${{ parameters.sqlImageTag }}
+        targets:
+          - name: DebianBookworm
             container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
             entry: deb-bookworm.sh
-          AzLinux3:
+          - name: AzLinux3
             container: mcr.microsoft.com/azurelinux/base/core:3.0
             entry: azlinux3.sh
-          RHEL9:
+          - name: RHEL9
             container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi9:latest
             entry: rhel.sh
-          OracleLinux9:
+          - name: OracleLinux9
             container: ghcr.io/microsoft/mssql-rs/import/oraclelinux:9
             entry: rhel.sh
-          SLES15:
+          - name: SLES15
             container: registry.suse.com/suse/sle15
             entry: sles.sh
-          Ubuntu22:
+          - name: Ubuntu22
             container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
             entry: deb-bookworm.sh
-          Ubuntu24:
+          - name: Ubuntu24
             container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
             entry: deb-bookworm.sh
 

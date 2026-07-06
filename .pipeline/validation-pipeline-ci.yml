@@ -26,11 +26,26 @@ parameters:
   type: boolean
   default: false
 
+- name: sqlInstanceMode
+  displayName: SQL host cardinality for ARM test stages
+  type: string
+  values:
+  - shared
+  - per-job
+  default: shared
+
+- name: sqlImageTag
+  displayName: SQL Server docker image tag for ARM test stages
+  type: string
+  default: '2025-latest'
+
 stages:
 - template: templates/validation-stages.yml
   parameters:
     buildType: ${{ parameters.buildType }}
     RunFuzz: ${{ parameters.RunFuzz }}
     RunLongHaul: ${{ parameters.RunLongHaul }}
+    sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+    sqlImageTag: ${{ parameters.sqlImageTag }}
     # Runs with internal resource access, so keep the infra stages.
     includeInfraStages: true

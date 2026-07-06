@@ -18,6 +18,14 @@ SAN_DNS="sql1"
 LOCAL_HOSTNAME=$(hostname 2>/dev/null || echo "")
 echo "Adding local hostname to SAN: $LOCAL_HOSTNAME"
 
+# Optional extra IP SAN entry (e.g. the public IP a cross-pool SQL host is
+# reached on). Set EXTRA_IP_SAN to have it added to the certificate.
+EXTRA_IP_SAN_LINE=""
+if [ -n "${EXTRA_IP_SAN:-}" ]; then
+    echo "Adding extra IP to SAN: $EXTRA_IP_SAN"
+    EXTRA_IP_SAN_LINE="IP.3 = $EXTRA_IP_SAN"
+fi
+
 # 1. Generate self-signed CA
 openssl req -x509 -nodes -newkey rsa:4096 -sha256 \
     -keyout "$CA_KEY" \
@@ -46,6 +54,7 @@ DNS.2 = localhost
 DNS.3 = $LOCAL_HOSTNAME
 IP.1 = 127.0.0.1
 IP.2 = ::1
+${EXTRA_IP_SAN_LINE:-}
 
 [ v3_ext ]
 authorityKeyIdentifier=keyid,issuer
