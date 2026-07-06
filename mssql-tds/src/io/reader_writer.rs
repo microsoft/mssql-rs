@@ -27,6 +27,16 @@ pub(crate) trait NetworkWriter: Send + Sync + TransportSslHandler {
     fn take_reset_mode(&mut self) -> ResetConnectionMode {
         ResetConnectionMode::None
     }
+
+    /// Returns the TLS channel binding token (`tls-unique`, RFC 5929 §3) for
+    /// the active connection, if one is available.
+    ///
+    /// Used to populate channel bindings for integrated-auth Extended
+    /// Protection. The default implementation returns `None` so transports
+    /// that do not support TLS (e.g. test mocks) need not implement it.
+    fn channel_binding_token(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 #[async_trait]
