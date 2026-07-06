@@ -45,7 +45,7 @@ Build (existing)                                                   completes
    |        2. boot mcr.microsoft.com/mssql/server                  |
    |        3. probe readiness via sqlcmd                           |
    |        4. publish sql-ready-<id> artifact (contains endpoint)  |
-   |        5. poll ADO REST API for tests-done sentinels           |
+   |        5. poll ADO REST API for teardown sentinels             |
    |        6. always() docker stop + rm                            |
    |                                                                |
    |                                                       ARM 1ES agent(s)
@@ -67,7 +67,7 @@ ADO will not start a `dependsOn`-linked job until its upstream job
 *completes*, even when only output variables are referenced. If the test job
 declared `dependsOn: Sql_Host_<id>`, the SQL host would have to finish before
 the test job started. But the SQL host's job only finishes after the
-`tests-done` sentinels are published, which only happens once the tests
+teardown sentinels are published, which only happens once the tests
 *run* — a textbook deadlock. In the original design this manifested as the
 SQL host blocking until its `MAX_LIFETIME_MINUTES` cap fired (2 h by
 default), at which point the always() teardown step ran, the SQL container

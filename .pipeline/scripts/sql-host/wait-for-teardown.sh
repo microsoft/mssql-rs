@@ -76,7 +76,7 @@ while :; do
     missing=0
     for s in "${expected[@]}"; do
         # Match exact JSON property: "name":"<sentinel>"
-        if ! printf '%s' "${body}" | grep -q "\"name\":\"${s}\""; then
+        if ! printf '%s' "${body}" | grep -qF "\"name\":\"${s}\""; then
             missing=$((missing + 1))
         fi
     done

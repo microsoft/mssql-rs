@@ -18,8 +18,8 @@ SAN_DNS="sql1"
 LOCAL_HOSTNAME=$(hostname 2>/dev/null || echo "")
 echo "Adding local hostname to SAN: $LOCAL_HOSTNAME"
 
-# Optional extra IP SAN entry (e.g. the public IP a cross-pool SQL host is
-# reached on). Set EXTRA_IP_SAN to have it added to the certificate.
+# Optional extra IP SAN entry (e.g. the private VNet IPv4 a cross-pool SQL
+# host is reached on). Set EXTRA_IP_SAN to have it added to the certificate.
 EXTRA_IP_SAN_LINE=""
 if [ -n "${EXTRA_IP_SAN:-}" ]; then
     echo "Adding extra IP to SAN: $EXTRA_IP_SAN"

@@ -3,13 +3,14 @@
 # Defines a single x64 1ES "SQL host" job that boots a SQL Server docker
 # container, publishes its private-VNet endpoint to dependent test jobs via
 # a `sql-ready-<instanceId>` pipeline artifact, then blocks until those test
-# jobs publish their `tests-done-<name>` sentinel artifacts, and finally
-# tears the container down in an always() step.
+# jobs publish their teardown sentinel artifacts (each named by the raw
+# sentinel name listed in expectedSentinels, e.g. Ubuntu24, build_arm), and
+# finally tears the container down in an always() step.
 #
 # Why two-way artifact sentinels (and not ADO `dependsOn` + output vars):
 #   ADO will not start a `dependsOn`-linked job until the producer job
 #   COMPLETES. If the test job depended on this job, this job could not
-#   complete until tests publish `tests-done-*`, which they cannot do until
+#   complete until tests publish their teardown sentinels, which they cannot do until
 #   they are allowed to start — a deadlock that ends only when the SQL
 #   host's MAX_LIFETIME_MINUTES cap fires (after which the SQL container
 #   is torn down before the tests get a chance to run). The two-way artifact

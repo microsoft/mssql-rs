@@ -8,8 +8,8 @@
 # would deadlock — ADO won't start a dependent job until its upstream
 # completes, and the SQL host can only complete after tests finish). The two
 # jobs rendezvous via pipeline-artifact sentinels in both directions:
-#   * SQL host -> Test:  sql-ready-<instanceId>      (contains endpoint)
-#   * Test    -> SQL host: tests-done-<sentinelName> (one per matrix entry)
+#   * SQL host -> Test:  sql-ready-<instanceId>   (contains endpoint)
+#   * Test    -> SQL host: <sentinelName>         (raw name, one per matrix entry)
 #
 # Required env:
 #   ARTIFACT_NAME         Name of the sql-ready sentinel artifact.

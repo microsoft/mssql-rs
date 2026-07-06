@@ -10,12 +10,14 @@ The SQL host job and the ARM test jobs run concurrently and rendezvous through
 pipeline-artifact sentinels; the SA password is derived deterministically from
 the build context so no secret is transported between jobs.
 
-- **start.sh** — Derives the SA password, generates certs (adding the host's
-  public IP as an extra SAN via `EXTRA_IP_SAN`), starts the SQL container, and
-  publishes the `sql-ready-<instanceId>` sentinel carrying the endpoint plus
+- **start.sh** — Receives the SA password (derived by `derive-sql-password.sh`
+  in the YAML templates), generates certs (adding the host's private VNet IPv4
+  as an extra SAN via `EXTRA_IP_SAN`), starts the SQL container, and publishes
+  the `sql-ready-<instanceId>` sentinel carrying the endpoint plus
   `ca.crt`/`mssql.pem`.
-- **wait-for-teardown.sh** — Polls for the per-test teardown sentinels and
-  releases the SQL host once every expected sentinel has been published.
+- **wait-for-teardown.sh** — Polls for the teardown sentinel artifacts (named
+  by the raw sentinel names the test jobs publish) and releases the SQL host
+  once every expected sentinel has been published.
 - **teardown.sh** — Stops and removes the SQL container and network.
 
 See `.pipeline/docs/arm-sql-host-design.md` for the full design.

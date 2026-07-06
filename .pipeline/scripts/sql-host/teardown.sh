@@ -15,7 +15,7 @@ NETWORK_NAME="testnet-${INSTANCE_ID}"
 
 echo "=== sql-host/teardown.sh (instance=${INSTANCE_ID}) ==="
 
-if docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
+if docker ps -a --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
     echo "--- container logs (tail 200) before removal ---"
     docker logs --tail 200 "${CONTAINER_NAME}" 2>&1 || true
     docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true
@@ -25,7 +25,7 @@ else
     echo "Container ${CONTAINER_NAME} not present; nothing to stop."
 fi
 
-if docker network ls --format '{{.Name}}' | grep -qx "${NETWORK_NAME}"; then
+if docker network ls --format '{{.Name}}' | grep -qxF "${NETWORK_NAME}"; then
     docker network rm "${NETWORK_NAME}" >/dev/null 2>&1 || true
     echo "Network ${NETWORK_NAME} removed."
 else
