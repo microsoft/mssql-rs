@@ -469,4 +469,63 @@ mod mock_server_fedauth_tests {
 
         Ok(())
     }
+
+    /// Regression guard for eager token recording: the token must be visible in the
+    /// shared store WHILE the client connection is still open, i.e. without relying on
+    /// connection teardown. This mirrors the downstream ODBC pooled-connection scenario
+    /// where close() returns the socket to a pool without sending EOF, so a teardown-only
+    /// record would never fire.
+    #[tokio::test]
+    async fn test_token_recorded_before_connection_close() -> Result<(), Box<dyn std::error::Error>>
+    {
+        init_tracing();
+
+        let server = MockTdsServer::new("127.0.0.1:0").await?;
+        let server_addr = server.local_addr();
+        let connection_store = server.connection_store();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let access_token = "eager_record_guard_token_67890".to_string();
+
+        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+        let mut context = ClientContext::default();
+        context.access_token = Some(access_token.clone());
+        context.tds_authentication_method = TdsAuthenticationMethod::AccessToken;
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+
+        let provider = TdsConnectionProvider {};
+        let client = provider.create_client(context, &datasource, None).await?;
+
+        // Assert the token is recorded WITHOUT closing/dropping the connection first.
+        let recorded = {
+            let store = connection_store.lock().await;
+            store
+                .all()
+                .values()
+                .any(|c| c.received_token_as_string().as_deref() == Some(&access_token))
+        };
+        assert!(
+            recorded,
+            "FedAuth token must be recorded before the client connection is closed (eager-record guard)"
+        );
+
+        // Keep the connection alive until after the assertion.
+        drop(client);
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
 }
