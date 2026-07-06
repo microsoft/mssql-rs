@@ -86,6 +86,54 @@ stages:
           osType: Windows
           buildType: ${{ parameters.buildType }}
           testFilter: -E "not (test(connectivity))"
+      # Extended Protection (EPA) channel-binding test.
+      # Runs AFTER the main test pass. Runs the same integrated-auth encrypted
+      # login test under two server configurations, expecting success in both:
+      #   1. EPA = Off      -- baseline (channel binding not enforced).
+      #   2. EPA = Required -- the server rejects any login lacking a valid
+      #      channel binding, so a successful login proves we send a real,
+      #      server-validated tls-unique token.
+      # Reverts EPA to Off in `finally` so a failure still restores the
+      # instance. Each registry change requires a SQL service restart, handled
+      # by the script.
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          $spns = @("MSSQLSvc/localhost:1433", "MSSQLSvc/$($env:COMPUTERNAME):1433")
+          $configured = $false
+          try {
+            foreach ($level in @('Off', 'Required')) {
+              ./.pipeline/scripts/Configure-ExtendedProtection.ps1 `
+                -InstanceName 'MSSQLSERVER' -Level $level -ForceEncryption 'Yes' `
+                -AcceptedNtlmSpns $spns -RestartService $true
+              $configured = $true
+
+              Write-Host "Running EPA channel-binding test with Extended Protection = $level"
+              cargo nextest run --frozen --package mssql-tds `
+                -E 'test(epa_channel_binding)' --no-fail-fast --profile ci
+              if ($LASTEXITCODE -ne 0) { throw "EPA channel-binding test failed with EPA=$level (exit $LASTEXITCODE)" }
+            }
+          }
+          finally {
+            if ($configured) {
+              Write-Host 'Reverting Extended Protection to Off...'
+              ./.pipeline/scripts/Configure-ExtendedProtection.ps1 `
+                -InstanceName 'MSSQLSERVER' -Level 'Off' -ForceEncryption 'No' -RestartService $true
+            }
+          }
+        displayName: 'Extended Protection (EPA) channel-binding test'
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+        env:
+          EPA_TEST: '1'
+          SSPI_TEST: '1'
+          SQL_PASSWORD: $(SQL_PASSWORD)
+          RUST_BACKTRACE: full
+      - task: PublishTestResults@2
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+        displayName: 'Publish EPA test results'
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
+          testRunTitle: 'Extended Protection (EPA)'
       - template: build-python-wheels-template.yml
         parameters:
           osType: Windows

@@ -13,9 +13,10 @@ use crate::protocol::{
 use crate::query_response::QueryRegistry;
 use bytes::BytesMut;
 use native_tls::Identity;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -51,6 +52,8 @@ impl RedirectionConfig {
 /// Each connection gets its own processor instance.
 /// FedAuth and username/password authentication are always supported.
 pub struct ConnectionProcessor {
+    /// Unique per-connection id assigned at accept time
+    conn_id: u64,
     /// Client socket address
     addr: SocketAddr,
     /// Whether the client has authenticated
@@ -69,12 +72,20 @@ pub struct ConnectionProcessor {
     buffer: BytesMut,
     /// Optional redirection configuration
     redirection: Option<RedirectionConfig>,
+    /// Shared store used to record connection state as soon as it is known
+    connection_store: Option<Arc<Mutex<ConnectionStore>>>,
 }
 
 impl ConnectionProcessor {
     /// Create a new connection processor
-    pub fn new(addr: SocketAddr, query_registry: Arc<Mutex<QueryRegistry>>) -> Self {
+    pub fn new(
+        conn_id: u64,
+        addr: SocketAddr,
+        query_registry: Arc<Mutex<QueryRegistry>>,
+        connection_store: Option<Arc<Mutex<ConnectionStore>>>,
+    ) -> Self {
         Self {
+            conn_id,
             addr,
             is_authenticated: false,
             received_token: None,
@@ -84,16 +95,20 @@ impl ConnectionProcessor {
             query_registry,
             buffer: BytesMut::with_capacity(4096),
             redirection: None,
+            connection_store,
         }
     }
 
     /// Create a new connection processor with redirection configuration
     pub fn new_with_redirection(
+        conn_id: u64,
         addr: SocketAddr,
         query_registry: Arc<Mutex<QueryRegistry>>,
+        connection_store: Option<Arc<Mutex<ConnectionStore>>>,
         redirection: Option<RedirectionConfig>,
     ) -> Self {
         Self {
+            conn_id,
             addr,
             is_authenticated: false,
             received_token: None,
@@ -103,7 +118,13 @@ impl ConnectionProcessor {
             query_registry,
             buffer: BytesMut::with_capacity(4096),
             redirection,
+            connection_store,
         }
+    }
+
+    /// Get the unique connection id
+    pub(crate) fn conn_id(&self) -> u64 {
+        self.conn_id
     }
 
     /// Get the client address
@@ -146,6 +167,15 @@ impl ConnectionProcessor {
     /// Get mutable access to the buffer for reading data
     pub fn buffer_mut(&mut self) -> &mut BytesMut {
         &mut self.buffer
+    }
+
+    /// Upsert this connection's current state into the shared store.
+    /// Called eagerly during login so tokens are visible to callers the
+    /// moment the client's blocking LoginAck read returns.
+    async fn record_to_store(&self) {
+        if let Some(store) = &self.connection_store {
+            store.lock().await.store(self);
+        }
     }
 
     /// Process a single packet from the buffer and return the response
@@ -269,6 +299,7 @@ impl ConnectionProcessor {
                     resp_header.write(&mut packet);
                     packet.extend_from_slice(&response);
 
+                    self.record_to_store().await;
                     Some(packet)
                 }
             }
@@ -305,6 +336,7 @@ impl ConnectionProcessor {
                             resp_header.write(&mut packet);
                             packet.extend_from_slice(&response);
 
+                            self.record_to_store().await;
                             Some(packet)
                         }
                         Err(e) => {
@@ -418,8 +450,9 @@ impl ConnectionProcessor {
 /// This allows tests to access per-connection state after connections complete.
 #[derive(Debug, Default)]
 pub struct ConnectionStore {
-    /// Completed connection processors keyed by client socket address
-    connections: HashMap<SocketAddr, ConnectionInfo>,
+    /// Connection info keyed by unique connection id, ordered so that
+    /// iteration and `.values().last()` yield the most recent connection.
+    connections: BTreeMap<u64, ConnectionInfo>,
 }
 
 /// Captured information from a completed connection
@@ -461,11 +494,13 @@ impl ConnectionInfo {
 impl ConnectionStore {
     pub fn new() -> Self {
         Self {
-            connections: HashMap::new(),
+            connections: BTreeMap::new(),
         }
     }
 
-    /// Store connection info when a connection completes
+    /// Upsert connection info keyed by the connection's unique id.
+    /// Called both eagerly during login and again at connection teardown;
+    /// both updates target the same entry.
     pub fn store(&mut self, processor: &ConnectionProcessor) {
         let info = ConnectionInfo {
             addr: processor.addr(),
@@ -474,16 +509,16 @@ impl ConnectionStore {
             user_agent: processor.user_agent.clone(),
             received_server_name: processor.received_server_name().map(|s| s.to_string()),
         };
-        self.connections.insert(processor.addr(), info);
+        self.connections.insert(processor.conn_id(), info);
     }
 
-    /// Get connection info by address
-    pub fn get(&self, addr: &SocketAddr) -> Option<&ConnectionInfo> {
-        self.connections.get(addr)
+    /// Get connection info by connection id
+    pub fn get(&self, conn_id: u64) -> Option<&ConnectionInfo> {
+        self.connections.get(&conn_id)
     }
 
     /// Get all connection infos
-    pub fn all(&self) -> &HashMap<SocketAddr, ConnectionInfo> {
+    pub fn all(&self) -> &BTreeMap<u64, ConnectionInfo> {
         &self.connections
     }
 
@@ -513,6 +548,8 @@ pub struct MockTdsServer {
     connection_store: Arc<Mutex<ConnectionStore>>,
     /// Optional redirection configuration for testing client redirection behavior
     redirection: Option<RedirectionConfig>,
+    /// Monotonic counter assigning a unique id to each accepted connection
+    connection_counter: Arc<AtomicU64>,
 }
 
 impl MockTdsServer {
@@ -626,6 +663,7 @@ impl MockTdsServer {
             strict_mode,
             connection_store: Arc::new(Mutex::new(ConnectionStore::new())),
             redirection,
+            connection_counter: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -653,11 +691,13 @@ impl MockTdsServer {
         let strict_mode = self.strict_mode;
         let connection_store = self.connection_store;
         let redirection = self.redirection.map(Arc::new);
+        let connection_counter = self.connection_counter;
 
         loop {
             let (socket, addr) = listener.accept().await?;
             info!("New connection from {}", addr);
 
+            let conn_id = connection_counter.fetch_add(1, Ordering::SeqCst);
             let registry_clone = Arc::clone(&registry);
             let tls_acceptor_clone = tls_acceptor.clone();
             let store_clone = Arc::clone(&connection_store);
@@ -668,6 +708,7 @@ impl MockTdsServer {
                 if let Err(e) = handle_connection_with_tls(
                     socket,
                     addr,
+                    conn_id,
                     registry_clone,
                     tls_acceptor_clone,
                     strict_mode,
@@ -693,6 +734,7 @@ impl MockTdsServer {
         let strict_mode = self.strict_mode;
         let connection_store = self.connection_store;
         let redirection = self.redirection.map(Arc::new);
+        let connection_counter = self.connection_counter;
 
         tokio::select! {
             result = async {
@@ -703,13 +745,14 @@ impl MockTdsServer {
                             info!("New connection from {}", addr);
                             drop(listener); // Release lock before spawning
 
+                            let conn_id = connection_counter.fetch_add(1, Ordering::SeqCst);
                             let registry_clone = Arc::clone(&registry);
                             let tls_acceptor_clone = tls_acceptor.clone();
                             let store_clone = Arc::clone(&connection_store);
                             let redirection_clone = redirection.clone();
 
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection_with_tls(socket, addr, registry_clone, tls_acceptor_clone, strict_mode, store_clone, redirection_clone).await {
+                                if let Err(e) = handle_connection_with_tls(socket, addr, conn_id, registry_clone, tls_acceptor_clone, strict_mode, store_clone, redirection_clone).await {
                                     error!("Error handling connection from {}: {}", addr, e);
                                 }
                             });
@@ -731,9 +774,11 @@ impl MockTdsServer {
 
 /// Handle a connection with optional TLS support.
 /// FedAuth and username/password authentication are always supported.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection_with_tls(
     socket: TcpStream,
     addr: SocketAddr,
+    conn_id: u64,
     query_registry: Arc<Mutex<QueryRegistry>>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     strict_mode: bool,
@@ -764,6 +809,7 @@ async fn handle_connection_with_tls(
         handle_strict_encrypted_connection(
             tls_stream,
             addr,
+            conn_id,
             query_registry,
             connection_store,
             redirection,
@@ -801,6 +847,7 @@ async fn handle_connection_with_tls(
             handle_encrypted_tds_wrapped_connection(
                 tls_stream,
                 addr,
+                conn_id,
                 query_registry,
                 connection_store,
                 redirection,
@@ -811,6 +858,7 @@ async fn handle_connection_with_tls(
             handle_unencrypted_connection(
                 prelogin_socket,
                 addr,
+                conn_id,
                 query_registry,
                 connection_store,
                 redirection,
@@ -876,6 +924,7 @@ async fn handle_prelogin_negotiation(
 async fn handle_strict_encrypted_connection(
     mut socket: TlsStream<TcpStream>,
     addr: SocketAddr,
+    conn_id: u64,
     query_registry: Arc<Mutex<QueryRegistry>>,
     connection_store: Arc<Mutex<ConnectionStore>>,
     redirection: Option<Arc<RedirectionConfig>>,
@@ -883,8 +932,13 @@ async fn handle_strict_encrypted_connection(
     let redir_config = redirection
         .as_ref()
         .map(|r| RedirectionConfig::new(r.redirect_host.clone(), r.redirect_port));
-    let mut processor =
-        ConnectionProcessor::new_with_redirection(addr, query_registry, redir_config);
+    let mut processor = ConnectionProcessor::new_with_redirection(
+        conn_id,
+        addr,
+        query_registry,
+        Some(Arc::clone(&connection_store)),
+        redir_config,
+    );
     let mut prelogin_handled = false;
 
     loop {
@@ -952,10 +1006,16 @@ async fn handle_strict_encrypted_connection(
 async fn handle_encrypted_connection(
     mut socket: TlsStream<TcpStream>,
     addr: SocketAddr,
+    conn_id: u64,
     query_registry: Arc<Mutex<QueryRegistry>>,
     connection_store: Arc<Mutex<ConnectionStore>>,
 ) -> Result<(), ProtocolError> {
-    let mut processor = ConnectionProcessor::new(addr, query_registry);
+    let mut processor = ConnectionProcessor::new(
+        conn_id,
+        addr,
+        query_registry,
+        Some(Arc::clone(&connection_store)),
+    );
 
     loop {
         // Read data from TLS socket
@@ -989,6 +1049,7 @@ async fn handle_encrypted_connection(
 async fn handle_encrypted_tds_wrapped_connection(
     mut socket: TlsStream<crate::tds_tls_wrapper::TdsTlsWrapper>,
     addr: SocketAddr,
+    conn_id: u64,
     query_registry: Arc<Mutex<QueryRegistry>>,
     connection_store: Arc<Mutex<ConnectionStore>>,
     redirection: Option<Arc<RedirectionConfig>>,
@@ -996,8 +1057,13 @@ async fn handle_encrypted_tds_wrapped_connection(
     let redir_config = redirection
         .as_ref()
         .map(|r| RedirectionConfig::new(r.redirect_host.clone(), r.redirect_port));
-    let mut processor =
-        ConnectionProcessor::new_with_redirection(addr, query_registry, redir_config);
+    let mut processor = ConnectionProcessor::new_with_redirection(
+        conn_id,
+        addr,
+        query_registry,
+        Some(Arc::clone(&connection_store)),
+        redir_config,
+    );
 
     loop {
         // Read data from TLS socket (which wraps TdsTlsWrapper)
@@ -1032,6 +1098,7 @@ async fn handle_encrypted_tds_wrapped_connection(
 async fn handle_unencrypted_connection(
     mut socket: TcpStream,
     addr: SocketAddr,
+    conn_id: u64,
     query_registry: Arc<Mutex<QueryRegistry>>,
     connection_store: Arc<Mutex<ConnectionStore>>,
     redirection: Option<Arc<RedirectionConfig>>,
@@ -1039,8 +1106,13 @@ async fn handle_unencrypted_connection(
     let redir_config = redirection
         .as_ref()
         .map(|r| RedirectionConfig::new(r.redirect_host.clone(), r.redirect_port));
-    let mut processor =
-        ConnectionProcessor::new_with_redirection(addr, query_registry, redir_config);
+    let mut processor = ConnectionProcessor::new_with_redirection(
+        conn_id,
+        addr,
+        query_registry,
+        Some(Arc::clone(&connection_store)),
+        redir_config,
+    );
 
     loop {
         // Read data from plain socket
