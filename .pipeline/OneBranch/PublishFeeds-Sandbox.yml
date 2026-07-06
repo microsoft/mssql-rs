@@ -17,6 +17,9 @@
 #   Do not point real consumers at versions produced here. Treat the feed       #
 #   entries it creates as disposable test data.                                 #
 #                                                                               #
+#   All step logic lives in .pipeline/scripts/ (build/stamp/publish helpers);   #
+#   the YAML only wires jobs, pools and parameters to those scripts.            #
+#                                                                               #
 # Documentation:  https://aka.ms/obpipelines                                    #
 # Yaml Schema:    https://aka.ms/obpipelines/yaml/schema                        #
 #################################################################################
@@ -120,10 +123,7 @@ extends:
               versionSpec: '3.12'
               architecture: 'x64'
               addToPath: true
-          - pwsh: |
-              $ErrorActionPreference = 'Stop'
-              python .pipeline/scripts/check-version-not-published.py `
-                mssql-mock-tds-py/pyproject.toml mssql-mock-tds '$(pythonSimpleIndex)'
+          - pwsh: python .pipeline/scripts/check-version-not-published.py mssql-mock-tds-py/pyproject.toml mssql-mock-tds '$(pythonSimpleIndex)'
             displayName: 'Fail if release version already on feed'
         - ${{ if not(and(eq(parameters.releaseVersion, true), eq(parameters.publishPython, true))) }}:
           - pwsh: |
@@ -159,48 +159,17 @@ extends:
         - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
           parameters:
             installDocker: true
-        # Stamp a PEP 440 prerelease version into BOTH the pyproject.toml and the
-        # Cargo.toml so maturin bakes the right version into the wheel. The mounted
-        # workspace is what the container builds, so we patch on the host first.
-        - script: |
-            set -euo pipefail
-            BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-            case "${RELEASE_VERSION}" in
-              True|true|TRUE) VER="${BASE}" ;;   # release: publish BASE as-is (e.g. 1.0.0)
-              *) VER="${BASE}-dev$(date -u +%Y%m%d)${BUILD_BUILDID}" ;;   # PEP 440 normalizes -dev -> .dev
-            esac
-            echo "Sandbox wheel version: ${VER}"
-            # pyproject.toml [project].version
-            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
-            # Cargo.toml [package].version (first version line)
-            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
-            echo "##vso[task.setvariable variable=mockWheelVersion]${VER}"
+        - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
           displayName: 'Stamp sandbox wheel version'
           env:
             BUILD_BUILDID: $(Build.BuildId)
             RELEASE_VERSION: ${{ parameters.releaseVersion }}
-        - script: |
-            set -euo pipefail
-            CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest"
-            echo "Building mock wheel in container: $CONTAINER_IMAGE"
-            mkdir -p "$(ob_outputDirectory)/wheels"
-            bash .pipeline/scripts/docker-cargo-run.sh --rm \
-              -v "$(Build.SourcesDirectory):/workspace" \
-              -v "$(ob_outputDirectory)/wheels:/workspace/target/wheels" \
-              -e "WORKSPACE_DIR=/workspace" \
-              -e "OUTPUT_DIR=/workspace/target/wheels" \
-              "$CONTAINER_IMAGE" \
-              bash /workspace/scripts/build-mock-python-wheel-in-container.sh
-            sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/target" || true
-            WHEEL_COUNT=$(find "$(ob_outputDirectory)/wheels" -type f -name '*.whl' | wc -l)
-            if [ "$WHEEL_COUNT" -eq 0 ]; then
-              echo "ERROR: No mock wheels were produced!"
-              exit 1
-            fi
-            echo "$WHEEL_COUNT wheel(s) built."
-            ls -lh "$(ob_outputDirectory)/wheels"
+        - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
           displayName: 'Build mock abi3 wheel (manylinux_2_34)'
           env:
+            CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest
+            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)
+            BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
             CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
         - task: PublishPipelineArtifact@1
@@ -239,46 +208,17 @@ extends:
         - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
           parameters:
             installDocker: true
-        # Stamp a PEP 440 prerelease version into BOTH the pyproject.toml and the
-        # Cargo.toml so maturin bakes the right version into the wheel. The mounted
-        # workspace is what the container builds, so we patch on the host first.
-        - script: |
-            set -euo pipefail
-            BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-            case "${RELEASE_VERSION}" in
-              True|true|TRUE) VER="${BASE}" ;;   # release: publish BASE as-is (e.g. 1.0.0)
-              *) VER="${BASE}-dev$(date -u +%Y%m%d)${BUILD_BUILDID}" ;;   # PEP 440 normalizes -dev -> .dev
-            esac
-            echo "Sandbox wheel version: ${VER}"
-            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
-            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
-            echo "##vso[task.setvariable variable=mockWheelVersion]${VER}"
+        - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
           displayName: 'Stamp sandbox wheel version'
           env:
             BUILD_BUILDID: $(Build.BuildId)
             RELEASE_VERSION: ${{ parameters.releaseVersion }}
-        - script: |
-            set -euo pipefail
-            CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest"
-            echo "Building mock wheel in container: $CONTAINER_IMAGE"
-            mkdir -p "$(ob_outputDirectory)/wheels"
-            bash .pipeline/scripts/docker-cargo-run.sh --rm \
-              -v "$(Build.SourcesDirectory):/workspace" \
-              -v "$(ob_outputDirectory)/wheels:/workspace/target/wheels" \
-              -e "WORKSPACE_DIR=/workspace" \
-              -e "OUTPUT_DIR=/workspace/target/wheels" \
-              "$CONTAINER_IMAGE" \
-              bash /workspace/scripts/build-mock-python-wheel-in-container.sh
-            sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/target" || true
-            WHEEL_COUNT=$(find "$(ob_outputDirectory)/wheels" -type f -name '*.whl' | wc -l)
-            if [ "$WHEEL_COUNT" -eq 0 ]; then
-              echo "ERROR: No mock wheels were produced!"
-              exit 1
-            fi
-            echo "$WHEEL_COUNT wheel(s) built."
-            ls -lh "$(ob_outputDirectory)/wheels"
+        - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
           displayName: 'Build mock abi3 wheel (manylinux_2_34 aarch64)'
           env:
+            CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest
+            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)
+            BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
             CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
         - task: PublishPipelineArtifact@1
@@ -319,44 +259,18 @@ extends:
         - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
           parameters:
             installDocker: true
-        - script: |
-            set -euo pipefail
-            BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-            case "${RELEASE_VERSION}" in
-              True|true|TRUE) VER="${BASE}" ;;   # release: publish BASE as-is (e.g. 1.0.0)
-              *) VER="${BASE}-dev$(date -u +%Y%m%d)${BUILD_BUILDID}" ;;   # PEP 440 normalizes -dev -> .dev
-            esac
-            echo "Sandbox wheel version: ${VER}"
-            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
-            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
-            echo "##vso[task.setvariable variable=mockWheelVersion]${VER}"
+        - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
           displayName: 'Stamp sandbox wheel version'
           env:
             BUILD_BUILDID: $(Build.BuildId)
             RELEASE_VERSION: ${{ parameters.releaseVersion }}
-        - script: |
-            set -euo pipefail
-            CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest"
-            echo "Building mock wheel in container: $CONTAINER_IMAGE"
-            mkdir -p "$(ob_outputDirectory)/wheels"
-            bash .pipeline/scripts/docker-cargo-run.sh --rm \
-              -v "$(Build.SourcesDirectory):/workspace" \
-              -v "$(ob_outputDirectory)/wheels:/workspace/target/wheels" \
-              -e "WORKSPACE_DIR=/workspace" \
-              -e "OUTPUT_DIR=/workspace/target/wheels" \
-              -e "MATURIN_FEATURES=vendored-openssl" \
-              "$CONTAINER_IMAGE" \
-              bash /workspace/scripts/build-mock-python-wheel-in-container.sh
-            sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/target" || true
-            WHEEL_COUNT=$(find "$(ob_outputDirectory)/wheels" -type f -name '*.whl' | wc -l)
-            if [ "$WHEEL_COUNT" -eq 0 ]; then
-              echo "ERROR: No mock wheels were produced!"
-              exit 1
-            fi
-            echo "$WHEEL_COUNT wheel(s) built."
-            ls -lh "$(ob_outputDirectory)/wheels"
+        - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
           displayName: 'Build mock abi3 wheel (musllinux_1_2 x86_64)'
           env:
+            CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest
+            MATURIN_FEATURES: vendored-openssl
+            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)
+            BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
             CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
         - task: PublishPipelineArtifact@1
@@ -396,44 +310,18 @@ extends:
         - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
           parameters:
             installDocker: true
-        - script: |
-            set -euo pipefail
-            BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-            case "${RELEASE_VERSION}" in
-              True|true|TRUE) VER="${BASE}" ;;   # release: publish BASE as-is (e.g. 1.0.0)
-              *) VER="${BASE}-dev$(date -u +%Y%m%d)${BUILD_BUILDID}" ;;   # PEP 440 normalizes -dev -> .dev
-            esac
-            echo "Sandbox wheel version: ${VER}"
-            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
-            sed -i -E "0,/^version\s*=.*/s//version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
-            echo "##vso[task.setvariable variable=mockWheelVersion]${VER}"
+        - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
           displayName: 'Stamp sandbox wheel version'
           env:
             BUILD_BUILDID: $(Build.BuildId)
             RELEASE_VERSION: ${{ parameters.releaseVersion }}
-        - script: |
-            set -euo pipefail
-            CONTAINER_IMAGE="ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest"
-            echo "Building mock wheel in container: $CONTAINER_IMAGE"
-            mkdir -p "$(ob_outputDirectory)/wheels"
-            bash .pipeline/scripts/docker-cargo-run.sh --rm \
-              -v "$(Build.SourcesDirectory):/workspace" \
-              -v "$(ob_outputDirectory)/wheels:/workspace/target/wheels" \
-              -e "WORKSPACE_DIR=/workspace" \
-              -e "OUTPUT_DIR=/workspace/target/wheels" \
-              -e "MATURIN_FEATURES=vendored-openssl" \
-              "$CONTAINER_IMAGE" \
-              bash /workspace/scripts/build-mock-python-wheel-in-container.sh
-            sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/target" || true
-            WHEEL_COUNT=$(find "$(ob_outputDirectory)/wheels" -type f -name '*.whl' | wc -l)
-            if [ "$WHEEL_COUNT" -eq 0 ]; then
-              echo "ERROR: No mock wheels were produced!"
-              exit 1
-            fi
-            echo "$WHEEL_COUNT wheel(s) built."
-            ls -lh "$(ob_outputDirectory)/wheels"
+        - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
           displayName: 'Build mock abi3 wheel (musllinux_1_2 aarch64)'
           env:
+            CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest
+            MATURIN_FEATURES: vendored-openssl
+            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)
+            BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
             CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
         - task: PublishPipelineArtifact@1
@@ -475,38 +363,9 @@ extends:
             versionSpec: '3.12'
             architecture: 'x64'
             addToPath: true
-        - pwsh: |
-            $ErrorActionPreference = 'Stop'
-            $py = Get-Content 'mssql-mock-tds-py/pyproject.toml' -Raw
-            if ($py -match '(?m)^version\s*=\s*"([^"]+)"') { $base = $Matches[1] }
-            else { Write-Error 'Could not read version from pyproject.toml'; exit 1 }
-            if ('${{ parameters.releaseVersion }}' -eq 'True') {
-              $ver = $base   # release: publish base version as-is (e.g. 1.0.0)
-            } else {
-              $dev = "$(Get-Date -Format 'yyyyMMdd')$(Build.BuildId)"
-              $ver = "$base-dev$dev"   # PEP 440 normalizes -dev -> .dev for the wheel
-            }
-            Write-Host "Sandbox wheel version: $ver"
-            (Get-Content 'mssql-mock-tds-py/pyproject.toml' -Raw) `
-              -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$ver`"" |
-              Set-Content 'mssql-mock-tds-py/pyproject.toml' -NoNewline
-            (Get-Content 'mssql-mock-tds-py/Cargo.toml' -Raw) `
-              -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$ver`"" |
-              Set-Content 'mssql-mock-tds-py/Cargo.toml' -NoNewline
-            Write-Host "##vso[task.setvariable variable=mockWheelVersion]$ver"
+        - pwsh: .pipeline/scripts/stamp-mock-wheel-version.ps1 -ReleaseVersion '${{ parameters.releaseVersion }}' -BuildId '$(Build.BuildId)'
           displayName: 'Stamp sandbox wheel version'
-        - pwsh: |
-            $ErrorActionPreference = 'Stop'
-            python --version
-            pip install maturin
-            New-Item -ItemType Directory -Force -Path "$(ob_outputDirectory)\wheels" | Out-Null
-            # abi3 build: one wheel, no per-version loop. --manifest-path because the
-            # Cargo package is still mssql-mock-tds-py while the dist is mssql-mock-tds.
-            maturin build --release --auditwheel skip `
-              --interpreter python `
-              --manifest-path mssql-mock-tds-py\Cargo.toml `
-              --out "$(ob_outputDirectory)\wheels"
-            Get-ChildItem "$(ob_outputDirectory)\wheels" | Format-Table Name, Length
+        - pwsh: .pipeline/scripts/build-mock-wheel-windows.ps1 -OutputDir '$(ob_outputDirectory)'
           displayName: 'Build mock abi3 wheel (Windows x64)'
           env:
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
@@ -555,36 +414,9 @@ extends:
             versionSpec: '3.12'
             architecture: 'arm64'
             addToPath: true
-        - pwsh: |
-            $ErrorActionPreference = 'Stop'
-            $py = Get-Content 'mssql-mock-tds-py/pyproject.toml' -Raw
-            if ($py -match '(?m)^version\s*=\s*"([^"]+)"') { $base = $Matches[1] }
-            else { Write-Error 'Could not read version from pyproject.toml'; exit 1 }
-            if ('${{ parameters.releaseVersion }}' -eq 'True') {
-              $ver = $base   # release: publish base version as-is (e.g. 1.0.0)
-            } else {
-              $dev = "$(Get-Date -Format 'yyyyMMdd')$(Build.BuildId)"
-              $ver = "$base-dev$dev"   # PEP 440 normalizes -dev -> .dev for the wheel
-            }
-            Write-Host "Sandbox wheel version: $ver"
-            (Get-Content 'mssql-mock-tds-py/pyproject.toml' -Raw) `
-              -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$ver`"" |
-              Set-Content 'mssql-mock-tds-py/pyproject.toml' -NoNewline
-            (Get-Content 'mssql-mock-tds-py/Cargo.toml' -Raw) `
-              -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$ver`"" |
-              Set-Content 'mssql-mock-tds-py/Cargo.toml' -NoNewline
-            Write-Host "##vso[task.setvariable variable=mockWheelVersion]$ver"
+        - pwsh: .pipeline/scripts/stamp-mock-wheel-version.ps1 -ReleaseVersion '${{ parameters.releaseVersion }}' -BuildId '$(Build.BuildId)'
           displayName: 'Stamp sandbox wheel version'
-        - pwsh: |
-            $ErrorActionPreference = 'Stop'
-            python --version
-            pip install maturin
-            New-Item -ItemType Directory -Force -Path "$(ob_outputDirectory)\wheels" | Out-Null
-            maturin build --release --auditwheel skip `
-              --interpreter python `
-              --manifest-path mssql-mock-tds-py\Cargo.toml `
-              --out "$(ob_outputDirectory)\wheels"
-            Get-ChildItem "$(ob_outputDirectory)\wheels" | Format-Table Name, Length
+        - pwsh: .pipeline/scripts/build-mock-wheel-windows.ps1 -OutputDir '$(ob_outputDirectory)'
           displayName: 'Build mock abi3 wheel (Windows ARM64)'
           env:
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
@@ -631,66 +463,23 @@ extends:
           inputs:
             versionSpec: '3.12'
             addToPath: true
-        - script: |
-            set -euo pipefail
-            # Target the UsePythonVersion-selected interpreter explicitly. It is a
-            # managed, writable, on-PATH Python, so there is no PEP 668
-            # externally-managed-environment problem (no --break-system-packages) and
-            # the maturin/wheel console scripts land on PATH. abi3 needs only one
-            # interpreter regardless of the wheel's >=3.9 compatibility.
-            python -m pip install --upgrade pip
-            python -m pip install maturin wheel
-            echo "Installing Rust targets for universal2 build..."
-            rustup target add x86_64-apple-darwin
-            rustup target add aarch64-apple-darwin
+        - script: bash .pipeline/scripts/install-maturin-macos.sh
           displayName: 'Install maturin and Rust targets'
-        - script: |
-            set -euo pipefail
-            BASE=$(grep -m1 -E '^version\s*=' mssql-mock-tds-py/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-            case "${RELEASE_VERSION}" in
-              True|true|TRUE) VER="${BASE}" ;;   # release: publish BASE as-is (e.g. 1.0.0)
-              *) VER="${BASE}-dev$(date -u +%Y%m%d)${BUILD_BUILDID}" ;;   # PEP 440 normalizes -dev -> .dev
-            esac
-            echo "Sandbox wheel version: ${VER}"
-            # BSD sed (macOS) rejects the GNU empty-regex reuse `s//.../`, so use an
-            # explicit pattern. Each manifest has exactly one line-starting
-            # `version =` (the package version), so a plain substitution is safe.
-            sed -i '' -E "s/^version[[:space:]]*=.*/version = \"${VER}\"/" mssql-mock-tds-py/pyproject.toml
-            sed -i '' -E "s/^version[[:space:]]*=.*/version = \"${VER}\"/" mssql-mock-tds-py/Cargo.toml
-            echo "##vso[task.setvariable variable=mockWheelVersion]${VER}"
+        - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
           displayName: 'Stamp sandbox wheel version'
           env:
             BUILD_BUILDID: $(Build.BuildId)
             RELEASE_VERSION: ${{ parameters.releaseVersion }}
-        - script: |
-            set -euo pipefail
-            export MACOSX_DEPLOYMENT_TARGET=15.0
-            mkdir -p "$(ob_outputDirectory)/wheels"
-            # ONE universal2 abi3 wheel. vendored-openssl statically links OpenSSL
-            # so the wheel doesn't depend on Homebrew's libssl. --manifest-path
-            # because the Cargo package is still mssql-mock-tds-py.
-            maturin build --release \
-              --target universal2-apple-darwin \
-              --auditwheel skip \
-              --features vendored-openssl \
-              --manifest-path mssql-mock-tds-py/Cargo.toml \
-              --out "$(ob_outputDirectory)/wheels"
-            ls -lh "$(ob_outputDirectory)/wheels"
+        - script: bash .pipeline/scripts/build-mock-wheel-macos.sh
           displayName: 'Build mock universal2 wheel (macOS)'
           env:
+            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
             CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
-        - script: |
-            set -euo pipefail
-            # wheel was installed against the selected interpreter above; -m avoids
-            # any reliance on the console script's location on PATH.
-            for whl in "$(ob_outputDirectory)"/wheels/*.whl; do
-              echo "Re-tagging: $(basename "$whl")"
-              python -m wheel tags --platform-tag macosx_15_0_universal2 --remove "$whl"
-            done
-            echo "Re-tagged wheels:"
-            ls -lh "$(ob_outputDirectory)/wheels"
+        - script: bash .pipeline/scripts/retag-macos-wheel.sh
           displayName: 'Re-tag macOS wheel to uniform universal2 platform tag'
+          env:
+            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)
         - task: PublishPipelineArtifact@1
           displayName: 'Publish macOS universal2 mock wheel'
           inputs:
@@ -730,32 +519,14 @@ extends:
             versionSpec: '3.12'
             architecture: 'x64'
             addToPath: true
-        - pwsh: |
-            $ErrorActionPreference = 'Stop'
-            python -m pip install --upgrade twine
-            $dist = "$(Build.StagingDirectory)\dist"
-            New-Item -ItemType Directory -Force -Path $dist | Out-Null
-            Get-ChildItem "$(Pipeline.Workspace)" -Recurse -Filter *.whl |
-              Copy-Item -Destination $dist
-            Write-Host "=== Collected wheels ==="
-            Get-ChildItem $dist -Filter *.whl | ForEach-Object {
-              Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1KB,1)) KB)"
-            }
-            Write-Host "##vso[task.setvariable variable=distDir]$dist"
+        - pwsh: .pipeline/scripts/collect-wheels.ps1 -StagingDir '$(Build.StagingDirectory)' -SourceRoot '$(Pipeline.Workspace)'
           displayName: 'Collect wheels'
         - ${{ if eq(parameters.publishPython, true) }}:
           - task: TwineAuthenticate@1
             displayName: 'Authenticate twine to feed'
             inputs:
               artifactFeed: '$(pythonArtifactFeed)'
-          - pwsh: |
-              $ErrorActionPreference = 'Stop'
-              Write-Host "Uploading SANDBOX wheels to $(pythonFeedName) ..."
-              # Azure Artifacts' PyPI endpoint rejects --skip-existing
-              # (UnsupportedConfiguration). Each run stamps a unique
-              # .dev<date><BuildId> version, so there is no collision to skip.
-              twine upload -r $(pythonFeedName) --config-file "$(PYPIRC_PATH)" `
-                "$(distDir)\*.whl"
+          - pwsh: .pipeline/scripts/twine-upload-mock.ps1 -FeedName '$(pythonFeedName)' -ConfigFile '$(PYPIRC_PATH)' -DistDir '$(distDir)'
             displayName: 'twine upload (sandbox)'
         - ${{ if ne(parameters.publishPython, true) }}:
           - pwsh: |
@@ -796,13 +567,7 @@ extends:
           CARGO_TARGET_DIR: C:\cargo_target_dir
         steps:
         - ${{ if and(eq(parameters.releaseVersion, true), eq(parameters.publishCrate, true)) }}:
-          - pwsh: |
-              $ErrorActionPreference = 'Stop'
-              $baseVer = ([regex]'(?m)^version\s*=\s*"([^"]+)"').Match((Get-Content 'mssql-tds/Cargo.toml' -Raw)).Groups[1].Value
-              if ([string]::IsNullOrWhiteSpace($baseVer)) { Write-Error 'Could not read base version from mssql-tds/Cargo.toml'; exit 1 }
-              & .pipeline/scripts/check-crate-version-not-published.ps1 `
-                -IndexBaseUrl '$(cargoSparseIndex)' -Version $baseVer `
-                -Crates mssql-tds,mssql-mock-tds
+          - pwsh: .pipeline/scripts/preflight-crate-versions.ps1 -IndexBaseUrl '$(cargoSparseIndex)' -Crates mssql-tds,mssql-mock-tds
             displayName: 'Preflight: release crate versions not already published'
         - template: /.pipeline/templates/cargo-authenticate-template.yml@self
           parameters:
@@ -813,75 +578,18 @@ extends:
             skipPythonSetup: true
             skipRustupInstall: false
             enableJsDeps: false
-        # Stamp a PEP 440 / SemVer prerelease into ONLY the [package].version of
-        # mssql-tds and mssql-mock-tds. We do this inline instead of the shared
-        # .pipeline/scripts/stamp-crate-versions.ps1 because that script's global
-        # `^version = "..."` regex also rewrites table-style dependency versions
-        # such as [dependencies.uuid] version = "1.19.0", which corrupts the
-        # dependency requirement and makes `cargo publish` fail. Replacing only
-        # the first ^version line per file targets the package version.
-        - pwsh: |
-            $ErrorActionPreference = 'Stop'
-            $date = Get-Date -Format 'yyyyMMdd'
-            $rx = [regex]'(?m)^(version\s*=\s*)"[^"]+"'
-            $baseVer = ([regex]'(?m)^version\s*=\s*"([^"]+)"').Match((Get-Content 'mssql-tds/Cargo.toml' -Raw)).Groups[1].Value
-            if ([string]::IsNullOrWhiteSpace($baseVer)) { Write-Error 'Could not read base version from mssql-tds/Cargo.toml'; exit 1 }
-            if ('${{ parameters.releaseVersion }}' -eq 'True') {
-              $ver = $baseVer   # release: publish base version as-is (e.g. 1.0.0)
-            } else {
-              $ver = "$baseVer-dev.$date.$(Build.BuildId)"
-            }
-            Write-Host "Sandbox crate version: $ver"
-            foreach ($f in 'mssql-tds/Cargo.toml','mssql-mock-tds/Cargo.toml') {
-              $c = Get-Content $f -Raw
-              $c = $rx.Replace($c, ('${1}"' + $ver + '"'), 1)
-              Set-Content $f $c -NoNewline
-              Write-Host "Stamped $f -> version = `"$ver`""
-            }
-            Write-Host "##vso[task.setvariable variable=crateVersion]$ver"
+        - pwsh: .pipeline/scripts/stamp-crate-versions-sandbox.ps1 -ReleaseVersion '${{ parameters.releaseVersion }}' -BuildId '$(Build.BuildId)'
           displayName: 'Stamp crate versions (sandbox, package-only)'
-        # The mssql-tds path dependency in mssql-mock-tds/Cargo.toml has no version,
-        # which cargo publish rejects ("all dependencies must have a version"). Add
-        # the stamped version while keeping the path (cargo uses the version on
-        # publish and the path for local verify builds).
-        - pwsh: |
-            $ErrorActionPreference = 'Stop'
-            $ver = "$(crateVersion)"
-            if ([string]::IsNullOrWhiteSpace($ver)) { Write-Error 'crateVersion not set'; exit 1 }
-            $path = 'mssql-mock-tds/Cargo.toml'
-            $c = Get-Content $path -Raw
-            $c = $c -replace 'mssql-tds\s*=\s*\{\s*path\s*=\s*"\.\./mssql-tds"',
-                             "mssql-tds = { path = `"../mssql-tds`", version = `"$ver`""
-            Set-Content $path $c -NoNewline
-            Write-Host "Pinned mssql-tds dependency to version $ver"
-            Select-String -Path $path -Pattern 'mssql-tds\s*=' | ForEach-Object { Write-Host $_.Line }
+        - pwsh: .pipeline/scripts/pin-mssql-tds-dep-version.ps1 -Version '$(crateVersion)'
           displayName: 'Pin mssql-tds dependency version'
         - ${{ if eq(parameters.publishCrate, true) }}:
-          - pwsh: |
-              $ErrorActionPreference = 'Stop'
-              Write-Host "Publishing SANDBOX crates to $(cargoRegistry) (mssql-tds first)..."
-              cargo publish -p mssql-tds --registry $(cargoRegistry) --allow-dirty
-              # mssql-tds must be queryable in the feed index before mssql-mock-tds
-              # is verified/published. Sparse index propagation is usually quick, but
-              # allow a short settle window for the sandbox.
-              Start-Sleep -Seconds 30
-              cargo publish -p mssql-mock-tds --registry $(cargoRegistry) --allow-dirty
+          - pwsh: .pipeline/scripts/cargo-publish-mock.ps1 -Registry '$(cargoRegistry)'
             displayName: 'cargo publish (sandbox)'
             env:
               CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
               CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
         - ${{ if ne(parameters.publishCrate, true) }}:
-          - pwsh: |
-              $ErrorActionPreference = 'Stop'
-              Write-Host "================ DRY RUN ================"
-              Write-Host "publishCrate=false -> cargo publish --dry-run only."
-              Write-Host "========================================"
-              cargo publish -p mssql-tds --registry $(cargoRegistry) --dry-run --allow-dirty
-              # A dry run of mssql-mock-tds would need mssql-tds@$(crateVersion) to
-              # already exist in the feed (cargo verifies by building against the
-              # registry version), so it is intentionally NOT run here. Set
-              # publishCrate=true to publish mssql-tds then mssql-mock-tds in order.
-              Write-Host "Skipping mssql-mock-tds dry run (depends on a published mssql-tds)."
+          - pwsh: .pipeline/scripts/cargo-publish-mock.ps1 -Registry '$(cargoRegistry)' -DryRun
             displayName: 'cargo publish --dry-run (sandbox)'
             env:
               CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
