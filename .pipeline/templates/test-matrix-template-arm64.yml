@@ -101,7 +101,8 @@ jobs:
           displayName: 'Wait for SQL host endpoint sentinel'
           workingDirectory: '$(Build.SourcesDirectory)'
           env:
-            ARTIFACT_NAME: 'sql-ready-shared'
+            # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
+            ARTIFACT_NAME: 'sql-ready-shared-$(System.StageAttempt)'
             BUILD_BUILDID: $(Build.BuildId)
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             SYSTEM_COLLECTIONURI: $(System.CollectionUri)
@@ -162,7 +163,8 @@ jobs:
           condition: always()
           inputs:
             targetPath: '$(Agent.TempDirectory)/teardown'
-            artifact: '$(sentinelName)'
+            # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
+            artifact: '$(sentinelName)-$(System.StageAttempt)'
             publishLocation: 'pipeline'
 
   # ------------------------------------------------------------------
@@ -214,7 +216,8 @@ jobs:
             displayName: 'Wait for SQL host endpoint sentinel'
             workingDirectory: '$(Build.SourcesDirectory)'
             env:
-              ARTIFACT_NAME: 'sql-ready-${{ target.name }}'
+              # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
+              ARTIFACT_NAME: 'sql-ready-${{ target.name }}-$(System.StageAttempt)'
               BUILD_BUILDID: $(Build.BuildId)
               BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
               SYSTEM_COLLECTIONURI: $(System.CollectionUri)
@@ -275,5 +278,6 @@ jobs:
             condition: always()
             inputs:
               targetPath: '$(Agent.TempDirectory)/teardown'
-              artifact: '${{ target.name }}'
+              # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
+              artifact: '${{ target.name }}-$(System.StageAttempt)'
               publishLocation: 'pipeline'

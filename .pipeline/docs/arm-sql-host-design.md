@@ -80,12 +80,16 @@ ADO dependency between the jobs:
 
 | Direction | Artifact name              | Producer side                       | Consumer side                                |
 |-----------|----------------------------|-------------------------------------|----------------------------------------------|
-| host→test | `sql-ready-<instanceId>`   | `PublishPipelineArtifact@1` after `start.sh` | `poll-for-endpoint.sh` at start of test job  |
-| test→host | `<sentinelName>` (per matrix entry) | `PublishPipelineArtifact@1` always() at end of test job | `wait-for-teardown.sh` poll loop in SQL host |
+| host→test | `sql-ready-<instanceId>-<stageAttempt>`   | `PublishPipelineArtifact@1` after `start.sh` | `poll-for-endpoint.sh` at start of test job  |
+| test→host | `<sentinelName>-<stageAttempt>` (per matrix entry) | `PublishPipelineArtifact@1` always() at end of test job | `wait-for-teardown.sh` poll loop in SQL host |
 
 Both jobs are queued at the start of the stage and run concurrently. The
 test job's first SQL-touching step blocks on the `sql-ready` sentinel; the
-SQL host's wait step blocks on the `tests-done` sentinels.
+SQL host's wait step blocks on the teardown sentinels.
+
+Every rendezvous artifact name is suffixed with `$(System.StageAttempt)` (see
+the *Rerun safety* property below), so a stage rerun forms a fresh, isolated
+handshake instead of colliding with the previous attempt's artifacts.
 
 ### Shared SA password
 
@@ -297,7 +301,7 @@ coverage is the Rust integration suite.
 | `.pipeline/scripts/sql-host/derive-sql-password.sh`           | Derive shared SA password from build context.                  |
 | `.pipeline/scripts/sql-host/start.sh`                         | Boot SQL container, probe readiness, stage endpoint payload.   |
 | `.pipeline/scripts/sql-host/poll-for-endpoint.sh`             | Test-side: poll for sql-ready artifact, set DB_HOST/DB_PORT.   |
-| `.pipeline/scripts/sql-host/wait-for-teardown.sh`             | SQL-host-side: poll ADO REST for tests-done sentinels.         |
+| `.pipeline/scripts/sql-host/wait-for-teardown.sh`             | SQL-host-side: poll ADO REST for teardown sentinels.         |
 | `.pipeline/scripts/sql-host/teardown.sh`                      | Idempotent docker cleanup for `always()` step.                 |
 | `.pipeline/templates/test-matrix-template-arm64.yml`          | Refactored; targets list + sqlInstanceMode; consumes endpoint. |
 | `.pipeline/templates/test-matrix-template-alpine_arm64.yml`   | Same refactor for the musl/alpine flow.                        |
@@ -310,6 +314,18 @@ unchanged.
 
 ## Reliability properties
 
+- **Rerun safety (attempt namespacing).** Every rendezvous artifact name —
+  `sql-ready-<instanceId>` and each teardown sentinel — is suffixed with
+  `$(System.StageAttempt)`. Pipeline artifacts are build-scoped and immutable,
+  so without this a stage rerun would (a) fail `PublishPipelineArtifact@1` with
+  "artifact already exists" from the prior attempt, and (b) risk the test side
+  reading a stale endpoint. Because the SQL host and its test consumers live in
+  the same stage, they observe the same `System.StageAttempt` and rendezvous
+  only within their attempt; the previous attempt's artifacts are inert.
+  (Publishers append the suffix inline; `wait-for-teardown.sh` appends the same
+  value via `SENTINEL_SUFFIX`.) Note this makes **Rerun stage** clean; making
+  **Rerun failed jobs** work additionally requires coupling the SQL host's
+  outcome to the test's — see *Open assumptions*.
 - **No deadlock.** Symmetric pipeline-artifact sentinels with no ADO
   `dependsOn` between SQL host and test jobs. Either side can be late and
   the other side polls until it appears.
@@ -345,6 +361,15 @@ unchanged.
   `install-ubuntu-dependency.yaml`; the former is standard in the image.
 - Both ARM and x64 1ES pool agents have `python3` available (used by
   `poll-for-endpoint.sh` for JSON parsing). Standard in the Ubuntu images.
+- **Rerun granularity.** Attempt namespacing makes **Rerun stage** fully clean
+  (all jobs re-run under a new `System.StageAttempt`, forming a fresh
+  handshake). **Rerun failed jobs** is *not* fully supported yet: on a test
+  failure the SQL host job still reports success (its `always()` teardown
+  released it), so ADO does not re-run it, and the re-run test job polls for a
+  `sql-ready-*-<newAttempt>` artifact that no host will publish. Making that
+  path work requires additionally coupling the SQL host's outcome to the test
+  job's (host mirrors the test's failure so both re-run together) — deferred as
+  a follow-up.
 
 ## Operational notes
 

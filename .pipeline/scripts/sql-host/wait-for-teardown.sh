@@ -13,6 +13,10 @@
 #   SYSTEM_ACCESSTOKEN    OAuth token; the calling step must pass it via env:.
 #
 # Optional env:
+#   SENTINEL_SUFFIX       Appended to every expected sentinel name before
+#                         matching (e.g. "-2" from System.StageAttempt), so a
+#                         stage rerun waits on that attempt's artifacts and
+#                         never matches a previous attempt's leftovers.
 #   POLL_INTERVAL_SECONDS Default 15.
 #   MAX_LIFETIME_MINUTES  Hard cap; default 120 (2h). Returns 0 with a warning
 #                         once exceeded so the cleanup step can still tear down.
@@ -43,7 +47,16 @@ collection="${SYSTEM_COLLECTIONURI%/}/"
 project_enc="$(printf '%s' "${SYSTEM_TEAMPROJECT}" | sed 's/ /%20/g')"
 url="${collection}${project_enc}/_apis/build/builds/${BUILD_BUILDID}/artifacts?api-version=7.1"
 
-IFS=',' read -r -a expected <<< "${EXPECTED_SENTINELS}"
+# Namespacing: publishers suffix their teardown-sentinel artifact names with
+# SENTINEL_SUFFIX (the stage attempt) so reruns neither collide with nor match
+# a prior attempt's artifacts. Apply the same suffix to what we wait for.
+SENTINEL_SUFFIX="${SENTINEL_SUFFIX:-}"
+IFS=',' read -r -a expected_base <<< "${EXPECTED_SENTINELS}"
+expected=()
+for s in "${expected_base[@]}"; do
+    expected+=( "${s}${SENTINEL_SUFFIX}" )
+done
+
 echo "=== sql-host/wait-for-teardown.sh ==="
 echo "  Build       = ${BUILD_BUILDID}"
 echo "  Poll URL    = ${url}"

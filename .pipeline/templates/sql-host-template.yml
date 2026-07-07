@@ -20,11 +20,15 @@
 # Caller contract:
 #   * The dependent test job must NOT add `dependsOn` on this job.
 #   * The dependent test job must call sql-host/poll-for-endpoint.sh with
-#     ARTIFACT_NAME='sql-ready-<instanceId>' before it tries to connect.
+#     ARTIFACT_NAME='sql-ready-<instanceId>-$(System.StageAttempt)' before it
+#     tries to connect.
 #   * The dependent test job must publish a pipeline artifact whose name is
-#     listed in `expectedSentinels` once it has finished using the SQL host
-#     (use `condition: always()` so cancellations and failures still release
-#     the host).
+#     '<sentinel>-$(System.StageAttempt)', where <sentinel> is listed in
+#     `expectedSentinels`, once it has finished using the SQL host (use
+#     `condition: always()` so cancellations and failures still release the
+#     host). The `-$(System.StageAttempt)` suffix namespaces the rendezvous per
+#     stage attempt so reruns don't collide with or match prior attempts; this
+#     job appends the same suffix to `expectedSentinels` via SENTINEL_SUFFIX.
 #   * The SA password is derived deterministically from build context by
 #     sql-host/derive-sql-password.sh, so the same script must be invoked
 #     in the dependent test job to recompute the same value.
@@ -117,7 +121,11 @@ jobs:
         displayName: 'Publish sql-ready sentinel (unblocks test jobs)'
         inputs:
           targetPath: '$(Build.ArtifactStagingDirectory)/sql-endpoint-$(INSTANCE_ID)'
-          artifact: 'sql-ready-$(INSTANCE_ID)'
+          # Suffix with the stage attempt so a stage rerun publishes a fresh
+          # artifact name instead of colliding with the prior attempt's, and
+          # the paired poll-for-endpoint reads this attempt's endpoint (not a
+          # stale one). Consumers append the same $(System.StageAttempt).
+          artifact: 'sql-ready-$(INSTANCE_ID)-$(System.StageAttempt)'
           publishLocation: 'pipeline'
 
       - script: |
@@ -127,6 +135,10 @@ jobs:
         workingDirectory: '$(Build.SourcesDirectory)'
         env:
           EXPECTED_SENTINELS: $(EXPECTED_SENTINELS)
+          # Wait on this stage attempt's teardown sentinels (publishers suffix
+          # their artifact names with the same value), so a rerun never matches
+          # a previous attempt's leftover sentinels.
+          SENTINEL_SUFFIX: '-$(System.StageAttempt)'
           BUILD_BUILDID: $(Build.BuildId)
           SYSTEM_COLLECTIONURI: $(System.CollectionUri)
           SYSTEM_TEAMPROJECT: $(System.TeamProject)

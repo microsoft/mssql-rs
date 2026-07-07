@@ -148,7 +148,9 @@ steps:
     condition: eq(variables['Build.Reason'], 'PullRequest')
     workingDirectory: '$(Build.SourcesDirectory)'
     env:
-      ARTIFACT_NAME: 'sql-ready-build_arm'
+      # Suffix with the stage attempt so a stage rerun reads this attempt's
+      # freshly-published endpoint, not a stale one from a prior attempt.
+      ARTIFACT_NAME: 'sql-ready-build_arm-$(System.StageAttempt)'
       BUILD_BUILDID: $(Build.BuildId)
       BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
       SYSTEM_COLLECTIONURI: $(System.CollectionUri)
@@ -418,7 +420,10 @@ steps:
     condition: and(always(), eq(variables['Build.Reason'], 'PullRequest'))
     inputs:
       targetPath: '$(Agent.TempDirectory)/teardown'
-      artifact: 'build_arm'
+      # Suffix with the stage attempt so a rerun publishes a fresh name instead
+      # of colliding with the prior attempt's artifact; the host waits on the
+      # matching $(System.StageAttempt) via SENTINEL_SUFFIX.
+      artifact: 'build_arm-$(System.StageAttempt)'
       publishLocation: 'pipeline'
 
 - script: |
