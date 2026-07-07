@@ -24,7 +24,7 @@
 #
 # Optional env:
 #   POLL_INTERVAL_SECONDS    default 10
-#   MAX_WAIT_SECONDS         default 1800 (30 min). Covers x64 agent queueing,
+#   MAX_WAIT_SECONDS         default 3600 (60 min). Covers x64 agent queueing,
 #                            docker pull, and SQL Server startup.
 #   SYSTEM_STAGEATTEMPT      current stage attempt (ADO provides it). Used only
 #                            to detect a partial "Rerun failed jobs" and emit
