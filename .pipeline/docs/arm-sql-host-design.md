@@ -186,7 +186,7 @@ so the test side polls for the right sentinel.
 
 If the readiness probe fails, `start.sh` exits non-zero, the publish step
 is skipped, and the test job's poll script will time out at its
-`MAX_WAIT_SECONDS` cap (default 30 min) and fail with a clear error.
+`MAX_WAIT_SECONDS` cap (default 60 min) and fail with a clear error.
 
 ### Shutdown signalling (release)
 
