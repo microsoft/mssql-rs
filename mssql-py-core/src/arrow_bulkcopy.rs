@@ -158,13 +158,16 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
         (DataType::Null, _) => ColumnPlanKind::Null,
         (DataType::Boolean, S::Bit) => ColumnPlanKind::Bool,
 
+        // Any integer Arrow type may target any integer SQL type; `narrow_int`
+        // range-checks each cell at write time (A1: down-narrowing supported,
+        // e.g. Int64 -> INT, rejecting out-of-range values).
         (DataType::Int8, S::TinyInt | S::SmallInt | S::Int | S::BigInt) => ColumnPlanKind::Int8,
-        (DataType::Int16, S::SmallInt | S::Int | S::BigInt) => ColumnPlanKind::Int16,
-        (DataType::Int32, S::Int | S::BigInt) => ColumnPlanKind::Int32,
-        (DataType::Int64, S::BigInt) => ColumnPlanKind::Int64,
+        (DataType::Int16, S::TinyInt | S::SmallInt | S::Int | S::BigInt) => ColumnPlanKind::Int16,
+        (DataType::Int32, S::TinyInt | S::SmallInt | S::Int | S::BigInt) => ColumnPlanKind::Int32,
+        (DataType::Int64, S::TinyInt | S::SmallInt | S::Int | S::BigInt) => ColumnPlanKind::Int64,
         (DataType::UInt8, S::TinyInt | S::SmallInt | S::Int | S::BigInt) => ColumnPlanKind::UInt8,
-        (DataType::UInt16, S::SmallInt | S::Int | S::BigInt) => ColumnPlanKind::UInt16,
-        (DataType::UInt32, S::Int | S::BigInt) => ColumnPlanKind::UInt32,
+        (DataType::UInt16, S::TinyInt | S::SmallInt | S::Int | S::BigInt) => ColumnPlanKind::UInt16,
+        (DataType::UInt32, S::TinyInt | S::SmallInt | S::Int | S::BigInt) => ColumnPlanKind::UInt32,
 
         (DataType::Float32, S::Real | S::Float) => ColumnPlanKind::Float32,
         (DataType::Float64, S::Float) => ColumnPlanKind::Float64,
@@ -657,6 +660,55 @@ mod tests {
             ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "hello"),
             other => panic!("expected String, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn int64_narrows_to_int_in_range() {
+        // A1: Int64 source -> INT destination (pandas/pyarrow default int is i64).
+        let dest = meta("id", SqlDbType::Int, false);
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(2_000_000_000_i64)]));
+        let plan = one_col_plan(DataType::Int64, &dest);
+        assert_eq!(
+            plan.extract_value(arr.as_ref(), 0, &dest).unwrap(),
+            ColumnValues::Int(2_000_000_000)
+        );
+    }
+
+    #[test]
+    fn int64_narrow_to_int_out_of_range_errors() {
+        // A1: out-of-range value must be rejected, not silently wrapped/truncated.
+        let dest = meta("id", SqlDbType::Int, false);
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(i32::MAX as i64 + 1)]));
+        let plan = one_col_plan(DataType::Int64, &dest);
+        let err = plan.extract_value(arr.as_ref(), 0, &dest).unwrap_err();
+        assert!(format!("{err}").to_uppercase().contains("INT"));
+    }
+
+    #[test]
+    fn int64_narrows_to_tinyint_and_smallint() {
+        let dest_tiny = meta("b", SqlDbType::TinyInt, false);
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(200_i64)]));
+        let plan = one_col_plan(DataType::Int64, &dest_tiny);
+        assert_eq!(
+            plan.extract_value(arr.as_ref(), 0, &dest_tiny).unwrap(),
+            ColumnValues::TinyInt(200)
+        );
+
+        let dest_small = meta("s", SqlDbType::SmallInt, false);
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(-30000_i64)]));
+        let plan = one_col_plan(DataType::Int64, &dest_small);
+        assert_eq!(
+            plan.extract_value(arr.as_ref(), 0, &dest_small).unwrap(),
+            ColumnValues::SmallInt(-30000)
+        );
+    }
+
+    #[test]
+    fn int64_narrow_to_tinyint_out_of_range_errors() {
+        let dest = meta("b", SqlDbType::TinyInt, false);
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(256_i64)]));
+        let plan = one_col_plan(DataType::Int64, &dest);
+        assert!(plan.extract_value(arr.as_ref(), 0, &dest).is_err());
     }
 
     #[test]
