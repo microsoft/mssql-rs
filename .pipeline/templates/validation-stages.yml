@@ -26,6 +26,19 @@ parameters:
   type: boolean
   default: true
 
+- name: sqlInstanceMode
+  displayName: SQL host cardinality for ARM test stages (shared = one SQL host per stage; per-job = one per matrix entry)
+  type: string
+  values:
+  - shared
+  - per-job
+  default: shared
+
+- name: sqlImageTag
+  displayName: SQL Server docker image tag for ARM test stages
+  type: string
+  default: '2025-latest'
+
 stages:
 - stage: EvaluateDuplicate
   displayName: Evaluate PR duplicate
@@ -61,6 +74,16 @@ stages:
       )
     )
   jobs:
+  # On-demand x64 SQL host for the ARM64 build's integration tests. ARM agents
+  # cannot run the x64 SQL Server image natively, so Build_Linux_ARM connects
+  # cross-pool to this host instead. PR-only: the ARM build only runs its test
+  # pass on PRs, and this job would otherwise idle an x64 agent on every merge.
+  - template: sql-host-template.yml
+    parameters:
+      instanceId: build_arm
+      expectedSentinels: build_arm
+      sqlImageTag: ${{ parameters.sqlImageTag }}
+      jobCondition: eq(variables['Build.Reason'], 'PullRequest')
   - job: Build_Windows
     displayName: Build Windows
     pool:
@@ -233,7 +256,7 @@ stages:
         parameters:
           architecture: ARM64
           buildType: ${{ parameters.buildType }}
-          testFilter: -E 'not (test(query_processing_driver) | test(query_result) | test(connectivity) | test(transaction) | test(rpc_results) | test(timeout_and_cancel) | test(rpc_datatypes) | test(client_based_iterators) | test(connect_fetch_multiple_packets) | test(iter_rows) | test(bulk_copy) | test(transport_protocols) | test(vector_integration_tests) | test(no_protocol_resolution) | test(multi_subnet_failover) | test(encryption_tests) | binary(test_tls_handshake) | binary(test_tvp) | binary(test_cursor_ops) | binary(test_reset_connection) | binary(test_connection_pool_primitives))'
+          testFilter: -E 'not (test(connectivity))'
           additionalPythonTestArgs: '--skip-integration'
       - template: build-template-alpine.yml
         parameters:
@@ -497,17 +520,19 @@ stages:
         artifactName: 'Build_Linux_ARM'
         poolName: RUST-1ES-POOL-ARM-WUS3
         poolImageOverride: imageOverride -equals RUST-UBUNTU-ARM64
-        matrix:
-          Alpine3_18:
+        sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+        sqlImageTag: ${{ parameters.sqlImageTag }}
+        targets:
+          - name: Alpine3_18
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
             entry: alpine.sh
-          Alpine3_19:
+          - name: Alpine3_19
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
             entry: alpine.sh
-          Alpine3_20:
+          - name: Alpine3_20
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
             entry: alpine.sh
-          Alpine3_21:
+          - name: Alpine3_21
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
             entry: alpine.sh
 
@@ -551,26 +576,28 @@ stages:
   jobs:
     - template: test-matrix-template-arm64.yml
       parameters:
-        matrix:
-          DebianBookworm:
+        sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+        sqlImageTag: ${{ parameters.sqlImageTag }}
+        targets:
+          - name: DebianBookworm
             container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
             entry: deb-bookworm.sh
-          AzLinux3:
+          - name: AzLinux3
             container: mcr.microsoft.com/azurelinux/base/core:3.0
             entry: azlinux3.sh
-          RHEL9:
+          - name: RHEL9
             container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi9:latest
             entry: rhel.sh
-          OracleLinux9:
+          - name: OracleLinux9
             container: ghcr.io/microsoft/mssql-rs/import/oraclelinux:9
             entry: rhel.sh
-          SLES15:
+          - name: SLES15
             container: registry.suse.com/suse/sle15
             entry: sles.sh
-          Ubuntu22:
+          - name: Ubuntu22
             container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
             entry: deb-bookworm.sh
-          Ubuntu24:
+          - name: Ubuntu24
             container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
             entry: deb-bookworm.sh
 

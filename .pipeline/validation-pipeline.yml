@@ -23,12 +23,27 @@ parameters:
   type: boolean
   default: false
 
+- name: sqlInstanceMode
+  displayName: SQL host cardinality for ARM test stages
+  type: string
+  values:
+  - shared
+  - per-job
+  default: shared
+
+- name: sqlImageTag
+  displayName: SQL Server docker image tag for ARM test stages
+  type: string
+  default: '2025-latest'
+
 stages:
 - template: templates/validation-stages.yml
   parameters:
     buildType: ${{ parameters.buildType }}
     RunFuzz: ${{ parameters.RunFuzz }}
     RunLongHaul: ${{ parameters.RunLongHaul }}
+    sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+    sqlImageTag: ${{ parameters.sqlImageTag }}
     # PR validation for internal ADO and GitHub PRs. GitHub PRs run in the public
     # project, which lacks 'Magnitude Test', so exclude the infra stages here.
     includeInfraStages: false
