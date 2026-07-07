@@ -33,7 +33,9 @@ mod always_encrypted {
 
     use crate::common::{build_tcp_datasource, create_context, get_first_row, init_tracing};
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::client_context::ColumnEncryptionSetting;
+    use mssql_tds::connection::client_context::{
+        ColumnEncryptionSetting, ExecutionColumnEncryptionSetting,
+    };
     use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::TdsResult;
@@ -1658,6 +1660,37 @@ mod always_encrypted {
                     panic!("expected raw varbinary ciphertext with AE disabled, got {other:?}")
                 }
             }
+        });
+    }
+
+    /// `ResultSetOnly` decrypts encrypted result columns while sending
+    /// parameters unencrypted. This covers the result-set half: an encrypted
+    /// column read under a per-command `ResultSetOnly` override still decrypts
+    /// transparently.
+    #[tokio::test]
+    async fn result_set_only_decrypts_result_columns() {
+        ae_test!(|h| {
+            let table = h.create_encrypted_table("INT", "DETERMINISTIC").await;
+            h.insert_encrypted(&table, SqlType::Int(Some(4242))).await;
+
+            h.client
+                .execute_sp_executesql_with_encryption_setting(
+                    format!("SELECT val FROM {table};"),
+                    vec![],
+                    ExecutionColumnEncryptionSetting::ResultSetOnly,
+                    None,
+                    None,
+                )
+                .await
+                .expect("select under ResultSetOnly");
+            let (_meta, row) = get_first_row(&mut h.client)
+                .await
+                .expect("read row under ResultSetOnly");
+            assert!(
+                matches!(row[0], ColumnValues::Int(4242)),
+                "ResultSetOnly must decrypt the result column, got {:?}",
+                row[0]
+            );
         });
     }
 
