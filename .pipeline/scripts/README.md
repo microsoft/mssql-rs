@@ -1,6 +1,26 @@
 # SQL Server Configuration Scripts
 
-This directory contains PowerShell scripts used by the Azure DevOps pipeline to configure SQL Server instances.
+This directory contains scripts used by the Azure DevOps pipeline to configure and host SQL Server instances for tests.
+
+## sql-host/ — On-demand SQL Server for ARM test stages
+
+Boots a SQL Server docker container on an x64 1ES agent so ARM test jobs can
+run against a real SQL Server without depending on a static (ACI) IP address.
+The SQL host job and the ARM test jobs run concurrently and rendezvous through
+pipeline-artifact sentinels; the SA password is derived deterministically from
+the build context so no secret is transported between jobs.
+
+- **start.sh** — Receives the SA password (derived by `derive-sql-password.sh`
+  in the YAML templates), generates certs (adding the host's private VNet IPv4
+  as an extra SAN via `EXTRA_IP_SAN`), starts the SQL container, and publishes
+  the `sql-ready-<instanceId>` sentinel carrying the endpoint plus
+  `ca.crt`/`mssql.pem`.
+- **wait-for-teardown.sh** — Polls for the teardown sentinel artifacts (named
+  by the raw sentinel names the test jobs publish) and releases the SQL host
+  once every expected sentinel has been published.
+- **teardown.sh** — Stops and removes the SQL container and network.
+
+See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 
 ## Scripts
 

@@ -611,6 +611,14 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn mock_writer_uses_default_channel_binding_token() {
+        // Non-TLS transports rely on the `NetworkWriter` default, which yields
+        // no channel binding token.
+        let mock = MockNetworkWriter::new(8);
+        assert!(mock.channel_binding_token().is_none());
+    }
+
+    #[test]
     fn test_write_i16_async() {
         let mut mock = MockNetworkWriter::new(8);
         let mut writer = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);

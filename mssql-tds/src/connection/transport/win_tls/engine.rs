@@ -129,6 +129,10 @@ impl Stream for SchannelTlsStream<Box<dyn Stream>> {
     fn is_connection_dead(&self) -> bool {
         self.get_ref().is_connection_dead()
     }
+
+    fn channel_binding_token(&self) -> Option<Vec<u8>> {
+        SchannelTlsStream::channel_binding_token(self)
+    }
 }
 
 #[cfg(test)]
