@@ -188,9 +188,9 @@ fn sql_bind_parameter_safe(
     // A rebind invalidates any cached server-side prepared plan: the next
     // SQLExecute must re-prepare so the plan matches the new bindings. This
     // mirrors msodbcsql clearing DESC_CONSISTENT → FIsReprepareRequired. The
-    // prepared SQL text is kept; only the server handle is dropped, forcing the
-    // sp_prepexec path again.
-    stmt_state.prepared_handle = None;
+    // prepared SQL text is kept; the server handle is orphaned for release
+    // (via sp_unprepare) at the next execute, forcing the sp_prepexec path.
+    stmt_state.orphan_prepared_handle();
 
     debug!(parameter_number, "SQLBindParameter: parameter bound");
     SQL_SUCCESS
@@ -440,10 +440,12 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        // The prepared text survives, but the server handle is dropped so the
-        // next execute re-prepares.
+        // The prepared text survives, but the server handle is orphaned for
+        // release (via sp_unprepare) at the next execute, so the next execute
+        // re-prepares.
         let state = stmt.inner.lock().unwrap();
         assert!(state.prepared_sql.is_some());
         assert!(state.prepared_handle.is_none());
+        assert_eq!(state.pending_unprepare, Some(42));
     }
 }

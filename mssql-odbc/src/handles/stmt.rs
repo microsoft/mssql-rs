@@ -45,6 +45,14 @@ pub(crate) struct StmtState {
     /// subsequent `SQLExecute` calls reuse it via `sp_execute`. `None`
     /// until the first execute prepares it.
     pub(crate) prepared_handle: Option<i32>,
+    /// A prepared handle orphaned by a re-prepare / rebind / `SQLExecDirect`
+    /// that must be released with `sp_unprepare`. The drop is deferred to the
+    /// next point that already holds the TDS client (execute / exec-direct) or
+    /// to statement free, so bind/prepare stay I/O-free — mirroring msodbcsql's
+    /// deferred `hPrepDropDeferred`. Invariant: this is `None` whenever
+    /// `prepared_handle` is `Some` (a new handle can only be acquired by an
+    /// execute, which flushes any pending drop first).
+    pub(crate) pending_unprepare: Option<i32>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
     /// Statement lifecycle/status flags used for ODBC API state checks.
@@ -62,6 +70,20 @@ impl StmtState {
 
     pub(crate) fn clear_state(&mut self, mask: u32) {
         self.state_flags &= !mask;
+    }
+
+    /// Moves the cached `prepared_handle` (if any) into `pending_unprepare` so
+    /// the next execute / exec-direct (or statement free) releases it with
+    /// `sp_unprepare`. Called by re-prepare, rebind, and `SQLExecDirect` when
+    /// the current prepared plan is superseded. No network I/O.
+    pub(crate) fn orphan_prepared_handle(&mut self) {
+        if let Some(handle) = self.prepared_handle.take() {
+            debug_assert!(
+                self.pending_unprepare.is_none(),
+                "orphan_prepared_handle: a pending unprepare already exists"
+            );
+            self.pending_unprepare = Some(handle);
+        }
     }
 }
 
@@ -92,6 +114,7 @@ impl StmtHandle {
                 prepared_sql: None,
                 bound_params: Vec::new(),
                 prepared_handle: None,
+                pending_unprepare: None,
                 current_row: None,
                 state_flags: 0,
             }),

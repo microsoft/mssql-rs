@@ -92,6 +92,30 @@ pub(super) fn return_client_idle(dbc: &DbcHandle, statement_handle: SqlHandle, c
     }
 }
 
+/// Claims the TDS client only if the connection is live and **idle** (no
+/// statement currently holds it), marking `active_stmt` so the claim is visible
+/// to concurrent threads. Returns `None` — without side effects — when
+/// disconnected, busy, or the client is unavailable. Pairs with
+/// [`return_client_idle`].
+///
+/// Unlike [`claim_connection`], this posts no diagnostics and never sets
+/// `EXEC_STARTED`: it backs internal best-effort operations (e.g. releasing a
+/// prepared handle on statement free) that must not disturb a busy connection.
+pub(super) fn try_claim_idle_client(
+    dbc: &DbcHandle,
+    statement_handle: SqlHandle,
+) -> Option<TdsClient> {
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        return None;
+    };
+    if dbc_state.connection_state != ConnectionState::Connected || dbc_state.active_stmt.is_some() {
+        return None;
+    }
+    let client = dbc_state.client.take()?;
+    dbc_state.active_stmt = Some(statement_handle);
+    Some(client)
+}
+
 /// Returns `client` to the DBC but **keeps** the busy claim — used when a
 /// cursor is left open for `SQLFetch`.
 pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
@@ -120,6 +144,39 @@ pub(super) fn fail_with_tds(
     }
     clear_exec_started(stmt);
     SQL_ERROR
+}
+
+/// Releases a statement's pending orphaned prepared handle (from a re-prepare,
+/// rebind, or `SQLExecDirect` supersede) via `sp_unprepare`, using the already
+/// claimed `client`. Best-effort: any failure is logged and swallowed — a
+/// leaked handle is freed when the connection closes, and must not fail the
+/// caller's execution. Mirrors msodbcsql dropping the prior prepared handle at
+/// the next execute (it piggybacks the drop onto `sp_prepexec`; we issue a
+/// separate `sp_unprepare` since our TDS RPC can't carry the input handle).
+///
+/// No lock is held across the network I/O.
+pub(super) fn flush_pending_unprepare(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    client: &mut TdsClient,
+    op: &str,
+) {
+    let handle = match stmt.inner.lock() {
+        Ok(mut stmt_state) => stmt_state.pending_unprepare.take(),
+        Err(_) => {
+            error!("{op}: stmt mutex poisoned taking pending unprepare");
+            return;
+        }
+    };
+    let Some(handle) = handle else {
+        return;
+    };
+    if let Err(e) = dbc
+        .runtime
+        .block_on(client.execute_sp_unprepare(handle, None, None))
+    {
+        error!(%e, handle, "{op}: sp_unprepare failed — handle leaked until disconnect");
+    }
 }
 
 /// Captures the server-side prepared-statement handle from `sp_prepexec`'s
@@ -202,5 +259,38 @@ pub(super) fn finish_execute(
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handles::handle_from_raw;
+    use crate::test_support::TestHandles;
+
+    // The success path of `try_claim_idle_client` needs a real `TdsClient`,
+    // which unit tests can't construct; these cover the guard branches (each
+    // returns `None` without claiming `active_stmt`).
+
+    #[test]
+    fn try_claim_idle_client_none_when_disconnected() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // Default state is not connected.
+        assert!(try_claim_idle_client(dbc, h.dbc).is_none());
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+    }
+
+    #[test]
+    fn try_claim_idle_client_none_when_busy() {
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // A different statement already holds the connection.
+        let other = 0x1234 as SqlHandle;
+        dbc.inner.lock().unwrap().active_stmt = Some(other);
+        assert!(try_claim_idle_client(dbc, h.dbc).is_none());
+        // The existing claim must be left untouched.
+        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(other));
     }
 }

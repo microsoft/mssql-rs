@@ -246,6 +246,82 @@ TEST_F(PrepareExecuteLiveTest, PrepareOnceExecuteMany) {
     }
 }
 
+// Rebinding a parameter after an execute must not corrupt the connection: the
+// second execute returning the new value proves the statement remains usable
+// after the rebind (which internally orphans the cached handle for release).
+// This is a behavioral check only — that sp_unprepare + sp_prepexec actually
+// fire is asserted by the unit test rebind_invalidates_cached_prepared_handle;
+// both the reused and re-prepared paths return the same value, so this test
+// alone cannot distinguish them.
+TEST_F(PrepareExecuteLiveTest, RebindReleasesPriorHandleAndReprepares) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    std::vector<SQLCHAR> first = {'f', 'i', 'r', 's', 't', '\0'};
+    SQLLEN ind1 = SQL_NTS;
+    ASSERT_SQL_OK(BindChar(1, first, ind1), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("first", GetColumnChar(1));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Rebind parameter 1 to a different buffer — invalidates the prepared plan.
+    std::vector<SQLCHAR> second = {'s', 'e', 'c', 'o', 'n', 'd', '\0'};
+    SQLLEN ind2 = SQL_NTS;
+    ASSERT_SQL_OK(BindChar(1, second, ind2), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("second", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Re-preparing a statement with new text must not corrupt the connection: the
+// execute of the new plan returning its value proves the statement remains
+// usable after the re-prepare (which internally orphans the prior handle for
+// release). This is a behavioral check only — that the prior handle is actually
+// released is asserted by the unit test reprepare_orphans_prior_handle_for_unprepare.
+TEST_F(PrepareExecuteLiveTest, ReprepareReleasesPriorHandle) {
+    ASSERT_SQL_OK(Prepare("SELECT 1 AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1", GetColumnChar(1));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Re-prepare with different text — orphans the first handle.
+    ASSERT_SQL_OK(Prepare("SELECT 2 AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Freeing a prepared statement while its result-set cursor is still open must
+// leave the connection healthy: internally the driver drains the cursor
+// (capturing the prepared handle) and issues sp_unprepare, but this test only
+// verifies the observable outcome — a fresh statement on the same connection
+// executes normally afterward. Uses a private statement so the fixture's stmt_
+// teardown is unaffected.
+TEST_F(PrepareExecuteLiveTest, FreeWithOpenCursorReleasesHandleAndKeepsConnection) {
+    SQLHSTMT s = SQL_NULL_HSTMT;
+    ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &s));
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 7 AS v");
+    ASSERT_EQ(SQL_SUCCESS,
+              SQLPrepare(s, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS));
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(s));
+    // Fetch a row but deliberately leave the cursor open.
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(s));
+
+    // Free with the cursor still open — the driver must drain + unprepare.
+    ASSERT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_STMT, s));
+
+    // The connection is still healthy: a fresh statement executes normally.
+    ASSERT_SQL_OK(Prepare("SELECT 8 AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("8", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // A '?' inside a string literal is not a parameter marker.
 TEST_F(PrepareExecuteLiveTest, LiteralQuestionMarkIsNotAParam) {
     ASSERT_SQL_OK(Prepare("SELECT '?' AS v"), SQL_HANDLE_STMT, stmt_);

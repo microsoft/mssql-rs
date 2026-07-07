@@ -8,7 +8,9 @@ use tracing::{debug, error};
 
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
-use super::exec_common::{claim_connection, fail_with_tds, finish_execute};
+use super::exec_common::{
+    claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
+};
 use super::sqlstate::*;
 use super::util::rewrite_param_markers;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
@@ -63,6 +65,10 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
         Ok(client) => client,
         Err(rc) => return rc,
     };
+
+    // Release any handle orphaned by a prior rebind / re-prepare before we
+    // (re)prepare or reuse the current handle.
+    flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecute");
 
     match exec.handle {
         // Already prepared: reuse the cached server handle (msodbcsql

@@ -5,7 +5,9 @@
 
 use tracing::{debug, error};
 
-use super::exec_common::{claim_connection, fail_with_tds, finish_execute};
+use super::exec_common::{
+    claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
+};
 use super::sqlstate::*;
 use super::util::read_utf16;
 use crate::api::odbc_types::{
@@ -97,7 +99,9 @@ fn sql_exec_direct_w_safe(
         stmt_state.column_metadata.clear();
         stmt_state.current_row = None;
         stmt_state.prepared_sql = None;
-        stmt_state.prepared_handle = None;
+        // Superseding a prepared plan orphans its server handle; release it
+        // (deferred) once we hold the client below.
+        stmt_state.orphan_prepared_handle();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
     }
@@ -106,6 +110,9 @@ fn sql_exec_direct_w_safe(
         Ok(client) => client,
         Err(rc) => return rc,
     };
+
+    // Release any handle orphaned by the reset above before running the batch.
+    flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecDirectW");
 
     // Execute the SQL batch. Neither DBC nor STMT lock is held during I/O.
     if let Err(e) = dbc.runtime.block_on(client.execute(sql, None, None)) {
@@ -178,5 +185,8 @@ mod tests {
         assert!(state.prepared_sql.is_none());
         assert!(state.prepared_handle.is_none());
         assert!(!state.has_state(STMT_STATE_PREPARED));
+        // The superseded handle is queued for sp_unprepare. The flush never ran
+        // here because the connection claim failed, so it remains pending.
+        assert_eq!(state.pending_unprepare, Some(42));
     }
 }

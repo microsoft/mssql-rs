@@ -110,8 +110,9 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
 
     // Store the SQL text and defer the server-side prepare to SQLExecute.
     // Re-preparing discards any prior prepared text and stale result metadata.
+    // A prior prepared handle is orphaned for release at the next execute.
     stmt_state.prepared_sql = Some(sql);
-    stmt_state.prepared_handle = None;
+    stmt_state.orphan_prepared_handle();
     stmt_state.column_metadata.clear();
     stmt_state.current_row = None;
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
@@ -153,6 +154,35 @@ mod tests {
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.prepared_sql.as_deref(), Some("SELECT 1"));
         assert!(state.has_state(STMT_STATE_PREPARED));
+    }
+
+    #[test]
+    fn reprepare_orphans_prior_handle_for_unprepare() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared_sql = Some("SELECT 1".to_string());
+            state.prepared_handle = Some(42);
+            state.set_state(STMT_STATE_PREPARED);
+        }
+
+        let sql: Vec<u16> = "SELECT 2"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        assert_eq!(
+            unsafe { sql_prepare_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_SUCCESS
+        );
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.prepared_sql.as_deref(), Some("SELECT 2"));
+        assert!(state.prepared_handle.is_none());
+        // The old handle is queued for release at the next execute.
+        assert_eq!(state.pending_unprepare, Some(42));
     }
 
     #[test]
