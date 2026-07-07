@@ -366,8 +366,12 @@ unchanged.
   handshake). **Rerun failed jobs** is *not* fully supported yet: on a test
   failure the SQL host job still reports success (its `always()` teardown
   released it), so ADO does not re-run it, and the re-run test job polls for a
-  `sql-ready-*-<newAttempt>` artifact that no host will publish. Making that
-  path work requires additionally coupling the SQL host's outcome to the test
+  `sql-ready-*-<newAttempt>` artifact that no host will publish. To keep that
+  misuse from silently burning the full poll timeout, `poll-for-endpoint.sh`
+  detects `System.StageAttempt > 1` with no endpoint and surfaces ADO
+  `logissue` guidance — an early warning, then a failing error — telling the
+  operator to use **Rerun stage** instead. Fully supporting **Rerun failed
+  jobs** would additionally require coupling the SQL host's outcome to the test
   job's (host mirrors the test's failure so both re-run together) — deferred as
   a follow-up.
 

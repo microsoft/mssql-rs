@@ -23,9 +23,15 @@
 #   AGENT_TEMPDIRECTORY
 #
 # Optional env:
-#   POLL_INTERVAL_SECONDS  default 10
-#   MAX_WAIT_SECONDS       default 1800 (30 min). Covers x64 agent queueing,
-#                          docker pull, and SQL Server startup.
+#   POLL_INTERVAL_SECONDS    default 10
+#   MAX_WAIT_SECONDS         default 1800 (30 min). Covers x64 agent queueing,
+#                            docker pull, and SQL Server startup.
+#   SYSTEM_STAGEATTEMPT      current stage attempt (ADO provides it). Used only
+#                            to detect a partial "Rerun failed jobs" and emit
+#                            guidance to rerun the whole stage instead.
+#   RERUN_HINT_AFTER_SECONDS default 600. On attempt > 1, how long to wait with
+#                            no endpoint before warning that the SQL host job
+#                            was probably not restarted.
 #
 # Sets pipeline variables on success:
 #   DB_HOST   IP advertised by the SQL host
@@ -48,6 +54,24 @@ POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
 # the host's own teardown.
 MAX_WAIT_SECONDS="${MAX_WAIT_SECONDS:-3600}"
 
+STAGE_ATTEMPT="${SYSTEM_STAGEATTEMPT:-1}"
+# On a rerun (attempt > 1), warn this long into a fruitless wait that a partial
+# "Rerun failed jobs" won't have restarted the sibling SQL host job.
+RERUN_HINT_AFTER_SECONDS="${RERUN_HINT_AFTER_SECONDS:-600}"
+
+# The on-demand SQL host is a sibling job in THIS stage, not an upstream
+# dependency, and it is released as soon as tests finish. ADO's "Rerun failed
+# jobs" only re-runs the failed test job under a new System.StageAttempt; it
+# does NOT re-run the (already-succeeded) SQL host, so no host ever publishes
+# sql-ready-<instance>-<thisAttempt> and this poll would otherwise burn the
+# full MAX_WAIT_SECONDS before a cryptic timeout. Surface actionable guidance
+# via ADO logging commands so it lands in the run's Errors/Warnings summary.
+print_partial_rerun_guidance() {
+    echo "##vso[task.logissue type=error]SQL host endpoint '${ARTIFACT_NAME}' never appeared for stage attempt ${STAGE_ATTEMPT}."
+    echo "##vso[task.logissue type=error]The on-demand SQL host runs as a sibling job in this stage and is released once tests finish. 'Rerun failed jobs' does NOT restart it, so this rerun has no SQL server to connect to."
+    echo "##vso[task.logissue type=error]Fix: use 'Rerun stage' (or re-queue the pipeline) instead of 'Rerun failed jobs' so the SQL host job runs again alongside the tests."
+}
+
 collection="${SYSTEM_COLLECTIONURI%/}/"
 project_enc="$(printf '%s' "${SYSTEM_TEAMPROJECT}" | sed 's/ /%20/g')"
 url="${collection}${project_enc}/_apis/build/builds/${BUILD_BUILDID}/artifacts?api-version=7.1"
@@ -60,11 +84,18 @@ echo "  Poll every    = ${POLL_INTERVAL_SECONDS}s"
 echo "  Max wait      = ${MAX_WAIT_SECONDS}s"
 
 deadline=$(( $(date +%s) + MAX_WAIT_SECONDS ))
+start="$(date +%s)"
 download_url=""
+rerun_hinted=0
 
 while :; do
     now="$(date +%s)"
     if [ "${now}" -ge "${deadline}" ]; then
+        if [ "${STAGE_ATTEMPT}" -gt 1 ]; then
+            print_partial_rerun_guidance
+        else
+            echo "##vso[task.logissue type=error]artifact ${ARTIFACT_NAME} did not appear within ${MAX_WAIT_SECONDS}s (the SQL host job may have failed to start)."
+        fi
         echo "ERROR: artifact ${ARTIFACT_NAME} did not appear within ${MAX_WAIT_SECONDS}s." >&2
         exit 1
     fi
@@ -92,6 +123,14 @@ for a in data.get("value", []):
     fi
 
     remaining=$(( deadline - now ))
+    # Early nudge on a rerun: a legit "Rerun stage" restarts the SQL host job
+    # too and it usually publishes within a few minutes, so a long silence here
+    # on attempt > 1 most likely means a partial "Rerun failed jobs".
+    if [ "${rerun_hinted}" -eq 0 ] && [ "${STAGE_ATTEMPT}" -gt 1 ] \
+            && [ $(( now - start )) -ge "${RERUN_HINT_AFTER_SECONDS}" ]; then
+        echo "##vso[task.logissue type=warning]No SQL host endpoint after $(( (now - start) / 60 )) min on stage attempt ${STAGE_ATTEMPT}. If you used 'Rerun failed jobs', the SQL host job was NOT restarted and this will time out — cancel and use 'Rerun stage' instead."
+        rerun_hinted=1
+    fi
     echo "$(date -u +%H:%M:%S) waiting for ${ARTIFACT_NAME}; ${remaining}s left."
     sleep "${POLL_INTERVAL_SECONDS}"
 done
