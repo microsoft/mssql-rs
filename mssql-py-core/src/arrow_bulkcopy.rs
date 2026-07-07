@@ -17,7 +17,7 @@ use arrow::array::{
     LargeStringArray, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::array::{BinaryArray, NullArray};
 use arrow::datatypes::{DataType, Schema, TimeUnit};
@@ -66,6 +66,8 @@ pub enum ColumnPlanKind {
     UInt8,
     UInt16,
     UInt32,
+    /// Arrow `uint64` -> SQL `bigint`. Values > `i64::MAX` are rejected (A2).
+    UInt64,
     Float32,
     Float64,
     Bool,
@@ -168,6 +170,8 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
         (DataType::UInt8, S::TinyInt | S::SmallInt | S::Int | S::BigInt) => ColumnPlanKind::UInt8,
         (DataType::UInt16, S::TinyInt | S::SmallInt | S::Int | S::BigInt) => ColumnPlanKind::UInt16,
         (DataType::UInt32, S::TinyInt | S::SmallInt | S::Int | S::BigInt) => ColumnPlanKind::UInt32,
+        // UInt64 maps only to BigInt; the read path overflow-checks > i64::MAX (A2).
+        (DataType::UInt64, S::BigInt) => ColumnPlanKind::UInt64,
 
         (DataType::Float32, S::Real | S::Float) => ColumnPlanKind::Float32,
         (DataType::Float64, S::Float) => ColumnPlanKind::Float64,
@@ -297,6 +301,16 @@ impl ColumnPlan {
             }
             ColumnPlanKind::UInt32 => {
                 narrow_int(downcast::<UInt32Array>(arr)?.value(row_idx) as i64, dest)
+            }
+            ColumnPlanKind::UInt64 => {
+                let v = downcast::<UInt64Array>(arr)?.value(row_idx);
+                if v > i64::MAX as u64 {
+                    return Err(Error::UsageError(format!(
+                        "Value {} out of range for BIGINT column '{}' (exceeds i64::MAX)",
+                        v, dest.column_name
+                    )));
+                }
+                narrow_int(v as i64, dest)
             }
             ColumnPlanKind::Float32 => match dest.sql_type {
                 SqlDbType::Real => Ok(ColumnValues::Real(
@@ -709,6 +723,28 @@ mod tests {
         let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(256_i64)]));
         let plan = one_col_plan(DataType::Int64, &dest);
         assert!(plan.extract_value(arr.as_ref(), 0, &dest).is_err());
+    }
+
+    #[test]
+    fn uint64_to_bigint_in_range() {
+        // A2: uint64 -> BIGINT for values within i64 range.
+        let dest = meta("v", SqlDbType::BigInt, false);
+        let arr: ArrayRef = Arc::new(UInt64Array::from(vec![Some(9_000_000_000_000_000_000_u64)]));
+        let plan = one_col_plan(DataType::UInt64, &dest);
+        assert_eq!(
+            plan.extract_value(arr.as_ref(), 0, &dest).unwrap(),
+            ColumnValues::BigInt(9_000_000_000_000_000_000_i64)
+        );
+    }
+
+    #[test]
+    fn uint64_overflow_i64_max_errors() {
+        // A2: values above i64::MAX must be rejected, not wrapped negative.
+        let dest = meta("v", SqlDbType::BigInt, false);
+        let arr: ArrayRef = Arc::new(UInt64Array::from(vec![Some(u64::MAX)]));
+        let plan = one_col_plan(DataType::UInt64, &dest);
+        let err = plan.extract_value(arr.as_ref(), 0, &dest).unwrap_err();
+        assert!(format!("{err}").to_uppercase().contains("BIGINT"));
     }
 
     #[test]
