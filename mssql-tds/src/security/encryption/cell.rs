@@ -63,9 +63,12 @@ const SUPPORTED_NORMALIZATION_VERSION: u8 = 0x01;
 /// ciphertext is byte-compatible across drivers. A valid decimal magnitude
 /// (precision <= 38) always fits in 128 bits.
 const DECIMAL_MAGNITUDE_WORDS: usize = 4;
+/// The fixed magnitude width in bytes (four 32-bit words = 128 bits). A valid
+/// `decimal`/`numeric` (precision <= 38) never needs more than this.
+const DECIMAL_MAGNITUDE_BYTES: usize = DECIMAL_MAGNITUDE_WORDS * 4;
 /// Total length of the normalized `decimal`/`numeric` form: 1 sign byte plus the
 /// fixed 16-byte magnitude.
-const DECIMAL_NORMALIZED_LEN: usize = 1 + DECIMAL_MAGNITUDE_WORDS * 4;
+const DECIMAL_NORMALIZED_LEN: usize = 1 + DECIMAL_MAGNITUDE_BYTES;
 
 /// Decrypts an encrypted cell blob and denormalizes it into a typed value.
 ///
@@ -344,6 +347,19 @@ fn read_decimal(bytes: &[u8], base_type_info: &TypeInfo) -> TdsResult<DecimalPar
     let (sign, magnitude) = bytes
         .split_first()
         .ok_or_else(|| length_error("decimal sign byte", bytes.len()))?;
+
+    // A valid decimal/numeric magnitude (precision <= 38) fits in 128 bits, so
+    // it is at most 16 bytes (four 32-bit words). Reject anything longer: it
+    // signals wire-format drift or corrupted plaintext, would allocate an
+    // unbounded `int_parts`, and would break the downstream `DecimalParts`
+    // formatting, which folds `int_parts` into a `u128` (only four words wide).
+    if magnitude.len() > DECIMAL_MAGNITUDE_BYTES {
+        return Err(Error::ColumnEncryptionError(format!(
+            "Invalid decimal magnitude length {} (max {DECIMAL_MAGNITUDE_BYTES} bytes for \
+             precision <= 38)",
+            magnitude.len()
+        )));
+    }
 
     // Reference AE readers are length-tolerant: .NET reads `length >> 2` 32-bit
     // groups and ignores any trailing partial group, and JDBC uses the actual
@@ -1334,6 +1350,22 @@ mod tests {
             }
             other => panic!("expected Decimal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn read_decimal_rejects_oversized_magnitude() {
+        // A valid decimal magnitude is at most 16 bytes (128 bits). A longer
+        // magnitude must be rejected rather than allocating an unbounded
+        // `int_parts` or overflowing the downstream `u128` fold.
+        let info = type_info(
+            TdsDataType::DecimalN,
+            5,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::DecimalN, 17, 5, 2),
+        );
+        let mut bytes = vec![1u8]; // positive sign
+        bytes.extend_from_slice(&[0u8; 17]); // 17-byte magnitude => too long
+        let error = denormalize(&bytes, TdsDataType::DecimalN, &info, 1).unwrap_err();
+        assert!(matches!(error, Error::ColumnEncryptionError(_)));
     }
 
     #[test]
