@@ -204,8 +204,14 @@ pub(crate) mod test_utils {
         async fn read_u16_varbyte(&mut self) -> TdsResult<Vec<u8>> {
             unimplemented!()
         }
-        async fn read_unicode(&mut self, _string_length: usize) -> TdsResult<String> {
-            unimplemented!()
+        async fn read_unicode(&mut self, string_length: usize) -> TdsResult<String> {
+            let mut utf16_units = Vec::with_capacity(string_length);
+            for _ in 0..string_length {
+                utf16_units.push(self.read_uint16().await?);
+            }
+            String::from_utf16(&utf16_units).map_err(|e| {
+                crate::error::Error::ProtocolError(format!("UTF-16 decoding error: {e}"))
+            })
         }
         async fn read_unicode_with_byte_length(
             &mut self,

@@ -433,6 +433,8 @@ impl TypeLength {
 /// ```
 #[derive(Debug, Clone)]
 pub struct BulkCopyColumnMetadata {
+    // NOTE: see also the gated `encryption` field at the end of this struct,
+    // which carries Always Encrypted material for encrypted destination columns.
     /// Column name
     pub column_name: String,
 
@@ -476,6 +478,22 @@ pub struct BulkCopyColumnMetadata {
 
     /// Table name (for long/LOB types in some TDS versions)
     pub table_name: Option<String>,
+
+    /// Always Encrypted material for this column, populated from the destination
+    /// table metadata when column encryption is negotiated. `None` for plaintext
+    /// columns.
+    pub(crate) encryption: Option<BulkCopyColumnEncryption>,
+}
+
+/// Always Encrypted material captured for an encrypted bulk-copy destination
+/// column: the per-column crypto metadata plus the CEK table entry it references.
+#[derive(Debug, Clone)]
+pub(crate) struct BulkCopyColumnEncryption {
+    /// Per-column crypto metadata (base type, cipher algorithm id, encryption
+    /// type, normalization rule version, CEK table ordinal).
+    pub crypto_metadata: crate::query::metadata::CryptoMetadata,
+    /// The CEK table entry referenced by `crypto_metadata.cek_table_ordinal`.
+    pub cek_entry: crate::query::metadata::CekTableEntry,
 }
 
 impl BulkCopyColumnMetadata {
@@ -496,6 +514,7 @@ impl BulkCopyColumnMetadata {
             is_identity: false,
             is_encrypted: false,
             table_name: None,
+            encryption: None,
         }
     }
 
@@ -729,6 +748,7 @@ impl Default for BulkCopyColumnMetadata {
             is_identity: false,
             is_encrypted: false,
             table_name: None,
+            encryption: None,
         }
     }
 }
@@ -901,6 +921,10 @@ impl From<&ColumnMetadata> for BulkCopyColumnMetadata {
 
         if col.is_identity() {
             metadata = metadata.with_identity(true);
+        }
+
+        if col.is_encrypted() {
+            metadata = metadata.with_encrypted(true);
         }
 
         metadata
@@ -1485,6 +1509,34 @@ mod tests {
         assert_eq!(meta.tds_type, 0x38);
         assert!(meta.is_nullable);
         assert!(!meta.is_identity);
+    }
+
+    /// A `ColumnMetadata` with the Always Encrypted flag set (`fEncrypted`,
+    /// bit 11) produces bulk-copy metadata marked encrypted.
+    #[test]
+    fn from_column_metadata_marks_encrypted() {
+        use crate::datatypes::sqldatatypes::{
+            FixedLengthTypes, TdsDataType, TypeInfo, TypeInfoVariant,
+        };
+        use crate::query::metadata::ColumnMetadata;
+
+        let col = ColumnMetadata {
+            user_type: 0,
+            flags: 0x0800, // fEncrypted
+            type_info: TypeInfo {
+                tds_type: TdsDataType::Int4,
+                length: 4,
+                type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+            },
+            data_type: TdsDataType::Int4,
+            column_name: "secret".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+
+        let meta: BulkCopyColumnMetadata = (&col).into();
+        assert!(meta.is_encrypted);
+        assert_eq!(meta.column_name, "secret");
     }
 }
 
