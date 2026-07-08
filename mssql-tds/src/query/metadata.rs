@@ -85,14 +85,24 @@ impl ColumnMetadata {
         }
     }
 
-    /// Returns the precision for decimal/numeric types.
+    /// Returns the precision (max decimal digits) for numeric types.
     ///
-    /// Returns `Some(precision)` for types that include precision information
-    /// (e.g., `decimal(18,4)`, `numeric(38,0)`), or `None` for types where
-    /// precision is not applicable.
+    /// - `decimal`/`numeric` → declared precision (1–38).
+    /// - `money` → 19, `smallmoney` → 10 (T-SQL fixed precisions).
+    /// - `MoneyN` → 19 if 8-byte payload, 10 if 4-byte payload.
+    /// - All other types → `None`.
     pub fn get_precision(&self) -> Option<u8> {
+        use crate::datatypes::sqldatatypes::{FixedLengthTypes, VariableLengthTypes};
+
         match self.type_info.type_info_variant {
             TypeInfoVariant::VarLenPrecisionScale(_, _, precision, _) => Some(precision),
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Money) => Some(19),
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Money4) => Some(10),
+            TypeInfoVariant::VarLen(VariableLengthTypes::MoneyN, length) => match length {
+                8 => Some(19),
+                4 => Some(10),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -341,6 +351,66 @@ mod tests {
         let metadata =
             create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
         assert_eq!(metadata.get_scale(), None);
+    }
+
+    #[test]
+    fn test_get_precision_decimal_numeric() {
+        // VarLenPrecisionScale: declared precision returned verbatim, regardless of scale.
+        let dec = create_test_column_metadata(
+            0x00,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::DecimalN, 17, 38, 4),
+        );
+        assert_eq!(dec.get_precision(), Some(38));
+
+        let num = create_test_column_metadata(
+            0x00,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::NumericN, 9, 18, 0),
+        );
+        assert_eq!(num.get_precision(), Some(18));
+    }
+
+    #[test]
+    fn test_get_precision_money_types() {
+        // money/smallmoney have T-SQL fixed precisions; MoneyN dispatches on wire length.
+        let cases = [
+            (TypeInfoVariant::FixedLen(FixedLengthTypes::Money), Some(19)),
+            (
+                TypeInfoVariant::FixedLen(FixedLengthTypes::Money4),
+                Some(10),
+            ),
+            (
+                TypeInfoVariant::VarLen(VariableLengthTypes::MoneyN, 8),
+                Some(19),
+            ),
+            (
+                TypeInfoVariant::VarLen(VariableLengthTypes::MoneyN, 4),
+                Some(10),
+            ),
+            // MoneyN only ever carries 4 or 8 on the wire; anything else is malformed.
+            (
+                TypeInfoVariant::VarLen(VariableLengthTypes::MoneyN, 6),
+                None,
+            ),
+        ];
+        for (variant, expected) in cases {
+            let meta = create_test_column_metadata(0x00, variant);
+            assert_eq!(meta.get_precision(), expected);
+        }
+    }
+
+    #[test]
+    fn test_get_precision_none_for_non_numeric() {
+        // Variants that don't carry numeric precision all return None.
+        let cases = [
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+            TypeInfoVariant::VarLen(VariableLengthTypes::IntN, 4),
+            TypeInfoVariant::VarLenScale(VariableLengthTypes::TimeN, 7),
+            TypeInfoVariant::PartialLen(PartialLengthType::BigVarChar, None, None, None, None),
+        ];
+        for variant in cases {
+            let meta = create_test_column_metadata(0x00, variant);
+            assert_eq!(meta.get_precision(), None);
+        }
     }
 
     #[test]
