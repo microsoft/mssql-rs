@@ -548,8 +548,13 @@ impl PyCoreCursor {
         let tds_client = self.tds_client.clone();
         let runtime_handle = self.runtime_handle.clone();
 
-        let result = runtime_handle.block_on(async {
-            let mut client = tds_client.lock().await;
+        // D2: release the GIL while the Tokio runtime drives the bulk-copy
+        // network I/O. `ArrowRowIter` re-acquires the GIL via `Python::attach`
+        // only when it needs to pump the next Arrow batch, so releasing it here
+        // lets other Python threads run during the (potentially long) transfer.
+        let result = py.detach(|| {
+            runtime_handle.block_on(async {
+                let mut client = tds_client.lock().await;
 
             let mut bulk_copy = BulkCopy::new(&mut client, table_name)
                 .batch_size(options.batch_size)
@@ -631,6 +636,7 @@ impl PyCoreCursor {
                 })?;
 
             Ok::<_, PyErr>(bulk_result)
+            })
         })?;
 
         let py_result = PyDict::new(py);
@@ -1210,6 +1216,22 @@ impl PyCoreCursor {
         if source.is_instance(&batch_cls)? {
             let schema = source.getattr("schema")?;
             let batches = pyo3::types::PyList::new(py, [source])?;
+            let reader = rbr_cls.call_method1("from_batches", (schema, batches))?;
+            return Ok(reader.unbind());
+        }
+
+        // B1: single-batch producers exposing the Arrow PyCapsule *array*
+        // interface (`__arrow_c_array__`) but not the stream interface. Import
+        // the one batch via the C data interface and wrap it as a single-batch
+        // reader. Stream producers were already handled above and take priority.
+        if source.hasattr("__arrow_c_array__")? {
+            let capsules = source.call_method0("__arrow_c_array__")?;
+            let schema_capsule = capsules.get_item(0)?;
+            let array_capsule = capsules.get_item(1)?;
+            let batch = batch_cls
+                .call_method1("_import_from_c_capsule", (schema_capsule, array_capsule))?;
+            let schema = batch.getattr("schema")?;
+            let batches = pyo3::types::PyList::new(py, [batch])?;
             let reader = rbr_cls.call_method1("from_batches", (schema, batches))?;
             return Ok(reader.unbind());
         }

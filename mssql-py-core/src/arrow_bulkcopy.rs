@@ -201,11 +201,15 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
                 scale: pick_timestamp_scale(*unit, dest.scale),
             }
         }
-        // Tz-bearing timestamps mapped onto datetime2 are coerced to UTC.
-        (DataType::Timestamp(unit, _), S::DateTime2) => ColumnPlanKind::TimestampDateTime2 {
-            unit: *unit,
-            scale: pick_timestamp_scale(*unit, dest.scale),
-        },
+        // Tz-aware timestamp -> datetime2 would silently drop the timezone.
+        // Reject it and steer the user to a datetimeoffset destination (C1).
+        (DataType::Timestamp(_, Some(_)), S::DateTime2) => {
+            return Err(Error::UsageError(
+                "Cannot write a timezone-aware Arrow timestamp to a datetime2 column \
+                 without dropping the timezone; use a datetimeoffset destination column instead"
+                    .into(),
+            ));
+        }
 
         (DataType::Time32(unit @ (TimeUnit::Second | TimeUnit::Millisecond)), S::Time) => {
             ColumnPlanKind::Time {
@@ -797,6 +801,48 @@ mod tests {
                 assert_eq!(dt2.time.time_nanoseconds, 10);
             }
             other => panic!("expected DateTime2, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tz_aware_timestamp_to_datetime2_rejected() {
+        // C1: a timezone-aware timestamp must not be silently coerced onto
+        // datetime2; building the plan should fail and mention datetimeoffset.
+        let dest = meta_dt2("ts", 6);
+        let schema = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]);
+        let mappings = vec![ResolvedColumnMapping {
+            source_index: 0,
+            destination_index: 0,
+            destination_name: dest.column_name.clone(),
+            destination_type: dest.sql_type,
+        }];
+        let err =
+            build_column_plans(&schema, std::slice::from_ref(&dest), &mappings).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("datetimeoffset"));
+    }
+
+    #[test]
+    fn tz_aware_timestamp_to_datetimeoffset_ok() {
+        // Complement to C1: the correct destination still works.
+        let mut dest = meta("ts", SqlDbType::DateTimeOffset, true);
+        dest.scale = 6;
+        let arr: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![Some(0_i64)]).with_timezone("UTC"),
+        );
+        let plan = one_col_plan(
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            &dest,
+        );
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::DateTimeOffset(dto) => {
+                assert_eq!(dto.datetime2.days, 719_162);
+                assert_eq!(dto.offset, 0);
+            }
+            other => panic!("expected DateTimeOffset, got {:?}", other),
         }
     }
 
