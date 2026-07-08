@@ -21,7 +21,8 @@
 //! * `real`/`float` keep their 4- or 8-byte IEEE form.
 //! * `smallmoney`/`money` are normalized to the 8-byte `money` form (high dword
 //!   then low dword); `smallmoney` is sign-extended into that form.
-//! * `decimal`/`numeric` are a sign byte followed by the little-endian magnitude.
+//! * `decimal`/`numeric` are a sign byte followed by a fixed 16-byte
+//!   little-endian magnitude (four 32-bit words, zero-extended).
 //! * `binary`/`varbinary` and `uniqueidentifier` keep their raw bytes.
 //! * Character types keep their encoded bytes (UTF-16LE for the `n` types, the
 //!   collation code page otherwise).
@@ -53,6 +54,18 @@ use crate::security::encryption::ColumnEncryptionType;
 const AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID: u8 = 0x02;
 /// The only cell-normalization rule version defined by SQL Server today.
 const SUPPORTED_NORMALIZATION_VERSION: u8 = 0x01;
+/// Number of 32-bit words in the canonical `decimal`/`numeric` magnitude.
+///
+/// The Always Encrypted normalized form for `decimal`/`numeric` is a sign byte
+/// followed by a fixed 16-byte magnitude (four 32-bit little-endian words,
+/// zero-extended). This matches SQL Server and the reference drivers (.NET
+/// `SerializeDecimal`/`SerializeSqlDecimal`, msodbcsql), so deterministic
+/// ciphertext is byte-compatible across drivers. A valid decimal magnitude
+/// (precision <= 38) always fits in 128 bits.
+const DECIMAL_MAGNITUDE_WORDS: usize = 4;
+/// Total length of the normalized `decimal`/`numeric` form: 1 sign byte plus the
+/// fixed 16-byte magnitude.
+const DECIMAL_NORMALIZED_LEN: usize = 1 + DECIMAL_MAGNITUDE_WORDS * 4;
 
 /// Decrypts an encrypted cell blob and denormalizes it into a typed value.
 ///
@@ -332,16 +345,18 @@ fn read_decimal(bytes: &[u8], base_type_info: &TypeInfo) -> TdsResult<DecimalPar
         .split_first()
         .ok_or_else(|| length_error("decimal sign byte", bytes.len()))?;
 
-    if magnitude.len() % 4 != 0 {
-        return Err(Error::ColumnEncryptionError(format!(
-            "Invalid decimal magnitude length {} (must be a multiple of 4)",
-            magnitude.len()
-        )));
-    }
-
+    // Reference AE readers are length-tolerant: .NET reads `length >> 2` 32-bit
+    // groups and ignores any trailing partial group, and JDBC uses the actual
+    // length (its bulk-copy path writes a 15-byte magnitude). Zero-pad a short
+    // trailing group into a full 32-bit word rather than rejecting it, so we can
+    // read magnitudes produced by every reference driver.
     let int_parts = magnitude
-        .chunks_exact(4)
-        .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("chunk is exactly 4 bytes")))
+        .chunks(4)
+        .map(|chunk| {
+            let mut word = [0u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            i32::from_le_bytes(word)
+        })
         .collect();
 
     Ok(DecimalParts {
@@ -712,12 +727,21 @@ fn normalize_small_money(m: &SqlSmallMoney) -> Vec<u8> {
 }
 
 /// Normalizes a `decimal`/`numeric` value: a sign byte (`1` = positive) followed
-/// by the little-endian magnitude in 32-bit groups.
+/// by a fixed 16-byte little-endian magnitude (four 32-bit words, zero-extended).
+///
+/// The fixed-width magnitude matches SQL Server's canonical form and the
+/// reference drivers (.NET `SerializeDecimal`/`SerializeSqlDecimal`, msodbcsql),
+/// so deterministically-encrypted decimal values are byte-compatible across
+/// drivers. The value's magnitude is scaled to its own `scale`, which the RPC
+/// parameter also declares on the wire, so both sides agree on the scale.
 fn normalize_decimal(d: &DecimalParts) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + d.int_parts.len() * 4);
+    let mut out = Vec::with_capacity(DECIMAL_NORMALIZED_LEN);
     out.push(u8::from(d.is_positive));
-    for part in &d.int_parts {
-        out.extend_from_slice(&part.to_le_bytes());
+    // A valid decimal/numeric magnitude (precision <= 38) fits in four 32-bit
+    // words, so any words beyond the first four are zero.
+    for i in 0..DECIMAL_MAGNITUDE_WORDS {
+        let word = d.int_parts.get(i).copied().unwrap_or(0);
+        out.extend_from_slice(&word.to_le_bytes());
     }
     out
 }
@@ -1247,6 +1271,9 @@ mod tests {
 
     #[test]
     fn normalize_decimal_layout() {
+        // The magnitude is emitted as a fixed 16-byte (four 32-bit words),
+        // zero-extended form, so two significant words are followed by two zero
+        // words. Total length is 1 sign byte + 16 magnitude bytes = 17.
         let d = DecimalParts {
             is_positive: false,
             scale: 2,
@@ -1256,10 +1283,83 @@ mod tests {
         let mut expected = vec![0u8];
         expected.extend_from_slice(&1i32.to_le_bytes());
         expected.extend_from_slice(&2i32.to_le_bytes());
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        let actual = normalize(&SqlType::Decimal(Some(d))).unwrap().unwrap();
+        assert_eq!(actual.len(), 17);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn normalize_decimal_pads_small_value_to_fixed_width() {
+        // A value that needs only one 32-bit word must still be emitted as the
+        // canonical 17-byte form (sign + four words) so deterministic ciphertext
+        // matches .NET/msodbcsql, which always zero-extend to 16 magnitude bytes.
+        let d = DecimalParts {
+            is_positive: true,
+            scale: 2,
+            precision: 5,
+            int_parts: vec![12345],
+        };
+        let mut expected = vec![1u8];
+        expected.extend_from_slice(&12345i32.to_le_bytes());
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        expected.extend_from_slice(&0i32.to_le_bytes());
         assert_eq!(
-            normalize(&SqlType::Decimal(Some(d))).unwrap().unwrap(),
+            normalize(&SqlType::Numeric(Some(d))).unwrap().unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn read_decimal_is_length_tolerant() {
+        // A 15-byte magnitude (JDBC bulk-copy writes this form) must be accepted,
+        // zero-padding the short trailing group into a full 32-bit word rather
+        // than being rejected. Value 12345 with scale 2 => 123.45.
+        let info = type_info(
+            TdsDataType::DecimalN,
+            5,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::DecimalN, 17, 5, 2),
+        );
+        let mut bytes = vec![1u8]; // positive sign
+        bytes.extend_from_slice(&12345i32.to_le_bytes()); // first 32-bit word
+        bytes.extend_from_slice(&[0u8; 11]); // 11 more bytes => 15-byte magnitude
+        let value = denormalize(&bytes, TdsDataType::DecimalN, &info, 1).unwrap();
+        match value {
+            ColumnValues::Decimal(parts) => {
+                assert!(parts.is_positive);
+                assert_eq!(parts.scale, 2);
+                assert_eq!(parts.to_string(), "123.45");
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_then_read_decimal_roundtrips() {
+        // The fixed-width write form must read back to the same value through the
+        // (now length-tolerant) reader.
+        let d = DecimalParts {
+            is_positive: false,
+            scale: 3,
+            precision: 12,
+            int_parts: vec![987654],
+        };
+        let normalized = normalize(&SqlType::Decimal(Some(d))).unwrap().unwrap();
+        let info = type_info(
+            TdsDataType::DecimalN,
+            12,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::DecimalN, 17, 12, 3),
+        );
+        let value = denormalize(&normalized, TdsDataType::DecimalN, &info, 1).unwrap();
+        match value {
+            ColumnValues::Decimal(parts) => {
+                assert!(!parts.is_positive);
+                assert_eq!(parts.to_string(), "-987.654");
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
     }
 
     #[test]
