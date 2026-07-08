@@ -363,9 +363,11 @@ fn read_decimal(bytes: &[u8], base_type_info: &TypeInfo) -> TdsResult<DecimalPar
 
     // Reference AE readers are length-tolerant: .NET reads `length >> 2` 32-bit
     // groups and ignores any trailing partial group, and JDBC uses the actual
-    // length (its bulk-copy path writes a 15-byte magnitude). Zero-pad a short
-    // trailing group into a full 32-bit word rather than rejecting it, so we can
-    // read magnitudes produced by every reference driver.
+    // length (its bulk-copy path writes a 15-byte magnitude). We zero-pad a
+    // short trailing group into a full 32-bit word rather than rejecting it, and
+    // — unlike .NET — we preserve those trailing bytes instead of dropping them,
+    // so no significant magnitude bits are lost. This lets us read magnitudes
+    // produced by every reference driver.
     let int_parts = magnitude
         .chunks(4)
         .map(|chunk| {
@@ -754,7 +756,18 @@ fn normalize_decimal(d: &DecimalParts) -> Vec<u8> {
     let mut out = Vec::with_capacity(DECIMAL_NORMALIZED_LEN);
     out.push(u8::from(d.is_positive));
     // A valid decimal/numeric magnitude (precision <= 38) fits in four 32-bit
-    // words, so any words beyond the first four are zero.
+    // words, so any words beyond the first four are zero. Emitting only the
+    // first four therefore never loses data for a valid value; assert that
+    // invariant in debug/test builds so a malformed `DecimalParts` (e.g. built
+    // for a > 38-digit value) is caught here rather than silently truncated into
+    // wrong ciphertext. The reader rejects the oversized case at runtime.
+    debug_assert!(
+        d.int_parts
+            .get(DECIMAL_MAGNITUDE_WORDS..)
+            .is_none_or(|extra| extra.iter().all(|&word| word == 0)),
+        "decimal magnitude exceeds 128 bits (precision <= 38): {:?}",
+        d.int_parts
+    );
     for i in 0..DECIMAL_MAGNITUDE_WORDS {
         let word = d.int_parts.get(i).copied().unwrap_or(0);
         out.extend_from_slice(&word.to_le_bytes());
@@ -1326,6 +1339,22 @@ mod tests {
             normalize(&SqlType::Numeric(Some(d))).unwrap().unwrap(),
             expected
         );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "decimal magnitude exceeds 128 bits")]
+    fn normalize_decimal_asserts_bounded_magnitude() {
+        // A malformed DecimalParts carrying a non-zero word beyond the 128-bit
+        // limit must trip the debug-only invariant check rather than silently
+        // truncating into wrong ciphertext.
+        let d = DecimalParts {
+            is_positive: true,
+            scale: 0,
+            precision: 38,
+            int_parts: vec![0, 0, 0, 0, 1],
+        };
+        let _ = normalize(&SqlType::Decimal(Some(d)));
     }
 
     #[test]
