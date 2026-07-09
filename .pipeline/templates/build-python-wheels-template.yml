@@ -178,7 +178,7 @@ steps:
         Write-Host "Building Python wheel for Python ${{ pythonVersion }}..."
         python --version
         
-        # Install build and wheel repair tools for this Python version
+        # Install build tooling (maturin) and wheel utilities for this Python version
         pip install maturin wheel
         
         # Create wheels output directory
