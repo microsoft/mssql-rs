@@ -221,6 +221,8 @@ stages:
           testFilter: -E 'not (test(connectivity))'
           enableJsBuild: true
           enableJsTest: true
+          additionalPythonTestArgs: '--coverage'
+          collectPythonCoverage: true
       - template: build-template-alpine.yml
         parameters:
           osType: Linux
@@ -600,6 +602,72 @@ stages:
           - name: Ubuntu24
             container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
             entry: deb-bookworm.sh
+
+# Merge the mssql-tds Rust coverage (Build_Windows) and the mssql-py-core
+# coverage from the Python tests (Build_Linux) into one Cobertura report. ADO
+# does not merge coverage across stages/jobs, so it is combined here and
+# published as CoberturaCoverage (the artifact the GitHub diff-cover workflow
+# consumes) and to the ADO coverage tab.
+- stage: Coverage
+  displayName: Merge Coverage
+  dependsOn:
+    - Build
+  condition: and(succeeded('Build'), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  jobs:
+  - job: Merge_Coverage
+    displayName: Merge Rust and Python coverage
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+      - checkout: self
+      - task: DownloadPipelineArtifact@2
+        displayName: Download Rust (mssql-tds) coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoverageRust'
+          targetPath: '$(Pipeline.Workspace)/cov-rust'
+      - task: DownloadPipelineArtifact@2
+        displayName: Download Python (mssql-py-core) coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoveragePython'
+          targetPath: '$(Pipeline.Workspace)/cov-python'
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$(Build.SourcesDirectory)/target"
+          rust="$(Pipeline.Workspace)/cov-rust/cobertura.xml"
+          py="$(Pipeline.Workspace)/cov-python/pycore-cobertura.xml"
+          inputs=()
+          [ -f "$rust" ] && inputs+=("$rust")
+          # mssql-py-core coverage is measured from within its own crate
+          # directory, so prefix its relative filenames to make them repo-root
+          # relative in the merged report.
+          [ -f "$py" ] && inputs+=("$py::mssql-py-core")
+          if [ ${#inputs[@]} -eq 0 ]; then
+            echo "##vso[task.logissue type=warning]No coverage inputs found to merge"
+            exit 0
+          fi
+          python3 .pipeline/scripts/merge-cobertura.py \
+            --output "$(Build.SourcesDirectory)/target/cobertura.xml" \
+            "${inputs[@]}"
+          echo "##vso[task.setvariable variable=coverageMerged]true"
+        displayName: Merge Cobertura reports
+      - task: PublishPipelineArtifact@1
+        condition: and(succeeded(), eq(variables['coverageMerged'], 'true'))
+        displayName: Publish merged Cobertura coverage artifact
+        inputs:
+          targetPath: '$(Build.SourcesDirectory)/target/cobertura.xml'
+          artifactName: 'CoberturaCoverage'
+      - task: PublishCodeCoverageResults@2
+        condition: and(succeeded(), eq(variables['coverageMerged'], 'true'))
+        displayName: Publish merged coverage results
+        inputs:
+          summaryFileLocation: '$(Build.SourcesDirectory)/target/cobertura.xml'
+          pathToSources: '$(Build.SourcesDirectory)'
 
 - ${{ if eq(parameters.includeInfraStages, true) }}:
   # Long-haul BCP test stage (30 minutes)

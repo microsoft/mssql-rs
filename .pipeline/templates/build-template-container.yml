@@ -36,6 +36,11 @@ parameters:
   type: string
   default: ''
 
+- name: collectPythonCoverage
+  displayName: Collect Cobertura coverage for mssql-py-core from the Python tests
+  type: boolean
+  default: false
+
 steps:
 # ARM64 integration tests connect cross-pool to an on-demand x64 SQL host
 # (Sql_Host_build_arm). Derive the SA password from build context so this job
@@ -403,6 +408,18 @@ steps:
     testResultsFormat: JUnit
     testResultsFiles: $(Build.SourcesDirectory)/mssql-py-core/pytest-results.xml
     testRunTitle: $(System.PhaseName)-Python
+
+# Publish the mssql-py-core Cobertura coverage produced by the Python tests
+# (test-python.sh --coverage). Merged with the Windows Rust coverage in the
+# Coverage stage, since ADO does not merge coverage across stages/jobs.
+- ${{ if eq(parameters.collectPythonCoverage, true) }}:
+  - task: PublishPipelineArtifact@1
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Publish mssql-py-core Cobertura coverage artifact
+    continueOnError: true
+    inputs:
+      targetPath: $(Build.SourcesDirectory)/target/pycore-cobertura.xml
+      artifactName: CoberturaCoveragePython
 
 # Release the cross-pool SQL host: publishing this sentinel is what unblocks
 # Sql_Host_build_arm's wait-for-teardown step. always() so failures and

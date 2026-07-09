@@ -186,7 +186,7 @@ steps:
       displayName: "Publish Cobertura coverage artifact"
       inputs:
         targetPath: "$(Build.SourcesDirectory)/target/cobertura.xml"
-        artifactName: "CoberturaCoverage"
+        artifactName: "CoberturaCoverageRust"
 
 - ${{ if eq(parameters.enableRustBuild, true) }}:
   - task: CopyFiles@2
