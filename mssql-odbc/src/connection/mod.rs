@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+use mssql_tds::connection::odbc_supported_auth_keywords::is_recognized_keyword;
 use tracing::warn;
 
 // Connection string keys (lowercase for matching)
@@ -20,6 +21,8 @@ const KEY_PWD: &str = "pwd";
 const KEY_PASSWORD: &str = "password";
 const KEY_TRUST_SRV_CERT: &str = "trustservercertificate";
 const KEY_ENCRYPT: &str = "encrypt";
+const KEY_AUTHENTICATION: &str = "authentication";
+const KEY_TRUSTED_CONNECTION: &str = "trusted_connection";
 
 // Known keys we currently accept but do not act on.
 // These should not produce 01S00 warnings.
@@ -36,7 +39,6 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
     "address",
     "addr",
     "mars_connection",
-    "trusted_connection",
     "autotranslate",
     "quotedid",
     "ansi_npw",
@@ -47,6 +49,21 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
 const YES_NO: &[&str] = &["yes", "no"];
 const ENCRYPT_VALUES: &[&str] = &["yes", "mandatory", "no", "optional", "strict"];
 
+// Recognized `Authentication=` keywords (mirrors mssql-tds `auth_method_from_keyword`).
+// Used only for the diagnostic hint; the accept/reject decision is delegated to
+// `is_recognized_keyword` so the two never drift.
+const AUTHENTICATION_VALUES: &[&str] = &[
+    "SqlPassword",
+    "ActiveDirectoryIntegrated",
+    "ActiveDirectoryPassword",
+    "ActiveDirectoryInteractive",
+    "ActiveDirectoryMSI",
+    "ActiveDirectoryServicePrincipal",
+    "ActiveDirectoryDefault",
+    "ActiveDirectoryDeviceCodeFlow",
+    "ActiveDirectoryWorkloadIdentity",
+];
+
 #[derive(Copy, Clone)]
 enum ConnAttrKey {
     Server,
@@ -55,6 +72,8 @@ enum ConnAttrKey {
     Pwd,
     TrustServerCert,
     Encrypt,
+    Authentication,
+    TrustedConnection,
     Count,
 }
 
@@ -110,6 +129,8 @@ pub(crate) struct ConnectionParams {
     pub(crate) pwd: String,
     pub(crate) trust_server_certificate: bool,
     pub(crate) encrypt: Option<String>,
+    pub(crate) authentication: Option<String>,
+    pub(crate) trusted_connection: Option<bool>,
 }
 
 impl ConnectionParams {
@@ -134,6 +155,15 @@ impl ConnectionParams {
         if let Some(encrypt) = &self.encrypt {
             parts.push(format!("Encrypt={encrypt}"));
         }
+        if let Some(authentication) = &self.authentication {
+            parts.push(format!("Authentication={authentication}"));
+        }
+        if let Some(trusted_connection) = self.trusted_connection {
+            parts.push(format!(
+                "Trusted_Connection={}",
+                if trusted_connection { "yes" } else { "no" }
+            ));
+        }
 
         parts.join(";")
     }
@@ -148,6 +178,8 @@ impl fmt::Debug for ConnectionParams {
             .field("pwd", &"<REDACTED>")
             .field("trust_server_certificate", &self.trust_server_certificate)
             .field("encrypt", &self.encrypt)
+            .field("authentication", &self.authentication)
+            .field("trusted_connection", &self.trusted_connection)
             .finish()
     }
 }
@@ -177,6 +209,8 @@ pub(crate) fn parse_connection_string(
             KEY_PWD | KEY_PASSWORD => Some(ConnAttrKey::Pwd),
             KEY_TRUST_SRV_CERT => Some(ConnAttrKey::TrustServerCert),
             KEY_ENCRYPT => Some(ConnAttrKey::Encrypt),
+            KEY_AUTHENTICATION => Some(ConnAttrKey::Authentication),
+            KEY_TRUSTED_CONNECTION => Some(ConnAttrKey::TrustedConnection),
             _ if KNOWN_IGNORED_KEYS.contains(&lower.as_str()) => None,
             _ => {
                 // Match msodbcsql behavior: unknown attributes are ignored,
@@ -207,6 +241,24 @@ pub(crate) fn parse_connection_string(
                 ConnAttrKey::Encrypt => {
                     validate_attr(&lower, value, ENCRYPT_VALUES)?;
                     params.encrypt = Some(value.clone());
+                }
+                ConnAttrKey::Authentication => {
+                    // Recognized-keyword check is delegated to mssql-tds
+                    // (the source of truth). Whether a recognized method is
+                    // *implemented* is gated later (T1-T4); parsing only
+                    // rejects values mssql-tds does not recognize.
+                    if !is_recognized_keyword(value) {
+                        return Err(InvalidAttrValue {
+                            key: lower.clone(),
+                            value: value.clone(),
+                            expected: AUTHENTICATION_VALUES,
+                        });
+                    }
+                    params.authentication = Some(value.clone());
+                }
+                ConnAttrKey::TrustedConnection => {
+                    validate_attr(&lower, value, YES_NO)?;
+                    params.trusted_connection = Some(is_yes(value));
                 }
                 ConnAttrKey::Count => {}
             }
@@ -487,5 +539,147 @@ mod tests {
             p.fmt_as_odbc_conn_str(),
             "Server=h;Database=db;UID=u;PWD=******;Encrypt=strict"
         );
+    }
+
+    // ── Authentication / Trusted_Connection (T0) ─────────────
+
+    #[test]
+    fn authentication_recognized_keywords() {
+        for kw in [
+            "SqlPassword",
+            "ActiveDirectoryIntegrated",
+            "ActiveDirectoryPassword",
+            "ActiveDirectoryInteractive",
+            "ActiveDirectoryMSI",
+            "ActiveDirectoryServicePrincipal",
+            "ActiveDirectoryDefault",
+            "ActiveDirectoryDeviceCodeFlow",
+            "ActiveDirectoryWorkloadIdentity",
+        ] {
+            let (p, warn) =
+                parse_connection_string(&format!("Server=h;UID=u;PWD=p;Authentication={kw}"))
+                    .unwrap();
+            assert_eq!(p.authentication.as_deref(), Some(kw), "keyword {kw}");
+            assert!(!warn, "recognized Authentication should not warn: {kw}");
+        }
+    }
+
+    #[test]
+    fn authentication_case_insensitive_recognized() {
+        // Recognized case-insensitively; the raw value is preserved as given.
+        let (p, ..) = parse_connection_string(
+            "Server=h;UID=u;PWD=p;authentication=activedirectoryintegrated",
+        )
+        .unwrap();
+        assert_eq!(
+            p.authentication.as_deref(),
+            Some("activedirectoryintegrated")
+        );
+    }
+
+    #[test]
+    fn authentication_unrecognized_is_error() {
+        let err =
+            parse_connection_string("Server=h;UID=u;PWD=p;Authentication=NotReal").unwrap_err();
+        assert_eq!(err.key, "authentication");
+        assert_eq!(err.value, "NotReal");
+    }
+
+    #[test]
+    fn authentication_empty_is_reset_ok() {
+        // Empty Authentication is an intentional reset (mssql-tds treats it as
+        // recognized); stored as Some("") to preserve the distinction from unset.
+        let (p, warn) = parse_connection_string("Server=h;UID=u;PWD=p;Authentication=").unwrap();
+        assert_eq!(p.authentication.as_deref(), Some(""));
+        assert!(!warn);
+    }
+
+    #[test]
+    fn trusted_connection_yes_no() {
+        let (p, ..) = parse_connection_string("Server=h;Trusted_Connection=Yes").unwrap();
+        assert_eq!(p.trusted_connection, Some(true));
+
+        let (p, ..) = parse_connection_string("Server=h;Trusted_Connection=no").unwrap();
+        assert_eq!(p.trusted_connection, Some(false));
+    }
+
+    #[test]
+    fn trusted_connection_invalid_is_error() {
+        let err = parse_connection_string("Server=h;Trusted_Connection=1").unwrap_err();
+        assert_eq!(err.key, "trusted_connection");
+        assert_eq!(err.value, "1");
+
+        let err = parse_connection_string("Server=h;Trusted_Connection=true").unwrap_err();
+        assert_eq!(err.key, "trusted_connection");
+    }
+
+    #[test]
+    fn trusted_connection_no_longer_silently_ignored() {
+        // Previously in KNOWN_IGNORED_KEYS and dropped without capture. Now parsed;
+        // still no 01S00 warning, but the value is retained.
+        let (p, warn) = parse_connection_string("Server=h;Trusted_Connection=Yes").unwrap();
+        assert!(!warn);
+        assert_eq!(p.trusted_connection, Some(true));
+    }
+
+    #[test]
+    fn auth_keys_follow_first_wins() {
+        let (p, ..) = parse_connection_string(
+            "Server=h;Authentication=ActiveDirectoryIntegrated;Authentication=SqlPassword",
+        )
+        .unwrap();
+        assert_eq!(
+            p.authentication.as_deref(),
+            Some("ActiveDirectoryIntegrated")
+        );
+
+        let (p, ..) =
+            parse_connection_string("Server=h;Trusted_Connection=Yes;Trusted_Connection=No")
+                .unwrap();
+        assert_eq!(p.trusted_connection, Some(true));
+    }
+
+    #[test]
+    fn auth_and_existing_keys_together() {
+        let (p, warn) = parse_connection_string(
+            "Server=h;Database=db;UID=u;PWD=p;Encrypt=strict;Authentication=ActiveDirectoryServicePrincipal",
+        )
+        .unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "h");
+        assert_eq!(p.database, "db");
+        assert_eq!(p.uid, "u");
+        assert_eq!(p.pwd, "p");
+        assert_eq!(p.encrypt.as_deref(), Some("strict"));
+        assert_eq!(
+            p.authentication.as_deref(),
+            Some("ActiveDirectoryServicePrincipal")
+        );
+    }
+
+    #[test]
+    fn new_auth_fields_default_none() {
+        let (p, ..) = parse_connection_string("Server=h;UID=u;PWD=p").unwrap();
+        assert_eq!(p.authentication, None);
+        assert_eq!(p.trusted_connection, None);
+    }
+
+    #[test]
+    fn auth_fields_render_without_leaking_secrets() {
+        let (p, ..) = parse_connection_string(
+            "Server=h;UID=u;PWD=secret;Authentication=ActiveDirectoryIntegrated;Trusted_Connection=Yes",
+        )
+        .unwrap();
+
+        let dbg = format!("{p:?}");
+        assert!(dbg.contains("ActiveDirectoryIntegrated"));
+        assert!(dbg.contains("<REDACTED>"));
+        assert!(!dbg.contains("secret"));
+
+        let s = p.fmt_as_odbc_conn_str();
+        assert!(s.contains("Authentication=ActiveDirectoryIntegrated"));
+        assert!(s.contains("Trusted_Connection=yes"));
+        assert!(s.contains("PWD=******"));
+        assert!(!s.contains("secret"));
     }
 }
