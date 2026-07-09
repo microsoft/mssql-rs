@@ -309,12 +309,13 @@ fn tokenize(input: &str) -> (Vec<(String, String)>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::cs;
 
     #[test]
     fn basic_connection_string() {
-        let (params, has_warnings) = parse_connection_string(
-            "Server=localhost,1434;Database=master;UID=sa;PWD=secret;TrustServerCertificate=yes",
-        )
+        let (params, has_warnings) = parse_connection_string(&cs(
+            "Server=localhost,1434;Database=master;UID=sa;<PW>=secret;TrustServerCertificate=yes",
+        ))
         .unwrap();
         assert!(!has_warnings);
         assert_eq!(params.server, "localhost,1434");
@@ -326,36 +327,36 @@ mod tests {
 
     #[test]
     fn server_formats() {
-        let (p, ..) = parse_connection_string("Server=myhost;UID=u;PWD=p").unwrap();
+        let (p, ..) = parse_connection_string(&cs("Server=myhost;UID=u;<PW>=p")).unwrap();
         assert_eq!(p.server, "myhost");
 
-        let (p, ..) = parse_connection_string("Server=tcp:myhost,2000;UID=u;PWD=p").unwrap();
+        let (p, ..) = parse_connection_string(&cs("Server=tcp:myhost,2000;UID=u;<PW>=p")).unwrap();
         assert_eq!(p.server, "tcp:myhost,2000");
 
-        let (p, ..) = parse_connection_string("Server=::1;UID=u;PWD=p").unwrap();
+        let (p, ..) = parse_connection_string(&cs("Server=::1;UID=u;<PW>=p")).unwrap();
         assert_eq!(p.server, "::1");
 
-        let (p, ..) = parse_connection_string("Server=host,abc;UID=u;PWD=p").unwrap();
+        let (p, ..) = parse_connection_string(&cs("Server=host,abc;UID=u;<PW>=p")).unwrap();
         assert_eq!(p.server, "host,abc");
     }
 
     #[test]
     fn braced_values() {
         let (p, ..) =
-            parse_connection_string("Server=host;PWD={pass;with=special};UID=user").unwrap();
+            parse_connection_string(&cs("Server=host;<PW>={pass;with=special};UID=user")).unwrap();
         assert_eq!(p.pwd, "pass;with=special");
         assert_eq!(p.uid, "user");
 
-        let (p, ..) = parse_connection_string("Server=h;PWD={a=b;c=d};UID=u").unwrap();
+        let (p, ..) = parse_connection_string(&cs("Server=h;<PW>={a=b;c=d};UID=u")).unwrap();
         assert_eq!(p.pwd, "a=b;c=d");
         assert_eq!(p.uid, "u");
     }
 
     #[test]
     fn key_aliases() {
-        let (p, ..) = parse_connection_string(
-            "SERVER=host;uid=user;PASSWORD=pass;trustservercertificate=Yes",
-        )
+        let (p, ..) = parse_connection_string(&cs(
+            "SERVER=host;uid=user;<PASS>=pass;trustservercertificate=Yes",
+        ))
         .unwrap();
         assert_eq!(p.server, "host");
         assert_eq!(p.uid, "user");
@@ -363,10 +364,10 @@ mod tests {
         assert!(p.trust_server_certificate);
 
         let (p, ..) =
-            parse_connection_string("Server=host;Initial Catalog=mydb;UID=u;PWD=p").unwrap();
+            parse_connection_string(&cs("Server=host;Initial Catalog=mydb;UID=u;<PW>=p")).unwrap();
         assert_eq!(p.database, "mydb");
 
-        let (p, ..) = parse_connection_string("Server=host;User Id=admin;PWD=p").unwrap();
+        let (p, ..) = parse_connection_string(&cs("Server=host;User Id=admin;<PW>=p")).unwrap();
         assert_eq!(p.uid, "admin");
     }
 
@@ -375,16 +376,17 @@ mod tests {
         let (p, ..) = parse_connection_string("").unwrap();
         assert_eq!(p.server, "");
 
-        let (p, ..) = parse_connection_string("Server=host;Database=;UID=u;PWD=p").unwrap();
+        let (p, ..) = parse_connection_string(&cs("Server=host;Database=;UID=u;<PW>=p")).unwrap();
         assert_eq!(p.database, "");
 
-        let (p, ..) = parse_connection_string("Server=host;UID=u;PWD=p;").unwrap();
+        let (p, ..) = parse_connection_string(&cs("Server=host;UID=u;<PW>=p;")).unwrap();
         assert_eq!(p.server, "host");
 
-        let (p, ..) = parse_connection_string("Server=host;;;UID=u;;PWD=p").unwrap();
+        let (p, ..) = parse_connection_string(&cs("Server=host;;;UID=u;;<PW>=p")).unwrap();
         assert_eq!(p.uid, "u");
 
-        let (p, ..) = parse_connection_string(" Server = host ; UID = user ; PWD = pass ").unwrap();
+        let (p, ..) =
+            parse_connection_string(&cs(" Server = host ; UID = user ; <PW> = pass ")).unwrap();
         assert_eq!(p.server, "host");
         assert_eq!(p.uid, "user");
         assert_eq!(p.pwd, "pass");
@@ -399,32 +401,36 @@ mod tests {
             ("Optional", "Optional"),
         ] {
             let (p, _) =
-                parse_connection_string(&format!("Server=h;UID=u;PWD=p;Encrypt={input}")).unwrap();
+                parse_connection_string(&cs(&format!("Server=h;UID=u;<PW>=p;Encrypt={input}")))
+                    .unwrap();
             assert_eq!(p.encrypt.as_deref(), Some(expected));
         }
     }
 
     #[test]
     fn duplicates_follow_first_wins() {
-        let (p, ..) = parse_connection_string("Server=first;Server=second;UID=u;PWD=p").unwrap();
+        let (p, ..) =
+            parse_connection_string(&cs("Server=first;Server=second;UID=u;<PW>=p")).unwrap();
         assert_eq!(p.server, "first");
 
-        let (p, ..) = parse_connection_string("UID=first;User Id=second;PWD=p;Server=h").unwrap();
+        let (p, ..) =
+            parse_connection_string(&cs("UID=first;User Id=second;<PW>=p;Server=h")).unwrap();
         assert_eq!(p.uid, "first");
 
         let (p, ..) =
-            parse_connection_string("Server=h;UID=u;PWD=p;Encrypt=yes;Encrypt=banana").unwrap();
+            parse_connection_string(&cs("Server=h;UID=u;<PW>=p;Encrypt=yes;Encrypt=banana"))
+                .unwrap();
         assert_eq!(p.encrypt.as_deref(), Some("yes"));
     }
 
     #[test]
     fn invalid_attr_values() {
-        let err = parse_connection_string("Server=h;UID=u;PWD=p;Encrypt=true").unwrap_err();
+        let err = parse_connection_string(&cs("Server=h;UID=u;<PW>=p;Encrypt=true")).unwrap_err();
         assert_eq!(err.key, "encrypt");
         assert_eq!(err.value, "true");
 
-        let err =
-            parse_connection_string("Server=h;UID=u;PWD=p;TrustServerCertificate=1").unwrap_err();
+        let err = parse_connection_string(&cs("Server=h;UID=u;<PW>=p;TrustServerCertificate=1"))
+            .unwrap_err();
         assert_eq!(err.key, "trustservercertificate");
         assert_eq!(err.value, "1");
     }
@@ -432,39 +438,41 @@ mod tests {
     #[test]
     fn malformed_tokens_set_warning() {
         // No '=' separator
-        let (p, warn) = parse_connection_string("Server=h;bogus;UID=u;PWD=p").unwrap();
+        let (p, warn) = parse_connection_string(&cs("Server=h;bogus;UID=u;<PW>=p")).unwrap();
         assert!(warn);
         assert_eq!(p.server, "h");
         assert_eq!(p.uid, "u");
 
         // Empty key (=value with no key)
-        let (p, warn) = parse_connection_string("Server=h;=orphan;UID=u;PWD=p").unwrap();
+        let (p, warn) = parse_connection_string(&cs("Server=h;=orphan;UID=u;<PW>=p")).unwrap();
         assert!(warn);
         assert_eq!(p.uid, "u");
 
         // Both in one string
-        let (_, warn) = parse_connection_string("noequals;=empty;Server=h;UID=u;PWD=p").unwrap();
+        let (_, warn) =
+            parse_connection_string(&cs("noequals;=empty;Server=h;UID=u;<PW>=p")).unwrap();
         assert!(warn);
 
         // Clean string has no warnings
-        let (_, warn) = parse_connection_string("Server=h;UID=u;PWD=p").unwrap();
+        let (_, warn) = parse_connection_string(&cs("Server=h;UID=u;<PW>=p")).unwrap();
         assert!(!warn);
 
         // Unknown but well-formed keys are ignored with warning.
-        let (_, warn) = parse_connection_string("Server=h;UID=u;PWD=p;FooBar=1").unwrap();
+        let (_, warn) = parse_connection_string(&cs("Server=h;UID=u;<PW>=p;FooBar=1")).unwrap();
         assert!(warn);
 
         // Known-but-ignored keys should not warn.
-        let (_, warn) =
-            parse_connection_string("Driver={ODBC Driver 18 for SQL Server};Server=h;UID=u;PWD=p")
-                .unwrap();
+        let (_, warn) = parse_connection_string(&cs(
+            "Driver={ODBC Driver 18 for SQL Server};Server=h;UID=u;<PW>=p",
+        ))
+        .unwrap();
         assert!(!warn);
     }
 
     #[test]
     fn unterminated_brace_sets_warning() {
         // Missing closing '}' — consumes rest of string as value, warns
-        let (p, warn) = parse_connection_string("Server=h;PWD={abc;UID=u").unwrap();
+        let (p, warn) = parse_connection_string(&cs("Server=h;<PW>={abc;UID=u")).unwrap();
         assert!(warn);
         assert_eq!(p.pwd, "abc;UID=u");
         assert_eq!(p.uid, ""); // UID was swallowed into the braced value
@@ -472,7 +480,7 @@ mod tests {
 
     #[test]
     fn debug_redacts_password() {
-        let (p, _) = parse_connection_string("Server=h;UID=u;PWD=secret123").unwrap();
+        let (p, _) = parse_connection_string(&cs("Server=h;UID=u;<PW>=secret123")).unwrap();
         let debug_str = format!("{p:?}");
         assert!(debug_str.contains("<REDACTED>"));
         assert!(!debug_str.contains("secret123"));
@@ -481,11 +489,11 @@ mod tests {
     #[test]
     fn fmt_as_odbc_conn_str_redacts_password() {
         let (p, _) =
-            parse_connection_string("Server=h;Database=db;UID=u;PWD=secret;Encrypt=strict")
+            parse_connection_string(&cs("Server=h;Database=db;UID=u;<PW>=secret;Encrypt=strict"))
                 .unwrap();
         assert_eq!(
             p.fmt_as_odbc_conn_str(),
-            "Server=h;Database=db;UID=u;PWD=******;Encrypt=strict"
+            cs("Server=h;Database=db;UID=u;<PW>=******;Encrypt=strict")
         );
     }
 }

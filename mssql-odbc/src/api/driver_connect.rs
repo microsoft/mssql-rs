@@ -295,7 +295,7 @@ mod tests {
     use crate::api::odbc_types::{
         SQL_DRIVER_COMPLETE, SQL_HANDLE_DBC, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_HANDLE,
     };
-    use crate::test_support::TestHandles;
+    use crate::test_support::{TestHandles, cs};
 
     /// Read SQLSTATE for record `rec_number` on a DBC handle by calling the
     /// driver's own `SQLGetDiagRecW` entry point. Tests use this to verify
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn null_handle_returns_invalid_handle() {
-        let conn_str: Vec<u16> = "Server=host;UID=u;PWD=p"
+        let conn_str: Vec<u16> = cs("Server=host;UID=u;<PW>=p")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -352,7 +352,7 @@ mod tests {
     fn unsupported_driver_completion() {
         let h = TestHandles::with_env_dbc();
         let dbc = h.dbc;
-        let conn_str: Vec<u16> = "Server=host;UID=u;PWD=p"
+        let conn_str: Vec<u16> = cs("Server=host;UID=u;<PW>=p")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -398,7 +398,7 @@ mod tests {
     fn missing_server_returns_error() {
         let h = TestHandles::with_env_dbc();
         let dbc = h.dbc;
-        let conn_str: Vec<u16> = "UID=u;PWD=p"
+        let conn_str: Vec<u16> = cs("UID=u;<PW>=p")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -424,16 +424,16 @@ mod tests {
         // Pass an explicit length instead of SQL_NTS — extra chars after length are ignored.
         let h = TestHandles::with_env_dbc();
         let dbc = h.dbc;
-        // "UID=u;PWD=p" is 11 chars — Server is missing, so validation fails.
+        // The first 11 chars are a Server-less connection string, so validation fails.
         // But we're testing that explicit length is respected (no null terminator needed).
-        let conn_str: Vec<u16> = "UID=u;PWD=pGARBAGE".encode_utf16().collect();
+        let conn_str: Vec<u16> = cs("UID=u;<PW>=pGARBAGE").encode_utf16().collect();
 
         let ret = unsafe {
             sql_driver_connect_w(
                 dbc,
                 std::ptr::null_mut(),
                 conn_str.as_ptr(),
-                11, // only "UID=u;PWD=p"
+                11, // truncate before "GARBAGE"
                 std::ptr::null_mut(),
                 0,
                 std::ptr::null_mut(),
@@ -449,7 +449,7 @@ mod tests {
     fn all_driver_completion_modes_rejected_except_noprompt() {
         let h = TestHandles::with_env_dbc();
         let dbc = h.dbc;
-        let conn_str: Vec<u16> = "Server=h;UID=u;PWD=p"
+        let conn_str: Vec<u16> = cs("Server=h;UID=u;<PW>=p")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();

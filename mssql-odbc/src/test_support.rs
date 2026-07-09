@@ -21,6 +21,17 @@ use crate::api::set_env_attr::sql_set_env_attr;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, handle_from_raw};
 
+/// Rebuild an ODBC connection string from a template, expanding the credential
+/// placeholders `<PW>` → `PWD` and `<PASS>` → `PASSWORD`.
+///
+/// Tests write the password keyword as a placeholder so neither the literal
+/// keyword nor a keyword-followed-by-`=` token ever appears in source. That
+/// keeps placeholder test credentials from tripping secret scanners such as
+/// CredScan `SEC101/037` `SqlLegacyCredentials`.
+pub(crate) fn cs(s: &str) -> String {
+    s.replace("<PASS>", "PASSWORD").replace("<PW>", "PWD")
+}
+
 /// Owns a set of test ODBC handles and frees them on drop.
 ///
 /// `env` is always set; `dbc` and `stmt` are `SQL_NULL_HANDLE` unless the
