@@ -77,8 +77,12 @@ cd "$PY_CORE_DIR"
 if [ "$COVERAGE" = true ]; then
     echo "Enabling coverage instrumentation for mssql-py-core..."
     cargo llvm-cov clean --workspace
-    # shellcheck disable=SC1090
-    source <(cargo llvm-cov show-env --export-prefix)
+    # Warm up the tooling first so any one-time rustup component install output
+    # (e.g. downloading llvm-tools) does not get sourced into the shell.
+    cargo llvm-cov show-env --export-prefix >/dev/null 2>&1 || true
+    # Source only the export statements; discard rustup/info chatter that would
+    # otherwise be evaluated as commands.
+    eval "$(cargo llvm-cov show-env --export-prefix 2>/dev/null | grep '^export ')"
 fi
 
 # Build and install the module in development mode
