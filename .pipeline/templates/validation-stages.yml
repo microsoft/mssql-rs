@@ -223,6 +223,7 @@ stages:
           enableJsTest: true
           additionalPythonTestArgs: '--coverage'
           collectPythonCoverage: true
+          collectRustCoverage: true
       - template: build-template-alpine.yml
         parameters:
           osType: Linux
@@ -603,11 +604,12 @@ stages:
             container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
             entry: deb-bookworm.sh
 
-# Merge the mssql-tds Rust coverage (Build_Windows) and the mssql-py-core
-# coverage from the Python tests (Build_Linux) into one Cobertura report. ADO
-# does not merge coverage across stages/jobs, so it is combined here and
-# published as CoberturaCoverage (the artifact the GitHub diff-cover workflow
-# consumes) and to the ADO coverage tab.
+# Merge the mssql-tds Rust coverage from every OS that runs the tests
+# (Build_Windows, Build_Linux, Test_MacOS) and the mssql-py-core coverage from
+# the Python tests (Build_Linux) into one Cobertura report. ADO does not merge
+# coverage across stages/jobs, so it is combined here and published as
+# CoberturaCoverage (the artifact the GitHub diff-cover workflow consumes) and
+# to the ADO coverage tab.
 - stage: Coverage
   displayName: Merge Coverage
   dependsOn:
@@ -623,12 +625,26 @@ stages:
     steps:
       - checkout: self
       - task: DownloadPipelineArtifact@2
-        displayName: Download Rust (mssql-tds) coverage
+        displayName: Download Rust (mssql-tds) Windows coverage
         continueOnError: true
         inputs:
           buildType: 'current'
-          artifactName: 'CoberturaCoverageRust'
-          targetPath: '$(Pipeline.Workspace)/cov-rust'
+          artifactName: 'CoberturaCoverageRust_Windows'
+          targetPath: '$(Pipeline.Workspace)/cov-rust-windows'
+      - task: DownloadPipelineArtifact@2
+        displayName: Download Rust (mssql-tds) Linux coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoverageRust_Linux'
+          targetPath: '$(Pipeline.Workspace)/cov-rust-linux'
+      - task: DownloadPipelineArtifact@2
+        displayName: Download Rust (mssql-tds) macOS coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoverageRust_MacOS'
+          targetPath: '$(Pipeline.Workspace)/cov-rust-macos'
       - task: DownloadPipelineArtifact@2
         displayName: Download Python (mssql-py-core) coverage
         continueOnError: true
@@ -639,13 +655,20 @@ stages:
       - bash: |
           set -euo pipefail
           mkdir -p "$(Build.SourcesDirectory)/target"
-          rust="$(Pipeline.Workspace)/cov-rust/cobertura.xml"
-          py="$(Pipeline.Workspace)/cov-python/pycore-cobertura.xml"
           inputs=()
-          [ -f "$rust" ] && inputs+=("$rust")
+          # Each OS emits its mssql-tds report with repo-root-relative paths, so
+          # the same source file lines up across reports and coverage is unioned:
+          # a line covered on any OS counts as covered in the merged result.
+          for report in \
+            "$(Pipeline.Workspace)/cov-rust-windows/cobertura.xml" \
+            "$(Pipeline.Workspace)/cov-rust-linux/cobertura.xml" \
+            "$(Pipeline.Workspace)/cov-rust-macos/cobertura.xml"; do
+            [ -f "$report" ] && inputs+=("$report")
+          done
           # mssql-py-core coverage is measured from within its own crate
           # directory, so prefix its relative filenames to make them repo-root
           # relative in the merged report.
+          py="$(Pipeline.Workspace)/cov-python/pycore-cobertura.xml"
           [ -f "$py" ] && inputs+=("$py::mssql-py-core")
           if [ ${#inputs[@]} -eq 0 ]; then
             echo "##vso[task.logissue type=warning]No coverage inputs found to merge"

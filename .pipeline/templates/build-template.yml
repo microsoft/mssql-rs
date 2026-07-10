@@ -167,23 +167,23 @@ steps:
       env:
         SQL_PASSWORD: $(SQL_PASSWORD)
 
-  - ${{ if eq(parameters.osType, 'Windows') }}:
-    # Coverage is not published to the ADO coverage tab here. The Windows run
-    # only produces the Rust Cobertura report as an artifact; the Coverage stage
-    # merges it with the Python (mssql-py-core) report and publishes the single
-    # combined report to the ADO coverage tab.
-    # Cobertura report consumed by the GitHub PR diff-coverage workflow (diff-cover).
-    - script: cargo llvm-cov report --package mssql-tds --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
-      condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
-      workingDirectory: "$(Build.SourcesDirectory)"
-      displayName: Save code coverage in Cobertura format (mssql-tds package only)
+  # Coverage is not published to the ADO coverage tab from the individual OS
+  # jobs. Each OS produces its own mssql-tds Rust Cobertura report as a per-OS
+  # artifact; the Coverage stage merges the Windows/Linux/macOS Rust reports
+  # with the mssql-py-core Python report and publishes the single combined
+  # report to the ADO coverage tab, because ADO does not merge coverage across
+  # stages/jobs. The merged report is what the GitHub diff-cover workflow uses.
+  - script: cargo llvm-cov report --package mssql-tds --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    workingDirectory: "$(Build.SourcesDirectory)"
+    displayName: Save code coverage in Cobertura format (mssql-tds package only)
 
-    - task: PublishPipelineArtifact@1
-      condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
-      displayName: "Publish Cobertura coverage artifact"
-      inputs:
-        targetPath: "$(Build.SourcesDirectory)/target/cobertura.xml"
-        artifactName: "CoberturaCoverageRust"
+  - task: PublishPipelineArtifact@1
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: "Publish Cobertura coverage artifact"
+    inputs:
+      targetPath: "$(Build.SourcesDirectory)/target/cobertura.xml"
+      artifactName: "CoberturaCoverageRust_${{ parameters.osType }}"
 
 - ${{ if eq(parameters.enableRustBuild, true) }}:
   - task: CopyFiles@2

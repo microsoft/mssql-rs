@@ -41,6 +41,11 @@ parameters:
   type: boolean
   default: false
 
+- name: collectRustCoverage
+  displayName: Publish the mssql-tds Rust Cobertura coverage as a per-OS artifact for merging
+  type: boolean
+  default: false
+
 steps:
 # ARM64 integration tests connect cross-pool to an on-demand x64 SQL host
 # (Sql_Host_build_arm). Derive the SA password from build context so this job
@@ -297,12 +302,19 @@ steps:
     failTaskOnFailedTests: false
     publishRunAttachments: true
 
-- task: PublishCodeCoverageResults@2
-  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
-  displayName: Publish coverage results
-  inputs:
-    summaryFileLocation: $(Build.SourcesDirectory)/target/lcov.info
-    pathToSources: $(Build.SourcesDirectory)
+# Coverage is not published to the ADO coverage tab from this job. The Linux
+# mssql-tds Rust Cobertura report is published as a per-OS artifact; the
+# Coverage stage merges the Windows/Linux/macOS Rust reports with the
+# mssql-py-core Python report and publishes the single combined report to the
+# ADO coverage tab, because ADO does not merge coverage across stages/jobs.
+- ${{ if eq(parameters.collectRustCoverage, true) }}:
+  - task: PublishPipelineArtifact@1
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Publish mssql-tds Linux Cobertura coverage artifact
+    continueOnError: true
+    inputs:
+      targetPath: $(Build.SourcesDirectory)/target/cobertura.xml
+      artifactName: CoberturaCoverageRust_Linux
 
 - task: CopyFiles@2
   displayName: Copy Rust Debug Build
