@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use super::client_context::TdsAuthenticationMethod;
+use mssql_tds::connection::client_context::TdsAuthenticationMethod;
 
 /// Maps an ODBC connection-string `Authentication=` value to a [`TdsAuthenticationMethod`].
 ///
