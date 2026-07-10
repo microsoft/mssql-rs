@@ -903,58 +903,164 @@ mod always_encrypted {
         });
     }
 
-    /// The prepared-statement paths (`sp_prepare` / `sp_prepexec` / `sp_execute`)
-    /// do not yet run the AE describe/encrypt flow, so on an Always Encrypted
-    /// connection they must fail fast with parameters rather than send plaintext.
+    /// `sp_prepexec` prepares and executes in one round-trip; under Always
+    /// Encrypted it describes the statement and encrypts flagged parameters, so
+    /// an encrypted insert round-trips.
     #[tokio::test]
-    async fn prepared_statement_params_fail_fast_under_ae() {
+    async fn sp_prepexec_encrypts_parameter() {
         ae_test!(|h| {
-            let sql = "SELECT @p".to_string();
-            let mk_param = || {
-                RpcParameter::new(
-                    Some("@p".to_string()),
-                    StatusFlags::NONE,
-                    SqlType::Int(Some(1)),
+            let table = h.create_encrypted_table("INT", "DETERMINISTIC").await;
+            let param = RpcParameter::new(
+                Some("@val".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(555)),
+            );
+            h.client
+                .execute_sp_prepexec(
+                    format!("INSERT INTO {table} (val) VALUES (@val);"),
+                    vec![param],
+                    None,
+                    None,
                 )
-            };
-
-            let prepare_err = h
-                .client
-                .execute_sp_prepare(sql.clone(), vec![mk_param()], None, None)
                 .await
-                .expect_err("sp_prepare with params must fail fast under AE");
+                .expect("sp_prepexec with encrypted parameter");
+            while h.client.move_to_next().await.unwrap() {}
+            h.client.close_query().await.unwrap();
+
+            let got = select_val(&mut h.client, &table)
+                .await
+                .expect("read back value inserted via sp_prepexec");
             assert!(
-                matches!(
-                    prepare_err,
-                    mssql_tds::error::Error::UnimplementedFeature { .. }
-                ),
-                "expected UnimplementedFeature for sp_prepare, got {prepare_err:?}"
+                matches!(got, ColumnValues::Int(555)),
+                "sp_prepexec encrypted insert round-trip, got {got:?}"
             );
+        });
+    }
 
-            let prepexec_err = h
-                .client
-                .execute_sp_prepexec(sql.clone(), vec![mk_param()], None, None)
-                .await
-                .expect_err("sp_prepexec with params must fail fast under AE");
-            assert!(
-                matches!(
-                    prepexec_err,
-                    mssql_tds::error::Error::UnimplementedFeature { .. }
-                ),
-                "expected UnimplementedFeature for sp_prepexec, got {prepexec_err:?}"
+    /// `sp_prepare` describes the statement's parameters once and caches the
+    /// metadata under the handle; each `sp_execute` then encrypts values from the
+    /// cache without describing again. Uses named parameters.
+    #[tokio::test]
+    async fn sp_prepare_execute_encrypts_named_parameters() {
+        ae_test!(|h| {
+            let table = h.create_encrypted_table("INT", "DETERMINISTIC").await;
+            let decl = RpcParameter::new(
+                Some("@val".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(None),
             );
-
-            let execute_err = h
+            let handle = h
                 .client
-                .execute_sp_execute(1, None, Some(vec![mk_param()]), None, None)
+                .execute_sp_prepare(
+                    format!("INSERT INTO {table} (val) VALUES (@val);"),
+                    vec![decl],
+                    None,
+                    None,
+                )
                 .await
-                .expect_err("sp_execute with params must fail fast under AE");
+                .expect("sp_prepare with encrypted parameter");
+
+            for v in [111, 222] {
+                let param = RpcParameter::new(
+                    Some("@val".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(v)),
+                );
+                h.client
+                    .execute_sp_execute(handle, None, Some(vec![param]), None, None)
+                    .await
+                    .expect("sp_execute with encrypted named parameter");
+                while h.client.move_to_next().await.unwrap() {}
+                h.client.close_query().await.unwrap();
+            }
+
+            h.client
+                .execute_sp_unprepare(handle, None, None)
+                .await
+                .expect("unprepare");
+
+            let rows = h
+                .query_rows(&format!("SELECT val FROM {table} ORDER BY id;"), 1)
+                .await;
+            assert_eq!(rows.len(), 2, "expected two encrypted rows inserted");
             assert!(
-                matches!(
-                    execute_err,
-                    mssql_tds::error::Error::UnimplementedFeature { .. }
-                ),
-                "expected UnimplementedFeature for sp_execute, got {execute_err:?}"
+                matches!(rows[0][0], ColumnValues::Int(111)),
+                "row0 {:?}",
+                rows[0][0]
+            );
+            assert!(
+                matches!(rows[1][0], ColumnValues::Int(222)),
+                "row1 {:?}",
+                rows[1][0]
+            );
+        });
+    }
+
+    /// `sp_execute` positional parameters (unnamed) are matched to the cached
+    /// describe metadata by ordinal and encrypted.
+    #[tokio::test]
+    async fn sp_execute_encrypts_positional_parameter() {
+        ae_test!(|h| {
+            let table = h.create_encrypted_table("INT", "DETERMINISTIC").await;
+            let decl = RpcParameter::new(
+                Some("@val".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(None),
+            );
+            let handle = h
+                .client
+                .execute_sp_prepare(
+                    format!("INSERT INTO {table} (val) VALUES (@val);"),
+                    vec![decl],
+                    None,
+                    None,
+                )
+                .await
+                .expect("sp_prepare");
+
+            // Positional (unnamed) value, matched to the declared @val by ordinal.
+            let param = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(999)));
+            h.client
+                .execute_sp_execute(handle, Some(vec![param]), None, None, None)
+                .await
+                .expect("sp_execute with positional encrypted parameter");
+            while h.client.move_to_next().await.unwrap() {}
+            h.client.close_query().await.unwrap();
+
+            h.client
+                .execute_sp_unprepare(handle, None, None)
+                .await
+                .expect("unprepare");
+
+            let got = select_val(&mut h.client, &table)
+                .await
+                .expect("read back positional prepared insert");
+            assert!(
+                matches!(got, ColumnValues::Int(999)),
+                "sp_execute positional encrypted insert, got {got:?}"
+            );
+        });
+    }
+
+    /// `sp_execute` with parameters under Always Encrypted requires the handle to
+    /// have been prepared on this connection (so its parameter-encryption metadata
+    /// is cached). An unknown handle must error rather than send plaintext.
+    #[tokio::test]
+    async fn sp_execute_without_prepared_metadata_errors_under_ae() {
+        ae_test!(|h| {
+            let param = RpcParameter::new(
+                Some("@val".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(1)),
+            );
+            let err = h
+                .client
+                .execute_sp_execute(999_999, None, Some(vec![param]), None, None)
+                .await
+                .expect_err("sp_execute with an unprepared handle must error under AE");
+            assert!(
+                matches!(err, mssql_tds::error::Error::ColumnEncryptionError(_)),
+                "expected ColumnEncryptionError for unknown handle, got {err:?}"
             );
         });
     }

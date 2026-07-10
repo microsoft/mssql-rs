@@ -85,6 +85,14 @@ pub struct TdsClient {
     count_map: HashMap<CurrentCommand, u64>,
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
+    /// Per-prepared-handle Always Encrypted parameter metadata, captured by
+    /// `execute_sp_prepare` from `sp_describe_parameter_encryption` and reused by
+    /// `execute_sp_execute` to encrypt parameter values without describing again.
+    /// Evicted by `execute_sp_unprepare`.
+    prepared_param_encryption: HashMap<
+        i32,
+        crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult,
+    >,
     /// State of the most recent `ReturnStatus` token, captured while draining a
     /// cursor RPC response and interpreted as a [`CursorStatus`](crate::cursor::CursorStatus).
     pub(in crate::connection) last_return_status: ReturnStatus,
@@ -132,6 +140,7 @@ impl TdsClient {
             current_decryptor: None,
             count_map: HashMap::new(),
             return_values: Vec::new(),
+            prepared_param_encryption: HashMap::new(),
             last_return_status: ReturnStatus::NotReceived,
             current_result_set_has_been_read_till_end: false,
             current_command_ce_setting:
@@ -1135,15 +1144,9 @@ impl TdsClient {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
-        // The prepared-statement paths do not yet run the AE describe/encrypt
-        // flow, so a prepared statement with parameters cannot be safely used on
-        // an Always Encrypted connection. Fail fast instead of preparing a
-        // statement whose parameters would later be sent as plaintext.
-        if self.column_encryption_enabled_on_connection() && !named_params.is_empty() {
-            return Err(Self::ae_params_unsupported(
-                "prepared statements (sp_prepare)",
-            ));
-        }
+        // Prepared-statement execution uses the connection's Always Encrypted
+        // setting; there is no per-command override on this path.
+        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
@@ -1157,7 +1160,8 @@ impl TdsClient {
 
         let database_collation = self.negotiated_settings.database_collation;
 
-        let sql_statement_value = SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql)));
+        let sql_statement_value =
+            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql.clone())));
 
         // Create the parameter list for sp_prepare
         let execute_sql_statement_parameter =
@@ -1167,6 +1171,29 @@ impl TdsClient {
         let mut params_list_as_string = String::new();
 
         build_parameter_list_string(&named_params, &mut params_list_as_string)?;
+
+        // Always Encrypted: describe the statement's parameters now and cache the
+        // result under the prepared handle so a later sp_execute can encrypt
+        // values without describing again. sp_prepare itself sends no user
+        // parameter values, so nothing is encrypted here.
+        let describe_for_cache = if self.should_encrypt_parameters() && !named_params.is_empty() {
+            let describe = self
+                .describe_parameter_encryption(
+                    &sql,
+                    &params_list_as_string,
+                    timeout_sec,
+                    cancel_handle,
+                )
+                .await?;
+            // The describe round-trip closes its own batch and clears the
+            // per-operation timeout/cancel state; restore it for the prepare RPC.
+            self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+            self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+            self.transport.reset_reader();
+            Some(describe)
+        } else {
+            None
+        };
 
         let params_as_sql_string =
             SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string)));
@@ -1221,7 +1248,13 @@ impl TdsClient {
         if self.return_values.len() == 1 {
             let returned_parameter = self.return_values.first().unwrap();
             if let ColumnValues::Int(handle) = &returned_parameter.value {
-                Ok(*handle)
+                let handle = *handle;
+                // Cache the parameter-encryption metadata (if any) under the
+                // handle for reuse by execute_sp_execute.
+                if let Some(describe) = describe_for_cache {
+                    self.prepared_param_encryption.insert(handle, describe);
+                }
+                Ok(handle)
             } else {
                 Err(crate::error::Error::ProtocolError(
                     "Expected an integer value".to_string(),
@@ -1249,6 +1282,9 @@ impl TdsClient {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
+
+        // Drop any cached Always Encrypted parameter metadata for this handle.
+        self.prepared_param_encryption.remove(&handle);
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
@@ -1304,7 +1340,7 @@ impl TdsClient {
     pub async fn execute_sp_prepexec(
         &mut self,
         sql: String,
-        named_params: Vec<RpcParameter>,
+        mut named_params: Vec<RpcParameter>,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
@@ -1312,14 +1348,9 @@ impl TdsClient {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
-        // The prepared-statement paths do not yet run the AE describe/encrypt
-        // flow, so parameter values here would be sent as plaintext on an
-        // Always Encrypted connection. Fail fast instead.
-        if self.column_encryption_enabled_on_connection() && !named_params.is_empty() {
-            return Err(Self::ae_params_unsupported(
-                "prepared statements (sp_prepexec)",
-            ));
-        }
+        // Prepared-statement execution uses the connection's Always Encrypted
+        // setting; there is no per-command override on this path.
+        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
@@ -1333,7 +1364,8 @@ impl TdsClient {
 
         let database_collation = self.negotiated_settings.database_collation;
 
-        let sql_statement_value = SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql)));
+        let sql_statement_value =
+            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql.clone())));
 
         // Create the parameter list for sp_prepexec
         let statement_parameter = RpcParameter::new(None, StatusFlags::NONE, sql_statement_value);
@@ -1342,6 +1374,28 @@ impl TdsClient {
         let mut params_list_as_string = String::new();
 
         build_parameter_list_string(&named_params, &mut params_list_as_string)?;
+
+        // Always Encrypted: sp_prepexec prepares and executes in one round-trip,
+        // so — like sp_executesql — it runs `sp_describe_parameter_encryption`
+        // against the statement and encrypts flagged parameters in place before
+        // sending the real RPC. The `@params` declaration keeps each parameter's
+        // original type; only the value is replaced with ciphertext plus cipher
+        // metadata.
+        if self.should_encrypt_parameters() && !named_params.is_empty() {
+            self.encrypt_parameters(
+                &sql,
+                &params_list_as_string,
+                &mut named_params,
+                timeout_sec,
+                cancel_handle,
+            )
+            .await?;
+            // The describe round-trip closes its own batch and clears the
+            // per-operation timeout/cancel state; restore it for the real RPC.
+            self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+            self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+            self.transport.reset_reader();
+        }
 
         let params_as_sql_string =
             SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string)));
@@ -1395,8 +1449,8 @@ impl TdsClient {
     pub async fn execute_sp_execute(
         &mut self,
         handle: i32,
-        positional_parameters: Option<Vec<RpcParameter>>,
-        named_parameters: Option<Vec<RpcParameter>>,
+        mut positional_parameters: Option<Vec<RpcParameter>>,
+        mut named_parameters: Option<Vec<RpcParameter>>,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
@@ -1404,19 +1458,9 @@ impl TdsClient {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
-        // The prepared-statement paths do not yet run the AE describe/encrypt
-        // flow, so parameter values here would be sent as plaintext on an
-        // Always Encrypted connection. Fail fast instead.
-        if self.column_encryption_enabled_on_connection()
-            && (positional_parameters
-                .as_ref()
-                .is_some_and(|p| !p.is_empty())
-                || named_parameters.as_ref().is_some_and(|p| !p.is_empty()))
-        {
-            return Err(Self::ae_params_unsupported(
-                "prepared statements (sp_execute)",
-            ));
-        }
+        // Prepared-statement execution uses the connection's Always Encrypted
+        // setting; there is no per-command override on this path.
+        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
@@ -1427,6 +1471,32 @@ impl TdsClient {
 
         self.return_values.clear();
         self.transport.reset_reader();
+
+        // Always Encrypted: encrypt the supplied parameter values in place using
+        // the metadata captured when the statement was prepared, then send the
+        // real RPC. sp_execute never describes — the metadata must already have
+        // been cached by execute_sp_prepare on this connection.
+        if self.should_encrypt_parameters()
+            && (positional_parameters
+                .as_ref()
+                .is_some_and(|p| !p.is_empty())
+                || named_parameters.as_ref().is_some_and(|p| !p.is_empty()))
+        {
+            let (providers, cek_cache) = self.cloned_ce_key_material()?;
+            let describe = self.prepared_param_encryption.get(&handle).ok_or_else(|| {
+                crate::error::Error::ColumnEncryptionError(format!(
+                    "Prepared statement handle {handle} has no Always Encrypted parameter \
+                     metadata; prepare it with execute_sp_prepare on this connection before \
+                     executing with parameters"
+                ))
+            })?;
+            if let Some(params) = positional_parameters.as_mut() {
+                Self::apply_parameter_encryption(describe, &providers, &cek_cache, params).await?;
+            }
+            if let Some(params) = named_parameters.as_mut() {
+                Self::apply_parameter_encryption(describe, &providers, &cek_cache, params).await?;
+            }
+        }
 
         let database_collation = self.negotiated_settings.database_collation;
 
@@ -1846,34 +1916,65 @@ impl TdsClient {
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
-        use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
-        use crate::security::encryption::encrypt_parameter;
-        use crate::security::keystore::decrypt_cek;
-
         let describe = self
             .describe_parameter_encryption(sql, params_decl, timeout_sec, cancel_handle)
             .await?;
+
+        let (providers, cek_cache) = self.cloned_ce_key_material()?;
+        Self::apply_parameter_encryption(&describe, &providers, &cek_cache, named_params).await
+    }
+
+    /// Clones the `Arc` handles to the column-master-key provider registry and
+    /// the CEK cache from the client context, so the parameter-encryption paths
+    /// can pass them around without holding a borrow on `self`.
+    fn cloned_ce_key_material(
+        &self,
+    ) -> TdsResult<(
+        std::sync::Arc<crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry>,
+        std::sync::Arc<crate::security::keystore::CekCache>,
+    )> {
+        let client_context = self
+            .recovery_context
+            .client_context
+            .as_ref()
+            .ok_or_else(|| {
+                crate::error::Error::ColumnEncryptionError(
+                    "Cannot encrypt parameters without a client context".to_string(),
+                )
+            })?;
+        Ok((
+            client_context.column_encryption_key_store_providers.clone(),
+            client_context.cek_cache.clone(),
+        ))
+    }
+
+    /// Encrypts, in place, the parameters that a prior
+    /// `sp_describe_parameter_encryption` call reported as requiring encryption.
+    ///
+    /// Parameters are matched to the describe result by name, or by 1-based
+    /// ordinal when every supplied parameter is unnamed (the positional case used
+    /// by `sp_execute`). Each flagged parameter's CEK is unwrapped through the key
+    /// store providers, its value is normalized and encrypted, and the ciphertext
+    /// plus cipher metadata are stored on the [`RpcParameter`] for serialization.
+    async fn apply_parameter_encryption(
+        describe: &crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult,
+        providers: &crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry,
+        cek_cache: &crate::security::keystore::CekCache,
+        named_params: &mut [RpcParameter],
+    ) -> TdsResult<()> {
+        use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
+        use crate::security::encryption::encrypt_parameter;
+        use crate::security::keystore::decrypt_cek;
 
         // Nothing to do when the server reports no encrypted parameters.
         if !describe.parameters.iter().any(|p| p.is_encrypted()) {
             return Ok(());
         }
 
-        let (providers, cek_cache) = {
-            let client_context =
-                self.recovery_context
-                    .client_context
-                    .as_ref()
-                    .ok_or_else(|| {
-                        crate::error::Error::ColumnEncryptionError(
-                            "Cannot encrypt parameters without a client context".to_string(),
-                        )
-                    })?;
-            (
-                client_context.column_encryption_key_store_providers.clone(),
-                client_context.cek_cache.clone(),
-            )
-        };
+        // When every supplied parameter is unnamed they are positional and are
+        // matched to the describe result by 1-based ordinal; otherwise they are
+        // matched by name (case-insensitively, like T-SQL identifiers).
+        let positional = !named_params.is_empty() && named_params.iter().all(|p| p.name.is_none());
 
         for info in &describe.parameters {
             if !info.is_encrypted() {
@@ -1887,23 +1988,29 @@ impl TdsClient {
                 ))
             })?;
 
-            let plaintext_cek = decrypt_cek(&providers, &cek_cache, cek_entry).await?;
-
-            // Parameter names are matched case-insensitively, like T-SQL identifiers.
-            let param = named_params
-                .iter_mut()
-                .find(|p| {
+            let index = if positional {
+                (info.parameter_ordinal as usize)
+                    .checked_sub(1)
+                    .filter(|&i| i < named_params.len())
+            } else {
+                named_params.iter().position(|p| {
                     p.name
                         .as_deref()
                         .map(|n| n.eq_ignore_ascii_case(&info.parameter_name))
                         .unwrap_or(false)
                 })
-                .ok_or_else(|| {
-                    crate::error::Error::ColumnEncryptionError(format!(
-                        "sp_describe_parameter_encryption returned encryption info for unknown parameter {}",
-                        info.parameter_name
-                    ))
-                })?;
+            };
+
+            let Some(index) = index else {
+                return Err(crate::error::Error::ColumnEncryptionError(format!(
+                    "sp_describe_parameter_encryption returned encryption info for parameter {} \
+                     that was not supplied to the call",
+                    info.parameter_name
+                )));
+            };
+
+            let plaintext_cek = decrypt_cek(providers, cek_cache, cek_entry).await?;
+            let param = &mut named_params[index];
 
             let ciphertext = encrypt_parameter(
                 param.value(),
