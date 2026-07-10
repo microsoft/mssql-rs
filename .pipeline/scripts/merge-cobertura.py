@@ -59,24 +59,15 @@ def normalize_path(filename: str, prefix: str) -> str:
 
 
 class LineData:
-    __slots__ = ("hits", "branch", "conditions")
+    __slots__ = ("hits",)
 
-    def __init__(self, hits: int, branch: bool, conditions: str | None):
+    def __init__(self, hits: int):
         self.hits = hits
-        self.branch = branch
-        self.conditions = conditions
 
-    def merge(self, hits: int, branch: bool, conditions: str | None) -> None:
+    def merge(self, hits: int) -> None:
         # Union of hits: covered by either run counts as covered.
         if hits > self.hits:
             self.hits = hits
-            # Prefer condition data from the run that actually exercised the line.
-            if conditions:
-                self.conditions = conditions
-        if branch:
-            self.branch = True
-            if conditions and not self.conditions:
-                self.conditions = conditions
 
 
 class ClassData:
@@ -116,14 +107,12 @@ def parse_input(path: str, prefix: str, classes: dict[str, ClassData]) -> bool:
                 hits = int(line.get("hits", "0"))
             except ValueError:
                 hits = 0
-            branch = line.get("branch", "false") == "true"
-            conditions = line.get("condition-coverage")
 
             existing = entry.lines.get(number)
             if existing is None:
-                entry.lines[number] = LineData(hits, branch, conditions)
+                entry.lines[number] = LineData(hits)
             else:
-                existing.merge(hits, branch, conditions)
+                existing.merge(hits)
 
     return True
 
@@ -171,7 +160,6 @@ def build_document(classes: dict[str, ClassData]) -> ET.Element:
                     "name": cls.name,
                     "filename": cls.filename,
                     "line-rate": f"{rate(cls_covered, cls_total):.4f}",
-                    "branch-rate": "0",
                     "complexity": "0",
                 },
             )
@@ -179,27 +167,20 @@ def build_document(classes: dict[str, ClassData]) -> ET.Element:
             lines_el = ET.SubElement(class_el, "lines")
             for number in sorted(cls.lines):
                 ln = cls.lines[number]
-                attrs = {
-                    "number": str(number),
-                    "hits": str(ln.hits),
-                    "branch": "true" if ln.branch else "false",
-                }
-                if ln.conditions:
-                    attrs["condition-coverage"] = ln.conditions
-                ET.SubElement(lines_el, "line", attrs)
+                ET.SubElement(
+                    lines_el,
+                    "line",
+                    {"number": str(number), "hits": str(ln.hits)},
+                )
 
         package_el.set("line-rate", f"{rate(pkg_covered, pkg_total):.4f}")
-        package_el.set("branch-rate", "0")
         package_el.set("complexity", "0")
         total_lines += pkg_total
         covered_lines += pkg_covered
 
     coverage.set("line-rate", f"{rate(covered_lines, total_lines):.4f}")
-    coverage.set("branch-rate", "0")
     coverage.set("lines-covered", str(covered_lines))
     coverage.set("lines-valid", str(total_lines))
-    coverage.set("branches-covered", "0")
-    coverage.set("branches-valid", "0")
     coverage.set("complexity", "0")
     coverage.set("version", "0")
     coverage.set("timestamp", "0")
