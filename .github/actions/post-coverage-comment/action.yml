@@ -45,7 +45,7 @@ runs:
           </td>
           <td>
 
-          **📦 Project:** `mssql-tds`
+          **📦 Project:** `mssql-tds + mssql-py-core`
           **ℹ️ Note:** diff coverage is reported, not enforced.
 
           </td>
