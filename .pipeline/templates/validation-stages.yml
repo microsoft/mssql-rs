@@ -662,6 +662,16 @@ stages:
         inputs:
           targetPath: '$(Build.SourcesDirectory)/target/cobertura.xml'
           artifactName: 'CoberturaCoverage'
+      # PublishCodeCoverageResults@2 renders the ADO coverage tab HTML with
+      # ReportGenerator, which requires .NET. The slim Linux agent does not ship
+      # it, so install it explicitly; otherwise the coverage tab reports that the
+      # HTML report was not found.
+      - task: UseDotNet@2
+        condition: and(succeeded(), eq(variables['coverageMerged'], 'true'))
+        displayName: Install .NET for coverage HTML rendering
+        inputs:
+          packageType: 'sdk'
+          version: '8.x'
       - task: PublishCodeCoverageResults@2
         condition: and(succeeded(), eq(variables['coverageMerged'], 'true'))
         displayName: Publish merged coverage results
