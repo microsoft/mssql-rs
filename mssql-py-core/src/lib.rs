@@ -9,6 +9,7 @@ use mssql_tds::connection::client_context::DriverVersion;
 mod bulkcopy;
 mod connection;
 mod cursor;
+mod odbc_auth;
 mod python_entra_token_factory;
 mod python_logger_adapter;
 mod row_writer;

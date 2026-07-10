@@ -1,10 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use super::client_context::TdsAuthenticationMethod;
 use super::odbc_supported_auth_keywords::{auth_method_from_keyword, is_recognized_keyword};
-use crate::core::TdsResult;
-use crate::error::Error;
+use mssql_tds::connection::client_context::TdsAuthenticationMethod;
+use mssql_tds::core::TdsResult;
+use mssql_tds::error::Error;
 
 /// Validates the connection string key values for conflicts (ODBC-equivalent checks).
 /// Returns `Ok(())` if valid, or a `TdsError` listing all detected conflicts.
