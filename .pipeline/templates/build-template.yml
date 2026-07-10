@@ -168,13 +168,10 @@ steps:
         SQL_PASSWORD: $(SQL_PASSWORD)
 
   - ${{ if eq(parameters.osType, 'Windows') }}:
-    - task: PublishCodeCoverageResults@2
-      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
-      displayName: "Publish coverage results"
-      inputs:
-        summaryFileLocation: "$(Build.SourcesDirectory)/target/lcov.info"
-        pathToSources: "$(Build.SourcesDirectory)"
-
+    # Coverage is not published to the ADO coverage tab here. The Windows run
+    # only produces the Rust Cobertura report as an artifact; the Coverage stage
+    # merges it with the Python (mssql-py-core) report and publishes the single
+    # combined report to the ADO coverage tab.
     # Cobertura report consumed by the GitHub PR diff-coverage workflow (diff-cover).
     - script: cargo llvm-cov report --package mssql-tds --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
       condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
