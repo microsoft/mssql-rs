@@ -85,6 +85,14 @@ pub struct TdsClient {
     count_map: HashMap<CurrentCommand, u64>,
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
+    /// Plaintext column encryption keys retained from the current command's
+    /// `sp_describe_parameter_encryption` call, keyed by normalized parameter
+    /// name (leading `@` stripped, ASCII-uppercased). An encrypted RETURNVALUE
+    /// output parameter carries no CEK table and reuses the CEK that encrypted
+    /// the matching input parameter, so these are consulted when decrypting
+    /// output parameters. Cleared and repopulated by `encrypt_parameters` on
+    /// every command.
+    output_param_ceks: HashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>,
     /// State of the most recent `ReturnStatus` token, captured while draining a
     /// cursor RPC response and interpreted as a [`CursorStatus`](crate::cursor::CursorStatus).
     pub(in crate::connection) last_return_status: ReturnStatus,
@@ -132,6 +140,7 @@ impl TdsClient {
             current_decryptor: None,
             count_map: HashMap::new(),
             return_values: Vec::new(),
+            output_param_ceks: HashMap::new(),
             last_return_status: ReturnStatus::NotReceived,
             current_result_set_has_been_read_till_end: false,
             current_command_ce_setting:
@@ -1519,7 +1528,7 @@ impl TdsClient {
                         .process_session_state(&session_state)?;
                 }
                 Tokens::ReturnValue(return_value_token) => {
-                    let return_value = return_value_token.into();
+                    let return_value = self.finalize_return_value(return_value_token)?;
                     self.return_values.push(return_value);
                 }
                 Tokens::ReturnStatus(return_status) => {
@@ -1634,7 +1643,7 @@ impl TdsClient {
                         .process_session_state(&session_state)?;
                 }
                 Tokens::ReturnValue(return_value_token) => {
-                    let return_value = return_value_token.into();
+                    let return_value = self.finalize_return_value(return_value_token)?;
                     self.return_values.push(return_value);
                 }
                 Tokens::ReturnStatus(return_status) => {
@@ -1728,6 +1737,64 @@ impl TdsClient {
                       stored-procedure parameters, or disable column encryption for this command."
                 .into(),
         }
+    }
+
+    /// Normalizes a parameter name for matching across
+    /// `sp_describe_parameter_encryption` output and RETURNVALUE tokens: strips a
+    /// single leading `@` and ASCII-uppercases it, mirroring T-SQL's
+    /// case-insensitive identifier matching.
+    fn normalize_param_name(name: &str) -> String {
+        name.strip_prefix('@').unwrap_or(name).to_ascii_uppercase()
+    }
+
+    /// Converts a RETURNVALUE token into a [`ReturnValue`], decrypting the value
+    /// when it is an encrypted Always Encrypted output parameter.
+    ///
+    /// An encrypted output parameter arrives as ciphertext with `CryptoMetaData`
+    /// but no CEK table; its CEK is the one resolved when the matching input
+    /// parameter was encrypted (retained in `output_param_ceks`). A plaintext
+    /// parameter is returned unchanged. Returns an error if an encrypted output
+    /// parameter has no retained CEK or did not arrive as varbinary ciphertext,
+    /// rather than surfacing ciphertext to the caller.
+    fn finalize_return_value(
+        &self,
+        token: crate::token::tokens::ReturnValueToken,
+    ) -> TdsResult<ReturnValue> {
+        let Some(crypto) = token.column_metadata.crypto_metadata.as_ref() else {
+            return Ok(token.into());
+        };
+
+        let cek = self
+            .output_param_ceks
+            .get(&Self::normalize_param_name(&token.param_name))
+            .ok_or_else(|| {
+                crate::error::Error::ColumnEncryptionError(format!(
+                    "No column encryption key available to decrypt encrypted output parameter {}",
+                    token.param_name
+                ))
+            })?;
+
+        let decrypted = match &token.value {
+            ColumnValues::Null => ColumnValues::Null,
+            ColumnValues::Bytes(cipher) => {
+                crate::security::encryption::decrypt_cell(crypto, cek.as_slice(), cipher)?
+            }
+            other => {
+                return Err(crate::error::Error::ColumnEncryptionError(format!(
+                    "Encrypted output parameter {} was expected to arrive as varbinary cipher \
+                     bytes, but decoded as {other:?}",
+                    token.param_name
+                )));
+            }
+        };
+
+        Ok(ReturnValue {
+            param_ordinal: token.param_ordinal,
+            param_name: token.param_name,
+            value: decrypted,
+            column_metadata: token.column_metadata,
+            status: token.status,
+        })
     }
 
     /// Resolves the effective Column Encryption setting for the current command,
@@ -1850,6 +1917,11 @@ impl TdsClient {
         use crate::security::encryption::encrypt_parameter;
         use crate::security::keystore::decrypt_cek;
 
+        // Reset the per-command retained CEKs before (re)populating them for this
+        // command's parameters, so a previous command's keys cannot leak into
+        // this one's output-parameter decryption.
+        self.output_param_ceks.clear();
+
         let describe = self
             .describe_parameter_encryption(sql, params_decl, timeout_sec, cancel_handle)
             .await?;
@@ -1888,6 +1960,15 @@ impl TdsClient {
             })?;
 
             let plaintext_cek = decrypt_cek(&providers, &cek_cache, cek_entry).await?;
+
+            // An encrypted RETURNVALUE output parameter carries no CEK table and
+            // reuses the CEK that encrypted the matching input parameter. Retain
+            // it here, keyed by normalized name, so the RETURNVALUE decode path
+            // can decrypt the returned value.
+            self.output_param_ceks.insert(
+                Self::normalize_param_name(&info.parameter_name),
+                plaintext_cek.clone(),
+            );
 
             // Parameter names are matched case-insensitively, like T-SQL identifiers.
             let param = named_params
@@ -2115,7 +2196,7 @@ impl TdsClient {
                         continue;
                     }
                     Tokens::ReturnValue(return_value_token) => {
-                        let return_value = return_value_token.into();
+                        let return_value = self.finalize_return_value(return_value_token)?;
                         self.return_values.push(return_value);
                         continue;
                     }
@@ -2827,6 +2908,19 @@ mod tests {
             TdsClient::timeout_to_duration(Some(30)),
             Some(Duration::from_secs(30))
         );
+    }
+
+    #[test]
+    fn normalize_param_name_strips_at_and_uppercases() {
+        // A single leading '@' is stripped and the name is ASCII-uppercased, so a
+        // describe parameter name, an RPC parameter name, and a RETURNVALUE name
+        // for the same parameter all normalize to the same key.
+        assert_eq!(TdsClient::normalize_param_name("@Out"), "OUT");
+        assert_eq!(TdsClient::normalize_param_name("out"), "OUT");
+        assert_eq!(TdsClient::normalize_param_name("@p1"), "P1");
+        // Only one leading '@' is stripped.
+        assert_eq!(TdsClient::normalize_param_name("@@version"), "@VERSION");
+        assert_eq!(TdsClient::normalize_param_name(""), "");
     }
 
     // ── Reconnection orchestration tests ──
