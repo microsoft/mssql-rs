@@ -847,4 +847,49 @@ mod client_based_iterators {
         client.close_query().await?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn decode_plp_empty_and_null_types() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "SELECT
+            CAST(N'' AS NVARCHAR(MAX)) AS nvm_empty,
+            CAST('' AS VARCHAR(MAX)) AS vm_empty,
+            CAST(0x AS VARBINARY(MAX)) AS vbm_empty,
+            CAST(NULL AS NVARCHAR(MAX)) AS nvm_null,
+            CAST(NULL AS VARBINARY(MAX)) AS vbm_null,
+            CAST(42 AS INT) AS tail"
+            .to_string();
+
+        client.execute(query, None, None).await?;
+        if let Some(resultset) = client.get_current_resultset() {
+            use mssql_tds::datatypes::column_values::ColumnValues;
+
+            let row = resultset.next_row().await?.expect("expected a row");
+            assert_eq!(row.len(), 6);
+
+            match &row[0] {
+                ColumnValues::String(s) => assert!(s.to_utf8_string().is_empty()),
+                other => panic!("Expected empty NVARCHAR(MAX), got {other:?}"),
+            }
+            match &row[1] {
+                ColumnValues::String(s) => assert!(s.to_utf8_string().is_empty()),
+                other => panic!("Expected empty VARCHAR(MAX), got {other:?}"),
+            }
+            match &row[2] {
+                ColumnValues::Bytes(b) => assert!(b.is_empty()),
+                other => panic!("Expected empty VARBINARY(MAX), got {other:?}"),
+            }
+            assert!(matches!(row[3], ColumnValues::Null));
+            assert!(matches!(row[4], ColumnValues::Null));
+            assert_eq!(row[5], ColumnValues::Int(42));
+        }
+        client.close_query().await?;
+        Ok(())
+    }
 }
