@@ -74,7 +74,7 @@ pub struct TdsClient {
     /// Empty metadata vector for returning when no metadata is available
     empty_metadata: Vec<ColumnMetadata>,
 
-    /// Holds a partially-consumed PLP column stream for incremental SQLGetData-style reads.
+    /// Holds a partially-consumed PLP column stream for incremental msodbcsql-style reads.
     /// `None` when no stream is active or after the stream has been fully consumed.
     active_plp_stream: Option<crate::datatypes::decoder::PlpColumnStream>,
 }
@@ -1382,6 +1382,11 @@ impl TdsClient {
     ) -> TdsResult<bool> {
         // Drain any partially-consumed PLP column stream from a prior read so
         // the wire is clean before we start parsing the next row.
+        // NOTE: this only drains the active PLP column stream. It does not
+        // skip remaining non-PLP columns in a partially-read row. Callers that
+        // do column-by-column reads (e.g. mssql-odbc SQLGetData) must consume
+        // or skip all remaining columns in the current row before calling
+        // get_next_row / get_next_row_into.
         if let Some(mut prev_stream) = self.active_plp_stream.take() {
             if !prev_stream.reached_end() {
                 prev_stream
@@ -1572,11 +1577,16 @@ impl TdsClient {
     /// Reads the next slice of bytes from the active PLP stream into `out`.
     ///
     /// Returns the number of bytes written. Returns `0` when the stream is
-    /// exhausted (`reached_end` is `true`) or when no stream is active.
+    /// exhausted (`reached_end` is `true`).
+    ///
+    /// Returns [`UsageError`](crate::error::Error::UsageError) if no stream is
+    /// active — call [`begin_plp_column_stream`](Self::begin_plp_column_stream) first.
     pub async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
         let mut stream = match self.active_plp_stream.take() {
             Some(s) => s,
-            None => return Ok(0),
+            None => return Err(UsageError(
+                "read_active_plp_bytes called with no active PLP stream; call begin_plp_column_stream first".to_string(),
+            )),
         };
         let result = stream
             .read_into(self.transport.as_packet_reader(), out)
@@ -2421,5 +2431,38 @@ mod tests {
         let mut client = create_test_client();
         client.recovery_context.recovery_count = 3;
         assert_eq!(client.connection_recovery_count(), 3);
+    }
+
+    // ── PLP streaming lifecycle contract tests ──
+
+    #[tokio::test]
+    async fn plp_read_bytes_no_active_stream_returns_usage_error() {
+        let mut client = create_test_client();
+        let mut buf = [0u8; 4];
+        let err = client.read_active_plp_bytes(&mut buf).await.unwrap_err();
+        assert!(
+            err.to_string().contains("begin_plp_column_stream"),
+            "Expected UsageError mentioning begin_plp_column_stream, got: {err}"
+        );
+    }
+
+    #[test]
+    fn plp_reached_end_returns_true_when_no_stream_active() {
+        let client = create_test_client();
+        assert!(client.active_plp_reached_end());
+    }
+
+    #[tokio::test]
+    async fn plp_skip_to_end_is_noop_when_no_stream_active() {
+        let mut client = create_test_client();
+        // Should succeed silently with no stream active.
+        client.skip_active_plp_to_end().await.unwrap();
+        assert!(client.active_plp_reached_end());
+    }
+
+    #[test]
+    fn plp_collation_returns_none_when_no_stream_active() {
+        let client = create_test_client();
+        assert!(client.active_plp_collation().is_none());
     }
 }

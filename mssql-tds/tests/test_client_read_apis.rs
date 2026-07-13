@@ -892,4 +892,45 @@ mod client_based_iterators {
         client.close_query().await?;
         Ok(())
     }
+
+    /// Verifies the TdsClient PLP streaming lifecycle contract at the API boundary:
+    ///
+    /// - `active_plp_reached_end` returns `true` before any stream is started.
+    /// - `read_active_plp_bytes` returns `UsageError` when called with no active stream.
+    /// - `skip_active_plp_to_end` is a no-op when no stream is active.
+    /// - After `close_query`, stream state is cleared.
+    #[tokio::test]
+    async fn plp_streaming_client_lifecycle_contract() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        // No stream active before any query.
+        assert!(client.active_plp_reached_end());
+        assert!(client.active_plp_collation().is_none());
+
+        // read_active_plp_bytes with no active stream must return UsageError, not silently EOF.
+        let mut buf = [0u8; 8];
+        let err = client.read_active_plp_bytes(&mut buf).await.unwrap_err();
+        assert!(
+            err.to_string().contains("begin_plp_column_stream"),
+            "Expected UsageError mentioning begin_plp_column_stream, got: {err}"
+        );
+
+        // skip_active_plp_to_end with no active stream must be a no-op.
+        client.skip_active_plp_to_end().await?;
+        assert!(client.active_plp_reached_end());
+
+        // After a normal PLP query + close, stream state remains clean.
+        let query = "SELECT CAST('hello' AS VARBINARY(MAX)) AS vbm".to_string();
+        client.execute(query, None, None).await?;
+        client.close_query().await?;
+        assert!(client.active_plp_reached_end());
+        assert!(client.active_plp_collation().is_none());
+
+        Ok(())
+    }
 }
