@@ -2938,6 +2938,156 @@ mod tests {
         assert_eq!(TdsClient::normalize_param_name(""), "");
     }
 
+    // ── finalize_return_value (encrypted RETURNVALUE decryption) tests ──
+
+    /// Builds a minimal `CryptoMetadata` describing an encrypted `int` output
+    /// parameter (AEAD cipher, base type `IntN`).
+    fn ae_crypto_metadata() -> crate::query::metadata::CryptoMetadata {
+        use crate::datatypes::sqldatatypes::{
+            FixedLengthTypes, TdsDataType, TypeInfo, TypeInfoVariant,
+        };
+        crate::query::metadata::CryptoMetadata {
+            cek_table_ordinal: 0,
+            base_data_type: TdsDataType::IntN,
+            base_type_info: TypeInfo {
+                tds_type: TdsDataType::IntN,
+                length: 4,
+                type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+            },
+            cipher_algorithm_id: 2,
+            cipher_algorithm_name: None,
+            encryption_type: 1,
+            normalization_rule_version: 1,
+        }
+    }
+
+    /// Builds a RETURNVALUE token named `name` carrying `value`, with the given
+    /// optional crypto metadata (present = encrypted output parameter).
+    fn ae_return_value_token(
+        name: &str,
+        value: ColumnValues,
+        crypto: Option<crate::query::metadata::CryptoMetadata>,
+    ) -> crate::token::tokens::ReturnValueToken {
+        use crate::datatypes::sqldatatypes::{
+            FixedLengthTypes, TdsDataType, TypeInfo, TypeInfoVariant,
+        };
+        let column_metadata = crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: if crypto.is_some() { 0x0800 } else { 0 },
+            data_type: TdsDataType::BigVarBinary,
+            type_info: TypeInfo {
+                tds_type: TdsDataType::BigVarBinary,
+                length: 8000,
+                type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+            },
+            column_name: name.to_string(),
+            multi_part_name: None,
+            crypto_metadata: crypto,
+        };
+        crate::token::tokens::ReturnValueToken {
+            param_ordinal: 0,
+            param_name: name.to_string(),
+            value,
+            column_metadata: Box::new(column_metadata),
+            status: crate::token::tokenitems::ReturnValueStatus::from(0u8),
+        }
+    }
+
+    fn insert_test_cek(client: &mut TdsClient, name: &str, cek: Vec<u8>) {
+        client.output_param_ceks.insert(
+            TdsClient::normalize_param_name(name),
+            std::sync::Arc::new(zeroize::Zeroizing::new(cek)),
+        );
+    }
+
+    #[test]
+    fn finalize_return_value_passes_through_plaintext() {
+        // No crypto metadata => a plaintext RETURNVALUE is returned unchanged.
+        let client = create_test_client();
+        let token = ae_return_value_token("@out", ColumnValues::Int(7), None);
+        let rv = client.finalize_return_value(token).unwrap();
+        assert_eq!(rv.value, ColumnValues::Int(7));
+    }
+
+    #[test]
+    fn finalize_return_value_passes_through_ciphertext_when_disabled() {
+        // Encrypted value but the command disabled AE => ciphertext is passed
+        // through unchanged and no CEK is consulted.
+        let mut client = create_test_client();
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Disabled;
+        let token = ae_return_value_token(
+            "@out",
+            ColumnValues::Bytes(vec![1, 2, 3]),
+            Some(ae_crypto_metadata()),
+        );
+        let rv = client.finalize_return_value(token).unwrap();
+        assert_eq!(rv.value, ColumnValues::Bytes(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn finalize_return_value_errors_without_cek() {
+        // Encrypted value under an enabled command but no retained CEK => error
+        // rather than surfacing ciphertext.
+        let mut client = create_test_client();
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+        let token = ae_return_value_token(
+            "@out",
+            ColumnValues::Bytes(vec![1, 2, 3]),
+            Some(ae_crypto_metadata()),
+        );
+        let err = client.finalize_return_value(token).unwrap_err();
+        assert!(matches!(err, crate::error::Error::ColumnEncryptionError(_)));
+    }
+
+    #[test]
+    fn finalize_return_value_decrypts_null_output() {
+        // A NULL encrypted output parameter decrypts to NULL without invoking the
+        // cipher.
+        let mut client = create_test_client();
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+        insert_test_cek(&mut client, "@out", vec![0u8; 32]);
+        let token = ae_return_value_token("@out", ColumnValues::Null, Some(ae_crypto_metadata()));
+        let rv = client.finalize_return_value(token).unwrap();
+        assert_eq!(rv.value, ColumnValues::Null);
+    }
+
+    #[test]
+    fn finalize_return_value_errors_on_non_varbinary_ciphertext() {
+        // An encrypted output parameter that did not arrive as varbinary cipher
+        // bytes is a protocol violation.
+        let mut client = create_test_client();
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+        insert_test_cek(&mut client, "@out", vec![0u8; 32]);
+        let token = ae_return_value_token("@out", ColumnValues::Int(5), Some(ae_crypto_metadata()));
+        let err = client.finalize_return_value(token).unwrap_err();
+        assert!(matches!(err, crate::error::Error::ColumnEncryptionError(_)));
+    }
+
+    #[test]
+    fn finalize_return_value_decrypts_ciphertext() {
+        // A ciphertext output parameter decrypts to the original value using the
+        // retained CEK.
+        use crate::security::encryption::{AeadAes256CbcHmacSha256, ColumnEncryptionType};
+        let mut client = create_test_client();
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+        let cek = [0x2a_u8; 32];
+        insert_test_cek(&mut client, "@out", cek.to_vec());
+
+        // Normalized 8-byte little-endian form of an `int`, encrypted with the CEK.
+        let normalized = 987_654_i64.to_le_bytes();
+        let cipher = AeadAes256CbcHmacSha256::new(&cek)
+            .unwrap()
+            .encrypt(&normalized, ColumnEncryptionType::Randomized)
+            .unwrap();
+        let token = ae_return_value_token(
+            "@out",
+            ColumnValues::Bytes(cipher),
+            Some(ae_crypto_metadata()),
+        );
+        let rv = client.finalize_return_value(token).unwrap();
+        assert_eq!(rv.value, ColumnValues::Int(987_654));
+    }
+
     // ── Reconnection orchestration tests ──
 
     #[tokio::test]
