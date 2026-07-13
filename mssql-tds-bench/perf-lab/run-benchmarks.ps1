@@ -151,6 +151,19 @@ Move-Item $StashedSrc $CandidateSrc
 Write-Host '>>> Comparing base -> candidate...'
 critcmp base candidate | Tee-Object -FilePath (Join-Path $ResultsDir 'comparison.txt')
 
+# Markdown summary — the perf lab attaches results/*.md to the run's Summary tab
+# (task.uploadsummary). Wrap the fixed-width critcmp table in a fenced code block.
+$comparison = Get-Content (Join-Path $ResultsDir 'comparison.txt') -Raw
+@(
+    '## mssql-tds perf - base -> candidate'
+    ''
+    "Baseline commit: ``$BaselineCommit``"
+    ''
+    '```'
+    $comparison.TrimEnd()
+    '```'
+) -join "`n" | Set-Content -Path (Join-Path $ResultsDir 'summary.md') -Encoding UTF8
+
 Copy-Item -Recurse -Force 'target/criterion' (Join-Path $ResultsDir 'criterion') -ErrorAction SilentlyContinue
 
 Write-Host ">>> Done. Results in $ResultsDir"

@@ -180,6 +180,20 @@ git worktree remove --force "$BASELINE_TREE" || true
 echo ">>> Comparing base -> candidate..."
 critcmp base candidate | tee "$RESULTS_DIR/comparison.txt"
 
+# Markdown summary — the perf lab attaches results/*.md to the run's Summary tab
+# (task.uploadsummary), so the comparison renders inline on the run page. The
+# critcmp table is fixed-width, so wrap it in a fenced code block to keep it
+# aligned.
+{
+    echo "## mssql-tds perf — base → candidate"
+    echo ""
+    echo "Baseline commit: \`${BASELINE_COMMIT}\`"
+    echo ""
+    echo '```'
+    cat "$RESULTS_DIR/comparison.txt"
+    echo '```'
+} > "$RESULTS_DIR/summary.md"
+
 # Archive the raw Criterion data for offline analysis.
 cp -r target/criterion "$RESULTS_DIR/criterion" 2>/dev/null || true
 
