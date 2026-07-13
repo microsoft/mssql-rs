@@ -25,13 +25,41 @@ fn packet_size_sensitivity(c: &mut Criterion) {
         return;
     }
     let env = bench_env().expect("env present after successful probe");
-    let query =
-        format!("SELECT REPLICATE(CAST('X' AS VARCHAR(MAX)), {READ_BYTES}) AS payload");
 
     let mut group = c.benchmark_group("packet_size_sensitivity");
     group.throughput(Throughput::Bytes(READ_BYTES));
     for packet_size in [4096u16, 8192, 32768] {
         let mut client = rt.block_on(connect_with_packet_size(&env, packet_size));
+
+        // Pre-materialize the payload once per connection (un-measured) so the
+        // benchmark times TDS packet reassembly of a stored read, not the
+        // server-side REPLICATE that would otherwise regenerate the 16 MB LOB on
+        // every iteration.
+        rt.block_on(async {
+            client
+                .execute(
+                    "CREATE TABLE #packet_payload (payload VARCHAR(MAX) NOT NULL)".to_string(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("create packet payload table failed");
+            client.close_query().await.expect("close_query failed");
+            client
+                .execute(
+                    format!(
+                        "INSERT INTO #packet_payload (payload) \
+                         SELECT REPLICATE(CAST('X' AS VARCHAR(MAX)), {READ_BYTES})"
+                    ),
+                    None,
+                    None,
+                )
+                .await
+                .expect("fill packet payload table failed");
+            client.close_query().await.expect("close_query failed");
+        });
+
+        let query = "SELECT payload FROM #packet_payload".to_string();
         group.bench_with_input(
             BenchmarkId::from_parameter(packet_size),
             &query,
