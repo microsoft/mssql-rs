@@ -153,9 +153,36 @@ critcmp base candidate | Tee-Object -FilePath (Join-Path $ResultsDir 'comparison
 
 # Markdown summary — the perf lab attaches results/*.md to the run's Summary tab
 # (task.uploadsummary). Wrap the fixed-width critcmp table in a fenced code block.
+#
+# Verdict: in each critcmp data row the faster side is 1.00 and the slower side
+# shows its ratio, so the candidate regressed a bench when the candidate ratio
+# (field 6) exceeds the threshold.
+$thr = [double]($env:BENCH_REGRESSION_RATIO)
+if (-not $thr) { $thr = 1.10 }
+$regressions = @()
+foreach ($line in (Get-Content (Join-Path $ResultsDir 'comparison.txt'))) {
+    $f = @($line -split '\s+' | Where-Object { $_ -ne '' })
+    if ($f.Count -ge 6 -and $f[1] -match '^[0-9]+\.[0-9]+$' -and $f[5] -match '^[0-9]+\.[0-9]+$') {
+        $cand = [double]$f[5]
+        if ($cand -ge $thr) { $regressions += [pscustomobject]@{ Name = $f[0]; Ratio = $cand } }
+    }
+}
+$pct = [int][math]::Round(($thr - 1) * 100)
+$warn = [char]::ConvertFromUtf32(0x26A0) + [char]::ConvertFromUtf32(0xFE0F)
+$check = [char]::ConvertFromUtf32(0x2705)
+if ($regressions.Count -gt 0) {
+    $worst = $regressions | Sort-Object Ratio -Descending | Select-Object -First 1
+    $wpct = [int][math]::Round(($worst.Ratio - 1) * 100)
+    $verdict = "$warn $($regressions.Count) benchmark(s) slower by >=$pct% vs baseline (worst: $($worst.Name) +$wpct%)"
+} else {
+    $verdict = "$check No benchmark slower by >=$pct% vs baseline"
+}
+
 $comparison = Get-Content (Join-Path $ResultsDir 'comparison.txt') -Raw
 @(
     '## mssql-tds perf - base -> candidate'
+    ''
+    "**$verdict**"
     ''
     "Baseline commit: ``$BaselineCommit``"
     ''

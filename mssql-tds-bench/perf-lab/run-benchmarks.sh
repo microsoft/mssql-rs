@@ -184,8 +184,28 @@ critcmp base candidate | tee "$RESULTS_DIR/comparison.txt"
 # (task.uploadsummary), so the comparison renders inline on the run page. The
 # critcmp table is fixed-width, so wrap it in a fenced code block to keep it
 # aligned.
+#
+# Verdict: in each critcmp data row the faster side is 1.00 and the slower side
+# shows its ratio, so the candidate regressed a bench when the candidate ratio
+# (field 6) exceeds the threshold. Flag any candidate regression >= the ratio.
+VERDICT=$(awk -v thr="${BENCH_REGRESSION_RATIO:-1.10}" '
+    $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ {
+        cand = $6 + 0
+        if (cand >= thr) { n++; if (cand > worst) { worst = cand; wname = $1 } }
+    }
+    END {
+        pct = int((thr - 1) * 100 + 0.5)
+        if (n > 0)
+            printf "\342\232\240\357\270\217 %d benchmark(s) slower by >=%d%% vs baseline (worst: %s +%d%%)", n, pct, wname, int((worst - 1) * 100 + 0.5)
+        else
+            printf "\342\234\205 No benchmark slower by >=%d%% vs baseline", pct
+    }
+' "$RESULTS_DIR/comparison.txt")
+
 {
     echo "## mssql-tds perf — base → candidate"
+    echo ""
+    echo "**${VERDICT}**"
     echo ""
     echo "Baseline commit: \`${BASELINE_COMMIT}\`"
     echo ""
