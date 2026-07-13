@@ -56,6 +56,16 @@ pub const SQL_OV_ODBC3_80: u32 = 380;
 // of the UTF-16-LE-encoded token.
 pub const SQL_COPT_SS_ACCESS_TOKEN: SqlInteger = 1256;
 
+// Standard ODBC connection attributes the Driver Manager commonly sets before
+// connecting. Accepted (currently ignored) so the DM handshake is not broken.
+pub const SQL_ATTR_ACCESS_MODE: SqlInteger = 101;
+pub const SQL_ATTR_LOGIN_TIMEOUT: SqlInteger = 103;
+pub const SQL_ATTR_PACKET_SIZE: SqlInteger = 112;
+pub const SQL_ATTR_CONNECTION_TIMEOUT: SqlInteger = 113;
+
+// Sentinel `StringLength` meaning "the value is a pointer" (ODBC).
+pub const SQL_IS_POINTER: SqlInteger = -4;
+
 // DriverCompletion constants for SQLDriverConnect
 pub const SQL_DRIVER_NOPROMPT: SqlUSmallInt = 0;
 pub const SQL_DRIVER_COMPLETE: SqlUSmallInt = 1;

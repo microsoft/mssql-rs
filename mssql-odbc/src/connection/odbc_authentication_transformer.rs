@@ -10,15 +10,15 @@ use mssql_tds::connection::client_context::TdsAuthenticationMethod;
 /// populating the remaining connection fields on `ClientContext` or
 /// wherever they are needed.
 #[derive(Debug, Clone)]
-pub struct TransformedAuth {
+pub(crate) struct TransformedAuth {
     /// Resolved authentication method.
-    pub method: TdsAuthenticationMethod,
+    pub(crate) method: TdsAuthenticationMethod,
     /// User name (may be empty if not applicable).
-    pub user_name: String,
+    pub(crate) user_name: String,
     /// Password (may be empty if not applicable).
-    pub password: String,
+    pub(crate) password: String,
     /// Pre-acquired access token, if any.
-    pub access_token: Option<String>,
+    pub(crate) access_token: Option<String>,
 }
 
 /// Clears credentials that the resolved auth method does not use.
@@ -59,7 +59,7 @@ fn apply_silent_clears(method: &TdsAuthenticationMethod, uid: &mut String, pwd: 
 ///
 /// After resolution, silent clears remove credentials the selected method
 /// doesn't use.
-pub fn transform_auth(
+pub(crate) fn transform_auth(
     auth: Option<&str>,
     tc: Option<bool>,
     uid: &str,
