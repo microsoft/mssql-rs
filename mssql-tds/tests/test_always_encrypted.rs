@@ -1065,6 +1065,37 @@ mod always_encrypted {
         });
     }
 
+    /// The connection's query-metadata cache elides repeat
+    /// `sp_describe_parameter_encryption` round-trips: executing the same
+    /// statement multiple times describes it only once.
+    #[tokio::test]
+    async fn query_metadata_cache_reuses_describe() {
+        ae_test!(|h| {
+            let table = h.create_encrypted_table("INT", "DETERMINISTIC").await;
+            let sql = format!("INSERT INTO {table} (val) VALUES (@val);");
+
+            let before = h.client.describe_round_trips();
+            for v in [1, 2, 3] {
+                let param = RpcParameter::new(
+                    Some("@val".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(v)),
+                );
+                h.client
+                    .execute_sp_executesql(sql.clone(), vec![param], None, None)
+                    .await
+                    .expect("encrypted insert");
+                while h.client.move_to_next().await.unwrap() {}
+                h.client.close_query().await.unwrap();
+            }
+            let describes = h.client.describe_round_trips() - before;
+            assert_eq!(
+                describes, 1,
+                "three identical executions should describe once, got {describes}"
+            );
+        });
+    }
+
     // ----- Bulk copy parameter encryption -----
 
     /// A row written through the streaming bulk-copy writer. The `id` column is

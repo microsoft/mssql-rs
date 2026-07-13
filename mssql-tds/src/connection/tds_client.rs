@@ -88,11 +88,24 @@ pub struct TdsClient {
     /// Per-prepared-handle Always Encrypted parameter metadata, captured by
     /// `execute_sp_prepare` from `sp_describe_parameter_encryption` and reused by
     /// `execute_sp_execute` to encrypt parameter values without describing again.
-    /// Evicted by `execute_sp_unprepare`.
+    /// Holds an `Arc` to the same describe result stored in
+    /// `query_metadata_cache`, pinning it for the prepared statement's lifetime
+    /// even if the shared cache evicts it. Evicted by `execute_sp_unprepare`.
     prepared_param_encryption: HashMap<
         i32,
-        crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult,
+        std::sync::Arc<
+            crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult,
+        >,
     >,
+    /// Connection-scoped cache of `sp_describe_parameter_encryption` results,
+    /// keyed by (database, query text), so every parameterized execution of the
+    /// same statement reuses the describe result instead of re-querying the
+    /// server. Mirrors the SqlClient/JDBC query-metadata caches.
+    query_metadata_cache: crate::security::query_metadata_cache::QueryMetadataCache,
+    /// Number of `sp_describe_parameter_encryption` round-trips actually sent to
+    /// the server (query-metadata cache misses). Exposed for observability and to
+    /// let tests confirm the cache elides repeat describes.
+    describe_round_trips: u64,
     /// State of the most recent `ReturnStatus` token, captured while draining a
     /// cursor RPC response and interpreted as a [`CursorStatus`](crate::cursor::CursorStatus).
     pub(in crate::connection) last_return_status: ReturnStatus,
@@ -141,6 +154,8 @@ impl TdsClient {
             count_map: HashMap::new(),
             return_values: Vec::new(),
             prepared_param_encryption: HashMap::new(),
+            query_metadata_cache: crate::security::query_metadata_cache::QueryMetadataCache::new(),
+            describe_round_trips: 0,
             last_return_status: ReturnStatus::NotReceived,
             current_result_set_has_been_read_till_end: false,
             current_command_ce_setting:
@@ -1172,21 +1187,25 @@ impl TdsClient {
 
         build_parameter_list_string(&named_params, &mut params_list_as_string)?;
 
-        // Always Encrypted: describe the statement's parameters now and cache the
-        // result under the prepared handle so a later sp_execute can encrypt
-        // values without describing again. sp_prepare itself sends no user
-        // parameter values, so nothing is encrypted here.
+        // Always Encrypted: describe the statement's parameters now (serving from
+        // or populating the query-metadata cache) and pin the result under the
+        // prepared handle so a later sp_execute can encrypt values without
+        // describing again. sp_prepare itself sends no user parameter values, so
+        // nothing is encrypted here.
         let describe_for_cache = if self.should_encrypt_parameters() && !named_params.is_empty() {
+            let has_output = named_params.iter().any(|p| p.is_output());
             let describe = self
-                .describe_parameter_encryption(
+                .describe_parameters_cached(
                     &sql,
                     &params_list_as_string,
+                    has_output,
                     timeout_sec,
                     cancel_handle,
                 )
                 .await?;
-            // The describe round-trip closes its own batch and clears the
-            // per-operation timeout/cancel state; restore it for the prepare RPC.
+            // A describe round-trip (on a cache miss) closes its own batch and
+            // clears the per-operation timeout/cancel state; restore it for the
+            // prepare RPC.
             self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
             self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
             self.transport.reset_reader();
@@ -1483,18 +1502,22 @@ impl TdsClient {
                 || named_parameters.as_ref().is_some_and(|p| !p.is_empty()))
         {
             let (providers, cek_cache) = self.cloned_ce_key_material()?;
-            let describe = self.prepared_param_encryption.get(&handle).ok_or_else(|| {
-                crate::error::Error::ColumnEncryptionError(format!(
-                    "Prepared statement handle {handle} has no Always Encrypted parameter \
-                     metadata; prepare it with execute_sp_prepare on this connection before \
-                     executing with parameters"
-                ))
-            })?;
+            let describe = self
+                .prepared_param_encryption
+                .get(&handle)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::error::Error::ColumnEncryptionError(format!(
+                        "Prepared statement handle {handle} has no Always Encrypted parameter \
+                         metadata; prepare it with execute_sp_prepare on this connection before \
+                         executing with parameters"
+                    ))
+                })?;
             if let Some(params) = positional_parameters.as_mut() {
-                Self::apply_parameter_encryption(describe, &providers, &cek_cache, params).await?;
+                Self::apply_parameter_encryption(&describe, &providers, &cek_cache, params).await?;
             }
             if let Some(params) = named_parameters.as_mut() {
-                Self::apply_parameter_encryption(describe, &providers, &cek_cache, params).await?;
+                Self::apply_parameter_encryption(&describe, &providers, &cek_cache, params).await?;
             }
         }
 
@@ -1845,6 +1868,10 @@ impl TdsClient {
             DescribeParameterEncryptionResult, accumulate_cek_entry, parse_parameter_info,
         };
 
+        // Count every actual describe round-trip so callers/tests can confirm the
+        // query-metadata cache is eliding repeats.
+        self.describe_round_trips = self.describe_round_trips.saturating_add(1);
+
         self.transport.reset_reader();
         let database_collation = self.negotiated_settings.database_collation;
 
@@ -1908,6 +1935,10 @@ impl TdsClient {
     /// through the registered key store providers, its plaintext value is
     /// normalized and encrypted, and the resulting ciphertext plus cipher
     /// metadata are stored on the [`RpcParameter`] for serialization.
+    ///
+    /// The describe result is served from (and populated into) the connection's
+    /// query-metadata cache, so repeat executions of the same statement avoid the
+    /// extra round-trip.
     async fn encrypt_parameters(
         &mut self,
         sql: &str,
@@ -1916,12 +1947,59 @@ impl TdsClient {
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
+        // Mirror SqlClient: don't cache metadata for statements with output
+        // parameters — the client can't validate cached describe results against
+        // a RETURNVALUE — but still use it for this call.
+        let has_output = named_params.iter().any(|p| p.is_output());
         let describe = self
-            .describe_parameter_encryption(sql, params_decl, timeout_sec, cancel_handle)
+            .describe_parameters_cached(sql, params_decl, has_output, timeout_sec, cancel_handle)
             .await?;
 
         let (providers, cek_cache) = self.cloned_ce_key_material()?;
         Self::apply_parameter_encryption(&describe, &providers, &cek_cache, named_params).await
+    }
+
+    /// Returns the describe result for a statement, serving it from the
+    /// connection's query-metadata cache when present and otherwise calling
+    /// `sp_describe_parameter_encryption` and caching the result.
+    ///
+    /// When `skip_cache` is set (a statement with output parameters), the fresh
+    /// describe result is returned but not stored, matching SqlClient.
+    async fn describe_parameters_cached(
+        &mut self,
+        sql: &str,
+        params_decl: &str,
+        skip_cache: bool,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<
+        std::sync::Arc<
+            crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult,
+        >,
+    > {
+        use crate::security::query_metadata_cache::QueryMetadataCache;
+
+        let key = QueryMetadataCache::key(&self.negotiated_settings.database, sql);
+        if let Some(describe) = self.query_metadata_cache.get(&key) {
+            return Ok(describe);
+        }
+
+        let describe = std::sync::Arc::new(
+            self.describe_parameter_encryption(sql, params_decl, timeout_sec, cancel_handle)
+                .await?,
+        );
+        if !skip_cache {
+            self.query_metadata_cache
+                .insert(key, std::sync::Arc::clone(&describe));
+        }
+        Ok(describe)
+    }
+
+    /// Number of `sp_describe_parameter_encryption` round-trips this connection
+    /// has sent to the server (query-metadata cache misses). Useful for
+    /// observability and for verifying the metadata cache is effective.
+    pub fn describe_round_trips(&self) -> u64 {
+        self.describe_round_trips
     }
 
     /// Clones the `Arc` handles to the column-master-key provider registry and
