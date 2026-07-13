@@ -11,6 +11,8 @@ use std::fmt;
 use crate::connection::odbc_supported_auth_keywords::is_recognized_keyword;
 use tracing::warn;
 
+pub(crate) mod odbc_authentication_transformer;
+pub(crate) mod odbc_authentication_validator;
 mod odbc_supported_auth_keywords;
 
 // Connection string keys (lowercase for matching)

@@ -394,13 +394,20 @@ pub unsafe extern "C" fn SQLRowCount(
 /// - `string_length` is used only for string-type attributes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLSetConnectAttrW(
-    _connection_handle: SqlHandle,
-    _attribute: SqlInteger,
-    _value_ptr: SqlPointer,
-    _string_length: SqlInteger,
+    connection_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    string_length: SqlInteger,
 ) -> SqlReturn {
     crate::init_tracing();
-    SQL_SUCCESS
+    unsafe {
+        super::set_connect_attr::sql_set_connect_attr_w(
+            connection_handle,
+            attribute,
+            value_ptr,
+            string_length,
+        )
+    }
 }
 
 /// Retrieves a connection attribute.

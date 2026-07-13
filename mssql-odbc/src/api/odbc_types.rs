@@ -50,6 +50,12 @@ pub const SQL_OV_ODBC2: u32 = 2;
 pub const SQL_OV_ODBC3: u32 = 3;
 pub const SQL_OV_ODBC3_80: u32 = 380;
 
+// Connection attribute identifiers (SQLSetConnectAttr / SQLGetConnectAttr).
+// msodbcsql-specific: pre-connect Entra access token. `value_ptr` points to an
+// ACCESSTOKEN struct: a 4-byte little-endian length followed by that many bytes
+// of the UTF-16-LE-encoded token.
+pub const SQL_COPT_SS_ACCESS_TOKEN: SqlInteger = 1256;
+
 // DriverCompletion constants for SQLDriverConnect
 pub const SQL_DRIVER_NOPROMPT: SqlUSmallInt = 0;
 pub const SQL_DRIVER_COMPLETE: SqlUSmallInt = 1;
