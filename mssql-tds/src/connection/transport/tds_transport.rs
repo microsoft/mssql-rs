@@ -5,6 +5,7 @@
 //! This allows for different implementations (real network, mock for testing/fuzzing, etc.)
 
 use crate::core::TdsResult;
+use crate::io::packet_reader::TdsPacketReader;
 use crate::io::reader_writer::NetworkWriter;
 use crate::io::token_stream::TdsTokenStreamReader;
 use async_trait::async_trait;
@@ -55,4 +56,8 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// Check whether the underlying connection is dead via a non-blocking socket poll.
     /// Returns `true` if the connection is known to be dead, `false` if alive or unknown.
     fn is_connection_dead(&self) -> bool;
+
+    /// Expose the transport as a `TdsPacketReader` for low-level streaming operations
+    /// such as incremental PLP column reads via [`PlpColumnStream`].
+    fn as_packet_reader(&mut self) -> &mut (dyn TdsPacketReader + Send + Sync);
 }

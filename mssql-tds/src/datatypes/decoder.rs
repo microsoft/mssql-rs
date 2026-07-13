@@ -125,8 +125,7 @@ pub(crate) enum PlpChunkReadLength {
 /// Stateful PLP chunk reader for resumable/incremental consumption.
 ///
 /// This keeps chunk cursor state so callers can read PLP payload in small
-/// slices across repeated calls, which is the required primitive for a future
-/// SQLGetData streaming implementation.
+/// slices across repeated calls, msodbcsql-style streaming implementation.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct PlpChunkStreamReader {
@@ -149,9 +148,7 @@ impl PlpChunkStreamReader {
         }
     }
 
-    pub(crate) async fn begin<T>(reader: &mut T) -> TdsResult<Option<Self>>
-    where
-        T: TdsPacketReader + Send + Sync,
+    pub(crate) async fn begin(reader: &mut (dyn TdsPacketReader + Send + Sync)) -> TdsResult<Option<Self>>
     {
         let raw_len_i64 = reader.read_int64().await?;
         let raw_len = raw_len_i64 as u64;
@@ -186,9 +183,7 @@ impl PlpChunkStreamReader {
         self.reached_end
     }
 
-    async fn ensure_active_chunk<T>(&mut self, reader: &mut T) -> TdsResult<bool>
-    where
-        T: TdsPacketReader + Send + Sync,
+    async fn ensure_active_chunk(&mut self, reader: &mut (dyn TdsPacketReader + Send + Sync)) -> TdsResult<bool>
     {
         if self.reached_end {
             return Ok(false);
@@ -245,9 +240,7 @@ impl PlpChunkStreamReader {
         Ok(true)
     }
 
-    pub(crate) async fn read_into<T>(&mut self, reader: &mut T, out: &mut [u8]) -> TdsResult<usize>
-    where
-        T: TdsPacketReader + Send + Sync,
+    pub(crate) async fn read_into(&mut self, reader: &mut (dyn TdsPacketReader + Send + Sync), out: &mut [u8]) -> TdsResult<usize>
     {
         // Supports the msodbcsql-style cbRequest==0 pattern to consume a
         // pending terminator after all data bytes were already read.
@@ -286,9 +279,7 @@ impl PlpChunkStreamReader {
         Ok(written)
     }
 
-    pub(crate) async fn skip_to_end<T>(&mut self, reader: &mut T) -> TdsResult<()>
-    where
-        T: TdsPacketReader + Send + Sync,
+    pub(crate) async fn skip_to_end(&mut self, reader: &mut (dyn TdsPacketReader + Send + Sync)) -> TdsResult<()>
     {
         while self.ensure_active_chunk(reader).await? {
             if self.chunk_remaining > 0 {
@@ -305,21 +296,18 @@ impl PlpChunkStreamReader {
 // Type-aware PLP column stream
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Type-aware PLP column stream
-// ---------------------------------------------------------------------------
-
 /// A type-aware, metadata-bound PLP column reader.
 ///
 /// Wraps [`PlpChunkStreamReader`] and carries the semantic type information
-/// needed by the SQLGetData layer to correctly interpret and convert the raw
-/// chunk bytes returned by the TDS server. The wire-level chunk framing is
-/// fully handled by the inner reader; this struct only adds type context.
+/// to correctly interpret and convert the raw chunk bytes returned by the
+/// TDS server. The wire-level chunk framing is fully handled by the inner
+/// reader; this struct only adds type context.
 ///
 /// The PLP type is represented directly as [`PartialLengthType`], which already
 /// covers all six PLP-capable SQL Server types (`varchar(max)`, `nvarchar(max)`,
 /// `varbinary(max)`, `xml`, `json`, `udt`). An optional [`SqlCollation`] is
-/// carried alongside for `varchar(max)` columns that need ANSI/codepage decoding.
+/// carried alongside from PLP metadata (typically for `varchar(max)`), for
+/// caller-side where collation-aware decoding may be needed.
 ///
 /// # Usage
 ///
@@ -350,12 +338,10 @@ impl PlpColumnStream {
     /// - `Ok(None)` for SQL NULL
     /// - `Ok(Some(stream))` ready for incremental reads
     /// - `Err` if the column is not PLP-typed or the header is malformed
-    pub(crate) async fn begin<T>(
+    pub(crate) async fn begin(
         metadata: &ColumnMetadata,
-        reader: &mut T,
+        reader: &mut (dyn TdsPacketReader + Send + Sync),
     ) -> TdsResult<Option<Self>>
-    where
-        T: TdsPacketReader + Send + Sync,
     {
         let (plp_type, collation) = Self::type_from_metadata(metadata)?;
         let inner = match PlpChunkStreamReader::begin(reader).await? {
@@ -370,7 +356,7 @@ impl PlpColumnStream {
         self.plp_type
     }
 
-    /// Collation, present for `varchar(max)` (`BigVarChar`) columns.
+    /// Collation from PLP metadata when provided (typically `varchar(max)` / `BigVarChar`).
     pub(crate) fn collation(&self) -> Option<SqlCollation> {
         self.collation
     }
@@ -386,17 +372,13 @@ impl PlpColumnStream {
     }
 
     /// Incrementally reads PLP payload bytes into `out`.
-    pub(crate) async fn read_into<T>(&mut self, reader: &mut T, out: &mut [u8]) -> TdsResult<usize>
-    where
-        T: TdsPacketReader + Send + Sync,
+    pub(crate) async fn read_into(&mut self, reader: &mut (dyn TdsPacketReader + Send + Sync), out: &mut [u8]) -> TdsResult<usize>
     {
         self.inner.read_into(reader, out).await
     }
 
     /// Discards all remaining PLP payload and terminator bytes.
-    pub(crate) async fn skip_to_end<T>(&mut self, reader: &mut T) -> TdsResult<()>
-    where
-        T: TdsPacketReader + Send + Sync,
+    pub(crate) async fn skip_to_end(&mut self, reader: &mut (dyn TdsPacketReader + Send + Sync)) -> TdsResult<()>
     {
         self.inner.skip_to_end(reader).await
     }
@@ -3512,6 +3494,55 @@ mod test {
             assert_eq!(stream.total_read(), 5);
         }
 
+        #[tokio::test]
+        async fn plp_chunk_stream_reader_partial_read_then_skip_drains_all_bytes() {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&0xFFFFFFFFFFFFFFFEu64.to_le_bytes()); // SQL_PLP_UNKNOWNLEN
+            buf.extend_from_slice(&10u32.to_le_bytes()); // single chunk of 10 bytes
+            buf.extend_from_slice(b"0123456789");
+            buf.extend_from_slice(&0u32.to_le_bytes()); // terminator
+
+            let mut reader = ByteReader::new(buf);
+            let mut stream = PlpChunkStreamReader::begin(&mut reader)
+                .await
+                .unwrap()
+                .expect("not null");
+
+            let mut partial = [0u8; 3];
+            let n = stream.read_into(&mut reader, &mut partial).await.unwrap();
+            assert_eq!(n, 3);
+            assert_eq!(&partial, b"012");
+            assert!(!stream.reached_end());
+
+            stream.skip_to_end(&mut reader).await.unwrap();
+            assert!(stream.reached_end());
+            assert_eq!(stream.total_read(), 10);
+        }
+
+        #[tokio::test]
+        async fn plp_column_stream_repeated_small_reads_exhaust_payload() {
+            let payload = b"hello world";
+            let md =
+                plp_metadata(TdsDataType::BigVarBinary, PartialLengthType::BigVarBinary, None);
+            let mut reader = ByteReader::new(plp_wire(payload));
+            let mut stream = PlpColumnStream::begin(&md, &mut reader)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let mut collected = Vec::new();
+            let mut chunk = [0u8; 4];
+            loop {
+                let n = stream.read_into(&mut reader, &mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                collected.extend_from_slice(&chunk[..n]);
+            }
+            assert_eq!(collected, payload);
+            assert!(stream.reached_end());
+        }
+
         // -------------------------------------------------------------------
         // PlpColumnStream tests — type-aware wrapper over PlpChunkStreamReader
         // -------------------------------------------------------------------
@@ -3588,7 +3619,7 @@ mod test {
         }
 
         #[tokio::test]
-        async fn plp_column_stream_ansi_text_kind_carries_collation() {
+        async fn plp_column_stream_bigvarchar_kind_carries_collation() {
             let payload = b"hello";
             let col = crate::token::tokens::SqlCollation {
                 info: 0x0409_0034,

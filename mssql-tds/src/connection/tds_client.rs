@@ -73,6 +73,10 @@ pub struct TdsClient {
 
     /// Empty metadata vector for returning when no metadata is available
     empty_metadata: Vec<ColumnMetadata>,
+
+    /// Holds a partially-consumed PLP column stream for incremental SQLGetData-style reads.
+    /// `None` when no stream is active or after the stream has been fully consumed.
+    active_plp_stream: Option<crate::datatypes::decoder::PlpColumnStream>,
 }
 
 impl TdsClient {
@@ -105,6 +109,7 @@ impl TdsClient {
             remaining_request_timeout: None,
             cancel_handle: None,
             empty_metadata: Vec::new(),
+            active_plp_stream: None,
         }
     }
 
@@ -1375,6 +1380,15 @@ impl TdsClient {
         &mut self,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<bool> {
+        // Drain any partially-consumed PLP column stream from a prior read so
+        // the wire is clean before we start parsing the next row.
+        if let Some(mut prev_stream) = self.active_plp_stream.take() {
+            if !prev_stream.reached_end() {
+                prev_stream
+                    .skip_to_end(self.transport.as_packet_reader())
+                    .await?;
+            }
+        }
         if self.current_metadata.is_none() {
             return Err(UsageError(
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
@@ -1517,6 +1531,85 @@ impl TdsClient {
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
         self.execution_context.set_has_open_batch(false);
+        self.active_plp_stream = None;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // PLP column streaming – incremental read support for msodbcsql style PLP streaming
+    // -----------------------------------------------------------------------
+
+    /// Reads the 8-byte PLP length/sentinel header at the current transport
+    /// position and begins an incremental PLP column read.
+    ///
+    /// Must be called when the transport is positioned at the start of a PLP
+    /// column's data (i.e., during a custom column-by-column row read loop).
+    /// After this call, use [`read_active_plp_bytes`](Self::read_active_plp_bytes) to
+    /// consume data and [`skip_active_plp_to_end`](Self::skip_active_plp_to_end) to
+    /// drain any remaining bytes before advancing to the next row.
+    ///
+    /// Returns `true` if the column is non-NULL, `false` if it is SQL NULL.
+    pub async fn begin_plp_column_stream(
+        &mut self,
+        metadata: &ColumnMetadata,
+    ) -> TdsResult<bool> {
+        // Drain any previously active stream before starting a new one.
+        if let Some(mut prev) = self.active_plp_stream.take() {
+            if !prev.reached_end() {
+                prev.skip_to_end(self.transport.as_packet_reader()).await?;
+            }
+        }
+        let stream = crate::datatypes::decoder::PlpColumnStream::begin(
+            metadata,
+            self.transport.as_packet_reader(),
+        )
+        .await?;
+        let is_non_null = stream.is_some();
+        self.active_plp_stream = stream;
+        Ok(is_non_null)
+    }
+
+    /// Reads the next slice of bytes from the active PLP stream into `out`.
+    ///
+    /// Returns the number of bytes written. Returns `0` when the stream is
+    /// exhausted (`reached_end` is `true`) or when no stream is active.
+    pub async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        let mut stream = match self.active_plp_stream.take() {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+        let result = stream
+            .read_into(self.transport.as_packet_reader(), out)
+            .await;
+        self.active_plp_stream = Some(stream);
+        result
+    }
+
+    /// Returns `true` after all payload bytes and the terminator of the active
+    /// PLP stream have been consumed, or when no stream is active.
+    pub fn active_plp_reached_end(&self) -> bool {
+        self.active_plp_stream
+            .as_ref()
+            .map(|s| s.reached_end())
+            .unwrap_or(true)
+    }
+
+    /// Returns the [`SqlCollation`](crate::token::tokens::SqlCollation) of the
+    /// active PLP column if the metadata carried one, or `None` otherwise.
+    pub fn active_plp_collation(&self) -> Option<crate::token::tokens::SqlCollation> {
+        self.active_plp_stream.as_ref().and_then(|s| s.collation())
+    }
+
+    /// Discards all remaining payload bytes and the terminator of the active
+    /// PLP stream. Clears the active stream slot afterward.
+    pub async fn skip_active_plp_to_end(&mut self) -> TdsResult<()> {
+        if let Some(mut stream) = self.active_plp_stream.take() {
+            if !stream.reached_end() {
+                stream
+                    .skip_to_end(self.transport.as_packet_reader())
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -2032,6 +2125,38 @@ mod tests {
         fn is_connection_dead(&self) -> bool {
             true
         }
+        fn as_packet_reader(
+            &mut self,
+        ) -> &mut (dyn crate::io::packet_reader::TdsPacketReader + Send + Sync) {
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::io::packet_reader::TdsPacketReader for TestTransport {
+        async fn read_byte(&mut self) -> TdsResult<u8> { unimplemented!("TestTransport") }
+        async fn read_int16_big_endian(&mut self) -> TdsResult<i16> { unimplemented!("TestTransport") }
+        async fn read_int32_big_endian(&mut self) -> TdsResult<i32> { unimplemented!("TestTransport") }
+        async fn read_uint40(&mut self) -> TdsResult<u64> { unimplemented!("TestTransport") }
+        async fn read_float32(&mut self) -> TdsResult<f32> { unimplemented!("TestTransport") }
+        async fn read_float64(&mut self) -> TdsResult<f64> { unimplemented!("TestTransport") }
+        async fn read_int16(&mut self) -> TdsResult<i16> { unimplemented!("TestTransport") }
+        async fn read_uint16(&mut self) -> TdsResult<u16> { unimplemented!("TestTransport") }
+        async fn read_uint24(&mut self) -> TdsResult<u32> { unimplemented!("TestTransport") }
+        async fn read_int32(&mut self) -> TdsResult<i32> { unimplemented!("TestTransport") }
+        async fn read_uint32(&mut self) -> TdsResult<u32> { unimplemented!("TestTransport") }
+        async fn read_int64(&mut self) -> TdsResult<i64> { unimplemented!("TestTransport") }
+        async fn read_uint64(&mut self) -> TdsResult<u64> { unimplemented!("TestTransport") }
+        async fn read_bytes(&mut self, _buf: &mut [u8]) -> TdsResult<usize> { unimplemented!("TestTransport") }
+        async fn read_u8_varbyte(&mut self) -> TdsResult<Vec<u8>> { unimplemented!("TestTransport") }
+        async fn read_u16_varbyte(&mut self) -> TdsResult<Vec<u8>> { unimplemented!("TestTransport") }
+        async fn read_varchar_u16_length(&mut self) -> TdsResult<Option<String>> { unimplemented!("TestTransport") }
+        async fn read_varchar_u8_length(&mut self) -> TdsResult<String> { unimplemented!("TestTransport") }
+        async fn read_unicode(&mut self, _len: usize) -> TdsResult<String> { unimplemented!("TestTransport") }
+        async fn read_unicode_with_byte_length(&mut self, _len: usize) -> TdsResult<String> { unimplemented!("TestTransport") }
+        async fn skip_bytes(&mut self, _count: usize) -> TdsResult<()> { unimplemented!("TestTransport") }
+        async fn cancel_read_stream(&mut self) -> TdsResult<()> { unimplemented!("TestTransport") }
+        fn reset_reader(&mut self) { unimplemented!("TestTransport") }
     }
 
     fn create_test_client() -> TdsClient {

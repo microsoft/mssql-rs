@@ -566,6 +566,10 @@ impl TdsTransport for MockTransport {
     fn is_connection_dead(&self) -> bool {
         false
     }
+
+    fn as_packet_reader(&mut self) -> &mut (dyn TdsPacketReader + Send + Sync) {
+        self
+    }
 }
 
 #[async_trait]
