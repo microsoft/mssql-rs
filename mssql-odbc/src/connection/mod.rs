@@ -3,8 +3,24 @@
 
 //! Connection string parsing for ODBC `SQLDriverConnect`.
 //!
-//! Parses `;`-delimited `Key=Value` connection strings per the ODBC spec.
-//! Supports `{braced values}` for values containing `;` or `=`.
+//! A single-pass, character-by-character state machine that mirrors the behavior
+//! of the msodbcsql driver's `ParseAttrStr`
+//! (`Sql/Ntdbms/sqlncli/odbc/sqlcconn.cpp`). The intent is byte-for-byte parity
+//! with the shipping ODBC driver, including its quirks. See
+//! [`docs/connection_string_parser.md`](../../docs/connection_string_parser.md).
+//!
+//! Key behaviors reproduced from msodbcsql:
+//! - The key is scanned until `=` and **reads through `;`** — a token without its
+//!   own `=` is merged with following text until an `=` or end-of-string.
+//! - If no `=` is found in the remainder, parsing **stops** (whatever was parsed
+//!   so far is kept) and a warning (`01S00`) is raised.
+//! - Keys and values are **never trimmed**; only leading whitespace/`;` before a
+//!   key is skipped. `Server =host` therefore does *not* match (trailing space).
+//! - `{braced}` values end at a single `}`; `}}` is an escape for a literal `}`.
+//! - A braced value must be followed by `;` or end-of-string; trailing junk after
+//!   `}` stops parsing with a warning.
+//! - Unknown keywords never fail the parse — they are ignored with a warning.
+//!   Only an invalid *value* for a recognized, validated key is a hard error.
 
 use std::fmt;
 
@@ -18,23 +34,28 @@ mod odbc_supported_auth_keywords;
 // Connection string keys (lowercase for matching)
 const KEY_SERVER: &str = "server";
 const KEY_DATABASE: &str = "database";
-const KEY_INITIAL_CATALOG: &str = "initial catalog";
 const KEY_UID: &str = "uid";
-const KEY_USER_ID: &str = "user id";
 const KEY_PWD: &str = "pwd";
-const KEY_PASSWORD: &str = "password";
 const KEY_TRUST_SRV_CERT: &str = "trustservercertificate";
 const KEY_ENCRYPT: &str = "encrypt";
 const KEY_AUTHENTICATION: &str = "authentication";
 const KEY_TRUSTED_CONNECTION: &str = "trusted_connection";
 
-// Known keys we currently accept but do not act on.
-// These should not produce 01S00 warnings.
+// Recognized msodbcsql keywords we accept but do not act on. Mirrors the
+// non-acted-on entries of msodbcsql's `x_rgLookup` table (including synonyms and
+// deprecated keys). Recognized keys never raise the 01S00 "invalid attribute"
+// warning even when unsupported; only genuinely unknown keys do.
+//
+// Note: unlike ADO.NET/OLE DB, the msodbcsql ODBC parser does NOT recognize
+// `Initial Catalog` or `User Id`; those are intentionally absent here so they are
+// treated as unknown, matching the driver.
 const KNOWN_IGNORED_KEYS: &[&str] = &[
-    "driver",
-    "dsn",
-    "filedsn",
     "savefile",
+    "filedsn",
+    "dsn",
+    "description",
+    "desc",
+    "driver",
     "app",
     "wsid",
     "language",
@@ -43,10 +64,52 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
     "address",
     "addr",
     "mars_connection",
+    "failover_partner",
+    "failoverpartnerspn",
     "autotranslate",
-    "quotedid",
-    "ansi_npw",
+    "querylog_on",
+    "querylogfile",
+    "querylogtime",
+    "statslog_on",
+    "statslogfile",
     "regional",
+    "quotedid",
+    "ansinpw",
+    "attachdbfilename",
+    "serverspn",
+    "applicationintent",
+    "multisubnetfailover",
+    "connectretrycount",
+    "connectretryinterval",
+    "clientcertificate",
+    "columnencryption",
+    "transparentnetworkipresolution",
+    "keystoreauthentication",
+    "keystoreprincipalid",
+    "keystoresecret",
+    "keystorelocation",
+    "usefmtonly",
+    "clientkey",
+    "keepalive",
+    "keepaliveinterval",
+    "replication",
+    "longasmax",
+    "hostnameincertificate",
+    "getdataextensions",
+    "ipaddresspreference",
+    "servercertificate",
+    "retryexec",
+    "concatnullyieldsnull",
+    "packetsize",
+    "vectortypesupport",
+    // Deprecated keys kept for back-compat (msodbcsql KEY_UNUSED entries).
+    "oemtoansi",
+    "translationname",
+    "translationoption",
+    "translationdll",
+    "fastconnectoption",
+    "useprocforprepare",
+    "fallback",
 ];
 
 // Valid attribute values
@@ -188,178 +251,219 @@ impl fmt::Debug for ConnectionParams {
     }
 }
 
-/// Parse an ODBC connection string into key-value pairs.
+/// Classification of a connection-string key against the msodbcsql keyword table.
+enum KeyClass {
+    /// Recognized and acted upon; maps to a [`ConnectionParams`] field.
+    Mapped(ConnAttrKey),
+    /// Recognized by msodbcsql but not acted upon here; raises no warning.
+    Ignored,
+    /// Not a recognized keyword; raises an `01S00` warning but never fails.
+    Unknown,
+}
+
+/// The whitespace set used by msodbcsql's `ISSPACE`: space, form-feed, newline,
+/// carriage return, tab, and vertical tab. Deliberately narrower than
+/// [`char::is_whitespace`] to match the driver exactly.
+fn is_odbc_space(c: char) -> bool {
+    matches!(c, ' ' | '\u{0c}' | '\n' | '\r' | '\t' | '\u{0b}')
+}
+
+fn classify_key(lower: &str) -> KeyClass {
+    match lower {
+        KEY_SERVER => KeyClass::Mapped(ConnAttrKey::Server),
+        KEY_DATABASE => KeyClass::Mapped(ConnAttrKey::Database),
+        KEY_UID => KeyClass::Mapped(ConnAttrKey::Uid),
+        KEY_PWD => KeyClass::Mapped(ConnAttrKey::Pwd),
+        KEY_TRUST_SRV_CERT => KeyClass::Mapped(ConnAttrKey::TrustServerCert),
+        KEY_ENCRYPT => KeyClass::Mapped(ConnAttrKey::Encrypt),
+        KEY_AUTHENTICATION => KeyClass::Mapped(ConnAttrKey::Authentication),
+        KEY_TRUSTED_CONNECTION => KeyClass::Mapped(ConnAttrKey::TrustedConnection),
+        _ if KNOWN_IGNORED_KEYS.contains(&lower) => KeyClass::Ignored,
+        _ => KeyClass::Unknown,
+    }
+}
+
+/// Validate and store a parsed value for a recognized, acted-upon key.
 ///
-/// Format: `Key1=Value1;Key2=Value2;...`
-/// Values may be `{braced}` to contain `;` or `=` literally.
+/// Returns `Err(InvalidAttrValue)` for an invalid value on a validated key,
+/// mirroring msodbcsql's `E_FAIL` from `IsAttrStrValid` (a hard connect failure).
+fn assign_value(
+    params: &mut ConnectionParams,
+    slot: ConnAttrKey,
+    lower: &str,
+    value: &str,
+) -> Result<(), InvalidAttrValue> {
+    match slot {
+        ConnAttrKey::Server => params.server = value.to_string(),
+        ConnAttrKey::Database => params.database = value.to_string(),
+        ConnAttrKey::Uid => params.uid = value.to_string(),
+        ConnAttrKey::Pwd => params.pwd = value.to_string(),
+        ConnAttrKey::TrustServerCert => {
+            validate_attr(lower, value, YES_NO)?;
+            params.trust_server_certificate = is_yes(value);
+        }
+        ConnAttrKey::Encrypt => {
+            validate_attr(lower, value, ENCRYPT_VALUES)?;
+            params.encrypt = Some(value.to_string());
+        }
+        ConnAttrKey::Authentication => {
+            // Recognized-keyword check is delegated to mssql-tds (the source of
+            // truth). Whether a recognized method is *implemented* is gated later;
+            // parsing only rejects values mssql-tds does not recognize.
+            if !is_recognized_keyword(value) {
+                return Err(InvalidAttrValue {
+                    key: lower.to_string(),
+                    value: value.to_string(),
+                    expected: AUTHENTICATION_VALUES,
+                });
+            }
+            params.authentication = Some(value.to_string());
+        }
+        ConnAttrKey::TrustedConnection => {
+            validate_attr(lower, value, YES_NO)?;
+            params.trusted_connection = Some(is_yes(value));
+        }
+        ConnAttrKey::Count => {}
+    }
+    Ok(())
+}
+
+/// Parse an ODBC connection string into [`ConnectionParams`].
+///
+/// A single-pass, character-by-character state machine that reproduces the
+/// behavior of msodbcsql's `ParseAttrStr`. See the module-level documentation for
+/// the full list of reproduced quirks.
 ///
 /// Returns `Ok((params, has_warnings))` on success, or `Err(InvalidAttrValue)`
-/// for invalid attribute values on known keys.
-/// `has_warnings` is true for malformed tokens and unknown keys (SQLSTATE 01S00).
+/// for an invalid value on a recognized, validated key (msodbcsql `E_FAIL`).
+/// `has_warnings` is true when any `01S00` condition was hit (unknown key, missing
+/// `=`, missing value, unterminated brace, or data after a braced value).
 pub(crate) fn parse_connection_string(
     input: &str,
 ) -> Result<(ConnectionParams, bool), InvalidAttrValue> {
-    let (pairs, mut has_warnings) = tokenize(input);
+    let chars: Vec<char> = input.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+
     let mut params = ConnectionParams::default();
     let mut seen_slots = [false; ConnAttrKey::COUNT];
+    let mut has_warnings = false;
 
-    for (key, value) in &pairs {
+    loop {
+        // Skip leading whitespace and separators before the key.
+        while i < n && (is_odbc_space(chars[i]) || chars[i] == ';') {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+
+        // Read the key up to '='. This reads *through* ';' — a token without its
+        // own '=' is merged with the following text until an '=' or end-of-input.
+        let key_start = i;
+        while i < n && chars[i] != '=' {
+            i += 1;
+        }
+        if i >= n {
+            // No '=' in the remainder: stop parsing, keeping what we have (S_FALSE).
+            warn!("invalid connection string attribute (no '=' separator)");
+            has_warnings = true;
+            break;
+        }
+        let key: String = chars[key_start..i].iter().collect();
+        i += 1; // consume '='
         let lower = key.to_ascii_lowercase();
 
-        let slot = match lower.as_str() {
-            KEY_SERVER => Some(ConnAttrKey::Server),
-            KEY_DATABASE | KEY_INITIAL_CATALOG => Some(ConnAttrKey::Database),
-            KEY_UID | KEY_USER_ID => Some(ConnAttrKey::Uid),
-            KEY_PWD | KEY_PASSWORD => Some(ConnAttrKey::Pwd),
-            KEY_TRUST_SRV_CERT => Some(ConnAttrKey::TrustServerCert),
-            KEY_ENCRYPT => Some(ConnAttrKey::Encrypt),
-            KEY_AUTHENTICATION => Some(ConnAttrKey::Authentication),
-            KEY_TRUSTED_CONNECTION => Some(ConnAttrKey::TrustedConnection),
-            _ if KNOWN_IGNORED_KEYS.contains(&lower.as_str()) => None,
-            _ => {
-                // Match msodbcsql behavior: unknown attributes are ignored,
-                // but reported as warning (01S00) on successful connect.
+        // A recognized, first-seen, acted-upon key receives the value; everything
+        // else parses the value but discards it (mirrors msodbcsql's lpszValue).
+        let target = match classify_key(&lower) {
+            KeyClass::Mapped(slot) => {
+                let idx = slot.idx();
+                if seen_slots[idx] {
+                    None // duplicate recognized key: first occurrence wins
+                } else {
+                    seen_slots[idx] = true;
+                    Some(slot)
+                }
+            }
+            KeyClass::Ignored => None,
+            KeyClass::Unknown => {
                 warn!(key = %key, "unknown connection string attribute");
                 has_warnings = true;
                 None
             }
         };
 
-        if let Some(slot) = slot {
-            let idx = slot.idx();
-            if seen_slots[idx] {
-                // Match msodbcsql behavior: ignore duplicate recognized attributes.
-                continue;
-            }
-            seen_slots[idx] = true;
+        // No value after '=': stop parsing (S_FALSE).
+        if i >= n {
+            warn!("invalid connection string attribute (missing value)");
+            has_warnings = true;
+            break;
+        }
 
-            match slot {
-                ConnAttrKey::Server => params.server = value.clone(),
-                ConnAttrKey::Database => params.database = value.clone(),
-                ConnAttrKey::Uid => params.uid = value.clone(),
-                ConnAttrKey::Pwd => params.pwd = value.clone(),
-                ConnAttrKey::TrustServerCert => {
-                    validate_attr(&lower, value, YES_NO)?;
-                    params.trust_server_certificate = is_yes(value);
-                }
-                ConnAttrKey::Encrypt => {
-                    validate_attr(&lower, value, ENCRYPT_VALUES)?;
-                    params.encrypt = Some(value.clone());
-                }
-                ConnAttrKey::Authentication => {
-                    // Recognized-keyword check is delegated to mssql-tds
-                    // (the source of truth). Whether a recognized method is
-                    // *implemented* is gated later (T1-T4); parsing only
-                    // rejects values mssql-tds does not recognize.
-                    if !is_recognized_keyword(value) {
-                        return Err(InvalidAttrValue {
-                            key: lower.clone(),
-                            value: value.clone(),
-                            expected: AUTHENTICATION_VALUES,
-                        });
+        // Read the value.
+        let mut value = String::new();
+        let mut stop_after = false;
+        if chars[i] == '{' {
+            i += 1;
+            let mut terminated = false;
+            while i < n {
+                if chars[i] == '}' {
+                    // '}}' is an escape for a literal '}'.
+                    if i + 1 < n && chars[i + 1] == '}' {
+                        value.push('}');
+                        i += 2;
+                        continue;
                     }
-                    params.authentication = Some(value.clone());
+                    terminated = true;
+                    break;
                 }
-                ConnAttrKey::TrustedConnection => {
-                    validate_attr(&lower, value, YES_NO)?;
-                    params.trusted_connection = Some(is_yes(value));
-                }
-                ConnAttrKey::Count => {}
+                value.push(chars[i]);
+                i += 1;
             }
-            continue;
+            if terminated {
+                i += 1; // consume closing '}'
+                // A braced value must be followed by ';' or end-of-input.
+                if i < n && chars[i] != ';' {
+                    warn!("invalid connection string attribute (data after braced value)");
+                    has_warnings = true;
+                    stop_after = true;
+                }
+            } else {
+                // Unterminated brace: value ran to the end of the string.
+                warn!("unterminated braced value in connection string");
+                has_warnings = true;
+                stop_after = true;
+            }
+        } else {
+            while i < n && chars[i] != ';' {
+                value.push(chars[i]);
+                i += 1;
+            }
+        }
+
+        // Validate and store. msodbcsql stores the value before its brace-close
+        // checks, so a value with trailing junk is still stored before we stop.
+        // An invalid value on a validated key fails immediately (E_FAIL).
+        if let Some(slot) = target {
+            assign_value(&mut params, slot, &lower, &value)?;
+        }
+
+        if stop_after {
+            break;
+        }
+
+        // Consume the trailing separator (if present) and continue.
+        if i < n {
+            i += 1;
         }
     }
+
     Ok((params, has_warnings))
 }
 
 fn is_yes(value: &str) -> bool {
     value.eq_ignore_ascii_case("yes")
-}
-
-/// Tokenize a connection string into (key, value) pairs.
-/// Returns the pairs and whether any malformed tokens were skipped.
-fn tokenize(input: &str) -> (Vec<(String, String)>, bool) {
-    let mut pairs = Vec::new();
-    let mut has_warnings = false;
-    let mut chars = input.chars().peekable();
-
-    loop {
-        // Skip leading whitespace and semicolons
-        while chars.peek().is_some_and(|&c| c == ';' || c.is_whitespace()) {
-            chars.next();
-        }
-        if chars.peek().is_none() {
-            break;
-        }
-
-        // Read key (up to '=')
-        let mut key = String::new();
-        let mut found_eq = false;
-        while let Some(&c) = chars.peek() {
-            if c == '=' {
-                chars.next(); // consume '='
-                found_eq = true;
-                break;
-            }
-            if c == ';' {
-                break;
-            }
-            key.push(c);
-            chars.next();
-        }
-
-        // No '=' found — skip this token (matches msodbcsql: S_FALSE / 01S00 warning)
-        if !found_eq {
-            warn!(token = %key, "invalid connection string attribute (no '=' separator)");
-            has_warnings = true;
-            continue;
-        }
-        let key = key.trim().to_string();
-        if key.is_empty() {
-            warn!("invalid connection string attribute (empty key)");
-            has_warnings = true;
-            continue;
-        }
-
-        // Read value
-        let value = if chars.peek() == Some(&'{') {
-            // Braced value — read until closing '}'
-            chars.next(); // consume '{'
-            let mut val = String::new();
-            let mut found_closing_brace = false;
-            for c in chars.by_ref() {
-                if c == '}' {
-                    found_closing_brace = true;
-                    break;
-                }
-                val.push(c);
-            }
-            if !found_closing_brace {
-                warn!(key = %key, "unterminated braced value in connection string");
-                has_warnings = true;
-            }
-            // Skip trailing chars up to ';'
-            while chars.peek().is_some_and(|&c| c != ';') {
-                chars.next();
-            }
-            val
-        } else {
-            // Unbraced value — read until ';' or end
-            let mut val = String::new();
-            while let Some(&c) = chars.peek() {
-                if c == ';' {
-                    break;
-                }
-                val.push(c);
-                chars.next();
-            }
-            val.trim().to_string()
-        };
-
-        pairs.push((key, value));
-    }
-
-    (pairs, has_warnings)
 }
 
 #[cfg(test)]
@@ -409,43 +513,81 @@ mod tests {
     }
 
     #[test]
-    fn key_aliases() {
-        let (p, ..) = parse_connection_string(&cs(
-            "SERVER=host;uid=user;<PASS>=pass;trustservercertificate=Yes",
+    fn key_matching_is_case_insensitive() {
+        let (p, warn) = parse_connection_string(&cs(
+            "SERVER=host;uid=user;<PW>=pass;trustservercertificate=Yes",
         ))
         .unwrap();
+        assert!(!warn);
         assert_eq!(p.server, "host");
         assert_eq!(p.uid, "user");
         assert_eq!(p.pwd, "pass");
         assert!(p.trust_server_certificate);
-
-        let (p, ..) =
-            parse_connection_string(&cs("Server=host;Initial Catalog=mydb;UID=u;<PW>=p")).unwrap();
-        assert_eq!(p.database, "mydb");
-
-        let (p, ..) = parse_connection_string(&cs("Server=host;User Id=admin;<PW>=p")).unwrap();
-        assert_eq!(p.uid, "admin");
     }
 
     #[test]
-    fn tokenizer_edge_cases() {
-        let (p, ..) = parse_connection_string("").unwrap();
-        assert_eq!(p.server, "");
-
-        let (p, ..) = parse_connection_string(&cs("Server=host;Database=;UID=u;<PW>=p")).unwrap();
+    fn adonet_only_keywords_are_unknown() {
+        // msodbcsql's ODBC parser does NOT recognize `Initial Catalog`, `User Id`,
+        // or `Password` (those are ADO.NET / OLE DB spellings). They are treated as
+        // unknown keys: the mapped field stays unset and a warning is raised.
+        let (p, warn) =
+            parse_connection_string("Server=host;Initial Catalog=mydb;UID=u;PWD=p").unwrap();
+        assert!(warn);
         assert_eq!(p.database, "");
 
-        let (p, ..) = parse_connection_string(&cs("Server=host;UID=u;<PW>=p;")).unwrap();
-        assert_eq!(p.server, "host");
+        let (p, warn) = parse_connection_string("Server=host;User Id=admin;PWD=p").unwrap();
+        assert!(warn);
+        assert_eq!(p.uid, "");
 
-        let (p, ..) = parse_connection_string(&cs("Server=host;;;UID=u;;<PW>=p")).unwrap();
+        let (p, warn) = parse_connection_string("Server=host;UID=u;Password=p").unwrap();
+        assert!(warn);
+        assert_eq!(p.pwd, "");
+    }
+
+    #[test]
+    fn separator_and_empty_edge_cases() {
+        let (p, warn) = parse_connection_string("").unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "");
+
+        // Empty value mid-string is fine (only end-of-string right after '=' stops).
+        let (p, warn) = parse_connection_string(&cs("Server=host;Database=;UID=u;<PW>=p")).unwrap();
+        assert!(!warn);
+        assert_eq!(p.database, "");
         assert_eq!(p.uid, "u");
 
-        let (p, ..) =
-            parse_connection_string(&cs(" Server = host ; UID = user ; <PW> = pass ")).unwrap();
+        // Trailing separator is skipped cleanly.
+        let (p, warn) = parse_connection_string(&cs("Server=host;UID=u;<PW>=p;")).unwrap();
+        assert!(!warn);
         assert_eq!(p.server, "host");
-        assert_eq!(p.uid, "user");
-        assert_eq!(p.pwd, "pass");
+
+        // Runs of separators are skipped.
+        let (p, warn) = parse_connection_string(&cs("Server=host;;;UID=u;;<PW>=p")).unwrap();
+        assert!(!warn);
+        assert_eq!(p.uid, "u");
+
+        // Leading separators are skipped.
+        let (p, warn) = parse_connection_string(&cs(";;Server=host;UID=u;<PW>=p")).unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "host");
+    }
+
+    #[test]
+    fn whitespace_is_not_trimmed() {
+        // msodbcsql skips only leading whitespace before a key. Trailing space in a
+        // key (before '=') stays part of the key, so it no longer matches; spaces in
+        // a value are preserved verbatim.
+        let (p, warn) =
+            parse_connection_string(&cs(" Server = host ; UID = user ; <PW> = pass ")).unwrap();
+        assert!(warn); // "Server ", " UID ", " PWD " are all unknown
+        assert_eq!(p.server, "");
+        assert_eq!(p.uid, "");
+        assert_eq!(p.pwd, "");
+
+        // With exact keys, values keep their surrounding spaces.
+        let (p, warn) = parse_connection_string("Server= host ;UID=u;PWD=p").unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, " host ");
     }
 
     #[test]
@@ -493,13 +635,16 @@ mod tests {
 
     #[test]
     fn malformed_tokens_set_warning() {
-        // No '=' separator
+        // A token without its own '=' merges with the following text (the key scan
+        // reads through ';'). Here the key becomes "bogus;UID", so UID is swallowed
+        // and never set; PWD still parses afterwards.
         let (p, warn) = parse_connection_string(&cs("Server=h;bogus;UID=u;<PW>=p")).unwrap();
         assert!(warn);
         assert_eq!(p.server, "h");
-        assert_eq!(p.uid, "u");
+        assert_eq!(p.uid, "");
+        assert_eq!(p.pwd, "p");
 
-        // Empty key (=value with no key)
+        // Empty key (value with no key) warns but parsing continues past it.
         let (p, warn) = parse_connection_string(&cs("Server=h;=orphan;UID=u;<PW>=p")).unwrap();
         assert!(warn);
         assert_eq!(p.uid, "u");
@@ -598,12 +743,19 @@ mod tests {
     }
 
     #[test]
-    fn authentication_empty_is_reset_ok() {
-        // Empty Authentication is an intentional reset (mssql-tds treats it as
-        // recognized); stored as Some("") to preserve the distinction from unset.
-        let (p, warn) = parse_connection_string("Server=h;UID=u;PWD=p;Authentication=").unwrap();
+    fn authentication_empty_reset_vs_end_of_string() {
+        // Empty Authentication mid-string is an intentional reset (mssql-tds treats
+        // it as recognized); stored as Some("") to preserve the distinction from unset.
+        let (p, warn) =
+            parse_connection_string("Server=h;Authentication=;UID=u;PWD=p").unwrap();
         assert_eq!(p.authentication.as_deref(), Some(""));
         assert!(!warn);
+
+        // But `Authentication=` at the very end of the string hits end-of-input right
+        // after '=' — msodbcsql stops with S_FALSE and the value is never set.
+        let (p, warn) = parse_connection_string("Server=h;UID=u;PWD=p;Authentication=").unwrap();
+        assert_eq!(p.authentication, None);
+        assert!(warn);
     }
 
     #[test]
@@ -693,5 +845,183 @@ mod tests {
         assert!(s.contains("Trusted_Connection=yes"));
         assert!(s.contains("PWD=******"));
         assert!(!s.contains("secret"));
+    }
+
+    // ── Exhaustive msodbcsql `ParseAttrStr` fidelity quirks ──────────────
+
+    #[test]
+    fn key_scan_reads_through_separator() {
+        // A token without its own '=' merges with following text: the key scan does
+        // not stop on ';'. Here the key is "foo;Server", so Server is never set.
+        let (p, warn) = parse_connection_string("foo;Server=host;UID=u;PWD=p").unwrap();
+        assert!(warn);
+        assert_eq!(p.server, "");
+        assert_eq!(p.uid, "u");
+    }
+
+    #[test]
+    fn missing_equals_stops_parsing() {
+        // No '=' in the remainder → S_FALSE, stop. Everything parsed so far is kept,
+        // but nothing after the malformed tail is parsed.
+        let (p, warn) = parse_connection_string("Server=host;UID=u;trailingjunk").unwrap();
+        assert!(warn);
+        assert_eq!(p.server, "host");
+        assert_eq!(p.uid, "u");
+        assert_eq!(p.pwd, "");
+    }
+
+    #[test]
+    fn missing_value_at_end_stops_parsing() {
+        // End-of-input immediately after '=' → S_FALSE, stop with the value unset.
+        let (p, warn) = parse_connection_string("Server=host;UID=u;Database=").unwrap();
+        assert!(warn);
+        assert_eq!(p.server, "host");
+        assert_eq!(p.uid, "u");
+        assert_eq!(p.database, "");
+    }
+
+    #[test]
+    fn empty_value_midstring_is_not_a_stop() {
+        // An empty value is fine when a ';' (not end-of-input) follows the '='.
+        let (p, warn) = parse_connection_string("Server=host;Database=;UID=u;PWD=p").unwrap();
+        assert!(!warn);
+        assert_eq!(p.database, "");
+        assert_eq!(p.uid, "u");
+        assert_eq!(p.pwd, "p");
+    }
+
+    #[test]
+    fn braced_double_brace_escape() {
+        // '}}' inside a braced value is a literal '}'.
+        let (p, warn) = parse_connection_string("Server=h;PWD={a}}b};UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.pwd, "a}b");
+        assert_eq!(p.uid, "u");
+
+        // Multiple escapes.
+        let (p, warn) = parse_connection_string("Server=h;PWD={p}}}}q};UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.pwd, "p}}q");
+        assert_eq!(p.uid, "u");
+    }
+
+    #[test]
+    fn braced_value_preserves_separators_and_equals() {
+        let (p, warn) = parse_connection_string("Server=h;PWD={a;b=c d};UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.pwd, "a;b=c d");
+        assert_eq!(p.uid, "u");
+    }
+
+    #[test]
+    fn junk_after_braced_value_stops_parsing() {
+        // A braced value must be followed by ';' or end-of-input. Trailing junk after
+        // '}' stops parsing with a warning — the value is still stored first.
+        let (p, warn) = parse_connection_string("Server=h;PWD={val}junk;UID=u").unwrap();
+        assert!(warn);
+        assert_eq!(p.pwd, "val");
+        assert_eq!(p.uid, ""); // parsing stopped, UID never reached
+    }
+
+    #[test]
+    fn braced_value_at_end_of_string() {
+        let (p, warn) = parse_connection_string("Server=h;UID=u;PWD={secret}").unwrap();
+        assert!(!warn);
+        assert_eq!(p.pwd, "secret");
+    }
+
+    #[test]
+    fn unterminated_brace_swallows_rest_and_stops() {
+        let (p, warn) = parse_connection_string("Server=h;PWD={abc;UID=u").unwrap();
+        assert!(warn);
+        assert_eq!(p.pwd, "abc;UID=u");
+        assert_eq!(p.uid, "");
+    }
+
+    #[test]
+    fn brace_not_at_value_start_is_literal() {
+        // '{' is only special as the first character of the value.
+        let (p, warn) = parse_connection_string("Server=h;UID=u;PWD=a{b}c").unwrap();
+        assert!(!warn);
+        assert_eq!(p.pwd, "a{b}c");
+    }
+
+    #[test]
+    fn recognized_but_ignored_keys_do_not_warn() {
+        for key in [
+            "Driver", "DSN", "APP", "WSID", "Language", "Network", "Address",
+            "MARS_Connection", "AutoTranslate", "QuotedId", "ApplicationIntent",
+            "MultiSubnetFailover", "ConnectRetryCount", "PacketSize", "ColumnEncryption",
+            "TransparentNetworkIPResolution", "OEMToANSI",
+        ] {
+            let s = format!("Server=h;{key}=whatever;UID=u;PWD=p");
+            let (p, warn) = parse_connection_string(&s).unwrap();
+            assert!(!warn, "recognized-but-ignored key should not warn: {key}");
+            assert_eq!(p.server, "h", "key {key}");
+            assert_eq!(p.uid, "u", "key {key}");
+        }
+    }
+
+    #[test]
+    fn unknown_keys_warn_but_never_fail() {
+        let (p, warn) = parse_connection_string("Server=h;TotallyMadeUp=1;UID=u;PWD=p").unwrap();
+        assert!(warn);
+        assert_eq!(p.server, "h");
+        assert_eq!(p.uid, "u");
+        assert_eq!(p.pwd, "p");
+    }
+
+    #[test]
+    fn duplicate_recognized_key_first_wins() {
+        let (p, warn) =
+            parse_connection_string("Server=first;Server=second;UID=a;UID=b;PWD=p").unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "first");
+        assert_eq!(p.uid, "a");
+    }
+
+    #[test]
+    fn invalid_value_is_hard_error_not_warning() {
+        // Encrypt is a validated key; an invalid value is E_FAIL (Err), not a warning.
+        let err = parse_connection_string("Server=h;UID=u;PWD=p;Encrypt=banana").unwrap_err();
+        assert_eq!(err.key, "encrypt");
+        assert_eq!(err.value, "banana");
+
+        let err =
+            parse_connection_string("Server=h;Trusted_Connection=maybe;UID=u").unwrap_err();
+        assert_eq!(err.key, "trusted_connection");
+        assert_eq!(err.value, "maybe");
+    }
+
+    #[test]
+    fn value_validation_is_case_insensitive() {
+        let (p, warn) = parse_connection_string("Server=h;Encrypt=STRICT;UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.encrypt.as_deref(), Some("STRICT"));
+
+        let (p, ..) = parse_connection_string("Server=h;TrustServerCertificate=YES;UID=u").unwrap();
+        assert!(p.trust_server_certificate);
+    }
+
+    #[test]
+    fn only_ascii_odbc_whitespace_is_skipped_before_key() {
+        // Tab / newline / CR before a key are skipped like a space.
+        let (p, warn) = parse_connection_string("Server=h;\t\r\nUID=u;PWD=p").unwrap();
+        assert!(!warn);
+        assert_eq!(p.uid, "u");
+
+        // A non-breaking space is NOT ODBC whitespace, so it becomes part of the key.
+        let (p, warn) = parse_connection_string("Server=h;\u{00a0}UID=u;PWD=p").unwrap();
+        assert!(warn);
+        assert_eq!(p.uid, "");
+    }
+
+    #[test]
+    fn empty_and_separator_only_inputs() {
+        for input in ["", ";", ";;;", "   ", " ; ; "] {
+            let (p, warn) = parse_connection_string(input).unwrap();
+            assert!(!warn, "input {input:?} should not warn");
+            assert_eq!(p.server, "", "input {input:?}");
+        }
     }
 }
