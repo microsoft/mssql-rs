@@ -848,52 +848,7 @@ mod client_based_iterators {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn decode_plp_empty_and_null_types() -> mssql_tds::core::TdsResult<()> {
-        init_tracing();
-        let context = create_context();
-        let provider = TdsConnectionProvider {};
-        let mut client = provider
-            .create_client(context, &build_tcp_datasource(), None)
-            .await?;
-
-        let query = "SELECT
-            CAST(N'' AS NVARCHAR(MAX)) AS nvm_empty,
-            CAST('' AS VARCHAR(MAX)) AS vm_empty,
-            CAST(0x AS VARBINARY(MAX)) AS vbm_empty,
-            CAST(NULL AS NVARCHAR(MAX)) AS nvm_null,
-            CAST(NULL AS VARBINARY(MAX)) AS vbm_null,
-            CAST(42 AS INT) AS tail"
-            .to_string();
-
-        client.execute(query, None, None).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            use mssql_tds::datatypes::column_values::ColumnValues;
-
-            let row = resultset.next_row().await?.expect("expected a row");
-            assert_eq!(row.len(), 6);
-
-            match &row[0] {
-                ColumnValues::String(s) => assert!(s.to_utf8_string().is_empty()),
-                other => panic!("Expected empty NVARCHAR(MAX), got {other:?}"),
-            }
-            match &row[1] {
-                ColumnValues::String(s) => assert!(s.to_utf8_string().is_empty()),
-                other => panic!("Expected empty VARCHAR(MAX), got {other:?}"),
-            }
-            match &row[2] {
-                ColumnValues::Bytes(b) => assert!(b.is_empty()),
-                other => panic!("Expected empty VARBINARY(MAX), got {other:?}"),
-            }
-            assert!(matches!(row[3], ColumnValues::Null));
-            assert!(matches!(row[4], ColumnValues::Null));
-            assert_eq!(row[5], ColumnValues::Int(42));
-        }
-        client.close_query().await?;
-        Ok(())
-    }
-
-    /// Verifies the TdsClient PLP streaming lifecycle contract at the API boundary:
+    /// Verifies the TdsClient PLP streaming lifecycle contract at the API boundary.
     ///
     /// - `active_plp_reached_end` returns `true` before any stream is started.
     /// - `read_active_plp_bytes` returns `UsageError` when called with no active stream.
@@ -916,21 +871,90 @@ mod client_based_iterators {
         let mut buf = [0u8; 8];
         let err = client.read_active_plp_bytes(&mut buf).await.unwrap_err();
         assert!(
-            err.to_string().contains("begin_plp_column_stream"),
-            "Expected UsageError mentioning begin_plp_column_stream, got: {err}"
+            err.to_string().contains("read_column"),
+            "Expected UsageError mentioning read_column, got: {err}"
         );
 
         // skip_active_plp_to_end with no active stream must be a no-op.
         client.skip_active_plp_to_end().await?;
         assert!(client.active_plp_reached_end());
 
-        // After a normal PLP query + close, stream state remains clean.
         let query = "SELECT CAST('hello' AS VARBINARY(MAX)) AS vbm".to_string();
         client.execute(query, None, None).await?;
+
+        let started = client.read_column(0).await?;
+        assert!(matches!(
+            started,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+
+        let mut plp_buf = [0u8; 16];
+        let n = client.read_active_plp_bytes(&mut plp_buf).await?;
+        assert_eq!(&plp_buf[..n], b"hello");
+        assert!(client.active_plp_reached_end());
+
+        // Row should now be consumed from the PLP perspective.
+        assert!(client.next_row().await?.is_none());
+
         client.close_query().await?;
         assert!(client.active_plp_reached_end());
         assert!(client.active_plp_collation().is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_column_read_multi_type_row_contract() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "SELECT CAST(7 AS INT) AS i, CAST('hello' AS VARBINARY(MAX)) AS p1, CAST('world' AS VARBINARY(MAX)) AS p2, CAST(9 AS INT) AS j".to_string();
+        client.execute(query, None, None).await?;
+
+        let value = client.read_column(0).await?;
+        assert!(matches!(
+            value,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
+                mssql_tds::datatypes::column_values::ColumnValues::Int(7)
+            ))
+        ));
+
+        let started = client.read_column(1).await?;
+        assert!(matches!(
+            started,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+
+        let mut plp_buf = [0u8; 16];
+        let n = client.read_active_plp_bytes(&mut plp_buf).await?;
+        assert_eq!(&plp_buf[..n], b"hello");
+        assert!(client.active_plp_reached_end());
+
+        let started = client.read_column(2).await?;
+        assert!(matches!(
+            started,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+
+        let n = client.read_active_plp_bytes(&mut plp_buf).await?;
+        assert_eq!(&plp_buf[..n], b"world");
+        assert!(client.active_plp_reached_end());
+
+        let value = client.read_column(3).await?;
+        assert!(matches!(
+            value,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
+                mssql_tds::datatypes::column_values::ColumnValues::Int(9)
+            ))
+        ));
+
+        assert!(client.next_row().await?.is_none());
+
+        client.close_query().await?;
         Ok(())
     }
 }

@@ -1003,7 +1003,7 @@ impl GenericDecoder {
     /// [`RowWriter`], bypassing the intermediate `ColumnValues` enum for
     /// common types. Rare types (XML, JSON, Vector, Image, UDT, SsVariant)
     /// fall back to `decode()` + `write_column_value()`.
-    pub(crate) async fn decode_into<T, W>(
+    pub(crate) async fn decode_into<T, W: ?Sized>(
         &self,
         reader: &mut T,
         metadata: &ColumnMetadata,
@@ -1012,7 +1012,7 @@ impl GenericDecoder {
     ) -> TdsResult<()>
     where
         T: TdsPacketReader + Send + Sync,
-        W: RowWriter + ?Sized,
+        W: RowWriter,
     {
         match metadata.data_type {
             // === Fixed-length integer types ===
@@ -1584,7 +1584,7 @@ impl StringDecoder {
         matches!(data_type, TdsDataType::NText | TdsDataType::Text)
     }
 
-    async fn decode_string_into<T, W>(
+    async fn decode_string_into<T, W: ?Sized>(
         &self,
         reader: &mut T,
         metadata: &ColumnMetadata,
@@ -1593,7 +1593,7 @@ impl StringDecoder {
     ) -> TdsResult<()>
     where
         T: TdsPacketReader + Send + Sync,
-        W: RowWriter + ?Sized,
+        W: RowWriter,
     {
         let encoding_type = get_encoding_type(metadata);
 
@@ -3569,6 +3569,7 @@ mod test {
                 },
                 column_name: "col".to_string(),
                 multi_part_name: None,
+                crypto_metadata: None,
             }
         }
 

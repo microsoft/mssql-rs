@@ -35,7 +35,7 @@ use crate::{
     handler::handler_factory::NegotiatedSettings,
     io::token_stream::{ParserContext, RowReadResult},
     message::{batch::SqlBatch, messages::Request},
-    token::tokens::{ColMetadataToken, CurrentCommand, EnvChangeTokenSubType, Tokens},
+    token::tokens::{ColMetadataToken, CurrentCommand, EnvChangeTokenSubType, TokenType, Tokens},
 };
 use async_trait::async_trait;
 use tracing::{debug, error, info, instrument};
@@ -44,9 +44,26 @@ use crate::{
     core::{CancelHandle, TdsResult},
     query::metadata::ColumnMetadata,
 };
+use crate::datatypes::decoder::{GenericDecoder, SqlTypeDecode};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[derive(Debug)]
+struct ActiveRowTail {
+    first_column_index: usize,
+    next_column_index: usize,
+    columns: Vec<ColumnMetadata>,
+    nbc_null_bitmap: Option<Vec<u8>>,
+}
+
+/// Result of reading a single column through the incremental row API.
+#[derive(Debug, PartialEq, Clone)]
+pub enum ColumnReadResult {
+    /// Fully materialized non-PLP value, or SQL `NULL`.
+    Value(ColumnValues),
+    /// A PLP payload is now active and can be consumed through `read_active_plp_bytes`.
+    ActivePlpStream,
+}
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -77,6 +94,10 @@ pub struct TdsClient {
     /// Holds a partially-consumed PLP column stream for incremental msodbcsql-style reads.
     /// `None` when no stream is active or after the stream has been fully consumed.
     active_plp_stream: Option<crate::datatypes::decoder::PlpColumnStream>,
+
+    /// Tracks trailing columns in the current row after a column-by-column read starts.
+    /// These columns must be consumed or drained before the next row is read.
+    active_row_tail: Option<ActiveRowTail>,
 }
 
 impl TdsClient {
@@ -110,7 +131,140 @@ impl TdsClient {
             cancel_handle: None,
             empty_metadata: Vec::new(),
             active_plp_stream: None,
+            active_row_tail: None,
         }
+    }
+
+    #[inline]
+    fn nbc_column_is_null(bitmap: &[u8], column_index: usize) -> bool {
+        let byte_index = column_index / 8;
+        let bit_index = column_index % 8;
+        bitmap
+            .get(byte_index)
+            .map(|b| (b & (1 << bit_index)) != 0)
+            .unwrap_or(false)
+    }
+
+    async fn drain_plp_context_if_any(&mut self) -> TdsResult<()> {
+        if let Some(mut prev_stream) = self.active_plp_stream.take() {
+            if !prev_stream.reached_end() {
+                prev_stream
+                    .skip_to_end(self.transport.as_packet_reader())
+                    .await?;
+            }
+        }
+
+        self.drain_active_row_tail().await
+    }
+
+    async fn decode_column_value(&mut self, metadata: &ColumnMetadata) -> TdsResult<ColumnValues> {
+        let decoder = GenericDecoder::default();
+        let packet_reader = self.transport.as_packet_reader();
+        let mut reader = packet_reader;
+        decoder.decode(&mut reader, metadata).await
+    }
+
+    async fn decode_and_discard_column(&mut self, metadata: &ColumnMetadata) -> TdsResult<()> {
+        let _ = self.decode_column_value(metadata).await?;
+        Ok(())
+    }
+
+    async fn drain_active_row_tail(&mut self) -> TdsResult<()> {
+        let Some(tail) = self.active_row_tail.take() else {
+            return Ok(());
+        };
+
+        for column_index in tail.next_column_index..(tail.first_column_index + tail.columns.len()) {
+            if let Some(bitmap) = tail.nbc_null_bitmap.as_ref()
+                && Self::nbc_column_is_null(bitmap, column_index)
+            {
+                continue;
+            }
+            let metadata = &tail.columns[column_index - tail.first_column_index];
+            self.decode_and_discard_column(metadata).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn read_positioned_column(
+        &mut self,
+        metadata: &ColumnMetadata,
+    ) -> TdsResult<ColumnReadResult> {
+        if metadata.is_plp() {
+            let is_non_null = self.begin_positioned_plp_column_stream(metadata).await?;
+            if is_non_null {
+                Ok(ColumnReadResult::ActivePlpStream)
+            } else {
+                Ok(ColumnReadResult::Value(ColumnValues::Null))
+            }
+        } else {
+            Ok(ColumnReadResult::Value(
+                self.decode_column_value(metadata).await?,
+            ))
+        }
+    }
+
+    async fn read_column_from_active_row(
+        &mut self,
+        column_index: usize,
+    ) -> TdsResult<Option<ColumnReadResult>> {
+        let Some(mut tail) = self.active_row_tail.take() else {
+            return self.read_next_row_column(column_index).await;
+        };
+
+        let row_end_column_index = tail.first_column_index + tail.columns.len();
+        if column_index < tail.first_column_index || column_index >= row_end_column_index {
+            self.active_row_tail = Some(tail);
+            return Err(UsageError(
+                format!(
+                    "Column index {column_index} is not available in the active row tail; call read_next_row_column to advance to the next row"
+                ),
+            ));
+        }
+
+        if column_index < tail.next_column_index {
+            let next_column_index = tail.next_column_index;
+            self.active_row_tail = Some(tail);
+            return Err(UsageError(
+                format!(
+                    "Column index {column_index} has already been consumed in the active row; next available column is {}",
+                    next_column_index
+                ),
+            ));
+        }
+
+        let target_offset = column_index - tail.first_column_index;
+        let target_col = tail.columns[target_offset].clone();
+
+        for skip_index in tail.next_column_index..column_index {
+            if let Some(bitmap) = tail.nbc_null_bitmap.as_ref()
+                && Self::nbc_column_is_null(bitmap, skip_index)
+            {
+                continue;
+            }
+
+            let metadata = &tail.columns[skip_index - tail.first_column_index];
+            self.decode_and_discard_column(metadata).await?;
+        }
+
+        tail.next_column_index = column_index + 1;
+        let has_more_columns = tail.next_column_index < row_end_column_index;
+        let is_null = tail
+            .nbc_null_bitmap
+            .as_ref()
+            .map(|bitmap| Self::nbc_column_is_null(bitmap, column_index))
+            .unwrap_or(false);
+
+        if has_more_columns {
+            self.active_row_tail = Some(tail);
+        }
+
+        if is_null {
+            return Ok(Some(ColumnReadResult::Value(ColumnValues::Null)));
+        }
+
+        Ok(Some(self.read_positioned_column(&target_col).await?))
     }
 
     /// Attempt to reconnect a dead connection by replaying session state.
@@ -1394,6 +1548,7 @@ impl TdsClient {
                     .await?;
             }
         }
+        self.drain_active_row_tail().await?;
         if self.current_metadata.is_none() {
             return Err(UsageError(
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
@@ -1537,6 +1692,7 @@ impl TdsClient {
         self.cancel_handle = None;
         self.execution_context.set_has_open_batch(false);
         self.active_plp_stream = None;
+        self.active_row_tail = None;
         Ok(())
     }
 
@@ -1544,21 +1700,129 @@ impl TdsClient {
     // PLP column streaming – incremental read support for msodbcsql style PLP streaming
     // -----------------------------------------------------------------------
 
+    /// Reads the next row token boundary and returns `column_index` from that row.
+    ///
+    /// Any columns before `column_index` in the same row are decoded and discarded to
+    /// position the transport at the requested column. Remaining columns stay resumable
+    /// in the active row so callers can continue with [`read_column`](Self::read_column).
+    /// Returns:
+    /// - `Ok(Some(ColumnReadResult::Value(_)))` for non-PLP values and SQL `NULL`,
+    /// - `Ok(Some(ColumnReadResult::ActivePlpStream))` for non-NULL PLP payloads,
+    /// - `Err(...)` for non-row tokens or invalid metadata/indices.
+    async fn read_next_row_column(
+        &mut self,
+        column_index: usize,
+    ) -> TdsResult<Option<ColumnReadResult>> {
+        self.drain_plp_context_if_any().await?;
+
+        let metadata = self.current_metadata.as_ref().ok_or(UsageError(
+            "No metadata found while starting a column read. Have you called execute()?"
+                .to_string(),
+        ))?;
+
+        if column_index >= metadata.columns.len() {
+            return Err(UsageError(
+                format!(
+                    "Column index {column_index} out of bounds for result set with {} columns",
+                    metadata.columns.len()
+                ),
+            ));
+        }
+
+        let target_col = metadata.columns[column_index].clone();
+        let row_columns = metadata.columns.clone();
+        let trailing_columns = if column_index + 1 < row_columns.len() {
+            row_columns[column_index + 1..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let token_type_byte = self.transport.as_packet_reader().read_byte().await?;
+        let token_type: TokenType = token_type_byte.try_into()?;
+        match token_type {
+            TokenType::Row => {
+                for metadata in row_columns.iter().take(column_index) {
+                    self.decode_and_discard_column(metadata).await?;
+                }
+
+                let value = self.read_positioned_column(&target_col).await?;
+                if !trailing_columns.is_empty() {
+                    self.active_row_tail = Some(ActiveRowTail {
+                        first_column_index: column_index + 1,
+                        next_column_index: column_index + 1,
+                        columns: trailing_columns,
+                        nbc_null_bitmap: None,
+                    });
+                }
+                Ok(Some(value))
+            }
+            TokenType::NbcRow => {
+                let bitmap_len = row_columns.len().div_ceil(8);
+                let mut bitmap = vec![0u8; bitmap_len];
+                self.transport.as_packet_reader().read_bytes(&mut bitmap).await?;
+
+                for (idx, metadata) in row_columns.iter().take(column_index).enumerate() {
+                    if Self::nbc_column_is_null(&bitmap, idx) {
+                        continue;
+                    }
+                    self.decode_and_discard_column(metadata).await?;
+                }
+
+                if !trailing_columns.is_empty() {
+                    self.active_row_tail = Some(ActiveRowTail {
+                        first_column_index: column_index + 1,
+                        next_column_index: column_index + 1,
+                        columns: trailing_columns,
+                        nbc_null_bitmap: Some(bitmap.clone()),
+                    });
+                }
+
+                if Self::nbc_column_is_null(&bitmap, column_index) {
+                    Ok(Some(ColumnReadResult::Value(ColumnValues::Null)))
+                } else {
+                    let value = self.read_positioned_column(&target_col).await?;
+                    Ok(Some(value))
+                }
+            }
+            other => Err(UsageError(format!(
+                "Expected ROW/NBCROW token before column read, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Reads `column_index` from the active row when present, otherwise from the next row.
+    ///
+    /// If a prior column in the current row was already consumed, this resumes the same
+    /// row, skips any intervening columns, and reads the requested later column.
+    /// Otherwise it advances to the next row and reads that column there.
+    ///
+    /// Returns:
+    /// - `Ok(None)` when no next row is available,
+    /// - `Ok(Some(ColumnReadResult::Value(_)))` for non-PLP values and SQL `NULL`,
+    /// - `Ok(Some(ColumnReadResult::ActivePlpStream))` for non-NULL PLP payloads.
+    pub async fn read_column(
+        &mut self,
+        column_index: usize,
+    ) -> TdsResult<Option<ColumnReadResult>> {
+        if let Some(mut prev) = self.active_plp_stream.take() {
+            if !prev.reached_end() {
+                prev.skip_to_end(self.transport.as_packet_reader()).await?;
+            }
+        }
+
+        if self.active_row_tail.is_some() {
+            return self.read_column_from_active_row(column_index).await;
+        }
+
+        self.read_next_row_column(column_index).await
+    }
+
     /// Reads the 8-byte PLP length/sentinel header at the current transport
     /// position and begins an incremental PLP column read.
-    ///
-    /// Must be called when the transport is positioned at the start of a PLP
-    /// column's data (i.e., during a custom column-by-column row read loop).
-    /// After this call, use [`read_active_plp_bytes`](Self::read_active_plp_bytes) to
-    /// consume data and [`skip_active_plp_to_end`](Self::skip_active_plp_to_end) to
-    /// drain any remaining bytes before advancing to the next row.
-    ///
-    /// Returns `true` if the column is non-NULL, `false` if it is SQL NULL.
-    pub async fn begin_plp_column_stream(
+    async fn begin_positioned_plp_column_stream(
         &mut self,
         metadata: &ColumnMetadata,
     ) -> TdsResult<bool> {
-        // Drain any previously active stream before starting a new one.
         if let Some(mut prev) = self.active_plp_stream.take() {
             if !prev.reached_end() {
                 prev.skip_to_end(self.transport.as_packet_reader()).await?;
@@ -1580,19 +1844,21 @@ impl TdsClient {
     /// exhausted (`reached_end` is `true`).
     ///
     /// Returns [`UsageError`](crate::error::Error::UsageError) if no stream is
-    /// active — call [`begin_plp_column_stream`](Self::begin_plp_column_stream) first.
+    /// active — call [`read_column`](Self::read_column) first.
     pub async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
         let mut stream = match self.active_plp_stream.take() {
             Some(s) => s,
             None => return Err(UsageError(
-                "read_active_plp_bytes called with no active PLP stream; call begin_plp_column_stream first".to_string(),
+                "read_active_plp_bytes called with no active PLP stream; call read_column first".to_string(),
             )),
         };
         let result = stream
             .read_into(self.transport.as_packet_reader(), out)
             .await;
         self.active_plp_stream = Some(stream);
-        result
+        let bytes_read = result?;
+
+        Ok(bytes_read)
     }
 
     /// Returns `true` after all payload bytes and the terminator of the active
@@ -2441,8 +2707,8 @@ mod tests {
         let mut buf = [0u8; 4];
         let err = client.read_active_plp_bytes(&mut buf).await.unwrap_err();
         assert!(
-            err.to_string().contains("begin_plp_column_stream"),
-            "Expected UsageError mentioning begin_plp_column_stream, got: {err}"
+            err.to_string().contains("read_column"),
+            "Expected UsageError mentioning read_column, got: {err}"
         );
     }
 
