@@ -4,7 +4,7 @@
 //! Bulk-insert benchmark via the `BulkCopy` builder.
 //!
 //! Inserts `BENCH_BULK_ROWS` rows (default 10,000) into a session temp table
-//! across batch sizes 50 / 500 / 5,000. The table is truncated in un-measured
+//! across batch sizes 500 / 5,000. The table is truncated in un-measured
 //! setup before each measured insert, so it does not grow across iterations and
 //! the truncate round-trip is excluded from the timing.
 
@@ -94,7 +94,7 @@ fn bulk_insert(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("bulk_insert");
     group.throughput(Throughput::Elements(rows_count));
-    for batch_size in [50usize, 500, 5_000] {
+    for batch_size in [500usize, 5_000] {
         group.bench_with_input(
             BenchmarkId::from_parameter(batch_size),
             &batch_size,
