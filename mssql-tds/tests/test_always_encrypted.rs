@@ -1042,6 +1042,81 @@ mod always_encrypted {
         });
     }
 
+    /// A prepared statement with two encrypted parameters executed with one value
+    /// supplied positionally and the other by name: both must be encrypted in a
+    /// single pass. Regression for the two-list double-apply bug, where each list
+    /// was described separately and the parameter in the other list was reported
+    /// as "not supplied".
+    #[tokio::test]
+    async fn sp_execute_encrypts_mixed_positional_and_named_parameters() {
+        ae_test!(|h| {
+            let enc = h.enc_clause("DETERMINISTIC");
+            let table = h
+                .create_table(&format!(
+                    "id INT IDENTITY(1,1) PRIMARY KEY, a INT {enc} NULL, b INT {enc} NULL"
+                ))
+                .await;
+            let decls = vec![
+                RpcParameter::new(
+                    Some("@a".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(None),
+                ),
+                RpcParameter::new(
+                    Some("@b".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(None),
+                ),
+            ];
+            let handle = h
+                .client
+                .execute_sp_prepare(
+                    format!("INSERT INTO {table} (a, b) VALUES (@a, @b);"),
+                    decls,
+                    None,
+                    None,
+                )
+                .await
+                .expect("sp_prepare two encrypted params");
+
+            // @a supplied positionally (ordinal 1); @b supplied by name.
+            let positional = vec![RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::Int(Some(11)),
+            )];
+            let named = vec![RpcParameter::new(
+                Some("@b".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(22)),
+            )];
+            h.client
+                .execute_sp_execute(handle, Some(positional), Some(named), None, None)
+                .await
+                .expect("sp_execute with mixed positional and named encrypted params");
+            while h.client.move_to_next().await.unwrap() {}
+            h.client.close_query().await.unwrap();
+
+            h.client
+                .execute_sp_unprepare(handle, None, None)
+                .await
+                .expect("unprepare");
+
+            let rows = h.query_rows(&format!("SELECT a, b FROM {table};"), 2).await;
+            assert_eq!(rows.len(), 1, "expected one row");
+            assert!(
+                matches!(rows[0][0], ColumnValues::Int(11)),
+                "a {:?}",
+                rows[0][0]
+            );
+            assert!(
+                matches!(rows[0][1], ColumnValues::Int(22)),
+                "b {:?}",
+                rows[0][1]
+            );
+        });
+    }
+
     /// `sp_execute` with parameters under Always Encrypted requires the handle to
     /// have been prepared on this connection (so its parameter-encryption metadata
     /// is cached). An unknown handle must error rather than send plaintext.

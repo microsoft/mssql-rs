@@ -284,6 +284,10 @@ impl TdsClient {
                     self.current_metadata = None;
                     self.count_map.clear();
                     self.return_values.clear();
+                    // Prepared-statement handles do not survive a reconnect, so
+                    // drop their cached Always Encrypted metadata to avoid
+                    // encrypting a later sp_execute with a stale describe result.
+                    self.prepared_param_encryption.clear();
                     self.current_result_set_has_been_read_till_end = false;
                     self.remaining_request_timeout = None;
                     self.cancel_handle = None;
@@ -1302,9 +1306,6 @@ impl TdsClient {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
-        // Drop any cached Always Encrypted parameter metadata for this handle.
-        self.prepared_param_encryption.remove(&handle);
-
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -1342,6 +1343,11 @@ impl TdsClient {
         if !server_errors.is_empty() {
             return Err(crate::error::Error::from_sql_errors(server_errors));
         }
+        // The handle is now released on the server; drop its cached Always
+        // Encrypted metadata. Done only after a successful unprepare so a failed
+        // RPC (handle possibly still valid) does not strip metadata a later
+        // sp_execute would need.
+        self.prepared_param_encryption.remove(&handle);
         Ok(())
     }
 
@@ -1513,12 +1519,18 @@ impl TdsClient {
                          executing with parameters"
                     ))
                 })?;
+            // Encrypt positional and named parameters together in one pass so a
+            // describe entry that lives in the other list is not misreported as
+            // "not supplied".
+            let mut param_refs: Vec<&mut RpcParameter> = Vec::new();
             if let Some(params) = positional_parameters.as_mut() {
-                Self::apply_parameter_encryption(&describe, &providers, &cek_cache, params).await?;
+                param_refs.extend(params.iter_mut());
             }
             if let Some(params) = named_parameters.as_mut() {
-                Self::apply_parameter_encryption(&describe, &providers, &cek_cache, params).await?;
+                param_refs.extend(params.iter_mut());
             }
+            Self::apply_parameter_encryption(&describe, &providers, &cek_cache, &mut param_refs)
+                .await?;
         }
 
         let database_collation = self.negotiated_settings.database_collation;
@@ -1956,7 +1968,8 @@ impl TdsClient {
             .await?;
 
         let (providers, cek_cache) = self.cloned_ce_key_material()?;
-        Self::apply_parameter_encryption(&describe, &providers, &cek_cache, named_params).await
+        let mut param_refs: Vec<&mut RpcParameter> = named_params.iter_mut().collect();
+        Self::apply_parameter_encryption(&describe, &providers, &cek_cache, &mut param_refs).await
     }
 
     /// Returns the describe result for a statement, serving it from the
@@ -2029,16 +2042,20 @@ impl TdsClient {
     /// Encrypts, in place, the parameters that a prior
     /// `sp_describe_parameter_encryption` call reported as requiring encryption.
     ///
-    /// Parameters are matched to the describe result by name, or by 1-based
-    /// ordinal when every supplied parameter is unnamed (the positional case used
-    /// by `sp_execute`). Each flagged parameter's CEK is unwrapped through the key
-    /// store providers, its value is normalized and encrypted, and the ciphertext
-    /// plus cipher metadata are stored on the [`RpcParameter`] for serialization.
+    /// Each describe parameter is matched to a supplied parameter by name
+    /// (case-insensitively, like a T-SQL identifier); if no name matches it falls
+    /// back to the *unnamed* parameter at the describe's 1-based ordinal (the
+    /// positional case used by `sp_execute`). Accepting one combined slice of
+    /// mutable references lets a single call cover all-named, all-positional, and
+    /// mixed positional/named parameter lists. Each flagged parameter's CEK is
+    /// unwrapped through the key store providers, its value is normalized and
+    /// encrypted, and the ciphertext plus cipher metadata are stored on the
+    /// [`RpcParameter`] for serialization.
     async fn apply_parameter_encryption(
         describe: &crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult,
         providers: &crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry,
         cek_cache: &crate::security::keystore::CekCache,
-        named_params: &mut [RpcParameter],
+        params: &mut [&mut RpcParameter],
     ) -> TdsResult<()> {
         use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
         use crate::security::encryption::encrypt_parameter;
@@ -2048,11 +2065,6 @@ impl TdsClient {
         if !describe.parameters.iter().any(|p| p.is_encrypted()) {
             return Ok(());
         }
-
-        // When every supplied parameter is unnamed they are positional and are
-        // matched to the describe result by 1-based ordinal; otherwise they are
-        // matched by name (case-insensitively, like T-SQL identifiers).
-        let positional = !named_params.is_empty() && named_params.iter().all(|p| p.name.is_none());
 
         for info in &describe.parameters {
             if !info.is_encrypted() {
@@ -2066,18 +2078,23 @@ impl TdsClient {
                 ))
             })?;
 
-            let index = if positional {
-                (info.parameter_ordinal as usize)
-                    .checked_sub(1)
-                    .filter(|&i| i < named_params.len())
-            } else {
-                named_params.iter().position(|p| {
+            // Match by name first; otherwise fall back to the unnamed parameter at
+            // this describe ordinal (the positional case). Requiring the ordinal
+            // slot to be unnamed keeps a named parameter from being matched by
+            // position.
+            let index = params
+                .iter()
+                .position(|p| {
                     p.name
                         .as_deref()
                         .map(|n| n.eq_ignore_ascii_case(&info.parameter_name))
                         .unwrap_or(false)
                 })
-            };
+                .or_else(|| {
+                    (info.parameter_ordinal as usize)
+                        .checked_sub(1)
+                        .filter(|&i| i < params.len() && params[i].name.is_none())
+                });
 
             let Some(index) = index else {
                 return Err(crate::error::Error::ColumnEncryptionError(format!(
@@ -2088,7 +2105,7 @@ impl TdsClient {
             };
 
             let plaintext_cek = decrypt_cek(providers, cek_cache, cek_entry).await?;
-            let param = &mut named_params[index];
+            let param = &mut *params[index];
 
             let ciphertext = encrypt_parameter(
                 param.value(),
