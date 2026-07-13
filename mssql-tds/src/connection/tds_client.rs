@@ -1748,20 +1748,35 @@ impl TdsClient {
     }
 
     /// Converts a RETURNVALUE token into a [`ReturnValue`], decrypting the value
-    /// when it is an encrypted Always Encrypted output parameter.
+    /// when it is an encrypted Always Encrypted output parameter and result
+    /// decryption is active for the current command.
     ///
     /// An encrypted output parameter arrives as ciphertext with `CryptoMetaData`
     /// but no CEK table; its CEK is the one resolved when the matching input
-    /// parameter was encrypted (retained in `output_param_ceks`). A plaintext
-    /// parameter is returned unchanged. Returns an error if an encrypted output
-    /// parameter has no retained CEK or did not arrive as varbinary ciphertext,
-    /// rather than surfacing ciphertext to the caller.
+    /// parameter was encrypted (retained in `output_param_ceks`). Decryption only
+    /// happens when the command's effective Column Encryption setting is
+    /// `Enabled` — under a `Disabled` or `ResultSetOnly` setting the ciphertext is
+    /// passed through unchanged, mirroring the result-column path and ensuring a
+    /// stale CEK from an earlier command is never consulted. A plaintext parameter
+    /// is returned unchanged. Returns an error if an encrypted output parameter
+    /// has no retained CEK or did not arrive as varbinary ciphertext, rather than
+    /// surfacing ciphertext to the caller.
     fn finalize_return_value(
         &self,
         token: crate::token::tokens::ReturnValueToken,
     ) -> TdsResult<ReturnValue> {
-        let Some(crypto) = token.column_metadata.crypto_metadata.as_ref() else {
-            return Ok(token.into());
+        // Only decrypt when the encrypted value carries crypto metadata and
+        // result decryption is enabled for this command. Otherwise pass the value
+        // through unchanged (plaintext, or ciphertext varbinary when encryption is
+        // disabled), consistent with how encrypted result columns are decoded.
+        let crypto = match token.column_metadata.crypto_metadata.as_ref() {
+            Some(crypto)
+                if self.effective_command_ce_setting()
+                    == ExecutionColumnEncryptionSetting::Enabled =>
+            {
+                crypto
+            }
+            _ => return Ok(token.into()),
         };
 
         let cek = self
