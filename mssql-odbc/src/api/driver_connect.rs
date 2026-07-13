@@ -223,13 +223,12 @@ fn do_connect(
     // Resolve authentication. Validate the ODBC keyword/credential combination,
     // then transform it into a concrete method with cleaned credentials. Any
     // access token was supplied before connect via SQL_COPT_SS_ACCESS_TOKEN.
-    let access_token = state.access_token.clone();
     if let Err(e) = validate_auth(
         params.authentication.as_deref(),
         params.trusted_connection,
         &params.uid,
         &params.pwd,
-        access_token.as_deref(),
+        state.access_token.as_deref(),
     ) {
         error!(%e, "SQLDriverConnectW: authentication validation failed");
         post_sql_error(state, SQLSTATE_HY024, 0, e.to_string());
@@ -240,7 +239,7 @@ fn do_connect(
         params.trusted_connection,
         &params.uid,
         &params.pwd,
-        access_token.as_deref(),
+        state.access_token.as_deref(),
     );
 
     // T1 wires SQL password, integrated (SSPI/GSSAPI), and pre-acquired access

@@ -126,11 +126,14 @@ unsafe fn sql_set_connect_attr_w_impl(
 /// `value_ptr` must point to a valid ACCESSTOKEN struct whose declared length
 /// does not exceed the allocation.
 unsafe fn decode_access_token(value_ptr: SqlPointer) -> Option<String> {
+    // Entra JWTs are only a few KB; reject an implausibly large declared length
+    // so a malformed struct fails closed instead of a huge read/allocation.
+    const MAX_ACCESS_TOKEN_BYTES: usize = 64 * 1024;
     let base = value_ptr as *const u8;
     let mut len_bytes = [0u8; 4];
     unsafe { std::ptr::copy_nonoverlapping(base, len_bytes.as_mut_ptr(), 4) };
     let data_size = u32::from_le_bytes(len_bytes) as usize;
-    if data_size == 0 || !data_size.is_multiple_of(2) {
+    if data_size == 0 || !data_size.is_multiple_of(2) || data_size > MAX_ACCESS_TOKEN_BYTES {
         return None;
     }
     let data = unsafe { std::slice::from_raw_parts(base.add(4), data_size) };
@@ -167,6 +170,14 @@ mod tests {
     fn decode_rejects_odd_length() {
         // Declared length 3 is odd -> not valid UTF-16-LE.
         let buf: Vec<u8> = vec![3, 0, 0, 0, b'a', 0, b'b'];
+        let decoded = unsafe { decode_access_token(buf.as_ptr() as SqlPointer) };
+        assert_eq!(decoded, None);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_length() {
+        // A declared length far above the cap is rejected before any read.
+        let buf: Vec<u8> = 200_000u32.to_le_bytes().to_vec();
         let decoded = unsafe { decode_access_token(buf.as_ptr() as SqlPointer) };
         assert_eq!(decoded, None);
     }
