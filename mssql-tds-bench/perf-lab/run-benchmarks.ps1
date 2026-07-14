@@ -224,3 +224,13 @@ $comparison = Get-Content (Join-Path $ResultsDir 'comparison.txt') -Raw
 Copy-Item -Recurse -Force 'target/criterion' (Join-Path $ResultsDir 'criterion') -ErrorAction SilentlyContinue
 
 Write-Host ">>> Done. Results in $ResultsDir"
+
+# Fail the run when any benchmark regressed past the threshold so the pipeline
+# surfaces it. Use `throw`, not `exit`: the scheduled-task wrapper relies on its
+# finally block to write the EXIT_CODE/DONE sentinels, and `exit` from a called
+# .ps1 terminates the whole process and would skip it (leaving run-remote to hang
+# until timeout). summary.md names the offenders; the standard triage is to
+# re-run to confirm a real regression versus run-to-run noise.
+if ($regressions.Count -gt 0) {
+    throw "PERF REGRESSION: $verdict"
+}

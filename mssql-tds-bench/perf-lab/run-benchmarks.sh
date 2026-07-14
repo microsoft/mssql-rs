@@ -218,3 +218,18 @@ VERDICT=$(awk -v thr="${BENCH_REGRESSION_RATIO:-1.10}" '
 cp -r target/criterion "$RESULTS_DIR/criterion" 2>/dev/null || true
 
 echo ">>> Done. Results in ${RESULTS_DIR}"
+
+# Fail the run when any benchmark regressed past the threshold so the pipeline
+# surfaces it. Uses the same rule as the verdict above: candidate ratio (field 6)
+# >= BENCH_REGRESSION_RATIO. summary.md (attached to the run) and the critcmp
+# table above name the offenders; the standard triage is to re-run to confirm a
+# real regression versus run-to-run noise.
+REGRESSIONS=$(awk -v thr="${BENCH_REGRESSION_RATIO:-1.10}" '
+    $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ && ($6 + 0) >= thr { n++ }
+    END { print n + 0 }
+' "$RESULTS_DIR/comparison.txt")
+if [ "${REGRESSIONS:-0}" -gt 0 ]; then
+    echo ">>> ${VERDICT}"
+    echo ">>> FAILING: ${REGRESSIONS} benchmark(s) exceeded the regression threshold (BENCH_REGRESSION_RATIO=${BENCH_REGRESSION_RATIO:-1.10})."
+    exit 1
+fi
