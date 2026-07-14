@@ -67,20 +67,20 @@ For each key/value pair, repeated until end of input:
 ```mermaid
 stateDiagram-v2
     [*] --> SkipLeading
-    SkipLeading --> ReadKey: non-space / non-';'
-    SkipLeading --> Done: end
-    ReadKey --> AfterEquals: '='
-    ReadKey --> StopWarn: end (no '=')
-    AfterEquals --> ReadBraced: '{'
-    AfterEquals --> ReadUnbraced: other
-    AfterEquals --> StopWarn: end
-    ReadBraced --> ReadBraced: '}}' escape / normal char
-    ReadBraced --> AfterBrace: single '}'
-    ReadBraced --> StopWarn: end (no '}')
-    AfterBrace --> Emit: next is ';' or end
-    AfterBrace --> StopWarn: next is other
-    ReadUnbraced --> Emit: ';' or end
-    Emit --> SkipLeading: consume ';'
+    SkipLeading --> ReadKey: non-space, non-semicolon
+    SkipLeading --> Done: end of input
+    ReadKey --> AfterEquals: equals sign
+    ReadKey --> StopWarn: end, no equals
+    AfterEquals --> ReadBraced: open brace
+    AfterEquals --> ReadUnbraced: other char
+    AfterEquals --> StopWarn: end of input
+    ReadBraced --> ReadBraced: doubled brace escape or normal char
+    ReadBraced --> AfterBrace: single close brace
+    ReadBraced --> StopWarn: end, unterminated
+    AfterBrace --> Emit: next is semicolon or end
+    AfterBrace --> StopWarn: next is junk
+    ReadUnbraced --> Emit: semicolon or end
+    Emit --> SkipLeading: consume separator
     StopWarn --> Done: set has_warnings
     Done --> [*]
 ```
