@@ -556,18 +556,17 @@ impl PyCoreCursor {
             runtime_handle.block_on(async {
                 let mut client = tds_client.lock().await;
 
-            let mut bulk_copy = BulkCopy::new(&mut client, table_name)
-                .batch_size(options.batch_size)
-                .timeout(options.timeout)
-                .check_constraints(options.check_constraints)
-                .fire_triggers(options.fire_triggers)
-                .keep_identity(options.keep_identity)
-                .keep_nulls(options.keep_nulls)
-                .table_lock(options.table_lock)
-                .use_internal_transaction(options.use_internal_transaction);
+                let mut bulk_copy = BulkCopy::new(&mut client, table_name)
+                    .batch_size(options.batch_size)
+                    .timeout(options.timeout)
+                    .check_constraints(options.check_constraints)
+                    .fire_triggers(options.fire_triggers)
+                    .keep_identity(options.keep_identity)
+                    .keep_nulls(options.keep_nulls)
+                    .table_lock(options.table_lock)
+                    .use_internal_transaction(options.use_internal_transaction);
 
-            let destination_metadata =
-                bulk_copy
+                let destination_metadata = bulk_copy
                     .retrieve_destination_metadata()
                     .await
                     .map_err(|e| {
@@ -581,61 +580,62 @@ impl PyCoreCursor {
                         ))
                     })?;
 
-            let mappings = if auto_generate_mappings {
-                let n = std::cmp::min(schema.fields().len(), destination_metadata.len());
-                (0..n)
-                    .map(|i| ColumnMapping::ByOrdinal {
-                        source: i,
-                        destination: destination_metadata[i].column_name.clone(),
-                    })
-                    .collect()
-            } else {
-                options.column_mappings
-            };
-
-            for mapping in mappings {
-                let tds_mapping = match mapping {
-                    ColumnMapping::ByName {
-                        source,
-                        destination,
-                    } => TdsColumnMapping {
-                        source: ColumnMappingSource::Name(source),
-                        destination,
-                    },
-                    ColumnMapping::ByOrdinal {
-                        source,
-                        destination,
-                    } => TdsColumnMapping {
-                        source: ColumnMappingSource::Ordinal(source),
-                        destination,
-                    },
+                let mappings = if auto_generate_mappings {
+                    let n = std::cmp::min(schema.fields().len(), destination_metadata.len());
+                    (0..n)
+                        .map(|i| ColumnMapping::ByOrdinal {
+                            source: i,
+                            destination: destination_metadata[i].column_name.clone(),
+                        })
+                        .collect()
+                } else {
+                    options.column_mappings
                 };
-                bulk_copy = bulk_copy.add_column_mapping(tds_mapping);
-            }
 
-            let resolved_mappings = bulk_copy.get_resolved_mappings().await.map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to resolve column mappings: {}",
-                    e
-                ))
-            })?;
+                for mapping in mappings {
+                    let tds_mapping = match mapping {
+                        ColumnMapping::ByName {
+                            source,
+                            destination,
+                        } => TdsColumnMapping {
+                            source: ColumnMappingSource::Name(source),
+                            destination,
+                        },
+                        ColumnMapping::ByOrdinal {
+                            source,
+                            destination,
+                        } => TdsColumnMapping {
+                            source: ColumnMappingSource::Ordinal(source),
+                            destination,
+                        },
+                    };
+                    bulk_copy = bulk_copy.add_column_mapping(tds_mapping);
+                }
 
-            let plans = build_column_plans(&schema, &destination_metadata, &resolved_mappings)
-                .map_err(convert_tds_error)?;
-            let plans_arc = Arc::new(plans);
-            let dest_arc = Arc::new(destination_metadata);
-
-            let row_iter = ArrowRowIter::new(reader, plans_arc, dest_arc);
-
-            let bulk_result = bulk_copy
-                .write_to_server_zerocopy(row_iter)
-                .await
-                .map_err(|e| {
-                    error!("bulkcopy_arrow: write_to_server_zerocopy failed: {}", e);
-                    convert_tds_error(e)
+                let resolved_mappings = bulk_copy.get_resolved_mappings().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to resolve column mappings: {}",
+                        e
+                    ))
                 })?;
 
-            Ok::<_, PyErr>(bulk_result)
+                let plans = build_column_plans(&schema, &destination_metadata, &resolved_mappings)
+                    .map_err(convert_tds_error)?;
+                let plans_arc = Arc::new(plans);
+                let dest_arc = Arc::new(destination_metadata);
+
+                let row_iter = ArrowRowIter::new(reader, plans_arc, dest_arc);
+
+                let bulk_result =
+                    bulk_copy
+                        .write_to_server_zerocopy(row_iter)
+                        .await
+                        .map_err(|e| {
+                            error!("bulkcopy_arrow: write_to_server_zerocopy failed: {}", e);
+                            convert_tds_error(e)
+                        })?;
+
+                Ok::<_, PyErr>(bulk_result)
             })
         })?;
 

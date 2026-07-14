@@ -820,8 +820,7 @@ mod tests {
             destination_name: dest.column_name.clone(),
             destination_type: dest.sql_type,
         }];
-        let err =
-            build_column_plans(&schema, std::slice::from_ref(&dest), &mappings).unwrap_err();
+        let err = build_column_plans(&schema, std::slice::from_ref(&dest), &mappings).unwrap_err();
         assert!(format!("{err}").to_lowercase().contains("datetimeoffset"));
     }
 
@@ -830,9 +829,8 @@ mod tests {
         // Complement to C1: the correct destination still works.
         let mut dest = meta("ts", SqlDbType::DateTimeOffset, true);
         dest.scale = 6;
-        let arr: ArrayRef = Arc::new(
-            TimestampMicrosecondArray::from(vec![Some(0_i64)]).with_timezone("UTC"),
-        );
+        let arr: ArrayRef =
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(0_i64)]).with_timezone("UTC"));
         let plan = one_col_plan(
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             &dest,
