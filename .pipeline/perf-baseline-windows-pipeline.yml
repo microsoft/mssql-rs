@@ -1,36 +1,33 @@
-# Fixed-baseline performance pipeline (dedicated perf lab)
+# Fixed-baseline performance pipeline — WINDOWS (dedicated perf lab)
 #
-# Compares the current commit against a fixed baseline pinned by a commit SHA
-# committed to mssql-tds-bench/perf-lab/baseline-commit.txt (advanced via PR),
-# using the mssql-tds-bench harness whose ONLY swapped input is the mssql-tds
-# source. The harness code, Criterion version, and toolchain are identical across
-# both runs, so any significant delta is attributable to mssql-tds itself.
+# Windows counterpart to perf-baseline-pipeline.yml (which defaults to Linux).
+# Both wrappers extend the same shared PerfTest lab template; the ONLY difference
+# is the default `platform`. They are registered as two separate ADO pipeline
+# definitions so each has its own schedule, artifacts, and regression gate —
+# Windows and Linux numbers are not comparable and are tuned independently.
 #
-# This pipeline consumes the shared PerfTest lab template, which runs the
-# benchmarks on a dedicated host VM (not on shared/noisy build agents):
-#   select region -> generate SSH key -> deploy VM -> copy repo -> run the
-#   testScript on the VM -> collect results -> tear down.
+# Compares the current commit against a fixed baseline pinned by a commit SHA in
+# mssql-tds-bench/perf-lab/baseline-commit.txt (advanced via PR), using the
+# mssql-tds-bench harness whose ONLY swapped input is the mssql-tds source. The
+# harness code, Criterion version, and toolchain are identical across both runs,
+# so any significant delta is attributable to mssql-tds itself.
 #
 # The build happens ON the VM (the lab's documented model): the testScript
 # bootstraps the toolchain, builds the candidate from the working tree and the
 # baseline from a local `git worktree` of the commit in baseline-commit.txt, then
-# compares with critcmp. See mssql-tds-bench/perf-lab/run-benchmarks.{sh,ps1}.
+# compares with critcmp. On Windows the template auto-selects run-benchmarks.ps1.
 #
-# Complements benchmark-pipeline.yml (PR vs target branch). Trigger manually or
-# on the weekly schedule below.
-#
-# This wrapper defaults to Linux. Its Windows counterpart is
-# perf-baseline-windows-pipeline.yml; both extend the same shared PerfTest
-# template and are registered as separate ADO pipeline definitions (ADO
-# scheduled triggers always use default parameter values, so each platform needs
-# its own definition to be scheduled).
+# The weekly cron is staggered two hours after the Linux pipeline's so the two
+# scheduled runs do not contend for the lab's limited VM slots. ADO scheduled
+# triggers always use default parameter values, which is exactly why a dedicated
+# Windows definition (defaulting platform to windows) is needed.
 
 trigger: none
 pr: none
 
 schedules:
-  - cron: '0 8 * * 1'
-    displayName: Weekly baseline comparison
+  - cron: '0 10 * * 1'
+    displayName: Weekly baseline comparison (Windows)
     branches:
       include:
         - main
@@ -40,7 +37,7 @@ parameters:
   - name: platform
     displayName: 'Target platform'
     type: string
-    default: linux
+    default: windows
     values:
       - linux
       - windows
