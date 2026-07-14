@@ -101,9 +101,10 @@ impl FedAuthFeature {
             TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow => {
                 Ok(active_directory_device_code_flow)
             }
-            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity => {
-                Ok(active_directory_managed_identity)
-            }
+            // MSI is a legacy alias for ManagedIdentity; both use the same workflow
+            // byte (matches .NET SqlClient TdsEnums). See bug #46177.
+            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity
+            | TdsAuthenticationMethod::ActiveDirectoryMSI => Ok(active_directory_managed_identity),
             TdsAuthenticationMethod::ActiveDirectoryWorkloadIdentity => {
                 Ok(active_directory_workload_identity)
             }
@@ -231,6 +232,23 @@ mod unittests {
     fn test_get_work_flow_identifier_unsupported() {
         let feature = FedAuthFeature::new(TdsAuthenticationMethod::Password, None, false);
         assert!(feature.get_work_flow_identifier().is_err());
+    }
+
+    #[test]
+    fn test_get_work_flow_identifier_msi_matches_managed_identity() {
+        // Regression for #46177: MSI is a legacy alias for ManagedIdentity and must
+        // resolve to the same workflow byte instead of falling through to an error.
+        let msi = FedAuthFeature::new(TdsAuthenticationMethod::ActiveDirectoryMSI, None, false);
+        let managed = FedAuthFeature::new(
+            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity,
+            None,
+            false,
+        );
+        assert_eq!(msi.get_work_flow_identifier().unwrap(), 0x03);
+        assert_eq!(
+            msi.get_work_flow_identifier().unwrap(),
+            managed.get_work_flow_identifier().unwrap()
+        );
     }
 
     #[test]

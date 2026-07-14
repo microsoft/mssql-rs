@@ -598,6 +598,17 @@ mod tests {
     }
 
     #[test]
+    fn authentication_managed_identity_is_rejected() {
+        // ActiveDirectoryManagedIdentity is NOT an ODBC keyword — msodbcsql only
+        // accepts ActiveDirectoryMSI (dlgattr.h), which maps to the same method.
+        // Matches the mssql-python driver's behavior. See bug #46177.
+        let err = parse_connection_string("Server=h;Authentication=ActiveDirectoryManagedIdentity")
+            .unwrap_err();
+        assert_eq!(err.key, "authentication");
+        assert_eq!(err.value, "ActiveDirectoryManagedIdentity");
+    }
+
+    #[test]
     fn authentication_empty_is_reset_ok() {
         // Empty Authentication is an intentional reset (mssql-tds treats it as
         // recognized); stored as Some("") to preserve the distinction from unset.
