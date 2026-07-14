@@ -175,14 +175,28 @@ Invoke-Native { git worktree remove --force $BaselineTree }
 
 # --- Compare ---
 Write-Host '>>> Comparing base -> candidate...'
-& {
-    $ErrorActionPreference = 'Continue'
-    critcmp base candidate | Tee-Object -FilePath (Join-Path $ResultsDir 'comparison.txt')
-    if ($LASTEXITCODE -ne 0) { throw "critcmp failed (exit $LASTEXITCODE)" }
-}
+# The critcmp table contains the ± sign (UTF-8). The previous code wrote
+# comparison.txt (correct) but then rebuilt summary.md by re-reading that file
+# with Get-Content, whose default encoding did not match how it was written, so
+# the ± was mangled only in summary.md. Fix: capture critcmp once and build BOTH
+# artifacts from that same in-memory string, written as UTF-8 without a BOM, so
+# they cannot diverge. Set the console decode to UTF-8 too (guarded: a
+# console-less host can reject the setter) so the capture itself is UTF-8-clean.
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-# Markdown summary — the perf lab attaches results/*.md to the run's Summary tab
-# (task.uploadsummary). Wrap the fixed-width critcmp table in a fenced code block.
+$comparison = & {
+    $ErrorActionPreference = 'Continue'
+    $out = critcmp base candidate | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "critcmp failed (exit $LASTEXITCODE)" }
+    $out
+}
+$comparison = $comparison.TrimEnd()
+Write-Host $comparison
+[System.IO.File]::WriteAllText((Join-Path $ResultsDir 'comparison.txt'), $comparison + "`n", $Utf8NoBom)
+
+# Markdown summary — the perf lab attaches results/*.md to the run's Summary tab.
+# Wrap the fixed-width critcmp table in a fenced code block.
 #
 # Verdict: in each critcmp data row the faster side is 1.00 and the slower side
 # shows its ratio, so the candidate regressed a bench when the candidate ratio
@@ -190,7 +204,7 @@ Write-Host '>>> Comparing base -> candidate...'
 $thr = [double]($env:BENCH_REGRESSION_RATIO)
 if (-not $thr) { $thr = 1.10 }
 $regressions = @()
-foreach ($line in (Get-Content (Join-Path $ResultsDir 'comparison.txt'))) {
+foreach ($line in ($comparison -split "\r?\n")) {
     $f = @($line -split '\s+' | Where-Object { $_ -ne '' })
     if ($f.Count -ge 6 -and $f[1] -match '^[0-9]+\.[0-9]+$' -and $f[5] -match '^[0-9]+\.[0-9]+$') {
         $cand = [double]$f[5]
@@ -208,8 +222,7 @@ if ($regressions.Count -gt 0) {
     $verdict = "$check No benchmark slower by >=$pct% vs baseline"
 }
 
-$comparison = Get-Content (Join-Path $ResultsDir 'comparison.txt') -Raw
-@(
+$summary = @(
     '## mssql-tds perf - base -> candidate'
     ''
     "**$verdict**"
@@ -217,9 +230,10 @@ $comparison = Get-Content (Join-Path $ResultsDir 'comparison.txt') -Raw
     "Baseline commit: ``$BaselineCommit``"
     ''
     '```'
-    $comparison.TrimEnd()
+    $comparison
     '```'
-) -join "`n" | Set-Content -Path (Join-Path $ResultsDir 'summary.md') -Encoding UTF8
+) -join "`n"
+[System.IO.File]::WriteAllText((Join-Path $ResultsDir 'summary.md'), $summary + "`n", $Utf8NoBom)
 
 Copy-Item -Recurse -Force 'target/criterion' (Join-Path $ResultsDir 'criterion') -ErrorAction SilentlyContinue
 
