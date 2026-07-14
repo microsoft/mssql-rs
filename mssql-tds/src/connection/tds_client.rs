@@ -1803,13 +1803,12 @@ impl TdsClient {
             }
         };
 
-        Ok(ReturnValue {
-            param_ordinal: token.param_ordinal,
-            param_name: token.param_name,
-            value: decrypted,
-            column_metadata: token.column_metadata,
-            status: token.status,
-        })
+        // Reuse the `From<ReturnValueToken>` conversion for the field mapping and
+        // only override the decrypted value, so this stays in sync if
+        // `ReturnValue` gains fields later.
+        let mut return_value: ReturnValue = token.into();
+        return_value.value = decrypted;
+        Ok(return_value)
     }
 
     /// Resolves the effective Column Encryption setting for the current command,
