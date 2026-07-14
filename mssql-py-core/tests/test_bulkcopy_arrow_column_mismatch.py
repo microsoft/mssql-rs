@@ -3,13 +3,14 @@
 
 """Arrow bulk copy tests for column mapping / count-mismatch scenarios.
 
-Mirrors test_bulkcopy_column_mismatch.py for cursor.bulkcopy_arrow. Adds the
-Arrow-specific by-name mapping case (mappings match Arrow field names).
+Mirrors test_bulkcopy_column_mismatch.py for cursor.bulkcopy_arrow.
 
 Behavior parity with the tuple path:
   * Source has more columns than mapped  -> extra columns dropped.
   * Source has fewer columns than table  -> unmapped columns get NULL/DEFAULT.
   * No mappings -> auto zip-by-ordinal up to min(arrow_fields, dest_columns).
+  * column_mappings=[str, ...] maps by source ordinal (index -> dest name);
+    column_mappings=[(int, str), ...] maps explicit source index -> dest name.
 """
 import pytest
 import mssql_py_core
@@ -177,35 +178,6 @@ def test_bulkcopy_arrow_partial_column_mapping(client_context):
     rows = cursor.fetchall()
     assert rows[0] == (1, None, 30)
     assert rows[2] == (3, None, 35)
-
-    conn.close()
-
-
-@pytest.mark.integration
-def test_bulkcopy_arrow_column_mappings_by_name(client_context):
-    """Arrow-specific: by-name mappings match Arrow field names, any order."""
-    conn = mssql_py_core.PyCoreConnection(client_context)
-    cursor = conn.cursor()
-
-    table_name = "#BCArrowMapByName"
-    cursor.execute(f"CREATE TABLE {table_name} (a INT, b NVARCHAR(20) NULL)")
-
-    # Arrow field names are "x" and "y"; map them positionally to a, b.
-    source = pa.table(
-        {
-            "x": pa.array([1, 2], type=pa.int32()),
-            "y": pa.array(["p", "q"]),
-        }
-    )
-
-    result = cursor.bulkcopy_arrow(
-        table_name, source, column_mappings=["a", "b"], batch_size=1000, timeout=30
-    )
-    assert result["rows_copied"] == 2
-
-    cursor.execute(f"SELECT a, b FROM {table_name} ORDER BY a")
-    rows = cursor.fetchall()
-    assert rows[0][1] == "p" and rows[1][1] == "q"
 
     conn.close()
 

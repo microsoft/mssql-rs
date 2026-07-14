@@ -92,10 +92,14 @@ def test_bulkcopy_arrow_internal_transaction_false_default(client_context):
 
 @pytest.mark.integration
 def test_bulkcopy_arrow_batch_size_splits_single_arrow_batch(client_context):
-    """One large Arrow batch still commits at the batch_size cadence.
+    """batch_size is honored independently of the Arrow RecordBatch layout.
 
-    10 rows arrive as a single Arrow RecordBatch; with batch_size=3 the TDS path
-    commits in batches of 3 -> batch_count = ceil(10/3) = 4.
+    10 rows arrive as a single Arrow RecordBatch; with batch_size=3 the reported
+    batch_count reflects the requested batch size (ceil(10/3) = 4), not the
+    single incoming Arrow batch, and every row lands. (batch_count is derived
+    from rows_affected and batch_size, so this asserts the reported value and
+    full row delivery, not the on-wire commit boundaries, which aren't
+    observable from the client.)
     """
     conn = mssql_py_core.PyCoreConnection(client_context)
     cursor = conn.cursor()
