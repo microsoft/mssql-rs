@@ -185,6 +185,41 @@ impl TryFrom<TableMetadataResult> for Vec<BulkCopyColumnMetadata> {
             }
         }
 
+        // Capture Always Encrypted material for encrypted columns. When column
+        // encryption is negotiated the destination COLMETADATA carries a CEK
+        // table plus per-column crypto metadata; pair each encrypted column with
+        // the CEK table entry it references so the bulk-copy writer can encrypt
+        // values and emit the encrypted COLMETADATA.
+        for (i, col_meta) in metadata.iter_mut().enumerate() {
+            let Some(crypto) = result
+                .col_metadata
+                .columns
+                .get(i)
+                .and_then(|c| c.crypto_metadata.as_ref())
+            else {
+                continue;
+            };
+            let cek_entry = result
+                .col_metadata
+                .cek_table
+                .get(crypto.cek_table_ordinal as usize)
+                .ok_or_else(|| {
+                    Error::ProtocolError(format!(
+                        "Encrypted column '{}' references CEK ordinal {} but the CEK table has \
+                         {} entries",
+                        col_meta.column_name,
+                        crypto.cek_table_ordinal,
+                        result.col_metadata.cek_table.len()
+                    ))
+                })?;
+            col_meta.encryption = Some(
+                crate::datatypes::bulk_copy_metadata::BulkCopyColumnEncryption {
+                    crypto_metadata: crypto.clone(),
+                    cek_entry: cek_entry.clone(),
+                },
+            );
+        }
+
         Ok(metadata)
     }
 }
@@ -449,6 +484,7 @@ mod tests {
             data_type: tds_type,
             column_name: name.to_string(),
             multi_part_name: None,
+            crypto_metadata: None,
         }
     }
 
@@ -460,6 +496,7 @@ mod tests {
             col_metadata: ColMetadataToken {
                 column_count: columns.len() as u16,
                 columns,
+                cek_table: Vec::new(),
             },
             collation_names,
         }
@@ -566,5 +603,82 @@ mod tests {
 
         assert!(metadata[0].is_identity);
         assert!(!metadata[1].is_identity);
+    }
+
+    #[test]
+    fn test_try_from_table_metadata_captures_encryption_material() {
+        use crate::query::metadata::{CekTableEntry, CryptoMetadata};
+
+        // Encrypted column: the COLMETADATA flags carry the encrypted bit and the
+        // column carries crypto metadata referencing CEK table ordinal 0.
+        let mut col = make_column(
+            "secret",
+            0x0800, // FLAG_ENCRYPTED
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+        );
+        col.crypto_metadata = Some(CryptoMetadata {
+            cek_table_ordinal: 0,
+            base_data_type: TdsDataType::IntN,
+            base_type_info: TypeInfo {
+                tds_type: TdsDataType::IntN,
+                length: 4,
+                type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+            },
+            cipher_algorithm_id: 2,
+            cipher_algorithm_name: None,
+            encryption_type: 1,
+            normalization_rule_version: 1,
+        });
+
+        let cek_entry = CekTableEntry {
+            database_id: 7,
+            cek_id: 11,
+            cek_version: 1,
+            cek_md_version: [1, 2, 3, 4, 5, 6, 7, 8],
+            encrypted_cek_values: Vec::new(),
+        };
+
+        let mut table = make_table_metadata(vec![col], vec![None]);
+        table.col_metadata.cek_table = vec![cek_entry];
+
+        let metadata = Vec::<BulkCopyColumnMetadata>::try_from(table).unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert!(metadata[0].is_encrypted);
+        let enc = metadata[0]
+            .encryption
+            .as_ref()
+            .expect("encryption material should be captured for an encrypted column");
+        assert_eq!(enc.crypto_metadata.encryption_type, 1);
+        assert_eq!(enc.crypto_metadata.cek_table_ordinal, 0);
+        assert_eq!(enc.cek_entry.database_id, 7);
+        assert_eq!(enc.cek_entry.cek_id, 11);
+    }
+
+    #[test]
+    fn test_try_from_table_metadata_rejects_dangling_cek_ordinal() {
+        use crate::query::metadata::CryptoMetadata;
+
+        let mut col = make_column(
+            "secret",
+            0x0800,
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+        );
+        col.crypto_metadata = Some(CryptoMetadata {
+            cek_table_ordinal: 3, // no such entry
+            base_data_type: TdsDataType::IntN,
+            base_type_info: TypeInfo {
+                tds_type: TdsDataType::IntN,
+                length: 4,
+                type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+            },
+            cipher_algorithm_id: 2,
+            cipher_algorithm_name: None,
+            encryption_type: 1,
+            normalization_rule_version: 1,
+        });
+
+        let table = make_table_metadata(vec![col], vec![None]);
+        let err = Vec::<BulkCopyColumnMetadata>::try_from(table).unwrap_err();
+        assert!(matches!(err, Error::ProtocolError(_)));
     }
 }

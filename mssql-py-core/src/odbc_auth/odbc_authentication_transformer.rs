@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use super::client_context::TdsAuthenticationMethod;
 use super::odbc_supported_auth_keywords::auth_method_from_keyword;
+use mssql_tds::connection::client_context::TdsAuthenticationMethod;
 
 /// Transformed authentication output produced by [`transform_auth`].
 ///
