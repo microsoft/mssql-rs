@@ -8,8 +8,12 @@
 
 use std::fmt;
 
-use mssql_tds::connection::odbc_supported_auth_keywords::is_recognized_keyword;
+use crate::connection::odbc_supported_auth_keywords::is_recognized_keyword;
 use tracing::warn;
+
+pub(crate) mod odbc_authentication_transformer;
+pub(crate) mod odbc_authentication_validator;
+mod odbc_supported_auth_keywords;
 
 // Connection string keys (lowercase for matching)
 const KEY_SERVER: &str = "server";
@@ -49,7 +53,7 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
 const YES_NO: &[&str] = &["yes", "no"];
 const ENCRYPT_VALUES: &[&str] = &["yes", "mandatory", "no", "optional", "strict"];
 
-// Recognized `Authentication=` keywords (mirrors mssql-tds `auth_method_from_keyword`).
+// Recognized `Authentication=` keywords (mirrors `auth_method_from_keyword`).
 // Used only for the diagnostic hint; the accept/reject decision is delegated to
 // `is_recognized_keyword` so the two never drift.
 const AUTHENTICATION_VALUES: &[&str] = &[
@@ -591,6 +595,17 @@ mod tests {
             parse_connection_string("Server=h;UID=u;PWD=p;Authentication=NotReal").unwrap_err();
         assert_eq!(err.key, "authentication");
         assert_eq!(err.value, "NotReal");
+    }
+
+    #[test]
+    fn authentication_managed_identity_is_rejected() {
+        // ActiveDirectoryManagedIdentity is NOT an ODBC keyword — msodbcsql only
+        // accepts ActiveDirectoryMSI (dlgattr.h), which maps to the same method.
+        // Matches the mssql-python driver's behavior. See bug #46177.
+        let err = parse_connection_string("Server=h;Authentication=ActiveDirectoryManagedIdentity")
+            .unwrap_err();
+        assert_eq!(err.key, "authentication");
+        assert_eq!(err.value, "ActiveDirectoryManagedIdentity");
     }
 
     #[test]

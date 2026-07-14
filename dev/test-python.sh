@@ -3,7 +3,7 @@ set -e
 
 # Script to run Python tests for mssql-py-core
 # This script sets up a Python virtual environment, installs dependencies, and runs pytest
-# Usage: test-python.sh [--skip-integration] [--mssql-python] [--smoke]
+# Usage: test-python.sh [--skip-integration] [--mssql-python] [--smoke] [--coverage]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -16,13 +16,20 @@ VENV_DIR="$PROJECT_ROOT/.venv-pycore"
 SKIP_INTEGRATION=false
 RUN_MSSQL_PYTHON=false
 RUN_SMOKE_ONLY=false
+COVERAGE=false
 for arg in "$@"; do
     case $arg in
         --skip-integration) SKIP_INTEGRATION=true ;;
         --mssql-python) RUN_MSSQL_PYTHON=true ;;
         --smoke) RUN_SMOKE_ONLY=true ;;
+        --coverage) COVERAGE=true ;;
     esac
 done
+
+# When --coverage is set, the mssql-py-core native extension is built with LLVM
+# source-based instrumentation so the Rust code exercised by the Python tests is
+# measured. Coverage output (Cobertura) is written to $COVERAGE_OUTPUT.
+COVERAGE_OUTPUT="${COVERAGE_OUTPUT:-$PROJECT_ROOT/target/pycore-cobertura.xml}"
 
 echo "==================================="
 echo "Python Test Runner for mssql-py-core"
@@ -62,6 +69,21 @@ pip install maturin pytest pytest-asyncio python-dotenv patchelf -q
 
 # Navigate to mssql-py-core directory
 cd "$PY_CORE_DIR"
+
+# Enable LLVM source-based coverage instrumentation for the native extension.
+# `cargo llvm-cov show-env` exports RUSTFLAGS (-C instrument-coverage), a target
+# dir and an LLVM_PROFILE_FILE pattern; maturin then builds an instrumented .so
+# and the Python test process writes .profraw files as it runs.
+if [ "$COVERAGE" = true ]; then
+    echo "Enabling coverage instrumentation for mssql-py-core..."
+    cargo llvm-cov clean --workspace
+    # Warm up the tooling first so any one-time rustup component install output
+    # (e.g. downloading llvm-tools) does not get sourced into the shell.
+    cargo llvm-cov show-env --export-prefix >/dev/null 2>&1 || true
+    # Source only the export statements; discard rustup/info chatter that would
+    # otherwise be evaluated as commands.
+    eval "$(cargo llvm-cov show-env --export-prefix 2>/dev/null | grep '^export ')"
+fi
 
 # Build and install the module in development mode
 echo "Building mssql-py-core with maturin develop..."
@@ -165,4 +187,23 @@ if [ "$RUN_MSSQL_PYTHON" = true ]; then
     echo "==================================="
     echo "mssql-python tests completed!"
     echo "==================================="
+fi
+
+# Generate the Cobertura coverage report for the instrumented native extension.
+# Runs from the mssql-py-core directory so cargo-llvm-cov reads the profraw files
+# produced while the Python tests exercised the compiled .so.
+if [ "$COVERAGE" = true ]; then
+    echo ""
+    echo "==================================="
+    echo "Generating mssql-py-core coverage report"
+    echo "==================================="
+    cd "$PY_CORE_DIR"
+    mkdir -p "$(dirname "$COVERAGE_OUTPUT")"
+    # Report generation is best-effort: the tests already ran and passed, so a
+    # coverage tooling hiccup should not fail the test run.
+    if cargo llvm-cov report --cobertura --output-path "$COVERAGE_OUTPUT"; then
+        echo "Coverage report written to $COVERAGE_OUTPUT"
+    else
+        echo "WARNING: failed to generate mssql-py-core coverage report" >&2
+    fi
 fi

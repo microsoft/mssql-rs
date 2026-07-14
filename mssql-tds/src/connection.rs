@@ -20,12 +20,6 @@ pub(crate) mod datasource_parser;
 pub(crate) mod execution_context;
 pub(crate) mod instance_cache;
 pub(crate) mod metadata_retriever;
-/// ODBC-style authentication keyword transform.
-pub mod odbc_authentication_transformer;
-/// ODBC-style authentication keyword validation.
-pub mod odbc_authentication_validator;
-/// Recognized ODBC `Authentication=` keywords and their `TdsAuthenticationMethod` mapping.
-pub mod odbc_supported_auth_keywords;
 pub(crate) mod session_recovery;
 /// Primary client type and result set traits.
 pub mod tds_client;

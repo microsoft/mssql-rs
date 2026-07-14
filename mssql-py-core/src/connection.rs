@@ -8,11 +8,11 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
+use crate::odbc_auth::odbc_authentication_transformer::transform_auth;
+use crate::odbc_auth::odbc_authentication_validator::validate_auth;
 use crate::python_logger_adapter::scoped_tracing_bridge;
 use mssql_tds::{
     connection::client_context::{ClientContext, IPAddressPreference},
-    connection::odbc_authentication_transformer::transform_auth,
-    connection::odbc_authentication_validator::validate_auth,
     connection::tds_client::TdsClient,
     connection_provider::tds_connection_provider::TdsConnectionProvider,
     core::{EncryptionOptions, EncryptionSetting},

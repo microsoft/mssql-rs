@@ -877,6 +877,55 @@ mod always_encrypted {
         });
     }
 
+    /// An encrypted stored-procedure OUTPUT parameter comes back as a RETURNVALUE
+    /// carrying `CryptoMetaData` and ciphertext (no CEK table). The driver must
+    /// decrypt it transparently using the CEK it resolved for the matching input
+    /// parameter during `sp_describe_parameter_encryption`.
+    #[tokio::test]
+    async fn encrypted_output_parameter_is_decrypted() {
+        ae_test!(|h| {
+            let table = h.create_encrypted_table("INT", "DETERMINISTIC").await;
+            h.insert_encrypted(&table, SqlType::Int(Some(4242))).await;
+
+            let proc = h.next_proc();
+            run_statement(
+                &mut h.client,
+                &format!(
+                    "CREATE PROCEDURE {proc} @out INT OUTPUT AS BEGIN \
+                     SELECT TOP 1 @out = val FROM {table} ORDER BY id; END"
+                ),
+            )
+            .await
+            .expect("create stored procedure with encrypted output parameter");
+
+            // Output parameter: NULL placeholder input value, marked BY_REF so it
+            // is declared `OUTPUT`. The driver encrypts the (NULL) input, then
+            // decrypts the ciphertext the server returns.
+            let out_param = RpcParameter::new(
+                Some("@out".to_string()),
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Int(None),
+            );
+            h.client
+                .execute_stored_procedure(proc.clone(), None, Some(vec![out_param]), None, None)
+                .await
+                .expect("execute stored procedure with encrypted output parameter");
+            while h.client.move_to_next().await.unwrap() {}
+            h.client.close_query().await.unwrap();
+
+            let return_values = h.client.get_return_values();
+            let out = return_values
+                .iter()
+                .find(|rv| rv.param_name.eq_ignore_ascii_case("@out"))
+                .expect("output parameter present in return values");
+            assert!(
+                matches!(out.value, ColumnValues::Int(4242)),
+                "decrypted encrypted output parameter, got {:?}",
+                out.value
+            );
+        });
+    }
+
     /// Positional stored-procedure parameters cannot be referenced by name in
     /// the `sp_describe_parameter_encryption` request, so they cannot be
     /// transparently encrypted. On an Always Encrypted connection the call must
