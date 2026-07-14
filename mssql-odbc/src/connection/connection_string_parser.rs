@@ -1088,6 +1088,32 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_in_validated_value_is_not_trimmed_and_is_invalid() {
+        // msodbcsql validates the value verbatim: `IsAttrStrValid` requires an exact
+        // length match (cchKeyVal == wcslen(OPTIONON)) *and* a case-insensitive content
+        // match, so any surrounding whitespace fails the length gate -> E_FAIL hard stop.
+        // Our `validate_attr` uses `eq_ignore_ascii_case` on the whole value, which
+        // enforces the same length+content check, so the value is never trimmed.
+        for cs in [
+            "Server=h;TrustServerCertificate= Yes;UID=u",
+            "Server=h;TrustServerCertificate=Yes ;UID=u",
+            "Server=h;TrustServerCertificate=\tYes;UID=u",
+        ] {
+            let err = parse_connection_string(cs).unwrap_err();
+            assert_eq!(err.key, "trustservercertificate");
+        }
+
+        // Same rule holds for the other validated keys (Encrypt, Trusted_Connection).
+        let err = parse_connection_string("Server=h;Encrypt= Strict;UID=u").unwrap_err();
+        assert_eq!(err.key, "encrypt");
+        assert_eq!(err.value, " Strict");
+
+        let err = parse_connection_string("Server=h;Trusted_Connection=Yes ").unwrap_err();
+        assert_eq!(err.key, "trusted_connection");
+        assert_eq!(err.value, "Yes ");
+    }
+
+    #[test]
     fn only_ascii_odbc_whitespace_is_skipped_before_key() {
         // Tab / newline / CR before a key are skipped like a space.
         let (p, warn) = parse_connection_string("Server=h;\t\r\nUID=u;PWD=p").unwrap();
