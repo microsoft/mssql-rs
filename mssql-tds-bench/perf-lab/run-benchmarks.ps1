@@ -14,6 +14,26 @@
 
 $ErrorActionPreference = 'Stop'
 
+# Native tools (cargo, git, rustup) legitimately write progress to stderr. On
+# Windows PowerShell 5.1 (the perf image ships Desktop 5.1) a native command's
+# stderr is promoted to a *terminating* error when $ErrorActionPreference is
+# 'Stop' — most reliably when the command's streams are redirected — which would
+# abort the run on benign output like cargo's "Updating crates.io index". Run
+# native commands with the preference relaxed and gate on the real exit code.
+function Invoke-Native {
+    param([Parameter(Mandatory)][scriptblock]$Command)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Command
+        if ($LASTEXITCODE -ne 0) {
+            throw "Native command failed (exit $LASTEXITCODE): $Command"
+        }
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
 $RepoRoot   = (Get-Location).Path
 $ResultsDir = Join-Path $RepoRoot 'results'
 # Baseline pointer — a committed commit SHA. Advancing the baseline requires a
@@ -33,7 +53,7 @@ if (-not $env:TRUST_SERVER_CERTIFICATE){ $env:TRUST_SERVER_CERTIFICATE = 'true' 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Host '>>> Installing Rust toolchain via rustup...'
     Invoke-WebRequest 'https://win.rustup.rs' -OutFile 'rustup-init.exe'
-    & ./rustup-init.exe -y --default-toolchain stable
+    Invoke-Native { & ./rustup-init.exe -y --default-toolchain stable }
 }
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
@@ -65,7 +85,7 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 
 if (-not (Get-Command critcmp -ErrorAction SilentlyContinue)) {
     Write-Host '>>> Installing critcmp...'
-    cargo install critcmp --version 0.1.8 --locked
+    Invoke-Native { cargo install critcmp --version 0.1.8 --locked }
 }
 
 # --- Kernel network tuning for high connection churn ---
@@ -116,12 +136,18 @@ if (-not $env:BENCH_SAMPLES)     { $env:BENCH_SAMPLES = '30' }
 Write-Host '>>> Warm-up pass (discarded)...'
 $origWarm = $env:BENCH_WARMUP_SECS; $origSecs = $env:BENCH_SECS; $origSamples = $env:BENCH_SAMPLES
 $env:BENCH_WARMUP_SECS = '1'; $env:BENCH_SECS = '1'; $env:BENCH_SAMPLES = '10'
-cargo bench -p mssql-tds-bench -- --save-baseline warmup *> $null
+# Warm-up failures are non-fatal (matches run-benchmarks.sh's `|| true`). Relax
+# the error preference so cargo's stderr progress under the stream redirect does
+# not abort the run, and deliberately ignore the exit code.
+& {
+    $ErrorActionPreference = 'Continue'
+    cargo bench -p mssql-tds-bench -- --save-baseline warmup *> $null
+}
 $env:BENCH_WARMUP_SECS = $origWarm; $env:BENCH_SECS = $origSecs; $env:BENCH_SAMPLES = $origSamples
 
 # --- Candidate run (mssql-tds = working tree) ---
 Write-Host '>>> Candidate benchmarks...'
-cargo bench -p mssql-tds-bench -- --save-baseline candidate
+Invoke-Native { cargo bench -p mssql-tds-bench -- --save-baseline candidate }
 
 # --- Baseline run (mssql-tds source swapped to the baseline commit) ---
 # Materialize the baseline mssql-tds via a local worktree, then replace the
@@ -131,7 +157,7 @@ cargo bench -p mssql-tds-bench -- --save-baseline candidate
 # avoids a Cargo lockfile package collision.
 $BaselineTree = Join-Path ([System.IO.Path]::GetTempPath()) "perf-baseline-$([System.Guid]::NewGuid().ToString('N'))"
 Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree..."
-& git worktree add --detach $BaselineTree $BaselineCommit
+Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
 
 Write-Host '>>> Swapping mssql-tds source to the baseline...'
 $CandidateSrc = Join-Path $RepoRoot 'mssql-tds'
@@ -140,16 +166,20 @@ Move-Item $CandidateSrc $StashedSrc
 Copy-Item -Recurse (Join-Path $BaselineTree 'mssql-tds') $CandidateSrc
 
 Write-Host '>>> Baseline benchmarks...'
-cargo bench -p mssql-tds-bench -- --save-baseline base
+Invoke-Native { cargo bench -p mssql-tds-bench -- --save-baseline base }
 
 # Restore the candidate source and remove the worktree.
 Remove-Item -Recurse -Force $CandidateSrc
 Move-Item $StashedSrc $CandidateSrc
-& git worktree remove --force $BaselineTree
+Invoke-Native { git worktree remove --force $BaselineTree }
 
 # --- Compare ---
 Write-Host '>>> Comparing base -> candidate...'
-critcmp base candidate | Tee-Object -FilePath (Join-Path $ResultsDir 'comparison.txt')
+& {
+    $ErrorActionPreference = 'Continue'
+    critcmp base candidate | Tee-Object -FilePath (Join-Path $ResultsDir 'comparison.txt')
+    if ($LASTEXITCODE -ne 0) { throw "critcmp failed (exit $LASTEXITCODE)" }
+}
 
 # Markdown summary — the perf lab attaches results/*.md to the run's Summary tab
 # (task.uploadsummary). Wrap the fixed-width critcmp table in a fenced code block.
