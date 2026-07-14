@@ -16,7 +16,13 @@
 //!   so far is kept) and a warning (`01S00`) is raised.
 //! - Keys and values are **never trimmed**; only leading whitespace/`;` before a
 //!   key is skipped. `Server =host` therefore does *not* match (trailing space).
-//! - `{braced}` values end at a single `}`; `}}` is an escape for a literal `}`.
+//! - `{braced}` values are only brace-quoted when `{` is the **first** character
+//!   of the value; braces elsewhere are literal (`PWD=a{b}c` stores `a{b}c`).
+//!   A braced value ends at a single `}`, and `}}` is an escape for a literal `}`.
+//!   There is **no `{{` escape** — the opening `{` is consumed as the delimiter and
+//!   any subsequent `{` is literal (`PWD={{a}` stores `{a`). The asymmetry mirrors
+//!   msodbcsql: only the terminator `}` is ambiguous inside the quote, so only it
+//!   needs escaping.
 //! - A braced value must be followed by `;` or end-of-string; trailing junk after
 //!   `}` stops parsing with a warning.
 //! - Unknown keywords never fail the parse — they are ignored with a warning.
@@ -264,6 +270,12 @@ fn is_odbc_space(c: char) -> bool {
     matches!(c, ' ' | '\u{0c}' | '\n' | '\r' | '\t' | '\u{0b}')
 }
 
+// TODO: If the acted-on key set grows past ~15, collapse the `KEY_*` consts and
+// the match below into a single descriptor table (`&[{ lower, ConnAttrKey }]`)
+// that `classify_key` iterates, making it the one source of truth. Adding a
+// mapped key currently fans out across ~6 sites; only `assign_value` is
+// compiler-enforced to stay in sync — `classify_key`, the `ConnectionParams`
+// field, `fmt_as_odbc_conn_str`, and the `Debug` impl can silently drift.
 fn classify_key(lower: &str) -> KeyClass {
     match lower {
         KEY_SERVER => KeyClass::Mapped(ConnAttrKey::Server),
@@ -334,19 +346,42 @@ fn assign_value(
 /// for an invalid value on a recognized, validated key (msodbcsql `E_FAIL`).
 /// `has_warnings` is true when any `01S00` condition was hit (unknown key, missing
 /// `=`, missing value, unterminated brace, or data after a braced value).
+///
+/// Worked examples (input on the left, resulting behavior on the right):
+///
+/// ```text
+/// "Server=host;UID=sa;PWD=p"      -> server="host", uid="sa", pwd="p", no warnings
+/// "Server=host;Foo=1;UID=sa"      -> Foo is unknown: warns, discarded; UID still set
+/// "Server=host;ApplicationIntent=ReadOnly" -> recognized-but-ignored: no warning
+/// "Server=host;PWD={p;w=d}"       -> braces quote ';' and '=': pwd="p;w=d"
+/// "Server=host;PWD={a}}b}"        -> "}}" escapes one '}': pwd="a}b"
+/// "Server=host;Encrypt=banana"    -> Err(InvalidAttrValue): validated key, bad value
+/// "Server=host;junk"              -> no '=' in "junk": warns and stops
+/// ```
 pub(crate) fn parse_connection_string(
     input: &str,
 ) -> Result<(ConnectionParams, bool), InvalidAttrValue> {
+    // The parser walks `chars` with a single cursor `i`. Each loop iteration
+    // consumes exactly one `key=value` pair (plus its trailing ';'), in four
+    // phases: (1) skip leading separators, (2) read the key up to '=', (3) read
+    // the value (brace-quoted or plain), (4) validate/store. All offsets are in
+    // `char`s, not bytes, so multi-byte UTF-8 values are handled correctly.
     let chars: Vec<char> = input.chars().collect();
     let n = chars.len();
     let mut i = 0;
 
     let mut params = ConnectionParams::default();
+    // One "already seen" flag per acted-on key so the *first* occurrence of a
+    // recognized key wins and later duplicates are ignored (e.g. in
+    // "Server=a;Server=b" the stored server is "a").
     let mut seen_slots = [false; ConnAttrKey::COUNT];
     let mut has_warnings = false;
 
     loop {
-        // Skip leading whitespace and separators before the key.
+        // Phase 1 — skip any run of whitespace and ';' before the key. Only the
+        // key's *position* is whitespace-tolerant, not its content. So in
+        // ";;  Server=host" the leading ";;  " is skipped, but in "Server =host"
+        // the trailing space stays part of the key ("server ") and won't match.
         while i < n && (is_odbc_space(chars[i]) || chars[i] == ';') {
             i += 1;
         }
@@ -354,24 +389,30 @@ pub(crate) fn parse_connection_string(
             break;
         }
 
-        // Read the key up to '='. This reads *through* ';' — a token without its
-        // own '=' is merged with the following text until an '=' or end-of-input.
+        // Phase 2 — read the key up to '='. This reads *through* ';', so a token
+        // without its own '=' is merged with the following text until an '=' or
+        // end-of-input. Example: in "Server=h;bogus;UID=u" the second key scan
+        // yields "bogus;UID" (one key), so UID is swallowed and never set.
         let key_start = i;
         while i < n && chars[i] != '=' {
             i += 1;
         }
         if i >= n {
             // No '=' in the remainder: stop parsing, keeping what we have (S_FALSE).
+            // Example: "Server=h;trailingjunk" stores server="h" then stops here.
             warn!("invalid connection string attribute (no '=' separator)");
             has_warnings = true;
             break;
         }
         let key: String = chars[key_start..i].iter().collect();
         i += 1; // consume '='
+        // Key matching is case-insensitive, so lowercase once up front.
         let lower = key.to_ascii_lowercase();
 
-        // A recognized, first-seen, acted-upon key receives the value; everything
-        // else parses the value but discards it (mirrors msodbcsql's lpszValue).
+        // Phase 2b — classify the key. A recognized, first-seen, acted-upon key
+        // gets a slot to receive the value; everything else parses the value but
+        // discards it (mirrors msodbcsql leaving `lpszValue` unstored). `target`
+        // is `Some(slot)` only when we will actually store the value.
         let target = match classify_key(&lower) {
             KeyClass::Mapped(slot) => {
                 let idx = slot.idx();
@@ -390,22 +431,30 @@ pub(crate) fn parse_connection_string(
             }
         };
 
-        // No value after '=': stop parsing (S_FALSE).
+        // No value after '=': stop parsing (S_FALSE). Example: "Server=h;UID="
+        // (the '=' is the last char) warns and stops with server="h".
         if i >= n {
             warn!("invalid connection string attribute (missing value)");
             has_warnings = true;
             break;
         }
 
-        // Read the value.
+        // Phase 3 — read the value. `stop_after` records a structural problem
+        // that forces the loop to end *after* the value is stored (msodbcsql
+        // stores first, then bails).
         let mut value = String::new();
         let mut stop_after = false;
         if chars[i] == '{' {
+            // Brace-quoted value: everything up to the matching single '}' is
+            // literal, so ';' and '=' inside braces are NOT separators. Used for
+            // passwords like "{p;w=d}" that contain reserved characters.
             i += 1;
             let mut terminated = false;
             while i < n {
                 if chars[i] == '}' {
-                    // '}}' is an escape for a literal '}'.
+                    // "}}" is an escape for a single literal '}'. Example:
+                    // "{a}}b}" -> value "a}b" (the doubled brace is consumed as
+                    // one '}', the later single '}' terminates the value).
                     if i + 1 < n && chars[i + 1] == '}' {
                         value.push('}');
                         i += 2;
@@ -419,28 +468,34 @@ pub(crate) fn parse_connection_string(
             }
             if terminated {
                 i += 1; // consume closing '}'
-                // A braced value must be followed by ';' or end-of-input.
+                // A braced value must be followed by ';' or end-of-input. Trailing
+                // junk (e.g. "{val}junk") is a structural error: warn and stop,
+                // but the already-collected "val" is still stored below.
                 if i < n && chars[i] != ';' {
                     warn!("invalid connection string attribute (data after braced value)");
                     has_warnings = true;
                     stop_after = true;
                 }
             } else {
-                // Unterminated brace: value ran to the end of the string.
+                // No closing '}' before end-of-input (e.g. "{abc"): the value ran
+                // to the end. Store what we have, warn, and stop.
                 warn!("unterminated braced value in connection string");
                 has_warnings = true;
                 stop_after = true;
             }
         } else {
+            // Plain value: read verbatim up to the next ';' (or end). No trimming
+            // — "Server= host " stores the value as " host " with both spaces.
             while i < n && chars[i] != ';' {
                 value.push(chars[i]);
                 i += 1;
             }
         }
 
-        // Validate and store. msodbcsql stores the value before its brace-close
-        // checks, so a value with trailing junk is still stored before we stop.
-        // An invalid value on a validated key fails immediately (E_FAIL).
+        // Phase 4 — validate and store. msodbcsql stores the value before its
+        // brace-close checks, so a value with trailing junk is still stored before
+        // we stop. An invalid value on a validated key fails immediately (E_FAIL)
+        // and aborts the whole parse via the `?`.
         if let Some(slot) = target {
             assign_value(&mut params, slot, &lower, &value)?;
         }
@@ -449,7 +504,8 @@ pub(crate) fn parse_connection_string(
             break;
         }
 
-        // Consume the trailing separator (if present) and continue.
+        // Consume the trailing ';' separator (if present) and continue with the
+        // next pair. At end-of-input this is a no-op and the loop exits at Phase 1.
         if i < n {
             i += 1;
         }
@@ -939,6 +995,27 @@ mod tests {
         let (p, warn) = parse_connection_string("Server=h;UID=u;PWD=a{b}c").unwrap();
         assert!(!warn);
         assert_eq!(p.pwd, "a{b}c");
+    }
+
+    #[test]
+    fn open_brace_is_never_an_escape() {
+        // Only the first '{' opens brace-quoting; a second '{' right after it is a
+        // literal character (there is no '{{' escape, unlike '}}'). Here the value
+        // "{{a}" is: 1st '{' delimiter, 2nd '{' literal, '}' terminator -> "{a".
+        let (p, warn) = parse_connection_string("Server=h;PWD={{a};UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.pwd, "{a");
+        assert_eq!(p.uid, "u");
+    }
+
+    #[test]
+    fn doubled_open_then_doubled_close_at_end_is_unterminated() {
+        // "{{}}": 1st '{' opens, 2nd '{' literal, "}}" escapes to one literal '}',
+        // then end-of-string arrives with no terminating '}' -> unterminated brace.
+        // The collected "{}" is still stored, and parsing warns and stops.
+        let (p, warn) = parse_connection_string("Server=h;PWD={{}}").unwrap();
+        assert!(warn);
+        assert_eq!(p.pwd, "{}");
     }
 
     #[test]
