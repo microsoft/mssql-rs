@@ -990,7 +990,9 @@ mod client_based_iterators {
             .create_client(context, &build_tcp_datasource(), None)
             .await?;
 
-        client.execute("SELECT 1 AS only_col".to_string(), None, None).await?;
+        client
+            .execute("SELECT 1 AS only_col".to_string(), None, None)
+            .await?;
 
         let err = client.read_column(1).await.unwrap_err();
         assert!(
@@ -1092,8 +1094,7 @@ mod client_based_iterators {
     }
 
     #[tokio::test]
-    async fn small_buffer_repeated_plp_reads_then_next_column()
-    -> mssql_tds::core::TdsResult<()> {
+    async fn small_buffer_repeated_plp_reads_then_next_column() -> mssql_tds::core::TdsResult<()> {
         init_tracing();
         let context = create_context();
         let provider = TdsConnectionProvider {};
@@ -1118,7 +1119,10 @@ mod client_based_iterators {
             if client.active_plp_reached_end() {
                 break;
             }
-            assert!(n > 0, "Expected progress while reading PLP with small buffer");
+            assert!(
+                n > 0,
+                "Expected progress while reading PLP with small buffer"
+            );
         }
 
         assert_eq!(collected, vec![0x78; 13]);
@@ -1190,8 +1194,7 @@ mod client_based_iterators {
     }
 
     #[tokio::test]
-    async fn sparse_column_reads_2_and_4_across_two_rows()
-    -> mssql_tds::core::TdsResult<()> {
+    async fn sparse_column_reads_2_and_4_across_two_rows() -> mssql_tds::core::TdsResult<()> {
         init_tracing();
         let context = create_context();
         let provider = TdsConnectionProvider {};
@@ -1199,12 +1202,13 @@ mod client_based_iterators {
             .create_client(context, &build_tcp_datasource(), None)
             .await?;
 
-        let query = "DECLARE @t TABLE (c0 INT, c1 INT, c2 VARBINARY(MAX), c3 INT, c4 VARBINARY(MAX)); \
+        let query =
+            "DECLARE @t TABLE (c0 INT, c1 INT, c2 VARBINARY(MAX), c3 INT, c4 VARBINARY(MAX)); \
             INSERT INTO @t VALUES \
                 (10, 11, 0x6161, 13, 0x6262), \
                 (20, 21, 0x6363, 23, 0x6464); \
             SELECT c0, c1, c2, c3, c4 FROM @t"
-            .to_string();
+                .to_string();
         client.execute(query, None, None).await?;
 
         // Fetch sparse columns for row 1: c2 and c4 (1-based: columns 3 and 5).
@@ -1253,8 +1257,7 @@ mod client_based_iterators {
     }
 
     #[tokio::test]
-    async fn sparse_column_reads_1_and_3_across_two_rows()
-    -> mssql_tds::core::TdsResult<()> {
+    async fn sparse_column_reads_1_and_3_across_two_rows() -> mssql_tds::core::TdsResult<()> {
         init_tracing();
         let context = create_context();
         let provider = TdsConnectionProvider {};

@@ -148,8 +148,9 @@ impl PlpChunkStreamReader {
         }
     }
 
-    pub(crate) async fn begin(reader: &mut (dyn TdsPacketReader + Send + Sync)) -> TdsResult<Option<Self>>
-    {
+    pub(crate) async fn begin(
+        reader: &mut (dyn TdsPacketReader + Send + Sync),
+    ) -> TdsResult<Option<Self>> {
         let raw_len_i64 = reader.read_int64().await?;
         let raw_len = raw_len_i64 as u64;
         let raw_len_usize = raw_len as usize;
@@ -183,8 +184,10 @@ impl PlpChunkStreamReader {
         self.reached_end
     }
 
-    async fn ensure_active_chunk(&mut self, reader: &mut (dyn TdsPacketReader + Send + Sync)) -> TdsResult<bool>
-    {
+    async fn ensure_active_chunk(
+        &mut self,
+        reader: &mut (dyn TdsPacketReader + Send + Sync),
+    ) -> TdsResult<bool> {
         if self.reached_end {
             return Ok(false);
         }
@@ -228,20 +231,23 @@ impl PlpChunkStreamReader {
             )));
         }
 
-        if let PlpChunkReadLength::Known(known_len) = self.length {
-            if next_total > known_len as usize {
-                return Err(crate::error::Error::ProtocolError(format!(
-                    "PLP chunk exceeds declared length: accumulated={next_total}, declared_len={known_len}"
-                )));
-            }
+        if let PlpChunkReadLength::Known(known_len) = self.length
+            && next_total > known_len as usize
+        {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "PLP chunk exceeds declared length: accumulated={next_total}, declared_len={known_len}"
+            )));
         }
 
         self.chunk_remaining = chunk_len;
         Ok(true)
     }
 
-    pub(crate) async fn read_into(&mut self, reader: &mut (dyn TdsPacketReader + Send + Sync), out: &mut [u8]) -> TdsResult<usize>
-    {
+    pub(crate) async fn read_into(
+        &mut self,
+        reader: &mut (dyn TdsPacketReader + Send + Sync),
+        out: &mut [u8],
+    ) -> TdsResult<usize> {
         // Supports the msodbcsql-style cbRequest==0 pattern to consume a
         // pending terminator after all data bytes were already read.
         if out.is_empty() {
@@ -279,8 +285,10 @@ impl PlpChunkStreamReader {
         Ok(written)
     }
 
-    pub(crate) async fn skip_to_end(&mut self, reader: &mut (dyn TdsPacketReader + Send + Sync)) -> TdsResult<()>
-    {
+    pub(crate) async fn skip_to_end(
+        &mut self,
+        reader: &mut (dyn TdsPacketReader + Send + Sync),
+    ) -> TdsResult<()> {
         while self.ensure_active_chunk(reader).await? {
             if self.chunk_remaining > 0 {
                 reader.skip_bytes(self.chunk_remaining).await?;
@@ -341,14 +349,17 @@ impl PlpColumnStream {
     pub(crate) async fn begin(
         metadata: &ColumnMetadata,
         reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<Option<Self>>
-    {
+    ) -> TdsResult<Option<Self>> {
         let (plp_type, collation) = Self::type_from_metadata(metadata)?;
         let inner = match PlpChunkStreamReader::begin(reader).await? {
             None => return Ok(None),
             Some(r) => r,
         };
-        Ok(Some(Self { plp_type, collation, inner }))
+        Ok(Some(Self {
+            plp_type,
+            collation,
+            inner,
+        }))
     }
 
     /// The PLP-capable SQL Server type for this column.
@@ -372,14 +383,19 @@ impl PlpColumnStream {
     }
 
     /// Incrementally reads PLP payload bytes into `out`.
-    pub(crate) async fn read_into(&mut self, reader: &mut (dyn TdsPacketReader + Send + Sync), out: &mut [u8]) -> TdsResult<usize>
-    {
+    pub(crate) async fn read_into(
+        &mut self,
+        reader: &mut (dyn TdsPacketReader + Send + Sync),
+        out: &mut [u8],
+    ) -> TdsResult<usize> {
         self.inner.read_into(reader, out).await
     }
 
     /// Discards all remaining PLP payload and terminator bytes.
-    pub(crate) async fn skip_to_end(&mut self, reader: &mut (dyn TdsPacketReader + Send + Sync)) -> TdsResult<()>
-    {
+    pub(crate) async fn skip_to_end(
+        &mut self,
+        reader: &mut (dyn TdsPacketReader + Send + Sync),
+    ) -> TdsResult<()> {
         self.inner.skip_to_end(reader).await
     }
 
@@ -1584,7 +1600,7 @@ impl StringDecoder {
         matches!(data_type, TdsDataType::NText | TdsDataType::Text)
     }
 
-    async fn decode_string_into<T, W: ?Sized>(
+    async fn decode_string_into<T, W>(
         &self,
         reader: &mut T,
         metadata: &ColumnMetadata,
@@ -1593,7 +1609,7 @@ impl StringDecoder {
     ) -> TdsResult<()>
     where
         T: TdsPacketReader + Send + Sync,
-        W: RowWriter,
+        W: RowWriter + ?Sized,
     {
         let encoding_type = get_encoding_type(metadata);
 
@@ -3505,8 +3521,11 @@ mod test {
         #[tokio::test]
         async fn plp_column_stream_repeated_small_reads_exhaust_payload() {
             let payload = b"hello world";
-            let md =
-                plp_metadata(TdsDataType::BigVarBinary, PartialLengthType::BigVarBinary, None);
+            let md = plp_metadata(
+                TdsDataType::BigVarBinary,
+                PartialLengthType::BigVarBinary,
+                None,
+            );
             let mut reader = ByteReader::new(plp_wire(payload));
             let mut stream = PlpColumnStream::begin(&md, &mut reader)
                 .await
@@ -3552,7 +3571,6 @@ mod test {
                 },
                 column_name: "col".to_string(),
                 multi_part_name: None,
-                crypto_metadata: None,
             }
         }
 
@@ -3569,7 +3587,11 @@ mod test {
         async fn plp_column_stream_null_returns_none() {
             let mut buf = Vec::new();
             buf.extend_from_slice(&0xFFFFFFFFFFFFFFFFu64.to_le_bytes()); // SQL_PLP_NULL
-            let md = plp_metadata(TdsDataType::BigVarBinary, PartialLengthType::BigVarBinary, None);
+            let md = plp_metadata(
+                TdsDataType::BigVarBinary,
+                PartialLengthType::BigVarBinary,
+                None,
+            );
             let mut reader = ByteReader::new(buf);
             let result = PlpColumnStream::begin(&md, &mut reader).await.unwrap();
             assert!(result.is_none());
@@ -3578,9 +3600,16 @@ mod test {
         #[tokio::test]
         async fn plp_column_stream_binary_kind() {
             let payload = b"binarydata";
-            let md = plp_metadata(TdsDataType::BigVarBinary, PartialLengthType::BigVarBinary, None);
+            let md = plp_metadata(
+                TdsDataType::BigVarBinary,
+                PartialLengthType::BigVarBinary,
+                None,
+            );
             let mut reader = ByteReader::new(plp_wire(payload));
-            let mut stream = PlpColumnStream::begin(&md, &mut reader).await.unwrap().unwrap();
+            let mut stream = PlpColumnStream::begin(&md, &mut reader)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(stream.plp_type(), PartialLengthType::BigVarBinary);
             let mut out = vec![0u8; payload.len()];
             let n = stream.read_into(&mut reader, &mut out).await.unwrap();
@@ -3594,7 +3623,10 @@ mod test {
             let payload = b"hi"; // raw bytes, not actually UTF-16 but fine for stream test
             let md = plp_metadata(TdsDataType::NVarChar, PartialLengthType::NVarChar, None);
             let mut reader = ByteReader::new(plp_wire(payload));
-            let mut stream = PlpColumnStream::begin(&md, &mut reader).await.unwrap().unwrap();
+            let mut stream = PlpColumnStream::begin(&md, &mut reader)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(stream.plp_type(), PartialLengthType::NVarChar);
             let mut out = vec![0u8; 2];
             let n = stream.read_into(&mut reader, &mut out).await.unwrap();
@@ -3611,9 +3643,16 @@ mod test {
                 col_flags: 0,
                 sort_id: 52,
             };
-            let md = plp_metadata(TdsDataType::BigVarChar, PartialLengthType::BigVarChar, Some(col));
+            let md = plp_metadata(
+                TdsDataType::BigVarChar,
+                PartialLengthType::BigVarChar,
+                Some(col),
+            );
             let mut reader = ByteReader::new(plp_wire(payload));
-            let mut stream = PlpColumnStream::begin(&md, &mut reader).await.unwrap().unwrap();
+            let mut stream = PlpColumnStream::begin(&md, &mut reader)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(stream.plp_type(), PartialLengthType::BigVarChar);
             assert!(stream.collation().is_some());
             let mut out = vec![0u8; 5];
@@ -3628,7 +3667,10 @@ mod test {
             let payload = b"<r/>";
             let md = plp_metadata(TdsDataType::Xml, PartialLengthType::Xml, None);
             let mut reader = ByteReader::new(plp_wire(payload));
-            let mut stream = PlpColumnStream::begin(&md, &mut reader).await.unwrap().unwrap();
+            let mut stream = PlpColumnStream::begin(&md, &mut reader)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(stream.plp_type(), PartialLengthType::Xml);
             stream.skip_to_end(&mut reader).await.unwrap();
             assert!(stream.reached_end());
@@ -3640,7 +3682,10 @@ mod test {
             let payload = b"{}";
             let md = plp_metadata(TdsDataType::Json, PartialLengthType::Json, None);
             let mut reader = ByteReader::new(plp_wire(payload));
-            let mut stream = PlpColumnStream::begin(&md, &mut reader).await.unwrap().unwrap();
+            let mut stream = PlpColumnStream::begin(&md, &mut reader)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(stream.plp_type(), PartialLengthType::Json);
             let mut out = vec![0u8; 2];
             let n = stream.read_into(&mut reader, &mut out).await.unwrap();
@@ -3653,7 +3698,10 @@ mod test {
             let payload = b"\x01\x02\x03";
             let md = plp_metadata(TdsDataType::Udt, PartialLengthType::Udt, None);
             let mut reader = ByteReader::new(plp_wire(payload));
-            let mut stream = PlpColumnStream::begin(&md, &mut reader).await.unwrap().unwrap();
+            let mut stream = PlpColumnStream::begin(&md, &mut reader)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(stream.plp_type(), PartialLengthType::Udt);
             let mut out = vec![0u8; 3];
             let n = stream.read_into(&mut reader, &mut out).await.unwrap();
@@ -3688,7 +3736,8 @@ mod test {
             let mut out = [0u8; 1];
             let err = stream.read_into(&mut reader, &mut out).await.unwrap_err();
             assert!(
-                err.to_string().contains("PLP chunk exceeds declared length"),
+                err.to_string()
+                    .contains("PLP chunk exceeds declared length"),
                 "unexpected error: {err}"
             );
         }

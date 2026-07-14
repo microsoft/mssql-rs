@@ -1389,7 +1389,9 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
         }
     }
 
-    fn as_packet_reader(&mut self) -> &mut (dyn crate::io::packet_reader::TdsPacketReader + Send + Sync) {
+    fn as_packet_reader(
+        &mut self,
+    ) -> &mut (dyn crate::io::packet_reader::TdsPacketReader + Send + Sync) {
         self
     }
 }

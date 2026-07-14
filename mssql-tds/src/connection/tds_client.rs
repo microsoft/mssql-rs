@@ -40,19 +40,27 @@ use crate::{
 use async_trait::async_trait;
 use tracing::{debug, error, info, instrument};
 
+use crate::datatypes::decoder::{GenericDecoder, SqlTypeDecode};
 use crate::{
     core::{CancelHandle, TdsResult},
     query::metadata::ColumnMetadata,
 };
-use crate::datatypes::decoder::{GenericDecoder, SqlTypeDecode};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Tracks the unread tail of the current row after column-mode access starts.
+///
+/// We persist this state so callers can fetch sparse/non-sequential columns
+/// while keeping the wire stream forward-only and drainable before row advance.
 #[derive(Debug)]
 struct ActiveRowTail {
+    /// Absolute index of the first column represented in `columns`.
     first_column_index: usize,
+    /// Next absolute column index to read from the current row tail.
     next_column_index: usize,
+    /// Snapshot of metadata for the trailing columns in the current row.
     columns: Vec<ColumnMetadata>,
+    /// Null bitmap from an NBC row, used to skip absent trailing values.
     nbc_null_bitmap: Option<Vec<u8>>,
 }
 
@@ -145,13 +153,19 @@ impl TdsClient {
             .unwrap_or(false)
     }
 
+    /// Clears any incremental column-read state before entering another read mode.
+    ///
+    /// This helper exists to keep row-mode and column-mode APIs composable:
+    /// if a caller switches from `read_column`/`read_active_plp_bytes` back to
+    /// row iteration, we must first consume any unread PLP bytes and pending
+    /// trailing columns from the current row to keep token boundaries aligned.
     async fn drain_plp_context_if_any(&mut self) -> TdsResult<()> {
-        if let Some(mut prev_stream) = self.active_plp_stream.take() {
-            if !prev_stream.reached_end() {
-                prev_stream
-                    .skip_to_end(self.transport.as_packet_reader())
-                    .await?;
-            }
+        if let Some(mut prev_stream) = self.active_plp_stream.take()
+            && !prev_stream.reached_end()
+        {
+            prev_stream
+                .skip_to_end(self.transport.as_packet_reader())
+                .await?;
         }
 
         self.drain_active_row_tail().await
@@ -169,6 +183,11 @@ impl TdsClient {
         Ok(())
     }
 
+    /// Drains unread trailing columns from the current active row tail.
+    ///
+    /// `read_column` can leave a partially-consumed row (by design). This helper
+    /// is used when advancing to the next row or switching modes so the stream is
+    /// restored to a clean row boundary, mirroring SQLGetData-style progression.
     async fn drain_active_row_tail(&mut self) -> TdsResult<()> {
         let Some(tail) = self.active_row_tail.take() else {
             return Ok(());
@@ -187,6 +206,10 @@ impl TdsClient {
         Ok(())
     }
 
+    /// Reads a single positioned column using metadata already aligned to the stream.
+    ///
+    /// This centralizes PLP-vs-non-PLP behavior for column-mode reads so callers
+    /// can handle `ActivePlpStream` uniformly without duplicating decode logic.
     async fn read_positioned_column(
         &mut self,
         metadata: &ColumnMetadata,
@@ -205,6 +228,15 @@ impl TdsClient {
         }
     }
 
+    /// Reads a column from the current row tail after column-mode was already started.
+    ///
+    /// This path enforces forward-only access within the active row and supports
+    /// sparse patterns by skipping intervening columns. If the requested index is
+    /// earlier than the current tail window, it is treated as a next-row request
+    /// (drain current tail, then restart positioned read on the following row).
+    ///
+    /// Keeping this logic isolated ensures row-tail invariants remain consistent
+    /// regardless of whether the caller requests contiguous or sparse columns.
     async fn read_column_from_active_row(
         &mut self,
         column_index: usize,
@@ -225,22 +257,18 @@ impl TdsClient {
 
         if column_index >= row_end_column_index {
             self.active_row_tail = Some(tail);
-            return Err(UsageError(
-                format!(
-                    "Column index {column_index} is not available in the active row tail; call read_next_row_column to advance to the next row"
-                ),
-            ));
+            return Err(UsageError(format!(
+                "Column index {column_index} is not available in the active row tail; call read_column with a lower index after advancing the row"
+            )));
         }
 
         if column_index < tail.next_column_index {
             let next_column_index = tail.next_column_index;
             self.active_row_tail = Some(tail);
-            return Err(UsageError(
-                format!(
-                    "Column index {column_index} has already been consumed in the active row; next available column is {}",
-                    next_column_index
-                ),
-            ));
+            return Err(UsageError(format!(
+                "Column index {column_index} has already been consumed in the active row; next available column is {}",
+                next_column_index
+            )));
         }
 
         let target_offset = column_index - tail.first_column_index;
@@ -1546,12 +1574,12 @@ impl TdsClient {
         // Drain any partially-consumed PLP stream and unread columns from a
         // prior row so the wire is positioned at the next row token before we
         // resume full-row parsing.
-        if let Some(mut prev_stream) = self.active_plp_stream.take() {
-            if !prev_stream.reached_end() {
-                prev_stream
-                    .skip_to_end(self.transport.as_packet_reader())
-                    .await?;
-            }
+        if let Some(mut prev_stream) = self.active_plp_stream.take()
+            && !prev_stream.reached_end()
+        {
+            prev_stream
+                .skip_to_end(self.transport.as_packet_reader())
+                .await?;
         }
         self.drain_active_row_tail().await?;
         if self.current_metadata.is_none() {
@@ -1710,6 +1738,11 @@ impl TdsClient {
     /// Any columns before `column_index` in the same row are decoded and discarded to
     /// position the transport at the requested column. Remaining columns stay resumable
     /// in the active row so callers can continue with [`read_column`](Self::read_column).
+    ///
+    /// Why this exists: ODBC-style incremental APIs (for example, SQLGetData)
+    /// often read only selected columns and may stream PLP payloads in chunks.
+    /// This method provides the row-boundary token handling needed to support
+    /// that access pattern without requiring full-row materialization first.
     /// Returns:
     /// - `Ok(Some(ColumnReadResult::Value(_)))` for non-PLP values and SQL `NULL`,
     /// - `Ok(Some(ColumnReadResult::ActivePlpStream))` for non-NULL PLP payloads,
@@ -1720,18 +1753,18 @@ impl TdsClient {
     ) -> TdsResult<Option<ColumnReadResult>> {
         self.drain_plp_context_if_any().await?;
 
-        let metadata = Arc::clone(self.current_metadata.as_ref().ok_or(UsageError(
-            "No metadata found while starting a column read. Have you called execute()?"
-                .to_string(),
-        ))?);
+        let metadata = Arc::clone(
+            self.current_metadata.as_ref().ok_or(UsageError(
+                "No metadata found while starting a column read. Have you called execute()?"
+                    .to_string(),
+            ))?,
+        );
 
         if column_index >= metadata.columns.len() {
-            return Err(UsageError(
-                format!(
-                    "Column index {column_index} out of bounds for result set with {} columns",
-                    metadata.columns.len()
-                ),
-            ));
+            return Err(UsageError(format!(
+                "Column index {column_index} out of bounds for result set with {} columns",
+                metadata.columns.len()
+            )));
         }
 
         let target_col = metadata.columns[column_index].clone();
@@ -1767,7 +1800,10 @@ impl TdsClient {
                 TokenType::NbcRow => {
                     let bitmap_len = row_columns.len().div_ceil(8);
                     let mut bitmap = vec![0u8; bitmap_len];
-                    self.transport.as_packet_reader().read_bytes(&mut bitmap).await?;
+                    self.transport
+                        .as_packet_reader()
+                        .read_bytes(&mut bitmap)
+                        .await?;
 
                     for (idx, metadata) in row_columns.iter().take(column_index).enumerate() {
                         if Self::nbc_column_is_null(&bitmap, idx) {
@@ -1795,13 +1831,9 @@ impl TdsClient {
                 other => {
                     let packet_reader = self.transport.as_packet_reader();
                     let mut reader = packet_reader;
-                    let token = dispatch_token(
-                        &mut reader,
-                        &parser_registry,
-                        other,
-                        &parser_context,
-                    )
-                    .await?;
+                    let token =
+                        dispatch_token(&mut reader, &parser_registry, other, &parser_context)
+                            .await?;
 
                     match token {
                         Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
@@ -1830,11 +1862,13 @@ impl TdsClient {
                             if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
                                 self.recovery_context.session_state_table.reset();
                             }
-                            self.execution_context.capture_change_property(&env_change)?;
+                            self.execution_context
+                                .capture_change_property(&env_change)?;
                             continue;
                         }
                         Tokens::SessionState(session_state) => {
-                            self.recovery_context.process_session_state(&session_state)?;
+                            self.recovery_context
+                                .process_session_state(&session_state)?;
                             continue;
                         }
                         Tokens::ReturnValue(return_value_token) => {
@@ -1877,6 +1911,10 @@ impl TdsClient {
     /// row, skips any intervening columns, and reads the requested later column.
     /// Otherwise it advances to the next row and reads that column there.
     ///
+    /// Why this exists: this is the incremental read API used for sparse,
+    /// forward-only column access and PLP chunk streaming while preserving
+    /// compatibility with existing row-mode iteration (`next_row`).
+    ///
     /// Returns:
     /// - `Ok(None)` when no next row is available,
     /// - `Ok(Some(ColumnReadResult::Value(_)))` for non-PLP values and SQL `NULL`,
@@ -1885,10 +1923,10 @@ impl TdsClient {
         &mut self,
         column_index: usize,
     ) -> TdsResult<Option<ColumnReadResult>> {
-        if let Some(mut prev) = self.active_plp_stream.take() {
-            if !prev.reached_end() {
-                prev.skip_to_end(self.transport.as_packet_reader()).await?;
-            }
+        if let Some(mut prev) = self.active_plp_stream.take()
+            && !prev.reached_end()
+        {
+            prev.skip_to_end(self.transport.as_packet_reader()).await?;
         }
 
         if self.active_row_tail.is_some() {
@@ -1904,10 +1942,10 @@ impl TdsClient {
         &mut self,
         metadata: &ColumnMetadata,
     ) -> TdsResult<bool> {
-        if let Some(mut prev) = self.active_plp_stream.take() {
-            if !prev.reached_end() {
-                prev.skip_to_end(self.transport.as_packet_reader()).await?;
-            }
+        if let Some(mut prev) = self.active_plp_stream.take()
+            && !prev.reached_end()
+        {
+            prev.skip_to_end(self.transport.as_packet_reader()).await?;
         }
         let stream = crate::datatypes::decoder::PlpColumnStream::begin(
             metadata,
@@ -1930,7 +1968,8 @@ impl TdsClient {
         let mut stream = match self.active_plp_stream.take() {
             Some(s) => s,
             None => return Err(UsageError(
-                "read_active_plp_bytes called with no active PLP stream; call read_column first".to_string(),
+                "read_active_plp_bytes called with no active PLP stream; call read_column first"
+                    .to_string(),
             )),
         };
         let result = stream
@@ -1960,12 +1999,12 @@ impl TdsClient {
     /// Discards all remaining payload bytes and the terminator of the active
     /// PLP stream. Clears the active stream slot afterward.
     pub async fn skip_active_plp_to_end(&mut self) -> TdsResult<()> {
-        if let Some(mut stream) = self.active_plp_stream.take() {
-            if !stream.reached_end() {
-                stream
-                    .skip_to_end(self.transport.as_packet_reader())
-                    .await?;
-            }
+        if let Some(mut stream) = self.active_plp_stream.take()
+            && !stream.reached_end()
+        {
+            stream
+                .skip_to_end(self.transport.as_packet_reader())
+                .await?;
         }
         Ok(())
     }
@@ -2491,29 +2530,75 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::io::packet_reader::TdsPacketReader for TestTransport {
-        async fn read_byte(&mut self) -> TdsResult<u8> { unimplemented!("TestTransport") }
-        async fn read_int16_big_endian(&mut self) -> TdsResult<i16> { unimplemented!("TestTransport") }
-        async fn read_int32_big_endian(&mut self) -> TdsResult<i32> { unimplemented!("TestTransport") }
-        async fn read_uint40(&mut self) -> TdsResult<u64> { unimplemented!("TestTransport") }
-        async fn read_float32(&mut self) -> TdsResult<f32> { unimplemented!("TestTransport") }
-        async fn read_float64(&mut self) -> TdsResult<f64> { unimplemented!("TestTransport") }
-        async fn read_int16(&mut self) -> TdsResult<i16> { unimplemented!("TestTransport") }
-        async fn read_uint16(&mut self) -> TdsResult<u16> { unimplemented!("TestTransport") }
-        async fn read_uint24(&mut self) -> TdsResult<u32> { unimplemented!("TestTransport") }
-        async fn read_int32(&mut self) -> TdsResult<i32> { unimplemented!("TestTransport") }
-        async fn read_uint32(&mut self) -> TdsResult<u32> { unimplemented!("TestTransport") }
-        async fn read_int64(&mut self) -> TdsResult<i64> { unimplemented!("TestTransport") }
-        async fn read_uint64(&mut self) -> TdsResult<u64> { unimplemented!("TestTransport") }
-        async fn read_bytes(&mut self, _buf: &mut [u8]) -> TdsResult<usize> { unimplemented!("TestTransport") }
-        async fn read_u8_varbyte(&mut self) -> TdsResult<Vec<u8>> { unimplemented!("TestTransport") }
-        async fn read_u16_varbyte(&mut self) -> TdsResult<Vec<u8>> { unimplemented!("TestTransport") }
-        async fn read_varchar_u16_length(&mut self) -> TdsResult<Option<String>> { unimplemented!("TestTransport") }
-        async fn read_varchar_u8_length(&mut self) -> TdsResult<String> { unimplemented!("TestTransport") }
-        async fn read_unicode(&mut self, _len: usize) -> TdsResult<String> { unimplemented!("TestTransport") }
-        async fn read_unicode_with_byte_length(&mut self, _len: usize) -> TdsResult<String> { unimplemented!("TestTransport") }
-        async fn skip_bytes(&mut self, _count: usize) -> TdsResult<()> { unimplemented!("TestTransport") }
-        async fn cancel_read_stream(&mut self) -> TdsResult<()> { unimplemented!("TestTransport") }
-        fn reset_reader(&mut self) { unimplemented!("TestTransport") }
+        async fn read_byte(&mut self) -> TdsResult<u8> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint40(&mut self) -> TdsResult<u64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_float32(&mut self) -> TdsResult<f32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_float64(&mut self) -> TdsResult<f64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int16(&mut self) -> TdsResult<i16> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint16(&mut self) -> TdsResult<u16> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint24(&mut self) -> TdsResult<u32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int32(&mut self) -> TdsResult<i32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint32(&mut self) -> TdsResult<u32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int64(&mut self) -> TdsResult<i64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint64(&mut self) -> TdsResult<u64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_bytes(&mut self, _buf: &mut [u8]) -> TdsResult<usize> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_u8_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_u16_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_varchar_u16_length(&mut self) -> TdsResult<Option<String>> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_varchar_u8_length(&mut self) -> TdsResult<String> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_unicode(&mut self, _len: usize) -> TdsResult<String> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_unicode_with_byte_length(&mut self, _len: usize) -> TdsResult<String> {
+            unimplemented!("TestTransport")
+        }
+        async fn skip_bytes(&mut self, _count: usize) -> TdsResult<()> {
+            unimplemented!("TestTransport")
+        }
+        async fn cancel_read_stream(&mut self) -> TdsResult<()> {
+            unimplemented!("TestTransport")
+        }
+        fn reset_reader(&mut self) {
+            unimplemented!("TestTransport")
+        }
     }
 
     fn create_test_client() -> TdsClient {

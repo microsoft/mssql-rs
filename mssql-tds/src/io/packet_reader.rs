@@ -87,6 +87,12 @@ pub struct PacketReader<'a> {
     working_buffer: Vec<u8>,
 }
 
+/// Forwards `TdsPacketReader` calls through mutable references.
+///
+/// This adapter lets generic parsing paths accept `&mut dyn TdsPacketReader`
+/// (or nested mutable references) without additional wrapper types.
+/// It keeps token-dispatch and decoder call sites ergonomic when readers are
+/// obtained from transport trait objects.
 #[async_trait]
 impl<T> TdsPacketReader for &mut T
 where
