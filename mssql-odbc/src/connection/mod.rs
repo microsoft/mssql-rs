@@ -746,8 +746,7 @@ mod tests {
     fn authentication_empty_reset_vs_end_of_string() {
         // Empty Authentication mid-string is an intentional reset (mssql-tds treats
         // it as recognized); stored as Some("") to preserve the distinction from unset.
-        let (p, warn) =
-            parse_connection_string("Server=h;Authentication=;UID=u;PWD=p").unwrap();
+        let (p, warn) = parse_connection_string("Server=h;Authentication=;UID=u;PWD=p").unwrap();
         assert_eq!(p.authentication.as_deref(), Some(""));
         assert!(!warn);
 
@@ -949,10 +948,23 @@ mod tests {
     #[test]
     fn recognized_but_ignored_keys_do_not_warn() {
         for key in [
-            "Driver", "DSN", "APP", "WSID", "Language", "Network", "Address",
-            "MARS_Connection", "AutoTranslate", "QuotedId", "ApplicationIntent",
-            "MultiSubnetFailover", "ConnectRetryCount", "PacketSize", "ColumnEncryption",
-            "TransparentNetworkIPResolution", "OEMToANSI",
+            "Driver",
+            "DSN",
+            "APP",
+            "WSID",
+            "Language",
+            "Network",
+            "Address",
+            "MARS_Connection",
+            "AutoTranslate",
+            "QuotedId",
+            "ApplicationIntent",
+            "MultiSubnetFailover",
+            "ConnectRetryCount",
+            "PacketSize",
+            "ColumnEncryption",
+            "TransparentNetworkIPResolution",
+            "OEMToANSI",
         ] {
             let s = format!("Server=h;{key}=whatever;UID=u;PWD=p");
             let (p, warn) = parse_connection_string(&s).unwrap();
@@ -987,8 +999,7 @@ mod tests {
         assert_eq!(err.key, "encrypt");
         assert_eq!(err.value, "banana");
 
-        let err =
-            parse_connection_string("Server=h;Trusted_Connection=maybe;UID=u").unwrap_err();
+        let err = parse_connection_string("Server=h;Trusted_Connection=maybe;UID=u").unwrap_err();
         assert_eq!(err.key, "trusted_connection");
         assert_eq!(err.value, "maybe");
     }
