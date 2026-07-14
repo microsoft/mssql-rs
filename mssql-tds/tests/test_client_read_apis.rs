@@ -894,12 +894,422 @@ mod client_based_iterators {
         assert!(client.active_plp_reached_end());
 
         // Row should now be consumed from the PLP perspective.
-        assert!(client.next_row().await?.is_none());
+        assert!(client.read_column(0).await?.is_none());
 
         client.close_query().await?;
         assert!(client.active_plp_reached_end());
         assert!(client.active_plp_collation().is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plp_streaming_row_boundary_multi_column_contract() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "DECLARE @t TABLE (p1 VARBINARY(MAX), p2 VARBINARY(MAX)); INSERT INTO @t VALUES (0x616263, 0x646566), (0x313233, 0x343536); SELECT p1, p2 FROM @t"
+            .to_string();
+        client.execute(query, None, None).await?;
+
+        let mut buf = [0u8; 8];
+
+        let started = client.read_column(0).await?;
+        assert!(matches!(
+            started,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+        let mut total = 0usize;
+        let mut first_row_p1 = Vec::new();
+        loop {
+            let n = client.read_active_plp_bytes(&mut buf).await?;
+            total += n;
+            first_row_p1.extend_from_slice(&buf[..n]);
+            if client.active_plp_reached_end() {
+                break;
+            }
+            assert!(n > 0, "Expected progress while draining first-row p1");
+        }
+        assert!(total > 0, "Expected non-empty first-row p1 payload");
+        assert_eq!(first_row_p1, vec![0x61, 0x62, 0x63]);
+        assert!(client.active_plp_reached_end());
+
+        let started = client.read_column(1).await?;
+        assert!(matches!(
+            started,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+        total = 0;
+        let mut first_row_p2 = Vec::new();
+        loop {
+            let n = client.read_active_plp_bytes(&mut buf).await?;
+            total += n;
+            first_row_p2.extend_from_slice(&buf[..n]);
+            if client.active_plp_reached_end() {
+                break;
+            }
+            assert!(n > 0, "Expected progress while draining first-row p2");
+        }
+        assert!(total > 0, "Expected non-empty first-row p2 payload");
+        assert_eq!(first_row_p2, vec![0x64, 0x65, 0x66]);
+        assert!(client.active_plp_reached_end());
+
+        let next_row = client
+            .next_row()
+            .await?
+            .expect("Expected second row after fully consuming first-row columns");
+        match &next_row[0] {
+            mssql_tds::datatypes::column_values::ColumnValues::Bytes(b) => {
+                assert_eq!(b, &vec![0x31, 0x32, 0x33]);
+            }
+            other => panic!("Expected Bytes for second-row p1, got: {other:?}"),
+        }
+        match &next_row[1] {
+            mssql_tds::datatypes::column_values::ColumnValues::Bytes(b) => {
+                assert_eq!(b, &vec![0x34, 0x35, 0x36]);
+            }
+            other => panic!("Expected Bytes for second-row p2, got: {other:?}"),
+        }
+
+        assert!(client.next_row().await?.is_none());
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_column_rejects_out_of_bounds_index() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client.execute("SELECT 1 AS only_col".to_string(), None, None).await?;
+
+        let err = client.read_column(1).await.unwrap_err();
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "Expected out-of-bounds UsageError, got: {err}"
+        );
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_column_rejects_backward_access_in_active_row_tail()
+    -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "SELECT CAST(10 AS INT) AS c0, CAST(20 AS INT) AS c1, CAST(30 AS INT) AS c2"
+            .to_string();
+        client.execute(query, None, None).await?;
+
+        let v = client.read_column(0).await?;
+        assert!(matches!(
+            v,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
+                mssql_tds::datatypes::column_values::ColumnValues::Int(10)
+            ))
+        ));
+
+        let v = client.read_column(1).await?;
+        assert!(matches!(
+            v,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
+                mssql_tds::datatypes::column_values::ColumnValues::Int(20)
+            ))
+        ));
+
+        let err = client.read_column(1).await.unwrap_err();
+        assert!(
+            err.to_string().contains("already been consumed"),
+            "Expected backward-access UsageError, got: {err}"
+        );
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_column_and_row_mode_drains_partial_plp_and_tail()
+    -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "SELECT CAST(1 AS INT) AS i, CAST(0x68656C6C6F AS VARBINARY(MAX)) AS p, CAST(11 AS INT) AS j UNION ALL SELECT CAST(2 AS INT) AS i, CAST(0x776F726C64 AS VARBINARY(MAX)) AS p, CAST(22 AS INT) AS j".to_string();
+        client.execute(query, None, None).await?;
+
+        let started = client.read_column(1).await?;
+        assert!(matches!(
+            started,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+
+        let mut partial = [0u8; 2];
+        let n = client.read_active_plp_bytes(&mut partial).await?;
+        assert_eq!(&partial[..n], b"he");
+
+        let next_row = client
+            .next_row()
+            .await?
+            .expect("Expected second row after draining first row tail");
+
+        assert!(matches!(
+            next_row[0],
+            mssql_tds::datatypes::column_values::ColumnValues::Int(2)
+        ));
+        assert!(matches!(
+            next_row[2],
+            mssql_tds::datatypes::column_values::ColumnValues::Int(22)
+        ));
+        match &next_row[1] {
+            mssql_tds::datatypes::column_values::ColumnValues::Bytes(b) => {
+                assert_eq!(b, &vec![0x77, 0x6F, 0x72, 0x6C, 0x64]);
+            }
+            other => panic!("Expected Bytes value, got: {other:?}"),
+        }
+
+        assert!(client.next_row().await?.is_none());
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn small_buffer_repeated_plp_reads_then_next_column()
+    -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "SELECT CAST(7 AS INT) AS i, CAST(REPLICATE('x', 13) AS VARBINARY(MAX)) AS p, CAST(9 AS INT) AS j".to_string();
+        client.execute(query, None, None).await?;
+
+        let started = client.read_column(1).await?;
+        assert!(matches!(
+            started,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+
+        let mut chunk = [0u8; 3];
+        let mut collected = Vec::new();
+        loop {
+            let n = client.read_active_plp_bytes(&mut chunk).await?;
+            collected.extend_from_slice(&chunk[..n]);
+            if client.active_plp_reached_end() {
+                break;
+            }
+            assert!(n > 0, "Expected progress while reading PLP with small buffer");
+        }
+
+        assert_eq!(collected, vec![0x78; 13]);
+        assert!(client.active_plp_reached_end());
+
+        let value = client.read_column(2).await?;
+        assert!(matches!(
+            value,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
+                mssql_tds::datatypes::column_values::ColumnValues::Int(9)
+            ))
+        ));
+
+        assert!(client.next_row().await?.is_none());
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_plp_then_switch_to_next_column_with_small_buffer()
+    -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query =
+            "SELECT CAST(1 AS INT) AS i, CAST(REPLICATE('q', 12) AS VARBINARY(MAX)) AS p, CAST(42 AS INT) AS j"
+                .to_string();
+        client.execute(query, None, None).await?;
+
+        let started = client.read_column(1).await?;
+        assert!(matches!(
+            started,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+
+        let mut chunk = [0u8; 4];
+        let n = client.read_active_plp_bytes(&mut chunk).await?;
+        assert_eq!(&chunk[..n], b"qqqq");
+        assert!(
+            !client.active_plp_reached_end(),
+            "PLP stream should still have unread bytes after partial read"
+        );
+
+        // Switching to the next column should drain the remaining PLP bytes first.
+        let value = client.read_column(2).await?;
+        assert!(matches!(
+            value,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
+                mssql_tds::datatypes::column_values::ColumnValues::Int(42)
+            ))
+        ));
+
+        let mut out = [0u8; 1];
+        let err = client.read_active_plp_bytes(&mut out).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no active PLP stream"),
+            "Expected no-active-stream UsageError, got: {err}"
+        );
+
+        assert!(client.next_row().await?.is_none());
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_column_reads_2_and_4_across_two_rows()
+    -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "DECLARE @t TABLE (c0 INT, c1 INT, c2 VARBINARY(MAX), c3 INT, c4 VARBINARY(MAX)); \
+            INSERT INTO @t VALUES \
+                (10, 11, 0x6161, 13, 0x6262), \
+                (20, 21, 0x6363, 23, 0x6464); \
+            SELECT c0, c1, c2, c3, c4 FROM @t"
+            .to_string();
+        client.execute(query, None, None).await?;
+
+        // Fetch sparse columns for row 1: c2 and c4 (1-based: columns 3 and 5).
+        let row1_c2 = client.read_column(2).await?;
+        assert!(matches!(
+            row1_c2,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+        let mut buf = [0u8; 8];
+        let n = client.read_active_plp_bytes(&mut buf).await?;
+        assert_eq!(&buf[..n], b"aa");
+        assert!(client.active_plp_reached_end());
+
+        let row1_c4 = client.read_column(4).await?;
+        assert!(matches!(
+            row1_c4,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+        let n = client.read_active_plp_bytes(&mut buf).await?;
+        assert_eq!(&buf[..n], b"bb");
+        assert!(client.active_plp_reached_end());
+
+        // Fetch the same sparse columns for row 2.
+        let row2_c2 = client.read_column(2).await?;
+        assert!(matches!(
+            row2_c2,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+        let n = client.read_active_plp_bytes(&mut buf).await?;
+        assert_eq!(&buf[..n], b"cc");
+        assert!(client.active_plp_reached_end());
+
+        let row2_c4 = client.read_column(4).await?;
+        assert!(matches!(
+            row2_c4,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+        let n = client.read_active_plp_bytes(&mut buf).await?;
+        assert_eq!(&buf[..n], b"dd");
+        assert!(client.active_plp_reached_end());
+
+        assert!(client.read_column(2).await?.is_none());
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_column_reads_1_and_3_across_two_rows()
+    -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "DECLARE @t TABLE (c0 INT, c1 VARBINARY(MAX), c2 VARBINARY(MAX), c3 VARBINARY(MAX), c4 INT); \
+            INSERT INTO @t VALUES \
+                (10, 0x6161, 0x6262, 0x6363, 14), \
+                (20, 0x6464, 0x6565, 0x6666, 24); \
+            SELECT c0, c1, c2, c3, c4 FROM @t"
+            .to_string();
+        client.execute(query, None, None).await?;
+
+        // Row 1 sparse columns: first int (c0) then third PLP (c3).
+        let row1_c0 = client.read_column(0).await?;
+        assert!(matches!(
+            row1_c0,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
+                mssql_tds::datatypes::column_values::ColumnValues::Int(10)
+            ))
+        ));
+
+        let row1_c3 = client.read_column(3).await?;
+        assert!(matches!(
+            row1_c3,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+        let mut buf = [0u8; 8];
+        let n = client.read_active_plp_bytes(&mut buf).await?;
+        assert_eq!(&buf[..n], b"cc");
+        assert!(client.active_plp_reached_end());
+
+        // Requesting c0 again should advance to row 2 and read row2.c0.
+        let row2_c0 = client.read_column(0).await?;
+        assert!(matches!(
+            row2_c0,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
+                mssql_tds::datatypes::column_values::ColumnValues::Int(20)
+            ))
+        ));
+
+        let row2_c3 = client.read_column(3).await?;
+        assert!(matches!(
+            row2_c3,
+            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
+        ));
+        let n = client.read_active_plp_bytes(&mut buf).await?;
+        assert_eq!(&buf[..n], b"ff");
+        assert!(client.active_plp_reached_end());
+
+        assert!(client.read_column(0).await?.is_none());
+
+        client.close_query().await?;
         Ok(())
     }
 

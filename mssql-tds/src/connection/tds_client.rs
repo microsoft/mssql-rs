@@ -33,7 +33,7 @@ use crate::{
     },
     datatypes::column_values::ColumnValues,
     handler::handler_factory::NegotiatedSettings,
-    io::token_stream::{ParserContext, RowReadResult},
+    io::token_stream::{GenericTokenParserRegistry, ParserContext, RowReadResult, dispatch_token},
     message::{batch::SqlBatch, messages::Request},
     token::tokens::{ColMetadataToken, CurrentCommand, EnvChangeTokenSubType, TokenType, Tokens},
 };
@@ -214,7 +214,16 @@ impl TdsClient {
         };
 
         let row_end_column_index = tail.first_column_index + tail.columns.len();
-        if column_index < tail.first_column_index || column_index >= row_end_column_index {
+        if column_index < tail.first_column_index {
+            // Caller requested an earlier column index than is available in the
+            // current active row tail. Treat this as a request for the next row:
+            // drain current row tail and restart positioned read at next row.
+            self.active_row_tail = Some(tail);
+            self.drain_active_row_tail().await?;
+            return self.read_next_row_column(column_index).await;
+        }
+
+        if column_index >= row_end_column_index {
             self.active_row_tail = Some(tail);
             return Err(UsageError(
                 format!(
@@ -1534,13 +1543,9 @@ impl TdsClient {
         &mut self,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<bool> {
-        // Drain any partially-consumed PLP column stream from a prior read so
-        // the wire is clean before we start parsing the next row.
-        // NOTE: this only drains the active PLP column stream. It does not
-        // skip remaining non-PLP columns in a partially-read row. Callers that
-        // do column-by-column reads (e.g. mssql-odbc SQLGetData) must consume
-        // or skip all remaining columns in the current row before calling
-        // get_next_row / get_next_row_into.
+        // Drain any partially-consumed PLP stream and unread columns from a
+        // prior row so the wire is positioned at the next row token before we
+        // resume full-row parsing.
         if let Some(mut prev_stream) = self.active_plp_stream.take() {
             if !prev_stream.reached_end() {
                 prev_stream
@@ -1715,10 +1720,10 @@ impl TdsClient {
     ) -> TdsResult<Option<ColumnReadResult>> {
         self.drain_plp_context_if_any().await?;
 
-        let metadata = self.current_metadata.as_ref().ok_or(UsageError(
+        let metadata = Arc::clone(self.current_metadata.as_ref().ok_or(UsageError(
             "No metadata found while starting a column read. Have you called execute()?"
                 .to_string(),
-        ))?;
+        ))?);
 
         if column_index >= metadata.columns.len() {
             return Err(UsageError(
@@ -1736,57 +1741,133 @@ impl TdsClient {
         } else {
             Vec::new()
         };
+        let parser_context = ParserContext::ColumnMetadata(Arc::clone(&metadata));
+        let parser_registry = GenericTokenParserRegistry::default();
 
-        let token_type_byte = self.transport.as_packet_reader().read_byte().await?;
-        let token_type: TokenType = token_type_byte.try_into()?;
-        match token_type {
-            TokenType::Row => {
-                for metadata in row_columns.iter().take(column_index) {
-                    self.decode_and_discard_column(metadata).await?;
-                }
-
-                let value = self.read_positioned_column(&target_col).await?;
-                if !trailing_columns.is_empty() {
-                    self.active_row_tail = Some(ActiveRowTail {
-                        first_column_index: column_index + 1,
-                        next_column_index: column_index + 1,
-                        columns: trailing_columns,
-                        nbc_null_bitmap: None,
-                    });
-                }
-                Ok(Some(value))
-            }
-            TokenType::NbcRow => {
-                let bitmap_len = row_columns.len().div_ceil(8);
-                let mut bitmap = vec![0u8; bitmap_len];
-                self.transport.as_packet_reader().read_bytes(&mut bitmap).await?;
-
-                for (idx, metadata) in row_columns.iter().take(column_index).enumerate() {
-                    if Self::nbc_column_is_null(&bitmap, idx) {
-                        continue;
+        loop {
+            let token_type_byte = self.transport.as_packet_reader().read_byte().await?;
+            let token_type: TokenType = token_type_byte.try_into()?;
+            match token_type {
+                TokenType::Row => {
+                    for metadata in row_columns.iter().take(column_index) {
+                        self.decode_and_discard_column(metadata).await?;
                     }
-                    self.decode_and_discard_column(metadata).await?;
-                }
 
-                if !trailing_columns.is_empty() {
-                    self.active_row_tail = Some(ActiveRowTail {
-                        first_column_index: column_index + 1,
-                        next_column_index: column_index + 1,
-                        columns: trailing_columns,
-                        nbc_null_bitmap: Some(bitmap.clone()),
-                    });
-                }
-
-                if Self::nbc_column_is_null(&bitmap, column_index) {
-                    Ok(Some(ColumnReadResult::Value(ColumnValues::Null)))
-                } else {
                     let value = self.read_positioned_column(&target_col).await?;
-                    Ok(Some(value))
+                    if !trailing_columns.is_empty() {
+                        self.active_row_tail = Some(ActiveRowTail {
+                            first_column_index: column_index + 1,
+                            next_column_index: column_index + 1,
+                            columns: trailing_columns.clone(),
+                            nbc_null_bitmap: None,
+                        });
+                    }
+                    return Ok(Some(value));
+                }
+                TokenType::NbcRow => {
+                    let bitmap_len = row_columns.len().div_ceil(8);
+                    let mut bitmap = vec![0u8; bitmap_len];
+                    self.transport.as_packet_reader().read_bytes(&mut bitmap).await?;
+
+                    for (idx, metadata) in row_columns.iter().take(column_index).enumerate() {
+                        if Self::nbc_column_is_null(&bitmap, idx) {
+                            continue;
+                        }
+                        self.decode_and_discard_column(metadata).await?;
+                    }
+
+                    if !trailing_columns.is_empty() {
+                        self.active_row_tail = Some(ActiveRowTail {
+                            first_column_index: column_index + 1,
+                            next_column_index: column_index + 1,
+                            columns: trailing_columns.clone(),
+                            nbc_null_bitmap: Some(bitmap.clone()),
+                        });
+                    }
+
+                    if Self::nbc_column_is_null(&bitmap, column_index) {
+                        return Ok(Some(ColumnReadResult::Value(ColumnValues::Null)));
+                    }
+
+                    let value = self.read_positioned_column(&target_col).await?;
+                    return Ok(Some(value));
+                }
+                other => {
+                    let packet_reader = self.transport.as_packet_reader();
+                    let mut reader = packet_reader;
+                    let token = dispatch_token(
+                        &mut reader,
+                        &parser_registry,
+                        other,
+                        &parser_context,
+                    )
+                    .await?;
+
+                    match token {
+                        Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
+                            if done.has_error() {
+                                return Err(crate::error::Error::ProtocolError(
+                                    "Server reported error in DONE token without preceding ERROR token"
+                                        .to_string(),
+                                ));
+                            }
+
+                            let count = self.count_map.entry(done.cur_cmd).or_insert(0);
+                            *count = count.saturating_add(done.row_count);
+
+                            self.current_result_set_has_been_read_till_end = true;
+                            if !done.has_more() {
+                                self.execution_context.set_has_open_batch(false);
+                            }
+                            return Ok(None);
+                        }
+                        Tokens::Order(order_token) => {
+                            info!(?order_token);
+                            continue;
+                        }
+                        Tokens::EnvChange(env_change) => {
+                            info!(?env_change);
+                            if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                                self.recovery_context.session_state_table.reset();
+                            }
+                            self.execution_context.capture_change_property(&env_change)?;
+                            continue;
+                        }
+                        Tokens::SessionState(session_state) => {
+                            self.recovery_context.process_session_state(&session_state)?;
+                            continue;
+                        }
+                        Tokens::ReturnValue(return_value_token) => {
+                            let return_value = return_value_token.into();
+                            self.return_values.push(return_value);
+                            continue;
+                        }
+                        Tokens::Error(error_token) => {
+                            let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
+                            let drain_errors = self.drain_stream().await?;
+                            all_errors.extend(drain_errors);
+                            return Err(crate::error::Error::from_sql_errors(all_errors));
+                        }
+                        Tokens::ColMetadata(_) => {
+                            return Err(crate::error::Error::UsageError(
+                                "Unexpected ColMetadata token encountered while reading rows. \
+                                 This typically indicates the API was not used correctly - \
+                                 you may need to call move_to_next() to advance to the next result set."
+                                    .to_string(),
+                            ));
+                        }
+                        Tokens::Info(info_token) => {
+                            info!(?info_token);
+                            continue;
+                        }
+                        _ => {
+                            return Err(crate::error::Error::ProtocolError(format!(
+                                "Unexpected token while finding the next row: {token:?}"
+                            )));
+                        }
+                    }
                 }
             }
-            other => Err(UsageError(format!(
-                "Expected ROW/NBCROW token before column read, got {other:?}"
-            ))),
         }
     }
 

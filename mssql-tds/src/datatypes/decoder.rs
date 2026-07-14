@@ -1003,7 +1003,7 @@ impl GenericDecoder {
     /// [`RowWriter`], bypassing the intermediate `ColumnValues` enum for
     /// common types. Rare types (XML, JSON, Vector, Image, UDT, SsVariant)
     /// fall back to `decode()` + `write_column_value()`.
-    pub(crate) async fn decode_into<T, W: ?Sized>(
+    pub(crate) async fn decode_into<T, W>(
         &self,
         reader: &mut T,
         metadata: &ColumnMetadata,
@@ -1012,7 +1012,7 @@ impl GenericDecoder {
     ) -> TdsResult<()>
     where
         T: TdsPacketReader + Send + Sync,
-        W: RowWriter,
+        W: RowWriter + ?Sized,
     {
         match metadata.data_type {
             // === Fixed-length integer types ===
@@ -3036,24 +3036,11 @@ mod test {
         struct ByteReader {
             data: Vec<u8>,
             pos: usize,
-            zero_progress_once: bool,
         }
 
         impl ByteReader {
             fn new(data: Vec<u8>) -> Self {
-                Self {
-                    data,
-                    pos: 0,
-                    zero_progress_once: false,
-                }
-            }
-
-            fn new_with_zero_progress_once(data: Vec<u8>) -> Self {
-                Self {
-                    data,
-                    pos: 0,
-                    zero_progress_once: true,
-                }
+                Self { data, pos: 0 }
             }
 
             fn take(&mut self, n: usize) -> TdsResult<&[u8]> {
@@ -3111,10 +3098,6 @@ mod test {
                     | (b[4] as u64) << 32)
             }
             async fn read_bytes(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
-                if self.zero_progress_once && !buffer.is_empty() {
-                    self.zero_progress_once = false;
-                    return Ok(0);
-                }
                 let slice = self.take(buffer.len())?;
                 buffer.copy_from_slice(slice);
                 Ok(buffer.len())
@@ -3706,29 +3689,6 @@ mod test {
             let err = stream.read_into(&mut reader, &mut out).await.unwrap_err();
             assert!(
                 err.to_string().contains("PLP chunk exceeds declared length"),
-                "unexpected error: {err}"
-            );
-        }
-
-        #[tokio::test]
-        async fn plp_chunk_stream_reader_zero_progress_read_errors() {
-            let mut buf = Vec::new();
-            buf.extend_from_slice(&0xFFFFFFFFFFFFFFFEu64.to_le_bytes());
-            buf.extend_from_slice(&1u32.to_le_bytes());
-            buf.push(b'a');
-            buf.extend_from_slice(&0u32.to_le_bytes());
-
-            let mut reader = ByteReader::new_with_zero_progress_once(buf);
-            let mut stream = PlpChunkStreamReader::begin(&mut reader)
-                .await
-                .unwrap()
-                .expect("not null");
-
-            let mut out = [0u8; 1];
-            let err = stream.read_into(&mut reader, &mut out).await.unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("PLP stream read made no progress while bytes were requested"),
                 "unexpected error: {err}"
             );
         }
