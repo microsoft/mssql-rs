@@ -34,6 +34,56 @@ function Invoke-Native {
     }
 }
 
+# Convert a taskset-style CPU list ("16-31", "8,9,10", "8-11,14") into a Win32
+# process-affinity bitmask. Returns $null when the list is empty. Mirrors the
+# `taskset -c` contract that run-benchmarks.sh consumes on Linux.
+function ConvertTo-AffinityMask {
+    param([string]$CpuList)
+    if ([string]::IsNullOrWhiteSpace($CpuList)) { return $null }
+    [long]$mask = 0
+    foreach ($part in ($CpuList -split ',')) {
+        $p = $part.Trim()
+        if ($p -eq '') { continue }
+        if ($p -match '^(\d+)-(\d+)$') {
+            $lo = [int]$Matches[1]; $hi = [int]$Matches[2]
+            if ($lo -gt $hi) { $tmp = $lo; $lo = $hi; $hi = $tmp }
+            for ($c = $lo; $c -le $hi; $c++) { $mask = $mask -bor ([long]1 -shl $c) }
+        } elseif ($p -match '^\d+$') {
+            $mask = $mask -bor ([long]1 -shl [int]$p)
+        } else {
+            throw "PERF_CLIENT_CPUS/BENCH_CPUS: unrecognized token '$p' (expected CPU numbers or ranges like 16-31)"
+        }
+    }
+    if ($mask -eq 0) { return $null }
+    return $mask
+}
+
+# Run a measured `cargo bench` invocation, optionally pinned to a CPU set (the
+# Windows analog of `taskset` in run-benchmarks.sh). When no CPU set is requested
+# the plain call is used so behavior is unchanged. cargo's child bench process
+# inherits the affinity mask set on the cargo process at spawn, and since
+# compilation dominates cargo's startup the mask is in place well before the
+# bench binary launches.
+function Invoke-Bench {
+    param([Parameter(Mandatory)][string]$SaveBaseline)
+    if ($null -eq $script:BenchAffinity) {
+        Invoke-Native { cargo bench -p mssql-tds-bench -- --save-baseline $SaveBaseline }
+        return
+    }
+    $proc = Start-Process -FilePath 'cargo' `
+        -ArgumentList @('bench', '-p', 'mssql-tds-bench', '--', '--save-baseline', $SaveBaseline) `
+        -NoNewWindow -PassThru
+    try {
+        $proc.ProcessorAffinity = [IntPtr]$script:BenchAffinity
+    } catch {
+        Write-Host ">>> WARNING: could not set ProcessorAffinity: $($_.Exception.Message)"
+    }
+    $proc.WaitForExit()
+    if ($proc.ExitCode -ne 0) {
+        throw "cargo bench (--save-baseline $SaveBaseline) failed (exit $($proc.ExitCode))"
+    }
+}
+
 $RepoRoot   = (Get-Location).Path
 $ResultsDir = Join-Path $RepoRoot 'results'
 # Baseline pointer — a committed commit SHA. Advancing the baseline requires a
@@ -126,8 +176,16 @@ if (-not $env:BENCH_WARMUP_SECS) { $env:BENCH_WARMUP_SECS = '10' }
 if (-not $env:BENCH_SECS)        { $env:BENCH_SECS = '30' }
 if (-not $env:BENCH_SAMPLES)     { $env:BENCH_SAMPLES = '30' }
 
-# Note: client CPU pinning (PERF_CLIENT_CPUS) is applied on Linux via taskset in
-# run-benchmarks.sh; a Windows equivalent (ProcessorAffinity) is not yet wired up.
+# --- Optional CPU pinning (avoid contention with a colocated SQL Server) ---
+# Mirror run-benchmarks.sh: when the lab reserves cores for SQL Server and
+# publishes the free set via PERF_CLIENT_CPUS (e.g. "16-31"), pin the benchmark
+# client to that DISJOINT set so the two do not fight for the same CPUs.
+# BENCH_CPUS overrides locally. If neither is set the benchmarks run unpinned.
+$BenchCpuList = if ($env:BENCH_CPUS) { $env:BENCH_CPUS } else { $env:PERF_CLIENT_CPUS }
+$script:BenchAffinity = ConvertTo-AffinityMask $BenchCpuList
+if ($null -ne $script:BenchAffinity) {
+    Write-Host (">>> Pinning benchmark client to CPUs '$BenchCpuList' (affinity 0x{0:X})" -f $script:BenchAffinity)
+}
 
 # --- Warm-up pass (discarded) ---
 # Candidate is measured first and baseline second; prime SQL Server and the OS
@@ -147,7 +205,7 @@ $env:BENCH_WARMUP_SECS = $origWarm; $env:BENCH_SECS = $origSecs; $env:BENCH_SAMP
 
 # --- Candidate run (mssql-tds = working tree) ---
 Write-Host '>>> Candidate benchmarks...'
-Invoke-Native { cargo bench -p mssql-tds-bench -- --save-baseline candidate }
+Invoke-Bench 'candidate'
 
 # --- Baseline run (mssql-tds source swapped to the baseline commit) ---
 # Materialize the baseline mssql-tds via a local worktree, then replace the
@@ -166,7 +224,7 @@ Move-Item $CandidateSrc $StashedSrc
 Copy-Item -Recurse (Join-Path $BaselineTree 'mssql-tds') $CandidateSrc
 
 Write-Host '>>> Baseline benchmarks...'
-Invoke-Native { cargo bench -p mssql-tds-bench -- --save-baseline base }
+Invoke-Bench 'base'
 
 # Restore the candidate source and remove the worktree.
 Remove-Item -Recurse -Force $CandidateSrc
