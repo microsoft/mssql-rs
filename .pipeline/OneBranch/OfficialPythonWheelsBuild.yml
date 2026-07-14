@@ -10,13 +10,14 @@
 # Support:        https://aka.ms/onebranchsup                                   #
 #################################################################################
 
-# Official build runs on every merge to main; no PR validation (PRs are
-# validated by the separate validation pipeline). Can also be queued manually.
+# Official build runs on every merge to the ADO stable branch (stable mirrors
+# GitHub main); no PR validation (PRs are validated by the separate validation
+# pipeline). Can also be queued manually.
 trigger:
   batch: true
   branches:
     include:
-      - main
+      - stable
 pr: none
 
 variables:

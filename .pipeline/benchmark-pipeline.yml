@@ -10,7 +10,6 @@ pr:
   branches:
     include:
       - main
-      - development
 
 parameters:
   - name: baselineBranch

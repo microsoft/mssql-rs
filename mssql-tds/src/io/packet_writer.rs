@@ -5,7 +5,7 @@ use super::reader_writer::NetworkWriter;
 use crate::core::{CancelHandle, TdsResult};
 use crate::error::Error::TimeoutError;
 use crate::error::TimeoutErrorType;
-use crate::message::messages::{PacketStatusFlags, PacketType};
+use crate::message::messages::{PacketStatusFlags, PacketType, ResetConnectionMode};
 use async_trait::async_trait;
 use byteorder::{BigEndian, WriteBytesExt};
 use std::io::Cursor;
@@ -100,6 +100,15 @@ pub struct PacketWriter<'a> {
     start_time: Instant,
     max_timeout_sec: Option<u32>,
     cancel_handle: Option<CancelHandle>,
+    /// Connection-reset request to set on the first packet of this message.
+    /// Only honored for SQL Batch, RPC, and Transaction Manager messages.
+    reset_mode: ResetConnectionMode,
+    /// Whether the server is still owed an End-Of-Message packet for the
+    /// current message. A non-final flush sets it; sending the final packet
+    /// clears it. This lets `finalize` emit a trailing EOM packet even when the
+    /// payload ended exactly on a packet boundary, leaving the buffer empty
+    /// (issue #73).
+    eom_pending: bool,
 }
 
 impl<'a> PacketWriter<'a> {
@@ -122,6 +131,17 @@ impl<'a> PacketWriter<'a> {
         // Normalise 0 → None (infinite timeout)
         let effective_timeout = timeout.filter(|&t| t > 0);
 
+        // A connection reset may only be requested on the first packet of a
+        // SQL Batch, RPC, or Transaction Manager message (MS-TDS 2.2.3.1.2).
+        // Consume (and clear) any pending request from the connection so that
+        // it applies to exactly one message.
+        let reset_mode = match packet_type {
+            PacketType::SqlBatch | PacketType::RpcRequest | PacketType::TransactionManager => {
+                network_writer.take_reset_mode()
+            }
+            _ => ResetConnectionMode::None,
+        };
+
         PacketWriter {
             packet_type,
             network_writer,
@@ -133,6 +153,8 @@ impl<'a> PacketWriter<'a> {
             start_time: Instant::now(),
             max_timeout_sec: effective_timeout,
             cancel_handle: cancel_handle.map(|handle| handle.child_handle()),
+            reset_mode,
+            eom_pending: false,
         }
     }
 
@@ -198,6 +220,12 @@ impl<'a> PacketWriter<'a> {
 
         // Position at the header start and start writing the header.
         self.payload_cursor.set_position(0);
+        // The connection-reset bit (if any) is only valid on the first packet
+        // of the message.
+        let reset_mode = match self.is_first_packet {
+            true => self.reset_mode,
+            false => ResetConnectionMode::None,
+        };
         let _ = Self::build_header(
             &mut self.payload_cursor,
             packet_length,
@@ -205,6 +233,7 @@ impl<'a> PacketWriter<'a> {
             self.packet_id,
             is_last_packet,
             is_ignore_packet,
+            reset_mode,
         );
         let data_slice = &self.payload_cursor.get_ref().as_slice()[..packet_length];
 
@@ -254,6 +283,11 @@ impl<'a> PacketWriter<'a> {
         // Add the counter for the packet and increment by 1 for the next packet.
         self.packet_id = self.packet_id.wrapping_add(1);
 
+        // A non-final flush leaves the message unterminated; a final packet
+        // terminates it. `finalize` uses this to know whether it still needs to
+        // send a trailing EOM packet when the buffer ends empty.
+        self.eom_pending = !is_last_packet;
+
         // Restore the cursor position.
         self.payload_cursor.set_position(saved_position);
         Ok(())
@@ -266,15 +300,21 @@ impl<'a> PacketWriter<'a> {
         packet_id: u8,
         is_last_packet: bool,
         is_ignore_packet: bool,
+        reset_mode: ResetConnectionMode,
     ) -> TdsResult<()> {
         let _ = WriteBytesExt::write_u8(writer, packet_type as u8);
-        let status = match is_last_packet {
+        let mut status = match is_last_packet {
             true => match is_ignore_packet {
                 true => PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
                 false => PacketStatusFlags::Eom as u8,
             },
             false => PacketStatusFlags::Normal as u8,
         };
+
+        // RESETCONNECTION (0x08) and RESETCONNECTIONSKIPTRAN (0x10) are mutually
+        // exclusive (MS-TDS 2.2.3.1.2); the caller guarantees this is only set
+        // on the first packet of a Batch/RPC/Transaction Manager message.
+        status |= u8::from(reset_mode);
 
         let _ = WriteBytesExt::write_u8(writer, status);
 
@@ -295,7 +335,12 @@ impl<'a> PacketWriter<'a> {
 #[async_trait]
 impl TdsPacketWriter for PacketWriter<'_> {
     async fn finalize(&mut self) -> TdsResult<()> {
-        if (self.payload_cursor.position()) > Self::PACKET_HEADER_SIZE as u64 {
+        // Send a final EOM packet when there is buffered payload, or when the
+        // server is still owed an EOM after a non-final flush. The latter
+        // happens when the payload ends exactly on a packet boundary, leaving
+        // the buffer empty after the flush (issue #73). `populate_header_and_send`
+        // clears `eom_pending` once the EOM packet goes out.
+        if self.payload_cursor.position() > Self::PACKET_HEADER_SIZE as u64 || self.eom_pending {
             self.populate_header_and_send(true, false).await?;
             self.payload_cursor
                 .set_position(Self::PACKET_HEADER_SIZE as u64);
@@ -507,11 +552,16 @@ pub(crate) mod tests {
     pub(crate) struct MockNetworkWriter {
         pub(crate) size: u32,
         pub(crate) data: Vec<u8>,
+        pub(crate) reset_mode: ResetConnectionMode,
     }
 
     impl MockNetworkWriter {
         pub(crate) fn new(size: u32) -> Self {
-            Self { size, data: vec![] }
+            Self {
+                size,
+                data: vec![],
+                reset_mode: ResetConnectionMode::None,
+            }
         }
     }
 
@@ -530,6 +580,14 @@ pub(crate) mod tests {
 
         fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
             unimplemented!()
+        }
+
+        fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
+            self.reset_mode = mode;
+        }
+
+        fn take_reset_mode(&mut self) -> ResetConnectionMode {
+            std::mem::replace(&mut self.reset_mode, ResetConnectionMode::None)
         }
     }
 
@@ -550,6 +608,14 @@ pub(crate) mod tests {
         let mut writer = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
         block_on(writer.write_byte_async(0xAB)).unwrap();
         assert_eq!(writer.payload_cursor.into_inner()[8..], vec![0xAB]);
+    }
+
+    #[test]
+    fn mock_writer_uses_default_channel_binding_token() {
+        // Non-TLS transports rely on the `NetworkWriter` default, which yields
+        // no channel binding token.
+        let mock = MockNetworkWriter::new(8);
+        assert!(mock.channel_binding_token().is_none());
     }
 
     #[test]
@@ -654,6 +720,144 @@ pub(crate) mod tests {
             buf[1],
             PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8
         );
+    }
+
+    #[test]
+    fn test_reset_connection_bit_set_on_first_packet() {
+        let mut mock = MockNetworkWriter::new(16);
+        mock.set_reset_mode(ResetConnectionMode::Reset);
+
+        let mut writer = PacketWriter::new(PacketType::SqlBatch, &mut mock, None, None);
+        // The pending reset must be consumed from the connection at construction.
+        assert_eq!(writer.reset_mode, ResetConnectionMode::Reset);
+
+        block_on(writer.write_byte_async(0xAB)).unwrap();
+        block_on(writer.finalize()).unwrap();
+
+        // First (and only) packet must carry EOM | RESETCONNECTION.
+        assert_eq!(
+            mock.data[1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::ResetConnection as u8
+        );
+        // And the connection's pending reset has been cleared (one-shot).
+        assert_eq!(mock.take_reset_mode(), ResetConnectionMode::None);
+    }
+
+    /// Splits the raw network bytes into individual TDS packets, returning the
+    /// status byte of each packet in order.
+    fn packet_statuses(data: &[u8]) -> Vec<u8> {
+        let mut statuses = Vec::new();
+        let mut offset = 0;
+        while offset + PacketWriter::PACKET_HEADER_SIZE <= data.len() {
+            let status = data[offset + 1];
+            let length = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+            assert!(
+                length >= PacketWriter::PACKET_HEADER_SIZE,
+                "invalid packet length"
+            );
+            statuses.push(status);
+            offset += length;
+        }
+        assert_eq!(offset, data.len(), "packets do not cover the whole stream");
+        statuses
+    }
+
+    /// Regression test for issue #73: when the payload ends exactly on a packet
+    /// boundary, `handle_overflow_if_needed` flushes the buffer as a non-EOM
+    /// packet and leaves it empty. `finalize` must still emit a trailing EOM
+    /// packet, otherwise the server waits forever for the end of the message and
+    /// the request (e.g. a bulk copy) hangs until the timeout fires.
+    ///
+    /// The byte-at-a-time write path used here mirrors the row encoder that
+    /// surfaced the bug.
+    #[test]
+    fn test_finalize_sends_eom_when_payload_ends_on_packet_boundary() {
+        // packet_size 16 => max_payload_size 8. Writing exactly 8 payload bytes
+        // fills the packet precisely and triggers an empty flush.
+        let mut mock = MockNetworkWriter::new(16);
+        let mut writer = PacketWriter::new(PacketType::BulkLoad, &mut mock, None, None);
+
+        for _ in 0..8 {
+            block_on(writer.write_byte_async(0xAB)).unwrap();
+        }
+        block_on(writer.finalize()).unwrap();
+
+        let statuses = packet_statuses(&mock.data);
+        // The boundary-filling packet is sent as Normal, followed by an empty EOM packet.
+        assert_eq!(
+            statuses,
+            vec![
+                PacketStatusFlags::Normal as u8,
+                PacketStatusFlags::Eom as u8
+            ]
+        );
+        assert_eq!(
+            *statuses.last().unwrap() & PacketStatusFlags::Eom as u8,
+            PacketStatusFlags::Eom as u8,
+            "the final packet must carry the EOM flag"
+        );
+    }
+
+    #[test]
+    fn test_reset_connection_skiptran_bit() {
+        let mut mock = MockNetworkWriter::new(16);
+        mock.set_reset_mode(ResetConnectionMode::ResetSkipTran);
+
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        block_on(writer.write_byte_async(0xAB)).unwrap();
+        block_on(writer.finalize()).unwrap();
+
+        assert_eq!(
+            mock.data[1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::ResetConnectionSkipTran as u8
+        );
+    }
+
+    #[test]
+    fn test_reset_connection_bit_only_on_first_of_multiple_packets() {
+        // Packet size 10 => 2 payload bytes per packet. Two bytes of payload
+        // plus overflow forces multiple packets.
+        let packet_size = 10u32;
+        let mut mock = MockNetworkWriter::new(packet_size);
+        mock.set_reset_mode(ResetConnectionMode::Reset);
+
+        let mut writer = PacketWriter::new(PacketType::SqlBatch, &mut mock, None, None);
+        for _ in 0..5 {
+            block_on(writer.write_byte_async(0xAB)).unwrap();
+        }
+        block_on(writer.finalize()).unwrap();
+
+        let size = packet_size as usize;
+        // First packet header status carries the reset bit (not EOM yet).
+        assert_eq!(
+            mock.data[1] & PacketStatusFlags::ResetConnection as u8,
+            PacketStatusFlags::ResetConnection as u8
+        );
+        // Subsequent packet(s) must NOT carry the reset bit.
+        let second_status = mock.data[size + 1];
+        assert_eq!(second_status & PacketStatusFlags::ResetConnection as u8, 0);
+    }
+
+    #[test]
+    fn test_reset_connection_not_consumed_for_non_request_packet() {
+        // PreLogin (and other non Batch/RPC/Trans messages) must never carry or
+        // consume a pending reset.
+        let mut mock = MockNetworkWriter::new(16);
+        mock.set_reset_mode(ResetConnectionMode::Reset);
+
+        let mut writer = PacketWriter::new(PacketType::PreLogin, &mut mock, None, None);
+        assert_eq!(writer.reset_mode, ResetConnectionMode::None);
+        block_on(writer.write_byte_async(0xAB)).unwrap();
+        block_on(writer.finalize()).unwrap();
+
+        // No reset bit in the sent header.
+        assert_eq!(mock.data[1] & PacketStatusFlags::ResetConnection as u8, 0);
+        assert_eq!(
+            mock.data[1] & PacketStatusFlags::ResetConnectionSkipTran as u8,
+            0
+        );
+        // The pending reset is preserved for a later request packet.
+        assert_eq!(mock.take_reset_mode(), ResetConnectionMode::Reset);
     }
 
     #[test]

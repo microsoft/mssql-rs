@@ -8,11 +8,11 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
+use crate::odbc_auth::odbc_authentication_transformer::transform_auth;
+use crate::odbc_auth::odbc_authentication_validator::validate_auth;
 use crate::python_logger_adapter::scoped_tracing_bridge;
 use mssql_tds::{
     connection::client_context::{ClientContext, IPAddressPreference},
-    connection::odbc_authentication_transformer::transform_auth,
-    connection::odbc_authentication_validator::validate_auth,
     connection::tds_client::TdsClient,
     connection_provider::tds_connection_provider::TdsConnectionProvider,
     core::{EncryptionOptions, EncryptionSetting},
@@ -35,6 +35,7 @@ impl PyCoreConnection {
     #[new]
     #[pyo3(signature = (client_context_dict, python_logger=None))]
     fn new(
+        py: Python<'_>,
         client_context_dict: &Bound<'_, PyDict>,
         python_logger: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
@@ -68,10 +69,12 @@ impl PyCoreConnection {
         );
         let datasource = client_context.data_source.clone();
         let provider = TdsConnectionProvider {};
-        let tds_client = runtime.block_on(async {
-            provider
-                .create_client(client_context, &datasource, None)
-                .await
+        let tds_client = py.detach(|| {
+            runtime.block_on(async {
+                provider
+                    .create_client(client_context, &datasource, None)
+                    .await
+            })
         });
 
         match tds_client {
@@ -440,6 +443,43 @@ impl PyCoreConnection {
 
         context.tds_authentication_method = transformed.method;
         context.access_token = transformed.access_token;
+
+        // Optional Entra ID token factory provided by Python (e.g. mssql-python
+        // wires this up for ActiveDirectoryServicePrincipal to acquire a JWT
+        // via azure-identity during the FedAuth handshake). The factory is
+        // registered under the resolved auth method; mssql-tds dispatches to
+        // it via `ClientContext::entra_id_token_factory()`.
+        if let Some(factory_obj) = dict.get_item("entra_id_token_factory")?
+            && !factory_obj.is_none()
+        {
+            if !factory_obj.is_callable() {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "entra_id_token_factory must be a callable (e.g., a function) that returns an access token",
+                ));
+            }
+
+            let factory = crate::python_entra_token_factory::PythonEntraIdTokenFactory::new(
+                factory_obj.unbind(),
+            );
+            context
+                .auth_method_map
+                .insert(context.tds_authentication_method.clone(), Box::new(factory));
+
+            // For factory-based AD methods (ServicePrincipal, Password) the
+            // login-packet user_name/password fields are not serialized on the
+            // wire: the factory captures the credentials itself and delivers a
+            // JWT during FedAuth. Drop them from ClientContext so the
+            // client_secret does not outlive the registration any longer than
+            // necessary.
+            if matches!(
+                context.tds_authentication_method,
+                mssql_tds::connection::client_context::TdsAuthenticationMethod::ActiveDirectoryServicePrincipal
+                    | mssql_tds::connection::client_context::TdsAuthenticationMethod::ActiveDirectoryPassword
+            ) {
+                context.user_name = String::new();
+                context.password = String::new();
+            }
+        }
 
         // Set library_name to "mssql-python" for Python driver
         context.library_name = "mssql-python".to_string();

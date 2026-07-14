@@ -97,6 +97,8 @@ pub enum TdsDataType {
     Udt = 0xF0,
     /// XML data (`0xF1`).
     Xml = 0xF1,
+    /// Table-valued parameter (`0xF3`).
+    SqlTable = 0xF3,
     /// JSON data (`0xF4`).
     Json = 0xF4,
     /// Fixed-dimension float vector (`0xF5`).
@@ -162,6 +164,7 @@ impl TdsDataType {
             | TdsDataType::FltN
             | TdsDataType::MoneyN
             | TdsDataType::DateTimeN
+            | TdsDataType::SqlTable
             | TdsDataType::None => {
                 return Err(Error::ImplementationError(format!(
                     "get_meta_type_name called on TdsDataType::{self:?}, which has no \
@@ -220,6 +223,7 @@ impl TryFrom<u8> for TdsDataType {
             0xEF => Ok(TdsDataType::NChar),
             0xF0 => Ok(TdsDataType::Udt),
             0xF1 => Ok(TdsDataType::Xml),
+            0xF3 => Ok(TdsDataType::SqlTable),
             0xF4 => Ok(TdsDataType::Json),
             0xF5 => Ok(TdsDataType::Vector),
             _ => Err(Error::ProtocolError(format(format_args!(
@@ -1002,11 +1006,10 @@ where
         return Ok(type_info);
     }
 
-    unimplemented!(
-        "Couldnt find the Variable length equivalent of data_type.
-        Is this UDT: {:?}",
-        data_type
-    )
+    Err(Error::ProtocolError(format!(
+        "Unsupported TDS data type in TYPE_INFO stream: {data_type:?}. \
+         No variable-length encoding known for this type."
+    )))
 }
 
 /// Returns `true` if the TDS data type uses Unicode encoding (NVarChar, NChar, NText).
@@ -1141,6 +1144,7 @@ mod tests {
         assert_eq!(TdsDataType::try_from(0x7F).unwrap(), TdsDataType::Int8);
         assert_eq!(TdsDataType::try_from(0xE7).unwrap(), TdsDataType::NVarChar);
         assert_eq!(TdsDataType::try_from(0xF1).unwrap(), TdsDataType::Xml);
+        assert_eq!(TdsDataType::try_from(0xF3).unwrap(), TdsDataType::SqlTable);
         assert_eq!(TdsDataType::try_from(0xF4).unwrap(), TdsDataType::Json);
     }
 
@@ -1149,6 +1153,24 @@ mod tests {
         assert!(TdsDataType::try_from(0xFF).is_err());
         assert!(TdsDataType::try_from(0x00).is_err());
         assert!(TdsDataType::try_from(0x99).is_err());
+    }
+
+    /// Regression: `read_type_info` previously called `unimplemented!()` for data
+    /// types that are neither fixed-length, variable-length, nor PLP (e.g. `SqlTable`
+    /// in a column metadata stream). Fuzzing reproduced this as a panic. The function
+    /// must now return a `ProtocolError` instead.
+    #[tokio::test]
+    async fn read_type_info_rejects_unsupported_type() {
+        use crate::token::parsers::common::test_utils::MockReader;
+
+        let mut reader = MockReader::new(Vec::new());
+        let err = read_type_info(&mut reader, TdsDataType::SqlTable)
+            .await
+            .expect_err("SqlTable has no variable-length encoding; expected ProtocolError");
+        assert!(
+            matches!(err, Error::ProtocolError(_)),
+            "expected ProtocolError, got {err:?}"
+        );
     }
 
     #[test]

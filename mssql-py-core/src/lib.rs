@@ -9,6 +9,8 @@ use mssql_tds::connection::client_context::DriverVersion;
 mod bulkcopy;
 mod connection;
 mod cursor;
+mod odbc_auth;
+mod python_entra_token_factory;
 mod python_logger_adapter;
 mod row_writer;
 mod tracing_init;
@@ -47,7 +49,7 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     tracing_init::init_tracing();
 
     // Statically capture the Python version once during module initialization
-    let py_version = m.py().version();
+    let py_version = pyo3::Python::version_str();
     let _ = RUNTIME_DETAILS.set(format!("Python {}", py_version));
 
     // Statically capture the mssql_python driver version during module initialization
@@ -80,5 +82,12 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<connection::PyCoreConnection>()?;
     m.add_class::<cursor::PyCoreCursor>()?;
+
+    // Test-only hook to drive PythonEntraIdTokenFactory::create_token from
+    // Python tests. Underscore-prefixed to mark as internal/test-only.
+    m.add_function(wrap_pyfunction!(
+        python_entra_token_factory::invoke_entra_id_token_factory,
+        m
+    )?)?;
     Ok(())
 }

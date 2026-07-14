@@ -2,7 +2,8 @@
 // Licensed under the MIT License.
 
 use crate::connection::client_context::{
-    ClientContext, TdsAuthenticationMethod, TransportContext, VectorVersion,
+    ClientContext, ColumnEncryptionSetting, TdsAuthenticationMethod, TransportContext,
+    VectorVersion,
 };
 use crate::message::features::jsonfeature::JsonFeature;
 use crate::message::login_options::{
@@ -21,6 +22,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
+use super::features::always_encrypted::AlwaysEncryptedFeature;
 use super::features::fedauth::FedAuthFeature;
 use super::features::session_recovery::SessionRecoveryFeature;
 use super::features::useragent::UserAgentFeature;
@@ -147,6 +149,7 @@ impl FeaturesRequest {
         access_token: Option<String>,
         prelogin_fedauth_response: bool,
         vector_version: VectorVersion,
+        column_encryption_setting: ColumnEncryptionSetting,
         user_agent_feature: UserAgentFeature,
     ) -> Self {
         let mut features: HashMap<FeatureExtension, Box<dyn Feature>> = HashMap::new();
@@ -160,6 +163,13 @@ impl FeaturesRequest {
         features.insert(FeatureExtension::UserAgent, Box::new(user_agent_feature));
         if let Some(vector_feature) = Option::<VectorFeature>::from(vector_version) {
             features.insert(FeatureExtension::Vector, Box::new(vector_feature));
+        }
+
+        if column_encryption_setting == ColumnEncryptionSetting::Enabled {
+            features.insert(
+                FeatureExtension::AlwaysEncrypted,
+                Box::new(AlwaysEncryptedFeature::default()),
+            );
         }
 
         if authentication_options != TdsAuthenticationMethod::SSPI
@@ -253,6 +263,22 @@ impl FeaturesRequest {
 
 use crate::connection::session_recovery::SessionRecoveryData;
 
+/// Emits a warning when Always Encrypted is enabled on the connection but no
+/// column master key store providers are registered. Without a provider, every
+/// encrypt/decrypt later fails with a `ColumnEncryptionError`; warning here turns
+/// that confusing first-query failure into an actionable connection-setup hint.
+fn warn_if_always_encrypted_has_no_providers(context: &ClientContext) {
+    if context.column_encryption_setting == ColumnEncryptionSetting::Enabled
+        && context.column_encryption_key_store_providers.is_empty()
+    {
+        tracing::warn!(
+            "Always Encrypted is enabled on this connection but no column master key store \
+             providers are registered; encrypted columns and parameters cannot resolve their \
+             keys until a provider (e.g. MSSQL_CERTIFICATE_STORE) is registered"
+        );
+    }
+}
+
 impl From<(&ClientContext, bool)> for FeaturesRequest {
     fn from(context_and_prelogin_fedauth_flag: (&ClientContext, bool)) -> Self {
         let context = context_and_prelogin_fedauth_flag.0;
@@ -261,8 +287,11 @@ impl From<(&ClientContext, bool)> for FeaturesRequest {
             context.access_token.clone(),
             context_and_prelogin_fedauth_flag.1,
             context.vector_version,
+            context.column_encryption_setting,
             UserAgentFeature::new(context),
         );
+
+        warn_if_always_encrypted_has_no_providers(context);
 
         if context.connect_retry_count > 0 {
             request.features.insert(
@@ -289,8 +318,11 @@ impl FeaturesRequest {
             context.access_token.clone(),
             prelogin_fedauth_response,
             context.vector_version,
+            context.column_encryption_setting,
             UserAgentFeature::new(context),
         );
+
+        warn_if_always_encrypted_has_no_providers(context);
 
         if context.connect_retry_count > 0 {
             let feature = if let Some(recovery_data) = recovery_data {
@@ -451,6 +483,17 @@ impl LoginResponseModel {
                 }
                 EnvChangeTokenSubType::CharacterSet => {
                     self.change_properties.char_set = Some(string_change.new_value().clone());
+                    Ok(())
+                }
+                EnvChangeTokenSubType::DatabaseMirroringPartner => {
+                    // The server advertises the mirroring/failover partner during
+                    // login for mirrored or AlwaysOn databases. We do not act on it
+                    // yet, but it must be consumed so login can proceed.
+                    event!(
+                        Level::DEBUG,
+                        "Ignoring database mirroring partner: {:?}",
+                        string_change.new_value()
+                    );
                     Ok(())
                 }
                 _ => {

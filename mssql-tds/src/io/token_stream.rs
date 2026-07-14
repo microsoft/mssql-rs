@@ -2,17 +2,18 @@
 // Licensed under the MIT License.
 
 use crate::core::{CancelHandle, TdsResult};
-use crate::datatypes::decoder::GenericDecoder;
-use crate::datatypes::row_writer::RowWriter;
+use crate::datatypes::decoder::{GenericDecoder, decrypt_encrypted_column};
+use crate::datatypes::row_writer::{RowWriter, write_column_value};
 use crate::io::packet_reader::TdsPacketReader;
 use crate::query::metadata::ColumnMetadata;
+use crate::security::cell_decryptor::CellDecryptor;
 use crate::token::parsers::TokenParser;
 use crate::token::parsers::{
-    ColMetadataTokenParser, DoneInProcTokenParser, DoneProcTokenParser, DoneTokenParser,
-    EnvChangeTokenParser, ErrorTokenParser, FeatureExtAckTokenParser, FedAuthInfoTokenParser,
-    InfoTokenParser, LoginAckTokenParser, NbcRowTokenParser, OrderTokenParser,
-    ReturnStatusTokenParser, ReturnValueTokenParser, RowTokenParser, SessionStateTokenParser,
-    SspiTokenParser,
+    ColInfoTokenParser, ColMetadataTokenParser, DoneInProcTokenParser, DoneProcTokenParser,
+    DoneTokenParser, EnvChangeTokenParser, ErrorTokenParser, FeatureExtAckTokenParser,
+    FedAuthInfoTokenParser, InfoTokenParser, LoginAckTokenParser, NbcRowTokenParser,
+    OrderTokenParser, ReturnStatusTokenParser, ReturnValueTokenParser, RowTokenParser,
+    SessionStateTokenParser, SspiTokenParser, TabNameTokenParser,
 };
 use crate::token::tokens::{ColMetadataToken, TokenType, Tokens};
 use async_trait::async_trait;
@@ -95,6 +96,12 @@ where
     pub parser_registry: Box<R>,
 }
 
+/// Column metadata plus the optional cell decryptor needed to decode a row.
+///
+/// Returned by [`extract_row_context`] so the ROW/NBCROW decode paths can both
+/// access the column layout and the Always Encrypted decryptor (if any).
+type RowDecodeContext<'a> = (&'a [ColumnMetadata], Option<&'a Arc<dyn CellDecryptor>>);
+
 /// `ParserContext` is used to add additional context, which can be leveraged by the token parsers.
 /// One of the usecase is passing the metadata for the columns, to the row parser and to the
 /// NBC row token parser.
@@ -103,7 +110,15 @@ where
 #[derive(Debug)]
 #[cfg(not(fuzzing))]
 pub(crate) enum ParserContext {
-    ColumnMetadata(Arc<ColMetadataToken>),
+    /// Column metadata for the current result set, paired with an optional
+    /// [`CellDecryptor`] used to decrypt Always Encrypted columns while decoding
+    /// rows. The decryptor is `None` when the result set has no encrypted
+    /// columns or column encryption is not enabled.
+    ColumnMetadata(Arc<ColMetadataToken>, Option<Arc<dyn CellDecryptor>>),
+    /// Carries whether Always Encrypted (TCE) was negotiated for the connection.
+    /// Consumed by the COLMETADATA parser to decide whether to parse the CEK
+    /// table and per-column crypto metadata.
+    ColumnEncryption(bool),
     None(()),
 }
 
@@ -111,7 +126,11 @@ pub(crate) enum ParserContext {
 #[cfg(fuzzing)]
 #[allow(private_interfaces)]
 pub enum ParserContext {
-    ColumnMetadata(Arc<ColMetadataToken>),
+    ColumnMetadata(Arc<ColMetadataToken>, Option<Arc<dyn CellDecryptor>>),
+    /// Carries whether Always Encrypted (TCE) was negotiated for the connection.
+    /// Consumed by the COLMETADATA parser to decide whether to parse the CEK
+    /// table and per-column crypto metadata.
+    ColumnEncryption(bool),
     None(()),
 }
 
@@ -121,9 +140,20 @@ impl Default for ParserContext {
     }
 }
 
-fn extract_column_metadata(context: &ParserContext) -> TdsResult<&[ColumnMetadata]> {
+impl ParserContext {
+    /// Returns `true` when this context indicates Always Encrypted was
+    /// negotiated, instructing the COLMETADATA parser to parse encryption
+    /// metadata.
+    pub(crate) fn is_column_encryption_supported(&self) -> bool {
+        matches!(self, ParserContext::ColumnEncryption(true))
+    }
+}
+
+fn extract_row_context(context: &ParserContext) -> TdsResult<RowDecodeContext<'_>> {
     match context {
-        ParserContext::ColumnMetadata(metadata) => Ok(&metadata.columns),
+        ParserContext::ColumnMetadata(metadata, decryptor) => {
+            Ok((&metadata.columns, decryptor.as_ref()))
+        }
         _ => Err(crate::error::Error::ProtocolError(
             "Expected ColumnMetadata in context for row decoding".to_string(),
         )),
@@ -164,6 +194,8 @@ pub(crate) async fn dispatch_token<R: TdsPacketReader + Send + Sync>(
         TokenParsers::NbcRow(parser) => parser.parse(reader, context).await,
         TokenParsers::ReturnValue(parser) => parser.parse(reader, context).await,
         TokenParsers::SessionState(parser) => parser.parse(reader, context).await,
+        TokenParsers::TabName(parser) => parser.parse(reader, context).await,
+        TokenParsers::ColInfo(parser) => parser.parse(reader, context).await,
         TokenParsers::Sspi(parser) => parser.parse(reader, context).await,
     }
 }
@@ -194,15 +226,36 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
 
     match token_type {
         TokenType::Row => {
-            let columns = extract_column_metadata(context)?;
+            let (columns, decryptor) = extract_row_context(context)?;
             let decoder = GenericDecoder::default();
             for (col, meta) in columns.iter().enumerate() {
-                decoder.decode_into(reader, meta, col, writer).await?;
+                // Decrypt only when a decryptor is available. Otherwise decode
+                // the ciphertext varbinary normally, but log the
+                // encrypted-but-undecryptable case so a misconfiguration is
+                // observable rather than silently returning ciphertext.
+                match (meta.crypto_metadata.is_some(), decryptor) {
+                    (true, Some(dec)) => {
+                        let value = decrypt_encrypted_column(&decoder, reader, meta, dec).await?;
+                        write_column_value(writer, col, value);
+                    }
+                    (true, None) => {
+                        tracing::info!(
+                            column = %meta.column_name,
+                            "Encrypted column has no column-encryption decryptor available \
+                             (Always Encrypted disabled for this command, or no key-store \
+                             provider registered); returning the raw ciphertext varbinary"
+                        );
+                        decoder.decode_into(reader, meta, col, writer).await?;
+                    }
+                    (false, _) => {
+                        decoder.decode_into(reader, meta, col, writer).await?;
+                    }
+                }
             }
             Ok(RowReadResult::RowWritten)
         }
         TokenType::NbcRow => {
-            let columns = extract_column_metadata(context)?;
+            let (columns, decryptor) = extract_row_context(context)?;
             let bitmap_len = columns.len().div_ceil(8);
             let mut bitmap = vec![0u8; bitmap_len];
             reader.read_bytes(&mut bitmap).await?;
@@ -211,7 +264,25 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
                 if bitmap[col / 8] & (1 << (col % 8)) != 0 {
                     writer.write_null(col);
                 } else {
-                    decoder.decode_into(reader, meta, col, writer).await?;
+                    match (meta.crypto_metadata.is_some(), decryptor) {
+                        (true, Some(dec)) => {
+                            let value =
+                                decrypt_encrypted_column(&decoder, reader, meta, dec).await?;
+                            write_column_value(writer, col, value);
+                        }
+                        (true, None) => {
+                            tracing::info!(
+                                column = %meta.column_name,
+                                "Encrypted column has no column-encryption decryptor available \
+                                 (Always Encrypted disabled for this command, or no key-store \
+                                 provider registered); returning the raw ciphertext varbinary"
+                            );
+                            decoder.decode_into(reader, meta, col, writer).await?;
+                        }
+                        (false, _) => {
+                            decoder.decode_into(reader, meta, col, writer).await?;
+                        }
+                    }
                 }
             }
             Ok(RowReadResult::RowWritten)
@@ -383,7 +454,7 @@ impl Default for GenericTokenParserRegistry {
         );
         internal_registry.insert(
             TokenType::ColMetadata,
-            TokenParsers::from(ColMetadataTokenParser::default()),
+            TokenParsers::from(ColMetadataTokenParser),
         );
         internal_registry.insert(
             TokenType::Row,
@@ -410,6 +481,8 @@ impl Default for GenericTokenParserRegistry {
             TokenType::SessionState,
             TokenParsers::from(SessionStateTokenParser),
         );
+        internal_registry.insert(TokenType::TabName, TokenParsers::from(TabNameTokenParser));
+        internal_registry.insert(TokenType::ColInfo, TokenParsers::from(ColInfoTokenParser));
         Self {
             parsers: internal_registry,
         }
@@ -440,6 +513,8 @@ pub enum TokenParsers {
     NbcRow(NbcRowTokenParser<GenericDecoder>),
     ReturnValue(ReturnValueTokenParser<GenericDecoder>),
     SessionState(SessionStateTokenParser),
+    TabName(TabNameTokenParser),
+    ColInfo(ColInfoTokenParser),
     Sspi(SspiTokenParser),
 }
 
@@ -472,6 +547,8 @@ impl_from_token_parser!(
     NbcRowTokenParser<GenericDecoder> => NbcRow,
     ReturnValueTokenParser<GenericDecoder> => ReturnValue,
     SessionStateTokenParser => SessionState,
+    TabNameTokenParser => TabName,
+    ColInfoTokenParser => ColInfo,
     SspiTokenParser => Sspi
 );
 
@@ -510,6 +587,8 @@ mod tests {
         assert!(registry.get_parser(&TokenType::NbcRow).is_some());
         assert!(registry.get_parser(&TokenType::ReturnValue).is_some());
         assert!(registry.get_parser(&TokenType::SessionState).is_some());
+        assert!(registry.get_parser(&TokenType::TabName).is_some());
+        assert!(registry.get_parser(&TokenType::ColInfo).is_some());
     }
 
     #[test]
@@ -528,7 +607,7 @@ mod tests {
 
         // Test with an unsupported token type (using a type that's not registered)
         // This tests the negative case
-        let unsupported_type = TokenType::TabName; // This token type is not registered in the default registry
+        let unsupported_type = TokenType::AltMetadata; // This token type is not registered in the default registry
         assert!(registry.get_parser(&unsupported_type).is_none());
     }
 

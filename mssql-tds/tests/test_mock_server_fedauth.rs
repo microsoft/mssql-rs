@@ -6,9 +6,12 @@
 #[cfg(test)]
 mod mock_server_fedauth_tests {
     use mssql_mock_tds::MockTdsServer;
-    use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
+    use mssql_tds::connection::client_context::{
+        ClientContext, EntraIdTokenFactory, TdsAuthenticationMethod,
+    };
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-    use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+    use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
+    use std::sync::{Arc, Mutex};
     use tokio::sync::oneshot;
     use tracing_subscriber::FmtSubscriber;
 
@@ -26,6 +29,32 @@ mod mock_server_fedauth_tests {
         // The access token should be a valid JWT-like structure, but for mock testing
         // we just need a non-empty string that the mock server will accept
         "mock_access_token_for_testing_12345".to_string()
+    }
+
+    #[derive(Clone)]
+    struct MockEntraFactory {
+        token: String,
+        calls: Arc<Mutex<Vec<(String, String, TdsAuthenticationMethod)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EntraIdTokenFactory for MockEntraFactory {
+        async fn create_token(
+            &self,
+            spn: String,
+            sts_url: String,
+            auth_method: TdsAuthenticationMethod,
+        ) -> TdsResult<Vec<u8>> {
+            self.calls
+                .lock()
+                .expect("factory call capture mutex poisoned")
+                .push((spn, sts_url, auth_method));
+            Ok(self
+                .token
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect())
+        }
     }
 
     /// Test basic connectivity to mock server using access token authentication
@@ -349,6 +378,150 @@ mod mock_server_fedauth_tests {
                 &unique_token[..50.min(unique_token.len())]
             );
         }
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_fedauth_challenge_and_token_factory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        init_tracing();
+
+        let server = MockTdsServer::new("127.0.0.1:0").await?;
+        let server_addr = server.local_addr();
+        let connection_store = server.connection_store();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let token = "mock_service_principal_token".to_string();
+        let factory_calls = Arc::new(Mutex::new(Vec::new()));
+
+        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+        let mut context = ClientContext::default();
+        context.tds_authentication_method =
+            TdsAuthenticationMethod::ActiveDirectoryServicePrincipal;
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+        context.auth_method_map.insert(
+            TdsAuthenticationMethod::ActiveDirectoryServicePrincipal,
+            Box::new(MockEntraFactory {
+                token: token.clone(),
+                calls: Arc::clone(&factory_calls),
+            }),
+        );
+
+        let provider = TdsConnectionProvider {};
+        let mut client = provider.create_client(context, &datasource, None).await?;
+        client.execute("SELECT 1".to_string(), None, None).await?;
+        drop(client);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        {
+            let calls = factory_calls
+                .lock()
+                .expect("factory call capture mutex poisoned");
+            assert_eq!(calls.len(), 1, "token factory should be called once");
+            assert_eq!(
+                calls[0],
+                (
+                    "https://database.windows.net/".to_string(),
+                    "https://login.microsoftonline.com/test-tenant/".to_string(),
+                    TdsAuthenticationMethod::ActiveDirectoryServicePrincipal
+                )
+            );
+        }
+
+        {
+            let store = connection_store.lock().await;
+            assert_eq!(
+                store.count(),
+                1,
+                "Server should have stored exactly one connection"
+            );
+
+            let conn_info = store
+                .all()
+                .values()
+                .next()
+                .expect("Should have at least one connection");
+            let received_token = conn_info
+                .received_token_as_string()
+                .expect("Should have received challenged token as string");
+
+            assert_eq!(received_token, token);
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
+
+    /// Regression guard for eager token recording: the token must be visible in the
+    /// shared store WHILE the client connection is still open, i.e. without relying on
+    /// connection teardown. This mirrors the downstream ODBC pooled-connection scenario
+    /// where close() returns the socket to a pool without sending EOF, so a teardown-only
+    /// record would never fire.
+    #[tokio::test]
+    async fn test_token_recorded_before_connection_close() -> Result<(), Box<dyn std::error::Error>>
+    {
+        init_tracing();
+
+        let server = MockTdsServer::new("127.0.0.1:0").await?;
+        let server_addr = server.local_addr();
+        let connection_store = server.connection_store();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let access_token = "eager_record_guard_token_67890".to_string();
+
+        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+        let mut context = ClientContext::default();
+        context.access_token = Some(access_token.clone());
+        context.tds_authentication_method = TdsAuthenticationMethod::AccessToken;
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+
+        let provider = TdsConnectionProvider {};
+        let client = provider.create_client(context, &datasource, None).await?;
+
+        // Assert the token is recorded WITHOUT closing/dropping the connection first.
+        let recorded = {
+            let store = connection_store.lock().await;
+            store
+                .all()
+                .values()
+                .any(|c| c.received_token_as_string().as_deref() == Some(&access_token))
+        };
+        assert!(
+            recorded,
+            "FedAuth token must be recorded before the client connection is closed (eager-record guard)"
+        );
+
+        // Keep the connection alive until after the assertion.
+        drop(client);
 
         let _ = shutdown_tx.send(());
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;

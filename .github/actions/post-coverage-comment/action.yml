@@ -1,0 +1,62 @@
+name: Post Coverage Comment
+description: Posts a standardized code coverage comment on a pull request
+
+inputs:
+  pr_number:
+    description: 'Pull request number'
+    required: true
+  coverage_percentage:
+    description: 'Overall coverage percentage'
+    required: true
+  patch_coverage_pct:
+    description: 'Patch/diff coverage percentage'
+    required: true
+  patch_coverage_summary:
+    description: 'Patch coverage summary markdown (multiline)'
+    required: true
+  ado_url:
+    description: 'Azure DevOps build URL'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Post coverage comment
+      uses: marocchino/sticky-pull-request-comment@v2
+      with:
+        header: Code Coverage Report
+        number: ${{ inputs.pr_number }}
+        message: |
+          # 📊 Code Coverage Report
+
+          <table>
+          <tr>
+          <td align="center" width="220">
+
+          ### 🔥 Diff Coverage
+          ### **${{ inputs.patch_coverage_pct }}**
+
+          </td>
+          <td align="center" width="220">
+
+          ### 🎯 Overall Coverage
+          ### **${{ inputs.coverage_percentage }}**
+
+          </td>
+          <td>
+
+          **📦 Project:** `mssql-tds + mssql-py-core`
+          **ℹ️ Note:** diff coverage is reported, not enforced.
+
+          </td>
+          </tr>
+          </table>
+
+          ---
+
+          ${{ inputs.patch_coverage_summary }}
+
+          ---
+          ### 🔗 Quick Links
+
+          [View Azure DevOps Build](${{ inputs.ado_url }}) · [Coverage Report](${{ inputs.ado_url }}&view=codecoverage-tab)

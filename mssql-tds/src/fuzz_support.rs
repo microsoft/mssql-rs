@@ -16,6 +16,9 @@ pub use crate::token::parsers::{
 };
 pub use crate::token::tokens::{SqlCollation, Tokens};
 
+// Re-export the DER/PEM framing fuzz entry point.
+pub use crate::security::crypto::fuzz_der_framing;
+
 // Re-export bulk copy internals for fuzz targets
 use crate::connection::bulk_copy::BulkCopyOptions;
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;

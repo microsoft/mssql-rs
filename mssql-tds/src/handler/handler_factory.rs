@@ -91,10 +91,14 @@ impl HandlerFactory {
 pub(crate) struct NegotiatedSettings {
     pub session_settings: SessionSettings,
     pub database_collation: SqlCollation,
-    #[allow(dead_code)] // populated during login, consumed by future env-change tracking
     pub language: String,
-    #[allow(dead_code)] // populated during login, consumed by future env-change tracking
     pub database: String,
+    /// The database / language / collation negotiated at login. Captured once at
+    /// construction and never mutated, so a connection reset (RESETCONNECTION)
+    /// can restore the current values back to these login defaults.
+    login_database: String,
+    login_language: String,
+    login_database_collation: SqlCollation,
     #[allow(dead_code)] // populated during login, consumed by future env-change tracking
     pub char_set: Option<String>,
     /// TDS version from LoginAckToken, captured for session recovery validation.
@@ -116,6 +120,9 @@ impl NegotiatedSettings {
         NegotiatedSettings {
             session_settings,
             database_collation,
+            login_database: database.clone(),
+            login_language: language.clone(),
+            login_database_collation: database_collation,
             language,
             database,
             char_set,
@@ -124,12 +131,30 @@ impl NegotiatedSettings {
         }
     }
 
+    /// Restores the current database / language / collation to the values
+    /// negotiated at login. Called when the server acknowledges a connection
+    /// reset (RESETCONNECTION / RESETCONNECTIONSKIPTRAN), which returns the
+    /// session to its login defaults.
+    pub(crate) fn restore_login_defaults(&mut self) {
+        self.database = self.login_database.clone();
+        self.language = self.login_language.clone();
+        self.database_collation = self.login_database_collation;
+    }
+
     /// Check if session recovery was acknowledged by the server in FEATUREEXTACK.
     pub(crate) fn is_session_recovery_acknowledged(&self) -> bool {
         self.session_settings
             .supported_features
             .iter()
             .any(|f| f.feature_identifier() == FeatureExtension::SRecovery && f.is_acknowledged())
+    }
+
+    /// Check if Always Encrypted (column encryption) was acknowledged by the
+    /// server in FEATUREEXTACK.
+    pub(crate) fn is_column_encryption_supported(&self) -> bool {
+        self.session_settings.supported_features.iter().any(|f| {
+            f.feature_identifier() == FeatureExtension::AlwaysEncrypted && f.is_acknowledged()
+        })
     }
 }
 
@@ -182,16 +207,20 @@ pub(crate) fn create_test_negotiated_settings_internal() -> NegotiatedSettings {
         negotiated_encryption_settings: NegotiatedEncryptionSetting::NoEncryption,
     };
 
+    let database_collation = SqlCollation {
+        info: 0,
+        lcid_language_id: 0x0409,
+        col_flags: 0,
+        sort_id: 0,
+    };
     NegotiatedSettings {
         session_settings,
-        database_collation: SqlCollation {
-            info: 0,
-            lcid_language_id: 0x0409,
-            col_flags: 0,
-            sort_id: 0,
-        },
+        database_collation,
         language: "us_english".to_string(),
         database: "master".to_string(),
+        login_database: "master".to_string(),
+        login_language: "us_english".to_string(),
+        login_database_collation: database_collation,
         char_set: None,
         login_ack_tds_version: None,
         login_ack_server_version: None,
@@ -530,8 +559,18 @@ impl LoginHandler<'_> {
 
         let response_status = login_response.get_status();
 
+        // Capture the features the server acknowledged in FEATUREEXTACK so the
+        // negotiated state (e.g. session recovery, Always Encrypted) is observable
+        // on the resulting NegotiatedSettings.
+        let supported_features = login_response
+            .features
+            .get_acknowledged_features()
+            .iter()
+            .map(|f| f.clone_box())
+            .collect();
+
         Ok(LoginResult {
-            supported_features: vec![],
+            supported_features,
             change_properties: login_response.change_properties,
             status: response_status,
             login_ack: login_response.success_token,
@@ -551,7 +590,21 @@ impl LoginHandler<'_> {
 
         // If using integrated security, create SSPI handler and get initial token
         let (sspi_token, sspi_handler) = if is_integrated_security {
-            let config = context.integrated_auth_config();
+            let mut config = context.integrated_auth_config();
+
+            // Bind the authentication exchange to the TLS channel (Extended
+            // Protection for Authentication). The token is only present when
+            // the connection is encrypted and the TLS engine exposes it
+            // (Windows Schannel-direct today); plaintext or engines without
+            // support return `None`, leaving channel bindings unset.
+            if let Some(token) = reader_writer.channel_binding_token() {
+                debug!(
+                    "Applying TLS channel binding token ({} bytes) for Extended Protection",
+                    token.len()
+                );
+                config = config.with_channel_bindings(token);
+            }
+
             let server = transport_context.get_server_name();
             let port = transport_context.get_port();
 
@@ -619,5 +672,74 @@ impl LoginHandler<'_> {
         } else {
             Ok(response_model)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NegotiatedSettings, create_test_negotiated_settings_internal};
+    use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
+    use crate::message::features::session_recovery::SessionRecoveryFeature;
+    use crate::message::login::Feature;
+
+    fn settings_with_ae(acknowledged: bool) -> NegotiatedSettings {
+        let mut settings = create_test_negotiated_settings_internal();
+        let mut feature = AlwaysEncryptedFeature::default();
+        feature.set_acknowledged(acknowledged);
+        settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+        settings
+    }
+
+    #[test]
+    fn is_column_encryption_supported_true_when_acknowledged() {
+        let settings = settings_with_ae(true);
+        assert!(settings.is_column_encryption_supported());
+    }
+
+    #[test]
+    fn is_column_encryption_supported_false_when_feature_present_but_unacknowledged() {
+        let settings = settings_with_ae(false);
+        assert!(!settings.is_column_encryption_supported());
+    }
+
+    #[test]
+    fn is_column_encryption_supported_false_when_feature_absent() {
+        let settings = create_test_negotiated_settings_internal();
+        assert!(!settings.is_column_encryption_supported());
+    }
+
+    fn settings_with_session_recovery(acknowledged: bool) -> NegotiatedSettings {
+        let mut settings = create_test_negotiated_settings_internal();
+        let mut feature = SessionRecoveryFeature::new(1);
+        feature.set_acknowledged(acknowledged);
+        settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+        settings
+    }
+
+    #[test]
+    fn is_session_recovery_acknowledged_true_when_acknowledged() {
+        // Regression guard: acknowledged features are now captured into
+        // NegotiatedSettings.session_settings.supported_features (previously
+        // hardcoded empty), so session-recovery detection actually works.
+        let settings = settings_with_session_recovery(true);
+        assert!(settings.is_session_recovery_acknowledged());
+    }
+
+    #[test]
+    fn is_session_recovery_acknowledged_false_when_unacknowledged() {
+        let settings = settings_with_session_recovery(false);
+        assert!(!settings.is_session_recovery_acknowledged());
+    }
+
+    #[test]
+    fn is_session_recovery_acknowledged_false_when_feature_absent() {
+        let settings = create_test_negotiated_settings_internal();
+        assert!(!settings.is_session_recovery_acknowledged());
     }
 }

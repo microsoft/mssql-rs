@@ -141,6 +141,8 @@ impl TryFrom<TdsDataType> for SqlDataTypes {
             TdsDataType::None => Err(()),
             // TODO(Phase 3): Add Vector to SqlDataTypes enum and implement proper conversion
             TdsDataType::Vector => Err(()),
+            // Table-valued parameters are not representable as a scalar JS data type.
+            TdsDataType::SqlTable => Err(()),
         }
     }
 

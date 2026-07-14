@@ -12,7 +12,7 @@ use crate::datatypes::column_values::ColumnValues;
 use crate::{
     error::Error,
     message::login::{FeatureExtension, RoutingInfo},
-    query::metadata::ColumnMetadata,
+    query::metadata::{CekTableEntry, ColumnMetadata},
 };
 
 /// TDS token type identifiers as defined by the protocol specification.
@@ -102,6 +102,8 @@ pub(crate) enum Tokens {
     Order(OrderToken),
     ReturnStatus(ReturnStatusToken),
     ReturnValue(ReturnValueToken),
+    TabName,
+    ColInfo,
 }
 
 /// Union of all parsed TDS tokens (public under `fuzzing` cfg).
@@ -125,6 +127,8 @@ pub enum Tokens {
     Order(OrderToken),
     ReturnStatus(ReturnStatusToken),
     ReturnValue(ReturnValueToken),
+    TabName,
+    ColInfo,
 }
 
 macro_rules! impl_from_token {
@@ -170,6 +174,8 @@ impl Token for Tokens {
             Tokens::ReturnStatus(token) => token.token_type(),
             Tokens::ReturnValue(token) => token.token_type(),
             Tokens::SessionState(token) => token.token_type(),
+            Tokens::TabName => TokenType::TabName,
+            Tokens::ColInfo => TokenType::ColInfo,
         }
     }
 }
@@ -300,6 +306,11 @@ impl Token for SessionStateToken {
 pub(crate) struct ColMetadataToken {
     pub column_count: u16,
     pub columns: Vec<ColumnMetadata>,
+    /// Column encryption key table, populated only when Always Encrypted is
+    /// negotiated. Per-column [`crate::query::metadata::CryptoMetadata`]
+    /// references entries here by ordinal.
+    #[allow(dead_code)] // Consumed by CEK decryption in a later phase.
+    pub cek_table: Vec<CekTableEntry>,
 }
 
 impl Token for ColMetadataToken {
@@ -951,12 +962,12 @@ impl DoneToken {
 pub(crate) struct ReturnStatusToken {
     /// Return value from the stored procedure's RETURN statement
     /// Convention: 0 = success, negative = error, positive = application-specific
-    pub _value: i32,
+    pub value: i32,
 }
 
 impl Token for ReturnStatusToken {
     fn token_type(&self) -> TokenType {
-        TokenType::ReturnValue
+        TokenType::ReturnStatus
     }
 }
 

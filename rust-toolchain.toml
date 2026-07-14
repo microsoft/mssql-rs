@@ -3,5 +3,5 @@
 # always come with support for the host platform.
 targets = ["i686-pc-windows-msvc", "aarch64-pc-windows-msvc", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]
 # Public channel for OSS development. OneBranch pipelines override this
-# with ms-prod-1.90 via the rustToolchain.version templateContext setting.
-channel = "1.90"
+# with ms-prod-1.95 via the rustToolchain.version templateContext setting.
+channel = "1.95"

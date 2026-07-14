@@ -53,11 +53,36 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// * `Err(_)` - Error sending attention or reading response
     async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool>;
 
-    /// Check whether the underlying connection is dead via a non-blocking socket poll.
-    /// Returns `true` if the connection is known to be dead, `false` if alive or unknown.
+    /// Probe whether the underlying connection is dead via a non-blocking socket
+    /// poll. Returns `true` if dead, `false` if alive or unknown.
+    ///
+    /// **Internal use only.** This reads from the socket and will consume a byte
+    /// if unsolicited data is present, so it is only safe to call on an idle
+    /// connection with no outstanding request or unread results. It is used by
+    /// the idle-connection-resiliency path, which calls it at a known-idle
+    /// point. Pool/liveness consumers must use [`connection_known_dead`] instead.
+    ///
+    /// [`connection_known_dead`]: TdsTransport::connection_known_dead
     fn is_connection_dead(&self) -> bool;
 
     /// Expose the transport as a `TdsPacketReader` for low-level streaming operations
     /// such as incremental PLP column reads via [`PlpColumnStream`].
     fn as_packet_reader(&mut self) -> &mut (dyn TdsPacketReader + Send + Sync);
+
+    /// Returns the connection's last-known liveness status **without touching the
+    /// socket**.
+    ///
+    /// Returns `true` once the connection has been explicitly closed or an I/O
+    /// operation has observed it broken. Unlike [`is_connection_dead`], this is a
+    /// cached read: it never reads from the socket, so it cannot consume
+    /// in-flight data and is always safe to call regardless of connection state.
+    ///
+    /// A `false` result means the connection has not been observed dead; it may
+    /// still have failed silently while idle, which idle connection resiliency
+    /// detects and recovers on the next operation.
+    ///
+    /// [`is_connection_dead`]: TdsTransport::is_connection_dead
+    fn connection_known_dead(&self) -> bool {
+        false
+    }
 }

@@ -9,13 +9,28 @@ keywords = ["sql-server", "tds", "mssql", "database", "async"]
 categories = ["database", "network-programming"]
 
 [features]
-default = ["integrated-auth"]
+default = ["integrated-auth", "tls-schannel-direct-on-windows"]
 # Windows SSPI (Security Support Provider Interface) for integrated authentication
 sspi = []
 # Unix GSSAPI (Kerberos) for integrated authentication
 gssapi = []
 # Enable both SSPI and GSSAPI for cross-platform integrated authentication
 integrated-auth = ["sspi", "gssapi"]
+# Use the in-tree Schannel-direct TLS engine (Windows-only effect; on
+# non-Windows targets this feature is a no-op because the win_tls module
+# itself is cfg(windows) gated).
+tls-schannel-direct = []
+# Default-on bundle that routes the dispatcher to the Schannel-direct
+# engine on Windows. Kept as a separate feature so downstream crates can
+# disable it (`default-features = false`) to fall back to native-tls
+# unconditionally — useful as an escape hatch if the rewrite needs to
+# be temporarily disabled in production.
+tls-schannel-direct-on-windows = ["tls-schannel-direct"]
+# Exposes in-process key-provisioning helpers used only by tests and tooling
+# (RSA key generation / PKCS#8 export and RsaKeyStoreProvider::generate_and_add_key).
+# Not part of the shipped API surface. Enabled for this crate's own tests via the
+# self dev-dependency below.
+test-util = []
 
 
 [lints]
@@ -34,6 +49,9 @@ tracing = { version = "0.1.43", features = ["log"] }
 bitflags = "2.10.0"
 thiserror = "2.0.17"
 bigdecimal = "0.4"
+# Zeroizes plaintext Always Encrypted key material (derived AEAD sub-keys and
+# resolved column encryption keys) on drop.
+zeroize = { version = "1.8", features = ["alloc", "derive"] }
 # For pretty printing of the packets in the traces.
 pretty-hex = "0.4"
 # Added for setting the keep alives on the socket.
@@ -54,10 +72,35 @@ half = "2.7.1"
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["namedpipeapi", "winerror", "winbase"] }
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Wdk_System_SystemServices"] }
+# Low-level raw SSPI / Schannel / CryptoAPI bindings for the win_tls module.
+# Pulled in directly because the `windows` crate's safe wrappers don't expose
+# the SecBuffer / InitializeSecurityContextW shapes we need verbatim.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+] }
 
 [target.'cfg(unix)'.dependencies]
 # For runtime GSSAPI library detection using dlopen/dlsym
 libc = "0.2"
+
+# OpenSSL backs the Always Encrypted crypto primitives on every target that is
+# neither Windows (which uses CNG) nor macOS (which uses Security.framework) — see
+# `security::crypto`. OpenSSL is already the TLS backend on these platforms (via
+# `native-tls`), so it adds no new system requirement.
+[target.'cfg(all(not(windows), not(target_os = "macos")))'.dependencies]
+openssl = { version = "0.10.66" }
+
+# Apple Security.framework (`SecKey`) backs RSA and key generation for Always
+# Encrypted on macOS; AES/HMAC/SHA/RNG go through CommonCrypto in `libSystem`.
+# Both crates are already present transitively (native-tls links Security.framework
+# on Apple targets), so they add no new system requirement.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7.0" }
+security-framework-sys = { version = "2.17.0" }
+core-foundation = { version = "0.10.1" }
 
 [dependencies.uuid]
 version = "1.19.0"
@@ -76,9 +119,18 @@ rand = "0.9.2"
 dotenv = "0.15"
 azure_identity = "0.25.0"
 azure_core = "0.25.0"
+# Pin `time` to 0.3.47: 0.3.48 introduces a `From<HourBase>` impl that triggers a
+# coherence conflict (E0119) when compiling `typespec_client_core` (pulled in via
+# the azure_* dev-dependencies). `time` arrives only as a transitive dev-dependency,
+# so this pin keeps fresh dependency resolution (e.g. the Kerberos CI container,
+# which has no committed Cargo.lock) on a version that compiles.
+time = "=0.3.47"
 ctor = "0.4"
 mockall = "0.13.1"
 criterion = "0.5"
 mssql-mock-tds = { path = "../mssql-mock-tds" }
 tempfile = "3.13"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+# Self dev-dependency: enables the `test-util` feature when building this crate's
+# integration tests (which use the in-process key-provisioning helpers).
+mssql-tds = { path = ".", features = ["test-util"] }

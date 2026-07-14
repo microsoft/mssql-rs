@@ -1,79 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::connection::transport::certificate_validator;
 use crate::connection::transport::network_transport::Stream;
+use crate::connection::transport::tls::{TlsConnectParams, TlsValidationConfig, default_engine};
 use crate::io::packet_writer::PacketWriter;
 use crate::message::messages::PacketType;
 use byteorder::{BigEndian, ByteOrder};
-use native_tls::TlsConnector as NativeTlsConnector;
-use std::collections::HashMap;
 use std::io::{Error, IoSlice};
 use std::pin::Pin;
-use std::sync::RwLock;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_native_tls::TlsStream;
 use tracing::{debug, error, info, warn};
 
 use super::network_transport::PRE_NEGOTIATED_PACKET_SIZE;
-use crate::core::{
-    EncryptionOptions, EncryptionSetting, NegotiatedEncryptionSetting, TDS_8_ALPN_PROTOCOL,
-    TdsResult,
-};
+use crate::core::{EncryptionOptions, EncryptionSetting, NegotiatedEncryptionSetting, TdsResult};
 #[cfg(target_os = "macos")]
 use std::io::{ErrorKind, Write};
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct TlsValidationConfig {
-    pub accept_invalid_certs: bool,
-    pub accept_invalid_hostnames: bool,
-    pub use_alpn: bool,
-}
-
-/// Cache of pre-built `NativeTlsConnector` instances keyed by validation config.
-/// Building a connector is expensive (~50ms on Linux) because `native-tls` loads
-/// and parses the system CA certificate store via OpenSSL on every call to
-/// `builder().build()`. Caching avoids this cost on subsequent connections.
-static CONNECTOR_CACHE: std::sync::LazyLock<
-    RwLock<HashMap<TlsValidationConfig, NativeTlsConnector>>,
-> = std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
-
-fn get_or_build_connector(validation: &TlsValidationConfig) -> TdsResult<NativeTlsConnector> {
-    if let Some(connector) = CONNECTOR_CACHE
-        .read()
-        .map_err(|_| {
-            crate::error::Error::ImplementationError(
-                "TLS connector cache read lock poisoned".to_string(),
-            )
-        })?
-        .get(validation)
-    {
-        return Ok(connector.clone());
-    }
-
-    let mut builder = NativeTlsConnector::builder();
-    if validation.accept_invalid_certs {
-        builder.danger_accept_invalid_certs(true);
-    }
-    if validation.accept_invalid_hostnames {
-        builder.danger_accept_invalid_hostnames(true);
-    }
-    if validation.use_alpn {
-        builder.request_alpns(&[TDS_8_ALPN_PROTOCOL]);
-    }
-    let connector = builder.build()?;
-
-    CONNECTOR_CACHE
-        .write()
-        .map_err(|_| {
-            crate::error::Error::ImplementationError(
-                "TLS connector cache write lock poisoned".to_string(),
-            )
-        })?
-        .insert(validation.clone(), connector.clone());
-    Ok(connector)
-}
 
 #[derive(Debug)]
 pub(crate) struct SslHandler {
@@ -123,11 +65,9 @@ impl SslHandler {
 
     pub(crate) async fn enable_ssl_async(
         &self,
-        mut base_stream: Box<dyn Stream>,
+        base_stream: Box<dyn Stream>,
         negotiated_encryption: NegotiatedEncryptionSetting,
     ) -> TdsResult<Box<dyn Stream>> {
-        base_stream.tls_handshake_starting();
-
         // Check if ServerCertificate and TrustServerCertificate are both specified
         if self.encryption_options.server_certificate.is_some()
             && self.encryption_options.trust_server_certificate
@@ -164,12 +104,12 @@ impl SslHandler {
             .host_name_in_cert
             .as_ref()
             .map_or_else(
-                || &self.server_host_name,
+                || self.server_host_name.as_str(),
                 |host_name| {
                     if host_name.is_empty() {
-                        &self.server_host_name
+                        self.server_host_name.as_str()
                     } else {
-                        host_name
+                        host_name.as_str()
                     }
                 },
             );
@@ -184,105 +124,14 @@ impl SslHandler {
             self.server_host_name,
         );
 
-        let connector = get_or_build_connector(&validation)?;
+        let params = TlsConnectParams {
+            validation: &validation,
+            host_name,
+            server_host_name: &self.server_host_name,
+            server_certificate_path: self.encryption_options.server_certificate.as_ref(),
+        };
 
-        info!(
-            "Starting TLS handshake to {} using host {}",
-            self.server_host_name, host_name
-        );
-        let encrypted_stream = tokio_native_tls::TlsConnector::from(connector)
-            .connect(host_name, base_stream)
-            .await;
-
-        match encrypted_stream {
-            Ok(mut stream) => {
-                if validation.use_alpn {
-                    match stream.get_ref().negotiated_alpn() {
-                        Ok(Some(ref proto)) => {
-                            debug!("Server negotiated ALPN: {}", String::from_utf8_lossy(proto));
-                        }
-                        Ok(None) => {
-                            debug!("Server did not negotiate an ALPN protocol");
-                        }
-                        Err(e) => {
-                            debug!("Failed to query negotiated ALPN: {}", e);
-                        }
-                    }
-                }
-
-                // If ServerCertificate is specified, perform certificate validation
-                if let Some(cert_path) = &self.encryption_options.server_certificate {
-                    info!("Validating server certificate using: {cert_path:?}",);
-
-                    // Get the server's certificate from the TLS stream
-                    let peer_cert = stream
-                        .get_ref()
-                        .peer_certificate()
-                        .map_err(crate::error::Error::TlsError)?
-                        .ok_or(crate::error::Error::NoServerCertificate)?;
-
-                    // Get the DER-encoded certificate data
-                    let server_cert_der =
-                        peer_cert.to_der().map_err(crate::error::Error::TlsError)?;
-
-                    // Validate the certificate
-                    certificate_validator::validate_server_certificate(
-                        cert_path,
-                        &server_cert_der,
-                    )?;
-
-                    info!("Server certificate validation successful");
-                }
-
-                // Call tls_handshake_completed on the underlying stream through the TlsStream wrapper
-                stream
-                    .get_mut()
-                    .get_mut()
-                    .get_mut()
-                    .tls_handshake_completed();
-                Ok(Box::new(stream))
-            }
-            Err(e) => {
-                error!(
-                    "TLS handshake FAILED: host_name={}, server_host_name={}, error={:?}, \
-                     trust_server_certificate={}, encryption_mode={:?}, os={}",
-                    host_name,
-                    self.server_host_name,
-                    e,
-                    self.encryption_options.trust_server_certificate,
-                    self.encryption_options.mode,
-                    std::env::consts::OS,
-                );
-                // Note: We can't retrieve the certificate SANs from a failed handshake
-                // because the connection is terminated before we can access the peer cert
-                Err(crate::error::Error::TlsHandshakeError {
-                    source: e,
-                    expected_host: host_name.to_string(),
-                    cert_sans:
-                        "(unavailable - handshake failed before certificate could be retrieved)"
-                            .to_string(),
-                })
-            }
-        }
-    }
-}
-
-impl Stream for TlsStream<Box<dyn Stream>> {
-    fn tls_handshake_starting(&mut self) {
-        // TlsStream wraps: tokio_native_tls::TlsStream -> native_tls::TlsStream -> AllowStd -> Box<dyn Stream>
-        // So we need get_mut() three times to reach the underlying Box<dyn Stream>
-        self.get_mut().get_mut().get_mut().tls_handshake_starting();
-    }
-
-    fn tls_handshake_completed(&mut self) {
-        // TlsStream wraps: tokio_native_tls::TlsStream -> native_tls::TlsStream -> AllowStd -> Box<dyn Stream>
-        // So we need get_mut() three times to reach the underlying Box<dyn Stream>
-        self.get_mut().get_mut().get_mut().tls_handshake_completed();
-    }
-
-    fn is_connection_dead(&self) -> bool {
-        // Navigate through the TLS wrapper chain using get_ref() to reach the underlying stream
-        self.get_ref().get_ref().get_ref().is_connection_dead()
+        default_engine().connect(base_stream, params).await
     }
 }
 
@@ -358,6 +207,7 @@ impl ActiveWriteState {
             self.packet_id,
             self.current_packet_bytes_remaining == self.payload_bytes_remaining,
             false,
+            crate::message::messages::ResetConnectionMode::None,
         );
     }
 }

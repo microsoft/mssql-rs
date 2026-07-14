@@ -1,10 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Security module for integrated authentication support.
+//! Security module: integrated authentication plus Always Encrypted crypto.
 //!
-//! This module provides abstractions and implementations for SSPI (Windows)
-//! and GSSAPI (Linux/macOS) authentication with SQL Server.
+//! Integrated authentication: abstractions and implementations for SSPI
+//! (Windows) and GSSAPI (Linux/macOS) authentication with SQL Server.
+//!
+//! Always Encrypted: the client-side crypto infrastructure — platform-native
+//! crypto primitives (`crypto`), the AEAD cell cipher and parameter encryption
+//! (`encryption`), `sp_describe_parameter_encryption` parsing
+//! (`describe_parameter_encryption`), the cell-decryptor seam
+//! (`cell_decryptor`), and the column master key store providers (`keystore`).
 //!
 //! # Platform Support
 //!
@@ -16,7 +22,12 @@
 //! - `sspi`: Enables Windows SSPI support
 //! - `gssapi`: Enables Unix GSSAPI/Kerberos support
 
+pub(crate) mod cell_decryptor;
+pub(crate) mod crypto;
+pub(crate) mod describe_parameter_encryption;
+pub(crate) mod encryption;
 mod error;
+pub(crate) mod keystore;
 pub mod mock;
 mod security_context;
 mod spn;
@@ -25,6 +36,9 @@ mod spn;
 pub use error::SecurityError;
 pub use security_context::{IntegratedAuthConfig, SecurityContext, SecurityPackage, SspiAuthToken};
 pub use spn::{canonicalize_hostname, is_loopback_address, make_spn, make_spn_canonicalized};
+
+// Always Encrypted key store provider API.
+pub use keystore::{ColumnEncryptionKeyStoreProvider, RsaKeyStoreProvider};
 
 // Platform-specific implementations
 #[cfg(windows)]
