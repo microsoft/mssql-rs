@@ -49,8 +49,9 @@ For each key/value pair, repeated until end of input:
      discarded (**first-wins**).
    - *Ignored* — recognized by msodbcsql but not acted on here (e.g. `Driver`,
      `DSN`, `ApplicationIntent`, `OEMToANSI`). No warning.
-   - *Unknown* — not in the table. Raises an `01S00` warning; the value is parsed
-     but discarded. **Never fails.**
+   - *Unknown* — not in the table. Raises an `01S00` warning, but **parsing
+     continues** to the next pair; the value is parsed and discarded. Never fails
+     and never halts the scan.
 5. **After `=`, if at end-of-input** → warning + **stop** (value never set).
 6. **Read the value**:
    - `{`-prefixed → **braced**: ends at a single `}`; `}}` is an escape for a
@@ -93,9 +94,29 @@ stateDiagram-v2
 | `S_FALSE` | warning condition | `Ok((params, true))` | `01S00` + `SQL_SUCCESS_WITH_INFO` |
 | `E_FAIL` | invalid value on a validated key | `Err(InvalidAttrValue)` | connect fails |
 
-`S_FALSE` is raised by: unknown key, missing `=`, missing value, unterminated
-brace, or data after a braced value. **Unknown/invalid *keywords* never fail** —
-only an invalid *value* on a recognized, validated key does.
+`S_FALSE` (the `01S00` warning) is raised by two different classes of condition,
+and they behave differently with respect to the rest of the string:
+
+**Warn and continue** — an **unknown / unrecognized keyword**. msodbcsql sets
+`hr = S_FALSE` but does *not* `goto RetExit`, so the loop keeps going. Because `hr`
+is never reset back to `S_OK`, the warning "sticks" and is returned at the end —
+but **every later key/value pair is still parsed and stored.**
+
+**Warn and stop** — a **structural malformation**, each of which does
+`goto RetExit` and abandons the rest of the string:
+
+- no `=` in the remainder (key with no separator),
+- no value after `=` (end-of-input right after `=`),
+- an unterminated `{` brace,
+- data after the closing `}` of a braced value.
+
+So a single unknown keyword does **not** halt parsing, whereas any of the four
+structural problems halts it immediately. In both cases whatever was parsed before
+the stopping point is kept.
+
+Only an invalid **value** on a recognized, validated key is a hard error: msodbcsql
+returns `E_FAIL` (→ `Err(InvalidAttrValue)`) and the connect fails. Unknown or
+invalid *keywords* never fail.
 
 ## Value validation
 
