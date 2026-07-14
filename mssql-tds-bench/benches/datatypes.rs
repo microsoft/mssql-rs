@@ -5,6 +5,8 @@
 //!
 //! - `primitives`   — BIT / TINYINT / SMALLINT / INT / BIGINT / DECIMAL / FLOAT,
 //!   decoded over many rows from a pre-populated heap.
+//! - `scalars`      — UNIQUEIDENTIFIER / VARBINARY / MONEY / REAL, decoded over
+//!   many rows from a pre-populated heap.
 //! - `strings`      — VARCHAR and NVARCHAR (4000 chars each).
 //! - `temporal`     — DATETIME2 / DATE / TIME / DATETIMEOFFSET, decoded over many
 //!   rows from a pre-populated heap.
@@ -118,6 +120,27 @@ fn primitives(c: &mut Criterion) {
     );
 }
 
+fn scalars(c: &mut Criterion) {
+    bench_decode_rows(
+        c,
+        "scalars",
+        "CREATE TABLE #scalars (\
+            c_guid UNIQUEIDENTIFIER NOT NULL, \
+            c_varbinary VARBINARY(64) NOT NULL, \
+            c_money MONEY NOT NULL, \
+            c_real REAL NOT NULL)",
+        &format!(
+            "INSERT INTO #scalars (c_guid, c_varbinary, c_money, c_real) \
+             SELECT CONVERT(UNIQUEIDENTIFIER, CONVERT(BINARY(16), CAST(value AS BIGINT))), \
+                    CONVERT(VARBINARY(64), REPLICATE('A', 64)), \
+                    CAST(value AS MONEY), \
+                    CAST(value AS REAL) * 1.5 \
+             FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({DECODE_ROWS} AS BIGINT))"
+        ),
+        "SELECT c_guid, c_varbinary, c_money, c_real FROM #scalars",
+    );
+}
+
 fn strings(c: &mut Criterion) {
     bench_query(
         c,
@@ -207,6 +230,6 @@ fn lob(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = criterion_config();
-    targets = primitives, strings, temporal, lob
+    targets = primitives, scalars, strings, temporal, lob
 }
 criterion_main!(benches);
