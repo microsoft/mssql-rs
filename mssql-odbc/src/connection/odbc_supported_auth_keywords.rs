@@ -7,13 +7,16 @@ use mssql_tds::connection::client_context::TdsAuthenticationMethod;
 ///
 /// Case-insensitive. Returns `None` for unrecognized or empty values.
 /// `SqlPassword` collapses to `Password` (same Login7 on the wire).
+/// `ActiveDirectoryMSI` collapses to `ActiveDirectoryManagedIdentity` (legacy alias).
 pub fn auth_method_from_keyword(value: &str) -> Option<TdsAuthenticationMethod> {
     match value.to_lowercase().as_str() {
         "sqlpassword" => Some(TdsAuthenticationMethod::Password),
         "activedirectoryintegrated" => Some(TdsAuthenticationMethod::ActiveDirectoryIntegrated),
         "activedirectorypassword" => Some(TdsAuthenticationMethod::ActiveDirectoryPassword),
         "activedirectoryinteractive" => Some(TdsAuthenticationMethod::ActiveDirectoryInteractive),
-        "activedirectorymsi" => Some(TdsAuthenticationMethod::ActiveDirectoryMSI),
+        // msodbcsql exposes only the ActiveDirectoryMSI keyword; it resolves to the
+        // canonical ManagedIdentity method (mssql-tds has no separate MSI workflow). #46177
+        "activedirectorymsi" => Some(TdsAuthenticationMethod::ActiveDirectoryManagedIdentity),
         "activedirectoryserviceprincipal" => {
             Some(TdsAuthenticationMethod::ActiveDirectoryServicePrincipal)
         }
@@ -65,5 +68,15 @@ mod tests {
     #[test]
     fn empty_returns_none() {
         assert_eq!(auth_method_from_keyword(""), None);
+    }
+
+    #[test]
+    fn msi_collapses_to_managed_identity() {
+        // msodbcsql exposes only the ActiveDirectoryMSI keyword; it maps to the
+        // canonical ManagedIdentity method (no separate MSI workflow in mssql-tds).
+        assert_eq!(
+            auth_method_from_keyword("ActiveDirectoryMSI"),
+            Some(TdsAuthenticationMethod::ActiveDirectoryManagedIdentity)
+        );
     }
 }

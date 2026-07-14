@@ -24,7 +24,7 @@ pub(crate) struct TransformedAuth {
 /// Clears credentials that the resolved auth method does not use.
 ///
 /// - **SSPI / ADIntegrated**: both uid and pwd cleared
-/// - **ADInteractive / ADMSI / ADDefault / ADDeviceCode / ADWorkloadIdentity**: pwd cleared, uid kept as hint/client_id
+/// - **ADInteractive / ADManagedIdentity / ADDefault / ADDeviceCode / ADWorkloadIdentity**: pwd cleared, uid kept as hint/client_id
 /// - **AccessToken**: both uid and pwd cleared (handled before this is called)
 fn apply_silent_clears(method: &TdsAuthenticationMethod, uid: &mut String, pwd: &mut String) {
     match method {
@@ -33,7 +33,7 @@ fn apply_silent_clears(method: &TdsAuthenticationMethod, uid: &mut String, pwd: 
             pwd.clear();
         }
         TdsAuthenticationMethod::ActiveDirectoryInteractive
-        | TdsAuthenticationMethod::ActiveDirectoryMSI
+        | TdsAuthenticationMethod::ActiveDirectoryManagedIdentity
         | TdsAuthenticationMethod::ActiveDirectoryDefault
         | TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow
         | TdsAuthenticationMethod::ActiveDirectoryWorkloadIdentity => {
@@ -211,15 +211,22 @@ mod tests {
 
     #[test]
     fn ad_msi_resolves_and_clears_pwd() {
+        // The ActiveDirectoryMSI keyword resolves to the canonical ManagedIdentity method.
         let r = transform_auth(Some("ActiveDirectoryMSI"), None, "", "leftover", None);
-        assert_eq!(r.method, TdsAuthenticationMethod::ActiveDirectoryMSI);
+        assert_eq!(
+            r.method,
+            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity
+        );
         assert!(r.password.is_empty());
     }
 
     #[test]
     fn ad_msi_keeps_uid_as_client_id() {
         let r = transform_auth(Some("ActiveDirectoryMSI"), None, "client-id-123", "", None);
-        assert_eq!(r.method, TdsAuthenticationMethod::ActiveDirectoryMSI);
+        assert_eq!(
+            r.method,
+            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity
+        );
         assert_eq!(r.user_name, "client-id-123");
     }
 
