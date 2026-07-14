@@ -19,31 +19,22 @@
 # Complements benchmark-pipeline.yml (PR vs target branch). Trigger manually or
 # on the weekly schedule below.
 #
-# This wrapper defaults to Linux. Its Windows counterpart is
-# perf-baseline-windows-pipeline.yml; both extend the same shared PerfTest
-# template and are registered as separate ADO pipeline definitions (ADO
-# scheduled triggers always use default parameter values, so each platform needs
-# its own definition to be scheduled).
+# This definition is Linux-only (platform hard-coded below). Its Windows
+# counterpart is perf-baseline-windows-pipeline.yml; both extend the same shared
+# PerfTest template and are registered as separate ADO pipeline definitions, one
+# per platform — Windows and Linux numbers are not comparable and are scheduled
+# and gated independently.
 
 trigger: none
 pr: none
 
 schedules:
   - cron: '0 8 * * 1'
-    displayName: Weekly baseline comparison
+    displayName: Weekly baseline comparison (Linux)
     branches:
       include:
         - main
     always: true
-
-parameters:
-  - name: platform
-    displayName: 'Target platform'
-    type: string
-    default: linux
-    values:
-      - linux
-      - windows
 
 resources:
   repositories:
@@ -55,12 +46,12 @@ resources:
 extends:
   template: v1/Perf.Test.Job.yml@PerfTemplates
   parameters:
-    platform: ${{ parameters.platform }}
+    platform: linux
     # Ship the whole repo (including .git) so the testScript can create a local
     # worktree of the baseline commit with no VM-side ADO authentication. The
     # baseline commit must be present in the shipped history (full checkout).
     testRootDir: $(Build.SourcesDirectory)/mssql-rs
-    # Relative to testRootDir. The template auto-swaps .sh -> .ps1 on Windows.
+    # Relative to testRootDir.
     testScript: mssql-tds-bench/perf-lab/run-benchmarks.sh
     testScriptArgs: none
     testResultsSubDir: results
