@@ -244,6 +244,14 @@ impl PlpChunkStreamReader {
         let chunk_len = reader.read_uint32().await? as usize;
         if chunk_len == 0 {
             self.reached_end = true;
+            if let PlpChunkReadLength::Known(known_len) = self.length
+                && self.total_read != known_len as usize
+            {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "PLP stream ended before declared length was reached: total_read={}, declared_len={known_len}",
+                    self.total_read
+                )));
+            }
             return Ok(false);
         }
 

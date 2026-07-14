@@ -212,10 +212,23 @@ impl TdsClient {
         decoder.decode(&mut reader, metadata).await
     }
 
-    async fn decode_and_discard_column(&mut self, metadata: &ColumnMetadata) -> TdsResult<()> {
-        let _ = self.decode_column_value(metadata).await?;
-        Ok(())
+async fn decode_and_discard_column(&mut self, metadata: &ColumnMetadata) -> TdsResult<()> {
+    if metadata.is_plp() {
+        if let Some(mut stream) = crate::datatypes::decoder::PlpChunkStreamReader::begin(
+            self.transport.as_packet_reader(),
+        )
+        .await?
+        {
+            stream
+                .skip_to_end(self.transport.as_packet_reader())
+                .await?;
+        }
+        return Ok(());
     }
+
+    let _ = self.decode_column_value(metadata).await?;
+    Ok(())
+}
 
     /// Drains unread trailing columns from the current active row tail.
     ///
@@ -2469,7 +2482,7 @@ impl TdsClient {
                         self.active_row_tail = Some(ActiveRowTail {
                             first_column_index: column_index + 1,
                             next_column_index: column_index + 1,
-                            columns: trailing_columns.clone(),
+                            columns: trailing_columns,
                             nbc_null_bitmap: None,
                         });
                     }
@@ -2494,9 +2507,8 @@ impl TdsClient {
                         self.active_row_tail = Some(ActiveRowTail {
                             first_column_index: column_index + 1,
                             next_column_index: column_index + 1,
-                            columns: trailing_columns.clone(),
+                            columns: trailing_columns,
                             nbc_null_bitmap: Some(bitmap.clone()),
-                        });
                     }
 
                     if Self::nbc_column_is_null(&bitmap, column_index) {
