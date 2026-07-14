@@ -6,10 +6,10 @@
 use tracing::{debug, error};
 
 use super::exec_common::{
-    claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
+    build_named_params, claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
 };
 use super::sqlstate::*;
-use super::util::read_utf16;
+use super::util::{read_utf16, rewrite_param_markers};
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
 };
@@ -81,8 +81,8 @@ fn sql_exec_direct_w_safe(
 
     let dbc = stmt.parent_dbc();
 
-    // Check STMT state and claim the in-flight slot.
-    {
+    // Check STMT state, gather parameter values, and reset prior context.
+    let (named_params, rewritten_sql, marker_count) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -93,6 +93,15 @@ fn sql_exec_direct_w_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        // Rewrite markers and read the bound parameter buffers before mutating
+        // any state, so a binding error (07002 / HYC00) leaves the statement
+        // unchanged.
+        let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
+        let named_params =
+            match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
+                Ok(params) => params,
+                Err(rc) => return rc,
+            };
         // A new execute invalidates prior metadata/context immediately, so a
         // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
@@ -104,7 +113,8 @@ fn sql_exec_direct_w_safe(
         stmt_state.orphan_prepared_handle();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-    }
+        (named_params, rewritten_sql, marker_count)
+    };
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
         Ok(client) => client,
@@ -114,8 +124,16 @@ fn sql_exec_direct_w_safe(
     // Release any handle orphaned by the reset above before running the batch.
     flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecDirectW");
 
-    // Execute the SQL batch. Neither DBC nor STMT lock is held during I/O.
-    if let Err(e) = dbc.runtime.block_on(client.execute(sql, None, None)) {
+    // Parameterized text runs via sp_executesql (direct execution, no cached
+    // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
+    // STMT lock is held during I/O.
+    let exec_result: Result<(), mssql_tds::error::Error> = if marker_count > 0 {
+        dbc.runtime
+            .block_on(client.execute_sp_executesql(rewritten_sql, named_params, None, None))
+    } else {
+        dbc.runtime.block_on(client.execute(sql, None, None))
+    };
+    if let Err(e) = exec_result {
         error!(%e, "SQLExecDirectW: execution failed");
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
@@ -188,5 +206,23 @@ mod tests {
         // The superseded handle is queued for sp_unprepare. The flush never ran
         // here because the connection claim failed, so it remains pending.
         assert_eq!(state.pending_unprepare, Some(42));
+    }
+
+    #[test]
+    fn unbound_parameter_marker_returns_07002() {
+        let h = TestHandles::with_env_dbc_stmt();
+        // SQL has one marker but no parameter is bound; the failure must be
+        // posted before any state mutation and before the connection claim.
+        let sql: Vec<u16> = "SELECT ? AS v"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
+        // A binding error must leave the statement unchanged — no EXEC_STARTED.
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }
 }

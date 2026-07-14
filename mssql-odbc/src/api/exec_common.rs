@@ -11,14 +11,17 @@ use tracing::error;
 
 use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
 use mssql_tds::error::Error as TdsError;
+use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn};
+use crate::error::post_sql_error;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
 };
 use crate::handles::{DbcHandle, StmtHandle};
+use crate::params::convert::bound_param_to_rpc;
 
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
 /// statement is reusable.
@@ -179,6 +182,44 @@ pub(super) fn flush_pending_unprepare(
     }
 }
 
+/// Builds the ordered `@P1..@Pn` RPC parameter list from the statement's bound
+/// parameters, reading application value buffers by reference. Posts the
+/// matching diagnostic and returns `Err(SQL_ERROR)` when a marker is unbound
+/// (`07002`) or a value cannot be converted (`HYC00`). Shared by `SQLExecute`
+/// and `SQLExecDirect`; `op` names the entry point for traceable diagnostics.
+///
+/// # Safety
+/// Each bound parameter's value/indicator pointers must still satisfy the
+/// `SQLBindParameter` contract; the buffers are read here.
+pub(super) unsafe fn build_named_params(
+    stmt_state: &mut StmtState,
+    marker_count: usize,
+    op: &str,
+) -> Result<Vec<RpcParameter>, SqlReturn> {
+    let mut named_params = Vec::with_capacity(marker_count);
+    for i in 0..marker_count {
+        let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
+            error!("{op}: parameter {} has no bound value", i + 1);
+            post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
+            return Err(SQL_ERROR);
+        };
+        let name = format!("@P{}", i + 1);
+        match unsafe { bound_param_to_rpc(name, bound_param) } {
+            Ok(param) => named_params.push(param),
+            Err(e) => {
+                error!(
+                    "{op}: parameter {} conversion failed: {}",
+                    i + 1,
+                    e.message()
+                );
+                post_sql_error(stmt_state, SQLSTATE_HYC00, 0, e.message());
+                return Err(SQL_ERROR);
+            }
+        }
+    }
+    Ok(named_params)
+}
+
 /// Captures the server-side prepared-statement handle from `sp_prepexec`'s
 /// `@handle` RETURNVALUE once the batch has been drained.
 ///
@@ -265,8 +306,11 @@ pub(super) fn finish_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen};
     use crate::handles::handle_from_raw;
+    use crate::params::BoundParam;
     use crate::test_support::TestHandles;
+    use std::ffi::c_void;
 
     // The success path of `try_claim_idle_client` needs a real `TdsClient`,
     // which unit tests can't construct; these cover the guard branches (each
@@ -292,5 +336,61 @@ mod tests {
         assert!(try_claim_idle_client(dbc, h.dbc).is_none());
         // The existing claim must be left untouched.
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(other));
+    }
+
+    /// Builds a `BoundParam` over the given char buffer and NTS indicator.
+    fn char_param(buf: &mut [u8], ind: &mut SqlLen) -> BoundParam {
+        BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
+            buffer_length: buf.len() as SqlLen,
+            strlen_or_ind_ptr: ind as *mut SqlLen,
+        }
+    }
+
+    #[test]
+    fn build_named_params_zero_markers_yields_empty() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        let params = unsafe { build_named_params(&mut state, 0, "test") }.unwrap();
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn build_named_params_builds_one_per_marker() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut buf1: Vec<u8> = b"abc\0".to_vec();
+        let mut ind1: SqlLen = SQL_NTS as SqlLen;
+        let mut buf2: Vec<u8> = b"de\0".to_vec();
+        let mut ind2: SqlLen = SQL_NTS as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state
+            .bound_params
+            .push(Some(char_param(&mut buf1, &mut ind1)));
+        state
+            .bound_params
+            .push(Some(char_param(&mut buf2, &mut ind2)));
+
+        let params = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn build_named_params_unbound_marker_posts_07002() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        // One marker expected, but nothing bound.
+        let mut state = stmt.inner.lock().unwrap();
+        let ret = unsafe { build_named_params(&mut state, 1, "test") };
+        assert_eq!(ret.unwrap_err(), SQL_ERROR);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
     }
 }

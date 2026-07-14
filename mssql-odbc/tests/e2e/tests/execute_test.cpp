@@ -130,6 +130,26 @@ TEST_F(PrepareExecuteLiveTest, WideCharParam) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// A wide-char parameter bound with an explicit byte-length indicator (not
+// SQL_NTS) sends exactly that many bytes. The indicator is a byte count per the
+// ODBC spec, so 8 bytes == 4 UTF-16 units.
+TEST_F(PrepareExecuteLiveTest, ExplicitLengthWideCharParam) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    // "wider" (no NUL) with an indicated length of 8 bytes → only "wide".
+    SQLWCHAR value[] = {'w', 'i', 'd', 'e', 'r', 0};
+    SQLLEN ind = 4 * sizeof(SQLWCHAR);  // 8 bytes = 4 code units
+    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR,
+                                    SQL_WVARCHAR, 5, 0, value, sizeof(value), &ind);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("wide", GetColumnChar(1));
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // A NULL-indicator parameter produces a SQL NULL result.
 TEST_F(PrepareExecuteLiveTest, NullParam) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -353,6 +373,54 @@ TEST_F(PrepareExecuteLiveTest, ReExecuteWhileCursorOpenReturns24000) {
     EXPECT_EQ("1", GetColumnChar(1));
 
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// SQLExecDirect with a bound parameter executes directly (sp_executesql) and
+// substitutes the value, with no persistent prepared handle.
+TEST_F(PrepareExecuteLiveTest, ExecDirectWithParam) {
+    std::vector<SQLCHAR> value = {'d', 'i', 'r', 'e', 'c', 't', '\0'};
+    SQLLEN ind = SQL_NTS;
+    ASSERT_SQL_OK(BindChar(1, value, ind), SQL_HANDLE_STMT, stmt_);
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT ? AS v");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("direct", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// SQLExecDirect substitutes multiple bound parameters positionally, including a
+// NULL-indicator parameter.
+TEST_F(PrepareExecuteLiveTest, ExecDirectWithMultipleParams) {
+    std::vector<SQLCHAR> a = {'5', '\0'};
+    std::vector<SQLCHAR> b = {'6', '\0'};
+    std::vector<SQLCHAR> c = {'i', 'g', 'n', 'o', 'r', 'e', 'd', '\0'};
+    SQLLEN ind_a = SQL_NTS, ind_b = SQL_NTS, ind_c = SQL_NULL_DATA;
+    ASSERT_SQL_OK(BindChar(1, a, ind_a), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindChar(2, b, ind_b), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindChar(3, c, ind_c), SQL_HANDLE_STMT, stmt_);
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SELECT CAST(? AS INT) + CAST(? AS INT) AS s, ? AS n");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("11", GetColumnChar(1));
+
+    SQLLEN ind_out = 0;
+    GetColumnChar(2, &ind_out);
+    EXPECT_EQ(SQL_NULL_DATA, ind_out);
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// SQLExecDirect with a marker but no bound parameter fails with 07002.
+TEST_F(PrepareExecuteLiveTest, ExecDirectUnboundMarkerReturns07002) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT ? AS v");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07002");
 }
 
 // A prepared statement with an unbound marker fails at execute time.

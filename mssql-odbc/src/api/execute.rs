@@ -9,17 +9,16 @@ use tracing::{debug, error};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{
-    claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
+    build_named_params, claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
 };
 use super::sqlstate::*;
 use super::util::rewrite_param_markers;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
-use crate::error::{free_errors, post_sql_error};
+use crate::error::free_errors;
 use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
-use crate::params::convert::bound_param_to_rpc;
 
 /// Executes the prepared statement on `statement_handle`.
 ///
@@ -144,35 +143,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
 
     let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
 
-    let mut named_params = Vec::with_capacity(marker_count);
-    for i in 0..marker_count {
-        let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
-            error!(
-                parameter = i + 1,
-                "SQLExecute: parameter marker has no bound value"
-            );
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_07002,
-                0,
-                "COUNT field incorrect or syntax error",
-            );
-            return Err(SQL_ERROR);
-        };
-        let name = format!("@P{}", i + 1);
-        match unsafe { bound_param_to_rpc(name, bound_param) } {
-            Ok(param) => named_params.push(param),
-            Err(e) => {
-                error!(
-                    parameter = i + 1,
-                    message = e.message(),
-                    "SQLExecute: parameter conversion failed"
-                );
-                post_sql_error(&mut stmt_state, SQLSTATE_HYC00, 0, e.message());
-                return Err(SQL_ERROR);
-            }
-        }
-    }
+    let named_params = unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
 
     let handle = stmt_state.prepared_handle;
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);

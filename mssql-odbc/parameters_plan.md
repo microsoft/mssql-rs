@@ -1,0 +1,117 @@
+# Parameterized execution — `SQLBindParameter` / `SQLExecute` / `SQLExecDirect`
+
+Status, behavior, and known gaps for parameterized prepared-statement execution
+in the ODBC Driver 18 (Rust).
+
+---
+
+## Implemented (Phase 1)
+
+`SQLPrepare(W)`, `SQLBindParameter`, `SQLExecute`, and parameterized
+`SQLExecDirect(W)`. Validated by 177 unit tests + live e2e against SQL Server
+2025 (`tests/e2e/tests/execute_test.cpp`).
+
+- **`SQLExecute`** — first execute runs `sp_prepexec` (prepare + execute in one
+  round trip); subsequent executes reuse the cached `prepared_handle` via
+  `sp_execute`.
+- **`SQLExecDirect`** — parameterized text runs `sp_executesql` (direct, no
+  cached handle); unparameterized text runs as a plain language batch.
+- **Prepared-handle capture** — for a result-returning `sp_prepexec` the
+  `@handle` arrives *after* the result set, so it is captured at drain time
+  (`SQLCloseCursor` / DDL finish) via `take_prepared_statement_handle()`.
+- **`sp_unprepare` (handle release)** — a handle superseded by a re-prepare,
+  rebind, or `SQLExecDirect` is deferred (`pending_unprepare`) and released at
+  the next execute; on `SQLFreeHandle(STMT)` it is released best-effort while
+  the connection is idle. Issued as a separate RPC rather than piggybacking the
+  drop onto the next `sp_prepexec` (see TODO).
+- **Lifecycle** — `SQL_RESET_PARAMS` clears bindings; `SQLCloseCursor` /
+  `SQLFreeStmt(SQL_CLOSE)` preserve the handle; re-`SQLPrepare` and rebind
+  orphan it for release.
+- **Placeholder rewrite** — `?` → `@P1…`, skipping string literals, quoted
+  identifiers, and comments.
+- **Types** — `SQL_C_CHAR` → varchar, `SQL_C_WCHAR` → nvarchar; all other C
+  types → `HYC00`. Indicator honored: `SQL_NULL_DATA` → typed NULL, `SQL_NTS`,
+  and explicit byte length.
+
+---
+
+## Remaining work (TODO)
+
+- **Piggyback the handle drop onto `sp_prepexec` (optimization).** `sp_unprepare`
+  now runs, but as a **separate** RPC issued just before the next `sp_prepexec`
+  (`flush_pending_unprepare`). The optimization is to defer the drop and pass the
+  superseded handle as the `@handle` **input** of the next `sp_prepexec`, freeing
+  the old plan and preparing the new one in **one** round trip. To implement,
+  extend `execute_sp_prepexec` to accept an optional handle-to-free and send it
+  as the first (return-value) proc parameter, then drop the separate
+  `flush_pending_unprepare` call on the execute path (keep it only for the
+  statement-free / exec-direct cases). Saves one round trip per re-prepare /
+  rebind.
+- **Cache parameter-marker offsets at prepare time.**
+  Today `rewrite_param_markers` re-scans the SQL text and builds a new rewritten
+  string on every `SQLExecute`. Split this into two phases:
+
+  **Phase 1 — parse once at `SQLPrepare` time:**
+  Scan the SQL for `?` markers (skipping string literals, quoted identifiers, and
+  comments) and record each marker's byte offset in an offset table on
+  `StmtState`. This is the only thing that *can* be done at prepare time: the
+  application hasn't bound parameters yet, so the driver doesn't know whether each
+  `?` is `INPUT`, `OUTPUT`, or a `?=` return-status marker.
+
+  **Phase 2 — rewrite at execute time:**
+  Walk the offset table and stream SQL chunks interleaved with `@P{n}` names
+  directly onto the wire. At this point bound-param state is available, so the
+  driver can:
+  - Append `OUTPUT` to the `@P{n}` slot when the parameter is bound as output.
+  - Handle `?=` syntax by adjusting the marker position by one character.
+  No intermediate buffer is materialized — the original SQL serves as the source.
+
+  **Why this matters:**
+  - The expensive parse (comments, quotes) runs once per prepare, not once per
+    execute — good for frequently re-executed statements.
+  - The rewrite can stream directly into the TDS buffer instead of materializing
+    an intermediate string.
+  - The offset count is the natural primitive for `SQLNumParams`.
+  - Defers semantics (output params, `?=`) to execute time where binding info is
+    available, which output-param support will require.
+
+  **Proposed change:** store `Vec<usize>` of marker byte offsets on `StmtState`
+  (computed during `SQLPrepare`), replace `rewrite_param_markers` with a
+  streaming emitter that consumes the offset table at execute time.
+- **Phase-2 type matrix:** widen beyond `SQL_C_CHAR` / `SQL_C_WCHAR` once
+  `SQLGetData` grows (numeric, binary, date C types).
+- **Drive the RPC parameter's TDS type from `ParameterType`, not the C type.**
+  Today `params::convert` ignores `sql_type` entirely: it branches only on the
+  C type and always emits `(n)varchar(max)`, relying on SQL Server's implicit
+  conversion to coerce the value into the target type. Instead, map the ODBC SQL
+  type (`SQL_DESC_CONCISE_TYPE` on the IPD) to the wire TDS type; the C type
+  should only govern how the application buffer is read, with a client-side
+  C→SQL conversion before sending. The shortcut works for common
+  `varchar → int/date/...` cases but diverges for binary / `uniqueidentifier` /
+  `money` / exact `decimal` / locale-sensitive `datetime`, declares the wrong
+  prepared-plan param types (`@P1 nvarchar(max)` vs `@P1 int`, hurting parameter
+  sniffing), and can throw server-side conversion errors. Phase 2: build the
+  `RpcParameter` from `ParameterType`, converting the C value to that SQL/TDS
+  type. This pairs with the type-matrix work above and lets `is_valid_conversion`
+  finally use its `_sql_type` argument.
+- **Improve the `mssql-tds` prepared-handle interface.** Today the ODBC layer
+  must call `client.take_prepared_statement_handle()` *after* `close_query` to
+  pick up the captured handle — an implicit two-step contract that's easy to
+  get wrong. Make the TDS API express this directly, e.g. have `close_query`
+  return any captured handle, or expose a single
+  `close_query_and_take_handle()`, so callers don't have to know the handle was
+  stashed before the `return_values` clear.
+- **Deferred features:** output params (`SQL_PARAM_OUTPUT`), data-at-exec
+  (`SQLParamData` / `SQLPutData`), parameter arrays (`SQL_ATTR_PARAMSET_SIZE`),
+  and TVPs. For DAE specifically, fall back to `sp_prepare` + `sp_execute` since
+  `sp_prepexec` can't carry data-at-exec values — add that branch when DAE lands.
+- **Canonical procedure calls / `sp_prepexecrpc`.** ODBC canonical calls
+  (`{call proc(?)}`) and single-row RPC batches can be prepared via
+  `sp_prepexecrpc`, gated on a single parameter row (`SQL_ATTR_PARAMSET_SIZE ==
+  1`) and a server parameter-count limit. We only handle ad-hoc T-SQL via
+  `sp_prepexec` today; add the canonical-RPC branch with the same param-count /
+  array-size guards when procedure-call syntax is supported.
+- **Dead-connection recovery on execute.** Detect a dead batch/session context
+  and attempt session recovery before executing. Our `claim_connection` only
+  checks the `Connected` state and fails otherwise — wire in recovery once the
+  TDS session-recovery path is exposed to the ODBC layer.

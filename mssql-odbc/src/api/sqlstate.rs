@@ -66,6 +66,10 @@ pub(crate) const ERR_INVALID_DESCRIPTOR_INDEX: DiagMsg = DiagMsg {
     state: SQLSTATE_07009,
     text: "Invalid descriptor index",
 };
+pub(crate) const ERR_UNBOUND_PARAMETER: DiagMsg = DiagMsg {
+    state: SQLSTATE_07002,
+    text: "COUNT field incorrect or syntax error",
+};
 pub(crate) const ERR_INVALID_SQL_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY004,
     text: "Invalid SQL data type",
