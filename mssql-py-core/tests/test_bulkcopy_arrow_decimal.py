@@ -91,6 +91,31 @@ def test_cursor_bulkcopy_arrow_decimal_negative_and_zero(client_context):
 
 
 @pytest.mark.integration
+def test_cursor_bulkcopy_arrow_decimal_precision_overflow(client_context):
+    """A decimal whose magnitude exceeds the destination precision must fail.
+
+    Arrow decimal128(20, 2) can hold values far larger than DECIMAL(10, 2);
+    such a value must be rejected (SQL Server arithmetic overflow) rather than
+    silently truncated.
+    """
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "#BulkCopyArrowDecimalPrecisionOverflow"
+    cursor.execute(f"CREATE TABLE {table_name} (value DECIMAL(10, 2) NOT NULL)")
+
+    # 12 integer digits; DECIMAL(10, 2) allows only 8.
+    source = pa.table(
+        {"value": pa.array([Decimal("999999999999.99")], type=pa.decimal128(20, 2))}
+    )
+
+    with pytest.raises(Exception):
+        cursor.bulkcopy_arrow(table_name, source, batch_size=1000, timeout=30)
+
+    conn.close()
+
+
+@pytest.mark.integration
 def test_cursor_bulkcopy_arrow_decimal_auto_mapping(client_context):
     """Arrow bulkcopy with automatic column mapping and NULL handling."""
     conn = mssql_py_core.PyCoreConnection(client_context)
