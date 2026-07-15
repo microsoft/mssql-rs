@@ -76,10 +76,8 @@ function Get-CpuSample {
         $freq = [math]::Round($s[1].CookedValue, 0)
         $busy = [math]::Round($s[2].CookedValue, 1)
     } catch { }
-    try {
-        $tz = Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop | Select-Object -First 1
-        if ($tz) { $temp = [math]::Round(($tz.CurrentTemperature / 10.0) - 273.15, 1) }
-    } catch { }
+    # CPU temperature is not exposed to Azure guests (no ACPI thermal zone), so
+    # we do not probe it here; the frequency/busy signal above is what matters.
     $eff = if (($null -ne $perf) -and ($null -ne $freq)) { [math]::Round($freq * $perf / 100.0, 0) } else { $null }
     [pscustomobject]@{ PctPerf = $perf; BaseMHz = $freq; EffMHz = $eff; Busy = $busy; TempC = $temp }
 }
@@ -95,32 +93,19 @@ function Write-CpuSample {
     Write-Host (">>> cpu[{0}] effFreq={1}MHz base={2}MHz %perf={3} busy={4}% temp={5}" -f $Label, $s.EffMHz, $s.BaseMHz, $s.PctPerf, $s.Busy, $s.TempC)
 }
 
-# Run a measured `cargo bench` invocation, optionally pinned to a CPU set (the
-# Windows analog of `taskset` in run-benchmarks.sh). When no CPU set is requested
-# the plain call is used so behavior is unchanged. cargo's child bench process
-# inherits the affinity mask set on the cargo process at spawn, and since
-# compilation dominates cargo's startup the mask is in place well before the
-# bench binary launches.
+# Run a measured `cargo bench` invocation and bracket it with CPU samples. The
+# client CPU pinning (when requested) is applied to the harness process before
+# these run, so cargo inherits it — see the pinning block below.
 function Invoke-Bench {
     param([Parameter(Mandatory)][string]$SaveBaseline)
+    # Client CPU pinning is applied once to THIS process (see the pinning block
+    # below); cargo and the bench binary it spawns inherit the affinity, so we
+    # just run cargo the normal way here. Using the call operator (not
+    # Start-Process) keeps stdout streaming to the run log and yields a reliable
+    # exit code via $LASTEXITCODE.
     Write-CpuSample "$SaveBaseline-start"
     try {
-        if ($null -eq $script:BenchAffinity) {
-            Invoke-Native { cargo bench -p mssql-tds-bench -- --save-baseline $SaveBaseline }
-            return
-        }
-        $proc = Start-Process -FilePath 'cargo' `
-            -ArgumentList @('bench', '-p', 'mssql-tds-bench', '--', '--save-baseline', $SaveBaseline) `
-            -NoNewWindow -PassThru
-        try {
-            $proc.ProcessorAffinity = [IntPtr]$script:BenchAffinity
-        } catch {
-            Write-Host ">>> WARNING: could not set ProcessorAffinity: $($_.Exception.Message)"
-        }
-        $proc.WaitForExit()
-        if ($proc.ExitCode -ne 0) {
-            throw "cargo bench (--save-baseline $SaveBaseline) failed (exit $($proc.ExitCode))"
-        }
+        Invoke-Native { cargo bench -p mssql-tds-bench -- --save-baseline $SaveBaseline }
     } finally {
         Write-CpuSample "$SaveBaseline-end"
     }
@@ -258,7 +243,18 @@ if (-not $env:BENCH_SAMPLES)     { $env:BENCH_SAMPLES = '30' }
 $BenchCpuList = if ($env:BENCH_CPUS) { $env:BENCH_CPUS } else { $env:PERF_CLIENT_CPUS }
 $script:BenchAffinity = ConvertTo-AffinityMask $BenchCpuList
 if ($null -ne $script:BenchAffinity) {
-    Write-Host (">>> Pinning benchmark client to CPUs '$BenchCpuList' (affinity 0x{0:X})" -f $script:BenchAffinity)
+    # Pin THIS PowerShell process to the reserved core set; cargo and the bench
+    # binary it spawns inherit the affinity mask at creation, so the whole client
+    # runs disjoint from SQL Server's cores. Setting affinity on the harness
+    # process is more robust than launching each cargo run via Start-Process,
+    # whose -PassThru ExitCode is null unless the handle is cached and whose child
+    # stdout is lost under the detached scheduled-task wrapper.
+    try {
+        (Get-Process -Id $PID).ProcessorAffinity = [IntPtr]$script:BenchAffinity
+        Write-Host (">>> Pinned benchmark client (this process + children) to CPUs '$BenchCpuList' (affinity 0x{0:X})" -f $script:BenchAffinity)
+    } catch {
+        Write-Host ">>> WARNING: could not set ProcessorAffinity: $($_.Exception.Message)"
+    }
 }
 
 # --- Warm-up pass (discarded) ---
