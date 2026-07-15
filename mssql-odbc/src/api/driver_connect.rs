@@ -246,8 +246,9 @@ fn do_connect(
     // Build ClientContext. T1 wired SQL password, integrated (SSPI/GSSAPI), and
     // pre-acquired access tokens; T2 adds Entra service principal (secret) and
     // managed identity via an Azure-SDK token factory. Methods that still need
-    // token acquisition (interactive, device code, workload identity, AD
-    // integrated) are rejected with HYC00 until a later tier.
+    // token acquisition (AD password, interactive, device code, workload
+    // identity, default credential, AD integrated) are rejected with HYC00
+    // until a later tier.
     let mut context = ClientContext::default();
     context.database = params.database.clone();
 

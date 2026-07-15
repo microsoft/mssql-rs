@@ -140,9 +140,11 @@ fn normalize_scope(spn: &str) -> String {
 /// server-provided authority is trusted. See the module-level security note on
 /// the residual risk when the TDS channel is not certificate-validated.
 fn split_sts_url(sts_url: &str) -> TdsResult<(String, String)> {
-    let trimmed = sts_url.trim_end_matches('/');
-    let after_scheme = trimmed
-        .strip_prefix("https://")
+    // The URL is server-provided (FEDAUTHINFO): tolerate surrounding whitespace
+    // and a mixed-case scheme (URL schemes are case-insensitive) before
+    // requiring https.
+    let trimmed = sts_url.trim().trim_end_matches('/');
+    let after_scheme = strip_https_prefix_ci(trimmed)
         .ok_or_else(|| Error::ConnectionError(format!("STS URL must use https: {sts_url}")))?;
     let (host, rest) = after_scheme
         .split_once('/')
@@ -154,6 +156,16 @@ fn split_sts_url(sts_url: &str) -> TdsResult<(String, String)> {
         )));
     }
     Ok((format!("https://{host}"), tenant.to_string()))
+}
+
+/// Strips a case-insensitive `https://` scheme, returning the remainder
+/// (host/path preserved as-is). Returns `None` if the scheme is not https.
+fn strip_https_prefix_ci(s: &str) -> Option<&str> {
+    const PREFIX: &str = "https://";
+    match s.get(..PREFIX.len()) {
+        Some(head) if head.eq_ignore_ascii_case(PREFIX) => Some(&s[PREFIX.len()..]),
+        _ => None,
+    }
 }
 
 /// Encodes a string as UTF-16LE bytes — the token format the FedAuth token
@@ -174,7 +186,9 @@ pub(crate) fn configure_auth(
     context: &mut ClientContext,
     resolved: TransformedAuth,
 ) -> Result<(), TdsAuthenticationMethod> {
-    context.tds_authentication_method = resolved.method.clone();
+    // Resolve the method first and only commit it to the context on a supported
+    // path, so the context is left untouched when we return `Err`.
+    let method = resolved.method.clone();
     match resolved.method {
         TdsAuthenticationMethod::Password | TdsAuthenticationMethod::SSPI => {
             context.user_name = resolved.user_name;
@@ -204,6 +218,7 @@ pub(crate) fn configure_auth(
         }
         other => return Err(other),
     }
+    context.tds_authentication_method = method;
     Ok(())
 }
 
@@ -283,6 +298,23 @@ mod tests {
         let (authority, tenant) =
             split_sts_url("https://login.microsoftonline.com:443/my-tenant").unwrap();
         assert_eq!(authority, "https://login.microsoftonline.com:443");
+        assert_eq!(tenant, "my-tenant");
+    }
+
+    #[test]
+    fn sts_url_scheme_is_case_insensitive() {
+        // URL schemes are case-insensitive; the reconstructed authority is
+        // normalized to lowercase https.
+        let (authority, tenant) =
+            split_sts_url("HTTPS://login.microsoftonline.com/my-tenant").unwrap();
+        assert_eq!(authority, "https://login.microsoftonline.com");
+        assert_eq!(tenant, "my-tenant");
+    }
+
+    #[test]
+    fn sts_url_trims_surrounding_whitespace() {
+        let (authority, tenant) = split_sts_url("  https://login.windows.net/my-tenant  ").unwrap();
+        assert_eq!(authority, "https://login.windows.net");
         assert_eq!(tenant, "my-tenant");
     }
 
