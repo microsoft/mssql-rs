@@ -249,16 +249,21 @@ pub(crate) fn sqlstate_for_sql_error(error_number: u32) -> Option<[u8; 5]> {
 /// typically `08001` for connect-time failures and `HY000` for general
 /// execution / fetch failures.
 pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, default: [u8; 5]) {
-    if let TdsError::SqlServerError { diagnostics } = err
-        && !diagnostics.is_empty()
-    {
-        for e in &diagnostics.errors {
-            let sqlstate = sqlstate_for_sql_error(e.number).unwrap_or(default);
-            let native = i32::try_from(e.number).unwrap_or(i32::MAX);
-            post_sql_error(state, sqlstate, native, e.message.clone());
+    if let TdsError::SqlServerError { diagnostics } = err {
+        if diagnostics.errors.is_empty() {
+            // An error return must surface at least one error record. If the
+            // server diagnostics unexpectedly carried no ERROR tokens, post a
+            // default record from the error's Display text so the caller still
+            // sees a primary failure.
+            post_sql_error(state, default, 0, err.to_string());
+        } else {
+            for e in &diagnostics.errors {
+                let sqlstate = sqlstate_for_sql_error(e.number).unwrap_or(default);
+                let native = i32::try_from(e.number).unwrap_or(i32::MAX);
+                post_sql_error(state, sqlstate, native, e.message.clone());
+            }
         }
-        // Errors are posted first so record 1 remains the primary failure;
-        // informational/warning records follow.
+        // Informational/warning records follow the primary error record(s).
         post_tds_info_messages(state, &diagnostics.info_messages);
         return;
     }
@@ -410,6 +415,36 @@ mod tests {
         assert_eq!(s.records.len(), 2);
         assert_eq!(s.records[0].sql_state, *b"28000");
         assert_eq!(s.records[0].native_error, 18456);
+        assert_eq!(s.records[1].sql_state, *b"01000");
+        assert_eq!(s.records[1].native_error, 5701);
+    }
+
+    #[test]
+    fn post_tds_error_info_only_diagnostics_still_posts_primary_error() {
+        // A SqlServerError that unexpectedly carries only INFO messages (no
+        // ERROR tokens) must still surface a primary error record for the error
+        // return, followed by the info record(s).
+        use mssql_tds::error::SqlServerDiagnostics;
+        let mut s = FakeState::default();
+        let diagnostics = SqlServerDiagnostics::new(
+            vec![],
+            vec![SqlInfoMessage {
+                message: "info only".into(),
+                state: 1,
+                class: 10,
+                number: 5701,
+                server_name: None,
+                proc_name: None,
+                line_number: Some(1),
+            }],
+        );
+        let err = TdsError::from_sql_diagnostics(diagnostics);
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 2);
+        // Record 1 is the synthesized primary error (default state, native 0).
+        assert_eq!(s.records[0].sql_state, SQLSTATE_HY000);
+        assert_eq!(s.records[0].native_error, 0);
+        // Record 2 is the info message.
         assert_eq!(s.records[1].sql_state, *b"01000");
         assert_eq!(s.records[1].native_error, 5701);
     }

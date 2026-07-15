@@ -192,11 +192,23 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
         return DrainOutcome::Failed;
     }
 
-    let info_messages = client.take_info_messages();
-    let has_server_info = if let Ok(mut stmt_state) = stmt.inner.lock() {
-        post_tds_info_messages(&mut stmt_state, &info_messages)
-    } else {
-        false
+    let has_server_info = match stmt.inner.lock() {
+        Ok(mut stmt_state) => {
+            // Drain INFO only after the lock is held so a poisoned mutex cannot
+            // silently drop the messages.
+            let info_messages = client.take_info_messages();
+            post_tds_info_messages(&mut stmt_state, &info_messages)
+        }
+        Err(_) => {
+            error!("drain_and_release: stmt mutex poisoned while posting info messages");
+            if let Ok(mut dbc_state) = dbc.inner.lock() {
+                dbc_state.client = Some(client);
+                if dbc_state.active_stmt == Some(statement_handle) {
+                    dbc_state.active_stmt = None;
+                }
+            }
+            return DrainOutcome::Failed;
+        }
     };
 
     // Drain complete: return client and release busy claim atomically.

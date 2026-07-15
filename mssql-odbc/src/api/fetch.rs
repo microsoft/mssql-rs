@@ -102,7 +102,6 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
 
     match fetch_result {
         Ok(Some(row)) => {
-            let info_messages = client.take_info_messages();
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLFetch: stmt mutex poisoned storing row");
                 if let Ok(mut ds) = dbc.inner.lock() {
@@ -114,6 +113,9 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 return SQL_ERROR;
             };
             stmt_state.current_row = Some(row);
+            // Drain INFO only after the lock is held so a poisoned mutex cannot
+            // silently drop the messages.
+            let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
 
@@ -130,17 +132,24 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             }
         }
         Ok(None) => {
-            let info_messages = client.take_info_messages();
             // End of current rowset. Do NOT drain the rest of the batch — the
             // application may call SQLMoreResults to advance to a subsequent
             // result set (msodbcsql behaviour). Cursor stays open; active_stmt
             // stays set so the connection remains "busy" with this statement.
-            if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.current_row = None;
-                // Dont clear CURSOR_OPEN here
-                // Cursor stays open until SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE)
-                post_tds_info_messages(&mut stmt_state, &info_messages);
-            }
+            let Ok(mut stmt_state) = stmt.inner.lock() else {
+                error!("SQLFetch: stmt mutex poisoned at end of rowset");
+                if let Ok(mut ds) = dbc.inner.lock() {
+                    ds.client = Some(client);
+                }
+                return SQL_ERROR;
+            };
+            stmt_state.current_row = None;
+            // Dont clear CURSOR_OPEN here
+            // Cursor stays open until SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE)
+            // Drain INFO only after the lock is held.
+            let info_messages = client.take_info_messages();
+            post_tds_info_messages(&mut stmt_state, &info_messages);
+            drop(stmt_state);
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
             }
@@ -150,11 +159,11 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         }
         Err(e) => {
             error!(%e, "SQLFetch: row fetch failed");
-            let info_messages = client.take_info_messages();
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.current_row = None;
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+                let info_messages = client.take_info_messages();
                 post_tds_info_messages(&mut stmt_state, &info_messages);
             }
             if let Ok(mut dbc_state) = dbc.inner.lock() {
