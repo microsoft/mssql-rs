@@ -282,13 +282,14 @@ mod rpc_results {
 
         match res {
             Ok(()) => panic!("Expected sp_unprepare to fail for handle 0"),
-            Err(Error::SqlServerError { errors }) => {
+            Err(Error::SqlServerError { diagnostics }) => {
                 assert!(
-                    errors
+                    diagnostics
+                        .errors
                         .iter()
                         .any(|e| e.number != 0 && !e.message.is_empty()),
                     "expected at least one populated server error, got: {:?}",
-                    errors,
+                    diagnostics.errors,
                 );
             }
             Err(other) => panic!(
@@ -316,13 +317,14 @@ mod rpc_results {
 
         match res {
             Ok(handle) => panic!("Expected sp_prepare to fail; got handle {}", handle),
-            Err(Error::SqlServerError { errors }) => {
+            Err(Error::SqlServerError { diagnostics }) => {
                 assert!(
-                    errors
+                    diagnostics
+                        .errors
                         .iter()
                         .any(|e| e.number != 0 && !e.message.is_empty()),
                     "expected at least one populated server error, got: {:?}",
-                    errors,
+                    diagnostics.errors,
                 );
             }
             Err(other) => panic!(

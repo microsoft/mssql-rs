@@ -10,7 +10,9 @@
 use tracing::{debug, error};
 
 use super::sqlstate::*;
-use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
+use crate::api::odbc_types::{
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn,
+};
 use crate::error::free_errors;
 use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -70,10 +72,14 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
 
-    drain_and_release(stmt, statement_handle);
+    let has_server_info = drain_and_release(stmt, statement_handle);
 
     debug!("SQLCloseCursor: cursor closed");
-    SQL_SUCCESS
+    if has_server_info {
+        SQL_SUCCESS_WITH_INFO
+    } else {
+        SQL_SUCCESS
+    }
 }
 
 unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
@@ -100,10 +106,14 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
 
-    drain_and_release(stmt, statement_handle);
+    let has_server_info = drain_and_release(stmt, statement_handle);
 
     debug!("SQLFreeStmt(SQL_CLOSE): cursor closed");
-    SQL_SUCCESS
+    if has_server_info {
+        SQL_SUCCESS_WITH_INFO
+    } else {
+        SQL_SUCCESS
+    }
 }
 
 /// Resets cursor state on the statement (cursor is no longer open, metadata cleared).
@@ -117,14 +127,14 @@ pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtStat
 /// `active_stmt` is kept set until the drain finishes so concurrent threads see the
 /// connection as busy (HY000) throughout — not just until `client` is taken.
 /// No locks are held during the network I/O.
-pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) {
+pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) -> bool {
     let dbc = stmt.parent_dbc();
 
     // Take the client; intentionally leave active_stmt set while draining.
     let client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("drain_and_release: dbc mutex poisoned");
-            return;
+            return false;
         };
         dbc_state.client.take()
     };
@@ -136,7 +146,7 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
         {
             ds.active_stmt = None;
         }
-        return;
+        return false;
     };
 
     if let Err(e) = dbc.runtime.block_on(client.close_query()) {
@@ -147,8 +157,15 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
                 ds.active_stmt = None;
             }
         }
-        return;
+        return false;
     }
+
+    let info_messages = client.take_info_messages();
+    let has_server_info = if let Ok(mut stmt_state) = stmt.inner.lock() {
+        post_tds_info_messages(&mut stmt_state, &info_messages)
+    } else {
+        false
+    };
 
     // Drain complete: return client and release busy claim atomically.
     if let Ok(mut dbc_state) = dbc.inner.lock() {
@@ -157,6 +174,8 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
             dbc_state.active_stmt = None;
         }
     }
+
+    has_server_info
 }
 
 #[cfg(test)]

@@ -14,10 +14,12 @@ use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
 
 use super::close_cursor::reset_cursor_state;
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SqlHandle, SqlReturn,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
+    SqlReturn,
 };
 use crate::api::sqlstate::{
     ERR_CONNECTION_BUSY, ERR_NO_ACTIVE_TDS_CLIENT, SQLSTATE_HY000, post_diag, post_tds_error,
+    post_tds_info_messages,
 };
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
@@ -95,21 +97,30 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // Positioned on a new result set. Refresh metadata, clear row state,
             // keep CURSOR_OPEN and active_stmt set.
             let metadata = client.get_metadata().clone();
+            let info_messages = client.take_info_messages();
+            let mut has_server_info = false;
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.column_metadata = metadata;
                 stmt_state.current_row = None;
+                has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             }
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
                 // active_stmt remains set — cursor still open on this statement.
             }
             debug!("SQLMoreResults: advanced to next result set");
-            SQL_SUCCESS
+            if has_server_info {
+                SQL_SUCCESS_WITH_INFO
+            } else {
+                SQL_SUCCESS
+            }
         }
         Ok(false) => {
+            let info_messages = client.take_info_messages();
             // Batch exhausted. Close cursor state and release the connection.
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 reset_cursor_state(&mut stmt_state);
+                post_tds_info_messages(&mut stmt_state, &info_messages);
             }
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
@@ -122,10 +133,12 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         }
         Err(e) => {
             error!(%e, "SQLMoreResults: move_to_next failed");
+            let info_messages = client.take_info_messages();
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 // Treat as terminal: clear cursor state and post diagnostic.
                 reset_cursor_state(&mut stmt_state);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+                post_tds_info_messages(&mut stmt_state, &info_messages);
             }
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);

@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::collections::HashMap;
-
 use crate::connection::bulk_copy::{BulkCopyOptions, BulkLoadRow, ResolvedColumnMapping};
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{ClientContext, ExecutionColumnEncryptionSetting};
@@ -12,7 +10,7 @@ use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sqltypes::SqlType;
 use crate::error::Error::UsageError;
-use crate::error::SqlErrorInfo;
+use crate::error::{SqlErrorInfo, SqlInfoMessage};
 use crate::io::packet_writer::PacketWriter;
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
 use crate::message::messages::{PacketType, ResetConnectionMode};
@@ -38,6 +36,7 @@ use crate::{
     token::tokens::{ColMetadataToken, CurrentCommand, EnvChangeTokenSubType, Tokens},
 };
 use async_trait::async_trait;
+use std::collections::HashMap;
 use tracing::{debug, error, info, instrument};
 
 use crate::{
@@ -85,6 +84,7 @@ pub struct TdsClient {
     count_map: HashMap<CurrentCommand, u64>,
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
+    info_messages: Vec<SqlInfoMessage>,
     /// Plaintext column encryption keys retained from the current command's
     /// `sp_describe_parameter_encryption` call, keyed by normalized parameter
     /// name (leading `@` stripped, ASCII-uppercased). An encrypted RETURNVALUE
@@ -140,6 +140,7 @@ impl TdsClient {
             current_decryptor: None,
             count_map: HashMap::new(),
             return_values: Vec::new(),
+            info_messages: Vec::new(),
             output_param_ceks: HashMap::new(),
             last_return_status: ReturnStatus::NotReceived,
             current_result_set_has_been_read_till_end: false,
@@ -248,7 +249,7 @@ impl TdsClient {
             )
             .await;
             match connect_result {
-                Ok((new_transport, new_settings, new_exec_ctx)) => {
+                Ok((new_transport, new_settings, new_exec_ctx, info_messages)) => {
                     // Validate reconnection properties match original
                     if let Err(validation_err) =
                         self.recovery_context.validate_reconnection(&new_settings)
@@ -269,6 +270,8 @@ impl TdsClient {
                     self.current_metadata = None;
                     self.count_map.clear();
                     self.return_values.clear();
+                    self.info_messages.clear();
+                    self.info_messages.extend(info_messages);
                     self.current_result_set_has_been_read_till_end = false;
                     self.remaining_request_timeout = None;
                     self.cancel_handle = None;
@@ -538,6 +541,7 @@ impl TdsClient {
             ));
         };
 
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -636,6 +640,7 @@ impl TdsClient {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -942,6 +947,7 @@ impl TdsClient {
                 }
                 Tokens::Info(info_token) => {
                     info!(?info_token);
+                    self.capture_info_message(&info_token);
                     continue;
                 }
                 Tokens::EnvChange(env_change) => {
@@ -1046,6 +1052,7 @@ impl TdsClient {
             ));
         }
 
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -1154,6 +1161,7 @@ impl TdsClient {
             ));
         }
 
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -1330,6 +1338,7 @@ impl TdsClient {
             ));
         }
 
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -1427,6 +1436,7 @@ impl TdsClient {
             ));
         }
 
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -1515,6 +1525,10 @@ impl TdsClient {
                 Tokens::Error(error_token) => {
                     info!(?error_token, "Draining ERROR token from stream");
                     collected_errors.push(SqlErrorInfo::from(&error_token));
+                }
+                Tokens::Info(info_token) => {
+                    info!(?info_token, "Draining INFO token from stream");
+                    self.capture_info_message(&info_token);
                 }
                 Tokens::EnvChange(t1) => {
                     if t1.sub_type == EnvChangeTokenSubType::ResetConnection {
@@ -1661,6 +1675,7 @@ impl TdsClient {
                 }
                 Tokens::Info(info_token) => {
                     info!(?info_token);
+                    self.capture_info_message(&info_token);
                     continue;
                 }
                 Tokens::TabName | Tokens::ColInfo => {
@@ -2231,6 +2246,7 @@ impl TdsClient {
                     }
                     Tokens::Info(info_token) => {
                         info!(?info_token);
+                        self.capture_info_message(&info_token);
                         continue;
                     }
                     Tokens::TabName | Tokens::ColInfo => {
@@ -2254,6 +2270,35 @@ impl TdsClient {
     /// or after [`move_to_next()`](Self::move_to_next) returns `false`).
     pub fn get_return_values(&self) -> Vec<ReturnValue> {
         self.return_values.clone()
+    }
+
+    /// Returns all informational messages captured from the current or most
+    /// recent token stream.
+    pub fn info_messages(&self) -> &[SqlInfoMessage] {
+        &self.info_messages
+    }
+
+    /// Drains and returns all informational messages captured so far.
+    pub fn take_info_messages(&mut self) -> Vec<SqlInfoMessage> {
+        std::mem::take(&mut self.info_messages)
+    }
+
+    pub(crate) fn extend_info_messages(&mut self, messages: Vec<SqlInfoMessage>) {
+        self.info_messages.extend(messages);
+    }
+
+    fn capture_info_message(&mut self, token: &crate::token::tokens::InfoToken) {
+        self.info_messages.push(SqlInfoMessage::from(token));
+    }
+
+    /// Resets the informational-message buffer at the start of a new command so
+    /// [`info_messages()`](Self::info_messages) reflects only that command.
+    ///
+    /// Call this before `check_and_reconnect`: a transparent reconnect
+    /// repopulates login messages for the new session *after* this point, so
+    /// those remain visible as part of the command that triggered the reconnect.
+    fn begin_command(&mut self) {
+        self.info_messages.clear();
     }
 
     /// Retrieves a snapshot of the output parameters (including return values)
@@ -2284,6 +2329,11 @@ impl TdsClient {
         info!("No more rows to consume.");
 
         // Reset the current metadata, return values, and timeout/cancel state.
+        // Note: `info_messages` is intentionally NOT cleared here. Draining the
+        // trailing token stream above can surface INFO/warning messages (e.g. a
+        // PRINT after the last result set), and the caller drains them via
+        // `take_info_messages()` after this returns (see the ODBC
+        // `drain_and_release` path). Clearing them here would discard them.
         self.current_metadata = None;
         self.return_values.clear();
         self.remaining_request_timeout = None;
@@ -2551,6 +2601,11 @@ impl TdsClient {
                     collected_errors.push(SqlErrorInfo::from(&error_token));
                     continue;
                 }
+                Tokens::Info(info_token) => {
+                    info!(?info_token);
+                    self.capture_info_message(&info_token);
+                    continue;
+                }
                 Tokens::EnvChange(env_change) => {
                     info!(?env_change);
                     if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
@@ -2715,7 +2770,9 @@ mod tests {
     use crate::datatypes::row_writer::RowWriter;
     use crate::io::reader_writer::{NetworkReader, NetworkWriter};
     use crate::io::token_stream::{ParserContext, RowReadResult, TdsTokenStreamReader};
-    use crate::token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, Tokens};
+    use crate::token::tokens::{
+        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
+    };
     use async_trait::async_trait;
     use std::collections::VecDeque;
 
@@ -2898,6 +2955,18 @@ mod tests {
         })
     }
 
+    fn info_token(number: u32, severity: u8, message: &str) -> Tokens {
+        Tokens::Info(InfoToken {
+            number,
+            state: 1,
+            severity,
+            message: message.to_string(),
+            server_name: "test-server".to_string(),
+            proc_name: String::new(),
+            line_number: 7,
+        })
+    }
+
     fn empty_col_metadata() -> Tokens {
         Tokens::ColMetadata(ColMetadataToken::default())
     }
@@ -2935,6 +3004,54 @@ mod tests {
         // Only one leading '@' is stripped.
         assert_eq!(TdsClient::normalize_param_name("@@version"), "@VERSION");
         assert_eq!(TdsClient::normalize_param_name(""), "");
+    }
+
+    #[tokio::test]
+    async fn consume_done_token_captures_all_info_tokens() {
+        let mut client = create_test_client_with_tokens(vec![
+            info_token(5701, 10, "Changed database context to 'master'."),
+            info_token(0, 0, "hello from PRINT"),
+            done_no_more(),
+        ]);
+
+        let rows_affected = client.consume_done_token().await.unwrap();
+
+        assert_eq!(rows_affected, 0);
+        assert_eq!(client.info_messages().len(), 2);
+        assert_eq!(client.info_messages()[0].number, 5701);
+        assert_eq!(client.info_messages()[0].class, 10);
+        assert_eq!(client.info_messages()[1].message, "hello from PRINT");
+
+        let messages = client.take_info_messages();
+        assert_eq!(messages.len(), 2);
+        assert!(client.info_messages().is_empty());
+    }
+
+    #[test]
+    fn begin_command_clears_stale_info_messages() {
+        // Simulates login/connect messages left on the client before a new
+        // command starts. `begin_command` (called at the top of every execute*
+        // entry point) must clear them so `info_messages()` reflects only the
+        // current command.
+        let mut client = create_test_client();
+        client.extend_info_messages(vec![SqlInfoMessage::from(
+            &crate::token::tokens::InfoToken {
+                number: 5701,
+                state: 1,
+                severity: 10,
+                message: "Changed database context to 'master'.".to_string(),
+                server_name: "srv".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            },
+        )]);
+        assert_eq!(client.info_messages().len(), 1);
+
+        client.begin_command();
+        assert!(
+            client.info_messages().is_empty(),
+            "begin_command must clear stale info messages"
+        );
     }
 
     // ── finalize_return_value (encrypted RETURNVALUE decryption) tests ──
