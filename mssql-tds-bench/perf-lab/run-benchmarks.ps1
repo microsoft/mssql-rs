@@ -129,6 +129,26 @@ function Get-CritcmpRegressions {
     }
 }
 
+# Fast, discarded run that primes SQL Server's buffer pool and the OS page cache
+# so the measured pass that follows starts warm. Run before BOTH the candidate
+# and baseline passes: the baseline mssql-tds is rebuilt after a long candidate
+# pass, which evicts caches, so without a re-warm the baseline looks spuriously
+# slower on the I/O-heavy benches (LOB, packet-size). $Filter optionally limits
+# it to a Criterion benchmark-id regex.
+function Invoke-WarmupPass {
+    param([string]$Filter)
+    Write-Host (">>> Warm-up pass (discarded)" + $(if ($Filter) { " [$Filter]" } else { "" }) + "...")
+    $ow = $env:BENCH_WARMUP_SECS; $os = $env:BENCH_SECS; $oa = $env:BENCH_SAMPLES
+    $env:BENCH_WARMUP_SECS = '1'; $env:BENCH_SECS = '1'; $env:BENCH_SAMPLES = '10'
+    $wargs = @('bench', '-p', 'mssql-tds-bench', '--', '--save-baseline', 'warmup')
+    if ($Filter) { $wargs += $Filter }
+    & {
+        $ErrorActionPreference = 'Continue'
+        cargo @wargs *> $null
+    }
+    $env:BENCH_WARMUP_SECS = $ow; $env:BENCH_SECS = $os; $env:BENCH_SAMPLES = $oa
+}
+
 $RepoRoot   = (Get-Location).Path
 $ResultsDir = Join-Path $RepoRoot 'results'
 # Baseline pointer — a committed commit SHA. Advancing the baseline requires a
@@ -276,20 +296,10 @@ if ($null -ne $script:BenchAffinity) {
 }
 
 # --- Warm-up pass (discarded) ---
-# Candidate is measured first and baseline second; prime SQL Server and the OS
-# once (fast, discarded) so both measured runs start warm and the candidate
-# doesn't pay a cold-cache penalty on the largest benches (e.g. the 20 MB LOB).
-Write-Host '>>> Warm-up pass (discarded)...'
-$origWarm = $env:BENCH_WARMUP_SECS; $origSecs = $env:BENCH_SECS; $origSamples = $env:BENCH_SAMPLES
-$env:BENCH_WARMUP_SECS = '1'; $env:BENCH_SECS = '1'; $env:BENCH_SAMPLES = '10'
-# Warm-up failures are non-fatal (matches run-benchmarks.sh's `|| true`). Relax
-# the error preference so cargo's stderr progress under the stream redirect does
-# not abort the run, and deliberately ignore the exit code.
-& {
-    $ErrorActionPreference = 'Continue'
-    cargo bench -p mssql-tds-bench -- --save-baseline warmup *> $null
-}
-$env:BENCH_WARMUP_SECS = $origWarm; $env:BENCH_SECS = $origSecs; $env:BENCH_SAMPLES = $origSamples
+# Prime SQL Server and the OS page cache before the candidate pass; a matching
+# re-warm runs before the baseline pass too (see below), because the long
+# candidate pass plus the baseline rebuild leaves caches cold otherwise.
+Invoke-WarmupPass
 
 # --- Candidate run (mssql-tds = working tree) ---
 Write-Host '>>> Candidate benchmarks...'
@@ -318,6 +328,9 @@ function Restore-CandidateSource {
 
 Write-Host '>>> Swapping mssql-tds source to the baseline...'
 Set-BaselineSource
+
+# Re-warm after the rebuild so the baseline pass starts as warm as the candidate.
+Invoke-WarmupPass
 
 Write-Host '>>> Baseline benchmarks...'
 Invoke-Bench 'base'
@@ -363,11 +376,13 @@ if ($regressions.Count -gt 0) {
 
     # Baseline is still swapped in and built - re-run just the offenders.
     Write-Host '>>> Auto-confirm: baseline re-run...'
+    Invoke-WarmupPass $filter
     Invoke-Bench 'base_confirm' $filter
 
     # Restore the candidate source and re-run just the offenders.
     Write-Host '>>> Auto-confirm: candidate re-run...'
     Restore-CandidateSource
+    Invoke-WarmupPass $filter
     Invoke-Bench 'candidate_confirm' $filter
 
     Write-Host '>>> Auto-confirm comparison (base_confirm -> candidate_confirm):'

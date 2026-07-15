@@ -178,15 +178,22 @@ if [ -n "$BENCH_CPUS" ]; then
     fi
 fi
 
-# --- Warm-up pass (discarded) ---
-# Candidate is measured first and baseline second, so without this the candidate
-# pays a cold-cache penalty (SQL buffer pool, memory grants, OS pages) that the
-# baseline run doesn't — which shows up as a spurious delta on the largest
-# working-set benches (e.g. the 20 MB LOB). Run the whole suite once, fast and
-# discarded, to prime SQL Server and the OS so BOTH measured runs start warm.
-echo ">>> Warm-up pass (discarded)..."
-BENCH_WARMUP_SECS=1 BENCH_SECS=1 BENCH_SAMPLES=10 \
-    "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline warmup >/dev/null 2>&1 || true
+# --- Warm-up passes (discarded) ---
+# Each measured pass is preceded by a fast, discarded run of the same benchmarks
+# to prime SQL Server's buffer pool and the OS page cache so it starts warm.
+# This must run before BOTH the candidate and the baseline passes: the candidate
+# pass runs for many minutes and the baseline mssql-tds is then rebuilt (which
+# churns memory and the page cache), so a single warm-up before the candidate
+# does NOT leave the baseline warm. Without a re-warm the second (baseline) pass
+# pays a cold-cache penalty that shows up as the baseline looking spuriously
+# slower, worst on the I/O-heavy benches (LOB, packet-size). $1 optionally limits
+# the warm-up to a Criterion benchmark-id regex.
+warmup_pass() {
+    echo ">>> Warm-up pass (discarded)${1:+ [$1]}..."
+    BENCH_WARMUP_SECS=1 BENCH_SECS=1 BENCH_SAMPLES=10 \
+        "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline warmup ${1:+"$1"} >/dev/null 2>&1 || true
+}
+warmup_pass
 
 # --- Candidate run (mssql-tds = working tree) ---
 echo ">>> Candidate benchmarks..."
@@ -216,6 +223,9 @@ restore_candidate() {
 
 echo ">>> Swapping mssql-tds source to the baseline..."
 swap_to_baseline
+
+# Re-warm after the rebuild so the baseline pass starts as warm as the candidate.
+warmup_pass
 
 echo ">>> Baseline benchmarks..."
 cpu_sample "base-start" || true
@@ -256,11 +266,13 @@ if [ -n "$OFFENDERS" ]; then
 
     # Baseline is still swapped in and built — re-run just the offenders.
     echo ">>> Auto-confirm: baseline re-run..."
+    warmup_pass "$FILTER"
     "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline base_confirm "$FILTER"
 
     # Restore the candidate source and re-run just the offenders.
     echo ">>> Auto-confirm: candidate re-run..."
     restore_candidate
+    warmup_pass "$FILTER"
     "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline candidate_confirm "$FILTER"
 
     echo ">>> Auto-confirm comparison (base_confirm -> candidate_confirm):"
