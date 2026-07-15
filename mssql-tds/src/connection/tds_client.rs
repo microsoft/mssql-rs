@@ -1267,6 +1267,7 @@ impl TdsClient {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -2294,9 +2295,11 @@ impl TdsClient {
     /// Resets the informational-message buffer at the start of a new command so
     /// [`info_messages()`](Self::info_messages) reflects only that command.
     ///
-    /// Call this before `check_and_reconnect`: a transparent reconnect
-    /// repopulates login messages for the new session *after* this point, so
-    /// those remain visible as part of the command that triggered the reconnect.
+    /// Call this at the top of every public token-consuming command, before
+    /// consuming the response (and before `check_and_reconnect` where
+    /// applicable): a transparent reconnect repopulates login messages for the
+    /// new session *after* this point, so those remain visible as part of the
+    /// command that triggered the reconnect.
     fn begin_command(&mut self) {
         self.info_messages.clear();
     }
@@ -2422,6 +2425,7 @@ impl TdsClient {
             ));
         }
 
+        self.begin_command();
         // begin_transaction has no command timeout — use connect_timeout as fallback.
         let _reconnect_elapsed = self.check_and_reconnect(None, None).await?;
 
@@ -2451,6 +2455,7 @@ impl TdsClient {
                 "Cannot save transaction while another batch is executing.".to_string(),
             ));
         }
+        self.begin_command();
         let transaction = TransactionManagementRequest::new(
             TransactionManagementType::Save(name),
             &self.execution_context,
@@ -2479,6 +2484,7 @@ impl TdsClient {
                 "Cannot commit transaction while another batch is executing.".to_string(),
             ));
         }
+        self.begin_command();
         let transaction = TransactionManagementRequest::new(
             TransactionManagementType::Commit {
                 name,
@@ -2510,6 +2516,7 @@ impl TdsClient {
                 "Cannot rollback transaction while another batch is executing.".to_string(),
             ));
         }
+        self.begin_command();
         let transaction = TransactionManagementRequest::new(
             TransactionManagementType::Rollback {
                 name,
@@ -2536,6 +2543,7 @@ impl TdsClient {
                 "Cannot get DTC address while another batch is executing.".to_string(),
             ));
         }
+        self.begin_command();
         let transaction = TransactionManagementRequest::new(
             TransactionManagementType::GetDtcAddress,
             &self.execution_context,
@@ -3051,6 +3059,41 @@ mod tests {
         assert!(
             client.info_messages().is_empty(),
             "begin_command must clear stale info messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sp_unprepare_clears_stale_info_messages() {
+        // Regression: token-consuming commands beyond the execute*/query family
+        // (here sp_unprepare, which drains via drain_stream) must also reset the
+        // info buffer so a prior command's messages don't leak into this one.
+        let mut client = create_test_client_with_tokens(vec![
+            info_token(0, 0, "unprepare info"),
+            done_no_more(),
+        ]);
+
+        // Stale message left over from an earlier command / login.
+        client.extend_info_messages(vec![SqlInfoMessage {
+            message: "stale from previous command".to_string(),
+            state: 1,
+            class: 10,
+            number: 5701,
+            server_name: None,
+            proc_name: None,
+            line_number: None,
+        }]);
+
+        client.execute_sp_unprepare(1, None, None).await.unwrap();
+
+        let msgs = client.info_messages();
+        assert!(
+            msgs.iter()
+                .all(|m| m.message != "stale from previous command"),
+            "stale info from a prior command must be cleared: {msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| m.message == "unprepare info"),
+            "the current command's info should be captured: {msgs:?}"
         );
     }
 
