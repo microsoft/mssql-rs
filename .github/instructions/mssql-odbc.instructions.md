@@ -14,6 +14,23 @@ fatal and unrecoverable.
 Before making changes, also read [mssql-odbc/README.md](../../mssql-odbc/README.md)
 for architecture, supported features, and build/run instructions.
 
+## Parity reference: the classic C++ msodbcsql driver
+
+The classic C++ **msodbcsql** driver (Microsoft ODBC Driver for SQL Server) is the
+authoritative parity reference for this crate. Its source lives in the
+`SqlClientDrivers` Azure DevOps org (`msodbcsql` project/repo, `master`).
+
+- Before adding, changing, or **rejecting** any behavior for parity reasons — auth
+  keywords, connection-string attributes, error/SQLSTATE mapping, Driver Manager
+  interaction — verify it against the actual msodbcsql source. Do **not** rely on
+  MS Learn docs or sibling drivers (JDBC/.NET/go-sqlcmd), which frequently differ
+  from what the C++ driver actually does.
+- When reporting a parity finding, cite the msodbcsql source (file + what it does),
+  and state explicitly whether the decision **matches**, **exceeds**, or **diverges
+  from** msodbcsql so the trade-off is visible.
+- Deliberate deviations (exceed-parity) are allowed with product-owner sign-off;
+  record the rationale in code comments and the tracking work item.
+
 ## No panics
 
 - **Never** use `.unwrap()` or `.expect()` on `Result` or `Option` in
