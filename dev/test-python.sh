@@ -64,8 +64,8 @@ echo "Upgrading pip..."
 pip install --upgrade pip -q
 
 # Install dependencies
-echo "Installing dependencies (maturin, pytest, pytest-asyncio, python-dotenv, patchelf)..."
-pip install maturin pytest pytest-asyncio python-dotenv patchelf -q
+echo "Installing dependencies (maturin, pytest, pytest-asyncio, python-dotenv, patchelf, pyarrow)..."
+pip install maturin pytest pytest-asyncio python-dotenv patchelf pyarrow -q
 
 # Navigate to mssql-py-core directory
 cd "$PY_CORE_DIR"
