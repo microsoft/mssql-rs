@@ -72,13 +72,19 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
 
-    let has_server_info = drain_and_release(stmt, statement_handle);
-
-    debug!("SQLCloseCursor: cursor closed");
-    if has_server_info {
-        SQL_SUCCESS_WITH_INFO
-    } else {
-        SQL_SUCCESS
+    match drain_and_release(stmt, statement_handle) {
+        DrainOutcome::Failed => {
+            error!("SQLCloseCursor: failed to drain TDS stream on close");
+            SQL_ERROR
+        }
+        DrainOutcome::InfoPosted => {
+            debug!("SQLCloseCursor: cursor closed");
+            SQL_SUCCESS_WITH_INFO
+        }
+        DrainOutcome::Clean => {
+            debug!("SQLCloseCursor: cursor closed");
+            SQL_SUCCESS
+        }
     }
 }
 
@@ -106,13 +112,19 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
 
-    let has_server_info = drain_and_release(stmt, statement_handle);
-
-    debug!("SQLFreeStmt(SQL_CLOSE): cursor closed");
-    if has_server_info {
-        SQL_SUCCESS_WITH_INFO
-    } else {
-        SQL_SUCCESS
+    match drain_and_release(stmt, statement_handle) {
+        DrainOutcome::Failed => {
+            error!("SQLFreeStmt(SQL_CLOSE): failed to drain TDS stream on close");
+            SQL_ERROR
+        }
+        DrainOutcome::InfoPosted => {
+            debug!("SQLFreeStmt(SQL_CLOSE): cursor closed");
+            SQL_SUCCESS_WITH_INFO
+        }
+        DrainOutcome::Clean => {
+            debug!("SQLFreeStmt(SQL_CLOSE): cursor closed");
+            SQL_SUCCESS
+        }
     }
 }
 
@@ -123,18 +135,33 @@ pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtStat
     stmt_state.column_metadata.clear();
 }
 
+/// Outcome of draining the TDS stream and releasing the connection on cursor close.
+pub(super) enum DrainOutcome {
+    /// Drain completed cleanly; no server INFO messages were posted.
+    Clean,
+    /// Drain completed and one or more server INFO messages were posted.
+    InfoPosted,
+    /// Draining the TDS stream failed (I/O error or a lost/poisoned client).
+    /// A diagnostic is posted where possible; the connection may be broken.
+    Failed,
+}
+
 /// Takes the TDS client from the DBC, drains any pending tokens, and clears `active_stmt`.
 /// `active_stmt` is kept set until the drain finishes so concurrent threads see the
 /// connection as busy (HY000) throughout — not just until `client` is taken.
 /// No locks are held during the network I/O.
-pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) -> bool {
+///
+/// Returns a [`DrainOutcome`] so callers can distinguish a clean close from one
+/// that surfaced server INFO messages, and — importantly — from a drain failure,
+/// which must not be reported to the app as success.
+pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) -> DrainOutcome {
     let dbc = stmt.parent_dbc();
 
     // Take the client; intentionally leave active_stmt set while draining.
     let client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("drain_and_release: dbc mutex poisoned");
-            return false;
+            return DrainOutcome::Failed;
         };
         dbc_state.client.take()
     };
@@ -146,18 +173,23 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
         {
             ds.active_stmt = None;
         }
-        return false;
+        return DrainOutcome::Failed;
     };
 
     if let Err(e) = dbc.runtime.block_on(client.close_query()) {
         error!(%e, "drain_and_release: failed to drain TDS stream — connection may be broken");
+        // Surface the failure as a diagnostic so the app is not told the close
+        // succeeded when the stream did not drain cleanly.
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+        }
         if let Ok(mut ds) = dbc.inner.lock() {
             ds.client = Some(client);
             if ds.active_stmt == Some(statement_handle) {
                 ds.active_stmt = None;
             }
         }
-        return false;
+        return DrainOutcome::Failed;
     }
 
     let info_messages = client.take_info_messages();
@@ -175,7 +207,11 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
         }
     }
 
-    has_server_info
+    if has_server_info {
+        DrainOutcome::InfoPosted
+    } else {
+        DrainOutcome::Clean
+    }
 }
 
 #[cfg(test)]

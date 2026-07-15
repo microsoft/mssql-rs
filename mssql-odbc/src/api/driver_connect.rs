@@ -320,8 +320,6 @@ fn do_connect(
 
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
-    // TODO: This print is for demo purposes only. Remove before release.
-    println!("**** Connected via mssql-odbc Driver ****");
     debug!("SQLDriverConnectW: connected successfully");
 
     if has_warnings || truncated || has_server_info {

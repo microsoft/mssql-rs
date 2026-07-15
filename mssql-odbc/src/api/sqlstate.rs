@@ -254,7 +254,8 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
     {
         for e in &diagnostics.errors {
             let sqlstate = sqlstate_for_sql_error(e.number).unwrap_or(default);
-            post_sql_error(state, sqlstate, e.number as i32, e.message.clone());
+            let native = i32::try_from(e.number).unwrap_or(i32::MAX);
+            post_sql_error(state, sqlstate, native, e.message.clone());
         }
         // Errors are posted first so record 1 remains the primary failure;
         // informational/warning records follow.
