@@ -117,8 +117,8 @@ harness = false
 [dev-dependencies]
 rand = "0.9.2"
 dotenv = "0.15"
-azure_identity = "0.25.0"
-azure_core = "0.25.0"
+azure_identity = "1.0"
+azure_core = "1.1"
 # Pin `time` to 0.3.47: 0.3.48 introduces a `From<HourBase>` impl that triggers a
 # coherence conflict (E0119) when compiling `typespec_client_core` (pulled in via
 # the azure_* dev-dependencies). `time` arrives only as a transitive dev-dependency,
