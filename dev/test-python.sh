@@ -198,6 +198,20 @@ if [ "$COVERAGE" = true ]; then
     echo "Generating mssql-py-core coverage report"
     echo "==================================="
     cd "$PY_CORE_DIR"
+
+    # Run the crate's own #[cfg(test)] Rust unit tests inside this same
+    # instrumented environment (shared target dir + LLVM_PROFILE_FILE exported by
+    # `cargo llvm-cov show-env` above) so their .profraw files co-locate with the
+    # ones the Python tests produced and get rolled into the report below. Without
+    # this, lines exercised only by these unit tests (e.g. in types.rs /
+    # tracing_init.rs) show as uncovered even though they are tested. Best-effort:
+    # the gating unit-test run is a separate pipeline step, so a coverage-only
+    # failure here must not fail the Python test run.
+    echo "Running mssql-py-core Rust unit tests for coverage..."
+    if ! cargo test --frozen; then
+        echo "WARNING: mssql-py-core Rust unit tests failed during coverage collection" >&2
+    fi
+
     mkdir -p "$(dirname "$COVERAGE_OUTPUT")"
     # Report generation is best-effort: the tests already ran and passed, so a
     # coverage tooling hiccup should not fail the test run.
