@@ -231,9 +231,11 @@ read `diagnostics.errors` (and, new, `diagnostics.info_messages`).
 - **Integration (`mssql-tds/tests/test_info_messages.rs`)**: INFO before a
   result set, INFO-only batches, INFO drained after result rows via
   `close_query`, and per-command reset (a prior command's info does not bleed
-  into the next).- **Integration (`mssql-tds/tests/test_bulk_copy.rs`)**: bulk copy surfaces INFO
-   emitted during the bulk load (an `AFTER INSERT` trigger `PRINT`, fired via
-   `fire_triggers`) through `info_messages()` after the operation completes.- **ODBC e2e (`mssql-odbc/tests/e2e/tests/exec_direct_test.cpp`)**: `PRINT` +
+  into the next).
+- **Integration (`mssql-tds/tests/test_bulk_copy.rs`)**: bulk copy surfaces INFO
+  emitted during the bulk load (an `AFTER INSERT` trigger `PRINT`, fired via
+  `fire_triggers`) through `info_messages()` after the operation completes.
+- **ODBC e2e (`mssql-odbc/tests/e2e/tests/exec_direct_test.cpp`)**: `PRINT` +
   low-severity `RAISERROR` yields `SQL_SUCCESS_WITH_INFO` with two retrievable
   diagnostic records.
 - **ODBC e2e (`mssql-odbc/tests/e2e/tests/more_results_test.cpp`)**: an INFO
