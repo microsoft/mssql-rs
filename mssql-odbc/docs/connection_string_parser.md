@@ -34,6 +34,12 @@ patched into fidelity — it had to be replaced by the single-pass scanner.
 
 For each key/value pair, repeated until end of input:
 
+0. **Clean-exit guard.** *Before* skipping anything, if the cursor is already at
+   end-of-input, stop with **no warning** (msodbcsql `ParseAttrStr`'s outer-loop
+   condition `cchAttrStr && *lpsz`). This point is reached only when the previous
+   iteration left the cursor exactly at the end — a value that ran to the end, or
+   the single trailing `;` consumed in step 9. This is what makes one trailing
+   separator clean while a run of two or more warns (see step 3).
 1. **Skip leading** runs of ODBC whitespace **and** the separator `;`.
    ODBC whitespace (`ISSPACE`) is exactly `space \f \n \r \t \v` — deliberately
    narrower than Rust's `char::is_whitespace` (e.g. a non-breaking space is *not*
@@ -43,7 +49,11 @@ For each key/value pair, repeated until end of input:
    that follows it.
 3. **No `=` in the remainder** → set the warning flag and **stop parsing**
    entirely (everything parsed so far is kept). This is msodbcsql `S_FALSE` +
-   `goto RetExit`.
+   `goto RetExit`. This also fires for the *empty* key produced when step 1 skips a
+   **trailing run of 2+ separators** (or a trailing `;` followed by whitespace): the
+   run is consumed, the cursor lands on end-of-input, and the empty key has no `=`.
+   So `Server=h;UID=u;` is clean, but `Server=h;UID=u;;` and `Server=h;UID=u; `
+   warn — matching msodbcsql byte-for-byte (verified against ODBC Driver 18).
 4. **Classify the key** (case-insensitive, **no trimming**):
    - *Mapped* — a key we act on. First occurrence stores the value; duplicates are
      discarded (**first-wins**).
@@ -67,11 +77,12 @@ For each key/value pair, repeated until end of input:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> SkipLeading
-    SkipLeading --> ReadKey: non-space, non-semicolon
-    SkipLeading --> Done: end of input
+    [*] --> Loop
+    Loop --> Done: at end of input (clean exit, no warning)
+    Loop --> SkipLeading: more input
+    SkipLeading --> ReadKey: consume run of whitespace and semicolons
     ReadKey --> AfterEquals: equals sign
-    ReadKey --> StopWarn: end, no equals
+    ReadKey --> StopWarn: end, no equals (incl. empty key after a trailing separator run)
     AfterEquals --> ReadBraced: open brace
     AfterEquals --> ReadUnbraced: other char
     AfterEquals --> StopWarn: end of input
@@ -81,7 +92,7 @@ stateDiagram-v2
     AfterBrace --> Emit: next is semicolon or end
     AfterBrace --> StopWarn: next is junk
     ReadUnbraced --> Emit: semicolon or end
-    Emit --> SkipLeading: consume separator
+    Emit --> Loop: consume one separator
     StopWarn --> Done: set has_warnings
     Done --> [*]
 ```
@@ -106,11 +117,13 @@ but **every later key/value pair is still parsed and stored.**
 `goto RetExit` and abandons the rest of the string:
 
 - no `=` in the remainder (key with no separator),
+- an empty key at end-of-input left by a **trailing run of 2+ separators** (or a
+  trailing `;` followed by whitespace) — a single trailing `;` is clean,
 - no value after `=` (end-of-input right after `=`),
 - an unterminated `{` brace,
 - data after the closing `}` of a braced value.
 
-So a single unknown keyword does **not** halt parsing, whereas any of the four
+So a single unknown keyword does **not** halt parsing, whereas any of the five
 structural problems halts it immediately. In both cases whatever was parsed before
 the stopping point is kept.
 

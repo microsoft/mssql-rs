@@ -382,15 +382,26 @@ pub(crate) fn parse_connection_string(
     let mut has_warnings = false;
 
     loop {
+        // Clean end-of-input guard (msodbcsql `ParseAttrStr` outer-loop condition,
+        // sqlcconn.cpp line 4299: `for (...; cchAttrStr && *lpsz; )`). This is
+        // checked *before* skipping separators, so the loop only exits cleanly
+        // (no warning) when the previous iteration left the cursor exactly at
+        // end-of-input — i.e. a value that ran to the end, or exactly ONE trailing
+        // separator consumed by the Phase-5 step below. A run of 2+ trailing
+        // separators (or a trailing ';' followed by whitespace) is NOT consumed
+        // here; instead a fresh iteration starts, the Phase-1 skip lands on
+        // end-of-input, and the empty key read in Phase 2 raises 01S00 — matching
+        // msodbcsql exactly (e.g. "Server=h;UID=u;" is clean, "…;;" warns).
+        if i >= n {
+            break;
+        }
+
         // Phase 1 — skip any run of whitespace and ';' before the key. Only the
         // key's *position* is whitespace-tolerant, not its content. So in
         // ";;  Server=host" the leading ";;  " is skipped, but in "Server =host"
         // the trailing space stays part of the key ("server ") and won't match.
         while matches!(peek(i), Some(c) if is_odbc_space(c) || c == ';') {
             i += 1;
-        }
-        if i >= n {
-            break;
         }
 
         // Phase 2 — read the key up to '='. This reads *through* ';', so a token
@@ -403,7 +414,12 @@ pub(crate) fn parse_connection_string(
         }
         if i >= n {
             // No '=' in the remainder: stop parsing, keeping what we have (S_FALSE).
-            // Example: "Server=h;trailingjunk" stores server="h" then stops here.
+            // Two shapes reach here, both mapping to msodbcsql's line-4320 S_FALSE:
+            //   1. a real token without '=', e.g. "Server=h;trailingjunk" — stores
+            //      server="h", then stops here;
+            //   2. an *empty* key at end-of-input, reached when Phase 1 skipped a
+            //      trailing run of 2+ separators / whitespace (e.g. "Server=h;;")
+            //      — the degenerate final iteration that makes msodbcsql warn.
             warn!("invalid connection string attribute (no '=' separator)");
             has_warnings = true;
             break;
@@ -511,8 +527,12 @@ pub(crate) fn parse_connection_string(
             break;
         }
 
-        // Consume the trailing ';' separator (if present) and continue with the
-        // next pair. At end-of-input this is a no-op and the loop exits at Phase 1.
+        // Phase 5 — consume exactly ONE trailing ';' separator (msodbcsql
+        // sqlcconn.cpp lines 4463-4467) and continue with the next pair. Consuming
+        // only one is what distinguishes a clean single trailing ';' (cursor lands
+        // exactly at end-of-input -> top-of-loop guard exits with no warning) from a
+        // run of 2+ (cursor lands on the next ';', so a degenerate final iteration
+        // runs and warns). At end-of-input this is a no-op.
         if i < n {
             i += 1;
         }
@@ -1146,29 +1166,60 @@ mod tests {
 
     #[test]
     fn empty_and_separator_only_inputs() {
-        for input in ["", ";", ";;;", "   ", " ; ; "] {
+        // Only a truly empty string exits cleanly (msodbcsql outer-loop guard
+        // `cchAttrStr && *lpsz` is false immediately -> S_OK, no warning).
+        let (p, warn) = parse_connection_string("").unwrap();
+        assert!(!warn, "empty input should not warn");
+        assert_eq!(p.server, "");
+
+        // A string made only of separators / whitespace DOES warn: the skip run
+        // lands on end-of-input, leaving a degenerate empty key with no '=', which
+        // is msodbcsql's line-4320 S_FALSE (01S00). Verified against ODBC Driver 18.
+        for input in [";", ";;;", "   ", " ; ; "] {
             let (p, warn) = parse_connection_string(input).unwrap();
-            assert!(!warn, "input {input:?} should not warn");
+            assert!(
+                warn,
+                "input {input:?} should warn (empty key at end-of-input)"
+            );
             assert_eq!(p.server, "", "input {input:?}");
         }
     }
 
     #[test]
-    fn interspersed_and_trailing_separators_never_warn() {
-        // The claimed "trailing ';;' posts 01S00" divergence does NOT exist.
-        // ParseAttrStr starts every iteration by skipping a run of whitespace
-        // and ';', so leading, middle, and trailing separator runs are all
-        // consumed cleanly with no warning. Direct probing of msodbcsql ODBC
-        // Driver 18 confirms none of these emit 01S00; our parser matches.
+    fn trailing_separator_run_matches_msodbcsql() {
+        // msodbcsql consumes exactly ONE separator after a value, then re-enters the
+        // parse loop. So a single trailing ';' is clean, but a run of 2+ (or a ';'
+        // followed by whitespace) starts a fresh iteration that finds an empty key
+        // at end-of-input and posts 01S00. Leading and middle separator runs are
+        // always clean because they are followed by a real key. Every case below was
+        // confirmed by direct probing of ODBC Driver 18 (see the e2e parity test).
+
+        // Clean: value at end, single trailing ';', and leading/middle runs.
         for input in [
+            "Server=host;UID=u;PWD=p",
             "Server=host;UID=u;PWD=p;",
-            "Server=host;UID=u;PWD=p;;;",
             ";;;Server=host;UID=u;PWD=p",
             "Server=host;;;UID=u;;;PWD=p",
+        ] {
+            let (p, warn) = parse_connection_string(input).unwrap();
+            assert!(!warn, "input {input:?} should not warn");
+            assert_eq!(p.server, "host", "input {input:?}");
+            assert_eq!(p.uid, "u", "input {input:?}");
+            assert_eq!(p.pwd, "p", "input {input:?}");
+        }
+
+        // Warns: a trailing run of 2+ separators, or a trailing ';' + whitespace.
+        for input in [
+            "Server=host;UID=u;PWD=p;;",
+            "Server=host;UID=u;PWD=p;;;",
+            "Server=host;UID=u;PWD=p; ",
             ";;;Server=host;;;UID=u;;;PWD=p;;;",
         ] {
             let (p, warn) = parse_connection_string(input).unwrap();
-            assert!(!warn, "input {input:?} should not warn on separators");
+            assert!(
+                warn,
+                "input {input:?} should warn on trailing separator run"
+            );
             assert_eq!(p.server, "host", "input {input:?}");
             assert_eq!(p.uid, "u", "input {input:?}");
             assert_eq!(p.pwd, "p", "input {input:?}");

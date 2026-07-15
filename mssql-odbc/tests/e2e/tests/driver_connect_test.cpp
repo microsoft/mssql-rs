@@ -309,20 +309,25 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
         EXPECT_TRUE(r.has28000);
     }
 
-    // Extra semicolons (leading, between, trailing) around valid keys --
-    // matches msodbcsql exactly. Every parse iteration begins by skipping a run
-    // of whitespace and ';', so separator runs in ANY position, including a
-    // trailing run, are consumed cleanly with NO 01S00. (Previously flagged as
-    // a KNOWN DIVERGENCE on the claim that msodbcsql posts 01S00 for trailing
-    // ';;'; direct probing of ODBC Driver 18 shows it does not.)
+    // Extra separators around valid keys -- matches msodbcsql exactly. Leading
+    // and between-key separator runs are consumed cleanly (each parse iteration
+    // starts by skipping a run of whitespace and ';', then reads a real key).
+    // A *trailing* run of 2+ separators is different: msodbcsql consumes exactly
+    // one separator after the final value, then re-enters its parse loop, skips
+    // the rest of the run, and finds a degenerate empty key at end-of-string,
+    // which posts 01S00 (SQLSTATE record is appended AFTER the server's login
+    // info messages, so HasDiagState -- which scans every record -- is required
+    // to observe it). Direct probing of ODBC Driver 18 confirms: baseline and a
+    // single trailing ';' emit no 01S00, but a trailing ';;'/';;;' does. Our
+    // rewritten single-pass parser reproduces this exactly.
     {
         auto r = tryConnect("Driver={" + cfg.Driver() + "}"
             ";;;Server=" + cfg.Server() +
             ";;;UID=" + cfg.Uid() +
             ";;PWD=" + cfg.Pwd() +
             ";TrustServerCertificate=" + cfg.TrustCert() + ";;;");
-        EXPECT_TRUE(SQL_SUCCEEDED(r.rc));
-        EXPECT_FALSE(r.has01S00);
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, r.rc);
+        EXPECT_TRUE(r.has01S00);
     }
 
     // Unknown keys are ignored with a 01S00 warning; the connection succeeds.
