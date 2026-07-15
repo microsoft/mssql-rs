@@ -216,11 +216,8 @@ mod bulk_copy_integration_tests {
 
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
-        // The destination must be a real, uniquely-named table (created and cleaned
-        // up here) because SQL Server rejects `CREATE TRIGGER` on a temporary table
-        // with error 167 ("Cannot create trigger on a temporary object"), and this
-        // test needs a fired trigger's PRINT to emit an INFO token during the bulk
-        // load. Same constraint as `test_bulk_copy_with_fire_triggers`.
+        // Unique permanent-table names: SQL Server does not allow triggers on
+        // temporary tables, so we create (and clean up) real tables.
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
