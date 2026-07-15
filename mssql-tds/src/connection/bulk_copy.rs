@@ -1045,6 +1045,11 @@ impl<'a> BulkCopy<'a> {
                     *total_rows += batch_count;
                 }
                 Err(e) => {
+                    // Capture this failing batch's INFO before rollback (which resets
+                    // the client's buffer via begin_command) can clear it, so it is
+                    // retained alongside the already-accumulated prior batches' INFO.
+                    accumulated_info.extend(self.client.take_info_messages());
+
                     // ═══════════════════════════════════════════════════════════
                     // ROLLBACK TRANSACTION: Rollback on batch failure
                     // This mirrors .NET SqlBulkCopy.AbortTransaction() behavior
@@ -1054,6 +1059,18 @@ impl<'a> BulkCopy<'a> {
                         // Attempt rollback, but don't mask the original error
                         let _ = self.client.rollback_transaction(None, None).await;
                     }
+
+                    // Restore the INFO accumulated up to the failure so a mid-stream
+                    // failure still leaves the completed batches' diagnostics (plus this
+                    // batch's INFO emitted before the error) retrievable via
+                    // `client.info_messages()`. The returned error carries the failure
+                    // itself; INFO is a separate, complementary channel (INFO tokens vs
+                    // ERROR tokens) and this mirrors .NET's InfoMessage events having
+                    // already fired for the batches that completed. Drop any residual
+                    // INFO left by the rollback first.
+                    let _ = self.client.take_info_messages();
+                    self.client
+                        .extend_info_messages(std::mem::take(&mut accumulated_info));
 
                     return Err(e);
                 }

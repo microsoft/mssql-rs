@@ -43,7 +43,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   informational-message buffer at entry and accumulates INFO across all
   bulk-load batches, so messages emitted during the load (e.g. from triggers
   fired via `fire_triggers`) remain retrievable via `info_messages()` after the
-  operation completes.
+  operation completes. On a mid-stream failure the completed batches' INFO is
+  preserved and remains retrievable alongside the returned error.
 
 ### Removed
 

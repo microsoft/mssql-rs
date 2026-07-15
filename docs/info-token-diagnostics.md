@@ -174,7 +174,11 @@ read `diagnostics.errors` (and, new, `diagnostics.info_messages`).
    the internal `commit_transaction` would otherwise reset the buffer. So the
    composite drains each batch's INFO before the commit and restores the full
    set once the loop finishes, making all bulk-load INFO retrievable via
-   `info_messages()` after the operation returns.
+   `info_messages()` after the operation returns. On a **mid-stream failure**
+   the completed batches' INFO (plus the failing batch's INFO emitted before the
+   error) is likewise restored before the error is returned — the error is the
+   primary signal, but INFO remains a separate, complementary channel and stays
+   retrievable via `info_messages()`.
 
 ## Consumer changes (`mssql-odbc`)
 
