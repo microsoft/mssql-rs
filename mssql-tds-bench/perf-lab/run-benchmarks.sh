@@ -24,6 +24,29 @@ RESULTS_DIR="$REPO_ROOT/results"
 BASELINE_FILE="$REPO_ROOT/mssql-tds-bench/perf-lab/baseline-commit.txt"
 mkdir -p "$RESULTS_DIR"
 
+# CPU telemetry: bracketed average-frequency/temperature samples written around
+# each measured pass so we can validate whether CPU frequency or thermals differ
+# between the candidate and baseline passes (the Linux control for the Windows
+# noise investigation). Temperature is best-effort (often unavailable in a VM).
+TELEMETRY_CSV="$RESULTS_DIR/cpu-telemetry.csv"
+echo "timestamp,label,avg_cur_freq_mhz,temp_c" > "$TELEMETRY_CSV"
+cpu_sample() {
+    local label="$1" sum=0 n=0 f v freq_mhz="" temp_c="" t tv
+    for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
+        [ -r "$f" ] || continue
+        v=$(cat "$f" 2>/dev/null) || continue
+        sum=$(( sum + v )); n=$(( n + 1 ))
+    done
+    if [ "$n" -gt 0 ]; then freq_mhz=$(( sum / n / 1000 )); fi
+    for t in /sys/class/thermal/thermal_zone*/temp; do
+        [ -r "$t" ] || continue
+        tv=$(cat "$t" 2>/dev/null) || continue
+        temp_c=$(( tv / 1000 )); break
+    done
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),${label},${freq_mhz},${temp_c}" >> "$TELEMETRY_CSV"
+    echo ">>> cpu[${label}] avgFreq=${freq_mhz}MHz temp=${temp_c}C"
+}
+
 # --- Connection (SQL_SERVER / SQL_PASSWORD injected by run-remote.sh) ---
 export DB_HOST="${SQL_SERVER:?SQL_SERVER not set}"
 export DB_PORT="${DB_PORT:-1433}"
@@ -31,6 +54,22 @@ export DB_USERNAME="${DB_USERNAME:-sa}"
 export TRUST_SERVER_CERTIFICATE="${TRUST_SERVER_CERTIFICATE:-true}"
 # SQL_PASSWORD is already exported into this session by run-remote.sh.
 : "${SQL_PASSWORD:?SQL_PASSWORD not set}"
+
+# --- SQL Server configuration snapshot (validate the instance is tuned) ---
+# Dump effective memory / MAXDOP / cost-threshold / affinity, tempdb placement,
+# durability/recovery, and trace flags so we can confirm the perf tuning took.
+# Best-effort - never fail the run over it (sqlcmd may be absent on the client).
+SQL_CONFIG_SQL="$REPO_ROOT/mssql-tds-bench/perf-lab/sql-config-dump.sql"
+sqlcmd_bin="$(command -v sqlcmd || true)"
+if [ -z "$sqlcmd_bin" ] && [ -x /opt/mssql-tools18/bin/sqlcmd ]; then sqlcmd_bin=/opt/mssql-tools18/bin/sqlcmd; fi
+if [ -z "$sqlcmd_bin" ] && [ -x /opt/mssql-tools/bin/sqlcmd ]; then sqlcmd_bin=/opt/mssql-tools/bin/sqlcmd; fi
+if [ -n "$sqlcmd_bin" ] && [ -f "$SQL_CONFIG_SQL" ]; then
+    echo ">>> Capturing SQL Server configuration snapshot..."
+    "$sqlcmd_bin" -S "$SQL_SERVER" -U "$DB_USERNAME" -P "$SQL_PASSWORD" -C -b -y 0 -Y 30 -i "$SQL_CONFIG_SQL" \
+        | tee "$RESULTS_DIR/sql-config.txt" || echo ">>> SQL config snapshot skipped (query failed)."
+else
+    echo ">>> Skipping SQL config snapshot (sqlcmd or query file not found)."
+fi
 
 # --- System prerequisites (Ubuntu) ---
 # The perf VM may be a minimal image without git or a C toolchain. Install what
@@ -151,7 +190,9 @@ BENCH_WARMUP_SECS=1 BENCH_SECS=1 BENCH_SAMPLES=10 \
 
 # --- Candidate run (mssql-tds = working tree) ---
 echo ">>> Candidate benchmarks..."
+cpu_sample "candidate-start" || true
 "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline candidate
+cpu_sample "candidate-end" || true
 
 # --- Baseline run (mssql-tds source swapped to the baseline commit) ---
 # Materialize the baseline mssql-tds via a local worktree, then replace the
@@ -169,7 +210,9 @@ mv "$REPO_ROOT/mssql-tds" "$REPO_ROOT/.mssql-tds-candidate"
 cp -r "$BASELINE_TREE/mssql-tds" "$REPO_ROOT/mssql-tds"
 
 echo ">>> Baseline benchmarks..."
+cpu_sample "base-start" || true
 "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline base
+cpu_sample "base-end" || true
 
 # Restore the candidate source and remove the worktree.
 rm -rf "$REPO_ROOT/mssql-tds"

@@ -58,6 +58,43 @@ function ConvertTo-AffinityMask {
     return $mask
 }
 
+# Sample effective CPU frequency and busy% once (best-effort). Used to bracket
+# each measured pass so we can see whether the second (baseline) pass runs at a
+# different frequency or utilization than the first (candidate) — i.e. whether
+# the hardware is actually the variable, or something else is (e.g. the client
+# contending with SQL Server for cores). Effective MHz = base MHz * %perf/100
+# (%perf can exceed 100 under turbo). Temperature is usually unavailable inside
+# an Azure guest; it is captured only if the ACPI thermal zone is exposed.
+function Get-CpuSample {
+    $perf = $null; $freq = $null; $busy = $null; $temp = $null
+    try {
+        $s = (Get-Counter -Counter @(
+            '\Processor Information(_Total)\% Processor Performance',
+            '\Processor Information(_Total)\Processor Frequency',
+            '\Processor Information(_Total)\% Processor Time') -ErrorAction Stop).CounterSamples
+        $perf = [math]::Round($s[0].CookedValue, 1)
+        $freq = [math]::Round($s[1].CookedValue, 0)
+        $busy = [math]::Round($s[2].CookedValue, 1)
+    } catch { }
+    try {
+        $tz = Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop | Select-Object -First 1
+        if ($tz) { $temp = [math]::Round(($tz.CurrentTemperature / 10.0) - 273.15, 1) }
+    } catch { }
+    $eff = if (($null -ne $perf) -and ($null -ne $freq)) { [math]::Round($freq * $perf / 100.0, 0) } else { $null }
+    [pscustomobject]@{ PctPerf = $perf; BaseMHz = $freq; EffMHz = $eff; Busy = $busy; TempC = $temp }
+}
+
+# Append a labeled CPU sample to the telemetry CSV and echo it to the log.
+function Write-CpuSample {
+    param([string]$Label)
+    $s = Get-CpuSample
+    if ($script:TelemetryCsv) {
+        ('{0:o},{1},{2},{3},{4},{5},{6}' -f (Get-Date), $Label, $s.PctPerf, $s.BaseMHz, $s.EffMHz, $s.Busy, $s.TempC) |
+            Add-Content -Path $script:TelemetryCsv -Encoding utf8
+    }
+    Write-Host (">>> cpu[{0}] effFreq={1}MHz base={2}MHz %perf={3} busy={4}% temp={5}" -f $Label, $s.EffMHz, $s.BaseMHz, $s.PctPerf, $s.Busy, $s.TempC)
+}
+
 # Run a measured `cargo bench` invocation, optionally pinned to a CPU set (the
 # Windows analog of `taskset` in run-benchmarks.sh). When no CPU set is requested
 # the plain call is used so behavior is unchanged. cargo's child bench process
@@ -66,21 +103,26 @@ function ConvertTo-AffinityMask {
 # bench binary launches.
 function Invoke-Bench {
     param([Parameter(Mandatory)][string]$SaveBaseline)
-    if ($null -eq $script:BenchAffinity) {
-        Invoke-Native { cargo bench -p mssql-tds-bench -- --save-baseline $SaveBaseline }
-        return
-    }
-    $proc = Start-Process -FilePath 'cargo' `
-        -ArgumentList @('bench', '-p', 'mssql-tds-bench', '--', '--save-baseline', $SaveBaseline) `
-        -NoNewWindow -PassThru
+    Write-CpuSample "$SaveBaseline-start"
     try {
-        $proc.ProcessorAffinity = [IntPtr]$script:BenchAffinity
-    } catch {
-        Write-Host ">>> WARNING: could not set ProcessorAffinity: $($_.Exception.Message)"
-    }
-    $proc.WaitForExit()
-    if ($proc.ExitCode -ne 0) {
-        throw "cargo bench (--save-baseline $SaveBaseline) failed (exit $($proc.ExitCode))"
+        if ($null -eq $script:BenchAffinity) {
+            Invoke-Native { cargo bench -p mssql-tds-bench -- --save-baseline $SaveBaseline }
+            return
+        }
+        $proc = Start-Process -FilePath 'cargo' `
+            -ArgumentList @('bench', '-p', 'mssql-tds-bench', '--', '--save-baseline', $SaveBaseline) `
+            -NoNewWindow -PassThru
+        try {
+            $proc.ProcessorAffinity = [IntPtr]$script:BenchAffinity
+        } catch {
+            Write-Host ">>> WARNING: could not set ProcessorAffinity: $($_.Exception.Message)"
+        }
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) {
+            throw "cargo bench (--save-baseline $SaveBaseline) failed (exit $($proc.ExitCode))"
+        }
+    } finally {
+        Write-CpuSample "$SaveBaseline-end"
     }
 }
 
@@ -91,6 +133,13 @@ $ResultsDir = Join-Path $RepoRoot 'results'
 $BaselineFile = Join-Path $RepoRoot 'mssql-tds-bench/perf-lab/baseline-commit.txt'
 New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
 
+# CPU telemetry file: bracketed effective-frequency/busy/temp samples written
+# around each measured pass (see Write-CpuSample) so we can validate whether CPU
+# frequency or contention differs between the candidate and baseline passes.
+$script:TelemetryCsv = Join-Path $ResultsDir 'cpu-telemetry.csv'
+'timestamp,label,pct_processor_performance,base_freq_mhz,eff_freq_mhz,cpu_busy_pct,temp_c' |
+    Set-Content -Path $script:TelemetryCsv -Encoding utf8
+
 # --- Connection (SQL_SERVER / SQL_PASSWORD injected by run-remote) ---
 if (-not $env:SQL_SERVER)   { throw 'SQL_SERVER not set' }
 if (-not $env:SQL_PASSWORD) { throw 'SQL_PASSWORD not set' }
@@ -98,6 +147,31 @@ $env:DB_HOST = $env:SQL_SERVER
 if (-not $env:DB_PORT)                 { $env:DB_PORT = '1433' }
 if (-not $env:DB_USERNAME)             { $env:DB_USERNAME = 'sa' }
 if (-not $env:TRUST_SERVER_CERTIFICATE){ $env:TRUST_SERVER_CERTIFICATE = 'true' }
+
+# --- SQL Server configuration snapshot (validate the instance is tuned) ---
+# Dump the effective memory / MAXDOP / cost-threshold / affinity, tempdb file
+# placement, durability/recovery, and trace flags so we can confirm the perf
+# tuning took and has not drifted. Best-effort — never fail the run over it.
+$SqlConfigSql = Join-Path $RepoRoot 'mssql-tds-bench/perf-lab/sql-config-dump.sql'
+try {
+    $sqlcmdExe = (Get-Command sqlcmd -ErrorAction SilentlyContinue).Source
+    if (-not $sqlcmdExe) {
+        $probe = 'C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\Tools\Binn\SQLCMD.EXE'
+        if (Test-Path $probe) { $sqlcmdExe = $probe }
+    }
+    if ($sqlcmdExe -and (Test-Path $SqlConfigSql)) {
+        Write-Host '>>> Capturing SQL Server configuration snapshot...'
+        & {
+            $ErrorActionPreference = 'Continue'
+            & $sqlcmdExe -S $env:SQL_SERVER -U $env:DB_USERNAME -P $env:SQL_PASSWORD -C -b -y 0 -Y 30 -i $SqlConfigSql |
+                Tee-Object -FilePath (Join-Path $ResultsDir 'sql-config.txt')
+        }
+    } else {
+        Write-Host '>>> Skipping SQL config snapshot (sqlcmd or query file not found).'
+    }
+} catch {
+    Write-Host ">>> SQL config snapshot skipped: $($_.Exception.Message)"
+}
 
 # --- Toolchain ---
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
