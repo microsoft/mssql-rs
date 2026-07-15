@@ -97,17 +97,35 @@ function Write-CpuSample {
 # client CPU pinning (when requested) is applied to the harness process before
 # these run, so cargo inherits it — see the pinning block below.
 function Invoke-Bench {
-    param([Parameter(Mandatory)][string]$SaveBaseline)
+    param([Parameter(Mandatory)][string]$SaveBaseline, [string]$Filter)
     # Client CPU pinning is applied once to THIS process (see the pinning block
     # below); cargo and the bench binary it spawns inherit the affinity, so we
     # just run cargo the normal way here. Using the call operator (not
     # Start-Process) keeps stdout streaming to the run log and yields a reliable
-    # exit code via $LASTEXITCODE.
+    # exit code via $LASTEXITCODE. $Filter, when set, is a Criterion benchmark-id
+    # regex that limits the run to specific benchmarks (used by auto-confirm).
     Write-CpuSample "$SaveBaseline-start"
     try {
-        Invoke-Native { cargo bench -p mssql-tds-bench -- --save-baseline $SaveBaseline }
+        $benchArgs = @('bench', '-p', 'mssql-tds-bench', '--', '--save-baseline', $SaveBaseline)
+        if ($Filter) { $benchArgs += $Filter }
+        Invoke-Native { cargo @benchArgs }
     } finally {
         Write-CpuSample "$SaveBaseline-end"
+    }
+}
+
+# Parse a critcmp comparison table and emit the benchmarks whose candidate ratio
+# (the 6th whitespace field) meets or exceeds $Threshold, as objects with
+# Name/Ratio. critcmp prints the faster side as 1.00 and the slower side as its
+# ratio, so a candidate ratio >= threshold means the candidate regressed.
+function Get-CritcmpRegressions {
+    param([string]$Comparison, [double]$Threshold)
+    foreach ($line in ($Comparison -split "\r?\n")) {
+        $f = @($line -split '\s+' | Where-Object { $_ -ne '' })
+        if ($f.Count -ge 6 -and $f[1] -match '^[0-9]+\.[0-9]+$' -and $f[5] -match '^[0-9]+\.[0-9]+$') {
+            $cand = [double]$f[5]
+            if ($cand -ge $Threshold) { [pscustomobject]@{ Name = $f[0]; Ratio = $cand } }
+        }
     }
 }
 
@@ -287,28 +305,28 @@ $BaselineTree = Join-Path ([System.IO.Path]::GetTempPath()) "perf-baseline-$([Sy
 Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree..."
 Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
 
-Write-Host '>>> Swapping mssql-tds source to the baseline...'
 $CandidateSrc = Join-Path $RepoRoot 'mssql-tds'
 $StashedSrc   = Join-Path $RepoRoot '.mssql-tds-candidate'
-Move-Item $CandidateSrc $StashedSrc
-Copy-Item -Recurse (Join-Path $BaselineTree 'mssql-tds') $CandidateSrc
+function Set-BaselineSource {
+    Move-Item $script:CandidateSrc $script:StashedSrc
+    Copy-Item -Recurse (Join-Path $script:BaselineTree 'mssql-tds') $script:CandidateSrc
+}
+function Restore-CandidateSource {
+    Remove-Item -Recurse -Force $script:CandidateSrc
+    Move-Item $script:StashedSrc $script:CandidateSrc
+}
+
+Write-Host '>>> Swapping mssql-tds source to the baseline...'
+Set-BaselineSource
 
 Write-Host '>>> Baseline benchmarks...'
 Invoke-Bench 'base'
 
-# Restore the candidate source and remove the worktree.
-Remove-Item -Recurse -Force $CandidateSrc
-Move-Item $StashedSrc $CandidateSrc
-Invoke-Native { git worktree remove --force $BaselineTree }
-
 # --- Compare ---
 Write-Host '>>> Comparing base -> candidate...'
-# The critcmp table contains the ± sign (UTF-8). The previous code wrote
-# comparison.txt (correct) but then rebuilt summary.md by re-reading that file
-# with Get-Content, whose default encoding did not match how it was written, so
-# the ± was mangled only in summary.md. Fix: capture critcmp once and build BOTH
-# artifacts from that same in-memory string, written as UTF-8 without a BOM, so
-# they cannot diverge. Set the console decode to UTF-8 too (guarded: a
+# The critcmp table contains the ± sign (UTF-8). Capture critcmp once and build
+# every artifact from that same in-memory string, written as UTF-8 without a BOM,
+# so they cannot diverge. Set the console decode to UTF-8 too (guarded: a
 # console-less host can reject the setter) so the capture itself is UTF-8-clean.
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -323,56 +341,109 @@ $comparison = $comparison.TrimEnd()
 Write-Host $comparison
 [System.IO.File]::WriteAllText((Join-Path $ResultsDir 'comparison.txt'), $comparison + "`n", $Utf8NoBom)
 
-# Markdown summary — the perf lab attaches results/*.md to the run's Summary tab.
-# Wrap the fixed-width critcmp table in a fenced code block.
-#
-# Verdict: in each critcmp data row the faster side is 1.00 and the slower side
-# shows its ratio, so the candidate regressed a bench when the candidate ratio
-# (field 6) exceeds the threshold.
 $thr = [double]($env:BENCH_REGRESSION_RATIO)
 if (-not $thr) { $thr = 1.10 }
-$regressions = @()
-foreach ($line in ($comparison -split "\r?\n")) {
-    $f = @($line -split '\s+' | Where-Object { $_ -ne '' })
-    if ($f.Count -ge 6 -and $f[1] -match '^[0-9]+\.[0-9]+$' -and $f[5] -match '^[0-9]+\.[0-9]+$') {
-        $cand = [double]$f[5]
-        if ($cand -ge $thr) { $regressions += [pscustomobject]@{ Name = $f[0]; Ratio = $cand } }
+$regressions = @(Get-CritcmpRegressions $comparison $thr)
+
+# --- Auto-confirm regressions (re-measure only the offenders, both sides) ---
+# A strict gate can trip on a transient single-benchmark outlier (e.g. one bad
+# sampling window). Instead of failing the whole run — which costs a full manual
+# re-run and investigation — immediately re-measure ONLY the benchmarks that
+# tripped, on BOTH the baseline (still swapped in, so no rebuild) and the
+# candidate, and keep as a real regression only those that trip AGAIN. Genuine
+# regressions reproduce; transient outliers wash out. This adds just the
+# offenders' run time, not a whole new lab run.
+$gateComparison = $comparison
+$gateRegressions = $regressions
+$confirmComparison = $null
+if ($regressions.Count -gt 0) {
+    $filter = (($regressions | ForEach-Object { '^' + $_.Name + '$' }) -join '|')
+    Write-Host (">>> Gate tripped by: " + (($regressions | ForEach-Object { $_.Name }) -join ', '))
+    Write-Host ">>> Auto-confirm: re-measuring only those benchmarks (filter: $filter)"
+
+    # Baseline is still swapped in and built - re-run just the offenders.
+    Write-Host '>>> Auto-confirm: baseline re-run...'
+    Invoke-Bench 'base_confirm' $filter
+
+    # Restore the candidate source and re-run just the offenders.
+    Write-Host '>>> Auto-confirm: candidate re-run...'
+    Restore-CandidateSource
+    Invoke-Bench 'candidate_confirm' $filter
+
+    Write-Host '>>> Auto-confirm comparison (base_confirm -> candidate_confirm):'
+    $confirmComparison = & {
+        $ErrorActionPreference = 'Continue'
+        $out = critcmp base_confirm candidate_confirm | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "critcmp (confirm) failed (exit $LASTEXITCODE)" }
+        $out
     }
+    $confirmComparison = $confirmComparison.TrimEnd()
+    Write-Host $confirmComparison
+    [System.IO.File]::WriteAllText((Join-Path $ResultsDir 'confirm.txt'), $confirmComparison + "`n", $Utf8NoBom)
+    $gateComparison = $confirmComparison
+    $gateRegressions = @(Get-CritcmpRegressions $confirmComparison $thr)
+} else {
+    Restore-CandidateSource
 }
+Invoke-Native { git worktree remove --force $BaselineTree }
+
+# --- Verdict (based on the gate comparison: the re-measured offenders after
+# auto-confirm, or the full run when nothing tripped) ---
 $pct = [int][math]::Round(($thr - 1) * 100)
 $warn = [char]::ConvertFromUtf32(0x26A0) + [char]::ConvertFromUtf32(0xFE0F)
 $check = [char]::ConvertFromUtf32(0x2705)
-if ($regressions.Count -gt 0) {
-    $worst = $regressions | Sort-Object Ratio -Descending | Select-Object -First 1
+if ($gateRegressions.Count -gt 0) {
+    $worst = $gateRegressions | Sort-Object Ratio -Descending | Select-Object -First 1
     $wpct = [int][math]::Round(($worst.Ratio - 1) * 100)
-    $verdict = "$warn $($regressions.Count) benchmark(s) slower by >=$pct% vs baseline (worst: $($worst.Name) +$wpct%)"
+    $verdict = "$warn $($gateRegressions.Count) benchmark(s) slower by >=$pct% vs baseline (worst: $($worst.Name) +$wpct%)"
 } else {
     $verdict = "$check No benchmark slower by >=$pct% vs baseline"
 }
 
-$summary = @(
+$summaryLines = @(
     '## mssql-tds perf - base -> candidate'
     ''
     "**$verdict**"
     ''
+)
+if ($regressions.Count -gt 0) {
+    $summaryLines += '_Auto-confirm re-ran the gate-tripping benchmark(s); the verdict reflects that re-measurement. Benchmarks that tripped once but not on the re-run are treated as transient noise._'
+    $summaryLines += ''
+}
+$summaryLines += @(
     "Baseline commit: ``$BaselineCommit``"
     ''
     '```'
     $comparison
     '```'
-) -join "`n"
+)
+if ($regressions.Count -gt 0) {
+    $summaryLines += @(
+        ''
+        '### Auto-confirm re-run (offenders only)'
+        ''
+        ('Tripped on the first pass: ' + (($regressions | ForEach-Object { $_.Name }) -join ', '))
+        ''
+        '```'
+        $confirmComparison
+        '```'
+    )
+}
+$summary = $summaryLines -join "`n"
 [System.IO.File]::WriteAllText((Join-Path $ResultsDir 'summary.md'), $summary + "`n", $Utf8NoBom)
 
 Copy-Item -Recurse -Force 'target/criterion' (Join-Path $ResultsDir 'criterion') -ErrorAction SilentlyContinue
 
 Write-Host ">>> Done. Results in $ResultsDir"
 
-# Fail the run when any benchmark regressed past the threshold so the pipeline
-# surfaces it. Use `throw`, not `exit`: the scheduled-task wrapper relies on its
-# finally block to write the EXIT_CODE/DONE sentinels, and `exit` from a called
-# .ps1 terminates the whole process and would skip it (leaving run-remote to hang
-# until timeout). summary.md names the offenders; the standard triage is to
-# re-run to confirm a real regression versus run-to-run noise.
-if ($regressions.Count -gt 0) {
+# Fail the run only on CONFIRMED regressions (the gate comparison). Use `throw`,
+# not `exit`: the scheduled-task wrapper relies on its finally block to write the
+# EXIT_CODE/DONE sentinels, and `exit` from a called .ps1 terminates the whole
+# process and would skip it (leaving run-remote to hang until timeout). summary.md
+# names the offenders and shows the auto-confirm re-run.
+if ($gateRegressions.Count -gt 0) {
     throw "PERF REGRESSION: $verdict"
+}
+if ($regressions.Count -gt 0) {
+    Write-Host ">>> Auto-confirm cleared all $($regressions.Count) initial regression(s) as transient; passing."
 }

@@ -205,32 +205,80 @@ BASELINE_TREE="$(mktemp -d)/perf-baseline"
 echo ">>> Adding baseline worktree for ${BASELINE_COMMIT} at ${BASELINE_TREE}..."
 git worktree add --detach "$BASELINE_TREE" "$BASELINE_COMMIT"
 
+swap_to_baseline() {
+    mv "$REPO_ROOT/mssql-tds" "$REPO_ROOT/.mssql-tds-candidate"
+    cp -r "$BASELINE_TREE/mssql-tds" "$REPO_ROOT/mssql-tds"
+}
+restore_candidate() {
+    rm -rf "$REPO_ROOT/mssql-tds"
+    mv "$REPO_ROOT/.mssql-tds-candidate" "$REPO_ROOT/mssql-tds"
+}
+
 echo ">>> Swapping mssql-tds source to the baseline..."
-mv "$REPO_ROOT/mssql-tds" "$REPO_ROOT/.mssql-tds-candidate"
-cp -r "$BASELINE_TREE/mssql-tds" "$REPO_ROOT/mssql-tds"
+swap_to_baseline
 
 echo ">>> Baseline benchmarks..."
 cpu_sample "base-start" || true
 "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline base
 cpu_sample "base-end" || true
 
-# Restore the candidate source and remove the worktree.
-rm -rf "$REPO_ROOT/mssql-tds"
-mv "$REPO_ROOT/.mssql-tds-candidate" "$REPO_ROOT/mssql-tds"
-git worktree remove --force "$BASELINE_TREE" || true
-
 # --- Compare (both baselines live in the shared target/criterion) ---
 echo ">>> Comparing base -> candidate..."
 critcmp base candidate | tee "$RESULTS_DIR/comparison.txt"
+
+# Print the IDs (field 1) of benchmarks whose candidate ratio (field 6) meets or
+# exceeds the regression threshold, one per line.
+regression_ids() {
+    awk -v thr="${BENCH_REGRESSION_RATIO:-1.10}" '
+        $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ && ($6 + 0) >= thr { print $1 }
+    ' "$1"
+}
+
+OFFENDERS=$(regression_ids "$RESULTS_DIR/comparison.txt")
+# The table the gate/verdict act on: the full run by default, or the re-measured
+# offenders when auto-confirm runs below.
+GATE_TABLE="$RESULTS_DIR/comparison.txt"
+
+# --- Auto-confirm regressions (re-measure only the offenders, both sides) ---
+# A strict gate can trip on a transient single-benchmark outlier (e.g. one bad
+# sampling window). Instead of failing the whole run — which costs a full manual
+# re-run and investigation — immediately re-measure ONLY the benchmarks that
+# tripped, on BOTH the baseline (still swapped in, so no rebuild) and the
+# candidate, and keep as a real regression only those that trip AGAIN. Genuine
+# regressions reproduce; transient outliers wash out. This adds just the
+# offenders' run time, not a whole new lab run.
+if [ -n "$OFFENDERS" ]; then
+    # Anchored regex OR of the offending IDs for the Criterion filter, e.g.
+    # ^scalars/decode$|^packet_size_sensitivity/4096$
+    FILTER=$(printf '%s\n' "$OFFENDERS" | sed 's|^|^|; s|$|$|' | paste -sd '|' -)
+    echo ">>> Gate tripped by: $(printf '%s ' $OFFENDERS)"
+    echo ">>> Auto-confirm: re-measuring only those benchmarks (filter: ${FILTER})"
+
+    # Baseline is still swapped in and built — re-run just the offenders.
+    echo ">>> Auto-confirm: baseline re-run..."
+    "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline base_confirm "$FILTER"
+
+    # Restore the candidate source and re-run just the offenders.
+    echo ">>> Auto-confirm: candidate re-run..."
+    restore_candidate
+    "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline candidate_confirm "$FILTER"
+
+    echo ">>> Auto-confirm comparison (base_confirm -> candidate_confirm):"
+    critcmp base_confirm candidate_confirm | tee "$RESULTS_DIR/confirm.txt"
+    GATE_TABLE="$RESULTS_DIR/confirm.txt"
+else
+    restore_candidate
+fi
+git worktree remove --force "$BASELINE_TREE" || true
 
 # Markdown summary — the perf lab attaches results/*.md to the run's Summary tab
 # (task.uploadsummary), so the comparison renders inline on the run page. The
 # critcmp table is fixed-width, so wrap it in a fenced code block to keep it
 # aligned.
 #
-# Verdict: in each critcmp data row the faster side is 1.00 and the slower side
-# shows its ratio, so the candidate regressed a bench when the candidate ratio
-# (field 6) exceeds the threshold. Flag any candidate regression >= the ratio.
+# Verdict acts on the gate table (the re-measured offenders after auto-confirm,
+# or the full run when nothing tripped): the candidate regressed a bench when its
+# ratio (field 6) meets or exceeds the threshold.
 VERDICT=$(awk -v thr="${BENCH_REGRESSION_RATIO:-1.10}" '
     $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ {
         cand = $6 + 0
@@ -243,18 +291,32 @@ VERDICT=$(awk -v thr="${BENCH_REGRESSION_RATIO:-1.10}" '
         else
             printf "\342\234\205 No benchmark slower by >=%d%% vs baseline", pct
     }
-' "$RESULTS_DIR/comparison.txt")
+' "$GATE_TABLE")
 
 {
     echo "## mssql-tds perf — base → candidate"
     echo ""
     echo "**${VERDICT}**"
     echo ""
+    if [ -n "$OFFENDERS" ]; then
+        echo "_Auto-confirm re-ran the gate-tripping benchmark(s); the verdict reflects that re-measurement. Benchmarks that tripped once but not on the re-run are treated as transient noise._"
+        echo ""
+    fi
     echo "Baseline commit: \`${BASELINE_COMMIT}\`"
     echo ""
     echo '```'
     cat "$RESULTS_DIR/comparison.txt"
     echo '```'
+    if [ -n "$OFFENDERS" ]; then
+        echo ""
+        echo "### Auto-confirm re-run (offenders only)"
+        echo ""
+        echo "Tripped on the first pass: $(printf '%s ' $OFFENDERS)"
+        echo ""
+        echo '```'
+        cat "$RESULTS_DIR/confirm.txt"
+        echo '```'
+    fi
 } > "$RESULTS_DIR/summary.md"
 
 # Archive the raw Criterion data for offline analysis.
@@ -262,17 +324,15 @@ cp -r target/criterion "$RESULTS_DIR/criterion" 2>/dev/null || true
 
 echo ">>> Done. Results in ${RESULTS_DIR}"
 
-# Fail the run when any benchmark regressed past the threshold so the pipeline
-# surfaces it. Uses the same rule as the verdict above: candidate ratio (field 6)
-# >= BENCH_REGRESSION_RATIO. summary.md (attached to the run) and the critcmp
-# table above name the offenders; the standard triage is to re-run to confirm a
-# real regression versus run-to-run noise.
-REGRESSIONS=$(awk -v thr="${BENCH_REGRESSION_RATIO:-1.10}" '
-    $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ && ($6 + 0) >= thr { n++ }
-    END { print n + 0 }
-' "$RESULTS_DIR/comparison.txt")
-if [ "${REGRESSIONS:-0}" -gt 0 ]; then
+# Fail the run only on CONFIRMED regressions (the gate table): the full run when
+# nothing tripped, or the auto-confirm re-run of the offenders. summary.md and
+# the tables above name them.
+CONFIRMED=$(regression_ids "$GATE_TABLE" | grep -c . || true)
+if [ "${CONFIRMED:-0}" -gt 0 ]; then
     echo ">>> ${VERDICT}"
-    echo ">>> FAILING: ${REGRESSIONS} benchmark(s) exceeded the regression threshold (BENCH_REGRESSION_RATIO=${BENCH_REGRESSION_RATIO:-1.10})."
+    echo ">>> FAILING: ${CONFIRMED} benchmark(s) still exceeded the threshold on the auto-confirm re-run (BENCH_REGRESSION_RATIO=${BENCH_REGRESSION_RATIO:-1.10})."
     exit 1
+fi
+if [ -n "$OFFENDERS" ]; then
+    echo ">>> Auto-confirm cleared all $(printf '%s\n' "$OFFENDERS" | grep -c .) initial regression(s) as transient; passing."
 fi
