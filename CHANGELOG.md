@@ -22,7 +22,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   diagnostic records (`SQLGetDiagRec` / `SQLGetDiagField`), and successful calls
   that observed them return `SQL_SUCCESS_WITH_INFO`
   (`SQLDriverConnect`, `SQLExecDirect`, `SQLFetch`, `SQLMoreResults`,
-  `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`).
+  `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`). INFO captured at end-of-rowset is
+  deferred to the next result-set boundary (`SQLMoreResults` advance or cursor
+  close) so it surfaces with a `SQL_SUCCESS_WITH_INFO` hint instead of being
+  posted under `SQL_NO_DATA`, which many applications never inspect.
 
 - Initial public release of the mssql-rs workspace.
 

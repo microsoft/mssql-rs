@@ -191,6 +191,20 @@ read `diagnostics.errors` (and, new, `diagnostics.info_messages`).
   otherwise successful call:
   `SQLDriverConnectW`, `SQLExecDirectW`, `SQLFetch`, `SQLMoreResults`,
   `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`.
+- **End-of-rowset INFO is deferred, not posted under `SQL_NO_DATA`.** `SQLFetch`
+  returning `SQL_NO_DATA` (and `SQLMoreResults` returning `SQL_NO_DATA` for an
+  exhausted batch) cannot be upgraded to `SQL_SUCCESS_WITH_INFO` per the ODBC
+  cursor contract, so those return codes carry no "read diagnostics" hint that
+  many applications rely on. Rather than post end-of-rowset INFO under
+  `SQL_NO_DATA` (where it may never be read) and consume it so nothing else can
+  re-surface it, `SQLFetch`'s end-of-rowset path leaves the captured INFO on the
+  client buffer. It is then surfaced *with* a hint by the next boundary call:
+  `SQLMoreResults` advancing to a further result set (`SQL_SUCCESS_WITH_INFO`),
+  or `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)` (`SQL_SUCCESS_WITH_INFO` via
+  `DrainOutcome::InfoPosted`). If the batch is exhausted and the application
+  calls `SQLMoreResults` rather than closing the cursor, that call still posts
+  the records (under `SQL_NO_DATA`) so they are never dropped — matching
+  msodbcsql's between-result surfacing.
 - `SQLDriverConnect` failure now fans out the full login diagnostics (all
   errors + info) via `post_tds_error`, matching `msodbcsql`.
 
@@ -222,6 +236,9 @@ read `diagnostics.errors` (and, new, `diagnostics.info_messages`).
    `fire_triggers`) through `info_messages()` after the operation completes.- **ODBC e2e (`mssql-odbc/tests/e2e/tests/exec_direct_test.cpp`)**: `PRINT` +
   low-severity `RAISERROR` yields `SQL_SUCCESS_WITH_INFO` with two retrievable
   diagnostic records.
+- **ODBC e2e (`mssql-odbc/tests/e2e/tests/more_results_test.cpp`)**: an INFO
+  message between two result sets surfaces on the `SQLMoreResults` advance with a
+  `SQL_SUCCESS_WITH_INFO` hint and a retrievable diagnostic record.
 
 ## Open items / future work
 
