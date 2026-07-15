@@ -8,9 +8,7 @@ use tracing::{debug, error};
 
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
-use super::exec_common::{
-    build_named_params, claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
-};
+use super::exec_common::{build_named_params, claim_connection, fail_with_tds, finish_execute};
 use super::sqlstate::*;
 use super::util::rewrite_param_markers;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
@@ -50,6 +48,9 @@ struct Execution {
     rewritten_sql: String,
     named_params: Vec<RpcParameter>,
     handle: Option<i32>,
+    /// A superseded prepared handle (from a prior rebind / re-prepare) to be dropped
+    /// on the server
+    drop_handle: Option<i32>,
 }
 
 fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
@@ -65,13 +66,11 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
         Err(rc) => return rc,
     };
 
-    // Release any handle orphaned by a prior rebind / re-prepare before we
-    // (re)prepare or reuse the current handle.
-    flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecute");
-
     match exec.handle {
         // Already prepared: reuse the cached server handle (msodbcsql
-        // `cmdp.hPrepCurrent`) via sp_execute.
+        // `cmdp.hPrepCurrent`) via sp_execute. No pending prepared handle drop can
+        // exist here. (StmtState invariant: `pending_unprepare` is set only when
+        // `prepared_handle` is None), so nothing to release.
         Some(handle) => {
             if let Err(e) = dbc.runtime.block_on(client.execute_sp_execute(
                 handle,
@@ -84,18 +83,21 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
         }
-        // First execute: prepare and run in a single round trip via sp_prepexec
-        // (msodbcsql's deferred-prepare path), then cache the returned handle
-        // for subsequent sp_execute reuse.
+        // First execute / re-prepare: prepare and run in one round trip via
+        // sp_prepexec (deferred-prepare path). A prepared handle superseded
+        // by a prior rebind / re-prepare is dropped in the same RPC by passing
+        // it as sp_prepexec's `@handle` input (`drop_handle`). This avoids
+        // a separate `sp_unprepare` round trip.
         //
         // NOTE: msodbcsql falls back to sp_prepare + sp_execute for statements
         // with data-at-execution (DAE) parameters, which sp_prepexec can't
         // carry. Phase 1 rejects DAE params at bind time, so that case can't
-        // occur here yet — add the sp_prepare branch when DAE support lands.
+        // occur here yet - add the sp_prepare branch when DAE support lands.
         None => {
             if let Err(e) = dbc.runtime.block_on(client.execute_sp_prepexec(
                 exec.rewritten_sql,
                 exec.named_params,
+                exec.drop_handle,
                 None,
                 None,
             )) {
@@ -146,6 +148,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
     let named_params = unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
 
     let handle = stmt_state.prepared_handle;
+    let drop_handle = stmt_state.pending_unprepare.take();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.column_metadata.clear();
     stmt_state.current_row = None;
@@ -155,6 +158,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
         rewritten_sql,
         named_params,
         handle,
+        drop_handle,
     })
 }
 
@@ -258,5 +262,45 @@ mod tests {
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    #[test]
+    fn stage_execution_threads_pending_unprepare_as_drop_handle() {
+        // A handle orphaned by a prior rebind / re-prepare lives in
+        // `pending_unprepare` with `prepared_handle == None`. Staging must move
+        // it into `drop_handle` (to piggyback onto sp_prepexec) and consume it
+        // so it can't be dropped twice.
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared_sql = Some("SELECT 1".to_string());
+            state.pending_unprepare = Some(42);
+        }
+
+        let exec = stage_execution(stmt).expect("staging should succeed");
+        assert_eq!(exec.handle, None);
+        assert_eq!(exec.drop_handle, Some(42));
+
+        let state = stmt.inner.lock().unwrap();
+        assert!(state.pending_unprepare.is_none());
+    }
+
+    #[test]
+    fn stage_execution_reuse_path_has_no_drop_handle() {
+        // With a cached `prepared_handle`, the next execute reuses it via
+        // sp_execute; the invariant guarantees no pending drop, so `drop_handle`
+        // is None.
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared_sql = Some("SELECT 1".to_string());
+            state.prepared_handle = Some(7);
+        }
+
+        let exec = stage_execution(stmt).expect("staging should succeed");
+        assert_eq!(exec.handle, Some(7));
+        assert_eq!(exec.drop_handle, None);
     }
 }

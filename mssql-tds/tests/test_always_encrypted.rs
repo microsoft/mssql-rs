@@ -1101,6 +1101,7 @@ mod always_encrypted {
                     vec![param],
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("sp_prepexec with encrypted parameter");

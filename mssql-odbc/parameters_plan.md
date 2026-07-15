@@ -19,11 +19,14 @@ in the ODBC Driver 18 (Rust).
 - **Prepared-handle capture** — for a result-returning `sp_prepexec` the
   `@handle` arrives *after* the result set, so it is captured at drain time
   (`SQLCloseCursor` / DDL finish) via `take_prepared_statement_handle()`.
-- **`sp_unprepare` (handle release)** — a handle superseded by a re-prepare,
-  rebind, or `SQLExecDirect` is deferred (`pending_unprepare`) and released at
-  the next execute; on `SQLFreeHandle(STMT)` it is released best-effort while
-  the connection is idle. Issued as a separate RPC rather than piggybacking the
-  drop onto the next `sp_prepexec` (see TODO).
+- **`sp_unprepare` (handle release)** — a handle superseded by a re-prepare or
+  rebind is deferred (`pending_unprepare`) and released at the next `SQLExecute`
+  by **piggybacking onto `sp_prepexec`**: the superseded handle is sent as that
+  call's `@handle` **input**, so the server drops the old plan and prepares the
+  new one in one round trip (no separate `sp_unprepare`). `SQLExecDirect`
+  supersede and `SQLFreeHandle(STMT)` still issue a standalone `sp_unprepare`
+  (`flush_pending_unprepare` / best-effort), since neither runs an `sp_prepexec`
+  to ride along.
 - **Lifecycle** — `SQL_RESET_PARAMS` clears bindings; `SQLCloseCursor` /
   `SQLFreeStmt(SQL_CLOSE)` preserve the handle; re-`SQLPrepare` and rebind
   orphan it for release.
@@ -37,16 +40,6 @@ in the ODBC Driver 18 (Rust).
 
 ## Remaining work (TODO)
 
-- **Piggyback the handle drop onto `sp_prepexec` (optimization).** `sp_unprepare`
-  now runs, but as a **separate** RPC issued just before the next `sp_prepexec`
-  (`flush_pending_unprepare`). The optimization is to defer the drop and pass the
-  superseded handle as the `@handle` **input** of the next `sp_prepexec`, freeing
-  the old plan and preparing the new one in **one** round trip. To implement,
-  extend `execute_sp_prepexec` to accept an optional handle-to-free and send it
-  as the first (return-value) proc parameter, then drop the separate
-  `flush_pending_unprepare` call on the execute path (keep it only for the
-  statement-free / exec-direct cases). Saves one round trip per re-prepare /
-  rebind.
 - **Cache parameter-marker offsets at prepare time.**
   Today `rewrite_param_markers` re-scans the SQL text and builds a new rewritten
   string on every `SQLExecute`. Split this into two phases:

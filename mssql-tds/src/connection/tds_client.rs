@@ -1422,6 +1422,15 @@ impl TdsClient {
     /// is stored internally and can be retrieved with
     /// [`get_return_values()`](Self::get_return_values).
     ///
+    /// `drop_handle` piggybacks a prepared-handle release onto this call: when
+    /// `Some(h)`, `h` is sent as the input value of the by-reference `@handle`
+    /// parameter, so the server drops that prior prepared statement before
+    /// preparing the new one - replacing a separate `sp_unprepare` round trip.
+    /// `None` prepares fresh (the `@handle` input is NULL). Either way the new
+    /// handle is returned in the `@handle` RETURNVALUE (ordinal 0). This mirrors
+    /// the reference ODBC/`SqlClient` drivers, which send the retained handle as
+    /// the `sp_prepexec` in/out `@handle` argument.
+    ///
     /// Result rows are available through [`read_row()`](Self::read_row) after
     /// this call returns.
     #[instrument(skip(self, named_params), level = "info")]
@@ -1429,6 +1438,7 @@ impl TdsClient {
         &mut self,
         sql: String,
         mut named_params: Vec<RpcParameter>,
+        drop_handle: Option<i32>,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
@@ -1497,7 +1507,10 @@ impl TdsClient {
 
         let params_parameter = RpcParameter::new(None, StatusFlags::NONE, params_as_sql_string);
 
-        let handle_value = SqlType::Int(None);
+        // The by-reference `@handle`: NULL input prepares fresh; a `Some(h)`
+        // input tells the server to drop prepared statement `h` before
+        // preparing. The new handle comes back as the `@handle` RETURNVALUE captured during drain.
+        let handle_value = SqlType::Int(drop_handle);
 
         let handle_parameter = RpcParameter::new(None, StatusFlags::BY_REF_VALUE, handle_value);
 
@@ -3172,6 +3185,9 @@ mod tests {
         closed: bool,
         pending_tokens: VecDeque<Tokens>,
         reset_mode: ResetConnectionMode,
+        /// Every byte handed to `send` (request framing + payload), so tests can
+        /// assert what was actually written to the wire.
+        sent: Arc<std::sync::Mutex<Vec<u8>>>,
     }
 
     impl TestTransport {
@@ -3180,6 +3196,7 @@ mod tests {
                 closed: false,
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -3188,6 +3205,7 @@ mod tests {
                 closed: false,
                 pending_tokens: VecDeque::from(tokens),
                 reset_mode: ResetConnectionMode::None,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
     }
@@ -3229,7 +3247,8 @@ mod tests {
 
     #[async_trait]
     impl NetworkWriter for TestTransport {
-        async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
+        async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
+            self.sent.lock().unwrap().extend_from_slice(data);
             Ok(())
         }
         fn packet_size(&self) -> u32 {
@@ -3334,6 +3353,24 @@ mod tests {
             execution_context,
             client_context,
         )
+    }
+
+    /// Builds a client whose transport replays `tokens` and captures every byte
+    /// written to the wire, returning the shared capture buffer alongside it.
+    fn create_capturing_client(tokens: Vec<Tokens>) -> (TdsClient, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let transport = Box::new(TestTransport::with_tokens(tokens));
+        let sent = Arc::clone(&transport.sent);
+        let negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let execution_context = crate::connection::execution_context::ExecutionContext::new();
+        let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        let client = TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            client_context,
+        );
+        (client, sent)
     }
 
     fn done_no_more() -> Tokens {
@@ -3950,10 +3987,72 @@ mod tests {
     #[tokio::test]
     async fn execute_sp_prepexec_clears_stale_metadata_when_no_result_set() {
         assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
-            c.execute_sp_prepexec("UPDATE t SET v = 1".to_string(), Vec::new(), None, None)
-                .await
+            c.execute_sp_prepexec(
+                "UPDATE t SET v = 1".to_string(),
+                Vec::new(),
+                None,
+                None,
+                None,
+            )
+            .await
         })
         .await;
+    }
+
+    // The `@handle` positional parameter of sp_prepexec serializes as:
+    //   0x00  positional name length
+    //   0x01  status flags = BY_REF_VALUE
+    //   0x26  TYPE_INFO type byte = INTN
+    //   0x04  TYPE_INFO max size = 4
+    //   value: length byte then little-endian bytes (length 0x00 for NULL).
+    // These tests pin the byte the current selection controls: `drop_handle`
+    // becomes the input value of that by-reference `@handle`.
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_sends_drop_handle_as_byref_handle_input() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .execute_sp_prepexec(
+                "UPDATE t SET v = 1".to_string(),
+                Vec::new(),
+                Some(0x5152_5354),
+                None,
+                None,
+            )
+            .await
+            .expect("sp_prepexec should succeed against the queued DONE token");
+
+        let bytes = sent.lock().unwrap().clone();
+        let expected = [0x00, 0x01, 0x26, 0x04, 0x04, 0x54, 0x53, 0x52, 0x51];
+        assert!(
+            bytes.windows(expected.len()).any(|w| w == expected),
+            "Some(handle) must be sent as the by-reference @handle input so the server \
+             drops the prior prepared statement"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_sends_null_handle_when_no_drop_handle() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .execute_sp_prepexec(
+                "UPDATE t SET v = 1".to_string(),
+                Vec::new(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("sp_prepexec should succeed against the queued DONE token");
+
+        let bytes = sent.lock().unwrap().clone();
+        let expected_null = [0x00, 0x01, 0x26, 0x04, 0x00];
+        assert!(
+            bytes
+                .windows(expected_null.len())
+                .any(|w| w == expected_null),
+            "None must send a NULL @handle input so the server prepares fresh"
+        );
     }
 
     #[tokio::test]
