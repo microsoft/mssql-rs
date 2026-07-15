@@ -226,11 +226,23 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
                        ";PWD=" + cfg.Pwd() +
                        ";TrustServerCertificate=" + cfg.TrustCert();
 
-    auto tryConnect = [&](const std::string& cs) {
+    struct ConnResult {
+        SQLRETURN rc;
+        bool has01S00;
+        bool has28000;
+    };
+
+    // Connect with |cs| and report the return code plus whether the parser's
+    // 01S00 warning and/or a 28000 login-failure SQLSTATE appear on ANY
+    // diagnostic record. We scan every record (not just record #1): a
+    // successful login interleaves the server's own 01000 info messages, and
+    // msodbcsql 18 appends its 01S00 parse warning AFTER them (record #3),
+    // whereas mssql-odbc posts it first. Reading only record #1 would miss it.
+    auto tryConnect = [&](const std::string& cs) -> ConnResult {
         SQLHDBC hdbc = SQL_NULL_HDBC;
         SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
         EXPECT_EQ(SQL_SUCCESS, rc);
-        if (rc != SQL_SUCCESS) return std::make_pair(rc, std::string());
+        if (rc != SQL_SUCCESS) return {rc, false, false};
 
         SqlTString connstr = ODBCTestUtils::ToSqlTStr(cs);
         SQLTCHAR outStr[1024] = {};
@@ -242,91 +254,185 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
                               outStr, 1024, &outLen,
                               SQL_DRIVER_NOPROMPT);
 
-        std::string state;
+        bool has01S00 = false;
+        bool has28000 = false;
         if (rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR) {
-            state = ODBCTestUtils::GetDiagState(SQL_HANDLE_DBC, hdbc);
+            has01S00 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "01S00");
+            has28000 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "28000");
         }
 
         if (SQL_SUCCEEDED(rc)) SQLDisconnect(hdbc);
         SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
-        return std::make_pair(rc, state);
+        return {rc, has01S00, has28000};
     };
 
-    // Token without '=' separator
+    // A trailing token with no '=' is malformed: the key scan reaches
+    // end-of-string without finding '=', so the parser posts 01S00 and keeps
+    // whatever it parsed already. The connection still succeeds.
     {
-        auto result = tryConnect(base + ";garbage");
-        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, result.first);
-        EXPECT_EQ("01S00", result.second);
+        auto r = tryConnect(base + ";garbage");
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, r.rc);
+        EXPECT_TRUE(r.has01S00);
     }
 
-    // Empty key (=value)
+    // Empty key ("=value"): zero-length key name -> 01S00, connection proceeds.
     {
-        auto result = tryConnect(base + ";=orphan");
-        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, result.first);
-        EXPECT_EQ("01S00", result.second);
+        auto r = tryConnect(base + ";=orphan");
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, r.rc);
+        EXPECT_TRUE(r.has01S00);
     }
 
-    // Multiple malformed tokens
+    // Several malformed tokens after a complete, valid attribute set.
     {
-        auto result = tryConnect(base + ";garbage;=orphan;junk");
-        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, result.first);
-        EXPECT_EQ("01S00", result.second);
+        auto r = tryConnect(base + ";garbage;=orphan;junk");
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, r.rc);
+        EXPECT_TRUE(r.has01S00);
     }
 
-    // KNOWN DIVERGENCE: Malformed token buried between valid keys.
+    // Malformed token buried between valid keys -- matches msodbcsql exactly.
     //
-    // mssql-odbc (expected): tokenizer breaks the key on `;` OR `=`, so
-    //   `;noequals;` becomes a malformed token → SUCCESS_WITH_INFO + 01S00
-    //   while UID/PWD/TrustServerCertificate parse correctly and the
-    //   connection succeeds.
-    //
-    // msodbcsql 18 (divergent): its connection-string parser extracts the
-    //   key by scanning ONLY for `=`, so it
-    //   greedily consumes `noequals;UID` as a single key name, leaving the
-    //   real UID empty → login fails as user '' → SQL_ERROR + 28000.
-    //
-    // Both outcomes correctly indicate the malformed token was detected;
-    // we accept either.
+    // The key scan stops ONLY at '=', never at ';'. So `;noequals;UID=<uid>`
+    // is read as the single key name "noequals;UID", which is unknown and
+    // discarded -- the real UID is never applied. The driver then tries to log
+    // in as an empty user and the server rejects it -> SQL_ERROR + 28000.
+    // (Previously flagged as a KNOWN DIVERGENCE; the rewritten single-pass
+    // parser now reproduces msodbcsql byte-for-byte, verified against ODBC
+    // Driver 18.)
     {
-        auto result = tryConnect(
+        auto r = tryConnect(
             "Driver={" + cfg.Driver() + "}"
-            ";Server=" + cfg.Server() + ";noequals;UID=" + cfg.Uid() +
-            ";PWD=" + cfg.Pwd() + ";TrustServerCertificate=" + cfg.TrustCert());
-        const bool ok =
-            (result.first == SQL_SUCCESS_WITH_INFO && result.second == "01S00") ||
-            (result.first == SQL_ERROR            && result.second == "28000");
-        EXPECT_TRUE(ok)
-            << "rc=" << result.first << " state=" << result.second;
+            ";Server=" + cfg.Server() +
+            ";noequals;UID=" + cfg.Uid() +
+            ";PWD=" + cfg.Pwd() +
+            ";TrustServerCertificate=" + cfg.TrustCert());
+        EXPECT_EQ(SQL_ERROR, r.rc);
+        EXPECT_TRUE(r.has28000);
     }
 
-    // KNOWN DIVERGENCE: Extra semicolons (leading, between, trailing) with
-    // otherwise valid keys.
-    //
-    // mssql-odbc (expected): the tokenizer coalesces any run of `;` and
-    //   whitespace as a single separator → plain SQL_SUCCESS, no diag record.
-    //
-    // msodbcsql 18 (divergent): leading and middle `;;` are silently
-    //   coalesced too, but TRAILING `;;` reaches the parser's "no `=` found"
-    //   branch on the empty trailing tail and posts 01S00 → SUCCESS_WITH_INFO.
-    //   This appears to be an inconsistency in msodbcsql (why is trailing
-    //   different from leading/middle?) rather than a deliberate spec.
-    //   We accept either outcome.
+    // Extra semicolons (leading, between, trailing) around valid keys --
+    // matches msodbcsql exactly. Every parse iteration begins by skipping a run
+    // of whitespace and ';', so separator runs in ANY position, including a
+    // trailing run, are consumed cleanly with NO 01S00. (Previously flagged as
+    // a KNOWN DIVERGENCE on the claim that msodbcsql posts 01S00 for trailing
+    // ';;'; direct probing of ODBC Driver 18 shows it does not.)
     {
-        auto result = tryConnect("Driver={" + cfg.Driver() + "}"
+        auto r = tryConnect("Driver={" + cfg.Driver() + "}"
             ";;;Server=" + cfg.Server() +
-            ";;;UID=" + cfg.Uid() + ";;PWD=" + cfg.Pwd() +
+            ";;;UID=" + cfg.Uid() +
+            ";;PWD=" + cfg.Pwd() +
             ";TrustServerCertificate=" + cfg.TrustCert() + ";;;");
-        const bool ok =
-            (result.first == SQL_SUCCESS           && result.second.empty()) ||
-            (result.first == SQL_SUCCESS_WITH_INFO && result.second == "01S00");
-        EXPECT_TRUE(ok)
-            << "rc=" << result.first << " state=" << result.second;
+        EXPECT_TRUE(SQL_SUCCEEDED(r.rc));
+        EXPECT_FALSE(r.has01S00);
     }
 
-    // Unknown keys are ignored but return warning 01S00.
+    // Unknown keys are ignored with a 01S00 warning; the connection succeeds.
     {
-        auto result = tryConnect(base + ";FooBar=xyz;Bogus=123");
-        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, result.first);
-        EXPECT_EQ("01S00", result.second);
+        auto r = tryConnect(base + ";FooBar=xyz;Bogus=123");
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, r.rc);
+        EXPECT_TRUE(r.has01S00);
+    }
+}
+
+// End-to-end coverage of the rewritten connection-string parser's observable
+// behavior, exercised through the public SQLDriverConnect entry point against a
+// live server. Fine-grained cases (`}}` escaping, verbatim value whitespace,
+// oversized values) are covered exhaustively by the Rust unit tests in
+// connection_string_parser.rs; here we assert the behaviors that are visible in
+// a real login and that must stay in lock-step with msodbcsql.
+TEST_F(DriverConnectLiveTest, ConnectionStringParserParityBehaviors) {
+    auto& cfg = ODBCTestConfig::Instance();
+
+    struct ConnResult {
+        SQLRETURN rc;
+        bool has01S00;
+        bool has28000;
+    };
+
+    auto tryConnect = [&](const std::string& cs) -> ConnResult {
+        SQLHDBC hdbc = SQL_NULL_HDBC;
+        SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
+        EXPECT_EQ(SQL_SUCCESS, rc);
+        if (rc != SQL_SUCCESS) return {rc, false, false};
+
+        SqlTString connstr = ODBCTestUtils::ToSqlTStr(cs);
+        SQLTCHAR outStr[1024] = {};
+        SQLSMALLINT outLen = 0;
+
+        rc = SQLDriverConnect(hdbc, nullptr,
+                              const_cast<SQLTCHAR*>(connstr.c_str()),
+                              static_cast<SQLSMALLINT>(connstr.size()),
+                              outStr, 1024, &outLen,
+                              SQL_DRIVER_NOPROMPT);
+
+        bool has01S00 = false;
+        bool has28000 = false;
+        if (rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR) {
+            has01S00 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "01S00");
+            has28000 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "28000");
+        }
+
+        if (SQL_SUCCEEDED(rc)) SQLDisconnect(hdbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+        return {rc, has01S00, has28000};
+    };
+
+    // Braced values: a leading '{' switches value scanning to "read until the
+    // matching '}'", and the braces are stripped from the stored value. Wrapping
+    // every value in braces must yield the same successful login as the plain
+    // form, with no parse warning.
+    {
+        auto r = tryConnect("Driver={" + cfg.Driver() + "}"
+            ";Server={" + cfg.Server() + "}"
+            ";UID={" + cfg.Uid() + "}"
+            ";PWD={" + cfg.Pwd() + "}"
+            ";TrustServerCertificate={" + cfg.TrustCert() + "}");
+        EXPECT_TRUE(SQL_SUCCEEDED(r.rc))
+            << "rc=" << r.rc;
+        EXPECT_FALSE(r.has01S00);
+    }
+
+    // First-wins duplicates: on a repeated key the FIRST occurrence is kept and
+    // later ones are ignored. A valid UID followed by a bogus UID keeps the
+    // valid one -> the login succeeds.
+    {
+        auto r = tryConnect(
+            "Driver={" + cfg.Driver() + "}"
+            ";Server=" + cfg.Server() +
+            ";UID=" + cfg.Uid() +
+            ";UID=bogus_user_should_be_ignored" +
+            ";PWD=" + cfg.Pwd() +
+            ";TrustServerCertificate=" + cfg.TrustCert());
+        EXPECT_TRUE(SQL_SUCCEEDED(r.rc))
+            << "rc=" << r.rc;
+    }
+
+    // First-wins, negative: a bogus UID BEFORE the valid one wins, so the login
+    // is attempted as the bogus user and the server rejects it -> 28000.
+    {
+        auto r = tryConnect(
+            "Driver={" + cfg.Driver() + "}"
+            ";Server=" + cfg.Server() +
+            ";UID=bogus_user_should_win" +
+            ";UID=" + cfg.Uid() +
+            ";PWD=" + cfg.Pwd() +
+            ";TrustServerCertificate=" + cfg.TrustCert());
+        EXPECT_EQ(SQL_ERROR, r.rc);
+        EXPECT_TRUE(r.has28000);
+    }
+
+    // Keys are matched verbatim -- they are NOT trimmed. A space before '='
+    // makes the key "UID " (with a trailing space), which does not match any
+    // known keyword, so the real UID is never set. The driver logs in as an
+    // empty user and the server rejects it -> 28000 (and the unknown key also
+    // raises 01S00).
+    {
+        auto r = tryConnect(
+            "Driver={" + cfg.Driver() + "}"
+            ";Server=" + cfg.Server() +
+            ";UID =" + cfg.Uid() +
+            ";PWD=" + cfg.Pwd() +
+            ";TrustServerCertificate=" + cfg.TrustCert());
+        EXPECT_EQ(SQL_ERROR, r.rc);
+        EXPECT_TRUE(r.has28000);
     }
 }

@@ -81,6 +81,18 @@ public:
     /// Retrieve the SQLSTATE string from the most recent diagnostic record.
     static std::string GetDiagState(SQLSMALLINT handleType, SQLHANDLE handle);
 
+    /// Return true if |state| appears on ANY diagnostic record for the handle.
+    ///
+    /// Prefer this over GetDiagState when checking for a connection-string
+    /// parse warning (01S00): on a successful connect the server posts its own
+    /// 01000 "changed database context/language" info messages, and driver
+    /// implementations differ on ordering. msodbcsql 18 appends the 01S00 parse
+    /// warning AFTER the server messages (record #3), while mssql-odbc posts it
+    /// first (record #1). GetDiagState only reads record #1, so it cannot see a
+    /// warning that the server messages push further down the list.
+    static bool HasDiagState(SQLSMALLINT handleType, SQLHANDLE handle,
+                             const std::string& state);
+
     /// Retrieve the full diagnostic message text.
     static std::string GetDiagMessage(SQLSMALLINT handleType, SQLHANDLE handle);
 

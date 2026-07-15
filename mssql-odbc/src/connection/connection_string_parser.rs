@@ -1152,4 +1152,26 @@ mod tests {
             assert_eq!(p.server, "", "input {input:?}");
         }
     }
+
+    #[test]
+    fn interspersed_and_trailing_separators_never_warn() {
+        // The claimed "trailing ';;' posts 01S00" divergence does NOT exist.
+        // ParseAttrStr starts every iteration by skipping a run of whitespace
+        // and ';', so leading, middle, and trailing separator runs are all
+        // consumed cleanly with no warning. Direct probing of msodbcsql ODBC
+        // Driver 18 confirms none of these emit 01S00; our parser matches.
+        for input in [
+            "Server=host;UID=u;PWD=p;",
+            "Server=host;UID=u;PWD=p;;;",
+            ";;;Server=host;UID=u;PWD=p",
+            "Server=host;;;UID=u;;;PWD=p",
+            ";;;Server=host;;;UID=u;;;PWD=p;;;",
+        ] {
+            let (p, warn) = parse_connection_string(input).unwrap();
+            assert!(!warn, "input {input:?} should not warn on separators");
+            assert_eq!(p.server, "host", "input {input:?}");
+            assert_eq!(p.uid, "u", "input {input:?}");
+            assert_eq!(p.pwd, "p", "input {input:?}");
+        }
+    }
 }
