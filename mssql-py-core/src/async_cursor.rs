@@ -1,19 +1,34 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Placeholder — the real implementation lands in Phase 3.
+//! Async cursor — placeholder shell.
 //!
-//! Exists in Phase 1 only so `lib.rs` can register the class and the
-//! extension exposes the expected symbol for the smoke-test.
+//! Phase 2 adds a minimal `new(tds_client)` constructor so
+//! `PyCoreAsyncConnection::cursor()` can hand out instances. The actual
+//! `execute_async` / `fetchone_async` / `cancel` methods land in Phase 3.
+
+use std::sync::Arc;
 
 use pyo3::prelude::*;
+use tokio::sync::Mutex;
+
+use mssql_tds::connection::tds_client::TdsClient;
 
 #[pyclass]
-pub struct PyCoreAsyncCursor;
+pub struct PyCoreAsyncCursor {
+    #[allow(dead_code)] // wired up in Phase 3
+    tds_client: Arc<Mutex<TdsClient>>,
+}
+
+impl PyCoreAsyncCursor {
+    pub(crate) fn new(tds_client: Arc<Mutex<TdsClient>>) -> Self {
+        Self { tds_client }
+    }
+}
 
 #[pymethods]
 impl PyCoreAsyncCursor {
     fn __repr__(&self) -> &'static str {
-        "PyCoreAsyncCursor(stub)"
+        "PyCoreAsyncCursor(pending Phase 3)"
     }
 }

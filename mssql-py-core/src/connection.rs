@@ -158,7 +158,7 @@ impl PyCoreConnection {
 
 impl PyCoreConnection {
     /// Convert Python dict (ClientContext fields) to Rust ClientContext
-    fn dict_to_client_context(dict: &Bound<'_, PyDict>) -> PyResult<ClientContext> {
+    pub(crate) fn dict_to_client_context(dict: &Bound<'_, PyDict>) -> PyResult<ClientContext> {
         tracing::debug!("Extracting connection parameters from Python dict");
         // Extract required fields with defaults
         let server = dict
