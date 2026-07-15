@@ -13,5 +13,8 @@ mssql-tds = { path = "../mssql-tds" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing = { version = "0.1.43", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+async-trait = "0.1"
+azure_identity = "0.25.0"
+azure_core = "0.25.0"
 
 [build-dependencies]
