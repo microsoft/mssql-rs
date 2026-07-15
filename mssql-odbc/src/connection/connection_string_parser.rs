@@ -369,6 +369,10 @@ pub(crate) fn parse_connection_string(
     let chars: Vec<char> = input.chars().collect();
     let n = chars.len();
     let mut i = 0;
+    // Bounds-checked cursor read: returns None past end-of-input instead of
+    // panicking. This crate is loaded via FFI where a panic is fatal, so all
+    // character access goes through `.get()` (never `chars[i]`).
+    let peek = |idx: usize| chars.get(idx).copied();
 
     let mut params = ConnectionParams::default();
     // One "already seen" flag per acted-on key so the *first* occurrence of a
@@ -382,7 +386,7 @@ pub(crate) fn parse_connection_string(
         // key's *position* is whitespace-tolerant, not its content. So in
         // ";;  Server=host" the leading ";;  " is skipped, but in "Server =host"
         // the trailing space stays part of the key ("server ") and won't match.
-        while i < n && (is_odbc_space(chars[i]) || chars[i] == ';') {
+        while matches!(peek(i), Some(c) if is_odbc_space(c) || c == ';') {
             i += 1;
         }
         if i >= n {
@@ -394,7 +398,7 @@ pub(crate) fn parse_connection_string(
         // end-of-input. Example: in "Server=h;bogus;UID=u" the second key scan
         // yields "bogus;UID" (one key), so UID is swallowed and never set.
         let key_start = i;
-        while i < n && chars[i] != '=' {
+        while matches!(peek(i), Some(c) if c != '=') {
             i += 1;
         }
         if i >= n {
@@ -404,7 +408,7 @@ pub(crate) fn parse_connection_string(
             has_warnings = true;
             break;
         }
-        let key: String = chars[key_start..i].iter().collect();
+        let key: String = chars.get(key_start..i).unwrap_or_default().iter().collect();
         i += 1; // consume '='
         // Key matching is case-insensitive, so lowercase once up front.
         let lower = key.to_ascii_lowercase();
@@ -444,18 +448,18 @@ pub(crate) fn parse_connection_string(
         // stores first, then bails).
         let mut value = String::new();
         let mut stop_after = false;
-        if chars[i] == '{' {
+        if peek(i) == Some('{') {
             // Brace-quoted value: everything up to the matching single '}' is
             // literal, so ';' and '=' inside braces are NOT separators. Used for
             // passwords like "{p;w=d}" that contain reserved characters.
             i += 1;
             let mut terminated = false;
-            while i < n {
-                if chars[i] == '}' {
+            while let Some(c) = peek(i) {
+                if c == '}' {
                     // "}}" is an escape for a single literal '}'. Example:
                     // "{a}}b}" -> value "a}b" (the doubled brace is consumed as
                     // one '}', the later single '}' terminates the value).
-                    if i + 1 < n && chars[i + 1] == '}' {
+                    if peek(i + 1) == Some('}') {
                         value.push('}');
                         i += 2;
                         continue;
@@ -463,7 +467,7 @@ pub(crate) fn parse_connection_string(
                     terminated = true;
                     break;
                 }
-                value.push(chars[i]);
+                value.push(c);
                 i += 1;
             }
             if terminated {
@@ -471,7 +475,7 @@ pub(crate) fn parse_connection_string(
                 // A braced value must be followed by ';' or end-of-input. Trailing
                 // junk (e.g. "{val}junk") is a structural error: warn and stop,
                 // but the already-collected "val" is still stored below.
-                if i < n && chars[i] != ';' {
+                if matches!(peek(i), Some(c) if c != ';') {
                     warn!("invalid connection string attribute (data after braced value)");
                     has_warnings = true;
                     stop_after = true;
@@ -486,8 +490,11 @@ pub(crate) fn parse_connection_string(
         } else {
             // Plain value: read verbatim up to the next ';' (or end). No trimming
             // — "Server= host " stores the value as " host " with both spaces.
-            while i < n && chars[i] != ';' {
-                value.push(chars[i]);
+            while let Some(c) = peek(i) {
+                if c == ';' {
+                    break;
+                }
+                value.push(c);
                 i += 1;
             }
         }

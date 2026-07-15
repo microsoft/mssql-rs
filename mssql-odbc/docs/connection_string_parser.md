@@ -1,7 +1,7 @@
 # ODBC Connection String Parser
 
-`mssql-odbc/src/connection/mod.rs` parses the connection string handed to
-`SQLDriverConnect` / `SQLBrowseConnect`. It is a single-pass,
+`mssql-odbc/src/connection/connection_string_parser.rs` parses the connection
+string handed to `SQLDriverConnect` / `SQLBrowseConnect`. It is a single-pass,
 character-by-character **state machine** that reproduces the behavior of the
 shipping msodbcsql driver's `ParseAttrStr`
 (`Sql/Ntdbms/sqlncli/odbc/sqlcconn.cpp`). The goal is byte-for-byte parity with
@@ -149,7 +149,8 @@ rather than deliberate contract, and are **not** reproduced:
 ## Tests
 
 Exhaustive unit tests live in the `#[cfg(test)] mod tests` block of
-`connection/mod.rs` and cover every quirk in the divergence table above plus
+`connection/connection_string_parser.rs` and cover every quirk in the divergence
+table above plus
 value validation, first-wins duplicates, whitespace fidelity, `}}` escaping,
 separator/empty-input edge cases, and the `S_OK` / `S_FALSE` / `E_FAIL` mapping.
 Run them with `cargo btest` (or `cargo nextest run -p mssql-odbc`).
