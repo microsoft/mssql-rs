@@ -257,5 +257,9 @@ read `diagnostics.errors` (and, new, `diagnostics.info_messages`).
   statement errors also carry a full `SqlServerDiagnostics`.
 - **Live validation.** The `mssql-tds` unit and integration suites (including the
   INFO-message and bulk-copy tests above) pass against a live SQL Server 2022
-  container. The ODBC C++ e2e suite has not yet been built/run here (no CMake in
-  this environment); the new `more_results_test.cpp` case is exercised in CI.
+  container, and the full `mssql-odbc` C++ e2e suite (13/13 executables,
+  including `exec_direct_test` and `more_results_test`) passes against the same
+  container. A successful connect surfaces the server's routine context-change
+  messages — "Changed database context" (5701) and "Changed language setting"
+  (5703) — as `SQL_SUCCESS_WITH_INFO` + `01000`, which was verified to match
+  msodbcsql 18's behavior directly.

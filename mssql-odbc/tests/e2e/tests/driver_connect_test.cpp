@@ -302,15 +302,24 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
     // KNOWN DIVERGENCE: Extra semicolons (leading, between, trailing) with
     // otherwise valid keys.
     //
-    // mssql-odbc (expected): the tokenizer coalesces any run of `;` and
-    //   whitespace as a single separator → plain SQL_SUCCESS, no diag record.
+    // mssql-odbc: the tokenizer coalesces any run of `;` and whitespace as a
+    //   single separator, so no connection-string parse warning is produced.
+    //   A successful connect still surfaces the server's routine login
+    //   context-change messages — "Changed database context" (5701) and
+    //   "Changed language setting" (5703) — as SQL_SUCCESS_WITH_INFO + 01000.
+    //   (msodbcsql posts these same 5701/5703 records too; verified directly.)
+    //   With the trailing `;;;` coalesced, record 1 is the 01000 context info.
     //
-    // msodbcsql 18 (divergent): leading and middle `;;` are silently
-    //   coalesced too, but TRAILING `;;` reaches the parser's "no `=` found"
-    //   branch on the empty trailing tail and posts 01S00 → SUCCESS_WITH_INFO.
+    // msodbcsql 18 (divergent parse): leading and middle `;;` are coalesced,
+    //   but TRAILING `;;` reaches the parser's "no `=` found" branch on the
+    //   empty trailing tail and posts 01S00 at record 1 → SUCCESS_WITH_INFO.
     //   This appears to be an inconsistency in msodbcsql (why is trailing
     //   different from leading/middle?) rather than a deliberate spec.
-    //   We accept either outcome.
+    //
+    // Any of these is a correct "no error" outcome, so we accept:
+    //   * plain SQL_SUCCESS (e.g. a pooled/reset session with no context change),
+    //   * SUCCESS_WITH_INFO + 01S00 (msodbcsql's trailing-semicolon warning), or
+    //   * SUCCESS_WITH_INFO + 01000 (mssql-odbc's routine context-change info).
     {
         auto result = tryConnect("Driver={" + cfg.Driver() + "}"
             ";;;Server=" + cfg.Server() +
@@ -318,7 +327,8 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
             ";TrustServerCertificate=" + cfg.TrustCert() + ";;;");
         const bool ok =
             (result.first == SQL_SUCCESS           && result.second.empty()) ||
-            (result.first == SQL_SUCCESS_WITH_INFO && result.second == "01S00");
+            (result.first == SQL_SUCCESS_WITH_INFO && result.second == "01S00") ||
+            (result.first == SQL_SUCCESS_WITH_INFO && result.second == "01000");
         EXPECT_TRUE(ok)
             << "rc=" << result.first << " state=" << result.second;
     }
