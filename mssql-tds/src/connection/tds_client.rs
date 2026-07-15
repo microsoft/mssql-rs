@@ -205,6 +205,10 @@ impl TdsClient {
         self.drain_active_row_tail().await
     }
 
+    // TODO(User Story 46383): bridge the AE streaming gap for incremental PLP reads.
+    // Current AE decryption is cell-oriented (requires full ciphertext), while
+    // column-mode PLP is stream-oriented; hook decode/read paths to a stateful
+    // streaming decrypt API once mssql-tds supports it.
     async fn decode_column_value(&mut self, metadata: &ColumnMetadata) -> TdsResult<ColumnValues> {
         let decoder = GenericDecoder::default();
         let packet_reader = self.transport.as_packet_reader();
@@ -212,23 +216,23 @@ impl TdsClient {
         decoder.decode(&mut reader, metadata).await
     }
 
-async fn decode_and_discard_column(&mut self, metadata: &ColumnMetadata) -> TdsResult<()> {
-    if metadata.is_plp() {
-        if let Some(mut stream) = crate::datatypes::decoder::PlpChunkStreamReader::begin(
-            self.transport.as_packet_reader(),
-        )
-        .await?
-        {
-            stream
-                .skip_to_end(self.transport.as_packet_reader())
-                .await?;
+    async fn decode_and_discard_column(&mut self, metadata: &ColumnMetadata) -> TdsResult<()> {
+        if metadata.is_plp() {
+            if let Some(mut stream) = crate::datatypes::decoder::PlpChunkStreamReader::begin(
+                self.transport.as_packet_reader(),
+            )
+            .await?
+            {
+                stream
+                    .skip_to_end(self.transport.as_packet_reader())
+                    .await?;
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    let _ = self.decode_column_value(metadata).await?;
-    Ok(())
-}
+        let _ = self.decode_column_value(metadata).await?;
+        Ok(())
+    }
 
     /// Drains unread trailing columns from the current active row tail.
     ///
@@ -2509,6 +2513,7 @@ async fn decode_and_discard_column(&mut self, metadata: &ColumnMetadata) -> TdsR
                             next_column_index: column_index + 1,
                             columns: trailing_columns,
                             nbc_null_bitmap: Some(bitmap.clone()),
+                        });
                     }
 
                     if Self::nbc_column_is_null(&bitmap, column_index) {
@@ -2552,8 +2557,10 @@ async fn decode_and_discard_column(&mut self, metadata: &ColumnMetadata) -> TdsR
                             if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
                                 self.recovery_context.session_state_table.reset();
                             }
-                            self.execution_context
-                                .capture_change_property(&env_change, &mut self.negotiated_settings)?;
+                            self.execution_context.capture_change_property(
+                                &env_change,
+                                &mut self.negotiated_settings,
+                            )?;
                             continue;
                         }
                         Tokens::SessionState(session_state) => {

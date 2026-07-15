@@ -3710,6 +3710,7 @@ mod test {
                 },
                 column_name: "col".to_string(),
                 multi_part_name: None,
+                crypto_metadata: None,
             }
         }
 
@@ -3877,6 +3878,29 @@ mod test {
             assert!(
                 err.to_string()
                     .contains("PLP chunk exceeds declared length"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn plp_chunk_stream_reader_known_length_early_terminator_errors() {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&4u64.to_le_bytes());
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            buf.extend_from_slice(b"ab");
+            buf.extend_from_slice(&0u32.to_le_bytes());
+
+            let mut reader = ByteReader::new(buf);
+            let mut stream = PlpChunkStreamReader::begin(&mut reader)
+                .await
+                .unwrap()
+                .expect("not null");
+
+            let mut out = [0u8; 4];
+            let err = stream.read_into(&mut reader, &mut out).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("PLP stream ended before declared length was reached"),
                 "unexpected error: {err}"
             );
         }
