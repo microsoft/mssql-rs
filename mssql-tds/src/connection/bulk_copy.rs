@@ -50,6 +50,7 @@ use crate::connection::tds_client::TdsClient;
 use crate::core::TdsResult;
 use crate::datatypes::bulk_copy_metadata::{BulkCopyColumnMetadata, SqlDbType};
 use crate::error::Error;
+use crate::error::SqlInfoMessage;
 use crate::error::bulk_copy_errors::{
     BulkCopyAttentionTimeoutError, BulkCopyError, BulkCopyTimeoutError,
 };
@@ -945,6 +946,14 @@ impl<'a> BulkCopy<'a> {
         // Capture use_internal_transaction flag at start (matches .NET _savedBatchSize pattern)
         let use_internal_transaction = self.options.use_internal_transaction;
 
+        // Accumulate INFO messages across all batches so the whole bulk copy operation's
+        // diagnostics are retrievable via `client.info_messages()` after it returns.
+        // Each `execute_bulk_load_streaming_zerocopy` call resets the client's buffer via
+        // `begin_command`, and the internal `commit_transaction` (when enabled) would clear
+        // it as well, so we drain each batch's INFO before commit and restore the full set
+        // once the loop completes.
+        let mut accumulated_info: Vec<SqlInfoMessage> = Vec::new();
+
         loop {
             if rows.peek().is_none() {
                 break;
@@ -1021,6 +1030,10 @@ impl<'a> BulkCopy<'a> {
             // Handle batch result with transaction management
             match batch_result {
                 Ok(batch_count) => {
+                    // Drain this batch's INFO messages before the internal commit (which
+                    // resets the client's buffer) can clear them.
+                    accumulated_info.extend(self.client.take_info_messages());
+
                     // ═══════════════════════════════════════════════════════════
                     // COMMIT TRANSACTION: Commit on successful batch completion
                     // This mirrors .NET SqlBulkCopy.CommitTransaction() behavior
@@ -1066,6 +1079,12 @@ impl<'a> BulkCopy<'a> {
                 });
             }
         }
+
+        // Restore the INFO messages accumulated across all batches so the caller can read
+        // the full bulk copy diagnostics via `client.info_messages()`. Drop any residual
+        // buffer left by the final internal commit first, so only bulk-load INFO remains.
+        let _ = self.client.take_info_messages();
+        self.client.extend_info_messages(accumulated_info);
 
         Ok(())
     }

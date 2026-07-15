@@ -205,6 +205,83 @@ mod bulk_copy_integration_tests {
         // Temp table will be automatically dropped when connection closes
     }
 
+    /// Bulk copy is a composite operation (metadata retrieval + optional internal
+    /// transaction + one or more bulk-load batches). INFO tokens emitted while the
+    /// bulk load runs — here via an AFTER INSERT trigger's `PRINT`, which surfaces
+    /// because `fire_triggers` is enabled — must be captured and remain retrievable
+    /// via `info_messages()` once the whole operation completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bulk_copy_captures_info_messages_from_fired_trigger() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        client
+            .execute(
+                "CREATE TABLE #BulkCopyInfo (
+                    id INT NOT NULL,
+                    value1 INT NOT NULL,
+                    value2 INT NOT NULL,
+                    value3 INT NOT NULL
+                )"
+                .to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to create test table");
+        client.close_query().await.expect("Failed to close query");
+
+        // AFTER INSERT trigger emitting an informational (PRINT) message. It only
+        // fires during the bulk load because the bulk copy enables FIRE_TRIGGERS.
+        client
+            .execute(
+                "CREATE TRIGGER trg_BulkCopyInfo ON #BulkCopyInfo AFTER INSERT AS \
+                 PRINT N'bulk copy trigger info';"
+                    .to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to create trigger");
+        client.close_query().await.expect("Failed to close query");
+
+        let test_data = vec![
+            TestUser {
+                id: 1,
+                value1: 100,
+                value2: 200,
+                value3: 300,
+            },
+            TestUser {
+                id: 2,
+                value1: 101,
+                value2: 201,
+                value3: 301,
+            },
+        ];
+
+        let result = {
+            let bulk_copy = BulkCopy::new(&mut client, "#BulkCopyInfo");
+            bulk_copy
+                .batch_size(1000)
+                .fire_triggers(true)
+                .write_to_server_zerocopy(&test_data)
+                .await
+                .expect("Bulk copy failed")
+        };
+
+        assert_eq!(result.rows_affected, 2, "Expected 2 rows to be inserted");
+
+        let messages = client.info_messages();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.message.contains("bulk copy trigger info")),
+            "bulk copy should surface INFO tokens emitted during the bulk load: {messages:?}"
+        );
+
+        // Temp table (and its trigger) are dropped automatically when the connection closes.
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_bulk_copy_large_batch() {
         let mut client = begin_connection(&build_tcp_datasource()).await;

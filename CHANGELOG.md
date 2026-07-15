@@ -15,8 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   New public `SqlInfoMessage` and `SqlServerDiagnostics` types in
   `mssql_tds::error`, a new `Error::from_sql_diagnostics` constructor, and
   `TdsClient::info_messages()` / `TdsClient::take_info_messages()`. INFO tokens
-  from batch, RPC, result-set draining, and login are accumulated instead of
-  discarded.
+  from batch, RPC, result-set draining, login, and bulk copy are accumulated
+  instead of discarded.
 
 - `mssql-odbc`: server informational/warning messages are surfaced as
   diagnostic records (`SQLGetDiagRec` / `SQLGetDiagField`), and successful calls
@@ -36,6 +36,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   the last) plus any INFO messages via `Error::SqlServerError { diagnostics }`.
 - `mssql-tds`: `TdsClient::info_messages()` reflects only the current command;
   each `execute*` call resets the informational-message buffer at entry.
+- `mssql-tds`: bulk copy (`BulkCopy::write_to_server_zerocopy`) resets the
+  informational-message buffer at entry and accumulates INFO across all
+  bulk-load batches, so messages emitted during the load (e.g. from triggers
+  fired via `fire_triggers`) remain retrievable via `info_messages()` after the
+  operation completes.
 
 ### Removed
 

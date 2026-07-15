@@ -142,7 +142,8 @@ read `diagnostics.errors` (and, new, `diagnostics.info_messages`).
 
 1. **INFO tokens are retained, not discarded.** Every `Tokens::Info` branch in
    `TdsClient` (batch done-consume, `drain_stream`, `move_to_column_metadata`,
-   row read, transaction-response consume) now records the message.
+   row read, transaction-response consume, and the bulk-load `consume_done_token`
+   loop) now records the message.
 
 2. **`Error::SqlServerError` carries errors *and* info.** Failed
    SQL-Server-originated operations expose the full diagnostic set. In-repo
@@ -164,6 +165,16 @@ read `diagnostics.errors` (and, new, `diagnostics.info_messages`).
    stream can surface INFO (e.g. a `PRINT` after the last result set) that the
    caller drains via `take_info_messages()` afterward. This is documented at the
    call site to prevent a future "cleanup" from regressing it.
+
+6. **Bulk copy accumulates INFO across the whole operation.**
+   `execute_bulk_load_streaming_zerocopy` calls `begin_command()` like the other
+   token-consuming entry points, and its `consume_done_token` loop captures INFO.
+   Because `BulkCopy::write_to_server_zerocopy` is a *composite* (metadata
+   retrieval + optional internal transaction + one or more bulk-load batches),
+   the internal `commit_transaction` would otherwise reset the buffer. So the
+   composite drains each batch's INFO before the commit and restores the full
+   set once the loop finishes, making all bulk-load INFO retrievable via
+   `info_messages()` after the operation returns.
 
 ## Consumer changes (`mssql-odbc`)
 
@@ -206,8 +217,9 @@ read `diagnostics.errors` (and, new, `diagnostics.info_messages`).
 - **Integration (`mssql-tds/tests/test_info_messages.rs`)**: INFO before a
   result set, INFO-only batches, INFO drained after result rows via
   `close_query`, and per-command reset (a prior command's info does not bleed
-  into the next).
-- **ODBC e2e (`mssql-odbc/tests/e2e/tests/exec_direct_test.cpp`)**: `PRINT` +
+  into the next).- **Integration (`mssql-tds/tests/test_bulk_copy.rs`)**: bulk copy surfaces INFO
+   emitted during the bulk load (an `AFTER INSERT` trigger `PRINT`, fired via
+   `fire_triggers`) through `info_messages()` after the operation completes.- **ODBC e2e (`mssql-odbc/tests/e2e/tests/exec_direct_test.cpp`)**: `PRINT` +
   low-severity `RAISERROR` yields `SQL_SUCCESS_WITH_INFO` with two retrievable
   diagnostic records.
 
