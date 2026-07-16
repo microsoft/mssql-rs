@@ -19,5 +19,6 @@ source ~/.cargo/env
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends cmake unixodbc-dev
+rm -rf /var/lib/apt/lists/*
 
 exec /workspace/mssql-odbc/tests/e2e/run_e2e.sh --retries="${ODBC_E2E_RETRIES:-3}"
