@@ -255,6 +255,36 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         column_index: usize,
         value: &ColumnValues,
     ) -> TdsResult<()> {
+        // Ciphertext passthrough (AllowEncryptedValueModifications): for an
+        // encrypted column, serialize the caller-supplied ciphertext verbatim —
+        // no plaintext CEK, no re-encryption, and no clone of the (potentially
+        // large) ciphertext buffer. The value must already be varbinary
+        // ciphertext (or NULL); anything else is a usage error rather than
+        // silently storing an un-decryptable value.
+        if self.allow_encrypted_value_modifications
+            && self
+                .column_metadata
+                .get(column_index)
+                .is_some_and(|col| col.encryption.is_some())
+        {
+            if !matches!(value, ColumnValues::Bytes(_) | ColumnValues::Null) {
+                return Err(Error::UsageError(format!(
+                    "allow_encrypted_value_modifications requires already-encrypted varbinary \
+                     ciphertext for encrypted column '{}', but got {value:?}",
+                    self.column_metadata[column_index].column_name
+                )));
+            }
+            let ctx = self.column_contexts.get(column_index).cloned().ok_or_else(|| {
+                Error::UsageError(format!(
+                    "Column index {} out of bounds, expected {} columns based on table metadata.",
+                    column_index,
+                    self.column_contexts.len()
+                ))
+            })?;
+            TdsValueSerializer::serialize_value(self.packet_writer, value, &ctx).await?;
+            return Ok(());
+        }
+
         // Always Encrypted: encrypt the plaintext cell value and emit the
         // ciphertext as a varbinary, matching the encrypted COLMETADATA wire
         // type. NULL values stay NULL (no ciphertext).
@@ -301,22 +331,6 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         let Some(enc) = &col_meta.encryption else {
             return Ok(None);
         };
-
-        // AllowEncryptedValueModifications: emit the caller-supplied ciphertext
-        // verbatim without the plaintext CEK. The value must already be
-        // varbinary ciphertext (or NULL); anything else is a usage error rather
-        // than silently storing an un-decryptable value.
-        if self.allow_encrypted_value_modifications {
-            return match value {
-                ColumnValues::Null => Ok(Some(ColumnValues::Null)),
-                ColumnValues::Bytes(_) => Ok(Some(value.clone())),
-                other => Err(Error::UsageError(format!(
-                    "allow_encrypted_value_modifications requires already-encrypted varbinary \
-                     ciphertext for encrypted column '{}', but got {other:?}",
-                    col_meta.column_name
-                ))),
-            };
-        }
 
         let cek = self
             .plaintext_ceks
@@ -1415,20 +1429,35 @@ mod ae_colmetadata_tests {
     }
 
     #[tokio::test]
-    async fn passthrough_null_stays_null() {
+    async fn passthrough_null_serializes_as_null() {
         let mut net = CapturingWriter { buffer: Vec::new() };
-        let mut packet_writer = PacketWriter::new(PacketType::BulkLoad, &mut net, None, None);
-        let mut writer = StreamingBulkLoadWriter::new(
-            &mut packet_writer,
-            "T".to_string(),
-            vec![deterministic_int_column()],
-            SqlCollation::default(),
-        );
-        writer.set_column_encryption_enabled(true);
-        writer.set_allow_encrypted_value_modifications(true);
+        {
+            let mut packet_writer = PacketWriter::new(PacketType::BulkLoad, &mut net, None, None);
+            let mut writer = StreamingBulkLoadWriter::new(
+                &mut packet_writer,
+                "T".to_string(),
+                vec![deterministic_int_column()],
+                SqlCollation::default(),
+            );
+            writer.set_column_encryption_enabled(true);
+            writer.set_allow_encrypted_value_modifications(true);
+            writer.begin().await.unwrap();
+            writer
+                .write_column_value(0, &ColumnValues::Null)
+                .await
+                .unwrap();
+            let _ = writer.end().await.unwrap();
+        }
 
-        let out = writer.try_encrypt_cell(0, &ColumnValues::Null).unwrap();
-        assert_eq!(out, Some(ColumnValues::Null));
+        let body = net.buffer[9..].to_vec();
+        let mut reader = MockReader::new(body);
+        let parser = ColMetadataTokenParser;
+        let context = ParserContext::ColumnEncryption(true);
+        let _ = parser.parse(&mut reader, &context).await.unwrap();
+
+        // A NULL varbinary is the 0xFFFF length sentinel.
+        let len = reader.read_uint16().await.unwrap();
+        assert_eq!(len, 0xFFFF);
     }
 
     #[tokio::test]
@@ -1445,9 +1474,11 @@ mod ae_colmetadata_tests {
         );
         writer.set_column_encryption_enabled(true);
         writer.set_allow_encrypted_value_modifications(true);
+        writer.begin().await.unwrap();
 
         let err = writer
-            .try_encrypt_cell(0, &ColumnValues::Int(42))
+            .write_column_value(0, &ColumnValues::Int(42))
+            .await
             .unwrap_err();
         assert!(
             format!("{err}").to_lowercase().contains("ciphertext"),

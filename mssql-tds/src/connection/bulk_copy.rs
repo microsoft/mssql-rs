@@ -115,6 +115,14 @@ pub struct BulkCopyOptions {
     /// already be varbinary ciphertext) instead of being normalized and
     /// encrypted with the column's key, so the plaintext CEK is not required.
     ///
+    /// # Precondition
+    ///
+    /// This option only takes effect when Always Encrypted is enabled on the
+    /// connection (Column Encryption Setting = Enabled and the server
+    /// acknowledged the feature) and the destination has encrypted columns. When
+    /// column encryption is not enabled, the option is ignored and values follow
+    /// the normal plaintext path.
+    ///
     /// # Security
     ///
     /// The server does not validate that the supplied ciphertext matches the
@@ -497,7 +505,9 @@ impl<'a> BulkCopy<'a> {
     /// Write already-encrypted (ciphertext) values into Always Encrypted
     /// columns without the driver re-encrypting them.
     ///
-    /// Default: false. See
+    /// Default: false. This option only takes effect when Always Encrypted is
+    /// enabled on the connection and the destination has encrypted columns;
+    /// otherwise it is ignored. See
     /// [`BulkCopyOptions::allow_encrypted_value_modifications`] for the security
     /// caveats — only use this to move ciphertext between columns that share the
     /// same column encryption key, algorithm, and encryption type.
