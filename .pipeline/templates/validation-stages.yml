@@ -157,9 +157,10 @@ stages:
           testResultsFormat: 'JUnit'
           testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
           testRunTitle: 'Extended Protection (EPA)'
-      # ODBC C++ gtest e2e suite, reusing the SQL Server this job already set up
-      # (sql-setup-template on localhost:1433). PR-only, gated inside the template.
-      - template: test-odbc-windows-template.yml
+      # ODBC C++ gtest e2e runs on Linux x64 + ARM only (see build-template-container.yml).
+      # Windows is intentionally excluded: the driver exports a Unicode-only surface with no
+      # SQLConnectW, so the Windows Driver Manager classifies it as ANSI and the live tests
+      # fail at SQLDriverConnect with IM001. Re-enable here once the driver exports SQLConnectW.
       - template: build-python-wheels-template.yml
         parameters:
           osType: Windows
