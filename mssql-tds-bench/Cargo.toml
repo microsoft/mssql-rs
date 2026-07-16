@@ -40,7 +40,15 @@ name = "connection"
 harness = false
 
 [[bench]]
-name = "query"
+name = "query_rows"
+harness = false
+
+[[bench]]
+name = "query_procs"
+harness = false
+
+[[bench]]
+name = "query_prepared"
 harness = false
 
 [[bench]]
