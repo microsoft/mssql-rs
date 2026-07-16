@@ -101,9 +101,10 @@ pub enum ColumnPlanKind {
         unit: TimeUnit,
         scale: u8,
     },
-    /// Arrow `decimal128(p,s)` → SQL `decimal(p,s)`.
+    /// Arrow `decimal128(_, s)` → SQL `decimal`/`numeric`. The stored Arrow
+    /// scale is used to format the raw value; the destination column's
+    /// precision/scale (and decimal-vs-numeric choice) are applied at write time.
     Decimal128 {
-        precision: u8,
         scale: u8,
     },
     /// Arrow `fixed_size_binary(16)` → SQL `uniqueidentifier`.
@@ -246,10 +247,9 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
             }
         }
 
-        (DataType::Decimal128(p, s), S::Decimal | S::Numeric) => ColumnPlanKind::Decimal128 {
-            precision: *p,
-            scale: *s as u8,
-        },
+        (DataType::Decimal128(_, s), S::Decimal | S::Numeric) => {
+            ColumnPlanKind::Decimal128 { scale: *s as u8 }
+        }
 
         (DataType::FixedSizeBinary(16), S::UniqueIdentifier) => ColumnPlanKind::FixedBin16Uuid,
         (DataType::FixedSizeBinary(16), S::Binary | S::VarBinary) => ColumnPlanKind::Binary,
@@ -444,13 +444,17 @@ impl ColumnPlan {
                     scale,
                 }))
             }
-            ColumnPlanKind::Decimal128 { precision, scale } => {
-                let a = downcast::<Decimal128Array>(arr)?;
-                let raw = a.value(row_idx);
+            ColumnPlanKind::Decimal128 { scale } => {
+                let raw = downcast::<Decimal128Array>(arr)?.value(row_idx);
+                // Format the raw integer at the Arrow scale to get the true value,
+                // then re-scale to the destination column's precision/scale (so
+                // decimal128(10,2) -> DECIMAL(10,4) stores 123.4500, not 1.2345).
                 let s = decimal128_to_string(raw, scale);
-                Ok(ColumnValues::Decimal(DecimalParts::from_string(
-                    &s, precision, scale,
-                )?))
+                let parts = DecimalParts::from_string(&s, dest.precision, dest.scale)?;
+                Ok(match dest.sql_type {
+                    SqlDbType::Numeric => ColumnValues::Numeric(parts),
+                    _ => ColumnValues::Decimal(parts),
+                })
             }
             ColumnPlanKind::FixedBin16Uuid => {
                 let a = downcast::<FixedSizeBinaryArray>(arr)?;
@@ -1058,6 +1062,43 @@ mod tests {
         match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
             ColumnValues::Decimal(d) => assert_eq!(d.to_string(), "-1.00"),
             other => panic!("expected Decimal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decimal128_rescales_to_dest_scale() {
+        // Arrow decimal128(10,2)=123.45 into DECIMAL(10,4) must store 123.4500,
+        // not 1.2345 (i.e. the destination scale wins, not the Arrow scale).
+        let dest = meta_decimal("amt", 10, 4);
+        let arr: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(12345_i128)])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        let plan = one_col_plan(DataType::Decimal128(10, 2), &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::Decimal(d) => {
+                assert_eq!(d.scale, 4);
+                assert_eq!(d.to_string(), "123.4500");
+            }
+            other => panic!("expected Decimal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decimal128_to_numeric_returns_numeric_variant() {
+        let mut dest = meta("n", SqlDbType::Numeric, true);
+        dest.precision = 10;
+        dest.scale = 2;
+        let arr: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(12345_i128)])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        let plan = one_col_plan(DataType::Decimal128(10, 2), &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::Numeric(d) => assert_eq!(d.to_string(), "123.45"),
+            other => panic!("expected Numeric, got {:?}", other),
         }
     }
 

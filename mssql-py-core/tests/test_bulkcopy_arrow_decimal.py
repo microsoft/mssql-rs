@@ -170,3 +170,31 @@ def test_cursor_bulkcopy_arrow_decimal_null_to_non_nullable_column(client_contex
         cursor.bulkcopy_arrow(table_name, source, batch_size=1000, timeout=30)
 
     conn.close()
+
+
+@pytest.mark.integration
+def test_cursor_bulkcopy_arrow_decimal_mismatched_scale(client_context):
+    """Arrow decimal scale != destination scale re-scales to the column's scale.
+
+    Regression test: decimal128(10,2) value 123.45 into DECIMAL(10,4) must store
+    123.4500, not 1.2345 (the destination scale is authoritative).
+    """
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "#BCArrowDecimalMismatchedScale"
+    cursor.execute(f"CREATE TABLE {table_name} (amt DECIMAL(10, 4) NOT NULL)")
+
+    source = pa.table(
+        {"amt": pa.array([Decimal("123.45"), Decimal("-1.20")], type=pa.decimal128(10, 2))}
+    )
+
+    result = cursor.bulkcopy_arrow(table_name, source, batch_size=1000, timeout=30)
+    assert result["rows_copied"] == 2
+
+    cursor.execute(f"SELECT amt FROM {table_name} ORDER BY amt")
+    rows = cursor.fetchall()
+    assert rows[0][0] == Decimal("-1.2000")
+    assert rows[1][0] == Decimal("123.4500")
+
+    conn.close()

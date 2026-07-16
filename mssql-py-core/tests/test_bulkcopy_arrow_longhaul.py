@@ -8,10 +8,11 @@ objects (not Python tuples) into cursor.bulkcopy_arrow for a configurable
 duration, exercising the multi-batch Arrow streaming path (ArrowRowIter pumping
 batches over the C-data interface) under sustained load.
 
-The wide table uses only SQL types in the Arrow v1 matrix. MONEY / SMALLMONEY /
-DATETIME (present in the tuple long-haul table) are intentionally omitted
-because the Arrow path rejects them; DATETIME2 / DATETIMEOFFSET / TIME / DATE /
-UNIQUEIDENTIFIER cover the temporal + binary surface instead.
+The wide table covers the Arrow-supported SQL type matrix, including MONEY /
+SMALLMONEY / DATETIME / SMALLDATETIME / XML (added in this PR) alongside the
+integer / decimal / float / string / binary / temporal / uuid types. (Native
+JSON is exercised via the money/xml columns and the NVARCHAR(MAX) json column;
+the native JSON type is version-dependent and covered by the per-type tests.)
 
 Duration and batch size are configured via LONGHAUL_DURATION_SECONDS
 (default 1800s = 30 min) and LONGHAUL_BATCH_SIZE (default 1000).
@@ -28,8 +29,8 @@ import mssql_py_core
 pa = pytest.importorskip("pyarrow")
 
 
-# Arrow-supported wide schema (15 columns). Every column's SQL type is in the
-# v1 (Arrow type -> SQL type) matrix.
+# Arrow-supported wide schema (20 columns). Every column's SQL type is in the
+# (Arrow type -> SQL type) matrix.
 _WIDE_TABLE_COLUMNS = (
     "id INT PRIMARY KEY, "
     "bigint_col BIGINT, "
@@ -45,6 +46,11 @@ _WIDE_TABLE_COLUMNS = (
     "time_col TIME, "
     "varbinary_col VARBINARY(100), "
     "uuid_col UNIQUEIDENTIFIER, "
+    "money_col MONEY, "
+    "smallmoney_col SMALLMONEY, "
+    "datetime_col DATETIME, "
+    "smalldatetime_col SMALLDATETIME, "
+    "xml_col XML, "
     "json_col NVARCHAR(MAX)"
 )
 
@@ -63,6 +69,11 @@ _FIELD_NAMES = [
     "time_col",
     "varbinary_col",
     "uuid_col",
+    "money_col",
+    "smallmoney_col",
+    "datetime_col",
+    "smalldatetime_col",
+    "xml_col",
     "json_col",
 ]
 
@@ -101,6 +112,21 @@ def _make_record_batch(start_id, n):
             ),
             pa.array([bytes([i % 256] * 10) for i in ids], type=pa.binary()),
             pa.array([uuid.uuid4().bytes for _ in ids], type=pa.binary(16)),
+            pa.array(
+                [Decimal(f"{i % 1000}.5000") for i in ids], type=pa.decimal128(19, 4)
+            ),
+            pa.array(
+                [Decimal(f"{i % 1000}.2500") for i in ids], type=pa.decimal128(10, 4)
+            ),
+            pa.array(
+                [_EPOCH + datetime.timedelta(seconds=i) for i in ids],
+                type=pa.timestamp("us"),
+            ),
+            pa.array(
+                [_EPOCH + datetime.timedelta(minutes=i % 1000) for i in ids],
+                type=pa.timestamp("us"),
+            ),
+            pa.array([f'<r id="{i}"/>' for i in ids], type=pa.string()),
             pa.array(
                 [f'{{"id": {i}, "value": "test"}}' for i in ids], type=pa.string()
             ),
