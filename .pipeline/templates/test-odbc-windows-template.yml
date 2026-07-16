@@ -17,17 +17,21 @@ parameters:
 steps:
 - pwsh: |
     $ErrorActionPreference = 'Stop'
-    if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+    $cmake = Get-Command cmake -ErrorAction SilentlyContinue
+    if ($cmake) {
+      & $cmake.Source --version
+    } else {
+      # cmake ships with VS2022 but its bin dir is not on PATH by default.
       $candidate = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse `
         -Filter 'cmake.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-      if ($candidate) {
-        Write-Host "Adding cmake to PATH: $($candidate.DirectoryName)"
-        Write-Host "##vso[task.prependpath]$($candidate.DirectoryName)"
-      } else {
-        throw "cmake not found on the agent. It is required to build the ODBC e2e tests."
+      if (-not $candidate) {
+        throw 'cmake not found on the agent. It is required to build the ODBC e2e tests.'
       }
+      Write-Host "Adding cmake to PATH for later steps: $($candidate.DirectoryName)"
+      # prependpath only affects subsequent steps, so verify via the full path here.
+      Write-Host "##vso[task.prependpath]$($candidate.DirectoryName)"
+      & $candidate.FullName --version
     }
-    cmake --version
   displayName: 'ODBC e2e: ensure cmake is available'
   condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
