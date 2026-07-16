@@ -81,6 +81,18 @@ public:
     /// Retrieve the SQLSTATE string from the most recent diagnostic record.
     static std::string GetDiagState(SQLSMALLINT handleType, SQLHANDLE handle);
 
+    /// Return true if |state| appears on ANY diagnostic record for the handle.
+    ///
+    /// Prefer this over GetDiagState when checking for a connection-string
+    /// parse warning (01S00): on a successful connect the server posts its own
+    /// 01000 "changed database context/language" info messages, and driver
+    /// implementations differ on ordering. msodbcsql 18 appends the 01S00 parse
+    /// warning AFTER the server messages (record #3), while mssql-odbc posts it
+    /// first (record #1). GetDiagState only reads record #1, so it cannot see a
+    /// warning that the server messages push further down the list.
+    static bool HasDiagState(SQLSMALLINT handleType, SQLHANDLE handle,
+                             const std::string& state);
+
     /// Retrieve the full diagnostic message text.
     static std::string GetDiagMessage(SQLSMALLINT handleType, SQLHANDLE handle);
 
@@ -124,6 +136,17 @@ public:
     bool HasDSN()         const { return !dsn_.empty(); }
     bool HasCredentials() const { return !uid_.empty(); }
     bool HasConnStr()     const { return !connstr_.empty(); }
+
+    /// True only when every field needed to build a SQL-auth login string from
+    /// scratch is present. The connection-string parser-parity tests assemble
+    /// their own strings from Server()/Uid()/Pwd() and corrupt individual auth
+    /// tokens, so they require all three. A suite configured via ODBC_TEST_CONNSTR,
+    /// a DSN, or integrated auth legitimately leaves Uid/Pwd empty, so those tests
+    /// must skip rather than build a broken empty-credential string and fail.
+    /// NOTE: tactical guard – a capability-based test framework is tracked separately.
+    bool HasSqlAuth() const {
+        return !server_.empty() && !uid_.empty() && !pwd_.empty();
+    }
 
     /// Returns true if ANY connection method is configured.
     bool HasConnection()  const { return HasConnStr() || HasDSN() || !server_.empty(); }
