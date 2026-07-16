@@ -825,43 +825,50 @@ impl TdsClient {
         // Always Encrypted: when column encryption is negotiated and enabled,
         // resolve the plaintext CEK for each encrypted destination column so the
         // writer can encrypt row values and emit the encrypted COLMETADATA.
-        let plaintext_ceks: Vec<Option<std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>>> = if self
-            .should_encrypt_bulk_copy()
-            && mapped_column_metadata.iter().any(|c| c.is_encrypted)
-        {
-            use crate::security::keystore::decrypt_cek;
+        //
+        // With `allow_encrypted_value_modifications`, the caller supplies
+        // ciphertext directly, so we skip CEK resolution entirely and let the
+        // writer pass those values through verbatim.
+        let has_encrypted_columns = mapped_column_metadata.iter().any(|c| c.is_encrypted);
+        let encrypt_bulk_copy = self.should_encrypt_bulk_copy() && has_encrypted_columns;
+        let passthrough_ciphertext =
+            encrypt_bulk_copy && options.allow_encrypted_value_modifications;
 
-            let (providers, cek_cache) = {
-                let client_context =
-                    self.recovery_context
-                        .client_context
-                        .as_ref()
-                        .ok_or_else(|| {
-                            crate::error::Error::ColumnEncryptionError(
-                                "Cannot encrypt bulk copy values without a client context"
-                                    .to_string(),
-                            )
-                        })?;
-                (
-                    client_context.column_encryption_key_store_providers.clone(),
-                    client_context.cek_cache.clone(),
-                )
-            };
+        let plaintext_ceks: Vec<Option<std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>>> =
+            if encrypt_bulk_copy && !passthrough_ciphertext {
+                use crate::security::keystore::decrypt_cek;
 
-            let mut ceks = Vec::with_capacity(mapped_column_metadata.len());
-            for col in &mapped_column_metadata {
-                match &col.encryption {
-                    Some(enc) => {
-                        let cek = decrypt_cek(&providers, &cek_cache, &enc.cek_entry).await?;
-                        ceks.push(Some(cek));
+                let (providers, cek_cache) = {
+                    let client_context =
+                        self.recovery_context
+                            .client_context
+                            .as_ref()
+                            .ok_or_else(|| {
+                                crate::error::Error::ColumnEncryptionError(
+                                    "Cannot encrypt bulk copy values without a client context"
+                                        .to_string(),
+                                )
+                            })?;
+                    (
+                        client_context.column_encryption_key_store_providers.clone(),
+                        client_context.cek_cache.clone(),
+                    )
+                };
+
+                let mut ceks = Vec::with_capacity(mapped_column_metadata.len());
+                for col in &mapped_column_metadata {
+                    match &col.encryption {
+                        Some(enc) => {
+                            let cek = decrypt_cek(&providers, &cek_cache, &enc.cek_entry).await?;
+                            ceks.push(Some(cek));
+                        }
+                        None => ceks.push(None),
                     }
-                    None => ceks.push(None),
                 }
-            }
-            ceks
-        } else {
-            Vec::new()
-        };
+                ceks
+            } else {
+                Vec::new()
+            };
 
         let mut packet_writer = PacketWriter::new(
             PacketType::BulkLoad,
@@ -878,8 +885,13 @@ impl TdsClient {
         );
 
         // Enable Always Encrypted serialization before writing metadata so the
-        // COLMETADATA carries the CEK table and per-column crypto metadata.
-        if !plaintext_ceks.is_empty() {
+        // COLMETADATA carries the CEK table and per-column crypto metadata. Under
+        // ciphertext passthrough the metadata is still emitted, but values are
+        // sent verbatim rather than encrypted, so no plaintext CEKs are attached.
+        if passthrough_ciphertext {
+            writer.set_column_encryption_enabled(true);
+            writer.set_allow_encrypted_value_modifications(true);
+        } else if !plaintext_ceks.is_empty() {
             writer.set_column_encryption_enabled(true);
             writer.set_plaintext_ceks(plaintext_ceks);
         }

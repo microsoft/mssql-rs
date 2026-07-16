@@ -1377,6 +1377,59 @@ mod always_encrypted {
         }
     }
 
+    /// `allow_encrypted_value_modifications` lets bulk copy move ciphertext
+    /// between two columns that share a CEK without the driver re-encrypting it:
+    /// the raw ciphertext read from one encrypted column is bulk-copied verbatim
+    /// into another and still decrypts to the original plaintext.
+    #[tokio::test]
+    async fn bulk_copy_allow_encrypted_value_modifications_passthrough() {
+        ae_test!(|h| {
+            const SECRET: i32 = 4242;
+
+            // Source table: insert through an encrypted parameter, then read the
+            // raw ciphertext back over an AE-disabled connection.
+            let source = h.create_encrypted_table("INT", "DETERMINISTIC").await;
+            h.insert_encrypted(&source, SqlType::Int(Some(SECRET)))
+                .await;
+            let ciphertext = read_ciphertext(&source, 1).await;
+
+            // Destination table with the same CEK / algorithm / encryption type.
+            let enc = h.enc_clause("DETERMINISTIC");
+            let dest = h
+                .create_table(&format!("id INT NOT NULL, val INT {enc} NULL"))
+                .await;
+
+            // Bulk-copy the ciphertext verbatim into the encrypted column. Without
+            // passthrough the driver would try to encrypt these bytes again.
+            let rows = vec![GenericBulkRow {
+                values: vec![
+                    ColumnValues::Int(1),
+                    ColumnValues::Bytes(ciphertext.clone()),
+                ],
+            }];
+            let result = BulkCopy::new(&mut h.client, dest.as_str())
+                .allow_encrypted_value_modifications(true)
+                .write_to_server_zerocopy(rows)
+                .await
+                .expect("passthrough bulk copy into encrypted column");
+            assert_eq!(result.rows_affected, 1, "expected one row copied");
+
+            // The destination stores the identical ciphertext at rest.
+            let dest_ciphertext = read_ciphertext(&dest, 1).await;
+            assert_eq!(
+                dest_ciphertext, ciphertext,
+                "passthrough must store the ciphertext verbatim"
+            );
+
+            // Reading the destination over the AE-enabled connection decrypts it
+            // back to the original plaintext, proving the ciphertext was valid.
+            let got = h
+                .query_rows(&format!("SELECT val FROM {dest} WHERE id = 1;"), 1)
+                .await;
+            assert_eq!(got, vec![vec![ColumnValues::Int(SECRET)]]);
+        });
+    }
+
     /// Bulk-copying string and binary values into encrypted columns encrypts each
     /// one on the client and round-trips it back transparently decrypted.
     #[tokio::test]
