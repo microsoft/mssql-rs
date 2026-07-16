@@ -1,0 +1,94 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+#
+# Runs the mssql-odbc C++ gtest e2e suite (tests/e2e/run_e2e.sh) against a
+# SQL Server brought up in Docker. Reuses the repo's existing SQL setup:
+# generated TLS cert (scripts/generate_cert.sh), conf/mssql.conf, the job-scoped
+# SQL_PASSWORD, and the sa login. Failing tests are retried via ctest until-pass.
+
+parameters:
+- name: retries
+  displayName: Number of times to rerun a failing e2e test before failing the build
+  type: number
+  default: 3
+
+steps:
+- template: generate-sql-password-template.yml
+  parameters:
+    osType: Linux
+
+- task: DockerInstaller@0
+  inputs:
+    dockerVersion: '29.0.0'
+  displayName: Install Docker
+
+- template: install-ubuntu-dependency.yaml
+  parameters:
+    installAzCli: false
+    installDocker: true
+
+- script: |
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    sudo apt-get update
+    sudo apt-get install -y cmake unixodbc-dev
+    cmake --version
+  displayName: Install e2e build dependencies (cmake, unixodbc-dev)
+
+- script: |
+    set -euo pipefail
+    # Generate TLS cert for SQL Server (same pattern as sql-setup-template.yml)
+    scripts/generate_cert.sh
+    sudo chown 10001:0 mssql.*
+
+    docker network create testnet
+
+    docker run -e "ACCEPT_EULA=Y" \
+      -e "MSSQL_SA_PASSWORD=$(SQL_PASSWORD)" \
+      -p 1433:1433 \
+      --hostname sql1 \
+      --network testnet \
+      --name sqlserver \
+      -v $PWD/conf/mssql.conf:/var/opt/mssql/mssql.conf \
+      -v $PWD/mssql.pem:/etc/ssl/certs/mssql.pem \
+      -v $PWD/mssql.key:/etc/ssl/private/mssql.key \
+      -u 0:0 \
+      -d mcr.microsoft.com/mssql/server:2025-latest
+
+    echo "Waiting for SQL Server to accept connections..."
+    for i in $(seq 1 30); do
+      docker exec sqlserver /opt/mssql-tools18/bin/sqlcmd \
+        -S localhost -U sa -P "$(SQL_PASSWORD)" -C -Q "SELECT 1" 2>/dev/null && break
+      echo "  attempt $i/30..."
+      sleep 2
+    done
+  displayName: Run SQL Server in Docker
+  env:
+    SQL_PASSWORD: $(SQL_PASSWORD)
+
+- script: |
+    set -euo pipefail
+    ./mssql-odbc/tests/e2e/run_e2e.sh --retries=${{ parameters.retries }}
+  displayName: Build driver and run ODBC e2e tests
+  env:
+    SQL_PASSWORD: $(SQL_PASSWORD)
+    ODBC_TEST_SERVER: localhost
+    ODBC_TEST_UID: sa
+    ODBC_TEST_PWD: $(SQL_PASSWORD)
+    ODBC_TEST_TRUST_CERT: 'Yes'
+    RUST_BACKTRACE: full
+
+- task: PublishTestResults@2
+  condition: succeededOrFailed()
+  displayName: Publish ODBC e2e test results
+  inputs:
+    testResultsFormat: 'JUnit'
+    testResultsFiles: '$(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml'
+    testRunTitle: 'ODBC e2e (Linux)'
+
+- script: |
+    docker stop sqlserver || true
+    docker rm sqlserver || true
+    docker network rm testnet || true
+  displayName: Cleanup
+  condition: always()

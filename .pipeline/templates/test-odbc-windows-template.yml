@@ -1,0 +1,55 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+#
+# Runs the mssql-odbc C++ gtest e2e suite (tests/e2e/run_e2e.ps1) against the
+# SQL Server preinstalled on the Windows build image. Reuses sql-setup-template
+# (Windows) to configure the sa/testuser logins, SQL_PASSWORD, and TLS certs.
+# run_e2e.ps1 registers the freshly built driver in HKLM (requires an elevated
+# agent) and restores the prior registration on exit. Failing tests are retried
+# via ctest until-pass.
+
+parameters:
+- name: retries
+  displayName: Number of times to rerun a failing e2e test before failing the build
+  type: number
+  default: 3
+
+steps:
+- template: sql-setup-template.yml
+  parameters:
+    buildTarget: Windows
+
+- pwsh: |
+    $ErrorActionPreference = 'Stop'
+    if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+      $candidate = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse `
+        -Filter 'cmake.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($candidate) {
+        Write-Host "Adding cmake to PATH: $($candidate.DirectoryName)"
+        Write-Host "##vso[task.prependpath]$($candidate.DirectoryName)"
+      } else {
+        throw "cmake not found on the agent. It is required to build the ODBC e2e tests."
+      }
+    }
+    cmake --version
+  displayName: Ensure cmake is available
+
+- pwsh: |
+    $ErrorActionPreference = 'Stop'
+    ./mssql-odbc/tests/e2e/run_e2e.ps1 -Retries ${{ parameters.retries }}
+  displayName: Build driver and run ODBC e2e tests
+  env:
+    SQL_PASSWORD: $(SQL_PASSWORD)
+    ODBC_TEST_SERVER: 'localhost,1433'
+    ODBC_TEST_UID: sa
+    ODBC_TEST_PWD: $(SQL_PASSWORD)
+    ODBC_TEST_TRUST_CERT: 'Yes'
+    RUST_BACKTRACE: full
+
+- task: PublishTestResults@2
+  condition: succeededOrFailed()
+  displayName: Publish ODBC e2e test results
+  inputs:
+    testResultsFormat: 'JUnit'
+    testResultsFiles: '$(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml'
+    testRunTitle: 'ODBC e2e (Windows)'

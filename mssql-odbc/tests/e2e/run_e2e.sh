@@ -9,10 +9,14 @@
 # For Windows, see run_e2e.ps1 (uses the Windows registry instead).
 #
 # Usage:
-#   ./run_e2e.sh [--release] [--verbose]
+#   ./run_e2e.sh [--release] [--verbose] [--retries=N]
 #                [--compare-with-msodbcsql] [--msodbcsql-ini=PATH]
 #
 # Default: runs the e2e suite against mssql-odbc only.
+#
+# --retries=N reruns each failing test up to N extra times (ctest
+# --repeat until-pass:N+1). A test that passes on any attempt counts as a
+# pass; the suite only fails if a test still fails after all retries.
 #
 # With --compare-with-msodbcsql, the script reruns the same suite against
 # the Microsoft C++ driver registered in --msodbcsql-ini (default
@@ -46,6 +50,7 @@ DRIVER_SECTION="ODBC Driver 18 for SQL Server"
 BUILD_TYPE="debug"
 VERBOSE=0
 COMPARE=0
+RETRIES=0
 MSODBCSQL_INI="/etc/odbcinst.ini"
 
 CTEST_ARGS=(--output-on-failure)
@@ -68,6 +73,7 @@ parse_args() {
                 CTEST_ARGS=(-V --output-on-failure)
                 ;;
             --compare-with-msodbcsql) COMPARE=1 ;;
+            --retries=*) RETRIES="${arg#--retries=}" ;;
             --msodbcsql-ini=*) MSODBCSQL_INI="${arg#--msodbcsql-ini=}" ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown argument: $arg" >&2; usage >&2; exit 2 ;;
@@ -291,6 +297,11 @@ PY
 # ----------------------------------------------------------------------------
 main() {
     parse_args "$@"
+    if [ "$RETRIES" -gt 0 ] 2>/dev/null; then
+        # until-pass:N runs a failing test up to N times total, so N retries = N+1.
+        CTEST_ARGS+=(--repeat "until-pass:$((RETRIES + 1))")
+        echo "Retries enabled: each failing test reruns up to $RETRIES time(s)."
+    fi
     setup_tracing
     setup_dev_sql_env
     build_rust_driver
