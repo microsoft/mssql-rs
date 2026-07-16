@@ -1,12 +1,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 #
-# Runs the mssql-odbc C++ gtest e2e suite (tests/e2e/run_e2e.ps1) against the
-# SQL Server preinstalled on the Windows build image. Reuses sql-setup-template
-# (Windows) to configure the sa/testuser logins, SQL_PASSWORD, and TLS certs.
-# run_e2e.ps1 registers the freshly built driver in HKLM (requires an elevated
-# agent) and restores the prior registration on exit. Failing tests are retried
-# via ctest until-pass.
+# ODBC C++ gtest e2e steps for the Build_Windows job. Reuses the SQL Server the
+# job already provisioned via sql-setup-template (localhost:1433, sa /
+# $(SQL_PASSWORD)) instead of standing up a new instance. run_e2e.ps1 registers
+# the freshly built driver in HKLM (Build_Windows runs elevated) and restores the
+# prior registration on exit. PR-only; failing tests are retried via ctest
+# until-pass so a flaky run does not fail the build.
 
 parameters:
 - name: retries
@@ -15,10 +15,6 @@ parameters:
   default: 3
 
 steps:
-- template: sql-setup-template.yml
-  parameters:
-    buildTarget: Windows
-
 - pwsh: |
     $ErrorActionPreference = 'Stop'
     if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
@@ -32,12 +28,14 @@ steps:
       }
     }
     cmake --version
-  displayName: Ensure cmake is available
+  displayName: 'ODBC e2e: ensure cmake is available'
+  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
 - pwsh: |
     $ErrorActionPreference = 'Stop'
     ./mssql-odbc/tests/e2e/run_e2e.ps1 -Retries ${{ parameters.retries }}
-  displayName: Build driver and run ODBC e2e tests
+  displayName: 'ODBC e2e: build driver and run tests'
+  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
   env:
     SQL_PASSWORD: $(SQL_PASSWORD)
     ODBC_TEST_SERVER: 'localhost,1433'
@@ -47,8 +45,8 @@ steps:
     RUST_BACKTRACE: full
 
 - task: PublishTestResults@2
-  condition: succeededOrFailed()
-  displayName: Publish ODBC e2e test results
+  condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+  displayName: 'Publish ODBC e2e test results'
   inputs:
     testResultsFormat: 'JUnit'
     testResultsFiles: '$(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml'

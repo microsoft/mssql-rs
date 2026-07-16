@@ -261,6 +261,35 @@ steps:
       CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
       CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
+  # ODBC C++ gtest e2e suite against the same in-network SQL Server (sql1) this
+  # job already uses. Runs inside the build container; the containerized script
+  # installs cmake + unixODBC-dev (absent from the build image) then invokes
+  # run_e2e.sh. PR-only, matching the Rust test pass above.
+  - script: |
+      BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
+
+      bash .pipeline/scripts/docker-cargo-run.sh --rm \
+        --network testnet \
+        -v $PWD:/workspace \
+        -v $HOME/.cargo/registry:/root/.cargo/registry \
+        -v $HOME/.cargo/git:/root/.cargo/git \
+        -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+        -e ODBC_TEST_SERVER="sql1" \
+        -e ODBC_TEST_UID="sa" \
+        -e ODBC_TEST_PWD="$(SQL_PASSWORD)" \
+        -e ODBC_TEST_TRUST_CERT="Yes" \
+        -e ODBC_E2E_RETRIES="3" \
+        -e RUST_BACKTRACE=full \
+        -w /workspace \
+        $BUILD_IMAGE \
+        /workspace/.pipeline/scripts/containerized-odbc-e2e.sh
+    displayName: Run ODBC e2e tests
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
 # ARM64 runs the same test pass but against the cross-pool SQL host resolved
 # by poll-for-endpoint.sh (DB_HOST/DB_PORT). TRUST_SERVER_CERTIFICATE bypasses
 # cert-chain validation so no host-specific cert wiring is needed on the wire.
@@ -292,6 +321,36 @@ steps:
       CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
       CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
+  # ODBC C++ gtest e2e suite against the cross-pool SQL host (DB_HOST:DB_PORT).
+  # TrustServerCertificate=Yes (ODBC_TEST_TRUST_CERT) bypasses cert validation,
+  # matching the Rust ARM test pass above. PR-only.
+  - script: |
+      BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
+
+      bash .pipeline/scripts/docker-cargo-run.sh --rm \
+        --network testnet \
+        -v $PWD:/workspace \
+        -v $HOME/.cargo/registry:/root/.cargo/registry \
+        -v $HOME/.cargo/git:/root/.cargo/git \
+        -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+        -e ODBC_TEST_SERVER="$(DB_HOST),$(DB_PORT)" \
+        -e ODBC_TEST_UID="sa" \
+        -e ODBC_TEST_PWD="$(SQL_PASSWORD)" \
+        -e ODBC_TEST_TRUST_CERT="Yes" \
+        -e ODBC_E2E_RETRIES="3" \
+        -e RUST_BACKTRACE=full \
+        -w /workspace \
+        $BUILD_IMAGE \
+        /workspace/.pipeline/scripts/containerized-odbc-e2e.sh
+    displayName: Run ODBC e2e tests
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+      DB_HOST: $(DB_HOST)
+      DB_PORT: $(DB_PORT)
+      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
 - task: PublishTestResults@2
   condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
   displayName: Publish test results
@@ -299,6 +358,18 @@ steps:
     testResultsFormat: JUnit
     testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
     testRunTitle: $(System.PhaseName)
+    failTaskOnFailedTests: false
+    publishRunAttachments: true
+
+# ODBC e2e JUnit (written by run_e2e.sh inside the container to the mounted
+# workspace). Shared by the x64 and ARM ODBC steps above; PR-only.
+- task: PublishTestResults@2
+  condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+  displayName: Publish ODBC e2e test results
+  inputs:
+    testResultsFormat: JUnit
+    testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
+    testRunTitle: $(System.PhaseName)-ODBC
     failTaskOnFailedTests: false
     publishRunAttachments: true
 
