@@ -131,3 +131,33 @@ def test_cursor_bulkcopy_arrow_datetime2_null_to_non_nullable_column(client_cont
         cursor.bulkcopy_arrow(table_name, source, batch_size=1000, timeout=30)
 
     conn.close()
+
+
+@pytest.mark.integration
+def test_cursor_bulkcopy_arrow_datetime2_scale_zero(client_context):
+    """DATETIME2(0) preserves the explicit scale 0 (sub-second precision dropped).
+
+    Regression test: the destination scale (0) must be honored, not overridden
+    by the Arrow microsecond unit.
+    """
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "#BCArrowDateTime2ScaleZero"
+    cursor.execute(f"CREATE TABLE {table_name} (ts DATETIME2(0) NOT NULL)")
+
+    source = pa.table(
+        {
+            "ts": pa.array(
+                [datetime.datetime(2024, 1, 15, 9, 30, 15)], type=pa.timestamp("us")
+            )
+        }
+    )
+
+    result = cursor.bulkcopy_arrow(table_name, source, batch_size=1000, timeout=30)
+    assert result["rows_copied"] == 1
+
+    cursor.execute(f"SELECT ts FROM {table_name}")
+    assert cursor.fetchone()[0] == datetime.datetime(2024, 1, 15, 9, 30, 15)
+
+    conn.close()

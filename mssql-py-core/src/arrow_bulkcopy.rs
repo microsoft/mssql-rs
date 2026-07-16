@@ -214,13 +214,13 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
         (DataType::Timestamp(unit, tz), S::DateTime2) if tz.is_none() => {
             ColumnPlanKind::TimestampDateTime2 {
                 unit: *unit,
-                scale: pick_timestamp_scale(*unit, dest.scale),
+                scale: pick_timestamp_scale(dest.scale),
             }
         }
         (DataType::Timestamp(unit, tz), S::DateTimeOffset) if tz.is_some() => {
             ColumnPlanKind::TimestampDateTimeOffset {
                 unit: *unit,
-                scale: pick_timestamp_scale(*unit, dest.scale),
+                scale: pick_timestamp_scale(dest.scale),
             }
         }
         // Tz-aware timestamp -> datetime2 would silently drop the timezone.
@@ -236,13 +236,13 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
         (DataType::Time32(unit @ (TimeUnit::Second | TimeUnit::Millisecond)), S::Time) => {
             ColumnPlanKind::Time {
                 unit: *unit,
-                scale: pick_timestamp_scale(*unit, dest.scale),
+                scale: pick_timestamp_scale(dest.scale),
             }
         }
         (DataType::Time64(unit @ (TimeUnit::Microsecond | TimeUnit::Nanosecond)), S::Time) => {
             ColumnPlanKind::Time {
                 unit: *unit,
-                scale: pick_timestamp_scale(*unit, dest.scale),
+                scale: pick_timestamp_scale(dest.scale),
             }
         }
 
@@ -289,18 +289,13 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
     Ok(kind)
 }
 
-/// Pick a TDS scale for a timestamp/time column. Honor an explicit destination
-/// scale if it was advertised; otherwise default by Arrow [`TimeUnit`].
-fn pick_timestamp_scale(unit: TimeUnit, dest_scale: u8) -> u8 {
-    if dest_scale > 0 {
-        return dest_scale.min(7);
-    }
-    match unit {
-        TimeUnit::Second => 0,
-        TimeUnit::Millisecond => 3,
-        TimeUnit::Microsecond => 6,
-        TimeUnit::Nanosecond => 7,
-    }
+/// TDS scale for a timestamp/time column: trust the destination column's
+/// advertised scale (0..=7). SQL Server always reports it for
+/// `time`/`datetime2`/`datetimeoffset`, so scale 0 is an explicit `TIME(0)` /
+/// `DATETIME2(0)` / `DATETIMEOFFSET(0)`, never "unknown" — the Arrow `TimeUnit`
+/// must not override it.
+fn pick_timestamp_scale(dest_scale: u8) -> u8 {
+    dest_scale.min(7)
 }
 
 impl ColumnPlan {
@@ -1238,6 +1233,29 @@ mod tests {
         match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
             ColumnValues::Json(j) => assert_eq!(j.bytes, b"{\"a\":1}"),
             other => panic!("expected Json, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn datetime2_scale_zero_preserved() {
+        // DATETIME2(0): an explicit scale 0 must not be overridden by the Arrow unit.
+        let dest = meta_dt2("ts", 0);
+        let plan = one_col_plan(DataType::Timestamp(TimeUnit::Microsecond, None), &dest);
+        match plan.kind {
+            ColumnPlanKind::TimestampDateTime2 { scale, .. } => assert_eq!(scale, 0),
+            other => panic!("expected TimestampDateTime2, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn time_scale_zero_preserved() {
+        // TIME(0): an explicit scale 0 is preserved.
+        let mut dest = meta("t", SqlDbType::Time, true);
+        dest.scale = 0;
+        let plan = one_col_plan(DataType::Time64(TimeUnit::Microsecond), &dest);
+        match plan.kind {
+            ColumnPlanKind::Time { scale, .. } => assert_eq!(scale, 0),
+            other => panic!("expected Time, got {:?}", other),
         }
     }
 }

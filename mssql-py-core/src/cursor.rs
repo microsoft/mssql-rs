@@ -624,7 +624,8 @@ impl PyCoreCursor {
                 let plans_arc = Arc::new(plans);
                 let dest_arc = Arc::new(destination_metadata);
 
-                let row_iter = ArrowRowIter::new(reader, plans_arc, dest_arc);
+                let read_error = Arc::new(std::sync::Mutex::new(None::<String>));
+                let row_iter = ArrowRowIter::new(reader, plans_arc, dest_arc, read_error.clone());
 
                 let bulk_result =
                     bulk_copy
@@ -634,6 +635,13 @@ impl PyCoreCursor {
                             error!("bulkcopy_arrow: write_to_server_zerocopy failed: {}", e);
                             convert_tds_error(e)
                         })?;
+
+                // A batch read/import error is captured out-of-band because the
+                // iterator cannot return a Result; surface it rather than
+                // reporting a partial (silently truncated) success.
+                if let Some(msg) = read_error.lock().unwrap().take() {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(msg));
+                }
 
                 Ok::<_, PyErr>(bulk_result)
             })
@@ -1306,6 +1314,11 @@ struct ArrowRowIter {
     current: Option<Arc<RecordBatch>>,
     row_idx: usize,
     finished: bool,
+    /// Captures a batch read/import failure. The `Iterator` cannot return a
+    /// `Result`, so on error the iterator stops and the caller checks this cell
+    /// after the write to surface the error instead of reporting a partial
+    /// (silently truncated) success.
+    read_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ArrowRowIter {
@@ -1313,6 +1326,7 @@ impl ArrowRowIter {
         reader: Py<PyAny>,
         plans: Arc<Vec<ColumnPlan>>,
         dest_metadata: Arc<Vec<mssql_tds::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata>>,
+        read_error: Arc<std::sync::Mutex<Option<String>>>,
     ) -> Self {
         Self {
             reader,
@@ -1321,6 +1335,7 @@ impl ArrowRowIter {
             current: None,
             row_idx: 0,
             finished: false,
+            read_error,
         }
     }
 
@@ -1380,6 +1395,8 @@ impl Iterator for ArrowRowIter {
                 Ok(false) => return None,
                 Err(e) => {
                     error!("ArrowRowIter::next: {}", e);
+                    *self.read_error.lock().unwrap() = Some(e);
+                    self.finished = true;
                     return None;
                 }
             }

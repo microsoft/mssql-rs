@@ -145,3 +145,28 @@ def test_bulkcopy_arrow_batch_size_zero_single_batch(client_context):
     finally:
         cursor.execute(f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL DROP TABLE {table_name}")
         conn.close()
+
+
+@pytest.mark.integration
+def test_bulkcopy_arrow_iterator_error_propagates(client_context):
+    """A mid-stream RecordBatch generator error must abort, not silently truncate.
+
+    Regression test: an error while pulling a later Arrow batch has to surface as
+    a failure instead of being treated as end-of-stream (partial success).
+    """
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "#BCArrowIterError"
+    cursor.execute(f"CREATE TABLE {table_name} (id INT NOT NULL)")
+
+    schema = pa.schema([("id", pa.int32())])
+
+    def batches():
+        yield pa.record_batch([pa.array([1, 2], type=pa.int32())], schema=schema)
+        raise RuntimeError("boom mid-stream")
+
+    with pytest.raises(Exception):
+        cursor.bulkcopy_arrow(table_name, batches(), batch_size=1000, timeout=30)
+
+    conn.close()
