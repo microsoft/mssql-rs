@@ -18,7 +18,9 @@ contribution guide.
 Required: link a GitHub issue OR an Azure DevOps work item. The PR check will
 fail without one.
 GitHub issue: Fixes #123 (or https://github.com/microsoft/mssql-rs/issues/123)
-ADO work item: https://sqlclientdrivers.visualstudio.com/<project>/_workitems/edit/<ID>
+ADO work item: https://sqlclientdrivers.visualstudio.com/<...>/_workitems/edit/<ID>
+  (any project/collection path is accepted, e.g. .../<project>/_workitems/edit/123
+  or .../DefaultCollection/<project>/_workitems/edit/123)
 -->
 
 ## Checklist

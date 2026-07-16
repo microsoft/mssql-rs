@@ -27,7 +27,7 @@ jobs:
             const githubIssueLinkPattern =
               /(https:\/\/github\.com\/microsoft\/mssql-rs\/issues\/\d+|#\d+)/i;
             const azureWorkItemLinkPattern =
-              /https:\/\/sqlclientdrivers\.visualstudio\.com\/[^\/]+\/_workitems\/edit\/\d+/i;
+              /https:\/\/sqlclientdrivers\.visualstudio\.com\/(?:[^\/\s]+\/)+_workitems\/edit\/\d+/i;
 
             const hasGitHubIssueLink = githubIssueLinkPattern.test(body);
             const hasWorkItemLink = azureWorkItemLinkPattern.test(body);
