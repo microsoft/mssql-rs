@@ -1684,7 +1684,7 @@ impl TdsClient {
     /// works regardless of which drain path reads the stream.
     fn push_return_value(&mut self, return_value: ReturnValue) {
         if self.expecting_prepare_handle
-            && self.return_values.is_empty()
+            && return_value.param_ordinal == 0
             && let ColumnValues::Int(handle) = &return_value.value
         {
             self.prepared_statement_handle = Some(*handle);

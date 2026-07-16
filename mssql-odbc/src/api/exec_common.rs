@@ -153,9 +153,7 @@ pub(super) fn fail_with_tds(
 /// rebind, or `SQLExecDirect` supersede) via `sp_unprepare`, using the already
 /// claimed `client`. Best-effort: any failure is logged and swallowed — a
 /// leaked handle is freed when the connection closes, and must not fail the
-/// caller's execution. Mirrors msodbcsql dropping the prior prepared handle at
-/// the next execute (it piggybacks the drop onto `sp_prepexec`; we issue a
-/// separate `sp_unprepare` since our TDS RPC can't carry the input handle).
+/// caller's execution.
 ///
 /// No lock is held across the network I/O.
 pub(super) fn flush_pending_unprepare(
