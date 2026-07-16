@@ -363,6 +363,11 @@ steps:
 
 # ODBC e2e JUnit (written by run_e2e.sh inside the container to the mounted
 # workspace). Shared by the x64 and ARM ODBC steps above; PR-only.
+#
+# ODBC e2e runs on Linux x64 + ARM only. Windows is intentionally excluded: the
+# driver exports a Unicode-only surface with no SQLConnectW, so the Windows Driver
+# Manager classifies it as ANSI and the live tests fail at SQLDriverConnect with
+# IM001. Re-enable a Windows ODBC e2e step once the driver exports SQLConnectW.
 - task: PublishTestResults@2
   condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
   displayName: Publish ODBC e2e test results
