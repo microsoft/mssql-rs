@@ -30,6 +30,12 @@ authoritative parity reference for this crate. Its source lives in the
   from** msodbcsql so the trade-off is visible.
 - Deliberate deviations (exceed-parity) are allowed with product-owner sign-off;
   record the rationale in code comments and the tracking work item.
+- Deliberate deviations are listed below:
+  - `ActiveDirectoryManagedIdentity` is accepted as an alias for managed-identity
+    authentication. msodbcsql recognizes only `ActiveDirectoryMSI`
+    (`Sql/Ntdbms/sqlncli/msdart/inc/dlgattr.h` → `OPTIONADMSI L"ActiveDirectoryMSI"`);
+    `ActiveDirectoryManagedIdentity` does not appear anywhere in the msodbcsql source.
+    Added to match MS Learn and the sibling drivers (JDBC/.NET/go-sqlcmd). Tracked in AB#46066.
 
 ## No panics
 
