@@ -11,6 +11,8 @@
 //! (`encryption`), `sp_describe_parameter_encryption` parsing
 //! (`describe_parameter_encryption`), the cell-decryptor seam
 //! (`cell_decryptor`), and the column master key store providers (`keystore`).
+//! Results of `sp_describe_parameter_encryption` are cached per connection by
+//! the query-metadata cache (`query_metadata_cache`).
 //!
 //! # Platform Support
 //!
@@ -29,6 +31,7 @@ pub(crate) mod encryption;
 mod error;
 pub(crate) mod keystore;
 pub mod mock;
+pub(crate) mod query_metadata_cache;
 mod security_context;
 mod spn;
 
