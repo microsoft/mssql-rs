@@ -140,6 +140,9 @@ pub const SQL_DIAG_MESSAGE_TEXT: SqlSmallInt = 6;
 // Special length/indicator constants.
 pub const SQL_NULL_DATA: SqlLen = -1;
 pub const SQL_DATA_AT_EXEC: SqlLen = -2;
+/// Driver-supplied "length unknown" indicator; never a valid application input
+/// length.
+pub const SQL_NO_TOTAL: SqlLen = -4;
 
 // SQLBindParameter extensions
 pub const SQL_DEFAULT_PARAM: SqlLen = -5;

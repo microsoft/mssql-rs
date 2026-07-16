@@ -21,7 +21,7 @@ use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
 };
 use crate::handles::{DbcHandle, StmtHandle};
-use crate::params::convert::bound_param_to_rpc;
+use crate::params::convert::{ParamConvError, bound_param_to_rpc};
 
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
 /// statement is reusable.
@@ -206,6 +206,11 @@ pub(super) unsafe fn build_named_params(
         let name = format!("@P{}", i + 1);
         match unsafe { bound_param_to_rpc(name, bound_param) } {
             Ok(param) => named_params.push(param),
+            Err(ParamConvError::InvalidLength(len)) => {
+                error!("{op}: parameter {} has invalid StrLen_or_Ind {len}", i + 1);
+                post_diag(stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+                return Err(SQL_ERROR);
+            }
             Err(e) => {
                 error!(
                     "{op}: parameter {} conversion failed: {}",

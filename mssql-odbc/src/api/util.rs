@@ -81,10 +81,23 @@ pub(crate) unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> St
 /// `@P2`, …) and returns the rewritten SQL together with the marker count.
 ///
 /// `?` inside string literals (`'…'`), quoted identifiers (`"…"` / `[…]`), and
-/// comments (`-- …` to end of line, `/* … */`, nested per T-SQL) is left
-/// untouched. `''`, `""`, and `]]` are treated as escaped quote characters, not
-/// delimiters. Markers are numbered 1-based in source order, matching the
-/// `@P1…` names used to build the `sp_prepare` parameter declaration.
+/// comments (`-- …` to end of line, `/* … */`) is left untouched. `''`, `""`,
+/// and `]]` are treated as escaped quote characters, not delimiters. Markers are
+/// numbered 1-based in source order, matching the `@P1…` names used to build the
+/// `sp_prepare` parameter declaration.
+///
+/// This intentionally mirrors msodbcsql's marker lexer
+/// (`ComputeParamInfo` / `CParamOffsetInfo::GetParameterInfo` in `sqlccmd.cpp`)
+/// for behavioral parity, including two deliberate quirks that differ from a
+/// strict T-SQL lexer:
+/// - **Block comments do not nest** — scanning stops at the first `*/`, so a `?`
+///   between an inner `*/` and the outer `*/` in `/* … /* … */ ? … */` is
+///   treated as a marker
+/// - **`--(* … *)--` vendor canonical-extension escape is not a comment** — a
+///   `--` that opens `--(*`, or that is immediately preceded by `*)`, is passed
+///   through rather than starting a line comment. A shared consequence is that
+///   `COUNT(*)--…` is *not* treated as a line comment (a `?` inside it is
+///   counted), matching msodbcsql.
 pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
     #[derive(PartialEq)]
     enum State {
@@ -99,6 +112,8 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
     let mut out = String::with_capacity(sql.len() + 8);
     let mut count: usize = 0;
     let mut state = State::Normal;
+    // The two preceding characters, used to detect the `*)--` close of an ODBC
+    // canonical-extension escape
     let mut prev1: Option<char> = None;
     let mut prev2: Option<char> = None;
     let mut chars = sql.chars().peekable();
@@ -124,6 +139,9 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
                     out.push(c);
                 }
                 '-' if chars.peek() == Some(&'-') => {
+                    // A `--` is a line comment unless it opens (`--(*`) or closes
+                    // (`*)--`, detected via the two preceding chars) an ODBC vendor
+                    // canonical extension, which is passed through as normal text.
                     let starts_canonical_extension = matches!(chars.clone().nth(1), Some('('))
                         && matches!(chars.clone().nth(2), Some('*'));
                     let ends_canonical_extension =
@@ -193,6 +211,7 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
                 }
             }
             State::BlockComment => {
+                // Non-nesting: the first `*/` closes the comment (msodbcsql parity).
                 out.push(c);
                 if c == '*' && chars.peek() == Some(&'/') {
                     if let Some(n) = chars.next() {
@@ -280,8 +299,20 @@ mod tests {
 
     #[test]
     fn rewrite_skips_block_comment_until_first_close() {
+        // Block comments do not nest (msodbcsql parity)
         let (out, n) = rewrite_param_markers("/* a /* ? */ ? */ x = ?");
         assert_eq!(out, "/* a /* ? */ @P1 */ x = @P2");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn rewrite_count_star_line_comment_is_not_a_comment_msodbcsql_parity() {
+        // Known quirk shared with msodbcsql: a `--` immediately preceded by `*)`
+        // is treated as the close of a `--(* … *)--` canonical extension, not a
+        // line comment. So `COUNT(*)--…` is NOT a comment and a `?` inside it is
+        // counted as a marker. (A strict T-SQL lexer would treat it as a comment.)
+        let (out, n) = rewrite_param_markers("SELECT COUNT(*)--has a ? here\nWHERE a = ?");
+        assert_eq!(out, "SELECT COUNT(*)--has a @P1 here\nWHERE a = @P2");
         assert_eq!(n, 2);
     }
 

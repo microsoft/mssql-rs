@@ -458,8 +458,11 @@ TEST_F(PrepareExecuteLiveTest, BindParameterNumberZeroReturns07009) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07009");
 }
 
-// Output parameters are not yet supported (Phase 1 input-only).
+// Output parameters are not implemented in Phase 1: mssql-odbc rejects the bind
+// with HYC00. The reference msodbcsql driver supports output params, so this is
+// mssql-odbc-specific behavior — skip it on the msodbcsql comparison leg.
 TEST_F(PrepareExecuteLiveTest, OutputParameterReturnsHyc00) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     std::vector<SQLCHAR> value = {'x', '\0'};
     SQLLEN ind = SQL_NTS;
     SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR,

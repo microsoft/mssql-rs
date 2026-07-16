@@ -6,7 +6,8 @@
 //!
 //! Phase 1 mirrors `SQLGetData`'s supported C types: only `SQL_C_CHAR`
 //! (→ `varchar`) and `SQL_C_WCHAR` (→ `nvarchar`). Every other C type, plus
-//! data-at-execution and default parameters, is rejected with `HYC00`.
+//! data-at-execution and default parameters, is rejected with `HYC00`; an
+//! invalid negative `StrLen_or_Ind` is rejected with `HY090`.
 
 use std::slice;
 
@@ -22,9 +23,16 @@ use crate::api::odbc_types::{
     SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR,
     SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlLen, SqlSmallInt,
 };
+use crate::api::sqlstate::ERR_INVALID_STRING_OR_BUFFER_LENGTH;
 use crate::params::BoundParam;
 
-/// Why a bound parameter could not be converted. All map to SQLSTATE `HYC00`.
+/// Why a bound parameter could not be converted.
+///
+/// The "not yet implemented" variants post `HYC00` via [`message`]; a bad
+/// indicator posts the canonical `HY090` diagnostic
+/// (`ERR_INVALID_STRING_OR_BUFFER_LENGTH`).
+///
+/// [`message`]: ParamConvError::message
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParamConvError {
     /// The application's C type is not supported in Phase 1.
@@ -33,6 +41,8 @@ pub(crate) enum ParamConvError {
     DataAtExecUnsupported,
     /// The parameter requested its default value.
     DefaultParamUnsupported,
+    /// `StrLen_or_Ind` is a negative value that is not a valid input length.
+    InvalidLength(SqlLen),
 }
 
 impl ParamConvError {
@@ -41,6 +51,7 @@ impl ParamConvError {
             Self::UnsupportedCType(_) => "Parameter C type not yet implemented",
             Self::DataAtExecUnsupported => "Data-at-execution parameters not yet implemented",
             Self::DefaultParamUnsupported => "Default parameters not yet implemented",
+            Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH.text,
         }
     }
 }
@@ -80,6 +91,10 @@ pub(crate) unsafe fn bound_param_to_value(param: &BoundParam) -> Result<SqlType,
         }
         if ind == SQL_DATA_AT_EXEC || ind <= SQL_LEN_DATA_AT_EXEC_OFFSET {
             return Err(ParamConvError::DataAtExecUnsupported);
+        }
+        // Any remaining negative indicator  is invalid for an input parameter
+        if ind < 0 && ind != SQL_NTS as SqlLen {
+            return Err(ParamConvError::InvalidLength(ind));
         }
     }
 
@@ -219,7 +234,7 @@ unsafe fn read_wchar_bytes(ptr: *const u16, len_spec: SqlLen) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_LONG, SQL_PARAM_INPUT};
+    use crate::api::odbc_types::{SQL_C_LONG, SQL_NO_TOTAL, SQL_PARAM_INPUT};
     use std::ffi::c_void;
 
     fn param(c_type: SqlSmallInt, ptr: *mut c_void, ind: *mut SqlLen) -> BoundParam {
@@ -282,6 +297,14 @@ mod tests {
         let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
         assert_eq!(err, ParamConvError::DataAtExecUnsupported);
+    }
+
+    #[test]
+    fn invalid_indicator_is_rejected() {
+        let mut ind: SqlLen = SQL_NO_TOTAL;
+        let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
+        let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+        assert_eq!(err, ParamConvError::InvalidLength(SQL_NO_TOTAL));
     }
 
     #[test]

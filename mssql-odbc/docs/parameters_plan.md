@@ -38,6 +38,27 @@ in the ODBC Driver 18 (Rust).
 
 ---
 
+## `mssql-tds` changes
+
+Crate-level delta backing the behavior above (commits `d344abe6`, `ad9c7b9a`,
+plus working-tree edits) — see **Implemented (Phase 1)** for the ODBC-level
+semantics. Files: `src/connection/tds_client.rs`, `tests/test_rpc_results.rs`,
+`tests/test_always_encrypted.rs`.
+
+- `execute_sp_prepexec` gained a `drop_handle: Option<i32>` argument — the handle
+  sent as the by-reference `@handle` input for the piggybacked unprepare (per the
+  `sp_unprepare` bullet above).
+- Handle capture via new `expecting_prepare_handle` / `prepared_statement_handle`
+  fields and `take_prepared_statement_handle()`. The `@handle` RETURNVALUE is
+  routed to that field and **not** surfaced through `get_return_values()` /
+  `retrieve_output_params()`, matching msodbcsql's `OnReturnValue` (handle goes to
+  `hPrepCurrent`, not the user output-param path).
+- Tests: byte-capturing mock transport (`create_capturing_client`) asserting the
+  `@handle` INTN input (`Some(h)` vs NULL), `push_return_value` unit tests, and a
+  live `sp_prepexec` piggyback test; existing callers updated for the new arg.
+
+---
+
 ## Remaining work (TODO)
 
 - **Cache parameter-marker offsets at prepare time.**

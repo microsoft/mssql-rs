@@ -24,6 +24,7 @@ pub(crate) const SQLSTATE_HY009: [u8; 5] = *b"HY009";
 pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
 pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
+pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
 
@@ -101,6 +102,10 @@ pub(crate) const ERR_INVALID_ATTRIBUTE_IDENTIFIER: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_CONNECTION_STRING_ATTRIBUTE: DiagMsg = DiagMsg {
     state: SQLSTATE_01S00,
     text: "Invalid connection string attribute",
+};
+pub(crate) const ERR_INVALID_STRING_OR_BUFFER_LENGTH: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY090,
+    text: "Invalid string or buffer length",
 };
 
 /// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with

@@ -544,23 +544,21 @@ mod rpc_results {
             while resultset.next_row().await.unwrap().is_some() {}
         }
 
-        // Move to next result set to consume remaining tokens (including return values)
+        // Move to next result set to consume remaining tokens (including the
+        // `@handle` return value).
         connection.move_to_next().await.unwrap();
 
-        // Get the prepared handle from output params
-        let out_params = connection.retrieve_output_params().unwrap();
-        assert!(out_params.is_some());
-        let out_params = out_params.unwrap();
-        assert_eq!(out_params.len(), 1);
-
-        let handle_param = out_params.first().unwrap();
-        let retrieved_handle = if let ColumnValues::Int(handle) = handle_param.value {
-            assert!(handle > 0);
-            handle
-        } else {
-            unreachable!("Expected a handle value");
-        };
-        assert_eq!(handle_param.status, ReturnValueStatus::OutputParam);
+        // The sp_prepexec `@handle` is captured into `prepared_statement_handle`
+        // during the drain above and is deliberately NOT surfaced through
+        // `retrieve_output_params()` (see `push_return_value`).
+        assert!(
+            connection.retrieve_output_params().unwrap().is_none(),
+            "the @handle should be diverted, leaving no surfaced output params"
+        );
+        let retrieved_handle = connection
+            .take_prepared_statement_handle()
+            .expect("sp_prepexec should capture the @handle during drain");
+        assert!(retrieved_handle > 0);
 
         // Execute the prepared statement again
         connection
@@ -600,11 +598,12 @@ mod rpc_results {
         }
         connection.move_to_next().await.unwrap();
 
-        let out_params = connection.retrieve_output_params().unwrap().unwrap();
-        match out_params.first().unwrap().value {
-            ColumnValues::Int(handle) => handle,
-            ref other => unreachable!("expected Int handle, got {other:?}"),
-        }
+        // The `@handle` RETURNVALUE arrives after the result set and is captured
+        // into `prepared_statement_handle` during the drain above — it is not
+        // exposed through `retrieve_output_params()` (see `push_return_value`).
+        connection
+            .take_prepared_statement_handle()
+            .expect("sp_prepexec should capture the @handle during drain")
     }
 
     // The sp_prepexec `@handle` piggyback: passing a prior prepared handle as

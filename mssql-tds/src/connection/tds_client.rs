@@ -1466,10 +1466,9 @@ impl TdsClient {
         let sql_statement_value =
             SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql.clone())));
 
-        // The @handle output parameter (RETURNVALUE ordinal 0) is captured as
-        // the response is drained; for a result-returning statement it arrives
-        // after the result set.
-        self.expecting_prepare_handle = true;
+        // Reset any prepared handle from a prior operation. The capture flag is
+        // armed just before the send below so a failure while building the RPC
+        // cannot leave it set.
         self.prepared_statement_handle = None;
 
         // Create the parameter list for sp_prepexec
@@ -1528,11 +1527,27 @@ impl TdsClient {
             &self.execution_context,
         );
 
+        // Clear the flag on any send/read failure so a leaked
+        // `true` cannot miscapture the first Int RETURNVALUE of a later
+        // operation as a prepared handle.
+        self.expecting_prepare_handle = true;
+
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut packet_writer).await?;
+        let serialize_result = rpc.serialize(&mut packet_writer).await;
+        drop(packet_writer);
+        if let Err(e) = serialize_result {
+            self.expecting_prepare_handle = false;
+            return Err(e);
+        }
 
-        let metadata = self.move_to_column_metadata().await?;
+        let metadata = match self.move_to_column_metadata().await {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                self.expecting_prepare_handle = false;
+                return Err(e);
+            }
+        };
         // No metadata means no rows were returned, so we set has_open_batch to false.
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
@@ -1674,6 +1689,7 @@ impl TdsClient {
         {
             self.prepared_statement_handle = Some(*handle);
             self.expecting_prepare_handle = false;
+            return;
         }
         self.return_values.push(return_value);
     }
@@ -4053,6 +4069,66 @@ mod tests {
                 .any(|w| w == expected_null),
             "None must send a NULL @handle input so the server prepares fresh"
         );
+    }
+
+    /// Builds an `Int` RETURNVALUE for exercising `push_return_value` directly.
+    /// The column metadata is irrelevant to the capture logic (which only
+    /// inspects the value), so a minimal INT4 descriptor is used.
+    fn int_return_value(ordinal: u16, value: i32) -> ReturnValue {
+        use crate::datatypes::sqldatatypes::{
+            FixedLengthTypes, TdsDataType, TypeInfo, TypeInfoVariant,
+        };
+        use crate::token::tokenitems::ReturnValueStatus;
+
+        ReturnValue {
+            param_ordinal: ordinal,
+            param_name: String::new(),
+            value: ColumnValues::Int(value),
+            column_metadata: Box::new(ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::IntN,
+                type_info: TypeInfo {
+                    tds_type: TdsDataType::IntN,
+                    length: 4,
+                    type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+                },
+                column_name: String::new(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            }),
+            status: ReturnValueStatus::OutputParam,
+        }
+    }
+
+    #[test]
+    fn push_return_value_captures_handle_then_surfaces_following_output_params() {
+        let mut client = create_test_client();
+        client.expecting_prepare_handle = true;
+
+        // First value = the sp_prepexec @handle: captured into the dedicated
+        // field and NOT surfaced as a user output parameter — mirroring
+        // msodbcsql, which routes it to hPrepCurrent, not the output-param path.
+        client.push_return_value(int_return_value(0, 0x0102_0304));
+
+        assert_eq!(client.prepared_statement_handle, Some(0x0102_0304));
+        assert!(!client.expecting_prepare_handle, "flag must be one-shot");
+        assert!(
+            client.return_values.is_empty(),
+            "the internal handle must not appear in return_values"
+        );
+        assert!(client.get_return_values().is_empty());
+
+        // Subsequent values are genuine output params and must be surfaced.
+        client.push_return_value(int_return_value(1, 7));
+        assert_eq!(client.return_values.len(), 1);
+        assert!(matches!(
+            client.return_values[0].value,
+            ColumnValues::Int(7)
+        ));
+
+        // The captured handle stays retrievable independently of return_values.
+        assert_eq!(client.take_prepared_statement_handle(), Some(0x0102_0304));
     }
 
     #[tokio::test]

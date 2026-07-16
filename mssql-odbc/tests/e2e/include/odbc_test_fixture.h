@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <cstdlib>
 
 /// SQLTCHAR-based string type for ODBC API calls.
 using SqlTString = std::basic_string<SQLTCHAR>;
@@ -67,6 +68,21 @@ using SqlTString = std::basic_string<SQLTCHAR>;
 #define EXPECT_SQLSTATE(handle_type, handle, expected_state)                    \
     EXPECT_EQ(std::string(expected_state),                                     \
               ODBCTestUtils::GetDiagState(handle_type, handle))
+
+// Skip the current test on the msodbcsql leg of a --compare-with-msodbcsql run.
+// The same test binary runs against both drivers; use this at the top of a test
+// that asserts mssql-odbc-specific behavior the full msodbcsql driver does not
+// share (e.g. a Phase-1 "HYC00 not implemented" response). The runner
+// (run_e2e.sh) exports ODBC_TEST_TARGET with the driver under test; a skipped
+// gtest case does not fail the binary, so the parity run stays green.
+#define SKIP_IF_COMPARING_MSODBCSQL()                                          \
+    do {                                                                       \
+        const char* _target = std::getenv("ODBC_TEST_TARGET");                 \
+        if (_target && std::string(_target) == "msodbcsql") {                  \
+            GTEST_SKIP() << "mssql-odbc-specific test; skipped on msodbcsql "   \
+                            "comparison leg";                                  \
+        }                                                                      \
+    } while (0)
 
 // ---------------------------------------------------------------------------
 // Forward declarations
