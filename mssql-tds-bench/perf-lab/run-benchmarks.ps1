@@ -295,28 +295,70 @@ if ($null -ne $script:BenchAffinity) {
     }
 }
 
-# --- Warm-up pass (discarded) ---
-# Prime SQL Server and the OS page cache before the candidate pass; a matching
-# re-warm runs before the baseline pass too (see below), because the long
-# candidate pass plus the baseline rebuild leaves caches cold otherwise.
-Invoke-WarmupPass
+# --- Build both sides, then interleave per bench binary --------------------
+# Make each benchmark's candidate and baseline measurements adjacent in time
+# (cancels the slow drift that otherwise makes the second, baseline pass look
+# spuriously slower) by building BOTH bench binaries up front and running them
+# per-binary back-to-back instead of all-candidate-then-all-baseline. Criterion
+# writes to $env:CRITERION_HOME; both sides point at the shared target/criterion
+# so critcmp can compare them. The two sides build into separate target dirs so
+# both persist. Interleaving per bench BINARY (not per individual bench) keeps
+# setup cost - and total run time - the same as the old two-pass approach.
 
-# --- Candidate run (mssql-tds = working tree) ---
-Write-Host '>>> Candidate benchmarks...'
-Invoke-Bench 'candidate'
+# Returns @{ bench-name = exe-path } for the built bench binaries. $TargetDir
+# sets CARGO_TARGET_DIR so the two sides build into distinct trees.
+function Get-BenchBinaries {
+    param([Parameter(Mandatory)][string]$TargetDir)
+    $bins = @{}
+    $prev = $env:CARGO_TARGET_DIR
+    $env:CARGO_TARGET_DIR = $TargetDir
+    try {
+        $lines = & {
+            $ErrorActionPreference = 'Continue'
+            cargo bench -p mssql-tds-bench --no-run --message-format=json 2>$null
+        }
+        foreach ($line in $lines) {
+            if (-not $line) { continue }
+            try { $m = $line | ConvertFrom-Json } catch { continue }
+            if ($m.executable -and ($m.target.kind -contains 'bench')) {
+                $bins[$m.target.name] = $m.executable
+            }
+        }
+    } finally {
+        if ($null -eq $prev) { Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue }
+        else { $env:CARGO_TARGET_DIR = $prev }
+    }
+    $bins
+}
 
-# --- Baseline run (mssql-tds source swapped to the baseline commit) ---
-# Materialize the baseline mssql-tds via a local worktree, then replace the
-# workspace's mssql-tds source in place. The harness (mssql-tds-bench) and its
-# `path = "../mssql-tds"` dependency are unchanged, so mssql-tds is the only
-# variable. Swapping the source keeps a single mssql-tds in the workspace and
-# avoids a Cargo lockfile package collision.
-$BaselineTree = Join-Path ([System.IO.Path]::GetTempPath()) "perf-baseline-$([System.Guid]::NewGuid().ToString('N'))"
-Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree..."
-Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
+# Run every bench binary once per side, candidate then baseline back-to-back,
+# saving to Criterion baselines $CandName / $BaseName; $Filter optionally limits
+# to a Criterion benchmark-id regex. Both binaries write to the shared
+# target/criterion via CRITERION_HOME. The child processes inherit the client CPU
+# pinning set on this process earlier.
+function Invoke-Interleave {
+    param([Parameter(Mandatory)][string]$CandName, [Parameter(Mandatory)][string]$BaseName, [string]$Filter)
+    $env:CRITERION_HOME = Join-Path $RepoRoot 'target/criterion'
+    try {
+        foreach ($name in @($script:CandBins.Keys)) {
+            $cpath = $script:CandBins[$name]
+            $bpath = $script:BaseBins[$name]
+            if (-not $bpath) { Write-Host ">>> WARN: no baseline binary for '$name'; skipping"; continue }
+            $cargs = @('--bench', '--save-baseline', $CandName); if ($Filter) { $cargs += $Filter }
+            $bargs = @('--bench', '--save-baseline', $BaseName); if ($Filter) { $bargs += $Filter }
+            Write-Host ">>> [$name] candidate..."
+            Invoke-Native { & $cpath @cargs }
+            Write-Host ">>> [$name] baseline..."
+            Invoke-Native { & $bpath @bargs }
+        }
+    } finally {
+        Remove-Item Env:CRITERION_HOME -ErrorAction SilentlyContinue
+    }
+}
 
 $CandidateSrc = Join-Path $RepoRoot 'mssql-tds'
 $StashedSrc   = Join-Path $RepoRoot '.mssql-tds-candidate'
+$BaselineTree = Join-Path ([System.IO.Path]::GetTempPath()) "perf-baseline-$([System.Guid]::NewGuid().ToString('N'))"
 function Set-BaselineSource {
     Move-Item $script:CandidateSrc $script:StashedSrc
     Copy-Item -Recurse (Join-Path $script:BaselineTree 'mssql-tds') $script:CandidateSrc
@@ -326,14 +368,27 @@ function Restore-CandidateSource {
     Move-Item $script:StashedSrc $script:CandidateSrc
 }
 
-Write-Host '>>> Swapping mssql-tds source to the baseline...'
-Set-BaselineSource
+Write-Host '>>> Building candidate bench binaries (target/)...'
+$script:CandBins = Get-BenchBinaries (Join-Path $RepoRoot 'target')
+if ($script:CandBins.Count -eq 0) { throw 'no candidate bench binaries found' }
 
-# Re-warm after the rebuild so the baseline pass starts as warm as the candidate.
+Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree..."
+Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
+Write-Host '>>> Building baseline bench binaries (target-base/)...'
+Set-BaselineSource
+$script:BaseBins = Get-BenchBinaries (Join-Path $RepoRoot 'target-base')
+Restore-CandidateSource
+Invoke-Native { git worktree remove --force $BaselineTree }
+if ($script:BaseBins.Count -eq 0) { throw 'no baseline bench binaries found' }
+
+# Warm-up once; interleaving keeps each candidate/baseline pair adjacent so one
+# warm-up is enough to prime SQL Server / the OS caches.
 Invoke-WarmupPass
 
-Write-Host '>>> Baseline benchmarks...'
-Invoke-Bench 'base'
+Write-Host '>>> Interleaving candidate/baseline per bench binary...'
+Write-CpuSample 'interleave-start'
+Invoke-Interleave 'candidate' 'base'
+Write-CpuSample 'interleave-end'
 
 # --- Compare ---
 Write-Host '>>> Comparing base -> candidate...'
@@ -358,14 +413,11 @@ $thr = [double]($env:BENCH_REGRESSION_RATIO)
 if (-not $thr) { $thr = 1.10 }
 $regressions = @(Get-CritcmpRegressions $comparison $thr)
 
-# --- Auto-confirm regressions (re-measure only the offenders, both sides) ---
-# A strict gate can trip on a transient single-benchmark outlier (e.g. one bad
-# sampling window). Instead of failing the whole run — which costs a full manual
-# re-run and investigation — immediately re-measure ONLY the benchmarks that
-# tripped, on BOTH the baseline (still swapped in, so no rebuild) and the
-# candidate, and keep as a real regression only those that trip AGAIN. Genuine
-# regressions reproduce; transient outliers wash out. This adds just the
-# offenders' run time, not a whole new lab run.
+# --- Auto-confirm regressions (re-measure only the offenders, interleaved) ---
+# A strict gate can trip on a transient single-benchmark outlier. Re-measure ONLY
+# the benchmarks that tripped - interleaved per binary, same as the main run - and
+# keep as a real regression only those that trip AGAIN. Both binaries are already
+# built, so this just replays the offenders (adds only their run time).
 $gateComparison = $comparison
 $gateRegressions = $regressions
 $confirmComparison = $null
@@ -373,17 +425,8 @@ if ($regressions.Count -gt 0) {
     $filter = (($regressions | ForEach-Object { '^' + $_.Name + '$' }) -join '|')
     Write-Host (">>> Gate tripped by: " + (($regressions | ForEach-Object { $_.Name }) -join ', '))
     Write-Host ">>> Auto-confirm: re-measuring only those benchmarks (filter: $filter)"
-
-    # Baseline is still swapped in and built - re-run just the offenders.
-    Write-Host '>>> Auto-confirm: baseline re-run...'
     Invoke-WarmupPass $filter
-    Invoke-Bench 'base_confirm' $filter
-
-    # Restore the candidate source and re-run just the offenders.
-    Write-Host '>>> Auto-confirm: candidate re-run...'
-    Restore-CandidateSource
-    Invoke-WarmupPass $filter
-    Invoke-Bench 'candidate_confirm' $filter
+    Invoke-Interleave 'candidate_confirm' 'base_confirm' $filter
 
     Write-Host '>>> Auto-confirm comparison (base_confirm -> candidate_confirm):'
     $confirmComparison = & {
@@ -397,10 +440,8 @@ if ($regressions.Count -gt 0) {
     [System.IO.File]::WriteAllText((Join-Path $ResultsDir 'confirm.txt'), $confirmComparison + "`n", $Utf8NoBom)
     $gateComparison = $confirmComparison
     $gateRegressions = @(Get-CritcmpRegressions $confirmComparison $thr)
-} else {
-    Restore-CandidateSource
 }
-Invoke-Native { git worktree remove --force $BaselineTree }
+Remove-Item -Recurse -Force (Join-Path $RepoRoot 'target-base') -ErrorAction SilentlyContinue
 
 # --- Verdict (based on the gate comparison: the re-measured offenders after
 # auto-confirm, or the full run when nothing tripped) ---

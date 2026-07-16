@@ -193,24 +193,35 @@ warmup_pass() {
     BENCH_WARMUP_SECS=1 BENCH_SECS=1 BENCH_SAMPLES=10 \
         "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline warmup ${1:+"$1"} >/dev/null 2>&1 || true
 }
-warmup_pass
 
-# --- Candidate run (mssql-tds = working tree) ---
-echo ">>> Candidate benchmarks..."
-cpu_sample "candidate-start" || true
-"${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline candidate
-cpu_sample "candidate-end" || true
+# --- Build both sides, then interleave per bench binary --------------------
+# To make each benchmark's candidate and baseline measurements adjacent in time
+# (which cancels the slow drift that otherwise makes the second, baseline pass
+# look spuriously slower), build BOTH bench binaries up front and run them
+# per-binary back-to-back instead of all-candidate-then-all-baseline. Criterion
+# writes to $CRITERION_HOME; both sides point at the shared target/criterion so
+# critcmp can compare them. The two sides are built into separate target dirs so
+# both persist. (Interleaving per bench BINARY, not per individual bench: a
+# per-bench filter would still re-run every bench's setup each time, so per-binary
+# keeps setup cost — and total run time — the same as the old two-pass approach.)
 
-# --- Baseline run (mssql-tds source swapped to the baseline commit) ---
-# Materialize the baseline mssql-tds via a local worktree, then replace the
-# workspace's mssql-tds source in place. The harness (mssql-tds-bench) and its
-# `path = "../mssql-tds"` dependency are unchanged, so mssql-tds is the only
-# variable. Swapping the source (rather than re-pointing the dependency at the
-# worktree) keeps a single mssql-tds in the workspace and avoids a Cargo lockfile
-# package collision.
-BASELINE_TREE="$(mktemp -d)/perf-baseline"
-echo ">>> Adding baseline worktree for ${BASELINE_COMMIT} at ${BASELINE_TREE}..."
-git worktree add --detach "$BASELINE_TREE" "$BASELINE_COMMIT"
+# Print "<bench-name><TAB><exe-path>" for each built bench binary. $1 = target dir.
+bench_bins() {
+    CARGO_TARGET_DIR="$1" cargo bench -p mssql-tds-bench --no-run --message-format=json 2>/dev/null \
+        | python3 -c 'import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    ex = m.get("executable")
+    t = m.get("target") or {}
+    if ex and "bench" in (t.get("kind") or []):
+        print((t.get("name") or "") + "\t" + ex)'
+}
 
 swap_to_baseline() {
     mv "$REPO_ROOT/mssql-tds" "$REPO_ROOT/.mssql-tds-candidate"
@@ -221,16 +232,47 @@ restore_candidate() {
     mv "$REPO_ROOT/.mssql-tds-candidate" "$REPO_ROOT/mssql-tds"
 }
 
-echo ">>> Swapping mssql-tds source to the baseline..."
-swap_to_baseline
+echo ">>> Building candidate bench binaries (target/)..."
+CAND_BINS="$(bench_bins "$REPO_ROOT/target")"
+[ -n "$CAND_BINS" ] || { echo "ERROR: no candidate bench binaries found"; exit 1; }
 
-# Re-warm after the rebuild so the baseline pass starts as warm as the candidate.
+BASELINE_TREE="$(mktemp -d)/perf-baseline"
+echo ">>> Adding baseline worktree for ${BASELINE_COMMIT} at ${BASELINE_TREE}..."
+git worktree add --detach "$BASELINE_TREE" "$BASELINE_COMMIT"
+echo ">>> Building baseline bench binaries (target-base/)..."
+swap_to_baseline
+BASE_BINS="$(bench_bins "$REPO_ROOT/target-base")"
+restore_candidate
+git worktree remove --force "$BASELINE_TREE" || true
+[ -n "$BASE_BINS" ] || { echo "ERROR: no baseline bench binaries found"; exit 1; }
+
+# Run every bench binary once per side, candidate then baseline back-to-back,
+# saving to Criterion baselines $1 (candidate) and $2 (baseline); $3 = optional
+# Criterion benchmark-id filter.
+interleave_run() {
+    local cand_name="$1" base_name="$2" filter="${3:-}"
+    export CRITERION_HOME="$REPO_ROOT/target/criterion"
+    local bname cpath bpath
+    while IFS=$'\t' read -r bname cpath; do
+        [ -n "$bname" ] || continue
+        bpath=$(printf '%s\n' "$BASE_BINS" | awk -F'\t' -v n="$bname" '$1==n{print $2}')
+        [ -n "$bpath" ] || { echo ">>> WARN: no baseline binary for '$bname'; skipping"; continue; }
+        echo ">>> [$bname] candidate..."
+        "${BENCH_PREFIX[@]}" "$cpath" --bench --save-baseline "$cand_name" ${filter:+"$filter"}
+        echo ">>> [$bname] baseline..."
+        "${BENCH_PREFIX[@]}" "$bpath" --bench --save-baseline "$base_name" ${filter:+"$filter"}
+    done <<< "$CAND_BINS"
+    unset CRITERION_HOME
+}
+
+# Warm-up once to prime SQL Server's buffer pool and the OS page cache; because
+# interleaving keeps each candidate/baseline pair adjacent, one warm-up suffices.
 warmup_pass
 
-echo ">>> Baseline benchmarks..."
-cpu_sample "base-start" || true
-"${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline base
-cpu_sample "base-end" || true
+echo ">>> Interleaving candidate/baseline per bench binary..."
+cpu_sample "interleave-start" || true
+interleave_run candidate base
+cpu_sample "interleave-end" || true
 
 # --- Compare (both baselines live in the shared target/criterion) ---
 echo ">>> Comparing base -> candidate..."
@@ -249,39 +291,22 @@ OFFENDERS=$(regression_ids "$RESULTS_DIR/comparison.txt")
 # offenders when auto-confirm runs below.
 GATE_TABLE="$RESULTS_DIR/comparison.txt"
 
-# --- Auto-confirm regressions (re-measure only the offenders, both sides) ---
-# A strict gate can trip on a transient single-benchmark outlier (e.g. one bad
-# sampling window). Instead of failing the whole run — which costs a full manual
-# re-run and investigation — immediately re-measure ONLY the benchmarks that
-# tripped, on BOTH the baseline (still swapped in, so no rebuild) and the
-# candidate, and keep as a real regression only those that trip AGAIN. Genuine
-# regressions reproduce; transient outliers wash out. This adds just the
-# offenders' run time, not a whole new lab run.
+# --- Auto-confirm regressions (re-measure only the offenders, interleaved) ---
+# A strict gate can trip on a transient single-benchmark outlier. Re-measure ONLY
+# the benchmarks that tripped — interleaved per binary, same as the main run — and
+# keep as a real regression only those that trip AGAIN. Both binaries are already
+# built, so this just replays the offenders (adds only their run time).
 if [ -n "$OFFENDERS" ]; then
-    # Anchored regex OR of the offending IDs for the Criterion filter, e.g.
-    # ^scalars/decode$|^packet_size_sensitivity/4096$
     FILTER=$(printf '%s\n' "$OFFENDERS" | sed 's|^|^|; s|$|$|' | paste -sd '|' -)
     echo ">>> Gate tripped by: $(printf '%s ' $OFFENDERS)"
     echo ">>> Auto-confirm: re-measuring only those benchmarks (filter: ${FILTER})"
-
-    # Baseline is still swapped in and built — re-run just the offenders.
-    echo ">>> Auto-confirm: baseline re-run..."
     warmup_pass "$FILTER"
-    "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline base_confirm "$FILTER"
-
-    # Restore the candidate source and re-run just the offenders.
-    echo ">>> Auto-confirm: candidate re-run..."
-    restore_candidate
-    warmup_pass "$FILTER"
-    "${BENCH_PREFIX[@]}" cargo bench -p mssql-tds-bench -- --save-baseline candidate_confirm "$FILTER"
-
+    interleave_run candidate_confirm base_confirm "$FILTER"
     echo ">>> Auto-confirm comparison (base_confirm -> candidate_confirm):"
     critcmp base_confirm candidate_confirm | tee "$RESULTS_DIR/confirm.txt"
     GATE_TABLE="$RESULTS_DIR/confirm.txt"
-else
-    restore_candidate
 fi
-git worktree remove --force "$BASELINE_TREE" || true
+rm -rf "$REPO_ROOT/target-base" 2>/dev/null || true
 
 # Markdown summary — the perf lab attaches results/*.md to the run's Summary tab
 # (task.uploadsummary), so the comparison renders inline on the run page. The
