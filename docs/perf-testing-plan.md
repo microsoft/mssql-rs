@@ -205,11 +205,6 @@ binaries keep the per-binary interleaving effective (see §2).
 
 ## 4. Implementation Phases
 
-> **Status:** all phases below are implemented and validated in the lab (Linux and
-> Windows runs pass with a symmetric, unbiased comparison). What remains is the pull
-> request to merge the harness crate and the two perf-baseline pipeline definitions to
-> `main`.
-
 1. **Additive harness crate.** Create `mssql-tds-bench` as a new workspace member.
    Leave the existing `mssql-tds/benches/perf.rs` and its `[[bench]]` entry untouched
    (the existing pipeline references `--bench perf`). Swappable `mssql-tds` dependency
