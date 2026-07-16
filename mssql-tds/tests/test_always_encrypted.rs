@@ -926,28 +926,91 @@ mod always_encrypted {
         });
     }
 
-    /// Positional stored-procedure parameters cannot be referenced by name in
-    /// the `sp_describe_parameter_encryption` request, so they cannot be
-    /// transparently encrypted. On an Always Encrypted connection the call must
-    /// fail fast rather than silently send the parameter as plaintext.
+    /// A positional stored-procedure parameter that flows into an encrypted
+    /// column is encrypted transparently: the driver describes the `EXEC` form
+    /// with a synthetic name bound by position, learns the parameter must be
+    /// encrypted, and sends ciphertext.
     #[tokio::test]
-    async fn positional_stored_proc_params_fail_fast_under_ae() {
+    async fn stored_procedure_encrypts_positional_parameter() {
         ae_test!(|h| {
-            let param = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(1)));
-            let err = h
-                .client
+            let table = h.create_encrypted_table("INT", "DETERMINISTIC").await;
+            let proc = h.next_proc();
+            run_statement(
+                &mut h.client,
+                &format!(
+                    "CREATE PROCEDURE {proc} @val INT AS BEGIN \
+                     INSERT INTO {table} (val) VALUES (@val); END"
+                ),
+            )
+            .await
+            .expect("create stored procedure");
+
+            // Unnamed (positional) parameter: bound to @val by position.
+            let param = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(321)));
+            h.client
+                .execute_stored_procedure(proc.clone(), Some(vec![param]), None, None, None)
+                .await
+                .expect("execute stored procedure with positional encrypted parameter");
+            while h.client.move_to_next().await.unwrap() {}
+            h.client.close_query().await.unwrap();
+
+            let got = select_val(&mut h.client, &table)
+                .await
+                .expect("read back value inserted via positional stored-procedure param");
+            assert!(
+                matches!(got, ColumnValues::Int(321)),
+                "positional stored-procedure encrypted insert round-trip, got {got:?}"
+            );
+        });
+    }
+
+    /// A stored procedure called with both a positional and a named parameter,
+    /// each flowing into a distinct encrypted column, encrypts both: positional
+    /// parameters are described under synthetic names bound by position and
+    /// named parameters bind by name, in a single describe/encrypt pass.
+    #[tokio::test]
+    async fn stored_procedure_encrypts_mixed_positional_and_named_parameters() {
+        ae_test!(|h| {
+            let enc = h.enc_clause("DETERMINISTIC");
+            let table = h
+                .create_table(&format!("a INT {enc} NULL, b INT {enc} NULL"))
+                .await;
+            let proc = h.next_proc();
+            run_statement(
+                &mut h.client,
+                &format!(
+                    "CREATE PROCEDURE {proc} @a INT, @b INT AS BEGIN \
+                     INSERT INTO {table} (a, b) VALUES (@a, @b); END"
+                ),
+            )
+            .await
+            .expect("create stored procedure with two encrypted params");
+
+            // @a supplied positionally, @b by name.
+            let positional = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(11)));
+            let named = RpcParameter::new(
+                Some("@b".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(22)),
+            );
+            h.client
                 .execute_stored_procedure(
-                    "sys.sp_who".to_string(),
-                    Some(vec![param]),
-                    None,
+                    proc.clone(),
+                    Some(vec![positional]),
+                    Some(vec![named]),
                     None,
                     None,
                 )
                 .await
-                .expect_err("positional sproc params must fail fast under AE");
-            assert!(
-                matches!(err, mssql_tds::error::Error::UnimplementedFeature { .. }),
-                "expected UnimplementedFeature, got {err:?}"
+                .expect("execute stored procedure with mixed positional/named encrypted params");
+            while h.client.move_to_next().await.unwrap() {}
+            h.client.close_query().await.unwrap();
+
+            let rows = h.query_rows(&format!("SELECT a, b FROM {table};"), 2).await;
+            assert_eq!(
+                rows,
+                vec![vec![ColumnValues::Int(11), ColumnValues::Int(22)]],
+                "mixed positional/named encrypted stored-procedure insert round-trip"
             );
         });
     }
