@@ -26,9 +26,11 @@ use mssql_tds::connection::bulk_copy::{BulkLoadRow, ResolvedColumnMapping};
 use mssql_tds::core::TdsResult;
 use mssql_tds::datatypes::bulk_copy_metadata::{BulkCopyColumnMetadata, SqlDbType};
 use mssql_tds::datatypes::column_values::{
-    ColumnValues, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime,
+    ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
+    SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
 };
 use mssql_tds::datatypes::decoder::DecimalParts;
+use mssql_tds::datatypes::sql_json::SqlJson;
 use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::error::Error;
 use mssql_tds::message::bulk_load::StreamingBulkLoadWriter;
@@ -106,6 +108,26 @@ pub enum ColumnPlanKind {
     },
     /// Arrow `fixed_size_binary(16)` → SQL `uniqueidentifier`.
     FixedBin16Uuid,
+    /// Arrow `decimal128(_, s)` → SQL `money` (scaled ×10⁴, 64-bit).
+    Money {
+        scale: u8,
+    },
+    /// Arrow `decimal128(_, s)` → SQL `smallmoney` (scaled ×10⁴, 32-bit).
+    SmallMoney {
+        scale: u8,
+    },
+    /// Arrow tz-naive `timestamp` → SQL `datetime` (days since 1900 + 1/300s ticks).
+    DateTime {
+        unit: TimeUnit,
+    },
+    /// Arrow tz-naive `timestamp` → SQL `smalldatetime` (days since 1900 + minutes).
+    SmallDateTime {
+        unit: TimeUnit,
+    },
+    /// Arrow `utf8`/`large_utf8` → SQL `xml`.
+    Xml,
+    /// Arrow `utf8`/`large_utf8` → SQL `json`.
+    Json,
     /// All-null arrow column.
     Null,
 }
@@ -231,6 +253,32 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
 
         (DataType::FixedSizeBinary(16), S::UniqueIdentifier) => ColumnPlanKind::FixedBin16Uuid,
         (DataType::FixedSizeBinary(16), S::Binary | S::VarBinary) => ColumnPlanKind::Binary,
+
+        // decimal128 → money / smallmoney (rescaled to ×10⁴ per cell).
+        (DataType::Decimal128(_, s), S::Money) => ColumnPlanKind::Money { scale: *s as u8 },
+        (DataType::Decimal128(_, s), S::SmallMoney) => {
+            ColumnPlanKind::SmallMoney { scale: *s as u8 }
+        }
+
+        // tz-naive timestamp → legacy datetime / smalldatetime.
+        (DataType::Timestamp(unit, tz), S::DateTime) if tz.is_none() => {
+            ColumnPlanKind::DateTime { unit: *unit }
+        }
+        (DataType::Timestamp(unit, tz), S::SmallDateTime) if tz.is_none() => {
+            ColumnPlanKind::SmallDateTime { unit: *unit }
+        }
+        // tz-aware → these legacy types would silently drop the timezone (C1).
+        (DataType::Timestamp(_, Some(_)), S::DateTime | S::SmallDateTime) => {
+            return Err(Error::UsageError(
+                "Cannot write a timezone-aware Arrow timestamp to a datetime/smalldatetime \
+                 column without dropping the timezone; use a datetimeoffset destination instead"
+                    .into(),
+            ));
+        }
+
+        // utf8 → xml / json (Arrow already guarantees valid UTF-8).
+        (DataType::Utf8 | DataType::LargeUtf8, S::Xml) => ColumnPlanKind::Xml,
+        (DataType::Utf8 | DataType::LargeUtf8, S::Json) => ColumnPlanKind::Json,
 
         _ => {
             return Err(Error::UsageError(
@@ -416,6 +464,85 @@ impl ColumnPlan {
                 buf.copy_from_slice(bytes);
                 Ok(ColumnValues::Uuid(Uuid::from_bytes(buf)))
             }
+            ColumnPlanKind::Money { scale } => {
+                let raw = downcast::<Decimal128Array>(arr)?.value(row_idx);
+                let money_val =
+                    i64::try_from(rescale_decimal128(raw, scale, 4)?).map_err(|_| {
+                        Error::UsageError(format!(
+                            "Value out of range for MONEY column '{}'",
+                            dest.column_name
+                        ))
+                    })?;
+                Ok(ColumnValues::Money(SqlMoney {
+                    lsb_part: (money_val & 0xFFFF_FFFF) as i32,
+                    msb_part: (money_val >> 32) as i32,
+                }))
+            }
+            ColumnPlanKind::SmallMoney { scale } => {
+                let raw = downcast::<Decimal128Array>(arr)?.value(row_idx);
+                let int_val = i32::try_from(rescale_decimal128(raw, scale, 4)?).map_err(|_| {
+                    Error::UsageError(format!(
+                        "Value out of range for SMALLMONEY column '{}'",
+                        dest.column_name
+                    ))
+                })?;
+                Ok(ColumnValues::SmallMoney(SqlSmallMoney { int_val }))
+            }
+            ColumnPlanKind::DateTime { unit } => {
+                let ts = read_timestamp(arr, row_idx, unit)?;
+                let (days, hour, minute, second, micro) = timestamp_to_1900_components(ts);
+                let days = i32::try_from(days)
+                    .map_err(|_| Error::UsageError("Timestamp out of DATETIME range".into()))?;
+                let (final_days, time_ticks) =
+                    crate::types::datetime_to_ticks(days, hour, minute, second, micro)?;
+                Ok(ColumnValues::DateTime(SqlDateTime {
+                    days: final_days,
+                    time: time_ticks,
+                }))
+            }
+            ColumnPlanKind::SmallDateTime { unit } => {
+                let ts = read_timestamp(arr, row_idx, unit)?;
+                let (days, hour, minute, second, _micro) = timestamp_to_1900_components(ts);
+                if !(0..=65_535).contains(&days) {
+                    return Err(Error::UsageError(format!(
+                        "Timestamp out of SMALLDATETIME range (days since 1900 = {days}); \
+                         valid 1900-01-01 to 2079-06-06"
+                    )));
+                }
+                // SMALLDATETIME has minute precision; seconds >= 30 round up (matching
+                // SQL Server client behavior), carrying into hour/day as needed.
+                let (mut r_min, mut r_hour, mut r_days) = (minute as u16, hour as u16, days);
+                if second >= 30 {
+                    r_min += 1;
+                    if r_min >= 60 {
+                        r_min = 0;
+                        r_hour += 1;
+                        if r_hour >= 24 {
+                            r_hour = 0;
+                            r_days += 1;
+                        }
+                    }
+                }
+                if !(0..=65_535).contains(&r_days) {
+                    return Err(Error::UsageError(
+                        "Timestamp out of SMALLDATETIME range after minute rounding".into(),
+                    ));
+                }
+                Ok(ColumnValues::SmallDateTime(SqlSmallDateTime {
+                    days: r_days as u16,
+                    time: r_hour * 60 + r_min,
+                }))
+            }
+            ColumnPlanKind::Xml => {
+                let s = read_utf8(arr, row_idx)?;
+                Ok(ColumnValues::Xml(SqlXml::from(s.to_owned())))
+            }
+            ColumnPlanKind::Json => {
+                let s = read_utf8(arr, row_idx)?;
+                Ok(ColumnValues::Json(SqlJson {
+                    bytes: s.as_bytes().to_vec(),
+                }))
+            }
         }
     }
 }
@@ -432,6 +559,67 @@ fn downcast_err<T>(arr: &dyn Array) -> Error {
         std::any::type_name::<T>(),
         arr.data_type()
     ))
+}
+
+/// Days from 1900-01-01 to 1970-01-01 (UNIX epoch). Legacy `datetime`/
+/// `smalldatetime` count days from 1900, while Arrow timestamps count from the
+/// epoch.
+const DAYS_1900_TO_EPOCH: i64 = 25_567;
+
+/// Rescale a `decimal128` raw `i128` from `from_scale` to `to_scale`, rounding
+/// half away from zero when reducing scale. Used by the money conversions —
+/// pure integer math, no `String`/`Decimal` allocation per cell.
+fn rescale_decimal128(raw: i128, from_scale: u8, to_scale: u8) -> TdsResult<i128> {
+    use std::cmp::Ordering;
+    match from_scale.cmp(&to_scale) {
+        Ordering::Equal => Ok(raw),
+        Ordering::Less => {
+            let factor = 10i128
+                .checked_pow((to_scale - from_scale) as u32)
+                .ok_or_else(|| Error::UsageError("decimal scale overflow".into()))?;
+            raw.checked_mul(factor)
+                .ok_or_else(|| Error::UsageError("money value overflow".into()))
+        }
+        Ordering::Greater => {
+            let div = 10i128
+                .checked_pow((from_scale - to_scale) as u32)
+                .ok_or_else(|| Error::UsageError("decimal scale overflow".into()))?;
+            let half = div / 2;
+            Ok(if raw >= 0 {
+                (raw + half) / div
+            } else {
+                (raw - half) / div
+            })
+        }
+    }
+}
+
+/// Split a 100-ns tick count since the UNIX epoch into (days since 1900, hour,
+/// minute, second, microsecond) for the legacy datetime/smalldatetime path.
+fn timestamp_to_1900_components(ticks_since_epoch: i64) -> (i64, u8, u8, u8, u32) {
+    let ticks_per_day: i64 = (TICKS_PER_SECOND as i64) * 86_400;
+    let days_since_epoch = ticks_since_epoch.div_euclid(ticks_per_day);
+    let intra_day_ticks = ticks_since_epoch.rem_euclid(ticks_per_day);
+    let days_since_1900 = days_since_epoch + DAYS_1900_TO_EPOCH;
+    let total_us = (intra_day_ticks / 10) as u64; // 100-ns ticks -> microseconds
+    let hour = (total_us / 3_600_000_000) as u8;
+    let rem = total_us % 3_600_000_000;
+    let minute = (rem / 60_000_000) as u8;
+    let rem = rem % 60_000_000;
+    let second = (rem / 1_000_000) as u8;
+    let microsecond = (rem % 1_000_000) as u32;
+    (days_since_1900, hour, minute, second, microsecond)
+}
+
+/// Read a UTF-8 string cell from either a `StringArray` or `LargeStringArray`.
+fn read_utf8(arr: &dyn Array, row_idx: usize) -> TdsResult<&str> {
+    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+        Ok(a.value(row_idx))
+    } else if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
+        Ok(a.value(row_idx))
+    } else {
+        Err(downcast_err::<StringArray>(arr))
+    }
 }
 
 /// Read a timestamp value as 100-ns ticks since UNIX epoch.
@@ -901,5 +1089,155 @@ mod tests {
     fn decimal_string_format_pads() {
         assert_eq!(decimal128_to_string(5, 3), "0.005");
         assert_eq!(decimal128_to_string(-5, 3), "-0.005");
+    }
+
+    #[test]
+    fn money_from_decimal128() {
+        // 123.45 at scale 2 -> money scaled x10^4 = 1_234_500.
+        let dest = meta("amt", SqlDbType::Money, false);
+        let arr: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(12345_i128)])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        let plan = one_col_plan(DataType::Decimal128(10, 2), &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::Money(m) => {
+                let money_val = ((m.lsb_part as i64) & 0xFFFF_FFFF) | ((m.msb_part as i64) << 32);
+                assert_eq!(money_val, 1_234_500);
+            }
+            other => panic!("expected Money, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn money_negative_and_high_scale_rounds() {
+        // -1.23456 at scale 5 -> rounds to -1.2346 -> scaled -12346.
+        let dest = meta("amt", SqlDbType::Money, false);
+        let arr: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(-123456_i128)])
+                .with_precision_and_scale(10, 5)
+                .unwrap(),
+        );
+        let plan = one_col_plan(DataType::Decimal128(10, 5), &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::Money(m) => {
+                let money_val = ((m.lsb_part as i64) & 0xFFFF_FFFF) | ((m.msb_part as i64) << 32);
+                assert_eq!(money_val, -12346);
+            }
+            other => panic!("expected Money, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn smallmoney_from_decimal128() {
+        let dest = meta("amt", SqlDbType::SmallMoney, false);
+        let arr: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(12345_i128)])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        let plan = one_col_plan(DataType::Decimal128(10, 2), &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::SmallMoney(m) => assert_eq!(m.int_val, 1_234_500),
+            other => panic!("expected SmallMoney, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn smallmoney_overflow_errors() {
+        // 300_000.0000 scaled x10^4 = 3_000_000_000 > i32::MAX -> reject.
+        let dest = meta("amt", SqlDbType::SmallMoney, false);
+        let arr: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(3_000_000_000_i128)])
+                .with_precision_and_scale(18, 4)
+                .unwrap(),
+        );
+        let plan = one_col_plan(DataType::Decimal128(18, 4), &dest);
+        let err = plan.extract_value(arr.as_ref(), 0, &dest).unwrap_err();
+        assert!(format!("{err}").to_uppercase().contains("SMALLMONEY"));
+    }
+
+    #[test]
+    fn datetime_epoch() {
+        // 1970-01-01 00:00:00 -> days since 1900 = 25_567, time = 0.
+        let dest = meta("ts", SqlDbType::DateTime, false);
+        let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(0_i64)]));
+        let plan = one_col_plan(DataType::Timestamp(TimeUnit::Microsecond, None), &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::DateTime(dt) => {
+                assert_eq!(dt.days, 25_567);
+                assert_eq!(dt.time, 0);
+            }
+            other => panic!("expected DateTime, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn datetime_one_second() {
+        // 1 second past epoch -> 300 (1/300s) ticks.
+        let dest = meta("ts", SqlDbType::DateTime, false);
+        let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(1_000_000_i64)]));
+        let plan = one_col_plan(DataType::Timestamp(TimeUnit::Microsecond, None), &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::DateTime(dt) => assert_eq!(dt.time, 300),
+            other => panic!("expected DateTime, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn smalldatetime_rounds_seconds_up() {
+        // 1970-01-01 00:00:45 -> 45s >= 30 rounds up to 00:01 (1 minute).
+        let dest = meta("ts", SqlDbType::SmallDateTime, false);
+        let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(45_000_000_i64)]));
+        let plan = one_col_plan(DataType::Timestamp(TimeUnit::Microsecond, None), &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::SmallDateTime(sdt) => {
+                assert_eq!(sdt.days, 25_567);
+                assert_eq!(sdt.time, 1);
+            }
+            other => panic!("expected SmallDateTime, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tz_aware_timestamp_to_datetime_rejected() {
+        // C1: tz-aware timestamp must not be silently coerced onto legacy datetime.
+        let dest = meta("ts", SqlDbType::DateTime, true);
+        let schema = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]);
+        let mappings = vec![ResolvedColumnMapping {
+            source_index: 0,
+            destination_index: 0,
+            destination_name: dest.column_name.clone(),
+            destination_type: dest.sql_type,
+        }];
+        let err = build_column_plans(&schema, std::slice::from_ref(&dest), &mappings).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("datetimeoffset"));
+    }
+
+    #[test]
+    fn xml_from_utf8() {
+        let dest = meta("x", SqlDbType::Xml, true);
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("<r/>")]));
+        let plan = one_col_plan(DataType::Utf8, &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::Xml(x) => assert_eq!(x.as_string(), "<r/>"),
+            other => panic!("expected Xml, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn json_from_utf8() {
+        let dest = meta("j", SqlDbType::Json, true);
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("{\"a\":1}")]));
+        let plan = one_col_plan(DataType::Utf8, &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::Json(j) => assert_eq!(j.bytes, b"{\"a\":1}"),
+            other => panic!("expected Json, got {:?}", other),
+        }
     }
 }
