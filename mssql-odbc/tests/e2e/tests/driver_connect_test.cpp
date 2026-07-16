@@ -220,6 +220,14 @@ TEST_F(DriverConnectLiveTest, OutputBufferTruncation) {
 // Malformed tokens in connection string → SQL_SUCCESS_WITH_INFO on successful connect.
 TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
     auto& cfg = ODBCTestConfig::Instance();
+    // These parity cases build/corrupt a SQL-auth login string from scratch
+    // (Server+UID+PWD), so they must skip cleanly when the suite is configured
+    // via ODBC_TEST_CONNSTR, a DSN, or integrated auth (UID/PWD legitimately
+    // empty). Tactical guard; capability-based gating tracked in a follow-up issue.
+    if (!cfg.HasSqlAuth()) {
+        GTEST_SKIP() << "Requires SQL auth (ODBC_TEST_SERVER + ODBC_TEST_UID + "
+                        "ODBC_TEST_PWD); see follow-up issue for capability gating";
+    }
     std::string base = "Driver={" + cfg.Driver() + "}"
                        ";Server=" + cfg.Server() +
                        ";UID=" + cfg.Uid() +
@@ -346,6 +354,14 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
 // a real login and that must stay in lock-step with msodbcsql.
 TEST_F(DriverConnectLiveTest, ConnectionStringParserParityBehaviors) {
     auto& cfg = ODBCTestConfig::Instance();
+    // These parity cases build/corrupt a SQL-auth login string from scratch
+    // (Server+UID+PWD), so they must skip cleanly when the suite is configured
+    // via ODBC_TEST_CONNSTR, a DSN, or integrated auth (UID/PWD legitimately
+    // empty). Tactical guard; capability-based gating tracked in a follow-up issue.
+    if (!cfg.HasSqlAuth()) {
+        GTEST_SKIP() << "Requires SQL auth (ODBC_TEST_SERVER + ODBC_TEST_UID + "
+                        "ODBC_TEST_PWD); see follow-up issue for capability gating";
+    }
 
     struct ConnResult {
         SQLRETURN rc;

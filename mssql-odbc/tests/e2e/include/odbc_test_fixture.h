@@ -137,6 +137,17 @@ public:
     bool HasCredentials() const { return !uid_.empty(); }
     bool HasConnStr()     const { return !connstr_.empty(); }
 
+    /// True only when every field needed to build a SQL-auth login string from
+    /// scratch is present. The connection-string parser-parity tests assemble
+    /// their own strings from Server()/Uid()/Pwd() and corrupt individual auth
+    /// tokens, so they require all three. A suite configured via ODBC_TEST_CONNSTR,
+    /// a DSN, or integrated auth legitimately leaves Uid/Pwd empty, so those tests
+    /// must skip rather than build a broken empty-credential string and fail.
+    /// NOTE: tactical guard – a capability-based test framework is tracked separately.
+    bool HasSqlAuth() const {
+        return !server_.empty() && !uid_.empty() && !pwd_.empty();
+    }
+
     /// Returns true if ANY connection method is configured.
     bool HasConnection()  const { return HasConnStr() || HasDSN() || !server_.empty(); }
 
