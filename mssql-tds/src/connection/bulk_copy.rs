@@ -106,6 +106,32 @@ pub struct BulkCopyOptions {
     /// Number of rows to process before calling the progress callback.
     /// Default: 0 (no progress notifications)
     pub notification_interval: usize,
+
+    /// Write already-encrypted (ciphertext) values into Always Encrypted
+    /// columns verbatim, without the driver encrypting them. Default: false.
+    ///
+    /// This is the counterpart to .NET
+    /// `SqlBulkCopyOptions.AllowEncryptedValueModifications`. When `true`, a
+    /// value targeting an encrypted destination column is sent as-is (it must
+    /// already be varbinary ciphertext) instead of being normalized and
+    /// encrypted with the column's key, so the plaintext CEK is not required.
+    ///
+    /// # Precondition
+    ///
+    /// This option only takes effect when Always Encrypted is enabled on the
+    /// connection (Column Encryption Setting = Enabled and the server
+    /// acknowledged the feature) and the destination has encrypted columns. When
+    /// column encryption is not enabled, the option is ignored and values follow
+    /// the normal plaintext path.
+    ///
+    /// # Security
+    ///
+    /// The server does not validate that the supplied ciphertext matches the
+    /// destination column's encryption configuration. Only enable this to move
+    /// ciphertext between columns encrypted with the same key, algorithm, and
+    /// encryption type; otherwise the destination will hold values that cannot
+    /// be decrypted. The same caveats as the .NET option apply.
+    pub allow_encrypted_value_modifications: bool,
 }
 
 impl Default for BulkCopyOptions {
@@ -120,6 +146,7 @@ impl Default for BulkCopyOptions {
             table_lock: false,
             use_internal_transaction: false, // Matches .NET SqlBulkCopy default
             notification_interval: 0,
+            allow_encrypted_value_modifications: false,
         }
     }
 }
@@ -473,6 +500,26 @@ impl<'a> BulkCopy<'a> {
     /// ```
     pub fn keep_nulls(mut self, enabled: bool) -> Self {
         self.options.keep_nulls = enabled;
+        self
+    }
+
+    /// Write already-encrypted (ciphertext) values into Always Encrypted
+    /// columns without the driver re-encrypting them.
+    ///
+    /// Default: false. This option only takes effect when Always Encrypted is
+    /// enabled on the connection and the destination has encrypted columns;
+    /// otherwise it is ignored. See
+    /// [`BulkCopyOptions::allow_encrypted_value_modifications`] for the security
+    /// caveats — only use this to move ciphertext between columns that share the
+    /// same column encryption key, algorithm, and encryption type.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// bulk_copy.allow_encrypted_value_modifications(true);
+    /// ```
+    pub fn allow_encrypted_value_modifications(mut self, enabled: bool) -> Self {
+        self.options.allow_encrypted_value_modifications = enabled;
         self
     }
 
