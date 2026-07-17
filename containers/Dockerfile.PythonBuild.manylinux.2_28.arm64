@@ -1,0 +1,33 @@
+# Pre-built glibc-2.28 build image for the mssql-odbc driver (ARM64).
+# Extends the PyPA manylinux_2_28 base with Rust and the C/C++ toolchain the
+# ODBC e2e build needs (cmake, unixODBC-devel, OpenSSL 1.1 dev, git), so CI does
+# not install them at runtime.
+#
+# manylinux_2_28 is based on AlmaLinux 8 (glibc 2.28, OpenSSL 1.1.x). Building
+# here links the driver against libssl.so.1.1, so it loads on RHEL 8 / UBI 8 -
+# where the modern glibc 2.35 / OpenSSL 3 build images would not.
+#
+# Base image is synced from quay.io/pypa to ACR via sync-container-images.yml.
+
+FROM tdslibrs.azurecr.io/import/python-build/manylinux_2_28_aarch64:latest
+
+# unixODBC-devel + cmake + OpenSSL 1.1 headers for the driver and gtest e2e;
+# git for the e2e CMake FetchContent(googletest) clone. gcc/g++/make ship in the
+# manylinux base.
+RUN dnf install -y --allowerasing \
+        cmake \
+        unixODBC-devel \
+        openssl-devel \
+        pkgconfig \
+        git \
+    && dnf clean all
+
+# Install Rust toolchain (stable), system-wide so the build script needs no setup.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:$PATH"
+
+RUN rustc --version && cargo --version
+
+WORKDIR /workspace
+
+CMD ["bash"]
