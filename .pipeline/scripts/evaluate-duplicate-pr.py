@@ -8,7 +8,7 @@ validation run on the same pipeline and PR head commit. When one is found, emits
 Any missing prerequisite (access token, source commit) or API error falls back
 to ``skipDuplicate=false`` so full validation proceeds (safe default).
 
-Consumed by the ``EvaluateDuplicate`` stage in
+Consumed by the ``SetDuplicateState`` step of the ``EvaluateRequirements`` stage in
 ``.pipeline/templates/validation-stages.yml``.
 """
 import json
