@@ -130,8 +130,8 @@ steps:
 
   - script: |
         export CERT_HOST_NAME="sql1"
-        cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --no-fail-fast --profile ci --success-output immediate
-    displayName: Run tests (mssql-tds package only)
+        cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --package mssql-odbc --no-fail-fast --profile ci --success-output immediate
+    displayName: Run tests (mssql-tds and mssql-odbc packages)
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
@@ -150,13 +150,6 @@ steps:
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
     workingDirectory: "$(Build.SourcesDirectory)"
     displayName: Save code coverage in lcov format (mssql-tds package only)
-
-  - ${{ if eq(parameters.osType, 'Linux') }}:
-    - bash: |
-        echo "Running mssql-py-core Rust unit tests..."
-        cd mssql-py-core && cargo test --frozen -- --show-output
-      displayName: Run Rust unit tests (mssql-py-core)
-      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
   - ${{ if eq(parameters.osType, 'Linux') }}:
     - bash: |

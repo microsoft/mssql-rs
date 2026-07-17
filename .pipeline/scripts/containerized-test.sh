@@ -10,7 +10,10 @@ echo '==> Generating test certificates for mock TDS server...'
 
 echo '==> Running tests...'
 mkdir -p /workspace/target/nextest/ci
-cargo llvm-cov nextest "$@" --frozen --no-report --all-targets --package mssql-tds --no-fail-fast --profile ci --success-output immediate
+# mssql-odbc is a workspace member but was excluded by the mssql-tds-only filter.
+# Include it so its Rust unit tests run and land in the shared JUnit report. Its
+# pure-Rust unit tests need no SQL Server; the C++ e2e suite runs separately.
+cargo llvm-cov nextest "$@" --frozen --no-report --all-targets --package mssql-tds --package mssql-odbc --no-fail-fast --profile ci --success-output immediate
 
 echo '==> Generating coverage report...'
 cargo llvm-cov report --package mssql-tds --lcov --output-path /workspace/target/lcov.info
