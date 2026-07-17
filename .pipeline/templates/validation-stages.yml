@@ -641,6 +641,35 @@ stages:
             container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
             entry: deb-bookworm.sh
 
+- stage: Test_odbc_arm64
+  dependsOn:
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test ODBC Linux arm64
+  jobs:
+    # Modern-glibc arm64 reuse matrix. Binaries are prebuilt on the arm64 Ubuntu
+    # 22.04 build image (glibc 2.35, OpenSSL 3), so only glibc >= 2.35 /
+    # libssl.so.3 distros are listed. SQL Server is an x64 cross-pool host
+    # (sql-host-template.yml) since the arm agents can't run the x64 SQL image.
+    - template: test-matrix-odbc-template-arm64.yml
+      parameters:
+        sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+        sqlImageTag: ${{ parameters.sqlImageTag }}
+        artifactName: 'Odbc_Linux_arm64'
+        targets:
+          - name: DebianBookworm
+            container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
+            entry: odbc-e2e-deb.sh
+          - name: Ubuntu22
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
+            entry: odbc-e2e-deb.sh
+          - name: Ubuntu24
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+            entry: odbc-e2e-deb.sh
+          - name: AzLinux3
+            container: mcr.microsoft.com/azurelinux/base/core:3.0
+            entry: odbc-e2e-azlinux3.sh
+
 # Merge the mssql-tds Rust coverage from every OS that runs the tests
 # (Build_Windows, Build_Linux, Test_MacOS) and the mssql-py-core coverage from
 # the Python tests (Build_Linux) into one Cobertura report. ADO does not merge

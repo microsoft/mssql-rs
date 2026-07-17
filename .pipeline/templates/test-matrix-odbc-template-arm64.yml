@@ -1,0 +1,262 @@
+# Template: test-matrix-odbc-template-arm64.yml
+#
+# ARM64 test matrix for the mssql-odbc C++ gtest e2e suite. Structurally
+# identical to test-matrix-template-arm64.yml (cross-pool x64 SQL host booted by
+# sql-host-template.yml, resolved via poll-for-endpoint.sh, released via teardown
+# sentinels) but instead of a nextest archive it downloads the prebuilt ODBC drop
+# (Odbc_Linux_arm64), restores it to mssql-odbc/tests/e2e/build, and reruns the
+# prebuilt driver + ctest binaries via run_e2e.sh --skip-build.
+#
+# See sql-host-template.yml for the cross-job sync rationale (no dependsOn,
+# sql-ready artifact in, teardown sentinel out, derived SA password).
+
+parameters:
+  - name: targets
+    # Each entry: { name, container, entry }
+    type: object
+  - name: sqlInstanceMode
+    type: string
+    default: shared
+    values:
+      - shared
+      - per-job
+  - name: sqlImageTag
+    type: string
+    default: '2025-latest'
+  - name: maxLifetimeMinutes
+    type: number
+    default: 120
+  - name: artifactName
+    type: string
+    default: 'Odbc_Linux_arm64'
+
+jobs:
+  # ------------------------------------------------------------------
+  # SHARED MODE: one SQL host + one matrix test job.
+  # ------------------------------------------------------------------
+  - ${{ if eq(parameters.sqlInstanceMode, 'shared') }}:
+    - template: sql-host-template.yml
+      parameters:
+        instanceId: odbc-shared
+        sqlImageTag: ${{ parameters.sqlImageTag }}
+        maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
+        expectedSentinels: ${{ join(',', parameters.targets.*.name) }}
+
+    - job: Test_Odbc_Matrix_arm64
+      displayName: ODBC e2e Linux arm64
+      # Intentionally no `dependsOn`: see sql-host-template.yml header.
+      strategy:
+        matrix:
+          ${{ each target in parameters.targets }}:
+            ${{ target.name }}:
+              container: ${{ target.container }}
+              entry: ${{ target.entry }}
+              sentinelName: ${{ target.name }}
+      pool:
+        name: RUST-1ES-POOL-ARM-WUS3
+        demands:
+          - imageOverride -equals RUST-UBUNTU-ARM64
+      steps:
+        - bash: |
+            set -euo pipefail
+            bash .pipeline/scripts/sql-host/derive-sql-password.sh
+          displayName: 'Derive shared SQL_PASSWORD from build context'
+          workingDirectory: '$(Build.SourcesDirectory)'
+          env:
+            BUILD_BUILDID: $(Build.BuildId)
+            SYSTEM_COLLECTIONID: $(System.CollectionId)
+
+        - task: DockerInstaller@0
+          inputs:
+            dockerVersion: '29.0.0'
+        - template: install-ubuntu-dependency.yaml
+          parameters:
+            installAzCli: false
+            installDocker: true
+
+        - task: DownloadPipelineArtifact@2
+          inputs:
+            buildType: 'current'
+            artifactName: ${{ parameters.artifactName }}
+            targetPath: '$(Pipeline.Workspace)/odbc-drop'
+          displayName: 'Download ODBC drop'
+
+        - bash: |
+            set -euo pipefail
+            bash .pipeline/scripts/sql-host/poll-for-endpoint.sh
+          displayName: 'Wait for SQL host endpoint sentinel'
+          workingDirectory: '$(Build.SourcesDirectory)'
+          env:
+            ARTIFACT_NAME: 'sql-ready-odbc-shared-$(System.StageAttempt)'
+            BUILD_BUILDID: $(Build.BuildId)
+            BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+            SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+            SYSTEM_TEAMPROJECT: $(System.TeamProject)
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            AGENT_TEMPDIRECTORY: $(Agent.TempDirectory)
+
+        - script: |
+            set -euo pipefail
+            echo "container=$(container) entry=$(entry)"
+            echo "DB_HOST=$DB_HOST DB_PORT=$DB_PORT"
+
+            rm -rf mssql-odbc/tests/e2e/build
+            cp -r "$(Pipeline.Workspace)/odbc-drop/build" mssql-odbc/tests/e2e/build
+
+            docker network create testnet
+
+            bash .pipeline/scripts/docker-cargo-run.sh --rm --entrypoint bash \
+              -v "$PWD:/workspace" \
+              -w /workspace \
+              -e "ODBC_TEST_SERVER=$DB_HOST,$DB_PORT" \
+              -e "ODBC_TEST_UID=sa" \
+              -e "ODBC_TEST_PWD=$(SQL_PASSWORD)" \
+              -e "ODBC_TEST_TRUST_CERT=Yes" \
+              -e "ODBC_E2E_RETRIES=3" \
+              -e "RUST_BACKTRACE=full" \
+              --network testnet \
+              $(container) /workspace/scripts/dockerentry/$(entry)
+          workingDirectory: "$(Build.SourcesDirectory)"
+          displayName: Run ODBC e2e in container
+          condition: succeeded()
+          env:
+            DB_HOST: $(DB_HOST)
+            DB_PORT: $(DB_PORT)
+            SQL_PASSWORD: $(SQL_PASSWORD)
+            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+        - task: PublishTestResults@2
+          condition: succeededOrFailed()
+          displayName: "Publish ODBC e2e results"
+          inputs:
+            testResultsFormat: "JUnit"
+            testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
+            testRunTitle: $(System.PhaseName)
+
+        - script: |
+            mkdir -p "$(Agent.TempDirectory)/teardown"
+            echo "$(System.JobName) done at $(date -u +%FT%TZ)" \
+              > "$(Agent.TempDirectory)/teardown/done.txt"
+          displayName: 'Stage teardown sentinel'
+          condition: always()
+
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish teardown sentinel (release SQL host)'
+          condition: always()
+          inputs:
+            targetPath: '$(Agent.TempDirectory)/teardown'
+            artifact: '$(sentinelName)-$(System.StageAttempt)'
+            publishLocation: 'pipeline'
+
+  # ------------------------------------------------------------------
+  # PER-JOB MODE: one SQL host + one test job per matrix entry.
+  # ------------------------------------------------------------------
+  - ${{ if eq(parameters.sqlInstanceMode, 'per-job') }}:
+    - ${{ each target in parameters.targets }}:
+      - template: sql-host-template.yml
+        parameters:
+          instanceId: ${{ target.name }}
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
+          expectedSentinels: ${{ target.name }}
+
+      - job: Test_Odbc_${{ target.name }}_arm64
+        displayName: 'ODBC e2e Linux arm64 ${{ target.name }}'
+        # Intentionally no `dependsOn`: see sql-host-template.yml header.
+        pool:
+          name: RUST-1ES-POOL-ARM-WUS3
+          demands:
+            - imageOverride -equals RUST-UBUNTU-ARM64
+        steps:
+          - bash: |
+              set -euo pipefail
+              bash .pipeline/scripts/sql-host/derive-sql-password.sh
+            displayName: 'Derive shared SQL_PASSWORD from build context'
+            workingDirectory: '$(Build.SourcesDirectory)'
+            env:
+              BUILD_BUILDID: $(Build.BuildId)
+              SYSTEM_COLLECTIONID: $(System.CollectionId)
+
+          - task: DockerInstaller@0
+            inputs:
+              dockerVersion: '29.0.0'
+          - template: install-ubuntu-dependency.yaml
+            parameters:
+              installAzCli: false
+              installDocker: true
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              artifactName: ${{ parameters.artifactName }}
+              targetPath: '$(Pipeline.Workspace)/odbc-drop'
+            displayName: 'Download ODBC drop'
+
+          - bash: |
+              set -euo pipefail
+              bash .pipeline/scripts/sql-host/poll-for-endpoint.sh
+            displayName: 'Wait for SQL host endpoint sentinel'
+            workingDirectory: '$(Build.SourcesDirectory)'
+            env:
+              ARTIFACT_NAME: 'sql-ready-${{ target.name }}-$(System.StageAttempt)'
+              BUILD_BUILDID: $(Build.BuildId)
+              BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+              SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+              SYSTEM_TEAMPROJECT: $(System.TeamProject)
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              AGENT_TEMPDIRECTORY: $(Agent.TempDirectory)
+
+          - script: |
+              set -euo pipefail
+              echo "container=${{ target.container }} entry=${{ target.entry }}"
+              echo "DB_HOST=$DB_HOST DB_PORT=$DB_PORT"
+
+              rm -rf mssql-odbc/tests/e2e/build
+              cp -r "$(Pipeline.Workspace)/odbc-drop/build" mssql-odbc/tests/e2e/build
+
+              docker network create testnet
+
+              bash .pipeline/scripts/docker-cargo-run.sh --rm --entrypoint bash \
+                -v "$PWD:/workspace" \
+                -w /workspace \
+                -e "ODBC_TEST_SERVER=$DB_HOST,$DB_PORT" \
+                -e "ODBC_TEST_UID=sa" \
+                -e "ODBC_TEST_PWD=$(SQL_PASSWORD)" \
+                -e "ODBC_TEST_TRUST_CERT=Yes" \
+                -e "ODBC_E2E_RETRIES=3" \
+                -e "RUST_BACKTRACE=full" \
+                --network testnet \
+                ${{ target.container }} /workspace/scripts/dockerentry/${{ target.entry }}
+            workingDirectory: "$(Build.SourcesDirectory)"
+            displayName: Run ODBC e2e in container
+            condition: succeeded()
+            env:
+              DB_HOST: $(DB_HOST)
+              DB_PORT: $(DB_PORT)
+              SQL_PASSWORD: $(SQL_PASSWORD)
+              CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+              CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            displayName: "Publish ODBC e2e results"
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
+              testRunTitle: $(System.PhaseName)
+
+          - script: |
+              mkdir -p "$(Agent.TempDirectory)/teardown"
+              echo "${{ target.name }} done at $(date -u +%FT%TZ)" \
+                > "$(Agent.TempDirectory)/teardown/done.txt"
+            displayName: 'Stage teardown sentinel'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish teardown sentinel (release SQL host)'
+            condition: always()
+            inputs:
+              targetPath: '$(Agent.TempDirectory)/teardown'
+              artifact: '${{ target.name }}-$(System.StageAttempt)'
+              publishLocation: 'pipeline'
