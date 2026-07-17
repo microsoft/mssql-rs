@@ -288,9 +288,7 @@ stages:
     displayName: Build MacOS
     # Skip on PRs whose diff touches no macOS-relevant paths (see
     # EvaluateRequirements/SetMacRelevance). Always runs on non-PR builds.
-    # not(canceled()) (rather than succeeded()) so a skipped EvaluateRequirements
-    # stage in CI does not cascade this job to skipped.
-    condition: and(not(canceled()), or(ne(variables['Build.Reason'], 'PullRequest'), eq(stageDependencies.EvaluateRequirements.Evaluate.outputs['SetMacRelevance.macRelevant'], 'true')))
+    condition: and(succeeded(), or(ne(variables['Build.Reason'], 'PullRequest'), eq(stageDependencies.EvaluateRequirements.Evaluate.outputs['SetMacRelevance.macRelevant'], 'true')))
     pool:
       name: Azure Pipelines
       vmImage: macOS-latest
@@ -321,9 +319,7 @@ stages:
     displayName: Test MacOS
     # Skip on PRs whose diff touches no macOS-relevant paths (see
     # EvaluateRequirements/SetMacRelevance). Always runs on non-PR builds.
-    # not(canceled()) (rather than succeeded()) so a skipped EvaluateRequirements
-    # stage in CI does not cascade this job to skipped.
-    condition: and(not(canceled()), or(ne(variables['Build.Reason'], 'PullRequest'), eq(stageDependencies.EvaluateRequirements.Evaluate.outputs['SetMacRelevance.macRelevant'], 'true')))
+    condition: and(succeeded(), or(ne(variables['Build.Reason'], 'PullRequest'), eq(stageDependencies.EvaluateRequirements.Evaluate.outputs['SetMacRelevance.macRelevant'], 'true')))
     pool:
       name: Azure Pipelines
       vmImage: macOS-latest
@@ -503,9 +499,7 @@ stages:
     displayName: Build mssql-python macOS (cross-repo)
     # Skip on PRs whose diff touches no macOS-relevant paths (see
     # EvaluateRequirements/SetMacRelevance). Always runs on non-PR builds.
-    # not(canceled()) (rather than succeeded()) so a skipped EvaluateRequirements
-    # stage in CI does not cascade this job to skipped.
-    condition: and(not(canceled()), or(ne(variables['Build.Reason'], 'PullRequest'), eq(stageDependencies.EvaluateRequirements.Evaluate.outputs['SetMacRelevance.macRelevant'], 'true')))
+    condition: and(succeeded(), or(ne(variables['Build.Reason'], 'PullRequest'), eq(stageDependencies.EvaluateRequirements.Evaluate.outputs['SetMacRelevance.macRelevant'], 'true')))
     pool:
       name: Azure Pipelines
       vmImage: macOS-latest
