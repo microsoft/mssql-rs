@@ -12,7 +12,7 @@ use crate::api::odbc_types::{
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE, ERR_INVALID_NULL_POINTER,
     ERR_STRING_RIGHT_TRUNCATION, SQLSTATE_08001, SQLSTATE_HY024, SQLSTATE_HY110, SQLSTATE_HYC00,
-    post_diag, post_tds_error,
+    post_diag, post_tds_error, post_tds_info_messages,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
@@ -292,7 +292,7 @@ fn do_connect(
         .runtime
         .block_on(provider.create_client(context, &params.server, None));
 
-    let client = match client {
+    let mut client = match client {
         Ok(c) => c,
         Err(e) => {
             error!(%e, "SQLDriverConnectW: connection failed");
@@ -300,6 +300,7 @@ fn do_connect(
             return SQL_ERROR;
         }
     };
+    let info_messages = client.take_info_messages();
 
     // Write output connection string
     // TODO: build completed output connection string from resolved attributes and negotiated
@@ -315,13 +316,13 @@ fn do_connect(
     truncated |=
         unsafe { copy_with_nul(out_connection_string, buffer_length as usize, &out_utf16) };
 
+    let has_server_info = post_tds_info_messages(state, &info_messages);
+
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
-    // TODO: This print is for demo purposes only. Remove before release.
-    println!("**** Connected via mssql-odbc Driver ****");
     debug!("SQLDriverConnectW: connected successfully");
 
-    if has_warnings || truncated {
+    if has_warnings || truncated || has_server_info {
         if has_warnings {
             post_diag(state, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE);
         }
