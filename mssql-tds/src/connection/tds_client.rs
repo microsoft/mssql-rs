@@ -46,6 +46,13 @@ use crate::{
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Prefix for the synthetic parameter names given to positional stored-procedure
+/// parameters when building the `sp_describe_parameter_encryption` request.
+/// Positional arguments have no caller-supplied name, so they are declared as
+/// `@ce_pos_0`, `@ce_pos_1`, ... in the describe `EXEC`. These names exist only
+/// in the describe request; the real RPC still sends the parameters unnamed.
+const SYNTHETIC_POSITIONAL_PARAM_PREFIX: &str = "ce_pos_";
+
 /// State of the `ReturnStatus` token observed while draining the most recent
 /// cursor RPC response. Distinguishes "no token was sent" from an actual raw
 /// status value, so neither case is silently collapsed at interpretation time.
@@ -1059,6 +1066,7 @@ impl TdsClient {
         // setting; there is no per-command override on this path.
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
 
+        let mut positional_parameters = positional_parameters;
         let mut named_parameters = named_parameters;
 
         if self.execution_context.has_open_batch() {
@@ -1066,20 +1074,6 @@ impl TdsClient {
                 ALREADY_EXECUTING_ERROR.to_string(),
             ));
         };
-
-        // Positional stored-procedure parameters cannot be referenced by name in
-        // the `sp_describe_parameter_encryption` request, so they cannot be
-        // transparently encrypted. Fail fast rather than silently sending them
-        // as plaintext on an Always Encrypted connection.
-        if self.column_encryption_enabled_on_connection()
-            && positional_parameters
-                .as_ref()
-                .is_some_and(|p| !p.is_empty())
-        {
-            return Err(Self::ae_params_unsupported(
-                "positional stored-procedure parameters",
-            ));
-        }
 
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
@@ -1093,19 +1087,44 @@ impl TdsClient {
         self.transport.reset_reader();
 
         // Always Encrypted: when the connection enabled column encryption and the
-        // server acknowledged the feature, ask the server which named parameters
-        // need encryption (via `sp_describe_parameter_encryption` against an
-        // `EXEC` form of the call) and encrypt them in place before sending the
-        // real stored-procedure RPC. Positional parameters cannot be referenced
-        // by name in the describe request and are sent unchanged.
-        if self.should_encrypt_parameters()
-            && let Some(named) = named_parameters.as_mut()
-            && named.iter().any(|p| p.name.is_some())
-        {
-            let (tsql, params_decl) =
-                Self::build_stored_procedure_describe_request(&stored_procedure_name, named)?;
-            self.encrypt_parameters(&tsql, &params_decl, named, timeout_sec, cancel_handle)
-                .await?;
+        // server acknowledged the feature, ask the server which parameters need
+        // encryption (via `sp_describe_parameter_encryption` against an `EXEC`
+        // form of the call) and encrypt them in place before sending the real
+        // stored-procedure RPC. Positional parameters are described under
+        // synthetic names bound by position; named parameters bind by name.
+        let has_positional = positional_parameters
+            .as_ref()
+            .is_some_and(|p| !p.is_empty());
+        let has_named = named_parameters
+            .as_ref()
+            .is_some_and(|p| p.iter().any(|param| param.name.is_some()));
+        if self.should_encrypt_parameters() && (has_positional || has_named) {
+            let (tsql, params_decl) = Self::build_stored_procedure_describe_request(
+                &stored_procedure_name,
+                positional_parameters.as_deref().unwrap_or(&[]),
+                named_parameters.as_deref().unwrap_or(&[]),
+            )?;
+
+            // Assemble one slice of mutable references in declaration order
+            // (positional first, then named) so the describe result maps back by
+            // ordinal (positional) or name (named).
+            let mut combined: Vec<&mut RpcParameter> = Vec::new();
+            if let Some(positional) = positional_parameters.as_mut() {
+                combined.extend(positional.iter_mut());
+            }
+            if let Some(named) = named_parameters.as_mut() {
+                combined.extend(named.iter_mut());
+            }
+
+            self.encrypt_combined_parameters(
+                &tsql,
+                &params_decl,
+                &mut combined,
+                timeout_sec,
+                cancel_handle,
+            )
+            .await?;
+
             // The describe round-trip closes its own batch, which clears
             // the per-operation timeout/cancel state; restore it for the
             // real RPC.
@@ -1853,20 +1872,6 @@ impl TdsClient {
         self.column_encryption_enabled_on_connection()
     }
 
-    /// Error for execution paths that cannot yet transparently encrypt their
-    /// parameters under Always Encrypted. Returned instead of silently sending
-    /// plaintext parameter values on an AE-enabled connection.
-    fn ae_params_unsupported(path: &str) -> crate::error::Error {
-        crate::error::Error::UnimplementedFeature {
-            feature: format!("Always Encrypted for {path}"),
-            context: "Column encryption is enabled on this connection but this execution path \
-                      does not run sp_describe_parameter_encryption, so its parameters cannot be \
-                      transparently encrypted. Use execute_sp_executesql or named \
-                      stored-procedure parameters, or disable column encryption for this command."
-                .into(),
-        }
-    }
-
     /// Normalizes a parameter name for matching across
     /// `sp_describe_parameter_encryption` output and RETURNVALUE tokens: strips a
     /// single leading `@` and ASCII-uppercases it, mirroring T-SQL's
@@ -2063,21 +2068,47 @@ impl TdsClient {
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
+        let mut param_refs: Vec<&mut RpcParameter> = named_params.iter_mut().collect();
+        self.encrypt_combined_parameters(
+            sql,
+            params_decl,
+            &mut param_refs,
+            timeout_sec,
+            cancel_handle,
+        )
+        .await
+    }
+
+    /// Describes and encrypts, in place, a combined set of parameter references.
+    ///
+    /// This is the shared core behind [`encrypt_parameters`](Self::encrypt_parameters)
+    /// (all-named) and the stored-procedure path (positional and/or named): the
+    /// caller assembles one slice of mutable parameter references in the same
+    /// order they were declared in `params_decl`, and
+    /// [`apply_parameter_encryption`](Self::apply_parameter_encryption) matches
+    /// each describe entry back by name (named) or ordinal (positional).
+    async fn encrypt_combined_parameters(
+        &mut self,
+        sql: &str,
+        params_decl: &str,
+        params: &mut [&mut RpcParameter],
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
         // Mirror SqlClient: don't cache metadata for statements with output
         // parameters — the client can't validate cached describe results against
         // a RETURNVALUE — but still use it for this call.
-        let has_output = named_params.iter().any(|p| p.is_output());
+        let has_output = params.iter().any(|p| p.is_output());
         let describe = self
             .describe_parameters_cached(sql, params_decl, has_output, timeout_sec, cancel_handle)
             .await?;
 
         let (providers, cek_cache) = self.cloned_ce_key_material()?;
-        let mut param_refs: Vec<&mut RpcParameter> = named_params.iter_mut().collect();
         Self::apply_parameter_encryption(
             &describe,
             &providers,
             &cek_cache,
-            &mut param_refs,
+            params,
             &mut self.output_param_ceks,
         )
         .await
@@ -2221,6 +2252,23 @@ impl TdsClient {
                 )));
             };
 
+            // An encrypted positional (unnamed) OUTPUT parameter cannot have its
+            // returned value decrypted: the RETURNVALUE token arrives unnamed, so
+            // its ciphertext can't be matched back to the CEK, which is retained
+            // under the parameter's synthetic describe name (`@ce_pos_N`). Reject
+            // it with an actionable error instead of returning ciphertext the
+            // caller can't read. Named OUTPUT parameters are unaffected (the
+            // RETURNVALUE name matches), as are non-encrypted positional OUTPUT
+            // parameters (they never reach this encrypted-parameter branch).
+            if params[index].is_output() && params[index].name.is_none() {
+                return Err(crate::error::Error::UsageError(
+                    "Encrypted positional OUTPUT stored-procedure parameters are not supported \
+                     because their returned value cannot be matched back to a column encryption \
+                     key; pass the output parameter by name so it can be decrypted on return."
+                        .to_string(),
+                ));
+            }
+
             let plaintext_cek = decrypt_cek(providers, cek_cache, cek_entry).await?;
 
             // An encrypted RETURNVALUE output parameter carries no CEK table and
@@ -2262,23 +2310,65 @@ impl TdsClient {
     /// `sp_describe_parameter_encryption` when the original call is a stored
     /// procedure (rather than an `sp_executesql` statement).
     ///
-    /// `@tsql` is an `EXEC` form that names every parameter so the server can
-    /// resolve per-parameter encryption metadata:
-    /// `EXEC <proc> @p1=@p1, @p2=@p2 OUTPUT, ...`. `@params` is the matching
-    /// declaration list (`@p1 int, @p2 nvarchar(10) OUTPUT, ...`). Only named
-    /// parameters participate; positional parameters cannot be referenced by
-    /// name and are omitted. Mirrors dotnet
-    /// `BuildStoredProcedureStatementForColumnEncryption`.
+    /// `@tsql` is an `EXEC` form of the call. Positional parameters bind by
+    /// position and are given synthetic names (`@ce_pos_0`, `@ce_pos_1`, ...) so
+    /// they can be declared in `@params` and referenced in the `EXEC`; named
+    /// parameters bind by name. Positional arguments precede named ones, as
+    /// T-SQL requires. `@params` is the matching declaration list. The synthetic
+    /// names exist only in the describe request — the real RPC still sends the
+    /// positional parameters unnamed, and the describe result is mapped back by
+    /// ordinal (positional) or name (named) in
+    /// [`apply_parameter_encryption`](Self::apply_parameter_encryption).
+    ///
+    /// Example: `EXEC dbo.p @ce_pos_0, @name1=@name1 OUTPUT` with
+    /// `@ce_pos_0 int, @name1 nvarchar(10) OUTPUT`. Mirrors dotnet
+    /// `BuildStoredProcedureStatementForColumnEncryption`, extended to cover the
+    /// positional-parameter case the Rust API exposes.
     fn build_stored_procedure_describe_request(
         stored_procedure_name: &str,
+        positional_params: &[RpcParameter],
         named_params: &[RpcParameter],
     ) -> TdsResult<(String, String)> {
         use std::fmt::Write as _;
+
+        for named in named_params
+            .iter()
+            .filter_map(|param| param.name.as_deref())
+        {
+            for ordinal in 0..positional_params.len() {
+                let synthetic = format!("@{SYNTHETIC_POSITIONAL_PARAM_PREFIX}{ordinal}");
+                if named.eq_ignore_ascii_case(&synthetic) {
+                    return Err(UsageError(format!(
+                        "Named parameter '{named}' conflicts with internally generated positional parameter name '{synthetic}'"
+                    )));
+                }
+            }
+        }
 
         let mut tsql = format!("EXEC {stored_procedure_name}");
         let mut params_decl = String::new();
         let mut first = true;
 
+        // Positional parameters: synthetic name, bound by position in the EXEC.
+        for (ordinal, param) in positional_params.iter().enumerate() {
+            let synthetic = format!("@{SYNTHETIC_POSITIONAL_PARAM_PREFIX}{ordinal}");
+            let type_name = RpcParameter::get_sql_name(param.value())?;
+            let output = if param.is_output() { " OUTPUT" } else { "" };
+
+            if first {
+                tsql.push(' ');
+                first = false;
+            } else {
+                tsql.push_str(", ");
+                params_decl.push_str(", ");
+            }
+
+            // `write!` into a String is infallible.
+            let _ = write!(tsql, "{synthetic}{output}");
+            let _ = write!(params_decl, "{synthetic} {type_name}{output}");
+        }
+
+        // Named parameters: bound by name.
         for param in named_params {
             let Some(name) = param.name.as_deref() else {
                 continue;
@@ -3885,7 +3975,7 @@ mod tests {
         ];
 
         let (tsql, params_decl) =
-            TdsClient::build_stored_procedure_describe_request("dbo.my_proc", &params)
+            TdsClient::build_stored_procedure_describe_request("dbo.my_proc", &[], &params)
                 .expect("building the describe request should succeed");
 
         assert_eq!(tsql, "EXEC dbo.my_proc @id=@id, @count=@count OUTPUT");
@@ -3893,31 +3983,52 @@ mod tests {
     }
 
     #[test]
-    fn build_sp_describe_request_skips_positional_params() {
+    fn build_sp_describe_request_positional_and_named() {
         use crate::datatypes::sqltypes::SqlType;
         use crate::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 
-        // A positional (unnamed) parameter cannot be referenced by name in the
-        // describe request and must be omitted without disturbing the commas.
-        let params = vec![
-            RpcParameter::new(
-                Some("@a".to_string()),
-                StatusFlags::NONE,
-                SqlType::Int(Some(1)),
-            ),
-            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(2))),
-            RpcParameter::new(
-                Some("@b".to_string()),
-                StatusFlags::NONE,
-                SqlType::BigInt(Some(3)),
-            ),
+        // Positional (unnamed) parameters get synthetic names bound by position
+        // and precede the named parameters, which bind by name.
+        let positional = vec![
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(1))),
+            RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::BigInt(None)),
         ];
+        let named = vec![RpcParameter::new(
+            Some("@b".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(3)),
+        )];
 
         let (tsql, params_decl) =
-            TdsClient::build_stored_procedure_describe_request("proc", &params)
+            TdsClient::build_stored_procedure_describe_request("proc", &positional, &named)
                 .expect("building the describe request should succeed");
 
-        assert_eq!(tsql, "EXEC proc @a=@a, @b=@b");
-        assert_eq!(params_decl, "@a int, @b bigint");
+        assert_eq!(tsql, "EXEC proc @ce_pos_0, @ce_pos_1 OUTPUT, @b=@b");
+        assert_eq!(
+            params_decl,
+            "@ce_pos_0 int, @ce_pos_1 bigint OUTPUT, @b int"
+        );
+    }
+
+    #[test]
+    fn build_sp_describe_request_rejects_synthetic_named_collision() {
+        use crate::datatypes::sqltypes::SqlType;
+        use crate::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let positional = vec![RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::Int(Some(1)),
+        )];
+        let named = vec![RpcParameter::new(
+            Some("@CE_POS_0".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(2)),
+        )];
+
+        let err = TdsClient::build_stored_procedure_describe_request("proc", &positional, &named)
+            .expect_err("synthetic positional name collision should be rejected");
+
+        assert!(matches!(err, UsageError(message) if message.contains("@CE_POS_0")));
     }
 }
