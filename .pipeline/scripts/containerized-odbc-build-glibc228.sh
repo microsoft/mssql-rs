@@ -13,8 +13,9 @@
 # a binary built here loads on RHEL 8 (the modern glibc 2.35 / OpenSSL 3 track
 # does not).
 #
-# The manylinux_2_28 base ships a C/C++ toolchain and Python but no cargo and not
-# the cmake / unixODBC dev headers we need, so install those (and rustup) here.
+# The manylinux_2_28 rust build image (python-build/manylinux_2_28_*_rust) ships
+# cargo plus the cmake / unixODBC dev headers we need pre-installed, so this
+# script just cleans the shared trees and runs the e2e build.
 #
 # Env:
 #   ODBC_DROP_DIR   Drop directory to stage into (default: /workspace/odbc-drop).
@@ -29,15 +30,10 @@ DROP_DIR="${ODBC_DROP_DIR:-/workspace/odbc-drop}"
 # cross-toolchain CMake cache reuse and host-side permission errors.
 rm -rf "$DROP_DIR" /workspace/mssql-odbc/tests/e2e/build
 
-# openssl-devel on AlmaLinux 8 is 1.1.1, so the driver links libssl.so.1.1.
-dnf install -y --allowerasing \
-    gcc gcc-c++ make cmake unixODBC-devel openssl-devel
-
-if ! command -v cargo >/dev/null 2>&1; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal
+# cargo is baked into the image at /root/.cargo; source it in case PATH was reset.
+if [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1090
+    source "$HOME/.cargo/env"
 fi
-# shellcheck disable=SC1090
-source "$HOME/.cargo/env"
 
 exec /workspace/mssql-odbc/tests/e2e/build_e2e.sh --release --out="$DROP_DIR"

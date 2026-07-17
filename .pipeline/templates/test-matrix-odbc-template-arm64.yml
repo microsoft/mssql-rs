@@ -46,6 +46,11 @@ parameters:
     # do not collide with the nextest jobs when they share a stage.
     type: string
     default: ''
+  - name: nameSuffix
+    # Suffix appended to the shared-mode matrix job name so two invocations in
+    # the same stage (e.g. glibc-modern and glibc-2.28) get distinct job names.
+    type: string
+    default: ''
 
 jobs:
   # ------------------------------------------------------------------
@@ -60,7 +65,7 @@ jobs:
           maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
           expectedSentinels: ${{ join(',', parameters.targets.*.name) }}
 
-    - job: Test_Odbc_Matrix_arm64
+    - job: Test_Odbc_Matrix${{ parameters.nameSuffix }}_arm64
       displayName: ODBC e2e Linux arm64
       # Intentionally no `dependsOn`: see sql-host-template.yml header.
       strategy:

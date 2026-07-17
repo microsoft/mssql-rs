@@ -11,10 +11,14 @@ parameters:
   # Pipeline artifact name, e.g. 'Odbc_glibc228_x64'.
   - name: artifactName
     type: string
-  # glibc-2.28 build container image (manylinux_2_28, mirrored to GHCR).
+  # glibc-2.28 build container image (manylinux_2_28 + rust, mirrored to GHCR).
   - name: buildImage
     type: string
-    default: 'ghcr.io/microsoft/mssql-rs/import/python-build/manylinux_2_28_x86_64:latest'
+    default: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_x86_64_rust:latest'
+  # Build architecture, used only for the step display name (x64 | arm64).
+  - name: architecture
+    type: string
+    default: 'x64'
 
 steps:
   - script: |
@@ -25,7 +29,7 @@ steps:
         -w /workspace \
         ${{ parameters.buildImage }} \
         /workspace/.pipeline/scripts/containerized-odbc-build-glibc228.sh
-    displayName: 'Build ODBC driver + e2e binaries glibc-2.28 (x64)'
+    displayName: 'Build ODBC driver + e2e binaries glibc-2.28 (${{ parameters.architecture }})'
     condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
     env:
       CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
