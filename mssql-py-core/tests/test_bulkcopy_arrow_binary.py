@@ -128,3 +128,41 @@ def test_cursor_bulkcopy_arrow_binary_null_to_non_nullable_column(client_context
         cursor.bulkcopy_arrow(table_name, source, batch_size=1000, timeout=30)
 
     conn.close()
+
+
+@pytest.mark.integration
+def test_cursor_bulkcopy_arrow_fixed_size_binary(client_context):
+    """Arrow fixed_size_binary(N) (N != 16) loads into BINARY(N)/VARBINARY(N).
+
+    Regression test: the planner must accept any fixed-size binary width for
+    BINARY/VARBINARY, not only width 16.
+    """
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "#BCArrowFixedSizeBinary"
+    cursor.execute(f"CREATE TABLE {table_name} (b4 BINARY(4), vb4 VARBINARY(4))")
+
+    values = [b"\x01\x02\x03\x04", b"\xaa\xbb\xcc\xdd"]
+    source = pa.table(
+        {
+            "b4": pa.array(values, type=pa.binary(4)),
+            "vb4": pa.array(values, type=pa.binary(4)),
+        }
+    )
+
+    result = cursor.bulkcopy_arrow(
+        table_name,
+        source,
+        batch_size=1000,
+        timeout=30,
+        column_mappings=[(0, "b4"), (1, "vb4")],
+    )
+    assert result["rows_copied"] == 2
+
+    cursor.execute(f"SELECT b4, vb4 FROM {table_name} ORDER BY b4")
+    rows = cursor.fetchall()
+    assert rows[0][0] == b"\x01\x02\x03\x04" and rows[0][1] == b"\x01\x02\x03\x04"
+    assert rows[1][0] == b"\xaa\xbb\xcc\xdd" and rows[1][1] == b"\xaa\xbb\xcc\xdd"
+
+    conn.close()

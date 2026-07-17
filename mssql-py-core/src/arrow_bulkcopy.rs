@@ -252,7 +252,12 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
         }
 
         (DataType::FixedSizeBinary(16), S::UniqueIdentifier) => ColumnPlanKind::FixedBin16Uuid,
-        (DataType::FixedSizeBinary(16), S::Binary | S::VarBinary) => ColumnPlanKind::Binary,
+        // Any-width fixed-size binary loads into BINARY/VARBINARY/IMAGE (the
+        // extractor reads FixedSizeBinaryArray of any width; the server enforces
+        // the column length), mirroring the variable-width binary arm above.
+        (DataType::FixedSizeBinary(_), S::Binary | S::VarBinary | S::Image) => {
+            ColumnPlanKind::Binary
+        }
 
         // decimal128 → money / smallmoney (rescaled to ×10⁴ per cell).
         (DataType::Decimal128(_, s), S::Money) => ColumnPlanKind::Money { scale: *s as u8 },
@@ -1274,6 +1279,21 @@ mod tests {
         match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
             ColumnValues::Json(j) => assert_eq!(j.bytes, b"{\"a\":1}"),
             other => panic!("expected Json, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fixed_size_binary_non16_to_varbinary() {
+        // A fixed-size binary of a width other than 16 must still map to
+        // BINARY/VARBINARY (not be rejected by the planner).
+        let dest = meta("b", SqlDbType::VarBinary, true);
+        let arr: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_iter(vec![vec![1u8, 2, 3, 4]].into_iter()).unwrap(),
+        );
+        let plan = one_col_plan(DataType::FixedSizeBinary(4), &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::Bytes(b) => assert_eq!(b, vec![1, 2, 3, 4]),
+            other => panic!("expected Bytes, got {:?}", other),
         }
     }
 
