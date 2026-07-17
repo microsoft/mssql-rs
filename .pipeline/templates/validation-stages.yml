@@ -40,27 +40,6 @@ parameters:
   default: '2025-latest'
 
 stages:
-# Component Governance runs on every build (PR and non-PR), independent of the
-# duplicate-PR skip logic and the build/test stages.
-- stage: ComponentGovernance
-  displayName: Component Governance
-  dependsOn: []
-  jobs:
-  - job: ComponentGovernance
-    displayName: Component Governance detection
-    pool:
-      name: RUST-1ES-POOL-WUS3
-      demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
-    steps:
-      - checkout: self
-      - task: ComponentGovernanceComponentDetection@0
-        displayName: Component Governance detection
-        inputs:
-          scanType: Register
-          verbosity: Verbose
-          sourceScanPath: '$(Build.SourcesDirectory)'
-
 - stage: EvaluateDuplicate
   displayName: Evaluate PR duplicate
   condition: and(eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
@@ -258,6 +237,14 @@ stages:
         parameters:
           osType: Alpine
           architecture: x64
+      # Runs unconditionally on every Linux build (PR and non-PR).
+      - task: ComponentGovernanceComponentDetection@0
+        displayName: Component Governance detection
+        condition: always()
+        inputs:
+          scanType: Register
+          verbosity: Verbose
+          sourceScanPath: '$(Build.SourcesDirectory)'
 
   - job: Build_Linux_ARM
     displayName: Build Linux ARM
