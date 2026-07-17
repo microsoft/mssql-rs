@@ -2,10 +2,7 @@
 // Licensed under the MIT License.
 
 use crate::core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult};
-use crate::{
-    io::{packet_writer::PacketWriter, reader_writer::NetworkWriter},
-    token::tokens::ErrorToken,
-};
+use crate::io::{packet_writer::PacketWriter, reader_writer::NetworkWriter};
 use async_trait::async_trait;
 
 #[derive(Copy, Clone)]
@@ -128,20 +125,6 @@ pub(crate) trait Request {
         'b: 'a;
 }
 
-pub(crate) struct TdsError {
-    pub(crate) error_token: ErrorToken,
-}
-
-impl TdsError {
-    pub fn new(error_token: ErrorToken) -> Self {
-        TdsError { error_token }
-    }
-
-    pub fn get_message(&self) -> String {
-        self.error_token.message.clone()
-    }
-}
-
 #[allow(dead_code)]
 pub struct TdsInfo {}
 
@@ -184,38 +167,6 @@ mod tests {
     fn test_packet_status_flags_bitmask_combine() {
         let combined = PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8;
         assert_eq!(combined, 0x03);
-    }
-
-    #[test]
-    fn test_tds_error_new_and_get_message() {
-        let token = ErrorToken {
-            number: 208,
-            state: 1,
-            severity: 16,
-            message: "Invalid object name 'foo'".to_string(),
-            server_name: "localhost".to_string(),
-            proc_name: String::new(),
-            line_number: 1,
-        };
-        let error = TdsError::new(token);
-        assert_eq!(error.get_message(), "Invalid object name 'foo'");
-        assert_eq!(error.error_token.number, 208);
-        assert_eq!(error.error_token.severity, 16);
-    }
-
-    #[test]
-    fn test_tds_error_empty_message() {
-        let token = ErrorToken {
-            number: 0,
-            state: 0,
-            severity: 0,
-            message: String::new(),
-            server_name: String::new(),
-            proc_name: String::new(),
-            line_number: 0,
-        };
-        let error = TdsError::new(token);
-        assert_eq!(error.get_message(), "");
     }
 
     #[test]
