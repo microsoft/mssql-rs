@@ -237,6 +237,10 @@ stages:
         parameters:
           osType: Alpine
           architecture: x64
+      - template: build-odbc-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_Linux_x64'
 
   - job: Build_Linux_ARM
     displayName: Build Linux ARM
@@ -274,6 +278,10 @@ stages:
         parameters:
           osType: Alpine
           architecture: ARM64
+      - template: build-odbc-template.yml
+        parameters:
+          architecture: ARM64
+          artifactName: 'Odbc_Linux_arm64'
   - job: Build_MacOS
     displayName: Build MacOS
     pool:
@@ -569,6 +577,35 @@ stages:
           Ubuntu24:
             container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
             entry: deb-bookworm.sh
+
+
+- stage: Test_odbc_amd64
+  dependsOn:
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test ODBC Linux amd64
+  jobs:
+    # Modern-glibc reuse matrix. The driver + ctest binaries are prebuilt on the
+    # Ubuntu 22.04 build image (glibc 2.35, OpenSSL 3 / libssl.so.3), so this
+    # matrix only lists distros whose glibc >= 2.35 and that ship libssl.so.3.
+    # RHEL 9 / Oracle 9 (glibc 2.34) and RHEL 8 (glibc 2.28, OpenSSL 1.1) are
+    # intentionally excluded here and covered by the glibc-2.28 track.
+    - template: test-matrix-odbc-template.yml
+      parameters:
+        artifactName: 'Odbc_Linux_x64'
+        matrix:
+          DebianBookworm:
+            container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
+            entry: odbc-e2e-deb.sh
+          Ubuntu22:
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
+            entry: odbc-e2e-deb.sh
+          Ubuntu24:
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+            entry: odbc-e2e-deb.sh
+          AzLinux3:
+            container: mcr.microsoft.com/azurelinux/base/core:3.0
+            entry: odbc-e2e-azlinux3.sh
 
 
 - stage: Test_arm64

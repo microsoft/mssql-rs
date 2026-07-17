@@ -150,6 +150,13 @@ build_rust_driver() {
         )
     else
         echo "=== Skipping driver build (--skip-build) ==="
+        # build_e2e.sh stages the driver inside the build tree, so prefer that
+        # copy when it exists before falling back to the cargo target dir.
+        if [ -f "$BUILD_DIR/$libname" ]; then
+            RUST_DRIVER_PATH="$BUILD_DIR/$libname"
+            echo "Using staged driver: $RUST_DRIVER_PATH"
+            return
+        fi
     fi
 
     # Cargo builds into the workspace root's target/ directory, which may

@@ -90,12 +90,15 @@ cmake --build "$BUILD_DIR" \
 if [ -n "$OUT_DIR" ]; then
     echo ""
     echo "=== Staging drop into $OUT_DIR ==="
+    # Copy the driver into the build tree so the whole drop is a single,
+    # path-consistent directory. run_e2e.sh --skip-build resolves the driver
+    # from build/<name> automatically.
+    cp "$DRIVER_PATH" "$BUILD_DIR/$DRIVER_FILE"
     mkdir -p "$OUT_DIR"
-    cp "$DRIVER_PATH" "$OUT_DIR/$DRIVER_FILE"
     rm -rf "$OUT_DIR/build"
     cp -r "$BUILD_DIR" "$OUT_DIR/build"
     echo "$DRIVER_FILE" > "$OUT_DIR/DRIVER_FILE"
-    echo "Staged driver + build/ into $OUT_DIR"
+    echo "Staged build/ (with $DRIVER_FILE) into $OUT_DIR"
 fi
 
 echo ""
