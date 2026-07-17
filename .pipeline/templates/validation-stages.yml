@@ -241,6 +241,10 @@ stages:
         parameters:
           architecture: x64
           artifactName: 'Odbc_Linux_x64'
+      - template: build-odbc-alpine-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_Musl_x64'
 
   - job: Build_Linux_ARM
     displayName: Build Linux ARM
@@ -282,6 +286,10 @@ stages:
         parameters:
           architecture: ARM64
           artifactName: 'Odbc_Linux_arm64'
+      - template: build-odbc-alpine-template.yml
+        parameters:
+          architecture: ARM64
+          artifactName: 'Odbc_Musl_arm64'
   - job: Build_MacOS
     displayName: Build MacOS
     pool:
@@ -669,6 +677,60 @@ stages:
           - name: AzLinux3
             container: mcr.microsoft.com/azurelinux/base/core:3.0
             entry: odbc-e2e-azlinux3.sh
+
+- stage: Test_odbc_alpine
+  dependsOn:
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test ODBC Alpine
+  jobs:
+    # musl x64 reuse matrix. The driver + ctest binaries are prebuilt on the
+    # Alpine 3.18 (musl) build image, so they run on Alpine only; every listed
+    # tag ships libssl.so.3 and the unixODBC runtime.
+    - template: test-matrix-odbc-template.yml
+      parameters:
+        artifactName: 'Odbc_Musl_x64'
+        matrix:
+          Alpine3_18:
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
+            entry: odbc-e2e-alpine.sh
+          Alpine3_19:
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
+            entry: odbc-e2e-alpine.sh
+          Alpine3_20:
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
+            entry: odbc-e2e-alpine.sh
+          Alpine3_21:
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+            entry: odbc-e2e-alpine.sh
+
+- stage: Test_odbc_alpine_arm64
+  dependsOn:
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test ODBC Alpine arm64
+  jobs:
+    # musl arm64 reuse matrix. Binaries are prebuilt on the arm64 Alpine 3.18
+    # (musl) build image; SQL Server is an x64 cross-pool host since the arm
+    # agents can't run the x64 SQL image.
+    - template: test-matrix-odbc-template-arm64.yml
+      parameters:
+        sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+        sqlImageTag: ${{ parameters.sqlImageTag }}
+        artifactName: 'Odbc_Musl_arm64'
+        targets:
+          - name: Alpine3_18
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
+            entry: odbc-e2e-alpine.sh
+          - name: Alpine3_19
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
+            entry: odbc-e2e-alpine.sh
+          - name: Alpine3_20
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
+            entry: odbc-e2e-alpine.sh
+          - name: Alpine3_21
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+            entry: odbc-e2e-alpine.sh
 
 # Merge the mssql-tds Rust coverage from every OS that runs the tests
 # (Build_Windows, Build_Linux, Test_MacOS) and the mssql-py-core coverage from
