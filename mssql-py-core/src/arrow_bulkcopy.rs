@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use arrow::array::BinaryArray;
 use arrow::array::{
     Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, FixedSizeBinaryArray,
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
@@ -19,7 +20,6 @@ use arrow::array::{
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::array::{BinaryArray, NullArray};
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use async_trait::async_trait;
 use mssql_tds::connection::bulk_copy::{BulkLoadRow, ResolvedColumnMapping};
@@ -787,14 +787,6 @@ impl BulkLoadRow for ArrowBatchRowAdapter {
         }
         Ok(())
     }
-}
-
-// The `NullArray` import is intentionally kept for exhaustiveness: it ensures
-// `Null` data types compile against arrow's accessor surface even though we
-// don't downcast to it (the validity bitmap is enough to short-circuit).
-#[allow(dead_code)]
-fn _null_array_witness(a: &NullArray) -> usize {
-    a.len()
 }
 
 #[cfg(test)]
