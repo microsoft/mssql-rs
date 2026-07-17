@@ -245,6 +245,9 @@ stages:
         parameters:
           architecture: x64
           artifactName: 'Odbc_Musl_x64'
+      - template: build-odbc-glibc228-template.yml
+        parameters:
+          artifactName: 'Odbc_glibc228_x64'
 
   - job: Build_Linux_ARM
     displayName: Build Linux ARM
@@ -731,6 +734,24 @@ stages:
           - name: Alpine3_21
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
             entry: odbc-e2e-alpine.sh
+
+- stage: Test_odbc_rhel8
+  dependsOn:
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test ODBC RHEL 8
+  jobs:
+    # glibc-2.28 track. The driver + ctest binaries are prebuilt on the
+    # manylinux_2_28 (AlmaLinux 8, glibc 2.28, OpenSSL 1.1) image, so they load
+    # on RHEL 8 / UBI 8 (libssl.so.1.1) where the modern glibc 2.35 / OpenSSL 3
+    # binaries would not.
+    - template: test-matrix-odbc-template.yml
+      parameters:
+        artifactName: 'Odbc_glibc228_x64'
+        matrix:
+          RHEL8:
+            container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi8:latest
+            entry: odbc-e2e-rhel.sh
 
 # Merge the mssql-tds Rust coverage from every OS that runs the tests
 # (Build_Windows, Build_Linux, Test_MacOS) and the mssql-py-core coverage from
