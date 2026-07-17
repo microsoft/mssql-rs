@@ -2297,6 +2297,20 @@ impl TdsClient {
     ) -> TdsResult<(String, String)> {
         use std::fmt::Write as _;
 
+        for named in named_params
+            .iter()
+            .filter_map(|param| param.name.as_deref())
+        {
+            for ordinal in 0..positional_params.len() {
+                let synthetic = format!("@{SYNTHETIC_POSITIONAL_PARAM_PREFIX}{ordinal}");
+                if named.eq_ignore_ascii_case(&synthetic) {
+                    return Err(UsageError(format!(
+                        "Named parameter '{named}' conflicts with internally generated positional parameter name '{synthetic}'"
+                    )));
+                }
+            }
+        }
+
         let mut tsql = format!("EXEC {stored_procedure_name}");
         let mut params_decl = String::new();
         let mut first = true;
@@ -3799,5 +3813,27 @@ mod tests {
             params_decl,
             "@ce_pos_0 int, @ce_pos_1 bigint OUTPUT, @b int"
         );
+    }
+
+    #[test]
+    fn build_sp_describe_request_rejects_synthetic_named_collision() {
+        use crate::datatypes::sqltypes::SqlType;
+        use crate::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let positional = vec![RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::Int(Some(1)),
+        )];
+        let named = vec![RpcParameter::new(
+            Some("@CE_POS_0".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(2)),
+        )];
+
+        let err = TdsClient::build_stored_procedure_describe_request("proc", &positional, &named)
+            .expect_err("synthetic positional name collision should be rejected");
+
+        assert!(matches!(err, UsageError(message) if message.contains("@CE_POS_0")));
     }
 }
