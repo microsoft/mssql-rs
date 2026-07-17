@@ -1485,4 +1485,32 @@ mod ae_colmetadata_tests {
             "expected a ciphertext usage error, got: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn passthrough_out_of_bounds_column_errors() {
+        // Passthrough for an encrypted column whose context is missing (because
+        // begin() has not populated column_contexts) surfaces a clear
+        // out-of-bounds error instead of panicking.
+        let mut net = CapturingWriter { buffer: Vec::new() };
+        let mut packet_writer = PacketWriter::new(PacketType::BulkLoad, &mut net, None, None);
+        let mut writer = StreamingBulkLoadWriter::new(
+            &mut packet_writer,
+            "T".to_string(),
+            vec![deterministic_int_column()],
+            SqlCollation::default(),
+        );
+        writer.set_column_encryption_enabled(true);
+        writer.set_allow_encrypted_value_modifications(true);
+        // begin() intentionally not called: column_contexts stays empty even
+        // though column_metadata has the encrypted column.
+
+        let err = writer
+            .write_column_value(0, &ColumnValues::Bytes(vec![1, 2, 3, 4]))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("out of bounds"),
+            "expected an out-of-bounds error, got: {err}"
+        );
+    }
 }
