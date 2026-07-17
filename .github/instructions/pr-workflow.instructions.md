@@ -1,6 +1,7 @@
 ---
 description: "Use when creating, updating, reviewing, or merging mssql-rs pull requests. Covers draft PRs, work item links, Copilot review, validation pipelines, auto-merge, and author-owned merges."
 name: "mssql-rs PR Workflow"
+applyTo: "**"
 ---
 
 # mssql-rs PR Workflow
