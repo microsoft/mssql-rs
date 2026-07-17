@@ -61,7 +61,6 @@ jobs:
             -u 0:0 -d mcr.microsoft.com/mssql/server:2025-latest
 
           bash .pipeline/scripts/docker-cargo-run.sh --rm \
-            --entrypoint bash \
             -v "$PWD:/workspace" \
             -w /workspace \
             -e "ODBC_TEST_SERVER=sql1" \

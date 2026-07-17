@@ -105,7 +105,7 @@ jobs:
 
             docker network create testnet
 
-            bash .pipeline/scripts/docker-cargo-run.sh --rm --entrypoint bash \
+            bash .pipeline/scripts/docker-cargo-run.sh --rm \
               -v "$PWD:/workspace" \
               -w /workspace \
               -e "ODBC_TEST_SERVER=$DB_HOST,$DB_PORT" \
@@ -217,7 +217,7 @@ jobs:
 
               docker network create testnet
 
-              bash .pipeline/scripts/docker-cargo-run.sh --rm --entrypoint bash \
+              bash .pipeline/scripts/docker-cargo-run.sh --rm \
                 -v "$PWD:/workspace" \
                 -w /workspace \
                 -e "ODBC_TEST_SERVER=$DB_HOST,$DB_PORT" \
