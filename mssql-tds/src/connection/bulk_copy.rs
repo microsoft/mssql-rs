@@ -1038,8 +1038,18 @@ impl<'a> BulkCopy<'a> {
                     // COMMIT TRANSACTION: Commit on successful batch completion
                     // This mirrors .NET SqlBulkCopy.CommitTransaction() behavior
                     // ═══════════════════════════════════════════════════════════
-                    if use_internal_transaction {
-                        self.client.commit_transaction(None, None).await?;
+                    if use_internal_transaction
+                        && let Err(e) = self.client.commit_transaction(None, None).await
+                    {
+                        // The commit itself failed. Restore the INFO accumulated up to
+                        // and including this batch before propagating the error, so it
+                        // stays retrievable via `client.info_messages()` — consistent
+                        // with the Err(e) arm below. Drop any residual INFO left by the
+                        // failed commit first.
+                        let _ = self.client.take_info_messages();
+                        self.client
+                            .extend_info_messages(std::mem::take(&mut accumulated_info));
+                        return Err(e);
                     }
 
                     *total_rows += batch_count;

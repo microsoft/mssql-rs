@@ -199,6 +199,13 @@ pub enum Error {
 
     /// One or more errors returned by SQL Server, plus any informational
     /// messages that accompanied them.
+    ///
+    /// `diagnostics.info_messages` is only populated on the **login** path,
+    /// where a failed connect has no live `TdsClient` to drain. Statement, RPC,
+    /// and batch failures are built via [`Error::from_sql_errors`] and leave
+    /// `info_messages` **empty**; any INFO those commands emitted is retained on
+    /// the client and must be read separately via
+    /// `TdsClient::take_info_messages()`.
     #[error("{}", SqlServerError::format_errors(&diagnostics.errors))]
     SqlServerError {
         /// Server-reported diagnostics (errors and informational messages).

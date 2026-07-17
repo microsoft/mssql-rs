@@ -2491,13 +2491,30 @@ impl TdsClient {
         self.return_values.clone()
     }
 
-    /// Returns all informational messages captured from the current or most
-    /// recent token stream.
+    /// Returns the informational (INFO-token) messages captured from the
+    /// current or most recent command's token stream — server `PRINT` output
+    /// and low-severity `RAISERROR`/context notices.
+    ///
+    /// The buffer is reset at the start of each command, so this reflects only
+    /// the most recent one. Messages are **retained even when that command
+    /// returned an error**: a failed statement/RPC/batch surfaces its errors in
+    /// [`Error::SqlServerError`](crate::error::Error::SqlServerError) whose
+    /// `diagnostics.info_messages` is empty on the statement path, so any INFO it
+    /// emitted must still be read from here. ([`close_query()`](Self::close_query)
+    /// deliberately preserves the buffer for the same reason.)
     pub fn info_messages(&self) -> &[SqlInfoMessage] {
         &self.info_messages
     }
 
-    /// Drains and returns all informational messages captured so far.
+    /// Drains and returns the captured informational messages, leaving the
+    /// buffer empty.
+    ///
+    /// Same lifecycle as [`info_messages()`](Self::info_messages): the buffer
+    /// reflects the current/most-recent command, is populated even when that
+    /// command errored (statement-path errors carry no INFO in
+    /// [`Error::SqlServerError`](crate::error::Error::SqlServerError)), and is
+    /// reset at the next command's start — so drain it before issuing the next
+    /// command if you need the messages.
     pub fn take_info_messages(&mut self) -> Vec<SqlInfoMessage> {
         std::mem::take(&mut self.info_messages)
     }
