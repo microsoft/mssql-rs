@@ -1015,6 +1015,74 @@ mod always_encrypted {
         });
     }
 
+    /// An **encrypted** positional (unnamed) OUTPUT parameter cannot have its
+    /// RETURNVALUE decrypted — it arrives unnamed, so its ciphertext can't be
+    /// matched back to the CEK retained under the synthetic describe name — so
+    /// the driver rejects it with an actionable error rather than returning
+    /// ciphertext the caller can't read. (Pass such output parameters by name.)
+    #[tokio::test]
+    async fn encrypted_positional_output_parameter_is_rejected() {
+        ae_test!(|h| {
+            let table = h.create_encrypted_table("INT", "DETERMINISTIC").await;
+            h.insert_encrypted(&table, SqlType::Int(Some(4242))).await;
+            let proc = h.next_proc();
+            run_statement(
+                &mut h.client,
+                &format!(
+                    "CREATE PROCEDURE {proc} @out INT OUTPUT AS BEGIN \
+                     SELECT TOP 1 @out = val FROM {table} ORDER BY id; END"
+                ),
+            )
+            .await
+            .expect("create stored procedure with encrypted output parameter");
+
+            // Positional (unnamed) OUTPUT parameter targeting the encrypted column.
+            let out_param = RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None));
+            let err = h
+                .client
+                .execute_stored_procedure(proc.clone(), Some(vec![out_param]), None, None, None)
+                .await
+                .expect_err("encrypted positional OUTPUT parameter must be rejected");
+            assert!(
+                matches!(&err, mssql_tds::error::Error::UsageError(m) if m.to_lowercase().contains("output")),
+                "expected an actionable OUTPUT usage error, got {err:?}"
+            );
+        });
+    }
+
+    /// A **non-encrypted** positional OUTPUT parameter still works on an Always
+    /// Encrypted connection: it is not flagged for encryption, so it is not
+    /// rejected and its plaintext RETURNVALUE decodes normally. Guards against
+    /// the encrypted-positional-OUTPUT rejection over-restricting.
+    #[tokio::test]
+    async fn plaintext_positional_output_parameter_round_trips_under_ae() {
+        ae_test!(|h| {
+            let proc = h.next_proc();
+            run_statement(
+                &mut h.client,
+                &format!("CREATE PROCEDURE {proc} @out INT OUTPUT AS BEGIN SET @out = 7; END"),
+            )
+            .await
+            .expect("create stored procedure with plaintext output parameter");
+
+            let out_param = RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None));
+            h.client
+                .execute_stored_procedure(proc.clone(), Some(vec![out_param]), None, None, None)
+                .await
+                .expect("plaintext positional OUTPUT parameter should be accepted");
+            while h.client.move_to_next().await.unwrap() {}
+            h.client.close_query().await.unwrap();
+
+            let return_values = h.client.get_return_values();
+            assert_eq!(return_values.len(), 1, "one return value expected");
+            assert!(
+                matches!(return_values[0].value, ColumnValues::Int(7)),
+                "plaintext positional output parameter round-trip, got {:?}",
+                return_values[0].value
+            );
+        });
+    }
+
     /// `sp_prepexec` prepares and executes in one round-trip; under Always
     /// Encrypted it describes the statement and encrypts flagged parameters, so
     /// an encrypted insert round-trips.

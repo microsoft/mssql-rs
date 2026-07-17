@@ -2235,6 +2235,23 @@ impl TdsClient {
                 )));
             };
 
+            // An encrypted positional (unnamed) OUTPUT parameter cannot have its
+            // returned value decrypted: the RETURNVALUE token arrives unnamed, so
+            // its ciphertext can't be matched back to the CEK, which is retained
+            // under the parameter's synthetic describe name (`@ce_pos_N`). Reject
+            // it with an actionable error instead of returning ciphertext the
+            // caller can't read. Named OUTPUT parameters are unaffected (the
+            // RETURNVALUE name matches), as are non-encrypted positional OUTPUT
+            // parameters (they never reach this encrypted-parameter branch).
+            if params[index].is_output() && params[index].name.is_none() {
+                return Err(crate::error::Error::UsageError(
+                    "Encrypted positional OUTPUT stored-procedure parameters are not supported \
+                     because their returned value cannot be matched back to a column encryption \
+                     key; pass the output parameter by name so it can be decrypted on return."
+                        .to_string(),
+                ));
+            }
+
             let plaintext_cek = decrypt_cek(providers, cek_cache, cek_entry).await?;
 
             // An encrypted RETURNVALUE output parameter carries no CEK table and
