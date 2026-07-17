@@ -29,18 +29,36 @@ parameters:
   - name: artifactName
     type: string
     default: 'Odbc_Linux_arm64'
+  - name: manageSqlHost
+    # When false, the caller (stage) owns the shared SQL host (shared with the
+    # nextest arm64 matrix), so this template only emits the test job and
+    # consumes the caller's sql-ready-<sqlReadyInstanceId> sentinel.
+    type: boolean
+    default: true
+  - name: sqlReadyInstanceId
+    # instanceId of the sql-ready sentinel to consume in shared mode. Defaults
+    # to a dedicated host; set to the nextest host id (shared / shared_musl) to
+    # reuse a single cross-pool SQL host per stage.
+    type: string
+    default: 'odbc_shared'
+  - name: sentinelPrefix
+    # Prefix applied to teardown sentinel / per-job host names so the ODBC jobs
+    # do not collide with the nextest jobs when they share a stage.
+    type: string
+    default: ''
 
 jobs:
   # ------------------------------------------------------------------
   # SHARED MODE: one SQL host + one matrix test job.
   # ------------------------------------------------------------------
   - ${{ if eq(parameters.sqlInstanceMode, 'shared') }}:
-    - template: sql-host-template.yml
-      parameters:
-        instanceId: odbc_shared
-        sqlImageTag: ${{ parameters.sqlImageTag }}
-        maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
-        expectedSentinels: ${{ join(',', parameters.targets.*.name) }}
+    - ${{ if parameters.manageSqlHost }}:
+      - template: sql-host-template.yml
+        parameters:
+          instanceId: ${{ parameters.sqlReadyInstanceId }}
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
+          expectedSentinels: ${{ join(',', parameters.targets.*.name) }}
 
     - job: Test_Odbc_Matrix_arm64
       displayName: ODBC e2e Linux arm64
@@ -51,7 +69,7 @@ jobs:
             ${{ target.name }}:
               container: ${{ target.container }}
               entry: ${{ target.entry }}
-              sentinelName: ${{ target.name }}
+              sentinelName: ${{ parameters.sentinelPrefix }}${{ target.name }}
       pool:
         name: RUST-1ES-POOL-ARM-WUS3
         demands:
@@ -87,7 +105,7 @@ jobs:
           displayName: 'Wait for SQL host endpoint sentinel'
           workingDirectory: '$(Build.SourcesDirectory)'
           env:
-            ARTIFACT_NAME: 'sql-ready-odbc_shared-$(System.StageAttempt)'
+            ARTIFACT_NAME: 'sql-ready-${{ parameters.sqlReadyInstanceId }}-$(System.StageAttempt)'
             BUILD_BUILDID: $(Build.BuildId)
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             SYSTEM_COLLECTIONURI: $(System.CollectionUri)
@@ -156,10 +174,10 @@ jobs:
     - ${{ each target in parameters.targets }}:
       - template: sql-host-template.yml
         parameters:
-          instanceId: ${{ target.name }}
+          instanceId: ${{ parameters.sentinelPrefix }}${{ target.name }}
           sqlImageTag: ${{ parameters.sqlImageTag }}
           maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
-          expectedSentinels: ${{ target.name }}
+          expectedSentinels: ${{ parameters.sentinelPrefix }}${{ target.name }}
 
       - job: Test_Odbc_${{ target.name }}_arm64
         displayName: 'ODBC e2e Linux arm64 ${{ target.name }}'
@@ -199,7 +217,7 @@ jobs:
             displayName: 'Wait for SQL host endpoint sentinel'
             workingDirectory: '$(Build.SourcesDirectory)'
             env:
-              ARTIFACT_NAME: 'sql-ready-${{ target.name }}-$(System.StageAttempt)'
+              ARTIFACT_NAME: 'sql-ready-${{ parameters.sentinelPrefix }}${{ target.name }}-$(System.StageAttempt)'
               BUILD_BUILDID: $(Build.BuildId)
               BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
               SYSTEM_COLLECTIONURI: $(System.CollectionUri)
@@ -248,7 +266,7 @@ jobs:
 
           - script: |
               mkdir -p "$(Agent.TempDirectory)/teardown"
-              echo "${{ target.name }} done at $(date -u +%FT%TZ)" \
+              echo "${{ parameters.sentinelPrefix }}${{ target.name }} done at $(date -u +%FT%TZ)" \
                 > "$(Agent.TempDirectory)/teardown/done.txt"
             displayName: 'Stage teardown sentinel'
             condition: always()
@@ -258,5 +276,5 @@ jobs:
             condition: always()
             inputs:
               targetPath: '$(Agent.TempDirectory)/teardown'
-              artifact: '${{ target.name }}-$(System.StageAttempt)'
+              artifact: '${{ parameters.sentinelPrefix }}${{ target.name }}-$(System.StageAttempt)'
               publishLocation: 'pipeline'

@@ -9,9 +9,10 @@
 parameters:
   matrix: {}
   artifactName: 'Odbc_Linux_x64'
+  nameSuffix: ''
 
 jobs:
-  - job: Test_Odbc_Matrix
+  - job: Test_Odbc_Matrix${{ parameters.nameSuffix }}
     displayName: ODBC e2e Linux amd64
     strategy:
       matrix: ${{ parameters.matrix }}
