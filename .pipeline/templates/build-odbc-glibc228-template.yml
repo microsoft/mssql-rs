@@ -19,8 +19,6 @@ parameters:
 steps:
   - script: |
       set -e
-      rm -rf "$(Build.SourcesDirectory)/odbc-drop"
-
       bash .pipeline/scripts/docker-cargo-run.sh --rm \
         -v "$PWD:/workspace" \
         -e ODBC_DROP_DIR=/workspace/odbc-drop \

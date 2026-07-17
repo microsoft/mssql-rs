@@ -23,6 +23,12 @@ set -euo pipefail
 
 DROP_DIR="${ODBC_DROP_DIR:-/workspace/odbc-drop}"
 
+# The glibc / musl / glibc-2.28 tracks build sequentially in the same job,
+# sharing the in-place CMake build tree (tests/e2e/build) and this drop dir.
+# Both end up root-owned by the container, so clean them here (as root) to avoid
+# cross-toolchain CMake cache reuse and host-side permission errors.
+rm -rf "$DROP_DIR" /workspace/mssql-odbc/tests/e2e/build
+
 # openssl-devel on AlmaLinux 8 is 1.1.1, so the driver links libssl.so.1.1.
 dnf install -y --allowerasing \
     gcc gcc-c++ make cmake unixODBC-devel openssl-devel
