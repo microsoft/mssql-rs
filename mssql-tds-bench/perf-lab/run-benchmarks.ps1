@@ -257,8 +257,8 @@ if (-not (Test-Path $BaselineFile)) {
 $BaselineCommit = (Get-Content $BaselineFile |
     Where-Object { $_ -notmatch '^\s*(#|$)' } |
     Select-Object -First 1).Trim()
-if ($BaselineCommit -notmatch '^[0-9a-fA-F]{7,40}$') {
-    throw "$BaselineFile does not contain a valid commit SHA (got: '$BaselineCommit')"
+if ($BaselineCommit -notmatch '^[0-9a-fA-F]{40}$') {
+    throw "$BaselineFile does not contain a valid 40-character commit SHA (got: '$BaselineCommit')"
 }
 & git rev-parse --verify --quiet "$BaselineCommit^{commit}" *> $null
 if ($LASTEXITCODE -ne 0) {

@@ -74,11 +74,13 @@ fi
 # --- System prerequisites (Ubuntu) ---
 # The perf VM may be a minimal image without git or a C toolchain. Install what
 # the run needs up front: git (for the baseline worktree), curl (for rustup),
-# and a C linker (to compile the benches).
+# python3 (to parse cargo's JSON output in bench_bins), and a C linker (to
+# compile the benches).
 ensure_packages() {
     local missing=()
     command -v git >/dev/null 2>&1 || missing+=(git)
     command -v curl >/dev/null 2>&1 || missing+=(curl)
+    command -v python3 >/dev/null 2>&1 || missing+=(python3)
     command -v cc >/dev/null 2>&1 || missing+=(build-essential)
     command -v pkg-config >/dev/null 2>&1 || missing+=(pkg-config)
     [ -f /usr/include/openssl/ssl.h ] || missing+=(libssl-dev)
@@ -130,8 +132,8 @@ if [ ! -f "$BASELINE_FILE" ]; then
     exit 1
 fi
 BASELINE_COMMIT="$(grep -vE '^[[:space:]]*(#|$)' "$BASELINE_FILE" | head -n1 | tr -d '[:space:]')"
-if ! printf '%s' "$BASELINE_COMMIT" | grep -qE '^[0-9a-fA-F]{7,40}$'; then
-    echo "ERROR: ${BASELINE_FILE} does not contain a valid commit SHA (got: '${BASELINE_COMMIT}')" >&2
+if ! printf '%s' "$BASELINE_COMMIT" | grep -qE '^[0-9a-fA-F]{40}$'; then
+    echo "ERROR: ${BASELINE_FILE} does not contain a valid 40-character commit SHA (got: '${BASELINE_COMMIT}')" >&2
     exit 1
 fi
 if ! git rev-parse --verify --quiet "${BASELINE_COMMIT}^{commit}" >/dev/null; then

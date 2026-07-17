@@ -4,7 +4,7 @@ A **fixed Criterion harness** for benchmarking [`mssql-tds`](../mssql-tds) with 
 **swappable dependency**, so a stable baseline build and a candidate build can be
 compared on the same host with `mssql-tds` as the only variable.
 
-See [`../mssql-tds/docs/perf-testing-plan.md`](../mssql-tds/docs/perf-testing-plan.md)
+See [`../docs/perf-testing-plan.md`](../docs/perf-testing-plan.md)
 for the full design and rationale.
 
 ## How isolation works
@@ -28,10 +28,12 @@ that file, so every move is reviewed and recorded in git history.
 
 | Bench file | Scenarios |
 |------------|-----------|
-| `connection` | single connect/close; N concurrent connects (50/100/500) |
-| `query` | simple SELECT; N-row reads (100/1k/10k); single INSERT; `sp_executesql`; stored procedure; batched statements |
+| `connection` | single connect/close; N concurrent connects (50/100) |
+| `query_rows` | simple SELECT; N-row reads (100/1k/10k); single INSERT |
+| `query_procs` | `sp_executesql`; stored procedure; stored procedure with OUTPUT parameter |
+| `query_prepared` | prepared execute (`sp_prepare`/`sp_execute`); one-shot `sp_prepexec`; batched statements |
 | `datatypes` | primitives; VARCHAR/NVARCHAR; temporal types; LOB (1 MB/20 MB, byte throughput) |
-| `bulk` | `BulkCopy` insert across batch sizes 50/500/5,000 |
+| `bulk` | `BulkCopy` insert across batch sizes 500/5,000 |
 | `tds_specific` | packet-size sensitivity (4096/8192/32768); zero-copy `next_row` row-iteration throughput |
 
 Each benchmark creates its own session temp tables / temp procedures, so **no
@@ -45,7 +47,7 @@ closes.
 cargo bench -p mssql-tds-bench
 
 # A single bench file
-cargo bench -p mssql-tds-bench --bench query
+cargo bench -p mssql-tds-bench --bench query_rows
 
 # Save a named baseline, then compare
 cargo bench -p mssql-tds-bench -- --save-baseline base

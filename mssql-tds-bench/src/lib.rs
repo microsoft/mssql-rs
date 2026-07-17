@@ -119,6 +119,10 @@ pub async fn connect(env: &BenchEnv) -> TdsClient {
 
 /// Connect with an explicit requested TDS packet size (512–32768).
 pub async fn connect_with_packet_size(env: &BenchEnv, packet_size: u16) -> TdsClient {
+    assert!(
+        (512..=32768).contains(&packet_size),
+        "requested TDS packet size {packet_size} is outside the supported range 512..=32768"
+    );
     let mut context = create_context();
     context.packet_size = packet_size;
     let provider = TdsConnectionProvider {};
