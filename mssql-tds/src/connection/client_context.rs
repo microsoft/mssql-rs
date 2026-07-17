@@ -80,6 +80,45 @@ pub enum VectorVersion {
     V2,
 }
 
+/// Controls the Always Encrypted (column encryption) behavior for a connection.
+///
+/// When `Enabled`, the client negotiates the Column Encryption (TCE) feature during
+/// login, transparently encrypts parameters targeting encrypted columns, and decrypts
+/// encrypted result columns. When `Disabled` (the default), the feature is not
+/// negotiated and the connection behaves as if Always Encrypted is unavailable.
+#[derive(PartialEq, Eq, Copy, Clone, Debug, Default)]
+pub enum ColumnEncryptionSetting {
+    /// Always Encrypted is disabled. The TCE feature is not requested. (Default.)
+    #[default]
+    Disabled,
+    /// Always Encrypted is enabled. The TCE feature is negotiated during login.
+    Enabled,
+}
+
+/// Per-execution override of the connection's Always Encrypted behavior.
+///
+/// A command may override the connection-level [`ColumnEncryptionSetting`] for a
+/// single execution. The default, [`UseConnectionSetting`](Self::UseConnectionSetting),
+/// inherits the connection's behavior. The override only has effect when the
+/// server acknowledged the Column Encryption feature during login (which only
+/// happens when the connection requested [`ColumnEncryptionSetting::Enabled`]).
+#[derive(PartialEq, Eq, Copy, Clone, Debug, Default)]
+pub enum ExecutionColumnEncryptionSetting {
+    /// Inherit the connection's [`ColumnEncryptionSetting`]. (Default.)
+    #[default]
+    UseConnectionSetting,
+    /// Encrypt parameters targeting encrypted columns and decrypt encrypted
+    /// result columns for this command.
+    Enabled,
+    /// Decrypt encrypted result columns but send parameters unencrypted. Useful
+    /// when a command reads encrypted columns but its parameters do not target
+    /// any encrypted column.
+    ResultSetOnly,
+    /// Disable Always Encrypted for this command: parameters are sent
+    /// unencrypted and result columns are not decrypted.
+    Disabled,
+}
+
 /// Provides a trait for creating Entra ID tokens.
 #[async_trait]
 pub trait EntraIdTokenFactory: Send + Sync {
@@ -253,6 +292,16 @@ pub struct ClientContext {
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
     pub vector_version: VectorVersion,
+    /// Always Encrypted (column encryption) setting for the connection.
+    /// Default: [`ColumnEncryptionSetting::Disabled`].
+    pub column_encryption_setting: ColumnEncryptionSetting,
+    /// Registry of column master key store providers used to unwrap column
+    /// encryption keys for Always Encrypted. Empty by default.
+    pub(crate) column_encryption_key_store_providers:
+        std::sync::Arc<crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry>,
+    /// Cache of decrypted column encryption keys, shared across the connection
+    /// (and its session-recovery clones) so a CMK only unwraps a CEK once.
+    pub(crate) cek_cache: std::sync::Arc<crate::security::keystore::CekCache>,
     /// UserAgent telemetry payload components.
     pub user_agent: UserAgent,
 }
@@ -299,6 +348,37 @@ impl UserAgent {
 }
 
 impl ClientContext {
+    /// Registers a column master key store provider used to unwrap column
+    /// encryption keys for Always Encrypted.
+    ///
+    /// `name` is matched case-insensitively against the `key_store_name`
+    /// carried in the result-set CEK table (for example
+    /// `MSSQL_CERTIFICATE_STORE`). Register providers before creating the
+    /// client so they are available for the first encrypted query or bulk copy.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use mssql_tds::security::RsaKeyStoreProvider;
+    ///
+    /// let mut provider = RsaKeyStoreProvider::new();
+    /// provider.add_key_from_pem("CurrentUser/My/<thumbprint>", pem_bytes)?;
+    ///
+    /// let mut context = ClientContext::with_data_source("tcp:localhost,1433");
+    /// context.register_column_encryption_key_store_provider(
+    ///     "MSSQL_CERTIFICATE_STORE",
+    ///     Arc::new(provider),
+    /// );
+    /// ```
+    pub fn register_column_encryption_key_store_provider(
+        &mut self,
+        name: impl AsRef<str>,
+        provider: std::sync::Arc<dyn crate::security::ColumnEncryptionKeyStoreProvider>,
+    ) {
+        std::sync::Arc::make_mut(&mut self.column_encryption_key_store_providers)
+            .register(name, provider);
+    }
+
     /// Creates a new ClientContext with the specified data source.
     /// The data source is mandatory for establishing a connection.
     ///
@@ -352,6 +432,11 @@ impl ClientContext {
             },
             // TODO: make V2 as default when full V2 support is added
             vector_version: VectorVersion::V1,
+            column_encryption_setting: ColumnEncryptionSetting::Disabled,
+            column_encryption_key_store_providers: std::sync::Arc::new(
+                crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),
+            ),
+            cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
             user_agent: UserAgent::default(),
         }
     }
@@ -408,6 +493,11 @@ impl ClientContext {
             },
             // TODO: make V2 as default when full V2 support is added
             vector_version: VectorVersion::V1,
+            column_encryption_setting: ColumnEncryptionSetting::Disabled,
+            column_encryption_key_store_providers: std::sync::Arc::new(
+                crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),
+            ),
+            cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
             user_agent: UserAgent::default(),
         }
     }
@@ -642,6 +732,11 @@ impl Clone for ClientContext {
             access_token: self.access_token.clone(),
             transport_context: self.transport_context.clone(),
             vector_version: self.vector_version,
+            column_encryption_setting: self.column_encryption_setting,
+            column_encryption_key_store_providers: self
+                .column_encryption_key_store_providers
+                .clone(),
+            cek_cache: self.cek_cache.clone(),
             user_agent: self.user_agent.clone(),
         }
     }

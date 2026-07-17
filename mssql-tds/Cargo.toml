@@ -26,6 +26,11 @@ tls-schannel-direct = []
 # unconditionally — useful as an escape hatch if the rewrite needs to
 # be temporarily disabled in production.
 tls-schannel-direct-on-windows = ["tls-schannel-direct"]
+# Exposes in-process key-provisioning helpers used only by tests and tooling
+# (RSA key generation / PKCS#8 export and RsaKeyStoreProvider::generate_and_add_key).
+# Not part of the shipped API surface. Enabled for this crate's own tests via the
+# self dev-dependency below.
+test-util = []
 
 
 [lints]
@@ -44,6 +49,9 @@ tracing = { version = "0.1.43", features = ["log"] }
 bitflags = "2.10.0"
 thiserror = "2.0.17"
 bigdecimal = "0.4"
+# Zeroizes plaintext Always Encrypted key material (derived AEAD sub-keys and
+# resolved column encryption keys) on drop.
+zeroize = { version = "1.8", features = ["alloc", "derive"] }
 # For pretty printing of the packets in the traces.
 pretty-hex = "0.4"
 # Added for setting the keep alives on the socket.
@@ -78,6 +86,22 @@ windows-sys = { version = "0.59", features = [
 # For runtime GSSAPI library detection using dlopen/dlsym
 libc = "0.2"
 
+# OpenSSL backs the Always Encrypted crypto primitives on every target that is
+# neither Windows (which uses CNG) nor macOS (which uses Security.framework) — see
+# `security::crypto`. OpenSSL is already the TLS backend on these platforms (via
+# `native-tls`), so it adds no new system requirement.
+[target.'cfg(all(not(windows), not(target_os = "macos")))'.dependencies]
+openssl = { version = "0.10.66" }
+
+# Apple Security.framework (`SecKey`) backs RSA and key generation for Always
+# Encrypted on macOS; AES/HMAC/SHA/RNG go through CommonCrypto in `libSystem`.
+# Both crates are already present transitively (native-tls links Security.framework
+# on Apple targets), so they add no new system requirement.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7.0" }
+security-framework-sys = { version = "2.17.0" }
+core-foundation = { version = "0.10.1" }
+
 [dependencies.uuid]
 version = "1.19.0"
 features = [
@@ -107,3 +131,6 @@ criterion = "0.5"
 mssql-mock-tds = { path = "../mssql-mock-tds" }
 tempfile = "3.13"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+# Self dev-dependency: enables the `test-util` feature when building this crate's
+# integration tests (which use the in-process key-provisioning helpers).
+mssql-tds = { path = ".", features = ["test-util"] }

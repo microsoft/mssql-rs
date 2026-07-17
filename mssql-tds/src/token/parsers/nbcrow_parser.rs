@@ -4,13 +4,16 @@
 use std::{io::Error, vec};
 
 use async_trait::async_trait;
-use tracing::trace;
+use tracing::{info, trace};
 
 use super::super::tokens::{RowToken, Tokens};
 use super::common::TokenParser;
 use crate::{core::TdsResult, io::packet_reader::TdsPacketReader};
 use crate::{
-    datatypes::{column_values::ColumnValues, decoder::SqlTypeDecode},
+    datatypes::{
+        column_values::ColumnValues,
+        decoder::{SqlTypeDecode, decrypt_encrypted_column},
+    },
     io::token_stream::ParserContext,
 };
 
@@ -41,10 +44,10 @@ impl<T: SqlTypeDecode + Sync, P: TdsPacketReader + Send + Sync> TokenParser<P>
     for NbcRowTokenParser<T>
 {
     async fn parse(&self, reader: &mut P, context: &ParserContext) -> TdsResult<Tokens> {
-        let column_metadata_token = match context {
-            ParserContext::ColumnMetadata(metadata) => {
+        let (column_metadata_token, decryptor) = match context {
+            ParserContext::ColumnMetadata(metadata, decryptor) => {
                 trace!("Metadata during Row Parsing: {:?}", metadata);
-                metadata
+                (metadata, decryptor.as_ref())
             }
             _ => {
                 return Err(crate::error::Error::from(Error::new(
@@ -60,7 +63,7 @@ impl<T: SqlTypeDecode + Sync, P: TdsPacketReader + Send + Sync> TokenParser<P>
         let col_count = all_metadata.len();
 
         let bitmap_length = col_count.div_ceil(8);
-        let mut bitmap: Vec<u8> = vec![0; bitmap_length as usize];
+        let mut bitmap: Vec<u8> = vec![0; bitmap_length];
         reader.read_bytes(bitmap.as_mut_slice()).await?;
         // let mut index = 0;
 
@@ -71,7 +74,25 @@ impl<T: SqlTypeDecode + Sync, P: TdsPacketReader + Send + Sync> TokenParser<P>
             if is_null {
                 all_values.push(ColumnValues::Null);
             } else {
-                let column_value = self.decoder.decode(reader, metadata).await?;
+                let column_value = match (metadata.crypto_metadata.is_some(), decryptor) {
+                    (true, Some(dec)) => {
+                        decrypt_encrypted_column(&self.decoder, reader, metadata, dec).await?
+                    }
+                    (true, None) => {
+                        // Encrypted column but no decryptor: AE disabled for this
+                        // command (expected) or enabled-but-misconfigured. Log
+                        // so the misconfigured case is observable, then decode
+                        // the raw ciphertext varbinary.
+                        info!(
+                            column = %metadata.column_name,
+                            "Encrypted column has no column-encryption decryptor available \
+                             (Always Encrypted disabled for this command, or no key-store \
+                             provider registered); returning the raw ciphertext varbinary"
+                        );
+                        self.decoder.decode(reader, metadata).await?
+                    }
+                    (false, _) => self.decoder.decode(reader, metadata).await?,
+                };
                 all_values.push(column_value);
             }
         }
@@ -123,14 +144,19 @@ mod tests {
             data_type: TdsDataType::Int4,
             column_name: name.to_string(),
             multi_part_name: None,
+            crypto_metadata: None,
         }
     }
 
     fn make_context(columns: Vec<ColumnMetadata>) -> ParserContext {
-        ParserContext::ColumnMetadata(Arc::new(ColMetadataToken {
-            column_count: columns.len() as u16,
-            columns,
-        }))
+        ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: columns.len() as u16,
+                columns,
+                cek_table: Vec::new(),
+            }),
+            None,
+        )
     }
 
     // --- is_null_value_in_column tests ---

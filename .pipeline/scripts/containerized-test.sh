@@ -14,3 +14,4 @@ cargo llvm-cov nextest "$@" --frozen --no-report --all-targets --package mssql-t
 
 echo '==> Generating coverage report...'
 cargo llvm-cov report --package mssql-tds --lcov --output-path /workspace/target/lcov.info
+cargo llvm-cov report --package mssql-tds --cobertura --output-path /workspace/target/cobertura.xml
