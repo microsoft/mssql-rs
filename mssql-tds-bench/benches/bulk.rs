@@ -62,6 +62,12 @@ fn bulk_rows() -> u64 {
         .unwrap_or(10_000)
 }
 
+// The single connection is shared between Criterion's un-measured setup closure
+// (truncate) and the measured closure (bulk copy) via a RefCell; each closure
+// borrows it in turn and the borrow is held across the await. That is safe here
+// (single-threaded bench, the closures never run concurrently), so the RefCell
+// lint does not apply.
+#[allow(clippy::await_holding_refcell_ref)]
 fn bulk_insert(c: &mut Criterion) {
     let rt = runtime();
     if try_connect(&rt, "bulk_insert").is_none() {
@@ -113,7 +119,7 @@ fn bulk_insert(c: &mut Criterion) {
                     |_| {
                         rt.block_on(async {
                             let mut conn = client.borrow_mut();
-                            let bulk_copy = BulkCopy::new(&mut *conn, "#bulk_target");
+                            let bulk_copy = BulkCopy::new(&mut conn, "#bulk_target");
                             bulk_copy
                                 .batch_size(batch_size)
                                 .write_to_server_zerocopy(&rows)

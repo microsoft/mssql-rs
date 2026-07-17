@@ -71,6 +71,12 @@ fn select_n_rows(c: &mut Criterion) {
     group.finish();
 }
 
+// The single connection is shared between Criterion's un-measured reset closure
+// (truncate) and the measured insert closure via a RefCell; each closure borrows
+// it in turn and the borrow is held across the await. That is safe here
+// (single-threaded bench, the closures never run concurrently), so the RefCell
+// lint does not apply.
+#[allow(clippy::await_holding_refcell_ref)]
 fn single_insert(c: &mut Criterion) {
     let rt = runtime();
     if try_connect(&rt, "single_insert").is_none() {
