@@ -642,7 +642,9 @@ fn read_timestamp(arr: &dyn Array, row_idx: usize, unit: TimeUnit) -> TdsResult<
         TimeUnit::Second => raw.checked_mul(TICKS_PER_SECOND as i64),
         TimeUnit::Millisecond => raw.checked_mul((TICKS_PER_SECOND / 1_000) as i64),
         TimeUnit::Microsecond => raw.checked_mul((TICKS_PER_SECOND / 1_000_000) as i64),
-        TimeUnit::Nanosecond => Some(raw / 100),
+        // Floor (not truncate-toward-zero) so pre-epoch timestamps stay
+        // consistent with the div_euclid used for the day/tick split below.
+        TimeUnit::Nanosecond => Some(raw.div_euclid(100)),
     };
     ticks.ok_or_else(|| Error::UsageError("Timestamp overflow when scaling to 100-ns ticks".into()))
 }
@@ -681,7 +683,9 @@ fn read_time_ticks(arr: &dyn Array, row_idx: usize, unit: TimeUnit) -> TdsResult
             let v = downcast::<Time64MicrosecondArray>(arr)?.value(row_idx);
             v * (TICKS_PER_SECOND / 1_000_000) as i64
         }
-        TimeUnit::Nanosecond => downcast::<Time64NanosecondArray>(arr)?.value(row_idx) / 100,
+        TimeUnit::Nanosecond => downcast::<Time64NanosecondArray>(arr)?
+            .value(row_idx)
+            .div_euclid(100),
     };
     if ticks < 0 {
         return Err(Error::UsageError("Time value is negative".into()));
@@ -991,6 +995,24 @@ mod tests {
             ColumnValues::DateTime2(dt2) => {
                 // 1µs = 10 ticks at 100-ns precision
                 assert_eq!(dt2.time.time_nanoseconds, 10);
+            }
+            other => panic!("expected DateTime2, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn timestamp_ns_pre_epoch_floors_to_100ns_tick() {
+        // A nanosecond timestamp 150 ns before the UNIX epoch must floor to
+        // -200 ns (2 ticks), not truncate toward zero to -100 ns (1 tick).
+        // Regression for the div_euclid(100) fix in read_timestamp.
+        let dest = meta_dt2("ts", 7);
+        let arr: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![Some(-150_i64)]));
+        let plan = one_col_plan(DataType::Timestamp(TimeUnit::Nanosecond, None), &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::DateTime2(dt2) => {
+                // 1969-12-31 23:59:59.9999998 -> day 719_161, 863_999_999_998 ticks.
+                assert_eq!(dt2.days, 719_161);
+                assert_eq!(dt2.time.time_nanoseconds, 863_999_999_998);
             }
             other => panic!("expected DateTime2, got {:?}", other),
         }
