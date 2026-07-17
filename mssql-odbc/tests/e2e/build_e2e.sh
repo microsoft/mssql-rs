@@ -61,9 +61,18 @@ echo "=== Building mssql-odbc driver ($BUILD_TYPE) ==="
     fi
 )
 
-TARGET_DIR="$(cd "$ODBC_CRATE_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null \
-    || echo "$ODBC_CRATE_DIR/target")"
+# Resolve the Cargo target dir (workspace-level for a workspace member) without
+# depending on python3/jq, which the musl (Alpine) build image doesn't ship.
+TARGET_DIR="$(cd "$ODBC_CRATE_DIR" \
+    && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | grep -o '"target_directory":"[^"]*"' | head -n1 \
+    | sed 's/^"target_directory":"//; s/"$//' || true)"
+if [ -z "$TARGET_DIR" ]; then
+    # Fallback: workspace-root target first, then a standalone crate build.
+    for cand in "$ODBC_CRATE_DIR/../target" "$ODBC_CRATE_DIR/target"; do
+        if [ -f "$cand/$BUILD_TYPE/$DRIVER_FILE" ]; then TARGET_DIR="$cand"; break; fi
+    done
+fi
 DRIVER_PATH="$TARGET_DIR/$BUILD_TYPE/$DRIVER_FILE"
 
 if [ ! -f "$DRIVER_PATH" ]; then

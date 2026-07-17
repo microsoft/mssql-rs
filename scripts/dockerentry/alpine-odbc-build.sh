@@ -30,8 +30,10 @@ DROP_DIR="${ODBC_DROP_DIR:-/workspace/odbc-drop}"
 # cross-toolchain CMake cache reuse and host-side permission errors.
 rm -rf "$DROP_DIR" /workspace/mssql-odbc/tests/e2e/build
 
-# bash is required by build_e2e.sh; build-base gives gcc/g++/make.
-apk add --no-cache bash build-base cmake unixodbc-dev openssl-dev
+# bash is required by build_e2e.sh; build-base gives gcc/g++/make; git is
+# needed by the e2e CMake FetchContent(googletest) step (the glibc build images
+# ship git already, Alpine does not).
+apk add --no-cache bash build-base cmake unixodbc-dev openssl-dev git
 
 export RUSTFLAGS="-C target-feature=-crt-static"
 
