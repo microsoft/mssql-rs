@@ -495,6 +495,19 @@ steps:
     failTaskOnFailedTests: false
     publishRunAttachments: true
 
+# Cobertura from the mssql-py-core Rust unit tests (produced by the step above).
+# Merged with the mssql-py-core Python coverage under the same crate prefix in
+# the Coverage stage, since ADO does not merge coverage across stages/jobs.
+- ${{ if eq(parameters.collectPythonCoverage, true) }}:
+  - task: PublishPipelineArtifact@1
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Publish mssql-py-core Rust Cobertura coverage artifact
+    continueOnError: true
+    inputs:
+      targetPath: $(Build.SourcesDirectory)/target/pycore-rust-cobertura.xml
+      artifactName: CoberturaCoveragePyCoreRust
+
+
 - script: |
     BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
