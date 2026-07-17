@@ -48,7 +48,7 @@ foreach ($crate in $Crates) {
 
     $content = $null
     try {
-        $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        $resp = Invoke-WebRequest -Uri $url -TimeoutSec 60 -ErrorAction Stop
         $content = $resp.Content
     }
     catch {
