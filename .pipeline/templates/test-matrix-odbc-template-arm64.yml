@@ -37,7 +37,7 @@ jobs:
   - ${{ if eq(parameters.sqlInstanceMode, 'shared') }}:
     - template: sql-host-template.yml
       parameters:
-        instanceId: odbc-shared
+        instanceId: odbc_shared
         sqlImageTag: ${{ parameters.sqlImageTag }}
         maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
         expectedSentinels: ${{ join(',', parameters.targets.*.name) }}
@@ -87,7 +87,7 @@ jobs:
           displayName: 'Wait for SQL host endpoint sentinel'
           workingDirectory: '$(Build.SourcesDirectory)'
           env:
-            ARTIFACT_NAME: 'sql-ready-odbc-shared-$(System.StageAttempt)'
+            ARTIFACT_NAME: 'sql-ready-odbc_shared-$(System.StageAttempt)'
             BUILD_BUILDID: $(Build.BuildId)
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             SYSTEM_COLLECTIONURI: $(System.CollectionUri)
