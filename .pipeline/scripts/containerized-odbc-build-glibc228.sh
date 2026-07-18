@@ -36,4 +36,15 @@ if [ -f "$HOME/.cargo/env" ]; then
     source "$HOME/.cargo/env"
 fi
 
+# Build into a target dir dedicated to this track. The modern-glibc track builds
+# first in the same job and shares the workspace, and it uses the same host
+# triple (x86_64-unknown-linux-gnu), so cargo's fingerprints match and it would
+# otherwise reuse the modern track's host build scripts (e.g. openssl-sys's
+# build-script-main). Those are linked against the modern image's glibc (2.34+)
+# and fail to run on this glibc-2.28 base. A separate target dir forces cargo to
+# recompile the build scripts here under glibc 2.28. build_e2e.sh resolves the
+# driver via `cargo metadata`, which honors CARGO_TARGET_DIR.
+export CARGO_TARGET_DIR=/workspace/target-glibc228
+rm -rf "$CARGO_TARGET_DIR"
+
 exec /workspace/mssql-odbc/tests/e2e/build_e2e.sh --release --out="$DROP_DIR"
