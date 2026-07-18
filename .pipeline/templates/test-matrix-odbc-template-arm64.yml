@@ -63,7 +63,10 @@ jobs:
           instanceId: ${{ parameters.sqlReadyInstanceId }}
           sqlImageTag: ${{ parameters.sqlImageTag }}
           maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
-          expectedSentinels: ${{ join(',', parameters.targets.*.name) }}
+          # Teardown sentinels are published as sentinelPrefix + target.name (see
+          # sentinelName below), so the managed host must wait for the prefixed
+          # names too. When sentinelPrefix is '' this reduces to the plain join.
+          expectedSentinels: ${{ format('{0}{1}', parameters.sentinelPrefix, replace(join(',', parameters.targets.*.name), ',', format(',{0}', parameters.sentinelPrefix))) }}
 
     - job: Test_Odbc_Matrix${{ parameters.nameSuffix }}_arm64
       displayName: ODBC e2e Linux arm64

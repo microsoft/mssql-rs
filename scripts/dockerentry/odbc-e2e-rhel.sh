@@ -2,10 +2,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 #
-# Test entrypoint for the mssql-odbc C++ gtest e2e suite on RHEL-family (dnf)
-# containers: RHEL 9 / UBI 9, Oracle Linux 9. Installs only the RUNTIME deps to
-# rerun the prebuilt driver + ctest binaries: ctest (from cmake), the unixODBC
-# driver manager runtime, OpenSSL libs, and the Kerberos runtime. The prebuilt
+# Test entrypoint for the mssql-odbc C++ gtest e2e suite on the glibc-2.28
+# RHEL-family (dnf) track: RHEL 8 / UBI 8 (glibc 2.28, OpenSSL 1.1). Installs
+# only the RUNTIME deps to rerun the prebuilt driver + ctest binaries: ctest
+# (from cmake), the unixODBC driver manager runtime, OpenSSL libs, and the
+# Kerberos runtime. The prebuilt
 # build/ tree (with libmsodbcsql18.so staged inside) is restored to
 # mssql-odbc/tests/e2e/build by the calling template.
 #
