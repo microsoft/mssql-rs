@@ -255,6 +255,10 @@ configure_and_build_tests() {
             echo "  Expected $BUILD_DIR/CTestTestfile.cmake (produced by build_e2e.sh)." >&2
             exit 1
         fi
+        # Publishing/downloading the build tree as a pipeline artifact drops the
+        # Unix execute bit, so the restored ctest binaries come back as 0644 and
+        # ctest fails to exec them ("permission denied"). Restore +x here.
+        find "$BUILD_DIR" -type f -name '*_test' -exec chmod +x {} +
         return
     fi
 
