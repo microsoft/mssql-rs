@@ -54,12 +54,32 @@ jobs:
 
           docker network create testnet
 
-          docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=$(SQL_PASSWORD)" \
+          sql_cid=$(docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=$(SQL_PASSWORD)" \
             -p 1433:1433 --hostname sql1 --network testnet \
             -v $PWD/conf/mssql.conf:/var/opt/mssql/mssql.conf \
             -v $PWD/mssql.pem:/etc/ssl/certs/mssql.pem \
             -v $PWD/mssql.key:/etc/ssl/private/mssql.key \
-            -u 0:0 -d mcr.microsoft.com/mssql/server:2025-latest
+            -u 0:0 -d mcr.microsoft.com/mssql/server:2025-latest)
+
+          # The e2e binaries are prebuilt (no cargo build to absorb SQL Server's
+          # first-boot window), so gate on the SA login being live before running
+          # them — otherwise the first live test races SQL init and gets 18456.
+          echo "Waiting for SQL Server to accept the SA login..."
+          ready=0
+          for i in $(seq 1 60); do
+            if docker exec "$sql_cid" /opt/mssql-tools18/bin/sqlcmd \
+                -S localhost -U sa -P "$SQL_PASSWORD" -C -Q "SELECT 1" >/dev/null 2>&1; then
+              ready=1
+              echo "SQL Server ready after $i attempt(s)."
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "ERROR: SQL Server did not become ready in time." >&2
+            docker logs --tail 200 "$sql_cid" >&2 || true
+            exit 1
+          fi
 
           bash .pipeline/scripts/docker-cargo-run.sh --rm \
             -v "$PWD:/workspace" \
