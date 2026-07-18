@@ -2,10 +2,8 @@
 set -e
 source ~/.cargo/env
 
-# mssql-py-core is outside the workspace, so its Rust unit tests are not covered
-# by the mssql-tds nextest run. Run them here under llvm-cov with the crate-local
-# `ci` profile so JUnit is written to mssql-py-core/target/nextest/ci/junit.xml
-# for the ADO test-results tab and a Cobertura report is produced for coverage.
+# mssql-py-core is excluded from the Cargo workspace, so its Rust unit tests
+# need a dedicated run here.
 echo '==> Running mssql-py-core Rust unit tests with coverage...'
 cd /workspace/mssql-py-core
 cargo llvm-cov clean --workspace
