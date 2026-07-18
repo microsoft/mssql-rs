@@ -519,3 +519,187 @@ pub unsafe extern "C" fn SQLCancel(_statement_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();
     SQL_SUCCESS
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ptr;
+
+    use super::*;
+    use crate::api::odbc_types::{SQL_DROP, SQL_HANDLE_ENV, SQL_INVALID_HANDLE, SQL_NULL_HANDLE};
+
+    /// Every delegating export forwards a null handle to its impl, which
+    /// uniformly reports `SQL_INVALID_HANDLE`.
+    #[test]
+    fn delegating_exports_reject_null_handle() {
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            assert_eq!(
+                SQLFreeHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE),
+                SQL_INVALID_HANDLE
+            );
+            assert_eq!(
+                SQLSetEnvAttr(SQL_NULL_HANDLE, 0, ptr::null_mut(), 0),
+                SQL_INVALID_HANDLE
+            );
+            assert_eq!(
+                SQLGetDiagRecW(
+                    SQL_HANDLE_ENV,
+                    SQL_NULL_HANDLE,
+                    1,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                ),
+                SQL_INVALID_HANDLE
+            );
+            assert_eq!(
+                SQLGetDiagFieldW(
+                    SQL_HANDLE_ENV,
+                    SQL_NULL_HANDLE,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                ),
+                SQL_INVALID_HANDLE
+            );
+            assert_eq!(
+                SQLDriverConnectW(
+                    SQL_NULL_HANDLE,
+                    ptr::null_mut(),
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                ),
+                SQL_INVALID_HANDLE
+            );
+            assert_eq!(SQLDisconnect(SQL_NULL_HANDLE), SQL_INVALID_HANDLE);
+            assert_eq!(
+                SQLSetConnectAttrW(SQL_NULL_HANDLE, 0, ptr::null_mut(), 0),
+                SQL_INVALID_HANDLE
+            );
+            assert_eq!(SQLCloseCursor(SQL_NULL_HANDLE), SQL_INVALID_HANDLE);
+            assert_eq!(SQLFreeStmt(SQL_NULL_HANDLE, SQL_CLOSE), SQL_INVALID_HANDLE);
+            assert_eq!(
+                SQLPrepareW(SQL_NULL_HANDLE, ptr::null(), 0),
+                SQL_INVALID_HANDLE
+            );
+            assert_eq!(
+                SQLExecDirectW(SQL_NULL_HANDLE, sql.as_ptr(), 0),
+                SQL_INVALID_HANDLE
+            );
+            assert_eq!(SQLFetch(SQL_NULL_HANDLE), SQL_INVALID_HANDLE);
+            assert_eq!(
+                SQLNumResultCols(SQL_NULL_HANDLE, ptr::null_mut()),
+                SQL_INVALID_HANDLE
+            );
+            assert_eq!(
+                SQLDescribeColW(
+                    SQL_NULL_HANDLE,
+                    1,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQL_INVALID_HANDLE
+            );
+            assert_eq!(
+                SQLGetData(SQL_NULL_HANDLE, 1, 0, ptr::null_mut(), 0, ptr::null_mut()),
+                SQL_INVALID_HANDLE
+            );
+            assert_eq!(SQLMoreResults(SQL_NULL_HANDLE), SQL_INVALID_HANDLE);
+        }
+    }
+
+    /// `SQLAllocHandle` validates its output pointer before touching the parent
+    /// handle; a null output pointer is `SQL_INVALID_HANDLE`.
+    #[test]
+    fn alloc_handle_rejects_null_output() {
+        let ret = unsafe { SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, ptr::null_mut()) };
+        assert_eq!(ret, SQL_INVALID_HANDLE);
+    }
+
+    /// Round-trips an ENV handle through the exported alloc/free wrappers.
+    #[test]
+    fn alloc_and_free_env_handle() {
+        let mut env: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
+            SQL_SUCCESS
+        );
+        assert!(!env.is_null());
+        assert_eq!(unsafe { SQLFreeHandle(SQL_HANDLE_ENV, env) }, SQL_SUCCESS);
+    }
+
+    /// Not-yet-implemented stubs succeed unconditionally regardless of handle.
+    #[test]
+    fn stub_exports_return_success() {
+        unsafe {
+            let mut row_count: i64 = -1;
+            assert_eq!(SQLRowCount(SQL_NULL_HANDLE, &mut row_count), SQL_SUCCESS);
+            assert_eq!(row_count, 0);
+
+            assert_eq!(
+                SQLGetConnectAttrW(SQL_NULL_HANDLE, 0, ptr::null_mut(), 0, ptr::null_mut()),
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                SQLSetStmtAttrW(SQL_NULL_HANDLE, 0, ptr::null_mut(), 0),
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                SQLGetStmtAttrW(SQL_NULL_HANDLE, 0, ptr::null_mut(), 0, ptr::null_mut()),
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                SQLGetDescFieldW(SQL_NULL_HANDLE, 0, 0, ptr::null_mut(), 0, ptr::null_mut()),
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                SQLBindParameter(
+                    SQL_NULL_HANDLE,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                ),
+                SQL_SUCCESS
+            );
+            assert_eq!(SQLCancel(SQL_NULL_HANDLE), SQL_SUCCESS);
+        }
+    }
+
+    /// `SQLRowCount` skips the write when the output pointer is null.
+    #[test]
+    fn row_count_tolerates_null_out_pointer() {
+        assert_eq!(
+            unsafe { SQLRowCount(SQL_NULL_HANDLE, ptr::null_mut()) },
+            SQL_SUCCESS
+        );
+    }
+
+    /// `SQLFreeStmt` only implements `SQL_CLOSE`; other options hit the default
+    /// arm and succeed without delegating.
+    #[test]
+    fn free_stmt_non_close_option_succeeds() {
+        assert_eq!(
+            unsafe { SQLFreeStmt(SQL_NULL_HANDLE, SQL_DROP) },
+            SQL_SUCCESS
+        );
+    }
+}

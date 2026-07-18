@@ -92,6 +92,7 @@ mod tests {
         SQL_ATTR_ODBC_VERSION, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
     };
     use crate::api::set_env_attr::sql_set_env_attr;
+    use crate::test_support::TestHandles;
 
     #[test]
     fn disconnect_when_not_connected() {
@@ -129,5 +130,18 @@ mod tests {
         let ret = unsafe { sql_disconnect(SQL_NULL_HANDLE) };
         assert_eq!(ret, SQL_INVALID_HANDLE);
         // TODO: verify SQLSTATE HY009 via SQLGetDiagRec
+    }
+
+    #[test]
+    fn connected_disconnect_succeeds() {
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+
+        assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.connection_state, ConnectionState::Disconnected);
+        assert!(state.active_stmt.is_none());
     }
 }

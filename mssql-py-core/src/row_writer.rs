@@ -144,3 +144,78 @@ impl RowWriter for PyRowWriter {
         // No-op — caller takes the row after each decode cycle.
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_methods_accumulate_column_values() {
+        let mut w = PyRowWriter::new(0);
+        w.write_null(0);
+        w.write_bool(0, true);
+        w.write_u8(0, 7);
+        w.write_i16(0, -3);
+        w.write_i32(0, 42);
+        w.write_i64(0, 1 << 40);
+        w.write_f32(0, 1.5);
+        w.write_f64(0, 2.5);
+        w.write_string(0, SqlString::from_utf8_string("hi".into()));
+        w.write_bytes(0, vec![1, 2, 3]);
+        w.write_decimal(0, DecimalParts::from_string("1.5", 2, 1).unwrap());
+        w.write_numeric(0, DecimalParts::from_string("2.5", 2, 1).unwrap());
+        w.write_date(0, SqlDate::create(1).unwrap());
+        let time = SqlTime {
+            time_nanoseconds: 1,
+            scale: 7,
+        };
+        w.write_time(0, time.clone());
+        w.write_datetime(0, SqlDateTime { days: 1, time: 2 });
+        w.write_smalldatetime(0, SqlSmallDateTime { days: 1, time: 2 });
+        let dt2 = SqlDateTime2 {
+            days: 1,
+            time: time.clone(),
+        };
+        w.write_datetime2(0, dt2.clone());
+        w.write_datetimeoffset(
+            0,
+            SqlDateTimeOffset {
+                datetime2: dt2,
+                offset: 60,
+            },
+        );
+        w.write_money(0, SqlMoney::from(10_000));
+        w.write_smallmoney(0, SqlSmallMoney::from(5_000));
+        w.write_uuid(0, Uuid::from_u128(0));
+        w.write_xml(0, SqlXml::from("<x/>".to_string()));
+        w.write_json(0, SqlJson::new(b"{}".to_vec()));
+        w.write_vector(0, SqlVector::try_from_f32(vec![1.0, 2.0]).unwrap());
+        w.end_row();
+
+        assert!(matches!(w.row[0], ColumnValues::Null));
+        assert!(matches!(w.row[1], ColumnValues::Bit(true)));
+        assert!(matches!(w.row[2], ColumnValues::TinyInt(7)));
+        assert!(matches!(w.row[3], ColumnValues::SmallInt(-3)));
+        assert!(matches!(w.row[4], ColumnValues::Int(42)));
+        assert!(matches!(w.row[5], ColumnValues::BigInt(_)));
+        assert!(matches!(w.row[6], ColumnValues::Real(_)));
+        assert!(matches!(w.row[7], ColumnValues::Float(_)));
+        assert!(matches!(w.row[8], ColumnValues::String(_)));
+        assert!(matches!(w.row[9], ColumnValues::Bytes(_)));
+        assert!(matches!(w.row[10], ColumnValues::Decimal(_)));
+        assert!(matches!(w.row[11], ColumnValues::Numeric(_)));
+        assert!(matches!(w.row[12], ColumnValues::Date(_)));
+        assert!(matches!(w.row[13], ColumnValues::Time(_)));
+        assert!(matches!(w.row[14], ColumnValues::DateTime(_)));
+        assert!(matches!(w.row[15], ColumnValues::SmallDateTime(_)));
+        assert!(matches!(w.row[16], ColumnValues::DateTime2(_)));
+        assert!(matches!(w.row[17], ColumnValues::DateTimeOffset(_)));
+        assert!(matches!(w.row[18], ColumnValues::Money(_)));
+        assert!(matches!(w.row[19], ColumnValues::SmallMoney(_)));
+        assert!(matches!(w.row[20], ColumnValues::Uuid(_)));
+        assert!(matches!(w.row[21], ColumnValues::Xml(_)));
+        assert!(matches!(w.row[22], ColumnValues::Json(_)));
+        assert!(matches!(w.row[23], ColumnValues::Vector(_)));
+        assert_eq!(w.row.len(), 24);
+    }
+}

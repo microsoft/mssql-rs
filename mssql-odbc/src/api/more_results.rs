@@ -166,3 +166,63 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::handles::dbc::DbcHandle;
+    use crate::test_support::TestHandles;
+
+    #[test]
+    fn null_handle_returns_invalid_handle() {
+        assert_eq!(
+            unsafe { sql_more_results(SQL_NULL_HANDLE) },
+            SQL_INVALID_HANDLE
+        );
+    }
+
+    #[test]
+    fn no_cursor_open_returns_no_data() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+    }
+
+    #[test]
+    fn busy_with_other_statement_returns_error() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other_stmt = h.alloc_extra_stmt();
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().set_state(STMT_STATE_CURSOR_OPEN);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().active_stmt = Some(other_stmt);
+
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_ERROR);
+
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert_eq!(stmt_state.diag_records.len(), 1);
+        assert_eq!(
+            stmt_state.diag_records[0].sql_state,
+            ERR_CONNECTION_BUSY.state
+        );
+    }
+
+    #[test]
+    fn cursor_open_without_client_returns_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().set_state(STMT_STATE_CURSOR_OPEN);
+
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_ERROR);
+
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert_eq!(stmt_state.diag_records.len(), 1);
+        assert_eq!(
+            stmt_state.diag_records[0].sql_state,
+            ERR_NO_ACTIVE_TDS_CLIENT.state
+        );
+    }
+}

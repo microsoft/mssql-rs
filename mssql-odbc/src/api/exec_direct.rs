@@ -261,6 +261,7 @@ fn clear_exec_started(stmt: &StmtHandle) {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_NTS, SQL_NULL_HANDLE};
+    use crate::handles::dbc::DbcHandle;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -292,5 +293,47 @@ mod tests {
         let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
         // DBC is not connected
         assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn connected_without_client_returns_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().chain(Some(0)).collect();
+        assert_eq!(
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_ERROR
+        );
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            stmt_state.diag_records[0].sql_state,
+            ERR_NO_ACTIVE_TDS_CLIENT.state
+        );
+    }
+
+    #[test]
+    fn connected_but_busy_with_other_statement_returns_error() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let other_stmt = h.alloc_extra_stmt();
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().active_stmt = Some(other_stmt);
+
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().chain(Some(0)).collect();
+        assert_eq!(
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_ERROR
+        );
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            stmt_state.diag_records[0].sql_state,
+            ERR_CONNECTION_BUSY.state
+        );
     }
 }

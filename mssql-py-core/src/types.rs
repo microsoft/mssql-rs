@@ -824,4 +824,56 @@ mod tests {
         assert_eq!((h, m, s), (16, 33, 33));
         assert_eq!(us, 123_333);
     }
+
+    fn meta(sql_type: SqlDbType) -> BulkCopyColumnMetadata {
+        BulkCopyColumnMetadata::new("c", sql_type, 0)
+    }
+
+    #[test]
+    fn compatible_types_validate_ok() {
+        let cases = [
+            (ColumnValues::TinyInt(1), SqlDbType::TinyInt),
+            (ColumnValues::SmallInt(1), SqlDbType::SmallInt),
+            (ColumnValues::Int(1), SqlDbType::Int),
+            (ColumnValues::BigInt(1), SqlDbType::BigInt),
+            (ColumnValues::Float(1.0), SqlDbType::Float),
+            (ColumnValues::Real(1.0), SqlDbType::Real),
+            (
+                ColumnValues::Numeric(DecimalParts::from_string("1", 1, 0).unwrap()),
+                SqlDbType::Decimal,
+            ),
+            (ColumnValues::Bit(true), SqlDbType::Bit),
+            (ColumnValues::Bytes(vec![1]), SqlDbType::VarBinary),
+            (
+                ColumnValues::String(SqlString::from_utf8_string("x".into())),
+                SqlDbType::NVarChar,
+            ),
+        ];
+        for (value, sql_type) in cases {
+            assert!(validate_type_compatibility(&value, &meta(sql_type)).is_ok());
+        }
+    }
+
+    #[test]
+    fn null_is_compatible_with_any_type() {
+        assert!(validate_type_compatibility(&ColumnValues::Null, &meta(SqlDbType::Int)).is_ok());
+    }
+
+    #[test]
+    fn variant_accepts_scalar_but_rejects_xml() {
+        assert!(
+            validate_type_compatibility(&ColumnValues::Int(1), &meta(SqlDbType::Variant)).is_ok()
+        );
+        let xml = ColumnValues::Xml(mssql_tds::datatypes::column_values::SqlXml::from(
+            "<x/>".to_string(),
+        ));
+        assert!(validate_type_compatibility(&xml, &meta(SqlDbType::Variant)).is_err());
+    }
+
+    #[test]
+    fn mismatched_types_return_usage_error() {
+        let err = validate_type_compatibility(&ColumnValues::Int(1), &meta(SqlDbType::VarChar))
+            .unwrap_err();
+        assert!(matches!(err, Error::UsageError(_)));
+    }
 }
