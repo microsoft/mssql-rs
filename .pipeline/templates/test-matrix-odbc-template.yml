@@ -54,30 +54,50 @@ jobs:
 
           docker network create testnet
 
-          sql_cid=$(docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=$(SQL_PASSWORD)" \
-            -p 1433:1433 --hostname sql1 --network testnet \
-            -v $PWD/conf/mssql.conf:/var/opt/mssql/mssql.conf \
-            -v $PWD/mssql.pem:/etc/ssl/certs/mssql.pem \
-            -v $PWD/mssql.key:/etc/ssl/private/mssql.key \
-            -u 0:0 -d mcr.microsoft.com/mssql/server:2025-latest)
-
           # The e2e binaries are prebuilt (no cargo build to absorb SQL Server's
           # first-boot window), so gate on the SA login being live before running
           # them — otherwise the first live test races SQL init and gets 18456.
-          echo "Waiting for SQL Server to accept the SA login..."
+          # SQL Server 2025 intermittently hits a SQLPAL startup assertion on these
+          # agents and the container dies; restart it if it crashes before the SA
+          # login is accepted.
+          start_sql() {
+            if [ -n "${sql_cid:-}" ]; then
+              docker rm -f "$sql_cid" >/dev/null 2>&1 || true
+            fi
+            sql_cid=$(docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=$SQL_PASSWORD" \
+              -p 1433:1433 --hostname sql1 --network testnet \
+              -v $PWD/conf/mssql.conf:/var/opt/mssql/mssql.conf \
+              -v $PWD/mssql.pem:/etc/ssl/certs/mssql.pem \
+              -v $PWD/mssql.key:/etc/ssl/private/mssql.key \
+              -u 0:0 -d mcr.microsoft.com/mssql/server:2025-latest)
+          }
+          wait_sql_ready() {
+            for _ in $(seq 1 60); do
+              if docker exec "$sql_cid" /opt/mssql-tools18/bin/sqlcmd \
+                  -S localhost -U sa -P "$SQL_PASSWORD" -C -Q "SELECT 1" >/dev/null 2>&1; then
+                return 0
+              fi
+              if [ "$(docker inspect -f '{{.State.Running}}' "$sql_cid" 2>/dev/null)" != "true" ]; then
+                return 1
+              fi
+              sleep 2
+            done
+            return 1
+          }
+          echo "Starting SQL Server and waiting for the SA login..."
           ready=0
-          for i in $(seq 1 60); do
-            if docker exec "$sql_cid" /opt/mssql-tools18/bin/sqlcmd \
-                -S localhost -U sa -P "$SQL_PASSWORD" -C -Q "SELECT 1" >/dev/null 2>&1; then
+          for attempt in 1 2 3; do
+            start_sql
+            if wait_sql_ready; then
               ready=1
-              echo "SQL Server ready after $i attempt(s)."
+              echo "SQL Server ready (attempt $attempt)."
               break
             fi
-            sleep 2
+            echo "SQL Server not ready on attempt $attempt; container logs (tail 100):" >&2
+            docker logs --tail 100 "$sql_cid" >&2 || true
           done
           if [ "$ready" -ne 1 ]; then
-            echo "ERROR: SQL Server did not become ready in time." >&2
-            docker logs --tail 200 "$sql_cid" >&2 || true
+            echo "ERROR: SQL Server did not become ready after 3 attempts." >&2
             exit 1
           fi
 
