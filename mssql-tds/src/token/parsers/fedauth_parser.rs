@@ -694,9 +694,17 @@ mod tests {
         let context = ParserContext::default();
 
         let result = parser.parse(&mut reader, &context).await;
-        assert!(
-            result.is_err(),
-            "Overflowing option offset/length must produce an error, not a panic"
-        );
+        let err = result
+            .expect_err("Overflowing option offset/length must produce an error, not a panic");
+        match err {
+            crate::error::Error::Io(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+                assert!(
+                    io_err.to_string().contains("out of bounds"),
+                    "unexpected error message: {io_err}"
+                );
+            }
+            other => panic!("expected Error::Io with InvalidData, got: {other:?}"),
+        }
     }
 }
