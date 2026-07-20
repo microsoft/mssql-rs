@@ -25,7 +25,7 @@ use crate::{
 };
 use crate::{query::metadata::ColumnMetadata, token::tokens::SqlCollation};
 
-use super::row_writer::{RowWriter, write_column_value};
+use super::row_writer::{PlpStreamingSink, RowWriter, write_column_value};
 
 /// Reads an encrypted column's cipher bytes from the wire and turns them back
 /// into a plaintext [`ColumnValues`].
@@ -1069,6 +1069,145 @@ impl GenericDecoder {
         }
     }
 
+    /// Reads PLP chunks from the wire and pushes them to `sink` via
+    /// [`PlpStreamingSink::write_chunk`]. Returns immediately on NULL (the
+    /// caller is responsible for calling `write_null` in that case).
+    ///
+    /// The `header` argument is the already-consumed 8-byte PLP length field.
+    /// Returns `true` if data was written, `false` if the header indicated NULL.
+    async fn fill_plp_sink<T>(
+        reader: &mut T,
+        header: u64,
+        sink: &mut dyn PlpStreamingSink,
+    ) -> TdsResult<bool>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
+        if header as usize == Self::SQL_PLP_NULL {
+            return Ok(false);
+        }
+        let known_len = if header as usize != Self::SQL_PLP_UNKNOWNLEN {
+            let capacity = header as usize;
+            if capacity > MAX_PLP_SIZE {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "PLP length {capacity} exceeds maximum allowed size of {MAX_PLP_SIZE} bytes"
+                )));
+            }
+            Some(capacity)
+        } else {
+            None
+        };
+        let mut accumulated = 0usize;
+        let mut chunk_len = reader.read_uint32().await? as usize;
+        let mut chunk_count = 0u32;
+        let mut chunk_buf = Vec::new();
+
+        while chunk_len > 0 {
+            chunk_count += 1;
+
+            #[cfg(fuzzing)]
+            {
+                eprintln!(
+                    "[ALLOC] fill_plp_sink: chunk #{chunk_count}, chunk_len={chunk_len}, accumulated={accumulated}"
+                );
+            }
+
+            if chunk_count > Self::MAX_PLP_CHUNKS {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "Too many PLP chunks: {chunk_count} (max {})",
+                    Self::MAX_PLP_CHUNKS
+                )));
+            }
+            if chunk_len > Self::MAX_PLP_CHUNK_SIZE {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "PLP chunk size {chunk_len} exceeds maximum allowed chunk size of {} bytes",
+                    Self::MAX_PLP_CHUNK_SIZE
+                )));
+            }
+            accumulated = accumulated.checked_add(chunk_len).ok_or_else(|| {
+                crate::error::Error::ProtocolError(format!(
+                    "PLP chunk accumulation would overflow: {accumulated} + {chunk_len}"
+                ))
+            })?;
+            if let Some(kl) = known_len {
+                if accumulated > kl {
+                    return Err(crate::error::Error::ProtocolError(format!(
+                        "PLP chunk exceeds declared length: accumulated={accumulated}, declared={kl}"
+                    )));
+                }
+            } else if accumulated > MAX_PLP_SIZE {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "PLP accumulated size {accumulated} exceeds maximum allowed size of {MAX_PLP_SIZE} bytes"
+                )));
+            }
+            chunk_buf.resize(chunk_len, 0);
+            reader.read_bytes(&mut chunk_buf).await?;
+            sink.write_chunk(&chunk_buf)?;
+            chunk_len = reader.read_uint32().await? as usize;
+        }
+        Ok(true)
+    }
+
+    /// Decodes a PLP column directly into the [`RowWriter`] via the
+    /// [`PlpStreamingSink`] interface. Handles NULL and delegates buffering
+    /// (or streaming) to the writer's `begin_plp` / `finalize_plp` hooks.
+    async fn decode_plp_into<T, W>(
+        reader: &mut T,
+        metadata: &ColumnMetadata,
+        col: usize,
+        writer: &mut W,
+    ) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+        W: RowWriter + ?Sized,
+    {
+        let header = reader.read_int64().await? as u64;
+        if header as usize == Self::SQL_PLP_NULL {
+            writer.write_null(col);
+            return Ok(());
+        }
+        let mut sink = writer.begin_plp(col, metadata);
+        Self::fill_plp_sink(reader, header, &mut *sink).await?;
+        writer.finalize_plp(col, sink)
+    }
+
+    /// Decodes a PLP string column into the [`RowWriter`]. Uses the sink
+    /// interface for chunk streaming; constructs `ColumnValues::String` from
+    /// the accumulated bytes and encoding metadata.
+    async fn decode_plp_string_into<T, W>(
+        reader: &mut T,
+        metadata: &ColumnMetadata,
+        encoding_type: EncodingType,
+        col: usize,
+        writer: &mut W,
+    ) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+        W: RowWriter + ?Sized,
+    {
+        let header = reader.read_int64().await? as u64;
+        if header as usize == Self::SQL_PLP_NULL {
+            writer.write_null(col);
+            return Ok(());
+        }
+        let mut sink = writer.begin_plp(col, metadata);
+        Self::fill_plp_sink(reader, header, &mut *sink).await?;
+        match sink.finalize()? {
+            ColumnValues::Bytes(bytes) => {
+                writer.write_string(col, SqlString::new(bytes, encoding_type));
+            }
+            ColumnValues::Null => {
+                writer.write_null(col);
+            }
+            other => {
+                // Custom sink finalized to a typed value already (e.g. streaming sink
+                // that decoded the string itself). Write it directly.
+                write_column_value(writer, col, other);
+            }
+        }
+        Ok(())
+    }
+
     /// Decodes a column value from the wire and writes it directly into a
     /// [`RowWriter`], bypassing the intermediate `ColumnValues` enum for
     /// common types. Rare types (XML, JSON, Vector, Image, UDT, SsVariant)
@@ -1208,10 +1347,7 @@ impl GenericDecoder {
             }
             TdsDataType::BigVarBinary => {
                 if metadata.is_plp() {
-                    match GenericDecoder::read_plp_bytes(reader).await? {
-                        Some(bytes) => writer.write_bytes(col, bytes),
-                        None => writer.write_null(col),
-                    }
+                    Self::decode_plp_into(reader, metadata, col, writer).await?;
                 } else {
                     let length = reader.read_uint16().await?;
                     // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
@@ -1688,10 +1824,8 @@ impl StringDecoder {
         let encoding_type = get_encoding_type(metadata);
 
         if metadata.is_plp() {
-            match GenericDecoder::read_plp_bytes(reader).await? {
-                Some(bytes) => writer.write_string(col, SqlString::new(bytes, encoding_type)),
-                None => writer.write_null(col),
-            }
+            GenericDecoder::decode_plp_string_into(reader, metadata, encoding_type, col, writer)
+                .await?;
         } else if Self::is_long_len_type(metadata.data_type) {
             let text_ptr_len = reader.read_byte().await? as usize;
 

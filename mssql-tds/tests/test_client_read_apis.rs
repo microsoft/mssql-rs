@@ -848,524 +848,391 @@ mod client_based_iterators {
         Ok(())
     }
 
-    /// Verifies the TdsClient PLP streaming lifecycle contract at the API boundary.
+    /// Verifies that a custom [`RowWriter`] can intercept PLP columns via
+    /// `begin_plp` / `finalize_plp` while leaving non-PLP columns buffered
+    /// normally through `DefaultRowWriter`'s write methods.
     ///
-    /// - `active_plp_reached_end` returns `true` before any stream is started.
-    /// - `read_active_plp_bytes` returns `UsageError` when called with no active stream.
-    /// - `skip_active_plp_to_end` is a no-op when no stream is active.
-    /// - After `close_query`, stream state is cleared.
+    /// This is the canonical usage pattern for callers that want to process a
+    /// specific PLP column (e.g. stream to disk, compute a hash, etc.) without
+    /// buffering the entire value.
     #[tokio::test]
-    async fn plp_streaming_client_lifecycle_contract() -> mssql_tds::core::TdsResult<()> {
+    async fn custom_row_writer_intercepts_plp_column() -> mssql_tds::core::TdsResult<()> {
+        use mssql_tds::datatypes::column_values::ColumnValues;
+        use mssql_tds::datatypes::row_writer::{BufferingPlpSink, PlpStreamingSink, RowWriter};
+        use mssql_tds::query::metadata::ColumnMetadata;
+
         init_tracing();
-        let context = create_context();
-        let provider = TdsConnectionProvider {};
-        let mut client = provider
-            .create_client(context, &build_tcp_datasource(), None)
-            .await?;
 
-        // No stream active before any query.
-        assert!(client.active_plp_reached_end());
-        assert!(client.active_plp_collation().is_none());
-
-        // read_active_plp_bytes with no active stream must return UsageError, not silently EOF.
-        let mut buf = [0u8; 8];
-        let err = client.read_active_plp_bytes(&mut buf).await.unwrap_err();
-        assert!(
-            err.to_string().contains("read_column"),
-            "Expected UsageError mentioning read_column, got: {err}"
-        );
-
-        // skip_active_plp_to_end with no active stream must be a no-op.
-        client.skip_active_plp_to_end().await?;
-        assert!(client.active_plp_reached_end());
-
-        let query = "SELECT CAST('hello' AS VARBINARY(MAX)) AS vbm".to_string();
-        client.execute(query, None, None).await?;
-
-        let started = client.read_column(0).await?;
-        assert!(matches!(
-            started,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-
-        let mut plp_buf = [0u8; 16];
-        let n = client.read_active_plp_bytes(&mut plp_buf).await?;
-        assert_eq!(&plp_buf[..n], b"hello");
-        assert!(client.active_plp_reached_end());
-
-        // Row should now be consumed from the PLP perspective.
-        assert!(client.read_column(0).await?.is_none());
-
-        client.close_query().await?;
-        assert!(client.active_plp_reached_end());
-        assert!(client.active_plp_collation().is_none());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn plp_streaming_row_boundary_multi_column_contract() -> mssql_tds::core::TdsResult<()> {
-        init_tracing();
-        let context = create_context();
-        let provider = TdsConnectionProvider {};
-        let mut client = provider
-            .create_client(context, &build_tcp_datasource(), None)
-            .await?;
-
-        let query = "DECLARE @t TABLE (p1 VARBINARY(MAX), p2 VARBINARY(MAX)); INSERT INTO @t VALUES (0x616263, 0x646566), (0x313233, 0x343536); SELECT p1, p2 FROM @t"
-            .to_string();
-        client.execute(query, None, None).await?;
-
-        let mut buf = [0u8; 8];
-
-        let started = client.read_column(0).await?;
-        assert!(matches!(
-            started,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-        let mut total = 0usize;
-        let mut first_row_p1 = Vec::new();
-        loop {
-            let n = client.read_active_plp_bytes(&mut buf).await?;
-            total += n;
-            first_row_p1.extend_from_slice(&buf[..n]);
-            if client.active_plp_reached_end() {
-                break;
-            }
-            assert!(n > 0, "Expected progress while draining first-row p1");
-        }
-        assert!(total > 0, "Expected non-empty first-row p1 payload");
-        assert_eq!(first_row_p1, vec![0x61, 0x62, 0x63]);
-        assert!(client.active_plp_reached_end());
-
-        let started = client.read_column(1).await?;
-        assert!(matches!(
-            started,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-        total = 0;
-        let mut first_row_p2 = Vec::new();
-        loop {
-            let n = client.read_active_plp_bytes(&mut buf).await?;
-            total += n;
-            first_row_p2.extend_from_slice(&buf[..n]);
-            if client.active_plp_reached_end() {
-                break;
-            }
-            assert!(n > 0, "Expected progress while draining first-row p2");
-        }
-        assert!(total > 0, "Expected non-empty first-row p2 payload");
-        assert_eq!(first_row_p2, vec![0x64, 0x65, 0x66]);
-        assert!(client.active_plp_reached_end());
-
-        let next_row = client
-            .next_row()
-            .await?
-            .expect("Expected second row after fully consuming first-row columns");
-        match &next_row[0] {
-            mssql_tds::datatypes::column_values::ColumnValues::Bytes(b) => {
-                assert_eq!(b, &vec![0x31, 0x32, 0x33]);
-            }
-            other => panic!("Expected Bytes for second-row p1, got: {other:?}"),
-        }
-        match &next_row[1] {
-            mssql_tds::datatypes::column_values::ColumnValues::Bytes(b) => {
-                assert_eq!(b, &vec![0x34, 0x35, 0x36]);
-            }
-            other => panic!("Expected Bytes for second-row p2, got: {other:?}"),
+        /// A RowWriter that captures chunks pushed for column 1 (VARBINARY(MAX))
+        /// into a side buffer, and falls back to DefaultRowWriter for everything else.
+        struct ChunkCapture {
+            inner: mssql_tds::datatypes::row_writer::DefaultRowWriter,
+            captured_chunks: Vec<u8>,
         }
 
-        assert!(client.next_row().await?.is_none());
-
-        client.close_query().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_column_rejects_out_of_bounds_index() -> mssql_tds::core::TdsResult<()> {
-        init_tracing();
-        let context = create_context();
-        let provider = TdsConnectionProvider {};
-        let mut client = provider
-            .create_client(context, &build_tcp_datasource(), None)
-            .await?;
-
-        client
-            .execute("SELECT 1 AS only_col".to_string(), None, None)
-            .await?;
-
-        let err = client.read_column(1).await.unwrap_err();
-        assert!(
-            err.to_string().contains("out of bounds"),
-            "Expected out-of-bounds UsageError, got: {err}"
-        );
-
-        client.close_query().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_column_rejects_backward_access_in_active_row_tail()
-    -> mssql_tds::core::TdsResult<()> {
-        init_tracing();
-        let context = create_context();
-        let provider = TdsConnectionProvider {};
-        let mut client = provider
-            .create_client(context, &build_tcp_datasource(), None)
-            .await?;
-
-        let query = "SELECT CAST(10 AS INT) AS c0, CAST(20 AS INT) AS c1, CAST(30 AS INT) AS c2"
-            .to_string();
-        client.execute(query, None, None).await?;
-
-        let v = client.read_column(0).await?;
-        assert!(matches!(
-            v,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
-                mssql_tds::datatypes::column_values::ColumnValues::Int(10)
-            ))
-        ));
-
-        let v = client.read_column(1).await?;
-        assert!(matches!(
-            v,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
-                mssql_tds::datatypes::column_values::ColumnValues::Int(20)
-            ))
-        ));
-
-        let err = client.read_column(1).await.unwrap_err();
-        assert!(
-            err.to_string().contains("already been consumed"),
-            "Expected backward-access UsageError, got: {err}"
-        );
-
-        client.close_query().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mixed_column_and_row_mode_drains_partial_plp_and_tail()
-    -> mssql_tds::core::TdsResult<()> {
-        init_tracing();
-        let context = create_context();
-        let provider = TdsConnectionProvider {};
-        let mut client = provider
-            .create_client(context, &build_tcp_datasource(), None)
-            .await?;
-
-        let query = "SELECT CAST(1 AS INT) AS i, CAST(0x68656C6C6F AS VARBINARY(MAX)) AS p, CAST(11 AS INT) AS j UNION ALL SELECT CAST(2 AS INT) AS i, CAST(0x776F726C64 AS VARBINARY(MAX)) AS p, CAST(22 AS INT) AS j".to_string();
-        client.execute(query, None, None).await?;
-
-        let started = client.read_column(1).await?;
-        assert!(matches!(
-            started,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-
-        let mut partial = [0u8; 2];
-        let n = client.read_active_plp_bytes(&mut partial).await?;
-        assert_eq!(&partial[..n], b"he");
-
-        let next_row = client
-            .next_row()
-            .await?
-            .expect("Expected second row after draining first row tail");
-
-        assert!(matches!(
-            next_row[0],
-            mssql_tds::datatypes::column_values::ColumnValues::Int(2)
-        ));
-        assert!(matches!(
-            next_row[2],
-            mssql_tds::datatypes::column_values::ColumnValues::Int(22)
-        ));
-        match &next_row[1] {
-            mssql_tds::datatypes::column_values::ColumnValues::Bytes(b) => {
-                assert_eq!(b, &vec![0x77, 0x6F, 0x72, 0x6C, 0x64]);
-            }
-            other => panic!("Expected Bytes value, got: {other:?}"),
+        /// Owned PLP sink that accumulates chunks independently.
+        /// On finalize, signals via a special sentinel value so `finalize_plp`
+        /// can move the bytes out and store them on the writer.
+        struct CapturingSink {
+            chunks: Vec<u8>,
         }
 
-        assert!(client.next_row().await?.is_none());
-
-        client.close_query().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn small_buffer_repeated_plp_reads_then_next_column() -> mssql_tds::core::TdsResult<()> {
-        init_tracing();
-        let context = create_context();
-        let provider = TdsConnectionProvider {};
-        let mut client = provider
-            .create_client(context, &build_tcp_datasource(), None)
-            .await?;
-
-        let query = "SELECT CAST(7 AS INT) AS i, CAST(REPLICATE('x', 13) AS VARBINARY(MAX)) AS p, CAST(9 AS INT) AS j".to_string();
-        client.execute(query, None, None).await?;
-
-        let started = client.read_column(1).await?;
-        assert!(matches!(
-            started,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-
-        let mut chunk = [0u8; 3];
-        let mut collected = Vec::new();
-        loop {
-            let n = client.read_active_plp_bytes(&mut chunk).await?;
-            collected.extend_from_slice(&chunk[..n]);
-            if client.active_plp_reached_end() {
-                break;
+        impl PlpStreamingSink for CapturingSink {
+            fn write_chunk(&mut self, data: &[u8]) -> mssql_tds::core::TdsResult<()> {
+                self.chunks.extend_from_slice(data);
+                Ok(())
             }
-            assert!(
-                n > 0,
-                "Expected progress while reading PLP with small buffer"
-            );
+
+            fn finalize(self: Box<Self>) -> mssql_tds::core::TdsResult<ColumnValues> {
+                Ok(ColumnValues::Bytes(self.chunks))
+            }
         }
 
-        assert_eq!(collected, vec![0x78; 13]);
-        assert!(client.active_plp_reached_end());
+        impl RowWriter for ChunkCapture {
+            fn begin_plp(
+                &mut self,
+                col: usize,
+                _metadata: &ColumnMetadata,
+            ) -> Box<dyn PlpStreamingSink> {
+                if col == 1 {
+                    Box::new(CapturingSink { chunks: Vec::new() })
+                } else {
+                    Box::new(BufferingPlpSink::new())
+                }
+            }
 
-        let value = client.read_column(2).await?;
-        assert!(matches!(
-            value,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
-                mssql_tds::datatypes::column_values::ColumnValues::Int(9)
-            ))
-        ));
+            fn finalize_plp(
+                &mut self,
+                col: usize,
+                sink: Box<dyn PlpStreamingSink>,
+            ) -> mssql_tds::core::TdsResult<()> {
+                let value = sink.finalize()?;
+                if col == 1 {
+                    // Move the bytes out of the finalized value into captured_chunks.
+                    if let ColumnValues::Bytes(bytes) = value {
+                        self.captured_chunks = bytes;
+                    }
+                    // Write Null to the row slot so the row vector length stays consistent.
+                    self.inner.write_null(col);
+                } else {
+                    mssql_tds::datatypes::row_writer::write_column_value(self, col, value);
+                }
+                Ok(())
+            }
 
-        assert!(client.next_row().await?.is_none());
+            // All other write_* methods delegate to the inner DefaultRowWriter.
+            fn write_null(&mut self, col: usize) {
+                self.inner.write_null(col);
+            }
+            fn write_bool(&mut self, col: usize, val: bool) {
+                self.inner.write_bool(col, val);
+            }
+            fn write_u8(&mut self, col: usize, val: u8) {
+                self.inner.write_u8(col, val);
+            }
+            fn write_i16(&mut self, col: usize, val: i16) {
+                self.inner.write_i16(col, val);
+            }
+            fn write_i32(&mut self, col: usize, val: i32) {
+                self.inner.write_i32(col, val);
+            }
+            fn write_i64(&mut self, col: usize, val: i64) {
+                self.inner.write_i64(col, val);
+            }
+            fn write_f32(&mut self, col: usize, val: f32) {
+                self.inner.write_f32(col, val);
+            }
+            fn write_f64(&mut self, col: usize, val: f64) {
+                self.inner.write_f64(col, val);
+            }
+            fn write_string(
+                &mut self,
+                col: usize,
+                val: mssql_tds::datatypes::sql_string::SqlString,
+            ) {
+                self.inner.write_string(col, val);
+            }
+            fn write_bytes(&mut self, col: usize, val: Vec<u8>) {
+                self.inner.write_bytes(col, val);
+            }
+            fn write_decimal(
+                &mut self,
+                col: usize,
+                val: mssql_tds::datatypes::decoder::DecimalParts,
+            ) {
+                self.inner.write_decimal(col, val);
+            }
+            fn write_numeric(
+                &mut self,
+                col: usize,
+                val: mssql_tds::datatypes::decoder::DecimalParts,
+            ) {
+                self.inner.write_numeric(col, val);
+            }
+            fn write_date(&mut self, col: usize, val: mssql_tds::datatypes::column_values::SqlDate) {
+                self.inner.write_date(col, val);
+            }
+            fn write_time(&mut self, col: usize, val: mssql_tds::datatypes::column_values::SqlTime) {
+                self.inner.write_time(col, val);
+            }
+            fn write_datetime(
+                &mut self,
+                col: usize,
+                val: mssql_tds::datatypes::column_values::SqlDateTime,
+            ) {
+                self.inner.write_datetime(col, val);
+            }
+            fn write_smalldatetime(
+                &mut self,
+                col: usize,
+                val: mssql_tds::datatypes::column_values::SqlSmallDateTime,
+            ) {
+                self.inner.write_smalldatetime(col, val);
+            }
+            fn write_datetime2(
+                &mut self,
+                col: usize,
+                val: mssql_tds::datatypes::column_values::SqlDateTime2,
+            ) {
+                self.inner.write_datetime2(col, val);
+            }
+            fn write_datetimeoffset(
+                &mut self,
+                col: usize,
+                val: mssql_tds::datatypes::column_values::SqlDateTimeOffset,
+            ) {
+                self.inner.write_datetimeoffset(col, val);
+            }
+            fn write_money(
+                &mut self,
+                col: usize,
+                val: mssql_tds::datatypes::column_values::SqlMoney,
+            ) {
+                self.inner.write_money(col, val);
+            }
+            fn write_smallmoney(
+                &mut self,
+                col: usize,
+                val: mssql_tds::datatypes::column_values::SqlSmallMoney,
+            ) {
+                self.inner.write_smallmoney(col, val);
+            }
+            fn write_uuid(&mut self, col: usize, val: uuid::Uuid) {
+                self.inner.write_uuid(col, val);
+            }
+            fn write_xml(
+                &mut self,
+                col: usize,
+                val: mssql_tds::datatypes::column_values::SqlXml,
+            ) {
+                self.inner.write_xml(col, val);
+            }
+            fn write_json(
+                &mut self,
+                col: usize,
+                val: mssql_tds::datatypes::sql_json::SqlJson,
+            ) {
+                self.inner.write_json(col, val);
+            }
+            fn write_vector(
+                &mut self,
+                col: usize,
+                val: mssql_tds::datatypes::sql_vector::SqlVector,
+            ) {
+                self.inner.write_vector(col, val);
+            }
+            fn end_row(&mut self) {
+                self.inner.end_row();
+            }
+        }
 
-        client.close_query().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn partial_plp_then_switch_to_next_column_with_small_buffer()
-    -> mssql_tds::core::TdsResult<()> {
-        init_tracing();
         let context = create_context();
         let provider = TdsConnectionProvider {};
         let mut client = provider
             .create_client(context, &build_tcp_datasource(), None)
             .await?;
 
+        // col 0: INT — handled by default write_i32
+        // col 1: VARBINARY(MAX) — intercepted by CapturingSink → captured_chunks
+        // col 2: VARBINARY(MAX) — buffered normally → ColumnValues::Bytes
         let query =
-            "SELECT CAST(1 AS INT) AS i, CAST(REPLICATE('q', 12) AS VARBINARY(MAX)) AS p, CAST(42 AS INT) AS j"
+            "SELECT CAST(42 AS INT), CAST(0x68656C6C6F AS VARBINARY(MAX)), CAST(0x776F726C64 AS VARBINARY(MAX))"
                 .to_string();
         client.execute(query, None, None).await?;
 
-        let started = client.read_column(1).await?;
-        assert!(matches!(
-            started,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
+        let col_count = client.get_metadata().len();
+        assert_eq!(col_count, 3);
 
-        let mut chunk = [0u8; 4];
-        let n = client.read_active_plp_bytes(&mut chunk).await?;
-        assert_eq!(&chunk[..n], b"qqqq");
-        assert!(
-            !client.active_plp_reached_end(),
-            "PLP stream should still have unread bytes after partial read"
-        );
+        let mut writer = ChunkCapture {
+            inner: mssql_tds::datatypes::row_writer::DefaultRowWriter::new(col_count),
+            captured_chunks: Vec::new(),
+        };
 
-        // Switching to the next column should drain the remaining PLP bytes first.
-        let value = client.read_column(2).await?;
-        assert!(matches!(
-            value,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
-                mssql_tds::datatypes::column_values::ColumnValues::Int(42)
-            ))
-        ));
+        if let Some(rs) = client.get_current_resultset() {
+            let has_row = rs.next_row_into(&mut writer).await?;
+            assert!(has_row, "Expected a row");
+        }
 
-        let mut out = [0u8; 1];
-        let err = client.read_active_plp_bytes(&mut out).await.unwrap_err();
-        assert!(
-            err.to_string().contains("no active PLP stream"),
-            "Expected no-active-stream UsageError, got: {err}"
-        );
+        // Column 1 chunks were streamed to captured_chunks — not in the row vector.
+        assert_eq!(writer.captured_chunks, b"hello");
 
-        assert!(client.next_row().await?.is_none());
+        // Column 2 was buffered normally.
+        let row = writer.inner.take_row();
+        assert!(matches!(row[0], ColumnValues::Int(42)));
+        // col 1 slot is Null because CapturingSink::finalize() returns Null.
+        assert!(matches!(row[1], ColumnValues::Null));
+        assert!(matches!(row[2], ColumnValues::Bytes(ref b) if b == b"world"));
 
         client.close_query().await?;
         Ok(())
     }
 
+    /// Verifies PLP columns (VARBINARY(MAX), NVARCHAR(MAX)) across multiple rows
+    /// are decoded correctly end-to-end using `next_row()`.
     #[tokio::test]
-    async fn sparse_column_reads_2_and_4_across_two_rows() -> mssql_tds::core::TdsResult<()> {
+    async fn plp_columns_across_multiple_rows() -> mssql_tds::core::TdsResult<()> {
+        use mssql_tds::datatypes::column_values::ColumnValues;
         init_tracing();
+
         let context = create_context();
         let provider = TdsConnectionProvider {};
         let mut client = provider
             .create_client(context, &build_tcp_datasource(), None)
             .await?;
 
-        let query =
-            "DECLARE @t TABLE (c0 INT, c1 INT, c2 VARBINARY(MAX), c3 INT, c4 VARBINARY(MAX)); \
-            INSERT INTO @t VALUES \
-                (10, 11, 0x6161, 13, 0x6262), \
-                (20, 21, 0x6363, 23, 0x6464); \
-            SELECT c0, c1, c2, c3, c4 FROM @t"
-                .to_string();
+        let query = "
+            DECLARE @t TABLE (id INT, payload VARBINARY(MAX), label NVARCHAR(MAX));
+            INSERT INTO @t VALUES
+                (1, 0x616263, N'alpha'),
+                (2, 0x646566, N'beta'),
+                (3, NULL,    N'gamma');
+            SELECT id, payload, label FROM @t
+        "
+        .to_string();
         client.execute(query, None, None).await?;
 
-        // Fetch sparse columns for row 1: c2 and c4 (1-based: columns 3 and 5).
-        let row1_c2 = client.read_column(2).await?;
-        assert!(matches!(
-            row1_c2,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-        let mut buf = [0u8; 8];
-        let n = client.read_active_plp_bytes(&mut buf).await?;
-        assert_eq!(&buf[..n], b"aa");
-        assert!(client.active_plp_reached_end());
+        if let Some(rs) = client.get_current_resultset() {
+            let row1 = rs.next_row().await?.expect("row 1");
+            assert!(matches!(row1[0], ColumnValues::Int(1)));
+            assert!(matches!(&row1[1], ColumnValues::Bytes(b) if b == b"abc"));
+            assert!(matches!(&row1[2], ColumnValues::String(s) if s.to_utf8_string() == "alpha"));
 
-        let row1_c4 = client.read_column(4).await?;
-        assert!(matches!(
-            row1_c4,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-        let n = client.read_active_plp_bytes(&mut buf).await?;
-        assert_eq!(&buf[..n], b"bb");
-        assert!(client.active_plp_reached_end());
+            let row2 = rs.next_row().await?.expect("row 2");
+            assert!(matches!(row2[0], ColumnValues::Int(2)));
+            assert!(matches!(&row2[1], ColumnValues::Bytes(b) if b == b"def"));
+            assert!(matches!(&row2[2], ColumnValues::String(s) if s.to_utf8_string() == "beta"));
 
-        // Fetch the same sparse columns for row 2.
-        let row2_c2 = client.read_column(2).await?;
-        assert!(matches!(
-            row2_c2,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-        let n = client.read_active_plp_bytes(&mut buf).await?;
-        assert_eq!(&buf[..n], b"cc");
-        assert!(client.active_plp_reached_end());
+            let row3 = rs.next_row().await?.expect("row 3");
+            assert!(matches!(row3[0], ColumnValues::Int(3)));
+            assert!(matches!(row3[1], ColumnValues::Null));
+            assert!(matches!(&row3[2], ColumnValues::String(s) if s.to_utf8_string() == "gamma"));
 
-        let row2_c4 = client.read_column(4).await?;
-        assert!(matches!(
-            row2_c4,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-        let n = client.read_active_plp_bytes(&mut buf).await?;
-        assert_eq!(&buf[..n], b"dd");
-        assert!(client.active_plp_reached_end());
-
-        assert!(client.read_column(2).await?.is_none());
+            assert!(rs.next_row().await?.is_none());
+        }
 
         client.close_query().await?;
         Ok(())
     }
 
+    /// Verifies that a caller can keep only columns 2 and 4 from a 5-column
+    /// result set by using `next_row_into()` with a custom `RowWriter`.
+    ///
+    /// The wire decode still walks columns left-to-right, but the writer can
+    /// ignore columns 1, 3, and 5 while retaining just the selected columns.
     #[tokio::test]
-    async fn sparse_column_reads_1_and_3_across_two_rows() -> mssql_tds::core::TdsResult<()> {
+    async fn custom_row_writer_keeps_only_columns_2_and_4() -> mssql_tds::core::TdsResult<()> {
+        use mssql_tds::datatypes::column_values::{SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney, SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml};
+        use mssql_tds::datatypes::decoder::DecimalParts;
+        use mssql_tds::datatypes::row_writer::RowWriter;
+        use mssql_tds::datatypes::sql_json::SqlJson;
+        use mssql_tds::datatypes::sql_string::SqlString;
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+
         init_tracing();
+
+        #[derive(Default)]
+        struct SelectedColumnsWriter {
+            selected_col_2: Option<String>,
+            selected_col_4: Option<Vec<u8>>,
+            row_complete: bool,
+        }
+
+        impl RowWriter for SelectedColumnsWriter {
+            fn write_null(&mut self, col: usize) {
+                if col == 1 {
+                    self.selected_col_2 = None;
+                } else if col == 3 {
+                    self.selected_col_4 = None;
+                }
+            }
+
+            fn write_bool(&mut self, _col: usize, _val: bool) {}
+            fn write_u8(&mut self, _col: usize, _val: u8) {}
+            fn write_i16(&mut self, _col: usize, _val: i16) {}
+            fn write_i32(&mut self, _col: usize, _val: i32) {}
+            fn write_i64(&mut self, _col: usize, _val: i64) {}
+            fn write_f32(&mut self, _col: usize, _val: f32) {}
+            fn write_f64(&mut self, _col: usize, _val: f64) {}
+
+            fn write_string(&mut self, col: usize, val: SqlString) {
+                if col == 1 {
+                    self.selected_col_2 = Some(val.to_utf8_string());
+                }
+            }
+
+            fn write_bytes(&mut self, col: usize, val: Vec<u8>) {
+                if col == 3 {
+                    self.selected_col_4 = Some(val);
+                }
+            }
+
+            fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
+            fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
+            fn write_date(&mut self, _col: usize, _val: SqlDate) {}
+            fn write_time(&mut self, _col: usize, _val: SqlTime) {}
+            fn write_datetime(&mut self, _col: usize, _val: SqlDateTime) {}
+            fn write_smalldatetime(&mut self, _col: usize, _val: SqlSmallDateTime) {}
+            fn write_datetime2(&mut self, _col: usize, _val: SqlDateTime2) {}
+            fn write_datetimeoffset(&mut self, _col: usize, _val: SqlDateTimeOffset) {}
+            fn write_money(&mut self, _col: usize, _val: SqlMoney) {}
+            fn write_smallmoney(&mut self, _col: usize, _val: SqlSmallMoney) {}
+            fn write_uuid(&mut self, _col: usize, _val: uuid::Uuid) {}
+            fn write_xml(&mut self, _col: usize, _val: SqlXml) {}
+            fn write_json(&mut self, _col: usize, _val: SqlJson) {}
+            fn write_vector(&mut self, _col: usize, _val: SqlVector) {}
+
+            fn end_row(&mut self) {
+                self.row_complete = true;
+            }
+        }
+
         let context = create_context();
         let provider = TdsConnectionProvider {};
         let mut client = provider
             .create_client(context, &build_tcp_datasource(), None)
             .await?;
 
-        let query = "DECLARE @t TABLE (c0 INT, c1 VARBINARY(MAX), c2 VARBINARY(MAX), c3 VARBINARY(MAX), c4 INT); \
-            INSERT INTO @t VALUES \
-                (10, 0x6161, 0x6262, 0x6363, 14), \
-                (20, 0x6464, 0x6565, 0x6666, 24); \
-            SELECT c0, c1, c2, c3, c4 FROM @t"
-            .to_string();
+        let query = "
+            SELECT
+                CAST(10 AS INT) AS c1,
+                CAST(N'second-column' AS NVARCHAR(MAX)) AS c2,
+                CAST(30 AS INT) AS c3,
+                CAST(0xDEADBEEF AS VARBINARY(MAX)) AS c4,
+                CAST(50 AS INT) AS c5
+        "
+        .to_string();
         client.execute(query, None, None).await?;
 
-        // Row 1 sparse columns: first int (c0) then third PLP (c3).
-        let row1_c0 = client.read_column(0).await?;
-        assert!(matches!(
-            row1_c0,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
-                mssql_tds::datatypes::column_values::ColumnValues::Int(10)
-            ))
-        ));
+        let mut writer = SelectedColumnsWriter::default();
+        if let Some(rs) = client.get_current_resultset() {
+            let has_row = rs.next_row_into(&mut writer).await?;
+            assert!(has_row, "Expected one row from the 5-column select");
+            assert!(rs.next_row().await?.is_none());
+        }
 
-        let row1_c3 = client.read_column(3).await?;
-        assert!(matches!(
-            row1_c3,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-        let mut buf = [0u8; 8];
-        let n = client.read_active_plp_bytes(&mut buf).await?;
-        assert_eq!(&buf[..n], b"cc");
-        assert!(client.active_plp_reached_end());
-
-        // Requesting c0 again should advance to row 2 and read row2.c0.
-        let row2_c0 = client.read_column(0).await?;
-        assert!(matches!(
-            row2_c0,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
-                mssql_tds::datatypes::column_values::ColumnValues::Int(20)
-            ))
-        ));
-
-        let row2_c3 = client.read_column(3).await?;
-        assert!(matches!(
-            row2_c3,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-        let n = client.read_active_plp_bytes(&mut buf).await?;
-        assert_eq!(&buf[..n], b"ff");
-        assert!(client.active_plp_reached_end());
-
-        assert!(client.read_column(0).await?.is_none());
-
-        client.close_query().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn streaming_column_read_multi_type_row_contract() -> mssql_tds::core::TdsResult<()> {
-        init_tracing();
-        let context = create_context();
-        let provider = TdsConnectionProvider {};
-        let mut client = provider
-            .create_client(context, &build_tcp_datasource(), None)
-            .await?;
-
-        let query = "SELECT CAST(7 AS INT) AS i, CAST('hello' AS VARBINARY(MAX)) AS p1, CAST('world' AS VARBINARY(MAX)) AS p2, CAST(9 AS INT) AS j".to_string();
-        client.execute(query, None, None).await?;
-
-        let value = client.read_column(0).await?;
-        assert!(matches!(
-            value,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
-                mssql_tds::datatypes::column_values::ColumnValues::Int(7)
-            ))
-        ));
-
-        let started = client.read_column(1).await?;
-        assert!(matches!(
-            started,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-
-        let mut plp_buf = [0u8; 16];
-        let n = client.read_active_plp_bytes(&mut plp_buf).await?;
-        assert_eq!(&plp_buf[..n], b"hello");
-        assert!(client.active_plp_reached_end());
-
-        let started = client.read_column(2).await?;
-        assert!(matches!(
-            started,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::ActivePlpStream)
-        ));
-
-        let n = client.read_active_plp_bytes(&mut plp_buf).await?;
-        assert_eq!(&plp_buf[..n], b"world");
-        assert!(client.active_plp_reached_end());
-
-        let value = client.read_column(3).await?;
-        assert!(matches!(
-            value,
-            Some(mssql_tds::connection::tds_client::ColumnReadResult::Value(
-                mssql_tds::datatypes::column_values::ColumnValues::Int(9)
-            ))
-        ));
-
-        assert!(client.next_row().await?.is_none());
+        assert!(writer.row_complete, "Writer should observe end_row() after the row is fully decoded");
+        assert_eq!(writer.selected_col_2.as_deref(), Some("second-column"));
+        assert_eq!(writer.selected_col_4.as_deref(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
 
         client.close_query().await?;
         Ok(())

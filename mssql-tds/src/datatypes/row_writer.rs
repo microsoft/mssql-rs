@@ -9,7 +9,28 @@ use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sql_json::SqlJson;
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sql_vector::SqlVector;
+use crate::query::metadata::ColumnMetadata;
+use crate::token::tokens::SqlCollation;
+use crate::core::TdsResult;
 use uuid::Uuid;
+
+/// Streaming sink for PLP column chunks.
+///
+/// When the decoder encounters a PLP column, it calls `RowWriter::begin_plp()`
+/// to obtain a sink. The decoder then pushes data chunks through `write_chunk()`.
+/// Once all chunks are written, the sink is finalized to produce a `ColumnValues`.
+pub trait PlpStreamingSink: Send {
+    /// Writes the next chunk of PLP data.
+    fn write_chunk(&mut self, data: &[u8]) -> TdsResult<()>;
+
+    /// Finalizes the PLP stream and returns the materialized value.
+    fn finalize(self: Box<Self>) -> TdsResult<ColumnValues>;
+
+    /// Returns the collation of this PLP column, if any.
+    fn collation(&self) -> Option<SqlCollation> {
+        None
+    }
+}
 
 /// Pluggable decode sink for TDS row data.
 ///
@@ -17,6 +38,32 @@ use uuid::Uuid;
 /// enabling consumers (Arrow writers, N-API binary encoders, etc.) to
 /// receive values without going through the intermediate `ColumnValues` enum.
 pub trait RowWriter {
+    /// Creates a streaming sink for the given PLP column.
+    ///
+    /// Called by the decoder when encountering a PLP column. Subclasses may
+    /// return a buffering sink (for full-row materilization) or a streaming sink
+    /// (for incremental reads). Default returns a buffering sink.
+    fn begin_plp(&mut self, _col: usize, _metadata: &ColumnMetadata) -> Box<dyn PlpStreamingSink> {
+        Box::new(BufferingPlpSink::new())
+    }
+
+    /// Finalizes a PLP sink and writes the resulting value to the row.
+    ///
+    /// Called after all chunks have been written to the sink returned by `begin_plp()`.
+    /// Default implementation writes the finalized value to the row via `write_column_value()`.
+    fn finalize_plp(&mut self, col: usize, sink: Box<dyn PlpStreamingSink>) -> TdsResult<()> {
+        let value = sink.finalize()?;
+        Ok(write_column_value(self, col, value))
+    }
+
+    /// Returns `true` to pause row decoding after reading column `col`.
+    ///
+    /// Used to support incremental column iteration: pause after reading a column
+    /// to let the caller process it, then resume from the next column.
+    fn pause_after_column(&self, _col: usize) -> bool {
+        false
+    }
+
     /// Writes a SQL `NULL` for column `col`.
     fn write_null(&mut self, col: usize);
     /// Writes a `bit` value.
@@ -67,6 +114,37 @@ pub trait RowWriter {
     fn write_vector(&mut self, col: usize, val: SqlVector);
     /// Signals the end of the current row.
     fn end_row(&mut self);
+}
+
+/// Buffers PLP chunks in memory and finalizes to `ColumnValues::Bytes`.
+/// Used by `DefaultRowWriter` for full-row materialization.
+pub struct BufferingPlpSink {
+    chunks: Vec<u8>,
+}
+
+impl BufferingPlpSink {
+    pub fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+        }
+    }
+}
+
+impl PlpStreamingSink for BufferingPlpSink {
+    fn write_chunk(&mut self, data: &[u8]) -> TdsResult<()> {
+        self.chunks.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finalize(self: Box<Self>) -> TdsResult<ColumnValues> {
+        Ok(ColumnValues::Bytes(self.chunks))
+    }
+}
+
+impl Default for BufferingPlpSink {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Default implementation that assembles `Vec<ColumnValues>`, preserving

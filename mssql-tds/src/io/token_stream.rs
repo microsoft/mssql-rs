@@ -40,12 +40,39 @@ pub(crate) enum RowReadResult {
     RowWritten,
     /// A non-row token was received and needs normal handling.
     Token(Tokens),
+    /// Row decoding paused after `paused_at_column`; call `resume_row_into` to
+    /// continue from the next column.
+    RowPaused(RowPauseState),
 }
 
 #[cfg(fuzzing)]
 pub enum RowReadResult {
     RowWritten,
     Token(Tokens),
+    RowPaused(RowPauseState),
+}
+
+/// Carry-over state when [`RowWriter::pause_after_column`] returns `true`.
+///
+/// Passed back to [`TdsTokenStreamReader::resume_row_into`] to continue
+/// decoding the rest of the row from where it paused.
+#[derive(Debug)]
+#[cfg(not(fuzzing))]
+pub(crate) struct RowPauseState {
+    /// Index of the first column that has not yet been decoded.
+    pub(crate) next_column_index: usize,
+    /// Full column metadata for the row (shared with the ParserContext).
+    pub(crate) columns: Vec<ColumnMetadata>,
+    /// NBCROW null-bitmap (one bit per column, LSB-first).  `None` for plain ROW.
+    pub(crate) nbc_null_bitmap: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+#[cfg(fuzzing)]
+pub struct RowPauseState {
+    pub next_column_index: usize,
+    pub columns: Vec<ColumnMetadata>,
+    pub nbc_null_bitmap: Option<Vec<u8>>,
 }
 
 #[async_trait]
@@ -65,6 +92,19 @@ pub(crate) trait TdsTokenStreamReader {
         cancel_handle: Option<&CancelHandle>,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult>;
+
+    /// Resume a paused row decode from the column after the one that triggered
+    /// [`pause_after_column`](RowWriter::pause_after_column).
+    ///
+    /// The caller is responsible for passing back the exact [`RowPauseState`]
+    /// that was returned inside `RowReadResult::RowPaused`.
+    async fn resume_row_into(
+        &mut self,
+        pause_state: RowPauseState,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult>;
 }
 
 #[async_trait]
@@ -80,6 +120,14 @@ pub trait TdsTokenStreamReader {
     async fn receive_row_into(
         &mut self,
         context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult>;
+
+    async fn resume_row_into(
+        &mut self,
+        pause_state: RowPauseState,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
         writer: &mut (dyn RowWriter + Send),
@@ -214,6 +262,91 @@ pub(crate) async fn receive_token_internal<R: TdsPacketReader + Send + Sync>(
     dispatch_token(reader, registry, token_type, context).await
 }
 
+/// Decodes columns starting at `start_col` for a plain ROW token.
+///
+/// Shared by both the initial ROW path and the resume-from-pause path.
+async fn decode_row_columns<R: TdsPacketReader + Send + Sync>(
+    reader: &mut R,
+    columns: &[ColumnMetadata],
+    decryptor: Option<&Arc<dyn CellDecryptor>>,
+    start_col: usize,
+    writer: &mut (dyn RowWriter + Send),
+) -> TdsResult<RowReadResult> {
+    let decoder = GenericDecoder::default();
+    for (col, meta) in columns.iter().enumerate().skip(start_col) {
+        match (meta.crypto_metadata.is_some(), decryptor) {
+            (true, Some(dec)) => {
+                let value = decrypt_encrypted_column(&decoder, reader, meta, dec).await?;
+                write_column_value(writer, col, value);
+            }
+            (true, None) => {
+                tracing::info!(
+                    column = %meta.column_name,
+                    "Encrypted column has no column-encryption decryptor available \
+                     (Always Encrypted disabled for this command, or no key-store \
+                     provider registered); returning the raw ciphertext varbinary"
+                );
+                decoder.decode_into(reader, meta, col, writer).await?;
+            }
+            (false, _) => {
+                decoder.decode_into(reader, meta, col, writer).await?;
+            }
+        }
+        if writer.pause_after_column(col) && col + 1 < columns.len() {
+            return Ok(RowReadResult::RowPaused(RowPauseState {
+                next_column_index: col + 1,
+                columns: columns.to_vec(),
+                nbc_null_bitmap: None,
+            }));
+        }
+    }
+    Ok(RowReadResult::RowWritten)
+}
+
+/// Decodes columns starting at `start_col` for an NBCROW token.
+async fn decode_nbcrow_columns<R: TdsPacketReader + Send + Sync>(
+    reader: &mut R,
+    columns: &[ColumnMetadata],
+    decryptor: Option<&Arc<dyn CellDecryptor>>,
+    bitmap: &[u8],
+    start_col: usize,
+    writer: &mut (dyn RowWriter + Send),
+) -> TdsResult<RowReadResult> {
+    let decoder = GenericDecoder::default();
+    for (col, meta) in columns.iter().enumerate().skip(start_col) {
+        if bitmap[col / 8] & (1 << (col % 8)) != 0 {
+            writer.write_null(col);
+        } else {
+            match (meta.crypto_metadata.is_some(), decryptor) {
+                (true, Some(dec)) => {
+                    let value = decrypt_encrypted_column(&decoder, reader, meta, dec).await?;
+                    write_column_value(writer, col, value);
+                }
+                (true, None) => {
+                    tracing::info!(
+                        column = %meta.column_name,
+                        "Encrypted column has no column-encryption decryptor available \
+                         (Always Encrypted disabled for this command, or no key-store \
+                         provider registered); returning the raw ciphertext varbinary"
+                    );
+                    decoder.decode_into(reader, meta, col, writer).await?;
+                }
+                (false, _) => {
+                    decoder.decode_into(reader, meta, col, writer).await?;
+                }
+            }
+        }
+        if writer.pause_after_column(col) && col + 1 < columns.len() {
+            return Ok(RowReadResult::RowPaused(RowPauseState {
+                next_column_index: col + 1,
+                columns: columns.to_vec(),
+                nbc_null_bitmap: Some(bitmap.to_vec()),
+            }));
+        }
+    }
+    Ok(RowReadResult::RowWritten)
+}
+
 pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
     registry: &impl TokenParserRegistry,
@@ -227,69 +360,40 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
     match token_type {
         TokenType::Row => {
             let (columns, decryptor) = extract_row_context(context)?;
-            let decoder = GenericDecoder::default();
-            for (col, meta) in columns.iter().enumerate() {
-                // Decrypt only when a decryptor is available. Otherwise decode
-                // the ciphertext varbinary normally, but log the
-                // encrypted-but-undecryptable case so a misconfiguration is
-                // observable rather than silently returning ciphertext.
-                match (meta.crypto_metadata.is_some(), decryptor) {
-                    (true, Some(dec)) => {
-                        let value = decrypt_encrypted_column(&decoder, reader, meta, dec).await?;
-                        write_column_value(writer, col, value);
-                    }
-                    (true, None) => {
-                        tracing::info!(
-                            column = %meta.column_name,
-                            "Encrypted column has no column-encryption decryptor available \
-                             (Always Encrypted disabled for this command, or no key-store \
-                             provider registered); returning the raw ciphertext varbinary"
-                        );
-                        decoder.decode_into(reader, meta, col, writer).await?;
-                    }
-                    (false, _) => {
-                        decoder.decode_into(reader, meta, col, writer).await?;
-                    }
-                }
-            }
-            Ok(RowReadResult::RowWritten)
+            decode_row_columns(reader, columns, decryptor, 0, writer).await
         }
         TokenType::NbcRow => {
             let (columns, decryptor) = extract_row_context(context)?;
             let bitmap_len = columns.len().div_ceil(8);
             let mut bitmap = vec![0u8; bitmap_len];
             reader.read_bytes(&mut bitmap).await?;
-            let decoder = GenericDecoder::default();
-            for (col, meta) in columns.iter().enumerate() {
-                if bitmap[col / 8] & (1 << (col % 8)) != 0 {
-                    writer.write_null(col);
-                } else {
-                    match (meta.crypto_metadata.is_some(), decryptor) {
-                        (true, Some(dec)) => {
-                            let value =
-                                decrypt_encrypted_column(&decoder, reader, meta, dec).await?;
-                            write_column_value(writer, col, value);
-                        }
-                        (true, None) => {
-                            tracing::info!(
-                                column = %meta.column_name,
-                                "Encrypted column has no column-encryption decryptor available \
-                                 (Always Encrypted disabled for this command, or no key-store \
-                                 provider registered); returning the raw ciphertext varbinary"
-                            );
-                            decoder.decode_into(reader, meta, col, writer).await?;
-                        }
-                        (false, _) => {
-                            decoder.decode_into(reader, meta, col, writer).await?;
-                        }
-                    }
-                }
-            }
-            Ok(RowReadResult::RowWritten)
+            decode_nbcrow_columns(reader, columns, decryptor, &bitmap, 0, writer).await
         }
         _ => {
             let token = dispatch_token(reader, registry, token_type, context).await?;
             Ok(RowReadResult::Token(token))
+        }
+    }
+}
+
+/// Resumes a paused row decode from `pause_state.next_column_index`.
+///
+/// Does not read a token-type byte — the token has already been consumed.
+pub(crate) async fn resume_row_into_internal<R: TdsPacketReader + Send + Sync>(
+    reader: &mut R,
+    pause_state: RowPauseState,
+    writer: &mut (dyn RowWriter + Send),
+) -> TdsResult<RowReadResult> {
+    let RowPauseState {
+        next_column_index,
+        columns,
+        nbc_null_bitmap,
+    } = pause_state;
+
+    match nbc_null_bitmap {
+        None => decode_row_columns(reader, &columns, None, next_column_index, writer).await,
+        Some(bitmap) => {
+            decode_nbcrow_columns(reader, &columns, None, &bitmap, next_column_index, writer).await
         }
     }
 }
@@ -381,6 +485,37 @@ where
                 context,
                 writer,
             ),
+        );
+        let result = match remaining_request_timeout.as_ref() {
+            Some(t) => match timeout(*t, cancellable).await {
+                Ok(r) => r,
+                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
+            },
+            None => cancellable.await,
+        };
+
+        match &result {
+            Ok(_) => {}
+            Err(err) => match err {
+                OperationCancelledError(_) | TimeoutError(_) => {
+                    self.cancel_read_stream_and_wait().await?;
+                }
+                _ => {}
+            },
+        }
+        result
+    }
+
+    async fn resume_row_into(
+        &mut self,
+        pause_state: RowPauseState,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult> {
+        let cancellable = CancelHandle::run_until_cancelled(
+            cancel_handle,
+            resume_row_into_internal(&mut self.packet_reader, pause_state, writer),
         );
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {
