@@ -127,10 +127,17 @@ where
                     )
                 })?;
 
+            // Compute the end offset in usize to avoid u32 overflow on malformed input.
+            let string_end = (option_data_offset as usize)
+                .checked_add(option_data_length as usize)
+                .ok_or_else(|| {
+                    Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "FedAuth string data length overflow",
+                    )
+                })?;
             let string_bytes: &[u8] = token_data
-                .get(
-                    option_data_offset as usize..(option_data_offset + option_data_length) as usize,
-                )
+                .get(option_data_offset as usize..string_end)
                 .ok_or_else(|| {
                     Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -663,6 +670,33 @@ mod tests {
         assert!(
             result.is_err(),
             "Should error when options_count requires more data than available"
+        );
+    }
+
+    /// Regression test for a fuzzer-discovered crash (crash-1a0718529807d9d6b4ae25c65ac23c42c1b742aa).
+    /// A malformed option header whose data offset and length are both large u32 values caused
+    /// `offset + length` to overflow when computing the string slice bounds, aborting the process.
+    /// The parser must return an error instead of panicking.
+    #[tokio::test]
+    async fn test_parse_fedauth_option_offset_length_overflow() {
+        // Crash input without the leading token-type byte (consumed by the token stream reader).
+        let data = vec![
+            0x0e, 0x00, 0x00, 0x00, // length = 14
+            0x01, 0x00, 0x00, 0x00, // options_count = 1
+            0x00, // option_id
+            0x00, 0x04, 0x27, 0x81, // option_data_length = 0x81270400
+            0xb9, 0xdf, 0x0b, 0xfe, // option_data_offset = 0xfe0bdfb9
+            0x3b, // filler
+        ];
+
+        let mut reader = MockReader::new(data);
+        let parser = FedAuthInfoTokenParser::default();
+        let context = ParserContext::default();
+
+        let result = parser.parse(&mut reader, &context).await;
+        assert!(
+            result.is_err(),
+            "Overflowing option offset/length must produce an error, not a panic"
         );
     }
 }
