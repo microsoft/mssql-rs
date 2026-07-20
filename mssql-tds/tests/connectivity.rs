@@ -42,18 +42,20 @@ mod connectivity {
         secret.to_string()
     }
 
-    #[allow(clippy::field_reassign_with_default)]
     async fn generate_access_token_with_sts_and_resource(
         spn: String,
         sts: String,
         auth_method: &TdsAuthenticationMethod,
     ) -> String {
-        // let azclicred = AzureCliCredential::new();
         let scopes = &[spn.as_ref()];
+        // `CustomConfiguration` is `#[non_exhaustive]`, so it must be built by
+        // mutating a default; the field-reassign lint does not fire on it.
         let mut custom = CustomConfiguration::default();
         custom.authority_host = sts;
-        let mut client_options = ClientOptions::default();
-        client_options.cloud = Some(Arc::new(CloudConfiguration::Custom(custom)));
+        let client_options = ClientOptions {
+            cloud: Some(Arc::new(CloudConfiguration::Custom(custom))),
+            ..Default::default()
+        };
         let token_response = match auth_method {
             TdsAuthenticationMethod::Password => todo!(),
             TdsAuthenticationMethod::SSPI => todo!(),

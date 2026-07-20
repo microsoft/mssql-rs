@@ -33,6 +33,7 @@ use azure_identity::{
     ManagedIdentityCredentialOptions, UserAssignedId,
 };
 use tokio::sync::OnceCell;
+use url::{Position, Url};
 
 use crate::connection::odbc_authentication_transformer::TransformedAuth;
 use mssql_tds::connection::client_context::{
@@ -76,17 +77,20 @@ impl EntraTokenFactory {
     /// Builds the Azure SDK credential for the configured method. For a service
     /// principal the server-provided STS URL selects the authority host; managed
     /// identity resolves via IMDS and ignores it.
-    // `CustomConfiguration` is `#[non_exhaustive]`, so the default()-then-assign
-    // pattern is the only cross-crate way to set its authority host.
-    #[allow(clippy::field_reassign_with_default)]
     fn build_credential(&self, sts_url: &str) -> TdsResult<Arc<dyn TokenCredential>> {
         match &self.config {
             CredentialConfig::ServicePrincipalSecret { client_id, secret } => {
                 let (authority_host, tenant_id) = split_sts_url(sts_url)?;
+                // `CustomConfiguration` is `#[non_exhaustive]`, so it must be
+                // built by mutating a default (a struct literal cannot name a
+                // non_exhaustive foreign type); the field-reassign lint does not
+                // fire on it.
                 let mut custom = CustomConfiguration::default();
                 custom.authority_host = authority_host;
-                let mut client_options = ClientOptions::default();
-                client_options.cloud = Some(Arc::new(CloudConfiguration::Custom(custom)));
+                let client_options = ClientOptions {
+                    cloud: Some(Arc::new(CloudConfiguration::Custom(custom))),
+                    ..Default::default()
+                };
                 let credential: Arc<dyn TokenCredential> = ClientSecretCredential::new(
                     &tenant_id,
                     client_id.clone(),
@@ -162,40 +166,33 @@ fn normalize_scope(spn: &str) -> String {
 }
 
 /// Splits an STS URL such as `https://login.microsoftonline.com/<tenant>` into
-/// its authority host (`https://login.microsoftonline.com`) and tenant.
+/// its authority (`https://login.microsoftonline.com`) and tenant.
 ///
 /// Requires `https` — the client secret is sent to this authority, so an
 /// unencrypted endpoint is rejected. The host is not otherwise restricted:
 /// matching msodbcsql (via `azure-identity-cpp`) and the Azure SDK, the
 /// server-provided authority is trusted. See the module-level security note on
 /// the residual risk when the TDS channel is not certificate-validated.
+///
+/// Parsing goes through the `url` crate (WHATWG): the scheme and host are
+/// lowercased and the default `:443` port is dropped.
 fn split_sts_url(sts_url: &str) -> TdsResult<(String, String)> {
-    // The URL is server-provided (FEDAUTHINFO): tolerate surrounding whitespace
-    // and a mixed-case scheme (URL schemes are case-insensitive) before
-    // requiring https.
-    let trimmed = sts_url.trim().trim_end_matches('/');
-    let after_scheme = strip_https_prefix_ci(trimmed)
-        .ok_or_else(|| Error::ConnectionError(format!("STS URL must use https: {sts_url}")))?;
-    let (host, rest) = after_scheme
-        .split_once('/')
-        .ok_or_else(|| Error::ConnectionError(format!("STS URL is missing a tenant: {sts_url}")))?;
-    let tenant = rest.split('/').next().unwrap_or_default();
-    if host.is_empty() || tenant.is_empty() {
+    // The URL is server-provided (FEDAUTHINFO): tolerate surrounding whitespace.
+    let url = Url::parse(sts_url.trim())
+        .map_err(|e| Error::ConnectionError(format!("invalid STS URL: {sts_url} ({e})")))?;
+    if url.scheme() != "https" {
         return Err(Error::ConnectionError(format!(
-            "STS URL is missing a host or tenant: {sts_url}"
+            "STS URL must use https: {sts_url}"
         )));
     }
-    Ok((format!("https://{host}"), tenant.to_string()))
-}
-
-/// Strips a case-insensitive `https://` scheme, returning the remainder
-/// (host/path preserved as-is). Returns `None` if the scheme is not https.
-fn strip_https_prefix_ci(s: &str) -> Option<&str> {
-    const PREFIX: &str = "https://";
-    match s.get(..PREFIX.len()) {
-        Some(head) if head.eq_ignore_ascii_case(PREFIX) => Some(&s[PREFIX.len()..]),
-        _ => None,
-    }
+    let authority = url[..Position::BeforePath].to_string();
+    let tenant = url
+        .path_segments()
+        .and_then(|mut segments| segments.next())
+        .filter(|segment| !segment.is_empty())
+        .ok_or_else(|| Error::ConnectionError(format!("STS URL is missing a tenant: {sts_url}")))?
+        .to_string();
+    Ok((authority, tenant))
 }
 
 /// Encodes a string as UTF-16LE bytes — the token format the FedAuth token
@@ -324,10 +321,20 @@ mod tests {
     }
 
     #[test]
-    fn sts_url_host_with_port_ok() {
+    fn sts_url_default_https_port_normalized() {
+        // WHATWG drops the default :443 port; harmless since 443 is the https
+        // default. Non-default ports are preserved (see next test).
         let (authority, tenant) =
             split_sts_url("https://login.microsoftonline.com:443/my-tenant").unwrap();
-        assert_eq!(authority, "https://login.microsoftonline.com:443");
+        assert_eq!(authority, "https://login.microsoftonline.com");
+        assert_eq!(tenant, "my-tenant");
+    }
+
+    #[test]
+    fn sts_url_non_default_port_preserved() {
+        let (authority, tenant) =
+            split_sts_url("https://sts.contoso.example:8443/my-tenant").unwrap();
+        assert_eq!(authority, "https://sts.contoso.example:8443");
         assert_eq!(tenant, "my-tenant");
     }
 
