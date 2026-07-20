@@ -7,7 +7,7 @@ try {
     $wc = New-Object -TypeName System.Net.WebClient
     $wc.DownloadFile($URL, $DestinationFile)}
 catch {
-    Write-Error -Message "Failed to download rustup: $_.Message"
+    throw "Failed to download rustup: $($_.Exception.Message)"
 }
 
 try{
@@ -31,5 +31,5 @@ try{
     Write-Host "Cargo is now available"
 }
 catch {
-    Write-Host "`nException while installing rustup, Error Message: " $_.Exception.Message
+    throw "Exception while installing rustup: $($_.Exception.Message)"
 }

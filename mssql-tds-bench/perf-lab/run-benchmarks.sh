@@ -55,6 +55,13 @@ export TRUST_SERVER_CERTIFICATE="${TRUST_SERVER_CERTIFICATE:-true}"
 # SQL_PASSWORD is already exported into this session by run-remote.sh.
 : "${SQL_PASSWORD:?SQL_PASSWORD not set}"
 
+# The perf lab always has a server provisioned and injected, so a failure to
+# connect must FAIL the run, not skip it. This flag makes the benches' try_connect
+# panic instead of returning None (see mssql-tds-bench/src/lib.rs); without it an
+# unreachable server would skip every benchmark, leave comparison.txt empty, and
+# the gate would pass spuriously green.
+export BENCH_REQUIRE_SERVER=1
+
 # --- SQL Server configuration snapshot (validate the instance is tuned) ---
 # Dump effective memory / MAXDOP / cost-threshold / affinity, tempdb placement,
 # durability/recovery, and trace flags so we can confirm the perf tuning took.
@@ -96,13 +103,21 @@ ensure_packages() {
 ensure_packages
 
 # --- Toolchain ---
+# Reuse the repo's canonical rustup installer (the same script the real CI stages
+# use, shipped to the VM at .pipeline/scripts/) rather than a second, drifting
+# copy. It passes no --default-toolchain, so the repo's rust-toolchain.toml
+# (channel = "1.95") drives the version the benches build under.
 if ! command -v cargo >/dev/null 2>&1; then
-    echo ">>> Installing Rust toolchain via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    echo ">>> Installing Rust toolchain via .pipeline/scripts/install-rustup.sh..."
+    bash "$REPO_ROOT/.pipeline/scripts/install-rustup.sh"
 fi
 # shellcheck disable=SC1091
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 export PATH="$HOME/.cargo/bin:$PATH"
+# Fail loud if the toolchain still isn't available: the canonical installer does
+# not itself abort on a failed download, and the lab must not proceed to a silent
+# no-op run.
+command -v cargo >/dev/null 2>&1 || { echo "ERROR: Rust toolchain install failed (cargo not found)" >&2; exit 1; }
 
 if ! command -v critcmp >/dev/null 2>&1; then
     echo ">>> Installing critcmp..."

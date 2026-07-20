@@ -132,11 +132,38 @@ pub async fn connect_with_packet_size(env: &BenchEnv, packet_size: u16) -> TdsCl
         .expect("failed to connect to SQL Server")
 }
 
+/// Whether a reachable server is mandatory. The perf-lab runners set
+/// `BENCH_REQUIRE_SERVER=1` because a server is always provisioned and injected
+/// there; when it is set (to a non-empty, non-`0` value) [`try_connect`] panics
+/// instead of skipping, so a broken connection fails the run loudly rather than
+/// skipping every benchmark and leaving the comparison empty and spuriously green.
+fn require_server() -> bool {
+    matches!(env::var("BENCH_REQUIRE_SERVER"), Ok(v) if !v.is_empty() && v != "0")
+}
+
 /// Probe whether the benchmark DB is reachable, returning a connected client on
 /// success and `None` otherwise. Use at the top of a benchmark to skip
 /// gracefully when no server is available.
+///
+/// When `BENCH_REQUIRE_SERVER` is set (the perf-lab runners set it), a missing
+/// connection environment or an unreachable server is a hard error instead of a
+/// skip: in the lab a server is required and injected, so failing to connect
+/// must fail the run rather than silently skip and leave the gate green.
 pub fn try_connect(rt: &tokio::runtime::Runtime, bench_name: &str) -> Option<TdsClient> {
-    let env = bench_env()?;
+    let require = require_server();
+    let Some(env) = bench_env() else {
+        if require {
+            panic!(
+                "{bench_name}: BENCH_REQUIRE_SERVER is set but the connection environment is not \
+                 configured (need DB_HOST/DB_PORT/DB_USERNAME and SQL_PASSWORD or /tmp/password)"
+            );
+        }
+        eprintln!(
+            "{bench_name}: skipped — connection env not set \
+             (expected when running benches without a server)"
+        );
+        return None;
+    };
     let client = rt.block_on(async {
         let provider = TdsConnectionProvider {};
         provider
@@ -145,6 +172,13 @@ pub fn try_connect(rt: &tokio::runtime::Runtime, bench_name: &str) -> Option<Tds
             .ok()
     });
     if client.is_none() {
+        if require {
+            panic!(
+                "{bench_name}: BENCH_REQUIRE_SERVER is set but the server at {} is unreachable; \
+                 failing the run instead of skipping",
+                env.datasource()
+            );
+        }
         eprintln!(
             "{bench_name}: skipped — DB unreachable or connection env not set \
              (expected when running benches without a server)"

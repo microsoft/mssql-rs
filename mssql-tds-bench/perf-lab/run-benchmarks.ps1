@@ -171,6 +171,13 @@ if (-not $env:DB_PORT)                 { $env:DB_PORT = '1433' }
 if (-not $env:DB_USERNAME)             { $env:DB_USERNAME = 'sa' }
 if (-not $env:TRUST_SERVER_CERTIFICATE){ $env:TRUST_SERVER_CERTIFICATE = 'true' }
 
+# The perf lab always has a server provisioned and injected, so a failure to
+# connect must FAIL the run, not skip it. This flag makes the benches' try_connect
+# panic instead of returning None (see mssql-tds-bench/src/lib.rs); without it an
+# unreachable server would skip every benchmark, leave comparison.txt empty, and
+# the gate would pass spuriously green.
+$env:BENCH_REQUIRE_SERVER = '1'
+
 # --- SQL Server configuration snapshot (validate the instance is tuned) ---
 # Dump the effective memory / MAXDOP / cost-threshold / affinity, tempdb file
 # placement, durability/recovery, and trace flags so we can confirm the perf
@@ -197,12 +204,21 @@ try {
 }
 
 # --- Toolchain ---
+# Reuse the repo's canonical rustup installer (the same script the real CI stages
+# use, shipped to the VM at .pipeline\scripts\) rather than a second, drifting
+# copy. It passes no --default-toolchain, so the repo's rust-toolchain.toml
+# (channel = "1.95") drives the version the benches build under, and it sets the
+# cargo bin dir on the in-process PATH.
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    Write-Host '>>> Installing Rust toolchain via rustup...'
-    Invoke-WebRequest 'https://win.rustup.rs' -OutFile 'rustup-init.exe'
-    Invoke-Native { & ./rustup-init.exe -y --default-toolchain stable }
+    Write-Host '>>> Installing Rust toolchain via .pipeline\scripts\InstallRustup.ps1...'
+    & (Join-Path $RepoRoot '.pipeline/scripts/InstallRustup.ps1')
 }
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+# Fail loud if the toolchain still isn't available: the lab must not proceed to a
+# silent no-op run.
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    throw 'Rust toolchain install failed: cargo not found after InstallRustup.ps1'
+}
 
 # --- git (needed for the baseline worktree) ---
 # The Windows Server perf image (RUST-Win22-Sql25-1P) normally ships git, but
