@@ -12,6 +12,13 @@ use std::sync::MutexGuard;
 /// SQLSTATE stored as 5 ASCII bytes (no NUL).
 pub(crate) type SqlState = [u8; 5];
 
+/// Prefix every diagnostic message carries, matching msodbcsql's format:
+/// `[Microsoft][ODBC Driver 18 for SQL Server]`. Errors raised inside the
+/// SQL Server engine add a further `[SQL Server]` sub-source after this (see
+/// `post_tds_error`). Consumers such as mssql-python and pyodbc rely on this
+/// prefix being present to identify and reformat driver diagnostics.
+pub(crate) const DRIVER_DIAG_PREFIX: &str = "[Microsoft][ODBC Driver 18 for SQL Server]";
+
 /// Implemented by state structs that store ODBC diagnostic records.
 pub(crate) trait HasDiagnostics {
     fn diag_records(&self) -> &[DiagRecord];
@@ -48,12 +55,18 @@ impl DiagRecord {
 }
 
 /// Post an ODBC diagnostic record onto a handle-local diagnostic list.
+///
+/// The message is prefixed with [`DRIVER_DIAG_PREFIX`] so every record the
+/// driver surfaces via `SQLGetDiagRec` matches msodbcsql's format. Callers
+/// pass the bare message (server paths first prepend their `[SQL Server]`
+/// sub-source); they must not include the `[Microsoft]...` prefix themselves.
 pub(crate) fn post_sql_error(
     state: &mut impl HasDiagnostics,
     sql_state: SqlState,
     native_error: i32,
     message: impl Into<String>,
 ) {
+    let message = format!("{DRIVER_DIAG_PREFIX}{}", message.into());
     state
         .diag_records_mut()
         .push(DiagRecord::new(sql_state, native_error, message));
