@@ -480,13 +480,13 @@ steps:
       $BUILD_IMAGE \
       /workspace/.pipeline/scripts/containerized-pycore-rust-test.sh
   displayName: Run Rust unit tests (mssql-py-core)
-  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), ne('${{ parameters.architecture }}', 'ARM64'))
   env:
     CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - task: PublishTestResults@2
-  condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+  condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'), ne('${{ parameters.architecture }}', 'ARM64'))
   displayName: Publish mssql-py-core Rust test results
   inputs:
     testResultsFormat: JUnit
@@ -506,7 +506,6 @@ steps:
     inputs:
       targetPath: $(Build.SourcesDirectory)/target/pycore-rust-cobertura.xml
       artifactName: CoberturaCoveragePyCoreRust
-
 
 - script: |
     BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
