@@ -2297,22 +2297,31 @@ impl TdsClient {
         // this one's output-parameter decryption.
         output_param_ceks.clear();
 
-        // ForceColumnEncryption: every parameter that demands encryption must be
-        // reported as encrypted by the server. Validate before any work — and
-        // before the "nothing encrypted" early return below — so a server that
-        // downgrades a parameter (reporting it plaintext) is caught rather than
-        // silently sending the value as plaintext.
-        for info in &describe.parameters {
-            if info.is_encrypted() {
+        // ForceColumnEncryption: every supplied parameter that demands
+        // encryption must be reported as encrypted by the server. Validate before
+        // any work — and before the "nothing encrypted" early return below — so a
+        // server that downgrades a forced parameter is caught rather than
+        // silently sending its value as plaintext. A downgrade takes two forms,
+        // both rejected here: the server reports the parameter's target column as
+        // plaintext, or it omits a row for the parameter entirely (which would
+        // otherwise slip past a describe-driven check and be serialized in the
+        // clear).
+        for index in 0..params.len() {
+            if !params[index].force_column_encryption() {
                 continue;
             }
-            if let Some(index) = Self::match_describe_param_index(params, info)
-                && params[index].force_column_encryption()
-            {
+            let reported_encrypted = describe.parameters.iter().any(|info| {
+                info.is_encrypted() && Self::match_describe_param_index(params, info) == Some(index)
+            });
+            if !reported_encrypted {
+                let name = params[index]
+                    .name
+                    .as_deref()
+                    .unwrap_or("<positional>")
+                    .to_string();
                 return Err(crate::error::Error::UsageError(format!(
-                    "Parameter {} has ForceColumnEncryption set, but the server reported its \
-                     target column as not encrypted; refusing to send it as plaintext.",
-                    info.parameter_name
+                    "Parameter {name} has ForceColumnEncryption set, but the server did not \
+                     report it as encrypted; refusing to send it as plaintext.",
                 )));
             }
         }
@@ -4122,5 +4131,46 @@ mod tests {
             .expect_err("synthetic positional name collision should be rejected");
 
         assert!(matches!(err, UsageError(message) if message.contains("@CE_POS_0")));
+    }
+
+    /// A forced parameter whose row the server omits entirely from the describe
+    /// result must be rejected — not silently sent as plaintext. This is the
+    /// downgrade a describe-driven check (iterating only the server's rows) would
+    /// miss, so the validation iterates the supplied forced parameters instead.
+    #[tokio::test]
+    async fn apply_parameter_encryption_rejects_forced_param_omitted_from_describe() {
+        use crate::datatypes::sqltypes::SqlType;
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+        use crate::security::keystore::{CekCache, ColumnEncryptionKeyStoreProviderRegistry};
+
+        // Server returns an empty describe result: no row for the forced param.
+        let describe = DescribeParameterEncryptionResult::new();
+        let providers = ColumnEncryptionKeyStoreProviderRegistry::new();
+        let cek_cache = CekCache::new();
+        let mut output_param_ceks = HashMap::new();
+
+        let mut forced = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(42)),
+        )
+        .with_force_column_encryption(true);
+        let mut params: Vec<&mut RpcParameter> = vec![&mut forced];
+
+        let err = TdsClient::apply_parameter_encryption(
+            &describe,
+            &providers,
+            &cek_cache,
+            &mut params,
+            &mut output_param_ceks,
+            &[],
+        )
+        .await
+        .expect_err("a forced parameter omitted from the describe result must be rejected");
+
+        assert!(
+            matches!(&err, UsageError(message) if message.contains("ForceColumnEncryption")),
+            "expected a ForceColumnEncryption usage error, got: {err}"
+        );
     }
 }
