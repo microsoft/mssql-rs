@@ -106,7 +106,6 @@ if [ -n "$OUT_DIR" ]; then
     mkdir -p "$OUT_DIR"
     rm -rf "$OUT_DIR/build"
     cp -r "$BUILD_DIR" "$OUT_DIR/build"
-    echo "$DRIVER_FILE" > "$OUT_DIR/DRIVER_FILE"
     echo "Staged build/ (with $DRIVER_FILE) into $OUT_DIR"
 fi
 

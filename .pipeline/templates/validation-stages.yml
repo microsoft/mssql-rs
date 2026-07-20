@@ -296,7 +296,7 @@ stages:
           artifactName: 'Odbc_Musl_arm64'
       - template: build-odbc-glibc228-template.yml
         parameters:
-          architecture: arm64
+          architecture: ARM64
           buildImage: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest'
           artifactName: 'Odbc_glibc228_arm64'
   - job: Build_MacOS
