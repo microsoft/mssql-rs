@@ -50,17 +50,21 @@ steps:
       echo "Building Python wheels in container: $CONTAINER_IMAGE"
       
       mkdir -p "$(ob_outputDirectory)/wheels"
+      mkdir -p "$(ob_outputDirectory)/symbols/${{ parameters.osType }}_${{ parameters.architecture }}"
       
       bash .pipeline/scripts/docker-cargo-run.sh --rm \
         -v "$(Build.SourcesDirectory):/workspace" \
         -v "$(ob_outputDirectory)/wheels:/workspace/target/wheels" \
+        -v "$(ob_outputDirectory)/symbols/${{ parameters.osType }}_${{ parameters.architecture }}:/workspace/target/symbols" \
         -e "WORKSPACE_DIR=/workspace" \
         -e "OUTPUT_DIR=/workspace/target/wheels" \
+        -e "SYMBOLS_OUTPUT_DIR=/workspace/target/symbols" \
         "$CONTAINER_IMAGE" \
         bash /workspace/scripts/build-python-wheels-in-container.sh
       
       # Fix permissions on any files created by the container
       sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/mssql-py-core/target" || true
+      sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/symbols" || true
       
       set -o pipefail
       WHEEL_COUNT=$(find "$(ob_outputDirectory)/wheels" -type f -name '*.whl' | wc -l)
@@ -70,6 +74,8 @@ steps:
       fi
       echo "✅ $WHEEL_COUNT wheels built successfully!"
       ls -lh "$(ob_outputDirectory)/wheels"
+      echo "--- Debug symbols captured ---"
+      find "$(ob_outputDirectory)/symbols" -type f 2>/dev/null | xargs -r ls -lh || true
     displayName: 'Build Python wheels in manylinux container (${{ parameters.architecture }})'
     env:
       CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
@@ -105,6 +111,20 @@ steps:
         cd mssql-py-core
         maturin build --release --target universal2-apple-darwin --interpreter python${{ pythonVersion }} --out $(ob_outputDirectory)/wheels
         echo "Universal2 wheel built successfully for Python ${{ pythonVersion }}"
+
+        # Collect .dSYM bundles emitted by split-debuginfo="packed" immediately
+        # after this interpreter's build — the next Python version's build reuses
+        # target/release/deps and would overwrite them.
+        PY_TAG="cp$(echo ${{ pythonVersion }} | tr -d .)"
+        SYM_DEST="$(ob_outputDirectory)/symbols/MacOS_universal2/$PY_TAG"
+        mkdir -p "$SYM_DEST"
+        # dSYM is a directory; tar it so it survives artifact publish.
+        for dsym in target/universal2-apple-darwin/release/deps/libmssql_py_core*.dSYM \
+                    target/release/deps/libmssql_py_core*.dSYM ; do
+          [ -d "$dsym" ] || continue
+          tar -czf "$SYM_DEST/$(basename "$dsym").tgz" -C "$(dirname "$dsym")" "$(basename "$dsym")"
+          echo "Captured dSYM: $dsym -> $SYM_DEST/$(basename "$dsym").tgz"
+        done
       displayName: 'Build universal2 wheel for Python ${{ pythonVersion }} (MacOS)'
   
   - script: |
@@ -138,17 +158,21 @@ steps:
       echo "Building Python wheels in container: $CONTAINER_IMAGE"
       
       mkdir -p "$(ob_outputDirectory)/wheels"
+      mkdir -p "$(ob_outputDirectory)/symbols/${{ parameters.osType }}_${{ parameters.architecture }}"
       
       bash .pipeline/scripts/docker-cargo-run.sh --rm \
         -v "$(Build.SourcesDirectory):/workspace" \
         -v "$(ob_outputDirectory)/wheels:/workspace/target/wheels" \
+        -v "$(ob_outputDirectory)/symbols/${{ parameters.osType }}_${{ parameters.architecture }}:/workspace/target/symbols" \
         -e "WORKSPACE_DIR=/workspace" \
         -e "OUTPUT_DIR=/workspace/target/wheels" \
+        -e "SYMBOLS_OUTPUT_DIR=/workspace/target/symbols" \
         "$CONTAINER_IMAGE" \
         bash /workspace/scripts/build-python-wheels-in-container.sh
       
       # Fix permissions on any files created by the container
       sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/mssql-py-core/target" || true
+      sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/symbols" || true
       
       WHEEL_COUNT=$(find "$(ob_outputDirectory)/wheels" -name '*.whl' | wc -l)
       if [ "$WHEEL_COUNT" -eq 0 ]; then
@@ -157,6 +181,8 @@ steps:
       fi
       echo "✅ $WHEEL_COUNT wheels built successfully!"
       ls -lh "$(ob_outputDirectory)/wheels"
+      echo "--- Debug symbols captured ---"
+      find "$(ob_outputDirectory)/symbols" -type f 2>/dev/null | xargs -r ls -lh || true
     displayName: 'Build Python wheels in musllinux container (${{ parameters.architecture }})'
     env:
       CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
@@ -182,13 +208,44 @@ steps:
         pip install maturin wheel
         
         # Create wheels output directory
-        New-Item -ItemType Directory -Force -Path "$(ob_outputDirectory)\wheels"
+        New-Item -ItemType Directory -Force -Path "$(ob_outputDirectory)\wheels" | Out-Null
         
         # Build the wheel
-        cd mssql-py-core
+        Push-Location mssql-py-core
         maturin build --release --interpreter python --out "$(ob_outputDirectory)\wheels"
+        if ($LASTEXITCODE -ne 0) { throw "maturin build failed" }
+        Pop-Location
         
         Write-Host "Wheel built successfully for Python ${{ pythonVersion }}"
+
+        # Collect .pdb files emitted by cargo (debug="full") immediately after
+        # this interpreter's build. The next Python version's build reuses
+        # target\release\deps and would overwrite the pdb.
+        $pyTag = "cp${{ pythonVersion }}".Replace('.', '')
+        $symDest = "$(ob_outputDirectory)\symbols\Windows_${{ parameters.architecture }}\$pyTag"
+        New-Item -ItemType Directory -Force -Path $symDest | Out-Null
+
+        # CARGO_TARGET_DIR may point outside the sources dir (Windows sets it to
+        # C:\cargo_target_dir); search there first, fall back to in-tree target.
+        $targetRoots = @()
+        if ($env:CARGO_TARGET_DIR) { $targetRoots += $env:CARGO_TARGET_DIR }
+        $targetRoots += "$(Build.SourcesDirectory)\mssql-py-core\target"
+        $targetRoots += "$(Build.SourcesDirectory)\target"
+
+        $pdbs = @()
+        foreach ($root in $targetRoots) {
+          if (Test-Path $root) {
+            $pdbs += Get-ChildItem -Path $root -Recurse -File -Filter 'mssql_py_core*.pdb' -ErrorAction SilentlyContinue
+          }
+        }
+        if ($pdbs.Count -eq 0) {
+          Write-Warning "No .pdb files found for Python ${{ pythonVersion }} under: $($targetRoots -join '; ')"
+        } else {
+          foreach ($pdb in $pdbs) {
+            Copy-Item -Path $pdb.FullName -Destination $symDest -Force
+            Write-Host "Captured PDB: $($pdb.FullName) -> $symDest"
+          }
+        }
       displayName: 'Build wheel for Python ${{ pythonVersion }} (Windows ${{ parameters.architecture }})'
 
   - ${{ if eq(parameters.signWindowsWheels, true) }}:

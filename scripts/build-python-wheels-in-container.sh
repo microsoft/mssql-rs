@@ -7,6 +7,9 @@ set -e
 PYTHON_VERSIONS=("3.10" "3.11" "3.12" "3.13" "3.14")
 WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 OUTPUT_DIR="${OUTPUT_DIR:-$WORKSPACE_DIR/target/wheels}"
+# Optional: when set, per-Python-version .dwp + .so symbol files are copied
+# into "$SYMBOLS_OUTPUT_DIR/<pytag>/" immediately after each maturin build.
+SYMBOLS_OUTPUT_DIR="${SYMBOLS_OUTPUT_DIR:-}"
 
 echo "==> Building Python wheels in container"
 echo "Workspace: $WORKSPACE_DIR"
@@ -81,6 +84,40 @@ for PY_VERSION in "${PYTHON_VERSIONS[@]}"; do
         --manifest-path "$WORKSPACE_DIR/mssql-py-core/Cargo.toml"
     
     echo "✅ Wheel built successfully for Python $PY_VERSION"
+
+    # -----------------------------------------------------------------------
+    # Collect split debug info (.dwp) emitted by
+    # split-debuginfo="packed" in mssql-py-core/Cargo.toml.
+    # The .dwp lives next to the built cdylib in the deps directory and is
+    # linked back to the shipped .so by GNU build-id, so publishing just the
+    # .dwp plus the (stripped) .so is enough for the symbol server to index.
+    # We copy immediately after each maturin build because building the next
+    # Python version reuses target/release/deps and overwrites artifacts.
+    # -----------------------------------------------------------------------
+    if [ -n "$SYMBOLS_OUTPUT_DIR" ]; then
+        PY_TAG="cp${PY_VERSION//./}"
+        SYM_DEST="$SYMBOLS_OUTPUT_DIR/$PY_TAG"
+        mkdir -p "$SYM_DEST"
+
+        TARGET_ROOT="$WORKSPACE_DIR/mssql-py-core/target"
+        # Look under both the default target dir and any triple-specific subdir
+        # (musllinux builds usually land under a x86_64-unknown-linux-musl subdir).
+        for candidate_dir in \
+            "$TARGET_ROOT/release/deps" \
+            "$TARGET_ROOT"/*/release/deps ; do
+            [ -d "$candidate_dir" ] || continue
+            find "$candidate_dir" -maxdepth 1 -name 'libmssql_py_core*.dwp' -exec cp -v {} "$SYM_DEST/" \;
+            find "$candidate_dir" -maxdepth 1 -name 'libmssql_py_core*.so'  -exec cp -v {} "$SYM_DEST/" \;
+        done
+
+        DWP_COUNT=$(find "$SYM_DEST" -maxdepth 1 -name '*.dwp' | wc -l)
+        if [ "$DWP_COUNT" -eq 0 ]; then
+            echo "⚠️  WARNING: no .dwp emitted for Python $PY_VERSION under $TARGET_ROOT"
+            echo "     Verify [profile.release] has split-debuginfo=\"packed\" and debug=\"full\"."
+        else
+            echo "📦 Captured $DWP_COUNT .dwp + matching .so into $SYM_DEST"
+        fi
+    fi
 done
 
 # auditwheel=skip in pyproject.toml means maturin won't vendor shared libs
