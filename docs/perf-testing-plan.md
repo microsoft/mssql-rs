@@ -135,10 +135,13 @@ build.
   - **Discarded warm-up pass** before the interleaved run to prime SQL Server's buffer
     pool / plan cache and the OS page cache, so the first measured benchmark isn't paying
     cold-start cost.
-  - **Auto-confirm** — a strict gate can trip on a transient single-benchmark outlier, so
-    any benchmark that trips the threshold is **re-measured** (interleaved, same as the
-    main run) and kept as a regression only if it trips **again**; one-off blips are
-    reported as transient noise, not failures.
+  - **Auto-confirm (best-of-N)** — a strict gate can trip on a transient single-benchmark
+    outlier (short, CPU-bound benches can swing double digits on a shared VM), so any
+    benchmark that trips the threshold is **re-measured `BENCH_CONFIRM_RUNS` times**
+    (default 4, interleaved, offenders only) and kept as a regression only if it trips in a
+    **majority** of those re-runs (`BENCH_CONFIRM_QUORUM`, default `N/2+1`). A real
+    regression reproduces consistently; a one-off spike does not and is reported as
+    transient noise, not a failure.
   - **Release-grade sampling** — heavier warm-up / measurement time / sample count than
     the fast local defaults (`BENCH_WARMUP_SECS` / `BENCH_SECS` / `BENCH_SAMPLES`),
     letting caches settle and separating small real deltas from noise.
@@ -161,7 +164,8 @@ The run **fails only when a *candidate* benchmark is slower than its baseline by
 the threshold** (`BENCH_REGRESSION_RATIO`, default `1.10` = 10%). A baseline-slower
 result never fails the gate — it can only mean the comparison lost sensitivity, which is
 exactly what the interleaving + pinning + warm-up work keeps in check. Any benchmark that
-trips is re-measured by **auto-confirm** and only fails the run if it trips again. The
+trips is re-measured by **auto-confirm** `BENCH_CONFIRM_RUNS` times (default 4) and only
+fails the run if it regresses in a **majority** of those re-runs (default 3 of 4). The
 verdict and the full `critcmp` table are written to `results/summary.md`, which the lab
 attaches to the run's **Summary** tab (`task.uploadsummary`) so the comparison renders
 inline on the pipeline run page.
@@ -267,7 +271,8 @@ binaries keep the per-binary interleaving effective (see §2).
   `extends` template; the build happens on the VM (the lab's documented model).
 - Comparison is **interleaved per bench binary** (not two full passes), and the run
   **fails only on a candidate-slower regression ≥ threshold** (default 10%), with
-  **auto-confirm** re-measuring any tripped benchmark before failing.
+  **best-of-N auto-confirm** (re-measure a tripped benchmark 4× and fail only on a
+  majority) rejecting transient outliers before failing.
 - Runs on **both Linux and Windows** as two separate pipeline definitions (numbers are
   not cross-comparable).
 - End-to-end (real SQL Server) only.
