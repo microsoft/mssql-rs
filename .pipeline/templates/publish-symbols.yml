@@ -1,0 +1,181 @@
+################################################################################
+# Reusable Symbol Publishing Template (ported from msodbcsql)
+#
+# Publishes debug symbol files to:
+#   - ADOOnly (default): SqlClientDrivers ADO org Artifacts symbol server ONLY.
+#                        Uses PublishSymbols@2 with System.AccessToken. No AAD
+#                        service connection required. Ideal for non-official
+#                        builds — short expiration, internal-only.
+#   - Private:           Same as above PLUS a request to the Microsoft Symbols
+#                        Publishing service to promote to the Microsoft
+#                        Internal Symbol Server (`msdlinternal.microsoft.com`).
+#   - Public:            Same as above PLUS a request to promote to the
+#                        Microsoft Public Symbol Server (`msdl.microsoft.com`).
+#
+# WARNING — Public promotion currently exposes full DWARF/PDB debug info from
+# Rust builds (source paths, private types, locals). Only use Public after
+# a public-symbol-stripping flow is in place. Public defaults to false in
+# every consumer pipeline.
+#
+# PREREQUISITE (Private/Public modes only): the mssql-rs ADO project must have
+# a service connection named `SymbolsPublishing-mssql-rs` (Workload Identity
+# Federation, modelled on the ADO.Net service connection of the same shape),
+# and the `mssql-rs` project namespace must be registered with the Microsoft
+# Symbols Publishing service. ADOOnly mode has no such prerequisite.
+################################################################################
+parameters:
+- name: SymbolServer
+  type: string
+  default: ADOOnly
+  values:
+  - ADOOnly
+  - Private
+  - Public
+- name: SymbolsFolder
+  type: string
+- name: SearchPattern
+  type: string
+  # PDB (Windows), .dwp DWARF package (Linux), .so (build-id carrier for Linux).
+  # .dSYM.tgz macOS bundles are excluded — dSYM indexing on ADO/MS symbol
+  # servers is not proven; macOS symbols are shipped as pipeline artifacts only.
+  default: |
+    **/*.pdb
+    **/*.dwp
+    **/libmssql_py_core*.so
+- name: SymbolsVersion
+  type: string
+- name: SymbolsProduct
+  type: string
+  default: mssql-py-core
+- name: ExpirationDays
+  type: number
+  default: 30
+
+steps:
+# ---------------------------------------------------------------------------
+# Step 1: Always publish to the SqlClientDrivers ADO org Artifacts symbol
+# server. Retrievable at:
+#   https://artifacts.dev.azure.com/sqlclientdrivers/_apis/symbol/symsrv
+# ---------------------------------------------------------------------------
+- task: PublishSymbols@2
+  displayName: 'Publish symbols to SqlClientDrivers ADO org (${{ parameters.SymbolServer }})'
+  inputs:
+    SymbolsFolder: ${{ parameters.SymbolsFolder }}
+    SearchPattern: ${{ parameters.SearchPattern }}
+    IndexSources: false
+    PublishSymbols: true
+    DetailedLog: true
+    SymbolServerType: TeamServices
+    SymbolsProduct: ${{ parameters.SymbolsProduct }}
+    SymbolsVersion: ${{ parameters.SymbolsVersion }}
+    SymbolsArtifactName: mssql_rs_${{ parameters.SymbolServer }}Symbols_${{ parameters.SymbolsVersion }}_$(System.TimelineId)
+    # Required for DWARF/ELF indexing (Linux .dwp + .so). Legacy client is
+    # Windows-PDB only.
+    UseNetCoreClientTool: true
+    IndexableFileFormats: All
+    Pat: $(System.AccessToken)
+  env:
+    ARTIFACTSERVICES_SYMBOL_ACCOUNTNAME: SqlClientDrivers
+
+# ---------------------------------------------------------------------------
+# Step 2: For Private/Public modes, ask the Microsoft Symbols Publishing
+# service to promote the just-uploaded symbol request to the corresponding
+# Microsoft symbol server.
+# ---------------------------------------------------------------------------
+- ${{ if ne(parameters.SymbolServer, 'ADOOnly') }}:
+  - task: AzureCLI@2
+    displayName: 'Promote to Microsoft ${{ parameters.SymbolServer }} symbol server'
+    inputs:
+      azureSubscription: SymbolsPublishing-mssql-rs
+      scriptType: 'pscore'
+      scriptLocation: 'inlineScript'
+      failOnStandardError: true
+      inlineScript: |
+        function Test-Completed([object] $publishingStatus)
+        {
+            if ($publishingStatus.publishToInternalServer) {
+                if( $publishingStatus.publishToInternalServerStatus -ne 3) {
+                    return $false
+                }
+            }
+            if ($publishingStatus.publishToPublicServer) {
+                if( $publishingStatus.publishToPublicServerStatus -ne 3) {
+                  return $false
+                }
+            }
+            return $true
+        }
+
+        function Test-Result([object] $publishingStatus)
+        {
+            $failed = $false
+            if ($publishingStatus.publishToInternalServer) {
+                if( $publishingStatus.publishToInternalServerResult -ne 1) {
+                    $failed = $true
+                    Write-Host $publishingStatus.publishToInternalServerFailureMessage
+                }
+            }
+            if ($publishingStatus.publishToPublicServer) {
+                if( $publishingStatus.publishToPublicServerResult -ne 1) {
+                    $failed = $true
+                    Write-Host $publishingStatus.publishToPublicServerFailureMessage
+                }
+            }
+            if ($failed) {
+                Write-Host "##[error]Publishing failed"
+                throw "Publishing failed"
+            } else {
+                Write-Host "Success"
+            }
+        }
+
+        $requestName = "mssql_rs_${{ parameters.SymbolServer }}Symbols_${{ parameters.SymbolsVersion }}_$(System.TimelineId)"
+        $expirationInDays = ${{ parameters.ExpirationDays }}
+        Write-Host "Request name: $requestName"
+
+        $symbolPublishingToken = az account get-access-token --resource api://30471ccf-0966-45b9-a979-065dbedb24c1 --query accessToken -o tsv
+
+        # Register the request name (ties the previously-uploaded symbol blobs
+        # to a named, optionally-expiring request).
+        if ($expirationInDays -gt 0) {
+            $expiration = (Get-Date).AddDays($expirationInDays).ToString("yyyy-MM-ddTHH:mm:ssZ")
+            $requestNameRegistrationBody = "{'requestName': '$requestName','expirationTime': '$expiration'}"
+            Write-Host "Expiration time: $expiration"
+        } else {
+            $requestNameRegistrationBody = "{'requestName': '$requestName'}"
+        }
+        Invoke-RestMethod -Method POST `
+            -Uri "https://symbolrequestprod.trafficmanager.net/projects/mssql-rs/requests" `
+            -Headers @{ Authorization = "Bearer $symbolPublishingToken" } `
+            -ContentType "application/json" `
+            -Body $requestNameRegistrationBody
+        Write-Host "Registration of request name succeeded."
+
+        if ("${{ parameters.SymbolServer }}" -eq "Public") {
+            $publishSymbolsBody = "{'publishToPublicServer': true}"
+        } else {
+            $publishSymbolsBody = "{'publishToInternalServer': true}"
+        }
+        Write-Host $publishSymbolsBody
+        Invoke-RestMethod -Method POST `
+            -Uri "https://symbolrequestprod.trafficmanager.net/projects/mssql-rs/requests/$requestName" `
+            -Headers @{ Authorization = "Bearer $symbolPublishingToken" } `
+            -ContentType "application/json" `
+            -Body $publishSymbolsBody
+        Write-Host "Publish request submitted."
+
+        Write-Host "Polling publishing status every 60s for 2 hours..."
+        $publishingStatusUrl = "https://symbolrequestprod.trafficmanager.net/projects/mssql-rs/requests/$requestName"
+        $publishingStatusHeaders = @{ Authorization = "Bearer $symbolPublishingToken" }
+
+        $timeLimit = (Get-Date).AddHours(2)
+        do {
+            Write-Host "Publishing in progress..."
+            Start-Sleep -Seconds 60
+            $publishingStatus = Invoke-RestMethod -Method GET -Uri $publishingStatusUrl `
+                -Headers $publishingStatusHeaders -ContentType "application/json"
+            $publishingStatus | ConvertTo-Json -Depth 4 | Write-Host
+            $completed = Test-Completed($publishingStatus)
+        } while (-not $completed -and (Get-Date) -lt $timeLimit)
+
+        Test-Result($publishingStatus)

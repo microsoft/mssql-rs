@@ -34,6 +34,16 @@ parameters:
   default: false
   displayName: 'Publish NuGet package to Azure Artifacts feed'
 
+- name: publishSymbolsToADO
+  type: boolean
+  default: false
+  displayName: 'Publish debug symbols to SqlClientDrivers ADO org symbol server'
+
+- name: symbolsExpirationDays
+  type: number
+  default: 30
+  displayName: 'Retention (days) for symbols published to the ADO org symbol server. 0 = never expire.'
+
 stages:
 #############################################################################
 # Build Stage - All platforms
@@ -386,3 +396,62 @@ stages:
           }
           Write-Host "OneBranch will auto-publish from $(ob_outputDirectory)/packages"
         displayName: 'Verify NuGet package'
+
+#############################################################################
+# PublishSymbols Stage - Publish per-target debug symbols to the
+# SqlClientDrivers ADO org Artifacts symbol server. Only enabled for
+# non-official builds; the Official flow ships symbols only as a pipeline
+# artifact and lets OfficialPythonWheelsRelease.yml publish them at
+# release time (mirroring the msodbcsql-Symbol-Server pipeline).
+#
+# Skipped on PR builds — fork PRs won't have a token with write scope
+# on the symbol store, and PR symbols aren't useful anyway.
+#############################################################################
+- ${{ if eq(parameters.publishSymbolsToADO, true) }}:
+  - stage: PublishSymbols
+    displayName: 'Publish Debug Symbols'
+    dependsOn: Build
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+    - job: PublishSymbolsJob
+      displayName: 'Publish symbols to SqlClientDrivers ADO org'
+      pool:
+        type: windows
+      variables:
+        ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+        ob_git_checkout: true  # need Cargo.toml for version extraction
+      steps:
+      - download: current
+        displayName: 'Download all build artifacts (wheels + symbols)'
+
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          $cargoToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/Cargo.toml" -Raw
+          if ($cargoToml -match 'version\s*=\s*"([^"]+)"') { $version = $Matches[1] }
+          else { Write-Error "Could not extract version from Cargo.toml"; exit 1 }
+          $dateStamp = Get-Date -Format "yyyyMMdd"
+          $symVersion = "$version-dev.$dateStamp.$(Build.BuildId)"
+          Write-Host "Symbols version: $symVersion"
+          Write-Host "##vso[task.setvariable variable=symbolsVersion]$symVersion"
+
+          # Consolidate all per-target `symbols/` folders from each drop into a
+          # single tree so PublishSymbols@2 can walk them in one pass.
+          $symRoot = "$(Build.StagingDirectory)/all-symbols"
+          New-Item -ItemType Directory -Force -Path $symRoot | Out-Null
+          $found = Get-ChildItem "$(Pipeline.Workspace)" -Recurse -Directory -Filter 'symbols' -ErrorAction SilentlyContinue
+          foreach ($d in $found) {
+            Copy-Item -Path (Join-Path $d.FullName '*') -Destination $symRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "--- Consolidated symbol payload ---"
+          Get-ChildItem $symRoot -Recurse -File | ForEach-Object {
+            Write-Host "  $($_.FullName.Replace($symRoot,''))  ($([math]::Round($_.Length/1KB,1)) KB)"
+          }
+        displayName: 'Consolidate symbol payload from per-target artifacts'
+
+      - template: /.pipeline/templates/publish-symbols.yml@self
+        parameters:
+          SymbolServer: ADOOnly
+          SymbolsFolder: '$(Build.StagingDirectory)/all-symbols'
+          SymbolsVersion: $(symbolsVersion)
+          ExpirationDays: ${{ parameters.symbolsExpirationDays }}
+

@@ -34,6 +34,21 @@ parameters:
     type: boolean
     default: false  # Safety: default to false
 
+  - name: publishSymbolsInternal
+    displayName: 'Publish debug symbols to Microsoft Internal Symbol Server (msdlinternal.microsoft.com)'
+    type: boolean
+    default: true
+
+  - name: publishSymbolsPublic
+    displayName: 'Publish debug symbols to Microsoft Public Symbol Server (msdl.microsoft.com). WARNING: Rust debug info currently contains source paths and private types; only enable after a public-symbol-stripping flow is in place.'
+    type: boolean
+    default: false
+
+  - name: symbolsExpirationDays
+    displayName: 'Retention (days) for release symbols. Default 0 = never expire (release symbols are permanent). Set >0 only for a time-boxed release candidate.'
+    type: number
+    default: 0
+
 variables:
   CDP_DEFINITION_BUILD_COUNT: $[counter('', 0)]
   LinuxContainerImage: 'mcr.microsoft.com/onebranch/azurelinux/build:3.0'
@@ -127,7 +142,18 @@ extends:
         - pwsh: |
             $ErrorActionPreference = 'Stop'
 
-            $cargoToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/Cargo.toml" -Raw
+            # Read version from the exact commit the Official Build ran against,
+            # not from whatever HEAD of stable happens to be. Prevents version
+            # drift between the wheels/symbols we're releasing and the Cargo.toml
+            # in this release run's checkout.
+            $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
+            Write-Host "Reading Cargo.toml at build source commit: $commitSha"
+            $cargoTomlAtCommit = git -C "$(Build.SourcesDirectory)" show "${commitSha}:mssql-py-core/Cargo.toml"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Could not read Cargo.toml at $commitSha; falling back to working-tree checkout."
+              $cargoTomlAtCommit = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/Cargo.toml" -Raw
+            }
+            $cargoToml = ($cargoTomlAtCommit -join "`n")
             if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
               $version = $Matches[1]
             } else {
@@ -137,25 +163,36 @@ extends:
 
             # Official release: clean semver, no prerelease suffix
             $packageVersion = $version
-            $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
             $shortSha = $commitSha.Substring(0, 8)
 
             Write-Host "Release version: $packageVersion"
             Write-Host "Source commit: $commitSha"
             Write-Host "Build run: $(resources.pipeline.officialBuild.runID)"
-            Write-Host "##vso[task.setvariable variable=releaseVersion]$packageVersion"
-            Write-Host "##vso[task.setvariable variable=sourceCommit]$commitSha"
+            Write-Host "##vso[task.setvariable variable=releaseVersion;isOutput=true]$packageVersion"
+            Write-Host "##vso[task.setvariable variable=sourceCommit;isOutput=true]$commitSha"
 
-            # Collect wheels
-            $wheelsDir = "$(Build.StagingDirectory)/wheels"
-            New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
+            # Cross-check that at least one wheel filename embeds the release
+            # version — protects against releasing a payload built from a
+            # different Cargo.toml version than the tag/nuget will claim.
             $wheels = Get-ChildItem "$(Pipeline.Workspace)/officialBuild" -Filter *.whl -Recurse
             if ($wheels.Count -eq 0) {
               Write-Error "No wheels found to package. Aborting."
               exit 1
             }
+            $versionRegex = [regex]::Escape($version)
+            $matching = $wheels | Where-Object { $_.Name -match "-$versionRegex-" -or $_.Name -match "-$versionRegex\+" }
+            if ($matching.Count -eq 0) {
+              Write-Warning "None of the $($wheels.Count) wheels have '$version' in their filename."
+              Write-Warning "Sample wheel names: $($wheels[0..([Math]::Min(3, $wheels.Count-1))].Name -join ', ')"
+              Write-Error "Version mismatch: aborting release to avoid mislabelled artifacts."
+              exit 1
+            }
+
+            # Collect wheels for nuspec
+            $wheelsDir = "$(Build.StagingDirectory)/wheels"
+            New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
             $wheels | Copy-Item -Destination $wheelsDir
-            Write-Host "Collected $($wheels.Count) wheels"
+            Write-Host "Collected $($wheels.Count) wheels (version check passed)"
 
             # Create .nuspec
             $nuspecContent = @"
@@ -176,6 +213,7 @@ extends:
             $nuspecPath = "$(Build.StagingDirectory)/mssql-py-core-wheels.nuspec"
             $nuspecContent | Out-File -FilePath $nuspecPath -Encoding utf8
             Write-Host "Created nuspec: $nuspecPath"
+          name: ReleaseVersion
           displayName: 'Prepare release NuGet package'
 
         - task: NuGetCommand@2
@@ -199,7 +237,125 @@ extends:
           displayName: 'Verify NuGet package'
 
     ###########################################################################
-    # Stage 2: Tag the source commit and create release branch
+    # Stage 2: Publish debug symbols
+    #
+    # Modelled on msodbcsql-Symbol-Server.yml. Downloads the per-target
+    # symbol payload the Official Build published under drop_Build_*/symbols/
+    # and hands it to the reusable publish-symbols.yml template.
+    #
+    # InternalSymbolServer stage always runs (Microsoft Internal Symbol Server).
+    # PublicSymbolServer stage is gated by publishSymbolsPublic (default false)
+    # and forces ExpirationDays=0 (public symbols cannot expire).
+    ###########################################################################
+    - ${{ if or(eq(parameters.publishSymbolsInternal, true), eq(parameters.publishSymbolsPublic, true)) }}:
+      - stage: GetSymbolsVersion
+        displayName: 'Resolve Release Version'
+        dependsOn: Release
+        jobs:
+        - job: ResolveVersion
+          displayName: 'Resolve version from build source commit'
+          pool:
+            type: windows
+          variables:
+            ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+          steps:
+          - checkout: self
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
+              Write-Host "Reading Cargo.toml at build source commit: $commitSha"
+              $cargoTomlAtCommit = git -C "$(Build.SourcesDirectory)" show "${commitSha}:mssql-py-core/Cargo.toml"
+              if ($LASTEXITCODE -ne 0) {
+                $cargoTomlAtCommit = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/Cargo.toml" -Raw
+              }
+              $cargoToml = ($cargoTomlAtCommit -join "`n")
+              if ($cargoToml -match 'version\s*=\s*"([^"]+)"') { $version = $Matches[1] }
+              else { Write-Error "Could not extract version from Cargo.toml"; exit 1 }
+              Write-Host "Release version: $version"
+              Write-Host "##vso[task.setvariable variable=releaseVersion;isOutput=true]$version"
+            name: v
+            displayName: 'Read release version'
+
+    - ${{ if eq(parameters.publishSymbolsInternal, true) }}:
+      - stage: InternalSymbolServer
+        displayName: 'Publish Symbols → Microsoft Internal'
+        dependsOn: GetSymbolsVersion
+        jobs:
+        - job: InternalSymbols
+          displayName: 'Publish to Microsoft Internal Symbol Server'
+          pool:
+            type: windows
+          variables:
+            ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+            ob_git_checkout: false
+            releaseVersion: $[ stageDependencies.GetSymbolsVersion.ResolveVersion.outputs['v.releaseVersion'] ]
+          steps:
+          - download: officialBuild
+            displayName: 'Download build artifacts (wheels + symbols)'
+
+          - pwsh: |
+              $symRoot = "$(Build.StagingDirectory)/all-symbols"
+              New-Item -ItemType Directory -Force -Path $symRoot | Out-Null
+              $found = Get-ChildItem "$(Pipeline.Workspace)/officialBuild" -Recurse -Directory -Filter 'symbols' -ErrorAction SilentlyContinue
+              foreach ($d in $found) {
+                Copy-Item -Path (Join-Path $d.FullName '*') -Destination $symRoot -Recurse -Force -ErrorAction SilentlyContinue
+              }
+              Write-Host "--- Consolidated symbol payload for release $(releaseVersion) ---"
+              Get-ChildItem $symRoot -Recurse -File | ForEach-Object {
+                Write-Host "  $($_.FullName.Replace($symRoot,''))  ($([math]::Round($_.Length/1KB,1)) KB)"
+              }
+            displayName: 'Consolidate symbols'
+
+          - template: /.pipeline/templates/publish-symbols.yml@self
+            parameters:
+              SymbolServer: Private
+              SymbolsFolder: '$(Build.StagingDirectory)/all-symbols'
+              SymbolsVersion: $(releaseVersion)
+              # When Public will also be published in this run, the ODBC playbook
+              # forces expiration = 0 (public symbols are permanent).
+              ExpirationDays: ${{ iif(parameters.publishSymbolsPublic, 0, parameters.symbolsExpirationDays) }}
+
+    - ${{ if eq(parameters.publishSymbolsPublic, true) }}:
+      - stage: PublicSymbolServer
+        displayName: 'Publish Symbols → Microsoft Public'
+        dependsOn: GetSymbolsVersion
+        jobs:
+        - job: PublicSymbols
+          displayName: 'Publish to Microsoft Public Symbol Server (msdl.microsoft.com)'
+          pool:
+            type: windows
+          variables:
+            ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+            ob_git_checkout: false
+            releaseVersion: $[ stageDependencies.GetSymbolsVersion.ResolveVersion.outputs['v.releaseVersion'] ]
+          steps:
+          - pwsh: |
+              Write-Host "##[warning]Publishing to Microsoft Public Symbol Server."
+              Write-Host "##[warning]Rust debug info includes source paths and private types."
+              Write-Host "##[warning]Confirm a public-symbol-stripping flow is in place before proceeding."
+            displayName: 'Public symbols warning'
+
+          - download: officialBuild
+            displayName: 'Download build artifacts (wheels + symbols)'
+
+          - pwsh: |
+              $symRoot = "$(Build.StagingDirectory)/all-symbols"
+              New-Item -ItemType Directory -Force -Path $symRoot | Out-Null
+              $found = Get-ChildItem "$(Pipeline.Workspace)/officialBuild" -Recurse -Directory -Filter 'symbols' -ErrorAction SilentlyContinue
+              foreach ($d in $found) {
+                Copy-Item -Path (Join-Path $d.FullName '*') -Destination $symRoot -Recurse -Force -ErrorAction SilentlyContinue
+              }
+            displayName: 'Consolidate symbols'
+
+          - template: /.pipeline/templates/publish-symbols.yml@self
+            parameters:
+              SymbolServer: Public
+              SymbolsFolder: '$(Build.StagingDirectory)/all-symbols'
+              SymbolsVersion: $(releaseVersion)
+              ExpirationDays: 0  # Public server: permanent
+
+    ###########################################################################
+    # Stage 3: Tag the source commit and create release branch
     ###########################################################################
     - ${{ if eq(parameters.tagRelease, true) }}:
       - stage: Tag

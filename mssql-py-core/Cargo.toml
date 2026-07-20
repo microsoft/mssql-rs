@@ -26,3 +26,22 @@ uuid = "1.19"
 
 [build-dependencies]
 pyo3-build-config = "0.29.0"
+
+# Release profile: emit split debug info so shipped binaries stay small
+# while a separate .pdb / .dwp / .dSYM is available for symbolication of
+# customer crash dumps. See work item 45990.
+#
+# - debug = "full": full DWARF / PDB info generated
+# - split-debuginfo = "packed": on Linux emits a build-id-linked .dwp next
+#   to the .so; on macOS produces a .dSYM bundle; ignored on Windows-MSVC
+#   which always emits a separate .pdb.
+# - strip = "debuginfo": strips DWARF from the shipped .so but keeps the
+#   symbol table + GNU build-id so the debug-info file can be located.
+#   NOTE: intentionally NOT "symbols" — that would drop .symtab and break
+#   symbol lookup by name for Linux minidumps.
+# - lto = true: mirrors the workspace release profile.
+[profile.release]
+lto = true
+debug = "full"
+split-debuginfo = "packed"
+strip = "debuginfo"
