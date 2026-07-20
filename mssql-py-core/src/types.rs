@@ -658,10 +658,13 @@ fn validate_type_compatibility(
             | SqlDbType::NText,
         ) => true,
 
-        // Binary (including legacy IMAGE type)
-        (ColumnValues::Bytes(_), SqlDbType::VarBinary | SqlDbType::Binary | SqlDbType::Image) => {
-            true
-        }
+        // Binary (including legacy IMAGE type). UDT is included because a CLR
+        // UDT is bulk-copied as its varbinary(max) serialized form (GH-667), so
+        // a Python bytes/bytearray value binds to a UDT column as Bytes.
+        (
+            ColumnValues::Bytes(_),
+            SqlDbType::VarBinary | SqlDbType::Binary | SqlDbType::Image | SqlDbType::Udt,
+        ) => true,
 
         // Boolean
         (ColumnValues::Bit(_), SqlDbType::Bit) => true,
@@ -823,5 +826,23 @@ mod tests {
         let (h, m, s, us) = ticks_to_time_components(ticks);
         assert_eq!((h, m, s), (16, 33, 33));
         assert_eq!(us, 123_333);
+    }
+
+    #[test]
+    fn validate_bytes_accepted_for_udt_column() {
+        // GH-667: a CLR UDT column is bulk-copied as its varbinary(max)
+        // serialized form, so a Python bytes value (ColumnValues::Bytes) must
+        // validate against a UDT target, not only VarBinary/Binary/Image.
+        let udt = BulkCopyColumnMetadata::new("g", SqlDbType::Udt, 0xA5);
+        let bytes = ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(validate_type_compatibility(&bytes, &udt).is_ok());
+
+        // Still accepted for varbinary, and NULL remains valid for a UDT column.
+        let varbinary = BulkCopyColumnMetadata::new("b", SqlDbType::VarBinary, 0xA5);
+        assert!(validate_type_compatibility(&bytes, &varbinary).is_ok());
+        assert!(validate_type_compatibility(&ColumnValues::Null, &udt).is_ok());
+
+        // A non-bytes value into a UDT column is still a mismatch.
+        assert!(validate_type_compatibility(&ColumnValues::Int(1), &udt).is_err());
     }
 }
