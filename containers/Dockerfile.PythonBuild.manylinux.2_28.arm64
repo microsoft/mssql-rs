@@ -5,7 +5,7 @@
 #
 # manylinux_2_28 is based on AlmaLinux 8 (glibc 2.28, OpenSSL 1.1.x). Building
 # here links the driver against libssl.so.1.1, so it loads on RHEL 8 / UBI 8 -
-# where the modern glibc 2.35 / OpenSSL 3 build images would not.
+# where the modern glibc 2.34 / OpenSSL 3 build images would not.
 #
 # Base image is synced from quay.io/pypa to ACR via sync-container-images.yml.
 
