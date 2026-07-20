@@ -50,6 +50,7 @@ use crate::connection::tds_client::TdsClient;
 use crate::core::TdsResult;
 use crate::datatypes::bulk_copy_metadata::{BulkCopyColumnMetadata, SqlDbType};
 use crate::error::Error;
+use crate::error::SqlInfoMessage;
 use crate::error::bulk_copy_errors::{
     BulkCopyAttentionTimeoutError, BulkCopyError, BulkCopyTimeoutError,
 };
@@ -105,6 +106,32 @@ pub struct BulkCopyOptions {
     /// Number of rows to process before calling the progress callback.
     /// Default: 0 (no progress notifications)
     pub notification_interval: usize,
+
+    /// Write already-encrypted (ciphertext) values into Always Encrypted
+    /// columns verbatim, without the driver encrypting them. Default: false.
+    ///
+    /// This is the counterpart to .NET
+    /// `SqlBulkCopyOptions.AllowEncryptedValueModifications`. When `true`, a
+    /// value targeting an encrypted destination column is sent as-is (it must
+    /// already be varbinary ciphertext) instead of being normalized and
+    /// encrypted with the column's key, so the plaintext CEK is not required.
+    ///
+    /// # Precondition
+    ///
+    /// This option only takes effect when Always Encrypted is enabled on the
+    /// connection (Column Encryption Setting = Enabled and the server
+    /// acknowledged the feature) and the destination has encrypted columns. When
+    /// column encryption is not enabled, the option is ignored and values follow
+    /// the normal plaintext path.
+    ///
+    /// # Security
+    ///
+    /// The server does not validate that the supplied ciphertext matches the
+    /// destination column's encryption configuration. Only enable this to move
+    /// ciphertext between columns encrypted with the same key, algorithm, and
+    /// encryption type; otherwise the destination will hold values that cannot
+    /// be decrypted. The same caveats as the .NET option apply.
+    pub allow_encrypted_value_modifications: bool,
 }
 
 impl Default for BulkCopyOptions {
@@ -119,6 +146,7 @@ impl Default for BulkCopyOptions {
             table_lock: false,
             use_internal_transaction: false, // Matches .NET SqlBulkCopy default
             notification_interval: 0,
+            allow_encrypted_value_modifications: false,
         }
     }
 }
@@ -472,6 +500,26 @@ impl<'a> BulkCopy<'a> {
     /// ```
     pub fn keep_nulls(mut self, enabled: bool) -> Self {
         self.options.keep_nulls = enabled;
+        self
+    }
+
+    /// Write already-encrypted (ciphertext) values into Always Encrypted
+    /// columns without the driver re-encrypting them.
+    ///
+    /// Default: false. This option only takes effect when Always Encrypted is
+    /// enabled on the connection and the destination has encrypted columns;
+    /// otherwise it is ignored. See
+    /// [`BulkCopyOptions::allow_encrypted_value_modifications`] for the security
+    /// caveats — only use this to move ciphertext between columns that share the
+    /// same column encryption key, algorithm, and encryption type.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// bulk_copy.allow_encrypted_value_modifications(true);
+    /// ```
+    pub fn allow_encrypted_value_modifications(mut self, enabled: bool) -> Self {
+        self.options.allow_encrypted_value_modifications = enabled;
         self
     }
 
@@ -945,6 +993,14 @@ impl<'a> BulkCopy<'a> {
         // Capture use_internal_transaction flag at start (matches .NET _savedBatchSize pattern)
         let use_internal_transaction = self.options.use_internal_transaction;
 
+        // Accumulate INFO messages across all batches so the whole bulk copy operation's
+        // diagnostics are retrievable via `client.info_messages()` after it returns.
+        // Each `execute_bulk_load_streaming_zerocopy` call resets the client's buffer via
+        // `begin_command`, and the internal `commit_transaction` (when enabled) would clear
+        // it as well, so we drain each batch's INFO before commit and restore the full set
+        // once the loop completes.
+        let mut accumulated_info: Vec<SqlInfoMessage> = Vec::new();
+
         loop {
             if rows.peek().is_none() {
                 break;
@@ -1021,17 +1077,36 @@ impl<'a> BulkCopy<'a> {
             // Handle batch result with transaction management
             match batch_result {
                 Ok(batch_count) => {
+                    // Drain this batch's INFO messages before the internal commit (which
+                    // resets the client's buffer) can clear them.
+                    accumulated_info.extend(self.client.take_info_messages());
+
                     // ═══════════════════════════════════════════════════════════
                     // COMMIT TRANSACTION: Commit on successful batch completion
                     // This mirrors .NET SqlBulkCopy.CommitTransaction() behavior
                     // ═══════════════════════════════════════════════════════════
-                    if use_internal_transaction {
-                        self.client.commit_transaction(None, None).await?;
+                    if use_internal_transaction
+                        && let Err(e) = self.client.commit_transaction(None, None).await
+                    {
+                        // The commit itself failed. Restore the INFO accumulated up to
+                        // and including this batch before propagating the error, so it
+                        // stays retrievable via `client.info_messages()` — consistent
+                        // with the Err(e) arm below. Drop any residual INFO left by the
+                        // failed commit first.
+                        let _ = self.client.take_info_messages();
+                        self.client
+                            .extend_info_messages(std::mem::take(&mut accumulated_info));
+                        return Err(e);
                     }
 
                     *total_rows += batch_count;
                 }
                 Err(e) => {
+                    // Capture this failing batch's INFO before rollback (which resets
+                    // the client's buffer via begin_command) can clear it, so it is
+                    // retained alongside the already-accumulated prior batches' INFO.
+                    accumulated_info.extend(self.client.take_info_messages());
+
                     // ═══════════════════════════════════════════════════════════
                     // ROLLBACK TRANSACTION: Rollback on batch failure
                     // This mirrors .NET SqlBulkCopy.AbortTransaction() behavior
@@ -1041,6 +1116,18 @@ impl<'a> BulkCopy<'a> {
                         // Attempt rollback, but don't mask the original error
                         let _ = self.client.rollback_transaction(None, None).await;
                     }
+
+                    // Restore the INFO accumulated up to the failure so a mid-stream
+                    // failure still leaves the completed batches' diagnostics (plus this
+                    // batch's INFO emitted before the error) retrievable via
+                    // `client.info_messages()`. The returned error carries the failure
+                    // itself; INFO is a separate, complementary channel (INFO tokens vs
+                    // ERROR tokens) and this mirrors .NET's InfoMessage events having
+                    // already fired for the batches that completed. Drop any residual
+                    // INFO left by the rollback first.
+                    let _ = self.client.take_info_messages();
+                    self.client
+                        .extend_info_messages(std::mem::take(&mut accumulated_info));
 
                     return Err(e);
                 }
@@ -1066,6 +1153,12 @@ impl<'a> BulkCopy<'a> {
                 });
             }
         }
+
+        // Restore the INFO messages accumulated across all batches so the caller can read
+        // the full bulk copy diagnostics via `client.info_messages()`. Drop any residual
+        // buffer left by the final internal commit first, so only bulk-load INFO remains.
+        let _ = self.client.take_info_messages();
+        self.client.extend_info_messages(accumulated_info);
 
         Ok(())
     }

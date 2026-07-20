@@ -234,6 +234,19 @@ mod unittests {
     }
 
     #[test]
+    fn test_get_work_flow_identifier_managed_identity() {
+        // #46177: managed identity uses the interactive workflow byte (0x03), matching
+        // .NET SqlClient. The activedirectorymsi keyword is mapped to this method by the
+        // ODBC binding, so mssql-tds only ever sees ActiveDirectoryManagedIdentity here.
+        let managed = FedAuthFeature::new(
+            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity,
+            None,
+            false,
+        );
+        assert_eq!(managed.get_work_flow_identifier().unwrap(), 0x03);
+    }
+
+    #[test]
     fn test_feature_identifier() {
         let feature = FedAuthFeature::new(
             TdsAuthenticationMethod::ActiveDirectoryPassword,

@@ -8,7 +8,8 @@ use tracing::{debug, error};
 use super::sqlstate::*;
 use super::util::read_utf16;
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn,
+    SqlSmallInt, SqlWChar,
 };
 use crate::error::free_errors;
 use crate::handles::dbc::ConnectionState;
@@ -152,12 +153,14 @@ fn sql_exec_direct_w_safe(
     // Execute the SQL batch. Neither DBC nor STMT lock is held during I/O.
     if let Err(e) = dbc.runtime.block_on(client.execute(sql, None, None)) {
         error!(%e, "SQLExecDirectW: execution failed");
+        let info_messages = client.take_info_messages();
         if let Ok(mut ds) = dbc.inner.lock() {
             ds.client = Some(client);
             ds.active_stmt = None;
         }
         if let Ok(mut ss) = stmt.inner.lock() {
             post_tds_error(&mut ss, &e, SQLSTATE_HY000);
+            post_tds_info_messages(&mut ss, &info_messages);
         }
         clear_exec_started(stmt);
         return SQL_ERROR;
@@ -174,12 +177,14 @@ fn sql_exec_direct_w_safe(
         // No cursor is opened — the app can re-execute immediately without SQLCloseCursor.
         if let Err(e) = dbc.runtime.block_on(client.close_query()) {
             error!(%e, "SQLExecDirectW: failed to drain after DDL/DML");
+            let info_messages = client.take_info_messages();
             if let Ok(mut ds) = dbc.inner.lock() {
                 ds.client = Some(client);
                 ds.active_stmt = None;
             }
             if let Ok(mut ss) = stmt.inner.lock() {
                 post_tds_error(&mut ss, &e, SQLSTATE_HY000);
+                post_tds_info_messages(&mut ss, &info_messages);
             }
             clear_exec_started(stmt);
             return SQL_ERROR;
@@ -196,13 +201,19 @@ fn sql_exec_direct_w_safe(
         stmt_state.column_metadata = metadata; // empty vec
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
+        let info_messages = client.take_info_messages();
+        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
         drop(stmt_state);
         if let Ok(mut ds) = dbc.inner.lock() {
             ds.client = Some(client);
             ds.active_stmt = None;
         }
         debug!("SQLExecDirectW: DDL/DML complete");
-        return SQL_SUCCESS;
+        return if has_server_info {
+            SQL_SUCCESS_WITH_INFO
+        } else {
+            SQL_SUCCESS
+        };
     }
 
     // Result-bearing query: leave the result set open for SQLFetch.
@@ -219,6 +230,8 @@ fn sql_exec_direct_w_safe(
     stmt_state.column_metadata = metadata;
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+    let info_messages = client.take_info_messages();
+    let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
     drop(stmt_state);
 
     // Return client to DBC. active_stmt is already set from the claim above.
@@ -231,7 +244,11 @@ fn sql_exec_direct_w_safe(
     drop(dbc_state);
 
     debug!("SQLExecDirectW: execution complete");
-    SQL_SUCCESS
+    if has_server_info {
+        SQL_SUCCESS_WITH_INFO
+    } else {
+        SQL_SUCCESS
+    }
 }
 
 fn clear_exec_started(stmt: &StmtHandle) {

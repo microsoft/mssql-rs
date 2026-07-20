@@ -25,6 +25,28 @@ std::string ODBCTestUtils::GetDiagState(SQLSMALLINT handleType,
     return "";
 }
 
+bool ODBCTestUtils::HasDiagState(SQLSMALLINT handleType, SQLHANDLE handle,
+                                 const std::string& target) {
+    SQLTCHAR state[8] = {};
+    SQLINTEGER nativeErr = 0;
+    SQLTCHAR msg[512] = {};
+    SQLSMALLINT msgLen = 0;
+
+    for (SQLSMALLINT recNum = 1; ; recNum++) {
+        SQLRETURN rc = SQLGetDiagRec(handleType, handle, recNum, state, &nativeErr,
+                                     msg,
+                                     static_cast<SQLSMALLINT>(sizeof(msg) / sizeof(SQLTCHAR)),
+                                     &msgLen);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+            break;
+        }
+        if (ToNarrow(SqlTString(state)) == target) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string ODBCTestUtils::GetDiagMessage(SQLSMALLINT handleType,
                                           SQLHANDLE handle) {
     SQLTCHAR state[8] = {};

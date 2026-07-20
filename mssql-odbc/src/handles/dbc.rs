@@ -48,7 +48,6 @@ unsafe impl Send for DbcHandle {}
 unsafe impl Sync for DbcHandle {}
 
 /// Mutable state within a connection handle, protected by `inner`.
-#[derive(Debug)]
 pub(crate) struct DbcState {
     pub(crate) diag_records: Vec<DiagRecord>,
     pub(crate) connection_state: ConnectionState,
@@ -61,6 +60,27 @@ pub(crate) struct DbcState {
     pub(crate) active_stmt: Option<*mut c_void>,
     /// Active TDS connection, present only when `connection_state == Connected`.
     pub(crate) client: Option<TdsClient>,
+    /// Pre-connect access token set via `SQL_COPT_SS_ACCESS_TOKEN`.
+    /// Consumed by `SQLDriverConnect` to select `AccessToken` authentication.
+    pub(crate) access_token: Option<String>,
+}
+
+// Manual `Debug` so the bearer access token is never rendered in logs or panic
+// messages; presence is shown, the value is redacted (mirrors `ConnectionParams`).
+impl std::fmt::Debug for DbcState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbcState")
+            .field("diag_records", &self.diag_records)
+            .field("connection_state", &self.connection_state)
+            .field("statements", &self.statements)
+            .field("active_stmt", &self.active_stmt)
+            .field("client", &self.client)
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<REDACTED>"),
+            )
+            .finish()
+    }
 }
 
 impl HasDiagnostics for DbcState {
@@ -84,6 +104,7 @@ impl DbcHandle {
                 statements: Vec::new(),
                 active_stmt: None,
                 client: None,
+                access_token: None,
             }),
         }
     }

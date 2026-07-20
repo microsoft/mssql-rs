@@ -11,8 +11,8 @@ use crate::api::odbc_types::{
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE, ERR_INVALID_NULL_POINTER,
-    ERR_STRING_RIGHT_TRUNCATION, SQLSTATE_08001, SQLSTATE_HY024, SQLSTATE_HY110, post_diag,
-    post_tds_error,
+    ERR_STRING_RIGHT_TRUNCATION, SQLSTATE_08001, SQLSTATE_HY024, SQLSTATE_HY110, SQLSTATE_HYC00,
+    post_diag, post_tds_error, post_tds_info_messages,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
@@ -20,11 +20,14 @@ use crate::handles::DbcHandle;
 use crate::handles::dbc::{ConnectionState, DbcState};
 use crate::handles::{HandleType, handle_from_raw};
 
-use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
+use mssql_tds::connection::client_context::ClientContext;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
 
 use super::util::read_utf16;
+use crate::auth::configure_auth;
+use crate::connection::odbc_authentication_transformer::transform_auth;
+use crate::connection::odbc_authentication_validator::validate_auth;
 use crate::connection::parse_connection_string;
 
 /// Implementation of `SQLDriverConnectW`.
@@ -218,12 +221,51 @@ fn do_connect(
         return SQL_ERROR;
     }
 
-    // Build ClientContext
+    // Resolve authentication. Validate the ODBC keyword/credential combination,
+    // then transform it into a concrete method with cleaned credentials. Any
+    // access token was supplied before connect via SQL_COPT_SS_ACCESS_TOKEN.
+    if let Err(e) = validate_auth(
+        params.authentication.as_deref(),
+        params.trusted_connection,
+        &params.uid,
+        &params.pwd,
+        state.access_token.as_deref(),
+    ) {
+        error!(%e, "SQLDriverConnectW: authentication validation failed");
+        post_sql_error(state, SQLSTATE_HY024, 0, e.to_string());
+        return SQL_ERROR;
+    }
+    let resolved = transform_auth(
+        params.authentication.as_deref(),
+        params.trusted_connection,
+        &params.uid,
+        &params.pwd,
+        state.access_token.as_deref(),
+    );
+
+    // Build ClientContext. T1 wired SQL password, integrated (SSPI/GSSAPI), and
+    // pre-acquired access tokens; T2 adds Entra service principal (secret) and
+    // managed identity via an Azure-SDK token factory. Methods that still need
+    // token acquisition (AD password, interactive, device code, workload
+    // identity, default credential, AD integrated) are rejected with HYC00
+    // until a later tier.
     let mut context = ClientContext::default();
-    context.user_name = params.uid.clone();
-    context.password = params.pwd.clone();
     context.database = params.database.clone();
-    context.tds_authentication_method = TdsAuthenticationMethod::Password;
+
+    if let Err(method) = configure_auth(&mut context, resolved) {
+        error!(
+            ?method,
+            "SQLDriverConnectW: authentication method not implemented"
+        );
+        post_sql_error(
+            state,
+            SQLSTATE_HYC00,
+            0,
+            format!("Authentication method {method:?} is not yet supported"),
+        );
+        return SQL_ERROR;
+    }
+
     context.encryption_options = EncryptionOptions {
         trust_server_certificate: params.trust_server_certificate,
         mode: match params.encrypt.as_deref() {
@@ -246,7 +288,7 @@ fn do_connect(
         .runtime
         .block_on(provider.create_client(context, &params.server, None));
 
-    let client = match client {
+    let mut client = match client {
         Ok(c) => c,
         Err(e) => {
             error!(%e, "SQLDriverConnectW: connection failed");
@@ -254,6 +296,7 @@ fn do_connect(
             return SQL_ERROR;
         }
     };
+    let info_messages = client.take_info_messages();
 
     // Write output connection string
     // TODO: build completed output connection string from resolved attributes and negotiated
@@ -269,13 +312,13 @@ fn do_connect(
     truncated |=
         unsafe { copy_with_nul(out_connection_string, buffer_length as usize, &out_utf16) };
 
+    let has_server_info = post_tds_info_messages(state, &info_messages);
+
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
-    // TODO: This print is for demo purposes only. Remove before release.
-    println!("**** Connected via mssql-odbc Driver ****");
     debug!("SQLDriverConnectW: connected successfully");
 
-    if has_warnings || truncated {
+    if has_warnings || truncated || has_server_info {
         if has_warnings {
             post_diag(state, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE);
         }
@@ -392,6 +435,60 @@ mod tests {
         };
         assert_eq!(ret, SQL_ERROR);
         assert_eq!(unsafe { diag_sqlstate(dbc, 1) }, "HY009");
+    }
+
+    #[test]
+    fn interactive_method_not_implemented_returns_hyc00() {
+        // ActiveDirectoryInteractive is recognized but not yet implemented (T3);
+        // the gate must reject it with HYC00 before any network activity.
+        // (T2 now implements ServicePrincipal and ManagedIdentity, so those no
+        // longer hit this gate.)
+        let h = TestHandles::with_env_dbc();
+        let dbc = h.dbc;
+        let conn_str: Vec<u16> = cs("Server=s;Authentication=ActiveDirectoryInteractive")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe {
+            sql_driver_connect_w(
+                dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(unsafe { diag_sqlstate(dbc, 1) }, "HYC00");
+    }
+
+    #[test]
+    fn authentication_with_trusted_connection_conflicts() {
+        // Authentication and Trusted_Connection are mutually exclusive; the
+        // validator must reject the combination (HY024) before connecting.
+        let h = TestHandles::with_env_dbc();
+        let dbc = h.dbc;
+        let conn_str: Vec<u16> = cs("Server=s;Authentication=SqlPassword;Trusted_Connection=yes")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe {
+            sql_driver_connect_w(
+                dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(unsafe { diag_sqlstate(dbc, 1) }, "HY024");
     }
 
     #[test]

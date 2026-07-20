@@ -15,6 +15,7 @@ mod more_results;
 mod num_result_cols;
 pub(crate) mod odbc_types;
 mod prepare;
+pub(crate) mod set_connect_attr;
 pub(crate) mod set_env_attr;
 pub(crate) mod sqlstate;
 pub(crate) mod util;

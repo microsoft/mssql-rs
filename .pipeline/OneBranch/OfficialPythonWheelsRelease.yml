@@ -171,14 +171,21 @@ extends:
             Write-Host "##vso[task.setvariable variable=releaseVersion;isOutput=true]$packageVersion"
             Write-Host "##vso[task.setvariable variable=sourceCommit;isOutput=true]$commitSha"
 
-            # Cross-check that at least one wheel filename embeds the release
-            # version — protects against releasing a payload built from a
-            # different Cargo.toml version than the tag/nuget will claim.
-            $wheels = Get-ChildItem "$(Pipeline.Workspace)/officialBuild" -Filter *.whl -Recurse
+            # Collect wheels — filter to the `wheels/` subfolder so any
+            # sibling directories in the drop (e.g. `symbols/`) don't get
+            # scooped up if they happen to contain a .whl.
+            $wheelsDir = "$(Build.StagingDirectory)/wheels"
+            New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
+            $wheels = Get-ChildItem "$(Pipeline.Workspace)/officialBuild" -Filter *.whl -Recurse |
+              Where-Object { $_.FullName -match '[\\/]+wheels[\\/][^\\/]+\.whl$' }
             if ($wheels.Count -eq 0) {
               Write-Error "No wheels found to package. Aborting."
               exit 1
             }
+
+            # Cross-check that at least one wheel filename embeds the release
+            # version — protects against releasing a payload built from a
+            # different Cargo.toml version than the tag/nuget will claim.
             $versionRegex = [regex]::Escape($version)
             $matching = $wheels | Where-Object { $_.Name -match "-$versionRegex-" -or $_.Name -match "-$versionRegex\+" }
             if ($matching.Count -eq 0) {
@@ -188,10 +195,7 @@ extends:
               exit 1
             }
 
-            # Collect wheels for nuspec
-            $wheelsDir = "$(Build.StagingDirectory)/wheels"
-            New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
-            $wheels | Copy-Item -Destination $wheelsDir
+            $wheels | Copy-Item -Destination $wheelsDir -Force
             Write-Host "Collected $($wheels.Count) wheels (version check passed)"
 
             # Create .nuspec

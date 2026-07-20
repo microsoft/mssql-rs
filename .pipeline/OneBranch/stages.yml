@@ -62,9 +62,14 @@ stages:
       demands:
         - imageOverride -equals RUST-Win22-Sql25-1P
     variables:
-      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-      ob_artifactSuffix: '_windows_x64'
-      CARGO_TARGET_DIR: C:\cargo_target_dir
+    - ${{ if eq(parameters.isOfficial, true) }}:
+      - group: 'ESRP Federated Creds (AME)'
+    - name: ob_outputDirectory
+      value: '$(Build.ArtifactStagingDirectory)'
+    - name: ob_artifactSuffix
+      value: '_windows_x64'
+    - name: CARGO_TARGET_DIR
+      value: C:\cargo_target_dir
     steps:
     - template: /.pipeline/templates/cargo-authenticate-template.yml
       parameters:
@@ -81,6 +86,7 @@ stages:
           osType: Windows
           architecture: x64
           publishArtifacts: false
+          signWindowsWheels: ${{ parameters.isOfficial }}
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Windows x64 Artifacts'
       inputs:
@@ -101,9 +107,14 @@ stages:
         demands:
           - imageOverride -equals RUST-WINSRV-ARM
       variables:
-        ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-        ob_artifactSuffix: '_windows_arm64'
-        CARGO_TARGET_DIR: C:\cargo_target_dir
+      - ${{ if eq(parameters.isOfficial, true) }}:
+        - group: 'ESRP Federated Creds (AME)'
+      - name: ob_outputDirectory
+        value: '$(Build.ArtifactStagingDirectory)'
+      - name: ob_artifactSuffix
+        value: '_windows_arm64'
+      - name: CARGO_TARGET_DIR
+        value: C:\cargo_target_dir
       steps:
       # Node.js workaround for ARM64 ADO tasks
       - pwsh: ./scripts/setup-nodejs-path.ps1
@@ -125,6 +136,7 @@ stages:
             osType: Windows
             architecture: arm64
             publishArtifacts: false
+            signWindowsWheels: ${{ parameters.isOfficial }}
             # Python 3.10 excluded - limited ARM64 support
             pythonVersions:
             - '3.11'
