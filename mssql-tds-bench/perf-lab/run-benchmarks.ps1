@@ -429,47 +429,63 @@ $thr = [double]($env:BENCH_REGRESSION_RATIO)
 if (-not $thr) { $thr = 1.10 }
 $regressions = @(Get-CritcmpRegressions $comparison $thr)
 
-# --- Auto-confirm regressions (re-measure only the offenders, interleaved) ---
-# A strict gate can trip on a transient single-benchmark outlier. Re-measure ONLY
-# the benchmarks that tripped - interleaved per binary, same as the main run - and
-# keep as a real regression only those that trip AGAIN. Both binaries are already
-# built, so this just replays the offenders (adds only their run time).
-$gateComparison = $comparison
-$gateRegressions = $regressions
-$confirmComparison = $null
+# --- Auto-confirm regressions: re-measure the offenders N times, require a
+# --- majority to confirm ---
+# A strict gate can trip on a transient single-benchmark outlier - short,
+# CPU-bound benches (e.g. the decode microbenches) can swing double digits on a
+# shared VM. So re-measure ONLY the benchmarks that tripped - interleaved per
+# binary, same as the main run - several times, and keep as a real regression
+# only those that trip in a MAJORITY of the re-runs. A true regression reproduces
+# consistently; noise does not. Both bench binaries are already built and the
+# offenders are a small subset, so the extra re-runs stay cheap.
+#   BENCH_CONFIRM_RUNS   (default 4)                - number of re-runs
+#   BENCH_CONFIRM_QUORUM (default majority = N/2+1)  - re-runs required to confirm
+$confirmRuns = if ($env:BENCH_CONFIRM_RUNS) { [int]$env:BENCH_CONFIRM_RUNS } else { 4 }
+$quorum = if ($env:BENCH_CONFIRM_QUORUM) { [int]$env:BENCH_CONFIRM_QUORUM } else { [int][math]::Floor($confirmRuns / 2) + 1 }
+$confirmed = @()
+$confirmRunComparisons = @()
+$tally = @{}
+$worstRatio = @{}
 if ($regressions.Count -gt 0) {
     $filter = (($regressions | ForEach-Object { '^' + $_.Name + '$' }) -join '|')
     Write-Host (">>> Gate tripped by: " + (($regressions | ForEach-Object { $_.Name }) -join ', '))
-    Write-Host ">>> Auto-confirm: re-measuring only those benchmarks (filter: $filter)"
+    Write-Host ">>> Auto-confirm: re-measuring those benchmark(s) ${confirmRuns}x; a regression counts only if it trips in >= $quorum of $confirmRuns re-runs."
+    # One warm-up before the loop; the re-runs are back-to-back so caches stay hot.
     Invoke-WarmupPass $filter
-    Invoke-Interleave 'candidate_confirm' 'base_confirm' $filter
-
-    Write-Host '>>> Auto-confirm comparison (base_confirm -> candidate_confirm):'
-    $confirmComparison = & {
-        $ErrorActionPreference = 'Continue'
-        $out = critcmp base_confirm candidate_confirm | Out-String
-        if ($LASTEXITCODE -ne 0) { throw "critcmp (confirm) failed (exit $LASTEXITCODE)" }
-        $out
+    for ($run = 1; $run -le $confirmRuns; $run++) {
+        Write-Host ">>> Auto-confirm re-run $run/$confirmRuns..."
+        Invoke-Interleave "candidate_confirm$run" "base_confirm$run" $filter
+        $ct = & {
+            $ErrorActionPreference = 'Continue'
+            $out = critcmp "base_confirm$run" "candidate_confirm$run" | Out-String
+            if ($LASTEXITCODE -ne 0) { throw "critcmp (confirm $run) failed (exit $LASTEXITCODE)" }
+            $out
+        }
+        $ct = $ct.TrimEnd()
+        Write-Host $ct
+        [System.IO.File]::WriteAllText((Join-Path $ResultsDir "confirm-run$run.txt"), $ct + "`n", $Utf8NoBom)
+        $confirmRunComparisons += , $ct
+        foreach ($r in @(Get-CritcmpRegressions $ct $thr)) {
+            if ($tally.ContainsKey($r.Name)) { $tally[$r.Name]++ } else { $tally[$r.Name] = 1 }
+            if (-not $worstRatio.ContainsKey($r.Name) -or $r.Ratio -gt $worstRatio[$r.Name]) { $worstRatio[$r.Name] = $r.Ratio }
+        }
     }
-    $confirmComparison = $confirmComparison.TrimEnd()
-    Write-Host $confirmComparison
-    [System.IO.File]::WriteAllText((Join-Path $ResultsDir 'confirm.txt'), $confirmComparison + "`n", $Utf8NoBom)
-    $gateComparison = $confirmComparison
-    $gateRegressions = @(Get-CritcmpRegressions $confirmComparison $thr)
+    # Confirmed = benchmarks that tripped in at least $quorum of the re-runs.
+    $confirmed = @($tally.Keys | Where-Object { $tally[$_] -ge $quorum })
 }
 Remove-Item -Recurse -Force (Join-Path $RepoRoot 'target-base') -ErrorAction SilentlyContinue
 
-# --- Verdict (based on the gate comparison: the re-measured offenders after
-# auto-confirm, or the full run when nothing tripped) ---
+# --- Verdict (based on the majority-confirmed regressions) ---
 $pct = [int][math]::Round(($thr - 1) * 100)
 $warn = [char]::ConvertFromUtf32(0x26A0) + [char]::ConvertFromUtf32(0xFE0F)
 $check = [char]::ConvertFromUtf32(0x2705)
-if ($gateRegressions.Count -gt 0) {
-    $worst = $gateRegressions | Sort-Object Ratio -Descending | Select-Object -First 1
-    $wpct = [int][math]::Round(($worst.Ratio - 1) * 100)
-    $verdict = "$warn $($gateRegressions.Count) benchmark(s) slower by >=$pct% vs baseline (worst: $($worst.Name) +$wpct%)"
+if ($confirmed.Count -gt 0) {
+    $worstName = $confirmed | Sort-Object { $worstRatio[$_] } -Descending | Select-Object -First 1
+    $wpct = [int][math]::Round(($worstRatio[$worstName] - 1) * 100)
+    $whits = $tally[$worstName]
+    $verdict = "$warn $($confirmed.Count) benchmark(s) consistently slower by >=$pct% vs baseline (worst: $worstName +$wpct%, tripped $whits/$confirmRuns re-runs)"
 } else {
-    $verdict = "$check No benchmark slower by >=$pct% vs baseline"
+    $verdict = "$check No benchmark consistently slower by >=$pct% vs baseline"
 }
 
 $summaryLines = @(
@@ -479,7 +495,7 @@ $summaryLines = @(
     ''
 )
 if ($regressions.Count -gt 0) {
-    $summaryLines += '_Auto-confirm re-ran the gate-tripping benchmark(s); the verdict reflects that re-measurement. Benchmarks that tripped once but not on the re-run are treated as transient noise._'
+    $summaryLines += "_Auto-confirm re-measured the initially-tripping benchmark(s) ${confirmRuns}x (interleaved, offenders only). A regression is counted only when it trips in at least $quorum of $confirmRuns re-runs; a benchmark that spikes once but not consistently is treated as transient noise._"
     $summaryLines += ''
 }
 $summaryLines += @(
@@ -492,14 +508,27 @@ $summaryLines += @(
 if ($regressions.Count -gt 0) {
     $summaryLines += @(
         ''
-        '### Auto-confirm re-run (offenders only)'
+        '### Auto-confirm re-runs (offenders only)'
         ''
-        ('Tripped on the first pass: ' + (($regressions | ForEach-Object { $_.Name }) -join ', '))
+        ('Initially tripped: ' + (($regressions | ForEach-Object { $_.Name }) -join ', '))
         ''
-        '```'
-        $confirmComparison
-        '```'
+        '| benchmark | re-runs tripped | worst |'
+        '|-----------|-----------------|-------|'
     )
+    foreach ($r in $regressions) {
+        $hits = if ($tally.ContainsKey($r.Name)) { $tally[$r.Name] } else { 0 }
+        if ($worstRatio.ContainsKey($r.Name)) {
+            $wcell = '+' + [string][int][math]::Round(($worstRatio[$r.Name] - 1) * 100) + '%'
+        } else {
+            $wcell = [string][char]0x2014
+        }
+        $summaryLines += "| $($r.Name) | $hits/$confirmRuns | $wcell |"
+    }
+    $confList = if ($confirmed.Count -gt 0) { ($confirmed -join ', ') } else { 'none' }
+    $summaryLines += @('', "_Confirmed (tripped in >= $quorum/$confirmRuns): ${confList}_", '')
+    for ($run = 1; $run -le $confirmRuns; $run++) {
+        $summaryLines += @("#### Re-run $run", '', '```', $confirmRunComparisons[$run - 1], '```', '')
+    }
 }
 $summary = $summaryLines -join "`n"
 [System.IO.File]::WriteAllText((Join-Path $ResultsDir 'summary.md'), $summary + "`n", $Utf8NoBom)
@@ -508,14 +537,14 @@ Copy-Item -Recurse -Force 'target/criterion' (Join-Path $ResultsDir 'criterion')
 
 Write-Host ">>> Done. Results in $ResultsDir"
 
-# Fail the run only on CONFIRMED regressions (the gate comparison). Use `throw`,
-# not `exit`: the scheduled-task wrapper relies on its finally block to write the
-# EXIT_CODE/DONE sentinels, and `exit` from a called .ps1 terminates the whole
-# process and would skip it (leaving run-remote to hang until timeout). summary.md
-# names the offenders and shows the auto-confirm re-run.
-if ($gateRegressions.Count -gt 0) {
+# Fail the run only on CONFIRMED regressions (tripped in a majority of re-runs).
+# Use `throw`, not `exit`: the scheduled-task wrapper relies on its finally block
+# to write the EXIT_CODE/DONE sentinels, and `exit` from a called .ps1 terminates
+# the whole process and would skip it (leaving run-remote to hang until timeout).
+# summary.md names the offenders and shows the auto-confirm re-runs.
+if ($confirmed.Count -gt 0) {
     throw "PERF REGRESSION: $verdict"
 }
 if ($regressions.Count -gt 0) {
-    Write-Host ">>> Auto-confirm cleared all $($regressions.Count) initial regression(s) as transient; passing."
+    Write-Host ">>> Auto-confirm cleared all $($regressions.Count) initial regression(s) as transient (none tripped in >= $quorum/$confirmRuns); passing."
 }
