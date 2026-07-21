@@ -893,8 +893,8 @@ mod always_encrypted {
                 .await
                 .expect_err("ForceColumnEncryption on a plaintext column must be rejected");
             assert!(
-                matches!(&err, mssql_tds::error::Error::UsageError(m) if m.contains("ForceColumnEncryption")),
-                "expected a ForceColumnEncryption usage error, got {err:?}"
+                matches!(&err, mssql_tds::error::Error::ColumnEncryptionError(m) if m.contains("ForceColumnEncryption")),
+                "expected a ForceColumnEncryption column-encryption error, got {err:?}"
             );
         });
     }

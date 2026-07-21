@@ -307,8 +307,23 @@ pub struct ClientContext {
     /// is configured for the connected server, the driver only unwraps a column
     /// encryption key whose CMK path is in the list, defending against a
     /// malicious server that points the client at an attacker-controlled CMK. A
-    /// server with no entry (or an empty list) is unrestricted. Empty by default.
-    pub(crate) trusted_master_key_paths: HashMap<String, Vec<String>>,
+    /// server with no entry (or an empty list) is unrestricted.
+    ///
+    /// `None` (unrestricted) by default. Boxed behind an `Option` so the common
+    /// case — connections that never opt into trusted paths — costs a single
+    /// pointer (8 bytes) instead of an inline 48-byte `HashMap`. (An
+    /// `Option<HashMap>` alone would not shrink: the map's internal non-null
+    /// pointer gives `Option` a free niche, so it stays 48 bytes — the `Box` is
+    /// what buys the reduction.) Keeping this by-value field small keeps the
+    /// `ClientContext`-carrying connect future off the `clippy::large_futures`
+    /// budget.
+    //
+    // The `#[allow]` is deliberate: `clippy::box_collection` flags `Box<HashMap>`
+    // as redundant heap-on-heap, but here the boxing is the whole point — it
+    // moves the map's 48-byte inline control block off the by-value
+    // `ClientContext` so the connect future stays small.
+    #[allow(clippy::box_collection)]
+    pub(crate) trusted_master_key_paths: Option<Box<HashMap<String, Vec<String>>>>,
     /// UserAgent telemetry payload components.
     pub user_agent: UserAgent,
 }
@@ -407,6 +422,7 @@ impl ClientContext {
         key_paths: Vec<String>,
     ) {
         self.trusted_master_key_paths
+            .get_or_insert_with(|| Box::new(HashMap::new()))
             .insert(server_name.as_ref().to_ascii_uppercase(), key_paths);
     }
 
@@ -415,17 +431,18 @@ impl ClientContext {
     /// unrestricted (no list registered, or none registered at all). An empty
     /// slice means "no restriction".
     pub(crate) fn trusted_key_paths_for_current_server(&self) -> &[String] {
-        if self.trusted_master_key_paths.is_empty() {
+        let Some(paths) = self
+            .trusted_master_key_paths
+            .as_ref()
+            .filter(|paths| !paths.is_empty())
+        else {
             return &[];
-        }
+        };
         let server = self
             .transport_context
             .get_server_name()
             .to_ascii_uppercase();
-        self.trusted_master_key_paths
-            .get(&server)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        paths.get(&server).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Creates a new ClientContext with the specified data source.
@@ -486,7 +503,7 @@ impl ClientContext {
                 crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),
             ),
             cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
-            trusted_master_key_paths: HashMap::new(),
+            trusted_master_key_paths: None,
             user_agent: UserAgent::default(),
         }
     }
@@ -548,7 +565,7 @@ impl ClientContext {
                 crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),
             ),
             cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
-            trusted_master_key_paths: HashMap::new(),
+            trusted_master_key_paths: None,
             user_agent: UserAgent::default(),
         }
     }

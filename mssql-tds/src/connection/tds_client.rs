@@ -2306,6 +2306,14 @@ impl TdsClient {
         // plaintext, or it omits a row for the parameter entirely (which would
         // otherwise slip past a describe-driven check and be serialized in the
         // clear).
+        //
+        // This is a server-trust failure — the "compromised server downgrades to
+        // harvest plaintext" threat this flag defends against — so it is a
+        // `ColumnEncryptionError`, matching the "parameter not supplied" mismatch
+        // below and the trusted-master-key-path rejection in `decrypt_cek`. It is
+        // deliberately distinct from the caller-misconfiguration case (the flag
+        // set while Always Encrypted is off) that
+        // `ensure_force_column_encryption_supported` reports as a `UsageError`.
         for index in 0..params.len() {
             if !params[index].force_column_encryption() {
                 continue;
@@ -2319,7 +2327,7 @@ impl TdsClient {
                     .as_deref()
                     .unwrap_or("<positional>")
                     .to_string();
-                return Err(crate::error::Error::UsageError(format!(
+                return Err(crate::error::Error::ColumnEncryptionError(format!(
                     "Parameter {name} has ForceColumnEncryption set, but the server did not \
                      report it as encrypted; refusing to send it as plaintext.",
                 )));
@@ -4169,8 +4177,8 @@ mod tests {
         .expect_err("a forced parameter omitted from the describe result must be rejected");
 
         assert!(
-            matches!(&err, UsageError(message) if message.contains("ForceColumnEncryption")),
-            "expected a ForceColumnEncryption usage error, got: {err}"
+            matches!(&err, crate::error::Error::ColumnEncryptionError(message) if message.contains("ForceColumnEncryption")),
+            "expected a ForceColumnEncryption column-encryption error, got: {err}"
         );
     }
 }
