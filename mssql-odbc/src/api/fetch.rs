@@ -49,14 +49,6 @@ fn sql_fetch_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
-        if stmt_state.column_metadata.is_empty() {
-            // Positioned on a no-row statement result (PRINT / RAISERROR / DDL /
-            // DML): zero columns, so there is nothing to fetch. Matches
-            // msodbcsql, which returns 24000 (invalid cursor state) here.
-            error!("SQLFetch: current result has no columns (no-row statement)");
-            post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
-            return SQL_ERROR;
-        }
     }
 
     fetch_rows_next(statement_handle, stmt)
@@ -105,6 +97,38 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
 
         client
     };
+
+    // At this point the connection is owned by this statement (`active_stmt`
+    // was `Some(self)`) and the client has been taken. A no-row statement
+    // result (PRINT / low-severity RAISERROR / DDL / DML) is positioned with
+    // zero columns: there is nothing to fetch, so return 24000 (invalid cursor
+    // state), matching msodbcsql. This is checked only after the busy-with-
+    // other-statement (HY000) and already-drained (SQL_NO_DATA) cases above,
+    // because those take precedence even when the column metadata is empty.
+    {
+        let no_columns = match stmt.inner.lock() {
+            Ok(ss) => ss.column_metadata.is_empty(),
+            Err(_) => {
+                error!("SQLFetch: stmt mutex poisoned checking no-row result");
+                if let Ok(mut ds) = dbc.inner.lock() {
+                    ds.client = Some(client);
+                }
+                return SQL_ERROR;
+            }
+        };
+        if no_columns {
+            error!("SQLFetch: current result has no columns (no-row statement)");
+            // Restore the client so the connection stays busy on this statement;
+            // the application can still call SQLMoreResults to advance.
+            if let Ok(mut ds) = dbc.inner.lock() {
+                ds.client = Some(client);
+            }
+            if let Ok(mut ss) = stmt.inner.lock() {
+                post_diag(&mut ss, ERR_INVALID_CURSOR_STATE);
+            }
+            return SQL_ERROR;
+        }
+    }
 
     let fetch_result = dbc.runtime.block_on(client.next_row());
 

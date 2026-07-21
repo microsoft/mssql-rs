@@ -1814,13 +1814,18 @@ impl TdsClient {
     /// next COLMETADATA — consecutive no-row statements collapse into the
     /// following row-returning result set.
     ///
-    /// With `true` (ODBC statement-wise navigation, matching msodbcsql), each
-    /// statement's DONE token is its own result boundary: a no-row statement is
-    /// returned as [`ResultBoundaryKind::NoRows`] instead of being skipped, so
-    /// every statement in a batch is individually navigable. A DONE reached in
-    /// this method (without a COLMETADATA earlier in the same call) always
-    /// belongs to a no-row statement, because a row-returning statement's DONE
-    /// is consumed while its rows are read/drained.
+    /// With `true` (ODBC statement-wise navigation, matching msodbcsql), a
+    /// no-row statement's DONE token can be its own result boundary, returned
+    /// as [`ResultBoundaryKind::NoRows`] instead of always being skipped. It is
+    /// surfaced only when the statement carries a row count (DONE `COUNT` flag)
+    /// or produced an informational message (PRINT / low-severity RAISERROR);
+    /// a pure no-op statement with neither — e.g. a bare `CREATE TABLE` — is
+    /// still collapsed into the following result, exactly as in result-set
+    /// navigation. This mirrors msodbcsql, which exposes a statement as its own
+    /// result iff it returns rows, carries a count, or produced a message. A
+    /// DONE reached in this method (without a COLMETADATA earlier in the same
+    /// call) always belongs to a no-row statement, because a row-returning
+    /// statement's DONE is consumed while its rows are read/drained.
     async fn advance_to_result_boundary(
         &mut self,
         expose_norow_statements: bool,
@@ -2032,14 +2037,18 @@ impl TdsClient {
         self.execution_context.has_open_batch()
     }
 
-    /// Executes a SQL batch and positions on its **first statement** using
-    /// statement-wise navigation, returning that statement's [`StatementResult`].
+    /// Executes a SQL batch and positions on its **first navigable statement**
+    /// using statement-wise navigation, returning that statement's
+    /// [`StatementResult`].
     ///
-    /// Unlike [`execute()`](Self::execute) — which skips leading no-row
-    /// statements to position on the first row-returning result set — this
-    /// exposes every statement (including PRINT / RAISERROR / DDL / DML) as its
-    /// own navigable result, matching msodbcsql's `SQLExecDirect` +
-    /// `SQLMoreResults` semantics. Advance through the remaining statements with
+    /// Unlike [`execute()`](Self::execute) — which skips every no-row statement
+    /// to position on the first row-returning result set — this exposes a no-row
+    /// statement as its own navigable result when it carries a row count or
+    /// produced a message (PRINT / low-severity RAISERROR / DML), matching
+    /// msodbcsql's `SQLExecDirect` + `SQLMoreResults` semantics. A pure no-op
+    /// statement with neither a count nor a message — e.g. a leading bare
+    /// `CREATE TABLE` — is still collapsed, so the first result may belong to a
+    /// later statement. Advance through the remaining statements with
     /// [`move_to_next_statement()`](Self::move_to_next_statement).
     #[instrument(skip(self), level = "info")]
     pub async fn execute_multi_statement(
@@ -3398,17 +3407,22 @@ impl ResultSetClient for TdsClient {
 /// [`move_to_next_statement`](TdsClient::move_to_next_statement)).
 ///
 /// Unlike the result-set navigation used by [`execute`](TdsClient::execute) /
-/// [`move_to_next`](TdsClient::move_to_next) — which collapses statements that
-/// return no rows — this exposes every statement in a batch individually,
-/// matching msodbcsql's `SQLExecDirect` + `SQLMoreResults` behavior.
+/// [`move_to_next`](TdsClient::move_to_next) — which collapses every statement
+/// that returns no rows — this surfaces a no-row statement as its own result
+/// when it carries a row count or produced a message (matching msodbcsql).
+/// A pure no-op statement with neither — e.g. a bare `CREATE TABLE` — is still
+/// collapsed, so callers never observe a [`NoRows`](Self::NoRows) value for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatementResult {
     /// A row-returning result set (e.g. `SELECT`). Column metadata is available
     /// via [`TdsClient::get_metadata`] and rows via the [`ResultSet`] API.
     RowSet,
-    /// A statement that produced no result set (`PRINT`, low-severity
-    /// `RAISERROR`, DDL, or DML). It has zero columns; `rows_affected` is the
-    /// row count reported by the statement's DONE token (0 for PRINT/RAISERROR).
+    /// A statement that produced no result set but is still individually
+    /// navigable because it carried a row count or produced a message
+    /// (DML, `PRINT`, or low-severity `RAISERROR`). It has zero columns;
+    /// `rows_affected` is the row count reported by the statement's DONE token
+    /// (0 for `PRINT` / `RAISERROR`). Pure no-op statements are collapsed and
+    /// never surface as this variant.
     NoRows {
         /// Rows affected reported by the statement's DONE token.
         rows_affected: u64,
@@ -3539,6 +3553,14 @@ mod tests {
             _cancel_handle: Option<&CancelHandle>,
             _writer: &mut (dyn RowWriter + Send),
         ) -> TdsResult<RowReadResult> {
+            // The mock has no row bytes to materialize, so it replays the queued
+            // tokens as control tokens (e.g. a terminal DONE). This lets drain
+            // paths — which read rows until the result set's DONE — be exercised
+            // without a live server. Running dry is a protocol error, mirroring a
+            // closed connection.
+            if let Some(tok) = self.pending_tokens.pop_front() {
+                return Ok(RowReadResult::Token(tok));
+            }
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
     }
@@ -3822,6 +3844,35 @@ mod tests {
             client.move_to_next_statement().await.unwrap(),
             StatementResult::End
         );
+    }
+
+    /// Regression test for a hang: after positioning on the batch's final row
+    /// set, calling `move_to_next_statement` without reading its rows must drain
+    /// them, observe the terminal DONE (which closes the batch), and return
+    /// `End` — instead of issuing another token read that would block forever on
+    /// an already-finished batch. The whole exchange is bounded by a timeout so a
+    /// regression surfaces as a test failure rather than a hung suite.
+    #[tokio::test]
+    async fn move_to_next_statement_end_after_draining_final_rowset() {
+        // A single row-returning statement: COLMETADATA then a terminal DONE.
+        let mut client = create_test_client_with_tokens(vec![empty_col_metadata(), done_no_more()]);
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.execute_multi_statement("SELECT 1;".to_string(), None, None),
+        )
+        .await
+        .expect("execute_multi_statement should not hang")
+        .unwrap();
+        assert_eq!(first, StatementResult::RowSet);
+
+        // Advance without fetching any rows: the drain consumes the terminal
+        // DONE and the call must report end-of-batch rather than block.
+        let next = tokio::time::timeout(Duration::from_secs(5), client.move_to_next_statement())
+            .await
+            .expect("move_to_next_statement must not hang after draining the final row set")
+            .unwrap();
+        assert_eq!(next, StatementResult::End);
     }
 
     #[test]
