@@ -126,6 +126,10 @@ variables:
   ACR_REGISTRY: 'tdslibrs.azurecr.io'
   GHCR_REGISTRY: 'ghcr.io'
   GHCR_NAMESPACE: 'ghcr.io/${{ parameters.ghcrOrg }}'
+  # 1ES pool + Linux image used by every job in this pipeline. Single source of
+  # truth: change these two lines to retarget the whole pipeline.
+  poolName: 'RUST-1ES-POOL-WUS3-NVME'
+  imageName: 'RUST-1ES-UBUSLIM-NVME'
 
 # =============================================================================
 # STAGE 1 (Import): Sync base images from public registries (incl. Docker Hub) to ACR
@@ -147,9 +151,9 @@ stages:
     displayName: 'Import manylinux x64 & arm64'
     condition: eq('${{ parameters.syncManylinux }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -210,9 +214,9 @@ stages:
     displayName: 'Import musllinux x64 & arm64'
     condition: eq('${{ parameters.syncMusllinux }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -247,9 +251,9 @@ stages:
     displayName: 'Import Ubuntu 22.04 & 24.04'
     condition: eq('${{ parameters.syncUbuntu }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -306,9 +310,9 @@ stages:
     displayName: 'Import Alpine 3.18 & 3.19'
     condition: eq('${{ parameters.syncAlpine1 }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -365,9 +369,9 @@ stages:
     displayName: 'Import Alpine 3.20 & 3.21'
     condition: eq('${{ parameters.syncAlpine2 }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -483,9 +487,9 @@ stages:
     displayName: 'Import Debian & RHEL UBI'
     condition: eq('${{ parameters.syncDebianRHEL }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -629,9 +633,9 @@ stages:
     displayName: 'Import Oracle Linux 9'
     condition: eq('${{ parameters.syncOracle }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -735,9 +739,9 @@ stages:
     displayName: Build x64 Images
     condition: or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true'))
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: self
       displayName: Checkout repository
@@ -1071,9 +1075,9 @@ stages:
     - BuildARM64Images
     condition: eq('${{ parameters.buildUbuntuImages }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
 
@@ -1132,9 +1136,9 @@ stages:
     - CreateMultiArchManifests
     condition: always()
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
 
@@ -1268,9 +1272,9 @@ stages:
     displayName: 'Mirror ACR -> GHCR'
     timeoutInMinutes: 60
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
 

@@ -51,10 +51,10 @@ parameters:
     default: 120
   - name: poolName
     type: string
-    default: 'RUST-1ES-POOL-WUS3'
+    default: 'RUST-1ES-POOL-WUS3-NVME'
   - name: poolImageOverride
     type: string
-    default: 'imageOverride -equals RUST-1ES-UBUSLIM'
+    default: 'imageOverride -equals RUST-1ES-UBUSLIM-NVME'
   - name: jobCondition
     # Job-level condition. Defaults to succeeded(); callers that only need the
     # SQL host on PRs (e.g. the Build stage) pass a Build.Reason check.

@@ -8,9 +8,9 @@ jobs:
     strategy:
       matrix: ${{ parameters.matrix }}
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-1ES-POOL-WUS3-NVME
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals RUST-1ES-UBUSLIM-NVME
     steps:
       - template: generate-sql-password-template.yml
         parameters:
