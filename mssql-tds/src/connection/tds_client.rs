@@ -33,7 +33,7 @@ use crate::{
     handler::handler_factory::NegotiatedSettings,
     io::token_stream::{ParserContext, RowReadResult},
     message::{batch::SqlBatch, messages::Request},
-    token::tokens::{ColMetadataToken, CurrentCommand, EnvChangeTokenSubType, Tokens},
+    token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, EnvChangeTokenSubType, Tokens},
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -580,6 +580,35 @@ impl TdsClient {
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
+        self.send_query_batch(sql_command, timeout_sec, cancel_handle)
+            .await?;
+
+        let metadata = self.move_to_column_metadata().await?;
+        // No metadata means no rows were returned, so we set has_open_batch to false.
+        if metadata.is_none() {
+            self.execution_context.set_has_open_batch(false);
+            self.current_metadata = None;
+        } else {
+            self.current_metadata = metadata;
+
+            self.execution_context.set_has_open_batch(true);
+        }
+        Ok(())
+    }
+
+    /// Runs the batch-execution prologue and sends a SQL batch to the wire:
+    /// sets the batch-level Always Encrypted setting, rejects a re-entrant call,
+    /// resets the per-command info buffer, reconnects if needed, stores the
+    /// timeout / cancel handle, and serializes the batch. Shared by
+    /// [`execute()`](Self::execute) and
+    /// [`execute_multi_statement()`](Self::execute_multi_statement); the caller
+    /// then consumes the response with the navigation model it wants.
+    async fn send_query_batch(
+        &mut self,
+        sql_command: String,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
         // Batch execution always uses the connection's Always Encrypted setting.
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
 
@@ -602,17 +631,6 @@ impl TdsClient {
         let mut packet_writer =
             batch.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         batch.serialize(&mut packet_writer).await?;
-
-        let metadata = self.move_to_column_metadata().await?;
-        // No metadata means no rows were returned, so we set has_open_batch to false.
-        if metadata.is_none() {
-            self.execution_context.set_has_open_batch(false);
-            self.current_metadata = None;
-        } else {
-            self.current_metadata = metadata;
-
-            self.execution_context.set_has_open_batch(true);
-        }
         Ok(())
     }
 
@@ -1788,17 +1806,38 @@ impl TdsClient {
         Ok(collected_errors)
     }
 
-    #[instrument(skip(self), level = "debug", name = "move_to_column_metadata")]
-    pub(crate) async fn move_to_column_metadata(
+    /// Reads tokens up to the next result boundary in the response stream.
+    ///
+    /// With `expose_norow_statements = false` (result-set navigation used by
+    /// batch execution and the JS/Python consumers), a no-row statement's DONE
+    /// token carrying the MORE flag is skipped so the method advances to the
+    /// next COLMETADATA — consecutive no-row statements collapse into the
+    /// following row-returning result set.
+    ///
+    /// With `true` (ODBC statement-wise navigation, matching msodbcsql), each
+    /// statement's DONE token is its own result boundary: a no-row statement is
+    /// returned as [`ResultBoundaryKind::NoRows`] instead of being skipped, so
+    /// every statement in a batch is individually navigable. A DONE reached in
+    /// this method (without a COLMETADATA earlier in the same call) always
+    /// belongs to a no-row statement, because a row-returning statement's DONE
+    /// is consumed while its rows are read/drained.
+    async fn advance_to_result_boundary(
         &mut self,
-    ) -> TdsResult<Option<Arc<ColMetadataToken>>> {
+        expose_norow_statements: bool,
+    ) -> TdsResult<ResultBoundaryKind> {
         // Tell the COLMETADATA parser whether Always Encrypted was negotiated so
         // it can parse the CEK table and per-column crypto metadata.
         let parser_context = ParserContext::ColumnEncryption(
             self.negotiated_settings.is_column_encryption_supported(),
         );
-        let mut col_metadata: Option<Arc<ColMetadataToken>> = None;
         let mut loop_count = 0u32;
+        // Whether the statement whose DONE we are about to reach produced any
+        // informational message. In statement-wise navigation, msodbcsql exposes
+        // a statement as its own result when it returns rows, carries a row count
+        // (DONE COUNT flag), or produced messages; pure DDL / no-op statements
+        // with none of these are collapsed. Tracks messages since the last
+        // boundary so a PRINT / low-severity RAISERROR is surfaced individually.
+        let mut saw_message = false;
 
         loop {
             loop_count += 1;
@@ -1807,7 +1846,7 @@ impl TdsClient {
             if loop_count.is_multiple_of(1000) {
                 debug!(
                     loop_count,
-                    "High iteration count in move_to_column_metadata"
+                    "High iteration count in advance_to_result_boundary"
                 );
             }
 
@@ -1824,9 +1863,8 @@ impl TdsClient {
             match token {
                 Tokens::ColMetadata(md) => {
                     info!(?md);
-                    col_metadata = Some(Arc::new(md));
                     self.current_result_set_has_been_read_till_end = false;
-                    break;
+                    return Ok(ResultBoundaryKind::RowSet(Arc::new(md)));
                 }
                 Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
                     info!(
@@ -1847,17 +1885,39 @@ impl TdsClient {
                     *count = count.saturating_add(done.row_count);
                     self.current_result_set_has_been_read_till_end = true;
 
-                    if !done.has_more() {
-                        // No more result sets - end of batch
-                        info!("No more result sets (has_more=false), ending batch");
-                        self.execution_context.set_has_open_batch(false);
-                        break;
+                    let is_last = !done.has_more();
+
+                    if expose_norow_statements {
+                        // Statement-wise navigation (msodbcsql parity): this DONE
+                        // is a navigable result only if the statement returned a
+                        // row count (COUNT flag) or produced messages. Pure DDL /
+                        // no-op statements (no count, no messages) are collapsed,
+                        // exactly like result-set navigation, so a batch such as
+                        // `CREATE; INSERT; SELECT` exposes the INSERT's row count
+                        // and the SELECT, not the bare CREATE.
+                        let has_count = done.status.contains(DoneStatus::COUNT);
+                        if has_count || saw_message {
+                            self.execution_context.set_has_open_batch(!is_last);
+                            return Ok(ResultBoundaryKind::NoRows {
+                                rows_affected: if has_count { done.row_count } else { 0 },
+                            });
+                        }
+                        // Collapsed no-op statement: fall through to the shared
+                        // skip / end-of-batch handling below.
                     }
 
-                    // has_more() is true - there are more result sets coming
-                    // For DML operations (CREATE TABLE, INSERT, UPDATE, DELETE), there's no ColMetadata.
-                    // The Done token represents the result, but we skip over it to find the next
-                    // result set with ColMetadata (SELECT). This matches SQL Server behavior.
+                    if is_last {
+                        // No more result sets - end of batch.
+                        info!("No more result sets (has_more=false), ending batch");
+                        self.execution_context.set_has_open_batch(false);
+                        return Ok(ResultBoundaryKind::End);
+                    }
+
+                    // has_more() is true - there are more result sets coming.
+                    // For no-row statements (PRINT / RAISERROR / DDL / DML) there
+                    // is no ColMetadata; in result-set navigation (and for
+                    // collapsed no-op statements above) we skip over their DONE
+                    // token to find the next result set with ColMetadata (SELECT).
                     info!(
                         "More result sets available (has_more=true), continuing to look for ColMetadata"
                     );
@@ -1866,7 +1926,7 @@ impl TdsClient {
                     if loop_count > 10000 {
                         error!(
                             loop_count,
-                            "Excessive iterations in move_to_column_metadata - possible malicious input or protocol violation"
+                            "Excessive iterations in advance_to_result_boundary - possible malicious input or protocol violation"
                         );
                         return Err(crate::error::Error::UsageError(
                             "Too many Done tokens with has_more=true without ColMetadata"
@@ -1907,20 +1967,103 @@ impl TdsClient {
                 Tokens::Info(info_token) => {
                     info!(?info_token);
                     self.capture_info_message(&info_token);
+                    // Marks the current statement as message-bearing so
+                    // statement-wise navigation surfaces it as its own result.
+                    saw_message = true;
                     continue;
                 }
                 Tokens::TabName | Tokens::ColInfo => {
                     continue;
                 }
                 _ => {
-                    info!("move_to_column_metadata: {:?}", token);
+                    info!("advance_to_result_boundary: {:?}", token);
                     return Err(UsageError(format!(
-                        "Unexpected token while moving to column metadata: {token:?}"
+                        "Unexpected token while moving to next result boundary: {token:?}"
                     )));
                 }
             }
         }
-        Ok(col_metadata)
+    }
+
+    #[instrument(skip(self), level = "debug", name = "move_to_column_metadata")]
+    pub(crate) async fn move_to_column_metadata(
+        &mut self,
+    ) -> TdsResult<Option<Arc<ColMetadataToken>>> {
+        match self.advance_to_result_boundary(false).await? {
+            ResultBoundaryKind::RowSet(md) => Ok(Some(md)),
+            ResultBoundaryKind::End => Ok(None),
+            // `expose_norow_statements = false` never yields a NoRows boundary.
+            ResultBoundaryKind::NoRows { .. } => Ok(None),
+        }
+    }
+
+    /// Applies a [`ResultBoundaryKind`] to the client's current-result state and
+    /// maps it to the public [`StatementResult`] returned by the statement-wise
+    /// navigation entry points ([`execute_multi_statement`](Self::execute_multi_statement),
+    /// [`move_to_next_statement`](Self::move_to_next_statement)).
+    fn apply_result_boundary(&mut self, boundary: ResultBoundaryKind) -> StatementResult {
+        match boundary {
+            ResultBoundaryKind::RowSet(md) => {
+                self.current_metadata = Some(md);
+                self.execution_context.set_has_open_batch(true);
+                self.current_result_set_has_been_read_till_end = false;
+                StatementResult::RowSet
+            }
+            ResultBoundaryKind::NoRows { rows_affected } => {
+                // A no-row statement has zero columns; `has_open_batch` was set
+                // by `advance_to_result_boundary` based on the DONE MORE flag.
+                self.current_metadata = None;
+                StatementResult::NoRows { rows_affected }
+            }
+            ResultBoundaryKind::End => {
+                self.current_metadata = None;
+                self.execution_context.set_has_open_batch(false);
+                self.current_result_set_has_been_read_till_end = true;
+                StatementResult::End
+            }
+        }
+    }
+
+    /// Executes a SQL batch and positions on its **first statement** using
+    /// statement-wise navigation, returning that statement's [`StatementResult`].
+    ///
+    /// Unlike [`execute()`](Self::execute) — which skips leading no-row
+    /// statements to position on the first row-returning result set — this
+    /// exposes every statement (including PRINT / RAISERROR / DDL / DML) as its
+    /// own navigable result, matching msodbcsql's `SQLExecDirect` +
+    /// `SQLMoreResults` semantics. Advance through the remaining statements with
+    /// [`move_to_next_statement()`](Self::move_to_next_statement).
+    #[instrument(skip(self), level = "info")]
+    pub async fn execute_multi_statement(
+        &mut self,
+        sql_command: String,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<StatementResult> {
+        self.send_query_batch(sql_command, timeout_sec, cancel_handle)
+            .await?;
+        let boundary = self.advance_to_result_boundary(true).await?;
+        Ok(self.apply_result_boundary(boundary))
+    }
+
+    /// Advances to the next statement's result using statement-wise navigation.
+    ///
+    /// Companion to [`execute_multi_statement()`](Self::execute_multi_statement):
+    /// returns the next statement as a [`StatementResult`] (a row set, a no-row
+    /// statement, or end of batch), draining any unread rows of the current
+    /// result set first. This is the msodbcsql-aligned counterpart to
+    /// [`move_to_next()`](Self::move_to_next), which instead collapses no-row
+    /// statements.
+    #[instrument(skip(self), level = "info")]
+    pub async fn move_to_next_statement(&mut self) -> TdsResult<StatementResult> {
+        if !self.execution_context.has_open_batch() {
+            return Ok(StatementResult::End);
+        }
+        if self.maybe_has_unread_rows() {
+            self.drain_rows().await?;
+        }
+        let boundary = self.advance_to_result_boundary(true).await?;
+        Ok(self.apply_result_boundary(boundary))
     }
 
     /// This functions returns to the next row in the result set.
@@ -3234,6 +3377,43 @@ impl ResultSetClient for TdsClient {
     }
 }
 
+/// The outcome of advancing to the next statement boundary during
+/// statement-wise result navigation
+/// ([`execute_multi_statement`](TdsClient::execute_multi_statement) /
+/// [`move_to_next_statement`](TdsClient::move_to_next_statement)).
+///
+/// Unlike the result-set navigation used by [`execute`](TdsClient::execute) /
+/// [`move_to_next`](TdsClient::move_to_next) — which collapses statements that
+/// return no rows — this exposes every statement in a batch individually,
+/// matching msodbcsql's `SQLExecDirect` + `SQLMoreResults` behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatementResult {
+    /// A row-returning result set (e.g. `SELECT`). Column metadata is available
+    /// via [`TdsClient::get_metadata`] and rows via the [`ResultSet`] API.
+    RowSet,
+    /// A statement that produced no result set (`PRINT`, low-severity
+    /// `RAISERROR`, DDL, or DML). It has zero columns; `rows_affected` is the
+    /// row count reported by the statement's DONE token (0 for PRINT/RAISERROR).
+    NoRows {
+        /// Rows affected reported by the statement's DONE token.
+        rows_affected: u64,
+    },
+    /// No more statements remain in the batch.
+    End,
+}
+
+/// Internal boundary kind produced by
+/// [`advance_to_result_boundary`](TdsClient::advance_to_result_boundary),
+/// before it is mapped to the public [`StatementResult`].
+enum ResultBoundaryKind {
+    /// A row-returning result set; carries its column metadata.
+    RowSet(Arc<ColMetadataToken>),
+    /// A no-row statement (only produced with `expose_norow_statements = true`).
+    NoRows { rows_affected: u64 },
+    /// End of batch.
+    End,
+}
+
 /// Async result set iteration.
 #[async_trait]
 pub trait ResultSet {
@@ -3512,6 +3692,121 @@ mod tests {
 
     fn stale_metadata() -> Arc<ColMetadataToken> {
         Arc::new(ColMetadataToken::default())
+    }
+
+    fn done_more() -> Tokens {
+        Tokens::Done(DoneToken {
+            status: DoneStatus::MORE,
+            cur_cmd: CurrentCommand::Insert,
+            row_count: 0,
+        })
+    }
+
+    fn done_more_with_count(row_count: u64) -> Tokens {
+        Tokens::Done(DoneToken {
+            status: DoneStatus::MORE | DoneStatus::COUNT,
+            cur_cmd: CurrentCommand::Insert,
+            row_count,
+        })
+    }
+
+    /// Statement-wise navigation exposes each no-row statement (PRINT /
+    /// RAISERROR) as its own result, matching msodbcsql, instead of collapsing
+    /// them the way `execute()` / `move_to_next()` do.
+    #[tokio::test]
+    async fn execute_multi_statement_exposes_each_norow_statement() {
+        // Batch: PRINT N'one'; RAISERROR(N'two', 10, 1);
+        let mut client = create_test_client_with_tokens(vec![
+            info_token(0, 0, "print one"),
+            done_more(),
+            info_token(50000, 10, "raiserror two"),
+            done_no_more(),
+        ]);
+
+        // First statement surfaces as its own no-row result.
+        let r1 = client
+            .execute_multi_statement(
+                "PRINT N'one'; RAISERROR(N'two', 10, 1) WITH NOWAIT;".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1, StatementResult::NoRows { rows_affected: 0 });
+        // Only the first statement's INFO is present when it is drained.
+        let info1 = client.take_info_messages();
+        assert!(
+            info1.iter().any(|m| m.message == "print one"),
+            "first statement's PRINT should be captured: {info1:?}"
+        );
+        assert!(
+            !info1.iter().any(|m| m.message == "raiserror two"),
+            "second statement's INFO must not leak into the first: {info1:?}"
+        );
+
+        // Second statement is a separate no-row result.
+        let r2 = client.move_to_next_statement().await.unwrap();
+        assert_eq!(r2, StatementResult::NoRows { rows_affected: 0 });
+        let info2 = client.take_info_messages();
+        assert!(
+            info2.iter().any(|m| m.message == "raiserror two"),
+            "second statement's RAISERROR should surface on its own step: {info2:?}"
+        );
+
+        // No more statements.
+        let r3 = client.move_to_next_statement().await.unwrap();
+        assert_eq!(r3, StatementResult::End);
+    }
+
+    /// A single no-row statement is exposed once, then the batch ends.
+    #[tokio::test]
+    async fn execute_multi_statement_single_norow_then_end() {
+        let mut client =
+            create_test_client_with_tokens(vec![info_token(0, 0, "just a print"), done_no_more()]);
+
+        let r1 = client
+            .execute_multi_statement("PRINT N'just a print';".to_string(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(r1, StatementResult::NoRows { rows_affected: 0 });
+
+        let r2 = client.move_to_next_statement().await.unwrap();
+        assert_eq!(r2, StatementResult::End);
+    }
+
+    /// Statement-wise navigation collapses pure no-op statements (no row count,
+    /// no messages — e.g. `CREATE TABLE`) but surfaces a DML statement's row
+    /// count, matching msodbcsql (`CREATE; INSERT; SELECT` exposes the INSERT
+    /// count and the SELECT, not the bare CREATE).
+    #[tokio::test]
+    async fn execute_multi_statement_collapses_noop_surfaces_rowcount() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_more(),             // pure no-op (CREATE) - collapsed
+            done_more_with_count(5), // DML with a row count - surfaced
+            done_no_more(),          // trailing no-op - collapsed -> End
+        ]);
+
+        let r1 = client
+            .execute_multi_statement(
+                "CREATE TABLE #t(i int); INSERT INTO #t VALUES(1);".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1, StatementResult::NoRows { rows_affected: 5 });
+
+        let r2 = client.move_to_next_statement().await.unwrap();
+        assert_eq!(r2, StatementResult::End);
+    }
+
+    #[tokio::test]
+    async fn move_to_next_statement_end_when_no_open_batch() {
+        let mut client = create_test_client();
+        assert_eq!(
+            client.move_to_next_statement().await.unwrap(),
+            StatementResult::End
+        );
     }
 
     #[test]
