@@ -89,7 +89,7 @@ fn prepared_prepexec(c: &mut Criterion) {
                     SqlType::Int(Some(42)),
                 )];
                 client
-                    .execute_sp_prepexec("SELECT @id AS v".to_string(), params, None, None)
+                    .execute_sp_prepexec("SELECT @id AS v".to_string(), params, None, None, None)
                     .await
                     .expect("sp_prepexec failed");
                 let handle = drain_capture_handle(&mut client).await;

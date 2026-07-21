@@ -119,7 +119,9 @@ impl TestHandles {
     pub(crate) fn mark_dbc_connected(&self) {
         assert!(!self.dbc.is_null(), "mark_dbc_connected requires a DBC");
         let dbc = unsafe { handle_from_raw::<DbcHandle>(self.dbc) };
-        let mut state = dbc.inner.lock().expect("dbc mutex poisoned");
+        let Ok(mut state) = dbc.inner.lock() else {
+            panic!("dbc mutex poisoned");
+        };
         state.connection_state = ConnectionState::Connected;
     }
 }

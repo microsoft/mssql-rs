@@ -57,6 +57,10 @@ mssql-odbc/
 │   │   ├── driver_connect.rs # SQLDriverConnect[W]
 │   │   ├── disconnect.rs     # SQLDisconnect
 │   │   ├── exec_direct.rs    # SQLExecDirect[W]
+│   │   ├── prepare.rs        # SQLPrepare[W] (deferred prepare)
+│   │   ├── execute.rs        # SQLExecute (sp_prepexec / sp_execute)
+│   │   ├── exec_common.rs    # Shared claim/execute/finish helpers for exec paths
+│   │   ├── bind_param.rs     # SQLBindParameter / SQLFreeStmt(SQL_RESET_PARAMS)
 │   │   ├── fetch.rs          # SQLFetch
 │   │   ├── get_data.rs       # SQLGetData
 │   │   ├── num_result_cols.rs# SQLNumResultCols
@@ -69,6 +73,10 @@ mssql-odbc/
 │   │   ├── env.rs            # EnvHandle, EnvState, OdbcVersion
 │   │   ├── dbc.rs            # DbcHandle, DbcState, ConnectionState
 │   │   └── stmt.rs           # StmtHandle, StmtState
+│   ├── params/            # Bound parameter storage and C→TDS value conversion
+│   │   ├── mod.rs            # BoundParam
+│   │   ├── bound_param.rs    # BoundParam struct
+│   │   └── convert.rs        # C-type → SqlType conversion, type/conversion validity
 │   ├── connection/         # Connection-string parsing and connect orchestration
 │   │   └── mod.rs
 │   └── error/              # Diagnostic record posting (post_sql_error, post_tds_error)
@@ -134,8 +142,16 @@ The project is organized into 15 phases grouped by priority. We start with found
 - SQLNumResultCols, SQLDescribeCol, SQLRowCount
 - SQLMoreResults for multi-statement batches
 - SQLCancel / SQLCancelHandle for query cancellation and timeout handling
-- SQLPrepare / SQLExecute with `sp_executesql` approach
-- SQLBindParameter for common types (INT, VARCHAR, NVARCHAR, DATE, NULL)
+- SQLPrepare / SQLExecute via **deferred prepare**: the first `SQLExecute`
+  prepares and runs in one round trip with `sp_prepexec`, caches the returned
+  handle, and subsequent executes reuse it via `sp_execute` (a rebind or
+  re-prepare invalidates the handle). Matches msodbcsql's deferred-prepare path.
+- SQLBindParameter — input parameters. Phase-1 subset: `SQL_C_CHAR` →
+  `char`/`varchar`/`longvarchar` and `SQL_C_WCHAR` →
+  `wchar`/`wvarchar`/`wlongvarchar`; bind-time type/conversion validation
+  (HY003 / HY004 / 07006). Output params, data-at-exec, parameter arrays, and
+  the wider C↔SQL type matrix are deferred — see
+  [parameters_plan.md](parameters_plan.md).
 - Statement reuse with different parameter values
 - Batch execution with multiple result sets
 
@@ -445,7 +461,7 @@ See [disconnect.rs line 63](src/api/disconnect.rs#L63) for the TODO comment noti
 | **Integrated / Domain** |
 | SSPI / Integrated | ✅ | ✅ | ✅ | Windows SSPI or Unix GSSAPI/Kerberos |
 | **Entra ID / Azure AD** |
-| ActiveDirectoryPassword | ✅ | ✅ | ✅ | Username + password |
+| ActiveDirectoryPassword | ✅ | ✅ | ✅ | Username + password. Deprecated by the drivers — uses the Azure AD ROPC flow, which Microsoft discourages; prefer Interactive / Default / ServicePrincipal |
 | ActiveDirectoryInteractive | ✅ | ✅ | ✅ | Browser-based interactive sign-in |
 | ActiveDirectoryDeviceCode | ✅ | ✅ | ✅ | Device code flow (headless/CLI environments) |
 | ActiveDirectoryServicePrincipal | ✅ | ✅ | ✅ | Client ID + secret or certificate |

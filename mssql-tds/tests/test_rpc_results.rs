@@ -529,7 +529,13 @@ mod rpc_results {
         let named_parameters = vec![database_id_param, compat_level_param];
 
         connection
-            .execute_sp_prepexec(query.to_string(), named_parameters.clone(), None, None)
+            .execute_sp_prepexec(
+                query.to_string(),
+                named_parameters.clone(),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -538,23 +544,21 @@ mod rpc_results {
             while resultset.next_row().await.unwrap().is_some() {}
         }
 
-        // Move to next result set to consume remaining tokens (including return values)
+        // Move to next result set to consume remaining tokens (including the
+        // `@handle` return value).
         connection.move_to_next().await.unwrap();
 
-        // Get the prepared handle from output params
-        let out_params = connection.retrieve_output_params().unwrap();
-        assert!(out_params.is_some());
-        let out_params = out_params.unwrap();
-        assert_eq!(out_params.len(), 1);
-
-        let handle_param = out_params.first().unwrap();
-        let retrieved_handle = if let ColumnValues::Int(handle) = handle_param.value {
-            assert!(handle > 0);
-            handle
-        } else {
-            unreachable!("Expected a handle value");
-        };
-        assert_eq!(handle_param.status, ReturnValueStatus::OutputParam);
+        // The sp_prepexec `@handle` is captured into `prepared_statement_handle`
+        // during the drain above and is deliberately NOT surfaced through
+        // `retrieve_output_params()` (see `push_return_value`).
+        assert!(
+            connection.retrieve_output_params().unwrap().is_none(),
+            "the @handle should be diverted, leaving no surfaced output params"
+        );
+        let retrieved_handle = connection
+            .take_prepared_statement_handle()
+            .expect("sp_prepexec should capture the @handle during drain");
+        assert!(retrieved_handle > 0);
 
         // Execute the prepared statement again
         connection
@@ -573,6 +577,70 @@ mod rpc_results {
             .execute_sp_unprepare(retrieved_handle, None, None)
             .await;
         assert!(result.is_ok());
+    }
+
+    // Prepares and executes `sql` via sp_prepexec, drains the result set, and
+    // returns the server-assigned prepared-statement handle. `drop_handle`
+    // piggybacks a release of a prior handle onto the prepare (sent as the
+    // `@handle` input).
+    async fn prepexec_and_get_handle(
+        connection: &mut mssql_tds::connection::tds_client::TdsClient,
+        sql: &str,
+        drop_handle: Option<i32>,
+    ) -> i32 {
+        connection
+            .execute_sp_prepexec(sql.to_string(), vec![], drop_handle, None, None)
+            .await
+            .unwrap();
+
+        if let Some(resultset) = connection.get_current_resultset() {
+            while resultset.next_row().await.unwrap().is_some() {}
+        }
+        connection.move_to_next().await.unwrap();
+
+        // The `@handle` RETURNVALUE arrives after the result set and is captured
+        // into `prepared_statement_handle` during the drain above — it is not
+        // exposed through `retrieve_output_params()` (see `push_return_value`).
+        connection
+            .take_prepared_statement_handle()
+            .expect("sp_prepexec should capture the @handle during drain")
+    }
+
+    // The sp_prepexec `@handle` piggyback: passing a prior prepared handle as
+    // the `@handle` input makes the server drop that plan and re-prepare in the
+    // same round trip, replacing a separate sp_unprepare. This validates that
+    // the server accepts the input handle (i.e. treats `@handle` as in/out, not
+    // pure output) and that the returned handle runs the new statement.
+    // (Whether the freed plan number is reused is server-internal, so the test
+    // does not assume `h1 != h2`.)
+    #[tokio::test]
+    async fn test_sp_prepexec_piggyback_reprepares_with_prior_handle() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        // First prepare+execute → handle h1.
+        let h1 = prepexec_and_get_handle(&mut connection, "SELECT 1 AS v", None).await;
+        assert!(h1 > 0);
+
+        // Re-prepare with new text, passing h1 as the `@handle` input so the
+        // server drops h1's plan and prepares "SELECT 2" in one RPC.
+        let h2 = prepexec_and_get_handle(&mut connection, "SELECT 2 AS v", Some(h1)).await;
+        assert!(h2 > 0);
+
+        // The returned handle runs the NEW statement.
+        connection
+            .execute_sp_execute(h2, None, None, None, None)
+            .await
+            .unwrap();
+        let scalar = get_scalar_value(&mut connection).await.unwrap();
+        assert!(
+            matches!(scalar, Some(ColumnValues::Int(2))),
+            "re-prepared handle should run SELECT 2, got {scalar:?}"
+        );
+
+        connection
+            .execute_sp_unprepare(h2, None, None)
+            .await
+            .unwrap();
     }
 
     // Executes the query and reads till the end of the result.
