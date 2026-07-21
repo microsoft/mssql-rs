@@ -348,7 +348,7 @@ unchanged.
 
 ## Open assumptions
 
-- Cross-pool reachability between `RUST-1ES-POOL-WUS3` (x64) and
+- Cross-pool reachability between `RUST-1ES-POOL-WUS3-NVME` (x64) and
   `RUST-1ES-POOL-ARM-WUS3` (ARM) on the SQL host's private IPv4 and the
   published port. Confirmed at design time; a connectivity regression here
   would surface as `poll-for-endpoint.sh` succeeds (the test job sees the
@@ -356,7 +356,7 @@ unchanged.
 - `mcr.microsoft.com/mssql/server:<sqlImageTag>` ships
   `/opt/mssql-tools18/bin/sqlcmd`, which `start.sh` uses for the readiness
   probe. The current default tag (`2025-latest`) does.
-- The ubuntu image used by the x64 SQL host (`RUST-1ES-UBUSLIM`) provides
+- The ubuntu image used by the x64 SQL host (`RUST-1ES-UBUSLIM-NVME`) provides
   `curl` and `docker`. The latter is enforced by `DockerInstaller@0` and
   `install-ubuntu-dependency.yaml`; the former is standard in the image.
 - Both ARM and x64 1ES pool agents have `python3` available (used by
