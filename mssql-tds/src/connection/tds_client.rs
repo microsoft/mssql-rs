@@ -2024,6 +2024,14 @@ impl TdsClient {
         }
     }
 
+    /// Returns `true` while the current batch still has unconsumed results on
+    /// the wire (a positioned result set, or further statements to navigate to).
+    /// Used by the ODBC layer to decide whether the connection stays busy after
+    /// positioning on a no-row statement result.
+    pub fn has_open_batch(&self) -> bool {
+        self.execution_context.has_open_batch()
+    }
+
     /// Executes a SQL batch and positions on its **first statement** using
     /// statement-wise navigation, returning that statement's [`StatementResult`].
     ///
@@ -2061,6 +2069,13 @@ impl TdsClient {
         }
         if self.maybe_has_unread_rows() {
             self.drain_rows().await?;
+        }
+        // Draining the current result set may have consumed the batch's final
+        // DONE token (has_more=false), which closes the batch. If so there is
+        // nothing left on the wire to advance to; reading again would block
+        // forever waiting for a token that never arrives.
+        if !self.execution_context.has_open_batch() {
+            return Ok(StatementResult::End);
         }
         let boundary = self.advance_to_result_boundary(true).await?;
         Ok(self.apply_result_boundary(boundary))

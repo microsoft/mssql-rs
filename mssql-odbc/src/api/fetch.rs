@@ -49,6 +49,14 @@ fn sql_fetch_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        if stmt_state.column_metadata.is_empty() {
+            // Positioned on a no-row statement result (PRINT / RAISERROR / DDL /
+            // DML): zero columns, so there is nothing to fetch. Matches
+            // msodbcsql, which returns 24000 (invalid cursor state) here.
+            error!("SQLFetch: current result has no columns (no-row statement)");
+            post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
+            return SQL_ERROR;
+        }
     }
 
     fetch_rows_next(statement_handle, stmt)

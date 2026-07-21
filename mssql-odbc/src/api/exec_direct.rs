@@ -131,7 +131,13 @@ fn sql_exec_direct_w_safe(
         dbc.runtime
             .block_on(client.execute_sp_executesql(rewritten_sql, named_params, None, None))
     } else {
-        dbc.runtime.block_on(client.execute(sql, None, None))
+        // Statement-wise navigation: position on the batch's first statement
+        // (msodbcsql parity) so no-row statements (PRINT / RAISERROR / DML) are
+        // individually navigable via SQLMoreResults. finish_execute inspects the
+        // resulting client state.
+        dbc.runtime
+            .block_on(client.execute_multi_statement(sql, None, None))
+            .map(|_| ())
     };
     if let Err(e) = exec_result {
         error!(%e, "SQLExecDirectW: execution failed");
