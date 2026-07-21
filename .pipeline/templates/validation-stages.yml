@@ -225,6 +225,9 @@ stages:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
     steps:
+      - script: |
+          .pipeline/scripts/print-disk-info.sh
+        displayName: 'Print agent disk info'
       - template: cargo-authenticate-template.yml
         parameters:
           osType: Linux
