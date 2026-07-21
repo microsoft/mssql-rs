@@ -125,7 +125,17 @@ semantics. Files: `src/connection/tds_client.rs`, `tests/test_rpc_results.rs`,
   1`) and a server parameter-count limit. We only handle ad-hoc T-SQL via
   `sp_prepexec` today; add the canonical-RPC branch with the same param-count /
   array-size guards when procedure-call syntax is supported.
-- **Dead-connection recovery on execute.** Detect a dead batch/session context
-  and attempt session recovery before executing. Our `claim_connection` only
-  checks the `Connected` state and fails otherwise — wire in recovery once the
-  TDS session-recovery path is exposed to the ODBC layer.
+- **Prepared-handle invalidation after transparent reconnect (next PR).**
+  `execute_sp_execute` / `execute_sp_prepexec` reconnect internally via
+  `check_and_reconnect`; after a transparent reconnect the cached `prepared_handle`
+  (and any deferred drop handle) belongs to the dead session. SQL Server restarts
+  prepared-handle numbering per session, so reuse fails with error 8179 ("Could
+  not find prepared statement with handle") or silently aliases another
+  statement's handle. Fix: thread the recovery generation through the
+  prepared-handle API — `PreparedHandle { id, generation }` stamped at prepare and
+  checked inside the TDS execute methods right after recovery (mirrors msodbcsql's
+  per-`LPSTMT` `dwConnectionId` + `FIsReprepareRequired`), returning a
+  `PreparedHandleStale` error the ODBC layer re-prepares on. The generation must
+  live with the handle's holder (`StmtState`), not a connection-side set, since
+  per-session handle reuse would otherwise alias handles. Touches only `mssql-odbc`
+  + `mssql-tds` (no FFI bindings).

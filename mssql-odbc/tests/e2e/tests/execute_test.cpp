@@ -273,6 +273,9 @@ TEST_F(PrepareExecuteLiveTest, PrepareOnceExecuteMany) {
 // fire is asserted by the unit test rebind_invalidates_cached_prepared_handle;
 // both the reused and re-prepared paths return the same value, so this test
 // alone cannot distinguish them.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert sp_unprepare +
+// sp_prepexec actually fired, which the returned value alone cannot.
 TEST_F(PrepareExecuteLiveTest, RebindReleasesPriorHandleAndReprepares) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
@@ -299,6 +302,9 @@ TEST_F(PrepareExecuteLiveTest, RebindReleasesPriorHandleAndReprepares) {
 // usable after the re-prepare (which internally orphans the prior handle for
 // release). This is a behavioral check only — that the prior handle is actually
 // released is asserted by the unit test reprepare_orphans_prior_handle_for_unprepare.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the prior handle's
+// sp_unprepare / piggybacked @handle drop actually fired.
 TEST_F(PrepareExecuteLiveTest, ReprepareReleasesPriorHandle) {
     ASSERT_SQL_OK(Prepare("SELECT 1 AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -320,6 +326,9 @@ TEST_F(PrepareExecuteLiveTest, ReprepareReleasesPriorHandle) {
 // verifies the observable outcome — a fresh statement on the same connection
 // executes normally afterward. Uses a private statement so the fixture's stmt_
 // teardown is unaffected.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the drain + sp_unprepare
+// RPCs fired, not just the healthy-connection outcome.
 TEST_F(PrepareExecuteLiveTest, FreeWithOpenCursorReleasesHandleAndKeepsConnection) {
     SQLHSTMT s = SQL_NULL_HSTMT;
     ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &s));
@@ -470,4 +479,33 @@ TEST_F(PrepareExecuteLiveTest, OutputParameterReturnsHyc00) {
                                     static_cast<SQLLEN>(value.size()), &ind);
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+}
+
+// A re-prepare whose new plan fails at sp_prepexec (syntax error) must leave the
+// statement reusable. The failing sp_prepexec carries the prior handle as its
+// piggybacked `@handle` drop, and the server releases it while processing the
+// RPC — so the driver must forget it, not re-arm it. Mirrors msodbcsql, which
+// clears `hPrepDropDeferred` before dispatch and never restores it on failure
+// (PrepOrPrepExecQuery, sqlccmd.cpp). Had the driver re-armed the handle, the
+// next sp_prepexec would re-drop it and fail with HY000/8179 (handle not found).
+TEST_F(PrepareExecuteLiveTest, FailedReprepareKeepsStatementUsable) {
+    // Prepare + execute a valid plan so a server handle is cached.
+    ASSERT_SQL_OK(Prepare("SELECT 1 AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1", GetColumnChar(1));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Re-prepare with failing text: sp_prepexec drops the cached handle but then
+    // fails on the syntax error. The driver must forget the released handle.
+    ASSERT_SQL_OK(Prepare("SELECT FROM WHERE"), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+
+    // A fresh plan still prepares and executes cleanly — a re-armed handle would
+    // make this sp_prepexec fail with HY000/8179 (handle not found).
+    ASSERT_SQL_OK(Prepare("SELECT 2 AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }

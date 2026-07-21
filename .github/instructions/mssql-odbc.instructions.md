@@ -279,6 +279,17 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
 - End-to-end tests that exercise the loadable `.so`/`.dll` through a real
   Driver Manager live in `tests/e2e/` as a CMake-built C++ suite (run via
   `tests/e2e/run_e2e.sh` / `.ps1`).
+- Tag any live e2e test that can only assert the observable *outcome* (a value
+  round-trips, the connection stays healthy) and cannot see the underlying TDS
+  RPC sequence with a `Benefits-from-mock-tds:` comment above the `TEST_F`,
+  noting what a byte-level mock TDS server would let it assert (e.g. that an
+  `sp_unprepare` / `sp_prepexec` `@handle` drop actually fired). Pin the exact
+  behavior with a Rust unit test meanwhile; `grep -rn Benefits-from-mock-tds`
+  surfaces every such test to tighten once mock-TDS support lands.
+- If an e2e test asserts mssql-odbc-specific behavior the full msodbcsql driver
+  does not share (e.g. a Phase-1 "not implemented" response), start it with the
+  `SKIP_IF_COMPARING_MSODBCSQL()` macro so it self-skips on the msodbcsql leg of
+  a `--compare-with-msodbcsql` run instead of failing the parity binary.
 - Every new `SQLXxx` function must have at least:
   - A success-path test.
   - A null-output-handle test.
