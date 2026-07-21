@@ -155,6 +155,11 @@ TEST_F(ExecDirectLiveTest, DmlDoesNotOpenCursor) {
 }
 
 TEST_F(ExecDirectLiveTest, InfoMessagesSurfaceAsDiagnostics) {
+    // mssql-odbc surfaces PRINT / low-severity RAISERROR output from a
+    // no-result-set batch as SQL_SUCCESS_WITH_INFO on SQLExecDirect. msodbcsql
+    // defers these differently, so skip this assertion in the parity comparison.
+    SKIP_IF_COMPARING_MSODBCSQL();
+
     SqlTString sql = ODBCTestUtils::ToSqlTStr(
         "PRINT N'odbc info one'; RAISERROR(N'odbc info two', 10, 1) WITH NOWAIT;");
 

@@ -88,6 +88,11 @@ TEST_F(MoreResultsLiveTest, MultipleSelectBatchAdvances) {
 // boundary-reporting call (SQLMoreResults advance, or SQLCloseCursor) rather than
 // posting them under SQL_NO_DATA where many applications never read them.
 TEST_F(MoreResultsLiveTest, TrailingInfoBetweenResultSetsSurfacesWithHint) {
+    // mssql-odbc surfaces an INFO message emitted between two result sets on the
+    // SQLMoreResults advance as SQL_SUCCESS_WITH_INFO. msodbcsql surfaces
+    // between-result INFO differently, so skip this assertion in the comparison.
+    SKIP_IF_COMPARING_MSODBCSQL();
+
     SqlTString sql = ODBCTestUtils::ToSqlTStr(
         "SELECT 1 AS a; PRINT N'between result sets info'; SELECT 2 AS b;");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
