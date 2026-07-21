@@ -33,45 +33,19 @@ use crate::{
     },
     datatypes::column_values::ColumnValues,
     handler::handler_factory::NegotiatedSettings,
-    io::token_stream::{GenericTokenParserRegistry, ParserContext, RowReadResult, dispatch_token},
+    io::token_stream::{ParserContext, PlpPauseState, RowPauseState, RowReadResult},
     message::{batch::SqlBatch, messages::Request},
-    token::tokens::{ColMetadataToken, CurrentCommand, EnvChangeTokenSubType, TokenType, Tokens},
+    token::tokens::{ColMetadataToken, CurrentCommand, EnvChangeTokenSubType, Tokens},
 };
 use async_trait::async_trait;
 use tracing::{debug, error, info, instrument};
 
-use crate::datatypes::decoder::{GenericDecoder, SqlTypeDecode};
 use crate::{
     core::{CancelHandle, TdsResult},
     query::metadata::ColumnMetadata,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-/// Tracks the unread tail of the current row after column-mode access starts.
-///
-/// We persist this state so callers can fetch sparse/non-sequential columns
-/// while keeping the wire stream forward-only and drainable before row advance.
-#[derive(Debug)]
-struct ActiveRowTail {
-    /// Absolute index of the first column represented in `columns`.
-    first_column_index: usize,
-    /// Next absolute column index to read from the current row tail.
-    next_column_index: usize,
-    /// Snapshot of metadata for the trailing columns in the current row.
-    columns: Vec<ColumnMetadata>,
-    /// Null bitmap from an NBC row, used to skip absent trailing values.
-    nbc_null_bitmap: Option<Vec<u8>>,
-}
-
-/// Result of reading a single column through the incremental row API.
-#[derive(Debug, PartialEq, Clone)]
-pub enum ColumnReadResult {
-    /// Fully materialized non-PLP value, or SQL `NULL`.
-    Value(ColumnValues),
-    /// A PLP payload is now active and can be consumed through `read_active_plp_bytes`.
-    ActivePlpStream,
-}
 
 /// State of the `ReturnStatus` token observed while draining the most recent
 /// cursor RPC response. Distinguishes "no token was sent" from an actual raw
@@ -90,6 +64,13 @@ type MemoizedCellDecryptor = (
     Arc<ColMetadataToken>,
     Option<Arc<dyn crate::security::cell_decryptor::CellDecryptor>>,
 );
+
+#[derive(Debug)]
+enum ActiveRowReadState {
+    Idle,
+    RowPaused(RowPauseState),
+    PlpPaused(PlpPauseState),
+}
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -129,13 +110,8 @@ pub struct TdsClient {
     /// Empty metadata vector for returning when no metadata is available
     empty_metadata: Vec<ColumnMetadata>,
 
-    /// Holds a partially-consumed PLP column stream for incremental msodbcsql-style reads.
-    /// `None` when no stream is active or after the stream has been fully consumed.
-    active_plp_stream: Option<crate::datatypes::decoder::PlpColumnStream>,
-
-    /// Tracks trailing columns in the current row after a column-by-column read starts.
-    /// These columns must be consumed or drained before the next row is read.
-    active_row_tail: Option<ActiveRowTail>,
+    // Active PLP stream state when row decoding paused at a PLP target column.
+    active_row_read_state: ActiveRowReadState,
 }
 
 impl TdsClient {
@@ -172,187 +148,8 @@ impl TdsClient {
             remaining_request_timeout: None,
             cancel_handle: None,
             empty_metadata: Vec::new(),
-            active_plp_stream: None,
-            active_row_tail: None,
+            active_row_read_state: ActiveRowReadState::Idle,
         }
-    }
-
-    #[inline]
-    fn nbc_column_is_null(bitmap: &[u8], column_index: usize) -> bool {
-        let byte_index = column_index / 8;
-        let bit_index = column_index % 8;
-        bitmap
-            .get(byte_index)
-            .map(|b| (b & (1 << bit_index)) != 0)
-            .unwrap_or(false)
-    }
-
-    /// Clears any incremental column-read state before entering another read mode.
-    ///
-    /// This helper exists to keep row-mode and column-mode APIs composable:
-    /// if a caller switches from `read_column`/`read_active_plp_bytes` back to
-    /// row iteration, we must first consume any unread PLP bytes and pending
-    /// trailing columns from the current row to keep token boundaries aligned.
-    async fn drain_plp_context_if_any(&mut self) -> TdsResult<()> {
-        if let Some(mut prev_stream) = self.active_plp_stream.take()
-            && !prev_stream.reached_end()
-        {
-            prev_stream
-                .skip_to_end(self.transport.as_packet_reader())
-                .await?;
-        }
-
-        self.drain_active_row_tail().await
-    }
-
-    // TODO(User Story 46383): bridge the AE streaming gap for incremental PLP reads.
-    // Current AE decryption is cell-oriented (requires full ciphertext), while
-    // column-mode PLP is stream-oriented; hook decode/read paths to a stateful
-    // streaming decrypt API once mssql-tds supports it.
-    async fn decode_column_value(&mut self, metadata: &ColumnMetadata) -> TdsResult<ColumnValues> {
-        let decoder = GenericDecoder::default();
-        let packet_reader = self.transport.as_packet_reader();
-        let mut reader = packet_reader;
-        decoder.decode(&mut reader, metadata).await
-    }
-
-    async fn decode_and_discard_column(&mut self, metadata: &ColumnMetadata) -> TdsResult<()> {
-        if metadata.is_plp() {
-            if let Some(mut stream) = crate::datatypes::decoder::PlpChunkStreamReader::begin(
-                self.transport.as_packet_reader(),
-            )
-            .await?
-            {
-                stream
-                    .skip_to_end(self.transport.as_packet_reader())
-                    .await?;
-            }
-            return Ok(());
-        }
-
-        let _ = self.decode_column_value(metadata).await?;
-        Ok(())
-    }
-
-    /// Drains unread trailing columns from the current active row tail.
-    ///
-    /// `read_column` can leave a partially-consumed row (by design). This helper
-    /// is used when advancing to the next row or switching modes so the stream is
-    /// restored to a clean row boundary, mirroring SQLGetData-style progression.
-    async fn drain_active_row_tail(&mut self) -> TdsResult<()> {
-        let Some(tail) = self.active_row_tail.take() else {
-            return Ok(());
-        };
-
-        for column_index in tail.next_column_index..(tail.first_column_index + tail.columns.len()) {
-            if let Some(bitmap) = tail.nbc_null_bitmap.as_ref()
-                && Self::nbc_column_is_null(bitmap, column_index)
-            {
-                continue;
-            }
-            let metadata = &tail.columns[column_index - tail.first_column_index];
-            self.decode_and_discard_column(metadata).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Reads a single positioned column using metadata already aligned to the stream.
-    ///
-    /// This centralizes PLP-vs-non-PLP behavior for column-mode reads so callers
-    /// can handle `ActivePlpStream` uniformly without duplicating decode logic.
-    async fn read_positioned_column(
-        &mut self,
-        metadata: &ColumnMetadata,
-    ) -> TdsResult<ColumnReadResult> {
-        if metadata.is_plp() {
-            let is_non_null = self.begin_positioned_plp_column_stream(metadata).await?;
-            if is_non_null {
-                Ok(ColumnReadResult::ActivePlpStream)
-            } else {
-                Ok(ColumnReadResult::Value(ColumnValues::Null))
-            }
-        } else {
-            Ok(ColumnReadResult::Value(
-                self.decode_column_value(metadata).await?,
-            ))
-        }
-    }
-
-    /// Reads a column from the current row tail after column-mode was already started.
-    ///
-    /// This path enforces forward-only access within the active row and supports
-    /// sparse patterns by skipping intervening columns. If the requested index is
-    /// earlier than the current tail window, it is treated as a next-row request
-    /// (drain current tail, then restart positioned read on the following row).
-    ///
-    /// Keeping this logic isolated ensures row-tail invariants remain consistent
-    /// regardless of whether the caller requests contiguous or sparse columns.
-    async fn read_column_from_active_row(
-        &mut self,
-        column_index: usize,
-    ) -> TdsResult<Option<ColumnReadResult>> {
-        let Some(mut tail) = self.active_row_tail.take() else {
-            return self.read_next_row_column(column_index).await;
-        };
-
-        let row_end_column_index = tail.first_column_index + tail.columns.len();
-        if column_index < tail.first_column_index {
-            // Caller requested an earlier column index than is available in the
-            // current active row tail. Treat this as a request for the next row:
-            // drain current row tail and restart positioned read at next row.
-            self.active_row_tail = Some(tail);
-            self.drain_active_row_tail().await?;
-            return self.read_next_row_column(column_index).await;
-        }
-
-        if column_index >= row_end_column_index {
-            self.active_row_tail = Some(tail);
-            return Err(UsageError(format!(
-                "Column index {column_index} is not available in the active row tail; call read_column with a lower index after advancing the row"
-            )));
-        }
-
-        if column_index < tail.next_column_index {
-            let next_column_index = tail.next_column_index;
-            self.active_row_tail = Some(tail);
-            return Err(UsageError(format!(
-                "Column index {column_index} has already been consumed in the active row; next available column is {}",
-                next_column_index
-            )));
-        }
-
-        let target_offset = column_index - tail.first_column_index;
-        let target_col = tail.columns[target_offset].clone();
-
-        for skip_index in tail.next_column_index..column_index {
-            if let Some(bitmap) = tail.nbc_null_bitmap.as_ref()
-                && Self::nbc_column_is_null(bitmap, skip_index)
-            {
-                continue;
-            }
-
-            let metadata = &tail.columns[skip_index - tail.first_column_index];
-            self.decode_and_discard_column(metadata).await?;
-        }
-
-        tail.next_column_index = column_index + 1;
-        let has_more_columns = tail.next_column_index < row_end_column_index;
-        let is_null = tail
-            .nbc_null_bitmap
-            .as_ref()
-            .map(|bitmap| Self::nbc_column_is_null(bitmap, column_index))
-            .unwrap_or(false);
-
-        if has_more_columns {
-            self.active_row_tail = Some(tail);
-        }
-
-        if is_null {
-            return Ok(Some(ColumnReadResult::Value(ColumnValues::Null)));
-        }
-
-        Ok(Some(self.read_positioned_column(&target_col).await?))
     }
 
     /// Attempt to reconnect a dead connection by replaying session state.
@@ -2251,8 +2048,47 @@ impl TdsClient {
         Ok(Some(decryptor))
     }
 
+    pub(crate) fn active_plp_collation(&self) -> Option<SqlCollation> {
+        match &self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => plp_state.collation(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn active_plp_reached_end(&self) -> bool {
+        match &self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => plp_state.reached_end(),
+            _ => true,
+        }
+    }
+
+    pub(crate) async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        let ActiveRowReadState::PlpPaused(plp_state) = &mut self.active_row_read_state else {
+            return Ok(0);
+        };
+
+        let start = Instant::now();
+        let read = self
+            .transport
+            .read_active_plp_bytes(
+                plp_state,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+                out,
+            )
+            .await?;
+        self.update_remaining_timeout(start);
+        Ok(read)
+    }
+
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
+    ///
+    /// If a prior call paused mid-row, this method first resumes and completes
+    /// that same logical row before reading tokens for a subsequent row. If row
+    /// decoding was paused on a PLP column and the caller did not finish draining
+    /// it via `read_active_plp_bytes`, this method drains the remaining PLP bytes
+    /// before resuming the row.
     ///
     /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
     /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
@@ -2261,22 +2097,45 @@ impl TdsClient {
         &mut self,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<bool> {
-        // Drain any partially-consumed PLP stream and unread columns from a
-        // prior row so the wire is positioned at the next row token before we
-        // resume full-row parsing.
-        if let Some(mut prev_stream) = self.active_plp_stream.take()
-            && !prev_stream.reached_end()
-        {
-            prev_stream
-                .skip_to_end(self.transport.as_packet_reader())
-                .await?;
-        }
-        self.drain_active_row_tail().await?;
         if self.current_metadata.is_none() {
             return Err(UsageError(
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
             ));
         }
+
+        match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
+            ActiveRowReadState::Idle => {}
+            ActiveRowReadState::RowPaused(pause_state) => {
+                return self.resume_row_loop(pause_state, writer).await;
+            }
+            ActiveRowReadState::PlpPaused(plp_state) => {
+                let mut plp_state = plp_state;
+                let mut buffer = [0u8; 8192];
+                while !plp_state.reached_end() {
+                    let start = Instant::now();
+                    let read = self
+                        .transport
+                        .read_active_plp_bytes(
+                            &mut plp_state,
+                            self.remaining_request_timeout,
+                            self.cancel_handle.as_ref(),
+                            &mut buffer,
+                        )
+                        .await?;
+                    self.update_remaining_timeout(start);
+
+                    if read == 0 && !plp_state.reached_end() {
+                        return Err(crate::error::Error::ProtocolError(
+                            "Active PLP drain made no progress before end-of-stream".to_string(),
+                        ));
+                    }
+                }
+                return self
+                    .resume_row_loop(plp_state.row_pause_state, writer)
+                    .await;
+            }
+        }
+
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
         let decryptor = self.resolve_cell_decryptor(&metadata).await?;
         let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
@@ -2299,79 +2158,132 @@ impl TdsClient {
                     info!("Row Received");
                     return Ok(true);
                 }
-                RowReadResult::Token(token) => match token {
-                    Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
-                        info!("done while get_next_row: {:?}", done);
-
-                        if done.has_error() {
-                            return Err(crate::error::Error::ProtocolError(
-                                "Server reported error in DONE token without preceding ERROR token"
-                                    .to_string(),
-                            ));
-                        }
-
-                        let count = self.count_map.entry(done.cur_cmd).or_insert(0);
-                        *count = count.saturating_add(done.row_count);
-
-                        self.current_result_set_has_been_read_till_end = true;
-                        if !done.has_more() {
-                            info!("No more rows for current command: {:?}", done.cur_cmd);
-                            self.execution_context.set_has_open_batch(false);
-                        }
-                        return Ok(false);
+                RowReadResult::RowPaused(pause_state) => {
+                    self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+                    return Ok(true);
+                }
+                RowReadResult::PlpPaused(plp_state) => {
+                    self.active_row_read_state = ActiveRowReadState::PlpPaused(plp_state);
+                    return Ok(true);
+                }
+                RowReadResult::Token(token) => {
+                    if let Some(has_row) = self.handle_row_read_token(token).await? {
+                        return Ok(has_row);
                     }
-                    Tokens::Order(order_token) => {
-                        info!(?order_token);
-                        continue;
-                    }
-                    Tokens::EnvChange(env_change) => {
-                        info!(?env_change);
-                        if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                            self.recovery_context.session_state_table.reset();
-                        }
-                        self.execution_context
-                            .capture_change_property(&env_change, &mut self.negotiated_settings)?;
-                        continue;
-                    }
-                    Tokens::SessionState(session_state) => {
-                        self.recovery_context
-                            .process_session_state(&session_state)?;
-                        continue;
-                    }
-                    Tokens::ReturnValue(return_value_token) => {
-                        let return_value = return_value_token.into();
-                        self.return_values.push(return_value);
-                        continue;
-                    }
-                    Tokens::Error(error_token) => {
-                        info!(?error_token);
-                        let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
-                        let drain_errors = self.drain_stream().await?;
-                        all_errors.extend(drain_errors);
-                        return Err(crate::error::Error::from_sql_errors(all_errors));
-                    }
-                    Tokens::ColMetadata(_) => {
-                        return Err(crate::error::Error::UsageError(
-                            "Unexpected ColMetadata token encountered while reading rows. \
-                             This typically indicates the API was not used correctly - \
-                             you may need to call move_to_next() to advance to the next result set."
-                                .to_string(),
-                        ));
-                    }
-                    Tokens::Info(info_token) => {
-                        info!(?info_token);
-                        continue;
-                    }
-                    Tokens::TabName | Tokens::ColInfo => {
-                        continue;
-                    }
-                    _ => {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "Unexpected token while finding the next row: {token:?}"
-                        )));
-                    }
-                },
+                }
             }
+        }
+    }
+
+    async fn resume_row_loop(
+        &mut self,
+        pause_state: RowPauseState,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<bool> {
+        let current = pause_state;
+        let start = Instant::now();
+        let result = self
+            .transport
+            .resume_row_into(
+                current,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+                writer,
+            )
+            .await?;
+        self.update_remaining_timeout(start);
+        match result {
+            RowReadResult::RowWritten => {
+                writer.end_row();
+                info!("Row Received");
+                Ok(true)
+            }
+            RowReadResult::RowPaused(next_pause) => {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(next_pause);
+                Ok(true)
+            }
+            RowReadResult::PlpPaused(plp_state) => {
+                self.active_row_read_state = ActiveRowReadState::PlpPaused(plp_state);
+                Ok(true)
+            }
+            RowReadResult::Token(token) => {
+                if let Some(has_row) = self.handle_row_read_token(token).await? {
+                    Ok(has_row)
+                } else {
+                    Err(crate::error::Error::ProtocolError(
+                        "Unexpected token during row resume".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn handle_row_read_token(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
+        match token {
+            Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
+                info!("done while get_next_row: {:?}", done);
+
+                if done.has_error() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "Server reported error in DONE token without preceding ERROR token"
+                            .to_string(),
+                    ));
+                }
+
+                let count = self.count_map.entry(done.cur_cmd).or_insert(0);
+                *count = count.saturating_add(done.row_count);
+
+                self.current_result_set_has_been_read_till_end = true;
+                if !done.has_more() {
+                    info!("No more rows for current command: {:?}", done.cur_cmd);
+                    self.execution_context.set_has_open_batch(false);
+                }
+                Ok(Some(false))
+            }
+            Tokens::Order(order_token) => {
+                info!(?order_token);
+                Ok(None)
+            }
+            Tokens::EnvChange(env_change) => {
+                info!(?env_change);
+                if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                    self.recovery_context.session_state_table.reset();
+                }
+                self.execution_context
+                    .capture_change_property(&env_change, &mut self.negotiated_settings)?;
+                Ok(None)
+            }
+            Tokens::SessionState(session_state) => {
+                self.recovery_context
+                    .process_session_state(&session_state)?;
+                Ok(None)
+            }
+            Tokens::ReturnValue(return_value_token) => {
+                let return_value = return_value_token.into();
+                self.return_values.push(return_value);
+                Ok(None)
+            }
+            Tokens::Error(error_token) => {
+                info!(?error_token);
+                let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
+                let drain_errors = self.drain_stream().await?;
+                all_errors.extend(drain_errors);
+                Err(crate::error::Error::from_sql_errors(all_errors))
+            }
+            Tokens::ColMetadata(_) => Err(crate::error::Error::UsageError(
+                "Unexpected ColMetadata token encountered while reading rows. \
+                     This typically indicates the API was not used correctly - \
+                     you may need to call move_to_next() to advance to the next result set."
+                    .to_string(),
+            )),
+            Tokens::Info(info_token) => {
+                info!(?info_token);
+                Ok(None)
+            }
+            Tokens::TabName | Tokens::ColInfo => Ok(None),
+            _ => Err(crate::error::Error::ProtocolError(format!(
+                "Unexpected token while finding the next row: {token:?}"
+            ))),
         }
     }
 
@@ -2417,292 +2329,9 @@ impl TdsClient {
         self.return_values.clear();
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
+        self.active_row_read_state = ActiveRowReadState::Idle;
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
-        self.active_plp_stream = None;
-        self.active_row_tail = None;
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // PLP column streaming – incremental read support for msodbcsql style PLP streaming
-    // -----------------------------------------------------------------------
-
-    /// Reads the next row token boundary and returns `column_index` from that row.
-    ///
-    /// Any columns before `column_index` in the same row are decoded and discarded to
-    /// position the transport at the requested column. Remaining columns stay resumable
-    /// in the active row so callers can continue with [`read_column`](Self::read_column).
-    ///
-    /// Why this exists: ODBC-style incremental APIs (for example, SQLGetData)
-    /// often read only selected columns and may stream PLP payloads in chunks.
-    /// This method provides the row-boundary token handling needed to support
-    /// that access pattern without requiring full-row materialization first.
-    /// Returns:
-    /// - `Ok(Some(ColumnReadResult::Value(_)))` for non-PLP values and SQL `NULL`,
-    /// - `Ok(Some(ColumnReadResult::ActivePlpStream))` for non-NULL PLP payloads,
-    /// - `Err(...)` for non-row tokens or invalid metadata/indices.
-    async fn read_next_row_column(
-        &mut self,
-        column_index: usize,
-    ) -> TdsResult<Option<ColumnReadResult>> {
-        self.drain_plp_context_if_any().await?;
-
-        let metadata = Arc::clone(
-            self.current_metadata.as_ref().ok_or(UsageError(
-                "No metadata found while starting a column read. Have you called execute()?"
-                    .to_string(),
-            ))?,
-        );
-
-        if column_index >= metadata.columns.len() {
-            return Err(UsageError(format!(
-                "Column index {column_index} out of bounds for result set with {} columns",
-                metadata.columns.len()
-            )));
-        }
-
-        let target_col = metadata.columns[column_index].clone();
-        let row_columns = metadata.columns.clone();
-        let trailing_columns = if column_index + 1 < row_columns.len() {
-            row_columns[column_index + 1..].to_vec()
-        } else {
-            Vec::new()
-        };
-        let parser_context = ParserContext::ColumnMetadata(Arc::clone(&metadata), None);
-        let parser_registry = GenericTokenParserRegistry::default();
-
-        loop {
-            let token_type_byte = self.transport.as_packet_reader().read_byte().await?;
-            let token_type: TokenType = token_type_byte.try_into()?;
-            match token_type {
-                TokenType::Row => {
-                    for metadata in row_columns.iter().take(column_index) {
-                        self.decode_and_discard_column(metadata).await?;
-                    }
-
-                    let value = self.read_positioned_column(&target_col).await?;
-                    if !trailing_columns.is_empty() {
-                        self.active_row_tail = Some(ActiveRowTail {
-                            first_column_index: column_index + 1,
-                            next_column_index: column_index + 1,
-                            columns: trailing_columns,
-                            nbc_null_bitmap: None,
-                        });
-                    }
-                    return Ok(Some(value));
-                }
-                TokenType::NbcRow => {
-                    let bitmap_len = row_columns.len().div_ceil(8);
-                    let mut bitmap = vec![0u8; bitmap_len];
-                    self.transport
-                        .as_packet_reader()
-                        .read_bytes(&mut bitmap)
-                        .await?;
-
-                    for (idx, metadata) in row_columns.iter().take(column_index).enumerate() {
-                        if Self::nbc_column_is_null(&bitmap, idx) {
-                            continue;
-                        }
-                        self.decode_and_discard_column(metadata).await?;
-                    }
-
-                    if !trailing_columns.is_empty() {
-                        self.active_row_tail = Some(ActiveRowTail {
-                            first_column_index: column_index + 1,
-                            next_column_index: column_index + 1,
-                            columns: trailing_columns,
-                            nbc_null_bitmap: Some(bitmap.clone()),
-                        });
-                    }
-
-                    if Self::nbc_column_is_null(&bitmap, column_index) {
-                        return Ok(Some(ColumnReadResult::Value(ColumnValues::Null)));
-                    }
-
-                    let value = self.read_positioned_column(&target_col).await?;
-                    return Ok(Some(value));
-                }
-                other => {
-                    let packet_reader = self.transport.as_packet_reader();
-                    let mut reader = packet_reader;
-                    let token =
-                        dispatch_token(&mut reader, &parser_registry, other, &parser_context)
-                            .await?;
-
-                    match token {
-                        Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
-                            if done.has_error() {
-                                return Err(crate::error::Error::ProtocolError(
-                                    "Server reported error in DONE token without preceding ERROR token"
-                                        .to_string(),
-                                ));
-                            }
-
-                            let count = self.count_map.entry(done.cur_cmd).or_insert(0);
-                            *count = count.saturating_add(done.row_count);
-
-                            self.current_result_set_has_been_read_till_end = true;
-                            if !done.has_more() {
-                                self.execution_context.set_has_open_batch(false);
-                            }
-                            return Ok(None);
-                        }
-                        Tokens::Order(order_token) => {
-                            info!(?order_token);
-                            continue;
-                        }
-                        Tokens::EnvChange(env_change) => {
-                            info!(?env_change);
-                            if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                                self.recovery_context.session_state_table.reset();
-                            }
-                            self.execution_context.capture_change_property(
-                                &env_change,
-                                &mut self.negotiated_settings,
-                            )?;
-                            continue;
-                        }
-                        Tokens::SessionState(session_state) => {
-                            self.recovery_context
-                                .process_session_state(&session_state)?;
-                            continue;
-                        }
-                        Tokens::ReturnValue(return_value_token) => {
-                            let return_value = return_value_token.into();
-                            self.return_values.push(return_value);
-                            continue;
-                        }
-                        Tokens::Error(error_token) => {
-                            let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
-                            let drain_errors = self.drain_stream().await?;
-                            all_errors.extend(drain_errors);
-                            return Err(crate::error::Error::from_sql_errors(all_errors));
-                        }
-                        Tokens::ColMetadata(_) => {
-                            return Err(crate::error::Error::UsageError(
-                                "Unexpected ColMetadata token encountered while reading rows. \
-                                 This typically indicates the API was not used correctly - \
-                                 you may need to call move_to_next() to advance to the next result set."
-                                    .to_string(),
-                            ));
-                        }
-                        Tokens::Info(info_token) => {
-                            info!(?info_token);
-                            continue;
-                        }
-                        _ => {
-                            return Err(crate::error::Error::ProtocolError(format!(
-                                "Unexpected token while finding the next row: {token:?}"
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Reads `column_index` from the active row when present, otherwise from the next row.
-    ///
-    /// If a prior column in the current row was already consumed, this resumes the same
-    /// row, skips any intervening columns, and reads the requested later column.
-    /// Otherwise it advances to the next row and reads that column there.
-    ///
-    /// Why this exists: this is the incremental read API used for sparse,
-    /// forward-only column access and PLP chunk streaming while preserving
-    /// compatibility with existing row-mode iteration (`next_row`).
-    ///
-    /// Returns:
-    /// - `Ok(None)` when no next row is available,
-    /// - `Ok(Some(ColumnReadResult::Value(_)))` for non-PLP values and SQL `NULL`,
-    /// - `Ok(Some(ColumnReadResult::ActivePlpStream))` for non-NULL PLP payloads.
-    pub async fn read_column(
-        &mut self,
-        column_index: usize,
-    ) -> TdsResult<Option<ColumnReadResult>> {
-        if let Some(mut prev) = self.active_plp_stream.take()
-            && !prev.reached_end()
-        {
-            prev.skip_to_end(self.transport.as_packet_reader()).await?;
-        }
-
-        if self.active_row_tail.is_some() {
-            return self.read_column_from_active_row(column_index).await;
-        }
-
-        self.read_next_row_column(column_index).await
-    }
-
-    /// Reads the 8-byte PLP length/sentinel header at the current transport
-    /// position and begins an incremental PLP column read.
-    async fn begin_positioned_plp_column_stream(
-        &mut self,
-        metadata: &ColumnMetadata,
-    ) -> TdsResult<bool> {
-        if let Some(mut prev) = self.active_plp_stream.take()
-            && !prev.reached_end()
-        {
-            prev.skip_to_end(self.transport.as_packet_reader()).await?;
-        }
-        let stream = crate::datatypes::decoder::PlpColumnStream::begin(
-            metadata,
-            self.transport.as_packet_reader(),
-        )
-        .await?;
-        let is_non_null = stream.is_some();
-        self.active_plp_stream = stream;
-        Ok(is_non_null)
-    }
-
-    /// Reads the next slice of bytes from the active PLP stream into `out`.
-    ///
-    /// Returns the number of bytes written. Returns `0` when the stream is
-    /// exhausted (`reached_end` is `true`).
-    ///
-    /// Returns [`UsageError`](crate::error::Error::UsageError) if no stream is
-    /// active — call [`read_column`](Self::read_column) first.
-    pub async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
-        let mut stream = match self.active_plp_stream.take() {
-            Some(s) => s,
-            None => return Err(UsageError(
-                "read_active_plp_bytes called with no active PLP stream; call read_column first"
-                    .to_string(),
-            )),
-        };
-        let result = stream
-            .read_into(self.transport.as_packet_reader(), out)
-            .await;
-        self.active_plp_stream = Some(stream);
-        let bytes_read = result?;
-
-        Ok(bytes_read)
-    }
-
-    /// Returns `true` after all payload bytes and the terminator of the active
-    /// PLP stream have been consumed, or when no stream is active.
-    pub fn active_plp_reached_end(&self) -> bool {
-        self.active_plp_stream
-            .as_ref()
-            .map(|s| s.reached_end())
-            .unwrap_or(true)
-    }
-
-    /// Returns the [`SqlCollation`](crate::token::tokens::SqlCollation) of the
-    /// active PLP column if the metadata carried one, or `None` otherwise.
-    pub fn active_plp_collation(&self) -> Option<crate::token::tokens::SqlCollation> {
-        self.active_plp_stream.as_ref().and_then(|s| s.collation())
-    }
-
-    /// Discards all remaining payload bytes and the terminator of the active
-    /// PLP stream. Clears the active stream slot afterward.
-    pub async fn skip_active_plp_to_end(&mut self) -> TdsResult<()> {
-        if let Some(mut stream) = self.active_plp_stream.take()
-            && !stream.reached_end()
-        {
-            stream
-                .skip_to_end(self.transport.as_packet_reader())
-                .await?;
-        }
         Ok(())
     }
 
@@ -3020,6 +2649,18 @@ impl ResultSet for TdsClient {
         }
     }
 
+    async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        TdsClient::read_active_plp_bytes(self, out).await
+    }
+
+    fn active_plp_reached_end(&self) -> bool {
+        TdsClient::active_plp_reached_end(self)
+    }
+
+    fn active_plp_collation(&self) -> Option<SqlCollation> {
+        TdsClient::active_plp_collation(self)
+    }
+
     fn maybe_has_unread_rows(&self) -> bool {
         !self.current_result_set_has_been_read_till_end
     }
@@ -3092,6 +2733,19 @@ pub trait ResultSet {
     /// a row was written or `false` when the result set is exhausted.
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool>;
 
+    /// Reads bytes from the active PLP stream captured after a `PlpPaused` result from
+    /// `next_row_into`. The caller must drain the stream to completion before calling
+    /// `next_row_into` again.
+    async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize>;
+
+    /// Returns `true` when the active PLP stream has been fully consumed or when
+    /// there is no active PLP stream.
+    fn active_plp_reached_end(&self) -> bool;
+
+    /// Returns the TDS collation for the active PLP string stream, or `None` for
+    /// binary types or when there is no active PLP stream.
+    fn active_plp_collation(&self) -> Option<SqlCollation>;
+
     /// Returns `true` if the result set may still contain unread rows.
     fn maybe_has_unread_rows(&self) -> bool;
 
@@ -3127,7 +2781,9 @@ mod tests {
     use crate::core::{CancelHandle, TdsResult};
     use crate::datatypes::row_writer::RowWriter;
     use crate::io::reader_writer::{NetworkReader, NetworkWriter};
-    use crate::io::token_stream::{ParserContext, RowReadResult, TdsTokenStreamReader};
+    use crate::io::token_stream::{
+        ParserContext, RowPauseState, RowReadResult, TdsTokenStreamReader,
+    };
     use crate::token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, Tokens};
     use async_trait::async_trait;
     use std::collections::VecDeque;
@@ -3180,6 +2836,26 @@ mod tests {
             _cancel_handle: Option<&CancelHandle>,
             _writer: &mut (dyn RowWriter + Send),
         ) -> TdsResult<RowReadResult> {
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+
+        async fn resume_row_into(
+            &mut self,
+            _pause_state: RowPauseState,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+            _writer: &mut (dyn RowWriter + Send),
+        ) -> TdsResult<RowReadResult> {
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+
+        async fn read_active_plp_bytes(
+            &mut self,
+            _plp_state: &mut PlpPauseState,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+            _out: &mut [u8],
+        ) -> TdsResult<usize> {
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
     }
@@ -3242,11 +2918,6 @@ mod tests {
         }
         fn is_connection_dead(&self) -> bool {
             true
-        }
-        fn as_packet_reader(
-            &mut self,
-        ) -> &mut (dyn crate::io::packet_reader::TdsPacketReader + Send + Sync) {
-            self
         }
     }
 
@@ -3413,6 +3084,45 @@ mod tests {
             TdsClient::timeout_to_duration(Some(30)),
             Some(Duration::from_secs(30))
         );
+    }
+
+    // ── PLP streaming lifecycle contract tests ──
+
+    #[tokio::test]
+    async fn plp_read_bytes_no_active_stream_returns_zero() {
+        let mut client = create_test_client();
+        let mut buf = [0u8; 4];
+
+        let read = client.read_active_plp_bytes(&mut buf).await.unwrap();
+
+        assert_eq!(read, 0);
+    }
+
+    #[test]
+    fn plp_reached_end_returns_true_when_no_stream_active() {
+        let client = create_test_client();
+
+        assert!(client.active_plp_reached_end());
+    }
+
+    #[test]
+    fn plp_collation_returns_none_when_no_stream_active() {
+        let client = create_test_client();
+
+        assert!(client.active_plp_collation().is_none());
+    }
+
+    #[test]
+    fn plp_helpers_treat_non_plp_row_pause_as_no_active_stream() {
+        let mut client = create_test_client();
+        client.active_row_read_state = ActiveRowReadState::RowPaused(RowPauseState {
+            next_column_index: 1,
+            columns: Vec::new(),
+            nbc_null_bitmap: None,
+        });
+
+        assert!(client.active_plp_reached_end());
+        assert!(client.active_plp_collation().is_none());
     }
 
     // ── Reconnection orchestration tests ──
@@ -3645,39 +3355,6 @@ mod tests {
         let mut client = create_test_client();
         client.recovery_context.recovery_count = 3;
         assert_eq!(client.connection_recovery_count(), 3);
-    }
-
-    // ── PLP streaming lifecycle contract tests ──
-
-    #[tokio::test]
-    async fn plp_read_bytes_no_active_stream_returns_usage_error() {
-        let mut client = create_test_client();
-        let mut buf = [0u8; 4];
-        let err = client.read_active_plp_bytes(&mut buf).await.unwrap_err();
-        assert!(
-            err.to_string().contains("read_column"),
-            "Expected UsageError mentioning read_column, got: {err}"
-        );
-    }
-
-    #[test]
-    fn plp_reached_end_returns_true_when_no_stream_active() {
-        let client = create_test_client();
-        assert!(client.active_plp_reached_end());
-    }
-
-    #[tokio::test]
-    async fn plp_skip_to_end_is_noop_when_no_stream_active() {
-        let mut client = create_test_client();
-        // Should succeed silently with no stream active.
-        client.skip_active_plp_to_end().await.unwrap();
-        assert!(client.active_plp_reached_end());
-    }
-
-    #[test]
-    fn plp_collation_returns_none_when_no_stream_active() {
-        let client = create_test_client();
-        assert!(client.active_plp_collation().is_none());
     }
 
     // ── execute() / current_metadata invariants ──

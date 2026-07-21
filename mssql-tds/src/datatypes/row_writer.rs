@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use crate::core::TdsResult;
 use crate::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
@@ -9,6 +10,7 @@ use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sql_json::SqlJson;
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sql_vector::SqlVector;
+use crate::token::tokens::SqlCollation;
 use uuid::Uuid;
 
 /// Pluggable decode sink for TDS row data.
@@ -17,6 +19,38 @@ use uuid::Uuid;
 /// enabling consumers (Arrow writers, N-API binary encoders, etc.) to
 /// receive values without going through the intermediate `ColumnValues` enum.
 pub trait RowWriter {
+    /// Returns `true` to pause row decoding after reading column `col`.
+    ///
+    /// Writers that need incremental column fetch behavior (for example,
+    /// ODBC-oriented row writers) should override this method and return `true`
+    /// at the appropriate column boundaries.
+    fn pause_after_column(&self, _col: usize) -> bool {
+        false
+    }
+
+    /// Reads bytes from the currently active PLP stream owned by this writer.
+    ///
+    /// Writers that support incremental PLP reads (for example an ODBC-facing
+    /// writer serving `SQLGetData`) should override this and return the number
+    /// of bytes copied into `out`.
+    fn read_active_plp_bytes(&mut self, _out: &mut [u8]) -> TdsResult<usize> {
+        Ok(0)
+    }
+
+    /// Returns `true` when the current active PLP stream has reached EOF.
+    ///
+    /// Writers that do not expose incremental PLP reads can keep the default.
+    fn active_plp_reached_end(&self) -> bool {
+        true
+    }
+
+    /// Returns the collation for the current active PLP stream, if any.
+    ///
+    /// For binary PLP values, this remains `None`.
+    fn active_plp_collation(&self) -> Option<SqlCollation> {
+        None
+    }
+
     /// Writes a SQL `NULL` for column `col`.
     fn write_null(&mut self, col: usize);
     /// Writes a `bit` value.
