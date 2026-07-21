@@ -284,6 +284,20 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_skips_doubled_double_quote_in_identifier() {
+        let (out, n) = rewrite_param_markers("SELECT \"a\"\"?\"\"b\" WHERE x = ?");
+        assert_eq!(out, "SELECT \"a\"\"?\"\"b\" WHERE x = @P1");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rewrite_skips_doubled_bracket_in_identifier() {
+        let (out, n) = rewrite_param_markers("SELECT [a]]?]]b] WHERE x = ?");
+        assert_eq!(out, "SELECT [a]]?]]b] WHERE x = @P1");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
     fn rewrite_skips_line_comment() {
         let (out, n) = rewrite_param_markers("SELECT 1 -- ? not a param\nWHERE x = ?");
         assert_eq!(out, "SELECT 1 -- ? not a param\nWHERE x = @P1");

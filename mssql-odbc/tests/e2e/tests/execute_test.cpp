@@ -509,3 +509,99 @@ TEST_F(PrepareExecuteLiveTest, FailedReprepareKeepsStatementUsable) {
     EXPECT_EQ("2", GetColumnChar(1));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
+
+// A prepared parameterized DML statement runs via sp_prepexec on the first
+// execute and reuses the cached handle via sp_execute on the next. Every other
+// parameterized prepared test is a SELECT; this is the only one that drives the
+// no-result-set finish path (drain + prepared-handle capture at DDL/DML finish)
+// with parameters.
+TEST_F(PrepareExecuteLiveTest, PreparedParamDmlReusesHandle) {
+    ExecDirect("CREATE TABLE #nums (v INT)");
+
+    ASSERT_SQL_OK(Prepare("INSERT INTO #nums (v) VALUES (CAST(? AS INT))"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // Fixed-capacity buffer bound once; its address stays stable across executes.
+    std::vector<SQLCHAR> value(16, 0);
+    SQLLEN ind = SQL_NTS;
+    ASSERT_SQL_OK(BindChar(1, value, ind), SQL_HANDLE_STMT, stmt_);
+
+    // First execute prepares (sp_prepexec); the second reuses the plan
+    // (sp_execute). A DML statement opens no cursor, so no close between executes.
+    for (const char* n : {"10", "20"}) {
+        std::memset(value.data(), 0, value.size());
+        std::memcpy(value.data(), n, std::strlen(n) + 1);
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+
+    // Both rows landed.
+    ASSERT_SQL_OK(Prepare("SELECT SUM(v) FROM #nums"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("30", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// SQLExecDirect on a statement that still holds an orphaned prepared handle must
+// release it via sp_unprepare before running the batch. Every other ExecDirect
+// test runs on a fresh statement where the pending drop is empty, so this is the
+// only path that exercises that release actually firing.
+TEST_F(PrepareExecuteLiveTest, ExecDirectReleasesOrphanedPreparedHandle) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    std::vector<SQLCHAR> first = {'f', 'i', 'r', 's', 't', '\0'};
+    SQLLEN ind1 = SQL_NTS;
+    ASSERT_SQL_OK(BindChar(1, first, ind1), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("first", GetColumnChar(1));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Rebind orphans the cached prepared handle, queuing it for release.
+    std::vector<SQLCHAR> second = {'s', 'e', 'c', 'o', 'n', 'd', '\0'};
+    SQLLEN ind2 = SQL_NTS;
+    ASSERT_SQL_OK(BindChar(1, second, ind2), SQL_HANDLE_STMT, stmt_);
+
+    // SQLExecDirect supersedes the prepared plan: it must sp_unprepare the
+    // orphaned handle and stay healthy (the bound param is ignored — no marker).
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 42 AS v");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("42", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A prepared parameterized SELECT that matches multiple rows exercises the fetch
+// loop under a cached plan; a re-execute with a narrower bound value reuses the
+// handle (sp_execute) and returns fewer rows.
+TEST_F(PrepareExecuteLiveTest, PreparedParamSelectMultipleRows) {
+    ExecDirect("CREATE TABLE #ids (id INT)");
+    ExecDirect("INSERT INTO #ids VALUES (1), (2), (3)");
+
+    ASSERT_SQL_OK(Prepare("SELECT id FROM #ids WHERE id <= CAST(? AS INT) ORDER BY id"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    std::vector<SQLCHAR> value(16, 0);
+    SQLLEN ind = SQL_NTS;
+    ASSERT_SQL_OK(BindChar(1, value, ind), SQL_HANDLE_STMT, stmt_);
+
+    std::memcpy(value.data(), "3", 2);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    for (const char* expected : {"1", "2", "3"}) {
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(expected, GetColumnChar(1));
+    }
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Re-execute reuses the cached plan via sp_execute with a narrower bound.
+    std::memset(value.data(), 0, value.size());
+    std::memcpy(value.data(), "2", 2);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    for (const char* expected : {"1", "2"}) {
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(expected, GetColumnChar(1));
+    }
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}

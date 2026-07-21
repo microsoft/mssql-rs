@@ -317,4 +317,51 @@ mod tests {
         assert!(!is_valid_conversion(SQL_C_CHAR, SQL_INTEGER));
         assert!(!is_valid_conversion(SQL_C_LONG, SQL_INTEGER));
     }
+
+    #[test]
+    fn default_param_indicator_is_rejected() {
+        let mut ind: SqlLen = SQL_DEFAULT_PARAM;
+        let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
+        let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+        assert_eq!(err, ParamConvError::DefaultParamUnsupported);
+    }
+
+    #[test]
+    fn null_indicator_wchar_yields_typed_null() {
+        let mut ind: SqlLen = SQL_NULL_DATA;
+        let p = param(SQL_C_WCHAR, std::ptr::null_mut(), &mut ind);
+        let value = unsafe { bound_param_to_value(&p) }.unwrap();
+        assert!(matches!(value, SqlType::NVarcharMax(None)));
+    }
+
+    #[test]
+    fn null_indicator_unsupported_c_type_is_rejected() {
+        let mut ind: SqlLen = SQL_NULL_DATA;
+        let p = param(SQL_C_LONG, std::ptr::null_mut(), &mut ind);
+        let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+        assert_eq!(err, ParamConvError::UnsupportedCType(SQL_C_LONG));
+    }
+
+    #[test]
+    fn read_char_bytes_edge_cases() {
+        assert!(unsafe { read_char_bytes(std::ptr::null(), 5) }.is_empty());
+        let buf = b"abc";
+        // Negative (non-NTS) length yields no bytes.
+        assert!(unsafe { read_char_bytes(buf.as_ptr(), -5) }.is_empty());
+        // Explicit positive length reads exactly that many bytes.
+        assert_eq!(unsafe { read_char_bytes(buf.as_ptr(), 3) }, b"abc");
+    }
+
+    #[test]
+    fn read_wchar_bytes_edge_cases() {
+        assert!(unsafe { read_wchar_bytes(std::ptr::null(), 5) }.is_empty());
+        let units: Vec<u16> = "hi".encode_utf16().chain(std::iter::once(0)).collect();
+        // SQL_NTS reads u16 units up to the NUL terminator.
+        assert_eq!(
+            unsafe { read_wchar_bytes(units.as_ptr(), SQL_NTS as SqlLen) },
+            vec![b'h', 0, b'i', 0]
+        );
+        // Negative (non-NTS) length yields no bytes.
+        assert!(unsafe { read_wchar_bytes(units.as_ptr(), -5) }.is_empty());
+    }
 }
