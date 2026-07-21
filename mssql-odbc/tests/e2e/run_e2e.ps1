@@ -8,10 +8,15 @@
 # (or manual registry edits) is required. See run_e2e.sh for Linux/macOS.
 #
 # Requires: Administrator privileges (writes to HKLM).
-# Usage: .\run_e2e.ps1 [-Release]
+# Usage: .\run_e2e.ps1 [-Release] [-Retries N]
+#
+# -Retries N reruns each failing test up to N extra times (ctest
+# --repeat until-pass:N+1). A test that passes on any attempt counts as a
+# pass; the suite only fails if a test still fails after all retries.
 
 param(
-    [switch]$Release
+    [switch]$Release,
+    [int]$Retries = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -88,7 +93,19 @@ try {
     }
     Pop-Location
 
-    $DriverPath = Join-Path $WorkspaceDir "target\$BuildType\msodbcsql18.dll"
+    # Cargo builds into the workspace root's target/ by default, but honors
+    # CARGO_TARGET_DIR (set by CI). Resolve via `cargo metadata` so the driver is
+    # found regardless of where it landed.
+    $TargetDir = $null
+    Push-Location $OdbcCrateDir
+    try {
+        $meta = cargo metadata --format-version 1 --no-deps 2>$null | ConvertFrom-Json
+        if ($meta -and $meta.target_directory) { $TargetDir = $meta.target_directory }
+    } catch { }
+    Pop-Location
+    if (-not $TargetDir) { $TargetDir = Join-Path $WorkspaceDir "target" }
+
+    $DriverPath = Join-Path $TargetDir "$BuildType\msodbcsql18.dll"
     if (-not (Test-Path $DriverPath)) {
         Write-Error "Driver not found at $DriverPath"
     }
@@ -109,9 +126,20 @@ try {
     Write-Host ""
     Write-Host "=== Running e2e tests ==="
     Push-Location build
-    ctest --output-on-failure -C Debug
+    $ctestArgs = @('--output-on-failure', '-C', 'Debug', '--output-junit', 'junit-mssql-odbc.xml')
+    if ($Retries -gt 0) {
+        # until-pass:N runs a failing test up to N times total, so N retries = N+1.
+        $ctestArgs += @('--repeat', "until-pass:$($Retries + 1)")
+        Write-Host "Retries enabled: each failing test reruns up to $Retries time(s)."
+    }
+    ctest @ctestArgs
+    $ctestExit = $LASTEXITCODE
     Pop-Location
     Pop-Location
+
+    if ($ctestExit -ne 0) {
+        throw "e2e tests FAILED (ctest exit $ctestExit)"
+    }
 
     Write-Host ""
     Write-Host "=== e2e tests passed ==="

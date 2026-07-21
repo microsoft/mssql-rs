@@ -24,6 +24,19 @@ on:
   pull_request:
     branches:
       - main
+    # Mirror the ADO PR validation build policy path excludes so this coverage
+    # report is skipped when that build is skipped (otherwise it fails waiting
+    # for a build that never runs). The issue_comment `/coverage` path below is
+    # unaffected and can still be used to run the report manually.
+    paths-ignore:
+      - 'docs/**'
+      - '.github/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - 'es-metadata.yml'
   issue_comment:
     types:
       - created

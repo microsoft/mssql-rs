@@ -1,0 +1,45 @@
+name: PR Linked Issue Check
+
+# Ensures every pull request references either a GitHub issue or an Azure
+# DevOps work item in its description, mirroring the check used in
+# microsoft/mssql-python.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Validate linked GitHub issue or ADO work item
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+
+            const githubIssueLinkPattern =
+              /(https:\/\/github\.com\/microsoft\/mssql-rs\/issues\/\d+|#\d+)/i;
+            const azureWorkItemLinkPattern =
+              /https:\/\/sqlclientdrivers\.visualstudio\.com\/(?:[^\/\s]+\/)+_workitems\/edit\/\d+/i;
+
+            const hasGitHubIssueLink = githubIssueLinkPattern.test(body);
+            const hasWorkItemLink = azureWorkItemLinkPattern.test(body);
+
+            if (!hasGitHubIssueLink && !hasWorkItemLink) {
+              core.setFailed(
+                '❌ PR must reference either a GitHub issue OR an Azure DevOps work item in its description.\n' +
+                'GitHub issue format: https://github.com/microsoft/mssql-rs/issues/XXX or #XXX\n' +
+                'ADO work item format: https://sqlclientdrivers.visualstudio.com/.../_workitems/edit/<ID>\n' +
+                'Please add at least one reference under the "## Related Issues" section.'
+              );
+              return;
+            }
+
+            core.info('✅ PR references a GitHub issue or ADO work item.');

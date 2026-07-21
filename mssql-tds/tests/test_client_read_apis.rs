@@ -632,7 +632,8 @@ mod client_based_iterators {
         );
 
         // Verify multiple errors are collected in the error variant
-        if let mssql_tds::error::Error::SqlServerError { errors } = &err {
+        if let mssql_tds::error::Error::SqlServerError { diagnostics } = &err {
+            let errors = &diagnostics.errors;
             assert_eq!(
                 errors.len(),
                 2,
@@ -681,7 +682,8 @@ mod client_based_iterators {
 
         // SQL Server may abort batch after first object-resolution failure,
         // so we may get 1 or 2 errors depending on server behavior.
-        if let mssql_tds::error::Error::SqlServerError { errors } = result.unwrap_err() {
+        if let mssql_tds::error::Error::SqlServerError { diagnostics } = result.unwrap_err() {
+            let errors = &diagnostics.errors;
             assert!(!errors.is_empty(), "Expected at least one error");
             assert!(
                 errors[0].message.contains("nonexistent_table_abc_1"),
