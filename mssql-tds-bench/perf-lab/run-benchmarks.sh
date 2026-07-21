@@ -303,57 +303,82 @@ regression_ids() {
     ' "$1"
 }
 
-OFFENDERS=$(regression_ids "$RESULTS_DIR/comparison.txt")
-# The table the gate/verdict act on: the full run by default, or the re-measured
-# offenders when auto-confirm runs below.
-GATE_TABLE="$RESULTS_DIR/comparison.txt"
+# Like regression_ids, but prints "id candidate_ratio" so the auto-confirm loop
+# can tally how many re-runs each benchmark tripped and track its worst ratio.
+regression_pairs() {
+    awk -v thr="${BENCH_REGRESSION_RATIO:-1.10}" '
+        $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ && ($6 + 0) >= thr { print $1, $6 }
+    ' "$1"
+}
 
-# --- Auto-confirm regressions (re-measure only the offenders, interleaved) ---
-# A strict gate can trip on a transient single-benchmark outlier. Re-measure ONLY
-# the benchmarks that tripped — interleaved per binary, same as the main run — and
-# keep as a real regression only those that trip AGAIN. Both binaries are already
-# built, so this just replays the offenders (adds only their run time).
+OFFENDERS=$(regression_ids "$RESULTS_DIR/comparison.txt")
+
+# --- Auto-confirm regressions: re-measure the offenders N times, require a
+# --- majority to confirm ---
+# A strict gate can trip on a transient single-benchmark outlier — short,
+# CPU-bound benches (e.g. the decode microbenches) can swing double digits on a
+# shared VM. So re-measure ONLY the benchmarks that tripped — interleaved per
+# binary, same as the main run — several times, and keep as a real regression
+# only those that trip in a MAJORITY of the re-runs. A true regression reproduces
+# consistently; noise does not. Both bench binaries are already built and the
+# offenders are a small subset, so the extra re-runs stay cheap.
+#   BENCH_CONFIRM_RUNS   (default 4)              — number of re-runs
+#   BENCH_CONFIRM_QUORUM (default majority = N/2+1) — re-runs required to confirm
+CONFIRM_RUNS="${BENCH_CONFIRM_RUNS:-4}"
+QUORUM="${BENCH_CONFIRM_QUORUM:-$(( CONFIRM_RUNS / 2 + 1 ))}"
+CONFIRMED_IDS=""
+TALLY_FILE="$RESULTS_DIR/confirm-tally.txt"
+: > "$TALLY_FILE"
+
 if [ -n "$OFFENDERS" ]; then
     FILTER=$(printf '%s\n' "$OFFENDERS" | sed 's|^|^|; s|$|$|' | paste -sd '|' -)
     echo ">>> Gate tripped by: $(printf '%s ' $OFFENDERS)"
-    echo ">>> Auto-confirm: re-measuring only those benchmarks (filter: ${FILTER})"
+    echo ">>> Auto-confirm: re-measuring those benchmark(s) ${CONFIRM_RUNS}x; a regression counts only if it trips in >= ${QUORUM} of ${CONFIRM_RUNS} re-runs."
+    # One warm-up before the loop; the re-runs are back-to-back so caches stay hot.
     warmup_pass "$FILTER"
-    interleave_run candidate_confirm base_confirm "$FILTER"
-    echo ">>> Auto-confirm comparison (base_confirm -> candidate_confirm):"
-    critcmp base_confirm candidate_confirm | tee "$RESULTS_DIR/confirm.txt"
-    GATE_TABLE="$RESULTS_DIR/confirm.txt"
+    for run in $(seq 1 "$CONFIRM_RUNS"); do
+        echo ">>> Auto-confirm re-run ${run}/${CONFIRM_RUNS}..."
+        interleave_run "candidate_confirm${run}" "base_confirm${run}" "$FILTER"
+        critcmp "base_confirm${run}" "candidate_confirm${run}" | tee "$RESULTS_DIR/confirm-run${run}.txt"
+        regression_pairs "$RESULTS_DIR/confirm-run${run}.txt" >> "$TALLY_FILE"
+    done
+    # Confirmed = benchmarks that tripped in at least QUORUM of the re-runs.
+    CONFIRMED_IDS=$(awk '{ print $1 }' "$TALLY_FILE" | sort | uniq -c \
+        | awk -v q="$QUORUM" '$1 >= q { print $2 }')
 fi
 rm -rf "$REPO_ROOT/target-base" 2>/dev/null || true
+
+# Per-offender trip count across the re-runs (0 if it never re-tripped).
+offender_hits() { awk -v id="$1" '$1 == id { c++ } END { print c + 0 }' "$TALLY_FILE"; }
+# Per-offender worst candidate ratio among the re-runs it tripped ("" if none).
+offender_worst() { awk -v id="$1" '$1 == id && $2 + 0 > w { w = $2 + 0 } END { if (w > 0) print w }' "$TALLY_FILE"; }
+
+# --- Verdict (based on the majority-confirmed regressions) ---
+THR="${BENCH_REGRESSION_RATIO:-1.10}"
+PCT=$(awk -v t="$THR" 'BEGIN { printf "%d", (t - 1) * 100 + 0.5 }')
+NCONF=$(printf '%s\n' ${CONFIRMED_IDS:-} | grep -c . || true)
+if [ "${NCONF:-0}" -gt 0 ]; then
+    # Worst confirmed benchmark by its max observed ratio across the re-runs.
+    WLINE=$(for id in $CONFIRMED_IDS; do echo "$(offender_worst "$id") $id $(offender_hits "$id")"; done | sort -rn | head -1)
+    WNAME=$(echo "$WLINE" | awk '{ print $2 }')
+    WPCT=$(echo "$WLINE" | awk '{ printf "%d", ($1 - 1) * 100 + 0.5 }')
+    WHITS=$(echo "$WLINE" | awk '{ print $3 }')
+    VERDICT=$(printf "\342\232\240\357\270\217 %d benchmark(s) consistently slower by >=%d%% vs baseline (worst: %s +%d%%, tripped %s/%s re-runs)" "$NCONF" "$PCT" "$WNAME" "$WPCT" "$WHITS" "$CONFIRM_RUNS")
+else
+    VERDICT=$(printf "\342\234\205 No benchmark consistently slower by >=%d%% vs baseline" "$PCT")
+fi
 
 # Markdown summary — the perf lab attaches results/*.md to the run's Summary tab
 # (task.uploadsummary), so the comparison renders inline on the run page. The
 # critcmp table is fixed-width, so wrap it in a fenced code block to keep it
 # aligned.
-#
-# Verdict acts on the gate table (the re-measured offenders after auto-confirm,
-# or the full run when nothing tripped): the candidate regressed a bench when its
-# ratio (field 6) meets or exceeds the threshold.
-VERDICT=$(awk -v thr="${BENCH_REGRESSION_RATIO:-1.10}" '
-    $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ {
-        cand = $6 + 0
-        if (cand >= thr) { n++; if (cand > worst) { worst = cand; wname = $1 } }
-    }
-    END {
-        pct = int((thr - 1) * 100 + 0.5)
-        if (n > 0)
-            printf "\342\232\240\357\270\217 %d benchmark(s) slower by >=%d%% vs baseline (worst: %s +%d%%)", n, pct, wname, int((worst - 1) * 100 + 0.5)
-        else
-            printf "\342\234\205 No benchmark slower by >=%d%% vs baseline", pct
-    }
-' "$GATE_TABLE")
-
 {
     echo "## mssql-tds perf — base → candidate"
     echo ""
     echo "**${VERDICT}**"
     echo ""
     if [ -n "$OFFENDERS" ]; then
-        echo "_Auto-confirm re-ran the gate-tripping benchmark(s); the verdict reflects that re-measurement. Benchmarks that tripped once but not on the re-run are treated as transient noise._"
+        echo "_Auto-confirm re-measured the initially-tripping benchmark(s) ${CONFIRM_RUNS}× (interleaved, offenders only). A regression is counted only when it trips in at least ${QUORUM} of ${CONFIRM_RUNS} re-runs; a benchmark that spikes once but not consistently is treated as transient noise._"
         echo ""
     fi
     echo "Baseline commit: \`${BASELINE_COMMIT}\`"
@@ -363,13 +388,33 @@ VERDICT=$(awk -v thr="${BENCH_REGRESSION_RATIO:-1.10}" '
     echo '```'
     if [ -n "$OFFENDERS" ]; then
         echo ""
-        echo "### Auto-confirm re-run (offenders only)"
+        echo "### Auto-confirm re-runs (offenders only)"
         echo ""
-        echo "Tripped on the first pass: $(printf '%s ' $OFFENDERS)"
+        echo "Initially tripped: $(printf '%s ' $OFFENDERS)"
         echo ""
-        echo '```'
-        cat "$RESULTS_DIR/confirm.txt"
-        echo '```'
+        echo "| benchmark | re-runs tripped | worst |"
+        echo "|-----------|-----------------|-------|"
+        for id in $OFFENDERS; do
+            hits=$(offender_hits "$id")
+            w=$(offender_worst "$id")
+            if [ -n "$w" ]; then
+                wcell=$(awk -v r="$w" 'BEGIN { printf "+%d%%", (r - 1) * 100 + 0.5 }')
+            else
+                wcell="—"
+            fi
+            echo "| ${id} | ${hits}/${CONFIRM_RUNS} | ${wcell} |"
+        done
+        echo ""
+        echo "_Confirmed (tripped in ≥ ${QUORUM}/${CONFIRM_RUNS}): ${CONFIRMED_IDS:-none}_"
+        echo ""
+        for run in $(seq 1 "$CONFIRM_RUNS"); do
+            echo "#### Re-run ${run}"
+            echo ""
+            echo '```'
+            cat "$RESULTS_DIR/confirm-run${run}.txt"
+            echo '```'
+            echo ""
+        done
     fi
 } > "$RESULTS_DIR/summary.md"
 
@@ -378,15 +423,12 @@ cp -r target/criterion "$RESULTS_DIR/criterion" 2>/dev/null || true
 
 echo ">>> Done. Results in ${RESULTS_DIR}"
 
-# Fail the run only on CONFIRMED regressions (the gate table): the full run when
-# nothing tripped, or the auto-confirm re-run of the offenders. summary.md and
-# the tables above name them.
-CONFIRMED=$(regression_ids "$GATE_TABLE" | grep -c . || true)
-if [ "${CONFIRMED:-0}" -gt 0 ]; then
+# Fail the run only on CONFIRMED regressions (tripped in a majority of re-runs).
+if [ "${NCONF:-0}" -gt 0 ]; then
     echo ">>> ${VERDICT}"
-    echo ">>> FAILING: ${CONFIRMED} benchmark(s) still exceeded the threshold on the auto-confirm re-run (BENCH_REGRESSION_RATIO=${BENCH_REGRESSION_RATIO:-1.10})."
+    echo ">>> FAILING: ${NCONF} benchmark(s) regressed in >= ${QUORUM} of ${CONFIRM_RUNS} auto-confirm re-runs (BENCH_REGRESSION_RATIO=${THR})."
     exit 1
 fi
 if [ -n "$OFFENDERS" ]; then
-    echo ">>> Auto-confirm cleared all $(printf '%s\n' "$OFFENDERS" | grep -c .) initial regression(s) as transient; passing."
+    echo ">>> Auto-confirm cleared all $(printf '%s\n' $OFFENDERS | grep -c .) initial regression(s) as transient (none tripped in >= ${QUORUM}/${CONFIRM_RUNS}); passing."
 fi
