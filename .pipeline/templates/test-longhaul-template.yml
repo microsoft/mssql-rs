@@ -12,6 +12,21 @@ parameters:
   type: number
   default: 1000
 
+- name: testSelector
+  displayName: Pytest selection args (marker/keyword expression)
+  type: string
+  default: '-m "longhaul"'
+
+- name: resultsFile
+  displayName: JUnit results file name
+  type: string
+  default: 'pytest-longhaul-results.xml'
+
+- name: testRunTitle
+  displayName: Test run title
+  type: string
+  default: 'LongHaul-BCP-Test'
+
 steps:
 - template: generate-sql-password-template.yml
   parameters:
@@ -99,17 +114,17 @@ steps:
         python3 -m venv /tmp/longhaul-venv
         source /tmp/longhaul-venv/bin/activate
         
-        # Install dependencies
+        # Install dependencies (pyarrow is required by the Arrow long-haul test)
         pip install --upgrade pip -q
-        pip install maturin pytest pytest-asyncio python-dotenv patchelf -q
+        pip install maturin pytest pytest-asyncio python-dotenv patchelf pyarrow -q
         
         # Build and install mssql-py-core
         echo "Building mssql-py-core..."
         maturin develop
         
-        # Run only longhaul tests
+        # Run only longhaul tests (selection controlled by the caller)
         echo "Starting longhaul test..."
-        pytest tests/ -v -m "longhaul" --ignore=tests/mssql_python --junitxml=pytest-longhaul-results.xml
+        pytest tests/ -v ${{ parameters.testSelector }} --ignore=tests/mssql_python --junitxml=${{ parameters.resultsFile }}
         
         echo "=================================="
         echo "Long-haul test completed!"
@@ -124,8 +139,8 @@ steps:
   displayName: Publish long-haul test results
   inputs:
     testResultsFormat: JUnit
-    testResultsFiles: $(Build.SourcesDirectory)/mssql-py-core/pytest-longhaul-results.xml
-    testRunTitle: LongHaul-BCP-Test
+    testResultsFiles: $(Build.SourcesDirectory)/mssql-py-core/${{ parameters.resultsFile }}
+    testRunTitle: ${{ parameters.testRunTitle }}
 
 - script: |
     docker stop sqlserver || true
