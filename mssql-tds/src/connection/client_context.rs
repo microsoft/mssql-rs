@@ -302,6 +302,28 @@ pub struct ClientContext {
     /// Cache of decrypted column encryption keys, shared across the connection
     /// (and its session-recovery clones) so a CMK only unwraps a CEK once.
     pub(crate) cek_cache: std::sync::Arc<crate::security::keystore::CekCache>,
+    /// Per-server allow-list of trusted column master key (CMK) paths for Always
+    /// Encrypted, keyed by server name (case-insensitive). When a non-empty list
+    /// is configured for the connected server, the driver only unwraps a column
+    /// encryption key whose CMK path is in the list, defending against a
+    /// malicious server that points the client at an attacker-controlled CMK. A
+    /// server with no entry (or an empty list) is unrestricted.
+    ///
+    /// `None` (unrestricted) by default. Boxed behind an `Option` so the common
+    /// case — connections that never opt into trusted paths — costs a single
+    /// pointer (8 bytes) instead of an inline 48-byte `HashMap`. (An
+    /// `Option<HashMap>` alone would not shrink: the map's internal non-null
+    /// pointer gives `Option` a free niche, so it stays 48 bytes — the `Box` is
+    /// what buys the reduction.) Keeping this by-value field small keeps the
+    /// `ClientContext`-carrying connect future off the `clippy::large_futures`
+    /// budget.
+    //
+    // The `#[allow]` is deliberate: `clippy::box_collection` flags `Box<HashMap>`
+    // as redundant heap-on-heap, but here the boxing is the whole point — it
+    // moves the map's 48-byte inline control block off the by-value
+    // `ClientContext` so the connect future stays small.
+    #[allow(clippy::box_collection)]
+    pub(crate) trusted_master_key_paths: Option<Box<HashMap<String, Vec<String>>>>,
     /// UserAgent telemetry payload components.
     pub user_agent: UserAgent,
 }
@@ -379,6 +401,50 @@ impl ClientContext {
             .register(name, provider);
     }
 
+    /// Registers the allow-list of trusted column master key (CMK) paths for
+    /// `server_name`, enabling the Always Encrypted trusted-master-key-path
+    /// check for that server.
+    ///
+    /// When a non-empty list is registered for the connected server, the driver
+    /// only unwraps a column encryption key whose CMK path matches one of the
+    /// listed paths (compared case-insensitively); any other path is rejected.
+    /// This defends against a compromised or malicious server that points the
+    /// client at an attacker-controlled column master key. A server with no
+    /// registered list (or an empty list) is unrestricted, so this is a
+    /// per-server opt-in, matching .NET
+    /// `SqlConnection.ColumnEncryptionTrustedMasterKeyPaths`.
+    ///
+    /// `server_name` is matched case-insensitively against the connected
+    /// server's name (the host portion of the data source).
+    pub fn register_trusted_master_key_paths(
+        &mut self,
+        server_name: impl AsRef<str>,
+        key_paths: Vec<String>,
+    ) {
+        self.trusted_master_key_paths
+            .get_or_insert_with(|| Box::new(HashMap::new()))
+            .insert(server_name.as_ref().to_ascii_uppercase(), key_paths);
+    }
+
+    /// Returns the trusted column master key path allow-list configured for the
+    /// currently connected server, or an empty slice when the server is
+    /// unrestricted (no list registered, or none registered at all). An empty
+    /// slice means "no restriction".
+    pub(crate) fn trusted_key_paths_for_current_server(&self) -> &[String] {
+        let Some(paths) = self
+            .trusted_master_key_paths
+            .as_ref()
+            .filter(|paths| !paths.is_empty())
+        else {
+            return &[];
+        };
+        let server = self
+            .transport_context
+            .get_server_name()
+            .to_ascii_uppercase();
+        paths.get(&server).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// Creates a new ClientContext with the specified data source.
     /// The data source is mandatory for establishing a connection.
     ///
@@ -437,6 +503,7 @@ impl ClientContext {
                 crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),
             ),
             cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
+            trusted_master_key_paths: None,
             user_agent: UserAgent::default(),
         }
     }
@@ -498,6 +565,7 @@ impl ClientContext {
                 crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),
             ),
             cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
+            trusted_master_key_paths: None,
             user_agent: UserAgent::default(),
         }
     }
@@ -737,6 +805,7 @@ impl Clone for ClientContext {
                 .column_encryption_key_store_providers
                 .clone(),
             cek_cache: self.cek_cache.clone(),
+            trusted_master_key_paths: self.trusted_master_key_paths.clone(),
             user_agent: self.user_agent.clone(),
         }
     }
@@ -1069,6 +1138,32 @@ mod tests {
         let ctx = ClientContext::with_data_source("tcp:myserver,1433");
         let cloned = ctx.clone();
         assert_eq!(cloned.data_source, "tcp:myserver,1433");
+    }
+
+    #[test]
+    fn trusted_master_key_paths_are_per_server_and_case_insensitive() {
+        let mut ctx = ClientContext::with_data_source("tcp:myserver,1433");
+        let _ = ctx.parse_datasource("tcp:myserver,1433");
+
+        // No configuration at all: the current server is unrestricted.
+        assert!(ctx.trusted_key_paths_for_current_server().is_empty());
+
+        // A list configured for a different server leaves this one unrestricted.
+        ctx.register_trusted_master_key_paths("otherserver", vec!["p".to_string()]);
+        assert!(ctx.trusted_key_paths_for_current_server().is_empty());
+
+        // A list for this server (registered with different casing) applies.
+        ctx.register_trusted_master_key_paths("MYSERVER", vec!["path/a".to_string()]);
+        assert_eq!(
+            ctx.trusted_key_paths_for_current_server(),
+            &["path/a".to_string()]
+        );
+
+        // Cloning preserves the configuration.
+        assert_eq!(
+            ctx.clone().trusted_key_paths_for_current_server(),
+            &["path/a".to_string()]
+        );
     }
 
     #[test]

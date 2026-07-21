@@ -713,6 +713,7 @@ impl TdsClient {
         // Always Encrypted: when the connection enabled column encryption and the
         // server acknowledged the feature, ask the server which parameters need
         // encryption and encrypt them in place before sending the real RPC.
+        self.ensure_force_column_encryption_supported(named_params.iter())?;
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
                 &sql,
@@ -864,7 +865,7 @@ impl TdsClient {
             if encrypt_bulk_copy && !passthrough_ciphertext {
                 use crate::security::keystore::decrypt_cek;
 
-                let (providers, cek_cache) = {
+                let (providers, cek_cache, trusted_key_paths) = {
                     let client_context =
                         self.recovery_context
                             .client_context
@@ -878,6 +879,9 @@ impl TdsClient {
                     (
                         client_context.column_encryption_key_store_providers.clone(),
                         client_context.cek_cache.clone(),
+                        client_context
+                            .trusted_key_paths_for_current_server()
+                            .to_vec(),
                     )
                 };
 
@@ -885,7 +889,13 @@ impl TdsClient {
                 for col in &mapped_column_metadata {
                     match &col.encryption {
                         Some(enc) => {
-                            let cek = decrypt_cek(&providers, &cek_cache, &enc.cek_entry).await?;
+                            let cek = decrypt_cek(
+                                &providers,
+                                &cek_cache,
+                                &enc.cek_entry,
+                                &trusted_key_paths,
+                            )
+                            .await?;
                             ceks.push(Some(cek));
                         }
                         None => ceks.push(None),
@@ -1117,6 +1127,12 @@ impl TdsClient {
         // form of the call) and encrypt them in place before sending the real
         // stored-procedure RPC. Positional parameters are described under
         // synthetic names bound by position; named parameters bind by name.
+        self.ensure_force_column_encryption_supported(
+            positional_parameters
+                .iter()
+                .flatten()
+                .chain(named_parameters.iter().flatten()),
+        )?;
         let has_positional = positional_parameters
             .as_ref()
             .is_some_and(|p| !p.is_empty());
@@ -1485,6 +1501,7 @@ impl TdsClient {
         // sending the real RPC. The `@params` declaration keeps each parameter's
         // original type; only the value is replaced with ciphertext plus cipher
         // metadata.
+        self.ensure_force_column_encryption_supported(named_params.iter())?;
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
                 &sql,
@@ -1600,13 +1617,19 @@ impl TdsClient {
         // the metadata captured when the statement was prepared, then send the
         // real RPC. sp_execute never describes — the metadata must already have
         // been cached by execute_sp_prepare on this connection.
+        self.ensure_force_column_encryption_supported(
+            positional_parameters
+                .iter()
+                .flatten()
+                .chain(named_parameters.iter().flatten()),
+        )?;
         if self.should_encrypt_parameters()
             && (positional_parameters
                 .as_ref()
                 .is_some_and(|p| !p.is_empty())
                 || named_parameters.as_ref().is_some_and(|p| !p.is_empty()))
         {
-            let (providers, cek_cache) = self.cloned_ce_key_material()?;
+            let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
             let describe = self
                 .prepared_param_encryption
                 .get(&handle)
@@ -1634,6 +1657,7 @@ impl TdsClient {
                 &cek_cache,
                 &mut param_refs,
                 &mut self.output_param_ceks,
+                &trusted_key_paths,
             )
             .await?;
         }
@@ -1924,6 +1948,27 @@ impl TdsClient {
             && self.effective_command_ce_setting() == ExecutionColumnEncryptionSetting::Enabled
     }
 
+    /// Enforces the ForceColumnEncryption precondition: if any supplied parameter
+    /// requires encryption but Always Encrypted is not enabled for this command,
+    /// fail rather than sending it as plaintext. The per-parameter downgrade
+    /// check (server reports the column plaintext) is enforced separately in
+    /// [`apply_parameter_encryption`](Self::apply_parameter_encryption).
+    fn ensure_force_column_encryption_supported<'p>(
+        &self,
+        params: impl IntoIterator<Item = &'p RpcParameter>,
+    ) -> TdsResult<()> {
+        if !self.should_encrypt_parameters()
+            && params.into_iter().any(|p| p.force_column_encryption())
+        {
+            return Err(crate::error::Error::UsageError(
+                "A parameter has ForceColumnEncryption set, but Always Encrypted is not enabled \
+                 for this command; enable column encryption on the connection, or clear the flag."
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns `true` when the connection negotiated Always Encrypted and
     /// enabled column encryption, ignoring any per-command override. Used by
     /// paths that have no per-command setting (bulk copy, prepared statements).
@@ -2178,13 +2223,14 @@ impl TdsClient {
             .describe_parameters_cached(sql, params_decl, has_output, timeout_sec, cancel_handle)
             .await?;
 
-        let (providers, cek_cache) = self.cloned_ce_key_material()?;
+        let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
         Self::apply_parameter_encryption(
             &describe,
             &providers,
             &cek_cache,
             params,
             &mut self.output_param_ceks,
+            &trusted_key_paths,
         )
         .await
     }
@@ -2233,13 +2279,15 @@ impl TdsClient {
     }
 
     /// Clones the `Arc` handles to the column-master-key provider registry and
-    /// the CEK cache from the client context, so the parameter-encryption paths
+    /// the CEK cache from the client context, plus the trusted master key path
+    /// allow-list for the connected server, so the parameter-encryption paths
     /// can pass them around without holding a borrow on `self`.
     fn cloned_ce_key_material(
         &self,
     ) -> TdsResult<(
         std::sync::Arc<crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry>,
         std::sync::Arc<crate::security::keystore::CekCache>,
+        Vec<String>,
     )> {
         let client_context = self
             .recovery_context
@@ -2253,7 +2301,34 @@ impl TdsClient {
         Ok((
             client_context.column_encryption_key_store_providers.clone(),
             client_context.cek_cache.clone(),
+            client_context
+                .trusted_key_paths_for_current_server()
+                .to_vec(),
         ))
+    }
+
+    /// Matches a `sp_describe_parameter_encryption` result entry to a supplied
+    /// parameter: by name first (case-insensitively, like a T-SQL identifier),
+    /// otherwise falling back to the *unnamed* parameter at the describe's
+    /// 1-based ordinal (the positional case). Requiring the ordinal slot to be
+    /// unnamed keeps a named parameter from being matched by position.
+    fn match_describe_param_index(
+        params: &[&mut RpcParameter],
+        info: &crate::security::describe_parameter_encryption::ParameterEncryptionInfo,
+    ) -> Option<usize> {
+        params
+            .iter()
+            .position(|p| {
+                p.name
+                    .as_deref()
+                    .map(|n| n.eq_ignore_ascii_case(&info.parameter_name))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                (info.parameter_ordinal as usize)
+                    .checked_sub(1)
+                    .filter(|&i| i < params.len() && params[i].name.is_none())
+            })
     }
 
     /// Encrypts, in place, the parameters that a prior
@@ -2274,6 +2349,7 @@ impl TdsClient {
         cek_cache: &crate::security::keystore::CekCache,
         params: &mut [&mut RpcParameter],
         output_param_ceks: &mut HashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>,
+        trusted_key_paths: &[String],
     ) -> TdsResult<()> {
         use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
         use crate::security::encryption::encrypt_parameter;
@@ -2283,6 +2359,43 @@ impl TdsClient {
         // command's parameters, so a previous command's keys cannot leak into
         // this one's output-parameter decryption.
         output_param_ceks.clear();
+
+        // ForceColumnEncryption: every supplied parameter that demands
+        // encryption must be reported as encrypted by the server. Validate before
+        // any work — and before the "nothing encrypted" early return below — so a
+        // server that downgrades a forced parameter is caught rather than
+        // silently sending its value as plaintext. A downgrade takes two forms,
+        // both rejected here: the server reports the parameter's target column as
+        // plaintext, or it omits a row for the parameter entirely (which would
+        // otherwise slip past a describe-driven check and be serialized in the
+        // clear).
+        //
+        // This is a server-trust failure — the "compromised server downgrades to
+        // harvest plaintext" threat this flag defends against — so it is a
+        // `ColumnEncryptionError`, matching the "parameter not supplied" mismatch
+        // below and the trusted-master-key-path rejection in `decrypt_cek`. It is
+        // deliberately distinct from the caller-misconfiguration case (the flag
+        // set while Always Encrypted is off) that
+        // `ensure_force_column_encryption_supported` reports as a `UsageError`.
+        for index in 0..params.len() {
+            if !params[index].force_column_encryption() {
+                continue;
+            }
+            let reported_encrypted = describe.parameters.iter().any(|info| {
+                info.is_encrypted() && Self::match_describe_param_index(params, info) == Some(index)
+            });
+            if !reported_encrypted {
+                let name = params[index]
+                    .name
+                    .as_deref()
+                    .unwrap_or("<positional>")
+                    .to_string();
+                return Err(crate::error::Error::ColumnEncryptionError(format!(
+                    "Parameter {name} has ForceColumnEncryption set, but the server did not \
+                     report it as encrypted; refusing to send it as plaintext.",
+                )));
+            }
+        }
 
         // Nothing to do when the server reports no encrypted parameters.
         if !describe.parameters.iter().any(|p| p.is_encrypted()) {
@@ -2301,25 +2414,7 @@ impl TdsClient {
                 ))
             })?;
 
-            // Match by name first; otherwise fall back to the unnamed parameter at
-            // this describe ordinal (the positional case). Requiring the ordinal
-            // slot to be unnamed keeps a named parameter from being matched by
-            // position.
-            let index = params
-                .iter()
-                .position(|p| {
-                    p.name
-                        .as_deref()
-                        .map(|n| n.eq_ignore_ascii_case(&info.parameter_name))
-                        .unwrap_or(false)
-                })
-                .or_else(|| {
-                    (info.parameter_ordinal as usize)
-                        .checked_sub(1)
-                        .filter(|&i| i < params.len() && params[i].name.is_none())
-                });
-
-            let Some(index) = index else {
+            let Some(index) = Self::match_describe_param_index(params, info) else {
                 return Err(crate::error::Error::ColumnEncryptionError(format!(
                     "sp_describe_parameter_encryption returned encryption info for parameter {} \
                      that was not supplied to the call",
@@ -2344,7 +2439,8 @@ impl TdsClient {
                 ));
             }
 
-            let plaintext_cek = decrypt_cek(providers, cek_cache, cek_entry).await?;
+            let plaintext_cek =
+                decrypt_cek(providers, cek_cache, cek_entry, trusted_key_paths).await?;
 
             // An encrypted RETURNVALUE output parameter carries no CEK table and
             // reuses the CEK that encrypted the matching input parameter. Retain
@@ -2525,6 +2621,7 @@ impl TdsClient {
             &client_context.column_encryption_key_store_providers,
             &client_context.cek_cache,
             &metadata.cek_table,
+            client_context.trusted_key_paths_for_current_server(),
         )
         .await;
         let decryptor: Arc<dyn CellDecryptor> = Arc::new(resolved);
@@ -4261,5 +4358,46 @@ mod tests {
             .expect_err("synthetic positional name collision should be rejected");
 
         assert!(matches!(err, UsageError(message) if message.contains("@CE_POS_0")));
+    }
+
+    /// A forced parameter whose row the server omits entirely from the describe
+    /// result must be rejected — not silently sent as plaintext. This is the
+    /// downgrade a describe-driven check (iterating only the server's rows) would
+    /// miss, so the validation iterates the supplied forced parameters instead.
+    #[tokio::test]
+    async fn apply_parameter_encryption_rejects_forced_param_omitted_from_describe() {
+        use crate::datatypes::sqltypes::SqlType;
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+        use crate::security::keystore::{CekCache, ColumnEncryptionKeyStoreProviderRegistry};
+
+        // Server returns an empty describe result: no row for the forced param.
+        let describe = DescribeParameterEncryptionResult::new();
+        let providers = ColumnEncryptionKeyStoreProviderRegistry::new();
+        let cek_cache = CekCache::new();
+        let mut output_param_ceks = HashMap::new();
+
+        let mut forced = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(42)),
+        )
+        .with_force_column_encryption(true);
+        let mut params: Vec<&mut RpcParameter> = vec![&mut forced];
+
+        let err = TdsClient::apply_parameter_encryption(
+            &describe,
+            &providers,
+            &cek_cache,
+            &mut params,
+            &mut output_param_ceks,
+            &[],
+        )
+        .await
+        .expect_err("a forced parameter omitted from the describe result must be rejected");
+
+        assert!(
+            matches!(&err, crate::error::Error::ColumnEncryptionError(message) if message.contains("ForceColumnEncryption")),
+            "expected a ForceColumnEncryption column-encryption error, got: {err}"
+        );
     }
 }
