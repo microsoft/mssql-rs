@@ -20,7 +20,7 @@ import secrets
 
 # Try to import the mock TDS server Python bindings
 try:
-    import mssql_mock_tds_py
+    import mssql_mock_tds
     MOCK_TDS_PY_AVAILABLE = True
 except ImportError:
     MOCK_TDS_PY_AVAILABLE = False
@@ -52,7 +52,7 @@ def mock_server_port():
 
 @pytest.mark.skipif(
     not MOCK_TDS_PY_AVAILABLE,
-    reason="mssql_mock_tds_py not available. Build it with: cd mssql-mock-tds-py && maturin develop",
+    reason="mssql_mock_tds not available. Build it with: cd mssql-mock-tds-py && maturin develop",
 )
 class TestMockServerFedAuth:
     """Test FedAuth (access token) authentication with mock TDS server."""
@@ -75,7 +75,7 @@ class TestMockServerFedAuth:
 
         # Create and start the mock server using Python bindings
         # Use tls=True to enable TLS encryption for secure token transmission
-        server = mssql_mock_tds_py.PyMockTdsServer(port=mock_server_port, tls=True)
+        server = mssql_mock_tds.PyMockTdsServer(port=mock_server_port, tls=True)
         
         with server:
             # Build client context for the mock server with access token auth
@@ -121,7 +121,7 @@ class TestMockServerFedAuth:
         # Generate a unique token for this test
         unique_token = f"unique_token_{secrets.token_hex(16)}"
 
-        server = mssql_mock_tds_py.PyMockTdsServer(port=mock_server_port, tls=True)
+        server = mssql_mock_tds.PyMockTdsServer(port=mock_server_port, tls=True)
         
         with server:
             client_context = {
@@ -148,7 +148,7 @@ class TestMockServerFedAuth:
 
     def test_mock_server_starts_successfully(self, mock_server_port):
         """Test that the mock TDS server starts and listens on the expected port."""
-        server = mssql_mock_tds_py.PyMockTdsServer(port=mock_server_port)
+        server = mssql_mock_tds.PyMockTdsServer(port=mock_server_port)
         
         with server:
             # Verify we can connect at the TCP level
@@ -169,7 +169,7 @@ class TestMockServerFedAuth:
 
         mock_token = "mock_token_for_query_execution"
 
-        server = mssql_mock_tds_py.PyMockTdsServer(port=mock_server_port, tls=True)
+        server = mssql_mock_tds.PyMockTdsServer(port=mock_server_port, tls=True)
         
         with server:
             client_context = {
@@ -211,7 +211,7 @@ class TestMockServerFedAuth:
 
         token = "test_token_for_connection_list"
         
-        server = mssql_mock_tds_py.PyMockTdsServer(port=mock_server_port, tls=True)
+        server = mssql_mock_tds.PyMockTdsServer(port=mock_server_port, tls=True)
         
         with server:
             client_context = {
@@ -238,7 +238,7 @@ class TestMockServerFedAuth:
         """Test clearing stored connection info."""
         import mssql_py_core
 
-        server = mssql_mock_tds_py.PyMockTdsServer(port=mock_server_port, tls=True)
+        server = mssql_mock_tds.PyMockTdsServer(port=mock_server_port, tls=True)
         
         with server:
             client_context = {
@@ -265,7 +265,7 @@ class TestMockServerFedAuth:
         """Test that MS-PYTHON is correctly sent as the driver name in the user agent."""
         import mssql_py_core
 
-        server = mssql_mock_tds_py.PyMockTdsServer(port=mock_server_port, tls=True)
+        server = mssql_mock_tds.PyMockTdsServer(port=mock_server_port, tls=True)
 
         with server:
             client_context = {
