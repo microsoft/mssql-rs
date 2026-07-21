@@ -3,14 +3,19 @@
 
 //! Implementation of `SQLSetStmtAttrW` / `SQLGetStmtAttrW`.
 //!
-//! Only the attributes exercised by the fetch path are given real semantics:
-//! the block-fetch rowset controls (`SQL_ATTR_ROW_ARRAY_SIZE`,
+//! The block-fetch rowset controls (`SQL_ATTR_ROW_ARRAY_SIZE`,
 //! `SQL_ATTR_ROWS_FETCHED_PTR`, `SQL_ATTR_ROW_STATUS_PTR`,
-//! `SQL_ATTR_ROW_BIND_TYPE`). Everything else the Driver Manager or
-//! mssql-python sets — cursor type, concurrency, param-set controls — is
-//! accepted as a no-op so the handshake is not broken. This driver only
-//! supports forward-only, read-only cursors, which is exactly what
-//! mssql-python requests.
+//! `SQL_ATTR_ROW_BIND_TYPE`) are stored and later consumed by the columnar
+//! fetch path. Other recognized statement attributes (cursor type, concurrency,
+//! param / descriptor controls) are accepted without effect because the driver
+//! is forward-only and read-only — exactly what mssql-python requests.
+//! `SQL_ATTR_PARAMSET_SIZE` accepts the ODBC default of 1 but rejects larger
+//! batches, since parameter arrays are not yet consumed and a silent success
+//! would execute only the first row. Unrecognized attribute identifiers fail
+//! with `HY092`.
+//!
+//! Each entry point follows the crate's mandatory layering: FFI panic boundary
+//! → `unsafe` raw-handle shim → safe core (`README.md`; `num_result_cols.rs`).
 
 use tracing::{debug, error};
 
@@ -18,11 +23,15 @@ use crate::api::odbc_types::{
     SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_ATTR_CONCURRENCY, SQL_ATTR_CURSOR_TYPE,
     SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_STATUS_PTR, SQL_ATTR_PARAMS_PROCESSED_PTR,
     SQL_ATTR_PARAMSET_SIZE, SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR,
-    SQL_ATTR_ROW_BIND_TYPE, SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR, SQL_ERROR,
-    SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen,
-    SqlUSmallInt,
+    SQL_ATTR_ROW_BIND_TYPE, SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR,
+    SQL_CONCUR_READ_ONLY, SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
+    SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
 };
-use crate::error::free_errors;
+use crate::api::sqlstate::{
+    ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE, SQLSTATE_HYC00, post_diag,
+};
+use crate::api::util::write_if_some;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Sets a statement attribute.
@@ -65,7 +74,14 @@ unsafe fn sql_set_stmt_attr_w_impl(
         HandleType::Stmt,
         "SQLSetStmtAttrW: handle is not a STMT"
     );
+    sql_set_stmt_attr_w_safe(stmt, attribute, value_ptr)
+}
 
+fn sql_set_stmt_attr_w_safe(
+    stmt: &StmtHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+) -> SqlReturn {
     let Ok(mut state) = stmt.inner.lock() else {
         error!("SQLSetStmtAttrW: stmt mutex poisoned");
         return SQL_ERROR;
@@ -75,11 +91,16 @@ unsafe fn sql_set_stmt_attr_w_impl(
     match attribute {
         SQL_ATTR_ROW_ARRAY_SIZE => {
             // The value is a `SQLULEN` passed by value in the pointer slot. Zero
-            // is invalid; clamp to one so downstream fetches never divide by it.
+            // is an invalid rowset size (HY024) — reject rather than paper over.
             let n = value_ptr as SqlULen;
-            state.row_array_size = n.max(1);
+            if n == 0 {
+                error!("SQLSetStmtAttrW: SQL_ATTR_ROW_ARRAY_SIZE of 0 is invalid");
+                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                return SQL_ERROR;
+            }
+            state.row_array_size = n;
             debug!(
-                row_array_size = state.row_array_size,
+                row_array_size = n,
                 "SQLSetStmtAttrW: SQL_ATTR_ROW_ARRAY_SIZE set"
             );
             SQL_SUCCESS
@@ -96,13 +117,38 @@ unsafe fn sql_set_stmt_attr_w_impl(
             state.row_bind_type = value_ptr as SqlULen;
             SQL_SUCCESS
         }
-        // Accepted as no-ops: the driver already behaves as forward-only /
-        // read-only, and the remaining param-set / descriptor controls are not
-        // yet acted upon. mssql-python sets these to values consistent with the
-        // implemented behavior, so accept silently rather than fail the DM.
+        SQL_ATTR_PARAMSET_SIZE => {
+            // Parameter arrays are not yet consumed (executemany batch insert is
+            // tracked separately). Accept the ODBC default of 1; reject a larger
+            // batch (HYC00) instead of silently executing only the first row,
+            // and reject 0 as an invalid value (HY024).
+            match value_ptr as SqlULen {
+                1 => SQL_SUCCESS,
+                0 => {
+                    error!("SQLSetStmtAttrW: SQL_ATTR_PARAMSET_SIZE of 0 is invalid");
+                    post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                    SQL_ERROR
+                }
+                n => {
+                    error!(
+                        paramset_size = n,
+                        "SQLSetStmtAttrW: SQL_ATTR_PARAMSET_SIZE > 1 not supported"
+                    );
+                    post_sql_error(
+                        &mut state,
+                        SQLSTATE_HYC00,
+                        0,
+                        "Parameter arrays (SQL_ATTR_PARAMSET_SIZE > 1) are not supported",
+                    );
+                    SQL_ERROR
+                }
+            }
+        }
+        // Recognized attributes accepted without tracking: the driver is
+        // forward-only / read-only and these param / descriptor controls have
+        // no effect on the implemented behavior.
         SQL_ATTR_CURSOR_TYPE
         | SQL_ATTR_CONCURRENCY
-        | SQL_ATTR_PARAMSET_SIZE
         | SQL_ATTR_PARAM_BIND_TYPE
         | SQL_ATTR_PARAM_STATUS_PTR
         | SQL_ATTR_PARAMS_PROCESSED_PTR
@@ -113,14 +159,12 @@ unsafe fn sql_set_stmt_attr_w_impl(
             SQL_SUCCESS
         }
         _ => {
-            // Unknown statement attributes are accepted as no-ops: the Driver
-            // Manager probes many attributes and rejecting them breaks the
-            // handshake.
-            debug!(
+            error!(
                 attribute,
-                "SQLSetStmtAttrW: unrecognized attribute accepted as no-op"
+                "SQLSetStmtAttrW: unrecognized attribute identifier"
             );
-            SQL_SUCCESS
+            post_diag(&mut state, ERR_INVALID_ATTRIBUTE_IDENTIFIER);
+            SQL_ERROR
         }
     }
 }
@@ -138,8 +182,14 @@ pub(crate) unsafe fn sql_get_stmt_attr_w(
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    debug!(?statement_handle, attribute, "SQLGetStmtAttrW called");
-    let _ = (buffer_length, string_length_ptr); // no string-valued attrs here
+    debug!(
+        ?statement_handle,
+        attribute,
+        ?value_ptr,
+        buffer_length,
+        ?string_length_ptr,
+        "SQLGetStmtAttrW called",
+    );
     crate::ffi_entry!("SQLGetStmtAttrW", unsafe {
         sql_get_stmt_attr_w_impl(statement_handle, attribute, value_ptr)
     })
@@ -154,10 +204,6 @@ unsafe fn sql_get_stmt_attr_w_impl(
         error!("SQLGetStmtAttrW: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    if value_ptr.is_null() {
-        // Nothing to write into; treat as a successful no-op.
-        return SQL_SUCCESS;
-    }
 
     let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
@@ -165,34 +211,54 @@ unsafe fn sql_get_stmt_attr_w_impl(
         HandleType::Stmt,
         "SQLGetStmtAttrW: handle is not a STMT"
     );
+    sql_get_stmt_attr_w_safe(stmt, attribute, value_ptr)
+}
 
-    let Ok(state) = stmt.inner.lock() else {
+fn sql_get_stmt_attr_w_safe(
+    stmt: &StmtHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+) -> SqlReturn {
+    let Ok(mut state) = stmt.inner.lock() else {
         error!("SQLGetStmtAttrW: stmt mutex poisoned");
         return SQL_ERROR;
     };
+    free_errors(&mut state);
 
+    // Every attribute reported here is a pointer-sized integer or pointer.
+    // `write_if_some` is a no-op when `value_ptr` is null.
     match attribute {
         SQL_ATTR_ROW_ARRAY_SIZE => unsafe {
-            *(value_ptr as *mut SqlULen) = state.row_array_size;
+            write_if_some(value_ptr as *mut SqlULen, state.row_array_size);
         },
         SQL_ATTR_ROWS_FETCHED_PTR => unsafe {
-            *(value_ptr as *mut *mut SqlULen) = state.rows_fetched_ptr;
+            write_if_some(value_ptr as *mut *mut SqlULen, state.rows_fetched_ptr);
         },
         SQL_ATTR_ROW_STATUS_PTR => unsafe {
-            *(value_ptr as *mut *mut SqlUSmallInt) = state.row_status_ptr;
+            write_if_some(value_ptr as *mut *mut SqlUSmallInt, state.row_status_ptr);
         },
         SQL_ATTR_ROW_BIND_TYPE => unsafe {
-            *(value_ptr as *mut SqlULen) = state.row_bind_type;
+            write_if_some(value_ptr as *mut SqlULen, state.row_bind_type);
         },
-        _ => unsafe {
-            // Report a benign zero for attributes we don't track rather than
-            // failing; callers reading an unset attribute get the ODBC default.
-            debug!(
+        // Recognized attributes we don't store: report their effective ODBC
+        // defaults for this forward-only, read-only, single-paramset driver.
+        SQL_ATTR_CURSOR_TYPE => unsafe {
+            write_if_some(value_ptr as *mut SqlULen, SQL_CURSOR_FORWARD_ONLY);
+        },
+        SQL_ATTR_CONCURRENCY => unsafe {
+            write_if_some(value_ptr as *mut SqlULen, SQL_CONCUR_READ_ONLY);
+        },
+        SQL_ATTR_PARAMSET_SIZE => unsafe {
+            write_if_some(value_ptr as *mut SqlULen, 1);
+        },
+        _ => {
+            error!(
                 attribute,
-                "SQLGetStmtAttrW: unrecognized attribute; returning 0"
+                "SQLGetStmtAttrW: unrecognized attribute identifier"
             );
-            *(value_ptr as *mut SqlULen) = 0;
-        },
+            post_diag(&mut state, ERR_INVALID_ATTRIBUTE_IDENTIFIER);
+            return SQL_ERROR;
+        }
     }
 
     SQL_SUCCESS
@@ -243,11 +309,12 @@ mod tests {
     }
 
     #[test]
-    fn set_row_array_size_zero_clamps_to_one() {
+    fn set_row_array_size_zero_rejected() {
         let h = TestHandles::with_env_dbc_stmt();
         let ret =
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 0 as SqlPointer, 0) };
-        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ret, SQL_ERROR);
+        // The previous (default) value must be left untouched.
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(stmt.inner.lock().unwrap().row_array_size, 1);
     }
@@ -261,6 +328,37 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(stmt.inner.lock().unwrap().rows_fetched_ptr, ptr);
+    }
+
+    #[test]
+    fn set_row_status_ptr_stored() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut status: SqlUSmallInt = 0;
+        let ptr = &mut status as *mut SqlUSmallInt;
+        let ret = unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_STATUS_PTR, ptr.cast(), 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(stmt.inner.lock().unwrap().row_status_ptr, ptr);
+    }
+
+    #[test]
+    fn set_row_bind_type_stored_and_readback() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_BIND_TYPE, 40 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        let mut out: SqlULen = 0;
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_ROW_BIND_TYPE,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 40);
     }
 
     #[test]
@@ -281,9 +379,146 @@ mod tests {
     }
 
     #[test]
-    fn unknown_attribute_accepted_as_noop() {
+    fn set_unknown_attribute_rejected() {
         let h = TestHandles::with_env_dbc_stmt();
         let ret = unsafe { sql_set_stmt_attr_w(h.stmt, 9999, 0 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn set_recognized_untracked_attribute_accepted() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret = unsafe {
+            sql_set_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_CONCURRENCY,
+                SQL_CONCUR_READ_ONLY as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+    }
+
+    #[test]
+    fn set_paramset_size_one_accepted() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_PARAMSET_SIZE, 1 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+    }
+
+    #[test]
+    fn set_paramset_size_greater_than_one_rejected() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_PARAMSET_SIZE, 100 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn set_paramset_size_zero_rejected() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_PARAMSET_SIZE, 0 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn get_stmt_attr_null_handle() {
+        let mut out: SqlULen = 0;
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                SQL_NULL_HANDLE,
+                SQL_ATTR_ROW_ARRAY_SIZE,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn get_unknown_attribute_rejected() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut out: SqlULen = 7;
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                9999,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        // Output must be left untouched on an invalid identifier.
+        assert_eq!(out, 7);
+    }
+
+    #[test]
+    fn get_concurrency_default_is_read_only() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut out: SqlULen = 999;
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_CONCURRENCY,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, SQL_CONCUR_READ_ONLY);
+    }
+
+    #[test]
+    fn get_cursor_type_default_is_forward_only() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut out: SqlULen = 999;
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_CURSOR_TYPE,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, SQL_CURSOR_FORWARD_ONLY);
+    }
+
+    #[test]
+    fn get_paramset_size_default_is_one() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut out: SqlULen = 999;
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_PARAMSET_SIZE,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 1);
+    }
+
+    #[test]
+    fn get_stmt_attr_null_value_ptr_is_noop_success() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_ROW_ARRAY_SIZE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
         assert_eq!(ret, SQL_SUCCESS);
     }
 }
