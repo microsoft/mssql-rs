@@ -1,30 +1,14 @@
-# Template: test-matrix-template-arm64.yml
+# Template: test-matrix-odbc-template-arm64.yml
 #
-# Runs the glibc Linux ARM64 test matrix against an x64-hosted SQL Server
-# (booted by sql-host-template.yml in the same stage). Two cardinality modes:
+# ARM64 test matrix for the mssql-odbc C++ gtest e2e suite. Structurally
+# identical to test-matrix-template-arm64.yml (cross-pool x64 SQL host booted by
+# sql-host-template.yml, resolved via poll-for-endpoint.sh, released via teardown
+# sentinels) but instead of a nextest archive it downloads the prebuilt ODBC drop
+# (Odbc_Linux_arm64), restores it to mssql-odbc/tests/e2e/build, and reruns the
+# prebuilt driver + ctest binaries via run_e2e.sh --skip-build.
 #
-#   sqlInstanceMode = shared
-#     One SQL host, all matrix entries connect to it. Each entry publishes
-#     its own teardown sentinel; the SQL host releases once every expected
-#     sentinel exists.
-#
-#   sqlInstanceMode = per-job
-#     One SQL host per matrix entry. Each test job has its own SQL host and
-#     publishes a single sentinel on completion. Use when shared SQL state
-#     causes test interference.
-#
-# Cross-job sync (see sql-host-template.yml for the rationale):
-#   * No ADO `dependsOn` between SQL host and test jobs (ADO `dependsOn`
-#     would deadlock — SQL host can only finish after sentinels arrive,
-#     sentinels can only be published once tests start).
-#   * SQL host -> test:  sql-ready-<instanceId>  pipeline artifact carries
-#                        the endpoint; resolved at test job start by
-#                        poll-for-endpoint.sh, exporting DB_HOST/DB_PORT.
-#   * Test -> SQL host:  one teardown-sentinel artifact per matrix entry,
-#                        published always() so the SQL host releases on
-#                        success, failure, and cancellation.
-#   * SA password is derived from build context by derive-sql-password.sh
-#     in both jobs so they agree without sharing a secret across jobs.
+# See sql-host-template.yml for the cross-job sync rationale (no dependsOn,
+# sql-ready artifact in, teardown sentinel out, derived SA password).
 
 parameters:
   - name: targets
@@ -42,12 +26,31 @@ parameters:
   - name: maxLifetimeMinutes
     type: number
     default: 120
+  - name: artifactName
+    type: string
+    default: 'Odbc_Linux_arm64'
   - name: manageSqlHost
-    # When false, the caller (stage) owns the shared SQL host so it can be
-    # shared with another matrix (e.g. the ODBC arm64 matrix in the same stage);
-    # this template then only emits the test job, which consumes sql-ready-shared.
+    # When false, the caller (stage) owns the shared SQL host (shared with the
+    # nextest arm64 matrix), so this template only emits the test job and
+    # consumes the caller's sql-ready-<sqlReadyInstanceId> sentinel.
     type: boolean
     default: true
+  - name: sqlReadyInstanceId
+    # instanceId of the sql-ready sentinel to consume in shared mode. Defaults
+    # to a dedicated host; set to the nextest host id (shared / shared_musl) to
+    # reuse a single cross-pool SQL host per stage.
+    type: string
+    default: 'odbc_shared'
+  - name: sentinelPrefix
+    # Prefix applied to teardown sentinel / per-job host names so the ODBC jobs
+    # do not collide with the nextest jobs when they share a stage.
+    type: string
+    default: ''
+  - name: nameSuffix
+    # Suffix appended to the shared-mode matrix job name so two invocations in
+    # the same stage (e.g. glibc-modern and glibc-2.28) get distinct job names.
+    type: string
+    default: ''
 
 jobs:
   # ------------------------------------------------------------------
@@ -57,23 +60,24 @@ jobs:
     - ${{ if parameters.manageSqlHost }}:
       - template: sql-host-template.yml
         parameters:
-          instanceId: shared
+          instanceId: ${{ parameters.sqlReadyInstanceId }}
           sqlImageTag: ${{ parameters.sqlImageTag }}
           maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
-          expectedSentinels: ${{ join(',', parameters.targets.*.name) }}
+          # Teardown sentinels are published as sentinelPrefix + target.name (see
+          # sentinelName below), so the managed host must wait for the prefixed
+          # names too. When sentinelPrefix is '' this reduces to the plain join.
+          expectedSentinels: ${{ format('{0}{1}', parameters.sentinelPrefix, replace(join(',', parameters.targets.*.name), ',', format(',{0}', parameters.sentinelPrefix))) }}
 
-    - job: Test_Matrix_arm64
-      displayName: Linux arm64
+    - job: Test_Odbc_Matrix${{ parameters.nameSuffix }}_arm64
+      displayName: ODBC e2e Linux arm64
       # Intentionally no `dependsOn`: see sql-host-template.yml header.
-      # The endpoint is resolved at runtime via the sql-ready-shared
-      # pipeline artifact (poll-for-endpoint.sh).
       strategy:
         matrix:
           ${{ each target in parameters.targets }}:
             ${{ target.name }}:
               container: ${{ target.container }}
               entry: ${{ target.entry }}
-              sentinelName: ${{ target.name }}
+              sentinelName: ${{ parameters.sentinelPrefix }}${{ target.name }}
       pool:
         name: RUST-1ES-POOL-ARM-WUS3
         demands:
@@ -99,8 +103,9 @@ jobs:
         - task: DownloadPipelineArtifact@2
           inputs:
             buildType: 'current'
-            artifactName: 'Build_Linux_ARM'
-          displayName: 'Download Pipeline Artifacts'
+            artifactName: ${{ parameters.artifactName }}
+            targetPath: '$(Pipeline.Workspace)/odbc-drop'
+          displayName: 'Download ODBC drop'
 
         - bash: |
             set -euo pipefail
@@ -108,8 +113,7 @@ jobs:
           displayName: 'Wait for SQL host endpoint sentinel'
           workingDirectory: '$(Build.SourcesDirectory)'
           env:
-            # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
-            ARTIFACT_NAME: 'sql-ready-shared-$(System.StageAttempt)'
+            ARTIFACT_NAME: 'sql-ready-${{ parameters.sqlReadyInstanceId }}-$(System.StageAttempt)'
             BUILD_BUILDID: $(Build.BuildId)
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             SYSTEM_COLLECTIONURI: $(System.CollectionUri)
@@ -122,26 +126,24 @@ jobs:
             echo "container=$(container) entry=$(entry)"
             echo "DB_HOST=$DB_HOST DB_PORT=$DB_PORT"
 
-            # ca.crt + mssql.pem are downloaded by poll-for-endpoint.sh
-            # from the sql-ready artifact; they match the cert chain the
-            # cross-pool SQL host is actually presenting on the wire.
-            scripts/generate_mock_tds_server_certs.sh
+            rm -rf mssql-odbc/tests/e2e/build
+            cp -r "$(Pipeline.Workspace)/odbc-drop/build" mssql-odbc/tests/e2e/build
 
-            cp $(Pipeline.Workspace)/tdslib-nextest.tar.zst $(Build.SourcesDirectory)
             docker network create testnet
 
-            bash .pipeline/scripts/docker-cargo-run.sh --entrypoint bash \
+            bash .pipeline/scripts/docker-cargo-run.sh --rm \
               -v "$PWD:/workspace" \
-              -e "DB_USERNAME=sa" \
-              -e "DB_HOST=$DB_HOST" \
-              -e "DB_PORT=$DB_PORT" \
-              -e "SQL_PASSWORD=$(SQL_PASSWORD)" \
-              -e "ARCHIVE_NAME=tdslib-nextest.tar.zst" \
-              -e "TRUST_SERVER_CERTIFICATE=true" \
+              -w /workspace \
+              -e "ODBC_TEST_SERVER=$DB_HOST,$DB_PORT" \
+              -e "ODBC_TEST_UID=sa" \
+              -e "ODBC_TEST_PWD=$(SQL_PASSWORD)" \
+              -e "ODBC_TEST_TRUST_CERT=Yes" \
+              -e "ODBC_E2E_RETRIES=3" \
+              -e "RUST_BACKTRACE=full" \
               --network testnet \
               $(container) /workspace/scripts/dockerentry/$(entry)
           workingDirectory: "$(Build.SourcesDirectory)"
-          displayName: Run docker test
+          displayName: Run ODBC e2e in container
           condition: succeeded()
           env:
             DB_HOST: $(DB_HOST)
@@ -152,10 +154,10 @@ jobs:
 
         - task: PublishTestResults@2
           condition: succeededOrFailed()
-          displayName: "Publish test results"
+          displayName: "Publish ODBC e2e results"
           inputs:
             testResultsFormat: "JUnit"
-            testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
+            testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
             testRunTitle: $(System.PhaseName)
 
         - script: |
@@ -170,7 +172,6 @@ jobs:
           condition: always()
           inputs:
             targetPath: '$(Agent.TempDirectory)/teardown'
-            # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
             artifact: '$(sentinelName)-$(System.StageAttempt)'
             publishLocation: 'pipeline'
 
@@ -181,13 +182,13 @@ jobs:
     - ${{ each target in parameters.targets }}:
       - template: sql-host-template.yml
         parameters:
-          instanceId: ${{ target.name }}
+          instanceId: ${{ parameters.sentinelPrefix }}${{ target.name }}
           sqlImageTag: ${{ parameters.sqlImageTag }}
           maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
-          expectedSentinels: ${{ target.name }}
+          expectedSentinels: ${{ parameters.sentinelPrefix }}${{ target.name }}
 
-      - job: Test_${{ target.name }}_arm64
-        displayName: 'Linux arm64 ${{ target.name }}'
+      - job: Test_Odbc_${{ target.name }}_arm64
+        displayName: 'ODBC e2e Linux arm64 ${{ target.name }}'
         # Intentionally no `dependsOn`: see sql-host-template.yml header.
         pool:
           name: RUST-1ES-POOL-ARM-WUS3
@@ -214,8 +215,9 @@ jobs:
           - task: DownloadPipelineArtifact@2
             inputs:
               buildType: 'current'
-              artifactName: 'Build_Linux_ARM'
-            displayName: 'Download Pipeline Artifacts'
+              artifactName: ${{ parameters.artifactName }}
+              targetPath: '$(Pipeline.Workspace)/odbc-drop'
+            displayName: 'Download ODBC drop'
 
           - bash: |
               set -euo pipefail
@@ -223,8 +225,7 @@ jobs:
             displayName: 'Wait for SQL host endpoint sentinel'
             workingDirectory: '$(Build.SourcesDirectory)'
             env:
-              # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
-              ARTIFACT_NAME: 'sql-ready-${{ target.name }}-$(System.StageAttempt)'
+              ARTIFACT_NAME: 'sql-ready-${{ parameters.sentinelPrefix }}${{ target.name }}-$(System.StageAttempt)'
               BUILD_BUILDID: $(Build.BuildId)
               BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
               SYSTEM_COLLECTIONURI: $(System.CollectionUri)
@@ -237,26 +238,24 @@ jobs:
               echo "container=${{ target.container }} entry=${{ target.entry }}"
               echo "DB_HOST=$DB_HOST DB_PORT=$DB_PORT"
 
-              # ca.crt + mssql.pem are downloaded by poll-for-endpoint.sh
-              # from the sql-ready artifact; they match the cert chain the
-              # cross-pool SQL host is actually presenting on the wire.
-              scripts/generate_mock_tds_server_certs.sh
+              rm -rf mssql-odbc/tests/e2e/build
+              cp -r "$(Pipeline.Workspace)/odbc-drop/build" mssql-odbc/tests/e2e/build
 
-              cp $(Pipeline.Workspace)/tdslib-nextest.tar.zst $(Build.SourcesDirectory)
               docker network create testnet
 
-              bash .pipeline/scripts/docker-cargo-run.sh --entrypoint bash \
+              bash .pipeline/scripts/docker-cargo-run.sh --rm \
                 -v "$PWD:/workspace" \
-                -e "DB_USERNAME=sa" \
-                -e "DB_HOST=$DB_HOST" \
-                -e "DB_PORT=$DB_PORT" \
-                -e "SQL_PASSWORD=$(SQL_PASSWORD)" \
-                -e "ARCHIVE_NAME=tdslib-nextest.tar.zst" \
-                -e "TRUST_SERVER_CERTIFICATE=true" \
+                -w /workspace \
+                -e "ODBC_TEST_SERVER=$DB_HOST,$DB_PORT" \
+                -e "ODBC_TEST_UID=sa" \
+                -e "ODBC_TEST_PWD=$(SQL_PASSWORD)" \
+                -e "ODBC_TEST_TRUST_CERT=Yes" \
+                -e "ODBC_E2E_RETRIES=3" \
+                -e "RUST_BACKTRACE=full" \
                 --network testnet \
                 ${{ target.container }} /workspace/scripts/dockerentry/${{ target.entry }}
             workingDirectory: "$(Build.SourcesDirectory)"
-            displayName: Run docker test
+            displayName: Run ODBC e2e in container
             condition: succeeded()
             env:
               DB_HOST: $(DB_HOST)
@@ -267,15 +266,15 @@ jobs:
 
           - task: PublishTestResults@2
             condition: succeededOrFailed()
-            displayName: "Publish test results"
+            displayName: "Publish ODBC e2e results"
             inputs:
               testResultsFormat: "JUnit"
-              testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
+              testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
               testRunTitle: $(System.PhaseName)
 
           - script: |
               mkdir -p "$(Agent.TempDirectory)/teardown"
-              echo "${{ target.name }} done at $(date -u +%FT%TZ)" \
+              echo "${{ parameters.sentinelPrefix }}${{ target.name }} done at $(date -u +%FT%TZ)" \
                 > "$(Agent.TempDirectory)/teardown/done.txt"
             displayName: 'Stage teardown sentinel'
             condition: always()
@@ -285,6 +284,5 @@ jobs:
             condition: always()
             inputs:
               targetPath: '$(Agent.TempDirectory)/teardown'
-              # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
-              artifact: '${{ target.name }}-$(System.StageAttempt)'
+              artifact: '${{ parameters.sentinelPrefix }}${{ target.name }}-$(System.StageAttempt)'
               publishLocation: 'pipeline'

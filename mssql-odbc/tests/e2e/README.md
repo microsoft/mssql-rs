@@ -33,6 +33,7 @@ tests/e2e/
 │   └── alloc_env_test.cpp      # SQLAllocHandle(ENV) variations
 ├── third_party/                # Reserved for git submodule (unused — using FetchContent)
 ├── run_e2e.sh                  # Build + test runner (Linux / macOS)
+├── build_e2e.sh                # Build-only half for CI artifact reuse (Linux / macOS)
 ├── run_e2e.ps1                 # Build + test runner (Windows, requires admin)
 └── README.md                   # This file
 ```
@@ -223,3 +224,35 @@ cmake --build build && ctest --test-dir build --output-on-failure
 Each test calls standard ODBC C APIs (`SQLAllocHandle`, `SQLDriverConnect`,
 etc.) through the Driver Manager, which loads our shared library — the same
 code path a real application uses.
+
+## CI: prebuilt artifact flow (build once, test on many distros)
+
+CI (the main-branch pipeline) does not rebuild the driver in every distro. It
+splits the flow into a build half and a run half so a single set of binaries can
+be exercised on many Linux versions:
+
+- **`build_e2e.sh [--release] [--out=DIR]`** — builds the Rust driver and the
+  C++ gtest binaries, then stages `build/` (with `libmsodbcsql18.so` copied
+  inside) into `DIR`. That directory is published as a pipeline artifact.
+- **`run_e2e.sh --skip-build [--driver=PATH]`** — skips all compilation. It
+  restores the prebuilt `build/` tree, auto-resolves the driver from
+  `build/libmsodbcsql18.so` (or `--driver`), registers it, and reruns the
+  prebuilt binaries via CTest.
+
+`CTestTestfile.cmake` bakes **absolute** paths to the test executables, so the
+consumer must place `build/` back at the *same* absolute path it was built at.
+In CI both the build and test jobs mount the repo at `/workspace`, so the paths
+line up.
+
+Binaries are libc/OpenSSL specific, so CI builds three tracks and reuses each
+across matching distros:
+
+| Track | Build base | Reused on |
+|---|---|---|
+| glibc modern (x64, arm64) | Ubuntu 22.04 (glibc 2.35, OpenSSL 3) | Debian bookworm, Ubuntu 22.04/24.04, Azure Linux 3 |
+| musl (x64, arm64) | Alpine 3.18 (musl, OpenSSL 3) | Alpine 3.18–3.21 |
+| glibc 2.28 (x64) | manylinux_2_28 / AlmaLinux 8 (OpenSSL 1.1) | RHEL 8 / UBI 8 |
+
+A glibc-2.35 binary may fail to load on older glibc (e.g. RHEL 8's 2.28), and an
+OpenSSL 3 binary won't find `libssl.so.1.1`, which is why the glibc-2.28 track
+exists as a separate build.

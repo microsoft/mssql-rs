@@ -11,8 +11,14 @@
 # Usage:
 #   ./run_e2e.sh [--release] [--verbose] [--retries=N]
 #                [--compare-with-msodbcsql] [--msodbcsql-ini=PATH]
+#                [--skip-build] [--driver=PATH]
 #
 # Default: runs the e2e suite against mssql-odbc only.
+#
+# --skip-build reuses a driver and CMake `build/` produced earlier by
+# build_e2e.sh (no cargo/cmake needed — only the unixODBC runtime). Combine
+# with --driver=PATH to point at the prebuilt libmsodbcsql18.so. This is how
+# CI runs prebuilt binaries across distro containers.
 #
 # --retries=N reruns each failing test up to N extra times (ctest
 # --repeat until-pass:N+1). A test that passes on any attempt counts as a
@@ -52,6 +58,8 @@ VERBOSE=0
 COMPARE=0
 RETRIES=0
 MSODBCSQL_INI="/etc/odbcinst.ini"
+SKIP_BUILD=0
+DRIVER_OVERRIDE=""
 
 CTEST_ARGS=(--output-on-failure)
 RUST_INI_DIR=""    # tempdir holding our generated odbcinst.ini
@@ -61,7 +69,9 @@ RUST_DRIVER_PATH=""
 # CLI parsing / help
 # ----------------------------------------------------------------------------
 usage() {
-    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+    # Print the leading comment block (line 2 to the first non-comment line),
+    # stripping the leading "# ".
+    awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
 }
 
 parse_args() {
@@ -75,6 +85,8 @@ parse_args() {
             --compare-with-msodbcsql) COMPARE=1 ;;
             --retries=*) RETRIES="${arg#--retries=}" ;;
             --msodbcsql-ini=*) MSODBCSQL_INI="${arg#--msodbcsql-ini=}" ;;
+            --skip-build) SKIP_BUILD=1 ;;
+            --driver=*) DRIVER_OVERRIDE="${arg#--driver=}" ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown argument: $arg" >&2; usage >&2; exit 2 ;;
         esac
@@ -106,15 +118,46 @@ setup_tracing() {
 # Step 2: Build the Rust driver and resolve its shared library path
 # ----------------------------------------------------------------------------
 build_rust_driver() {
-    echo "=== Building mssql-odbc ($BUILD_TYPE) ==="
-    (
-        cd "$ODBC_CRATE_DIR"
-        if [ "$BUILD_TYPE" = "release" ]; then
-            cargo build --release
-        else
-            cargo build
+    # Resolve the driver's shared-library filename for this platform.
+    local libname
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        libname="libmsodbcsql18.dylib"
+    else
+        libname="libmsodbcsql18.so"
+    fi
+
+    # Prebuilt mode: an explicit --driver=PATH wins; otherwise --skip-build
+    # resolves the path from the target dir without invoking cargo.
+    if [ -n "$DRIVER_OVERRIDE" ]; then
+        RUST_DRIVER_PATH="$DRIVER_OVERRIDE"
+        echo "=== Using prebuilt driver: $RUST_DRIVER_PATH ==="
+        if [ ! -f "$RUST_DRIVER_PATH" ]; then
+            echo "Error: Rust driver not found at $RUST_DRIVER_PATH" >&2
+            exit 1
         fi
-    )
+        return
+    fi
+
+    if [ "$SKIP_BUILD" -eq 0 ]; then
+        echo "=== Building mssql-odbc ($BUILD_TYPE) ==="
+        (
+            cd "$ODBC_CRATE_DIR"
+            if [ "$BUILD_TYPE" = "release" ]; then
+                cargo build --release
+            else
+                cargo build
+            fi
+        )
+    else
+        echo "=== Skipping driver build (--skip-build) ==="
+        # build_e2e.sh stages the driver inside the build tree, so prefer that
+        # copy when it exists before falling back to the cargo target dir.
+        if [ -f "$BUILD_DIR/$libname" ]; then
+            RUST_DRIVER_PATH="$BUILD_DIR/$libname"
+            echo "Using staged driver: $RUST_DRIVER_PATH"
+            return
+        fi
+    fi
 
     # Cargo builds into the workspace root's target/ directory, which may
     # differ from the crate-local directory. Use `cargo metadata` to resolve.
@@ -123,11 +166,7 @@ build_rust_driver() {
         | python3 -c 'import sys,json; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null \
         || echo "$ODBC_CRATE_DIR/target")"
 
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        RUST_DRIVER_PATH="$target_dir/$BUILD_TYPE/libmsodbcsql18.dylib"
-    else
-        RUST_DRIVER_PATH="$target_dir/$BUILD_TYPE/libmsodbcsql18.so"
-    fi
+    RUST_DRIVER_PATH="$target_dir/$BUILD_TYPE/$libname"
 
     if [ ! -f "$RUST_DRIVER_PATH" ]; then
         echo "Error: Rust driver not found at $RUST_DRIVER_PATH" >&2
@@ -208,6 +247,21 @@ setup_dev_sql_env() {
 # Step 6: Configure + build the C++ test binaries (once, shared by both runs)
 # ----------------------------------------------------------------------------
 configure_and_build_tests() {
+    if [ "$SKIP_BUILD" -eq 1 ]; then
+        echo ""
+        echo "=== Skipping e2e test build (--skip-build); reusing $BUILD_DIR ==="
+        if [ ! -f "$BUILD_DIR/CTestTestfile.cmake" ]; then
+            echo "Error: prebuilt CMake build not found at $BUILD_DIR" >&2
+            echo "  Expected $BUILD_DIR/CTestTestfile.cmake (produced by build_e2e.sh)." >&2
+            exit 1
+        fi
+        # Publishing/downloading the build tree as a pipeline artifact drops the
+        # Unix execute bit, so the restored ctest binaries come back as 0644 and
+        # ctest fails to exec them ("permission denied"). Restore +x here.
+        find "$BUILD_DIR" -type f -name '*_test' -exec chmod +x {} +
+        return
+    fi
+
     echo ""
     echo "=== Configuring e2e tests (CMake) ==="
     cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug
