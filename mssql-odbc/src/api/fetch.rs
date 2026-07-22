@@ -113,6 +113,8 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 return SQL_ERROR;
             };
             stmt_state.current_row = Some(row);
+            // A new row invalidates any in-progress SQLGetData streaming cursor.
+            stmt_state.reset_getdata();
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();

@@ -56,6 +56,13 @@ pub(crate) struct StmtState {
     pub(crate) pending_unprepare: Option<i32>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
+    /// The 1-based column of the in-progress `SQLGetData` streaming read, or 0
+    /// when no read is active. Used to detect resumption vs. a new column.
+    pub(crate) getdata_col: SqlUSmallInt,
+    /// Bytes/elements of the current `getdata_col` value already returned by
+    /// prior `SQLGetData` calls. `usize::MAX` marks a value that has been fully
+    /// returned (so a further call yields `SQL_NO_DATA`). Reset on each fetch.
+    pub(crate) getdata_offset: usize,
     /// Rowset size for block fetches (`SQL_ATTR_ROW_ARRAY_SIZE`). Defaults to 1
     /// (single-row). Consumed by the columnar `SQLFetchScroll` path.
     pub(crate) row_array_size: SqlULen,
@@ -84,6 +91,13 @@ impl StmtState {
 
     pub(crate) fn clear_state(&mut self, mask: u32) {
         self.state_flags &= !mask;
+    }
+
+    /// Clears the `SQLGetData` streaming cursor. Called whenever the current
+    /// row changes so a new row's columns are read from the start.
+    pub(crate) fn reset_getdata(&mut self) {
+        self.getdata_col = 0;
+        self.getdata_offset = 0;
     }
 
     /// Moves the cached `prepared_handle` (if any) into `pending_unprepare` so
@@ -130,6 +144,8 @@ impl StmtHandle {
                 prepared_handle: None,
                 pending_unprepare: None,
                 current_row: None,
+                getdata_col: 0,
+                getdata_offset: 0,
                 row_array_size: 1,
                 rows_fetched_ptr: std::ptr::null_mut(),
                 row_status_ptr: std::ptr::null_mut(),

@@ -28,3 +28,8 @@ reqwest = { version = "0.13", default-features = false, features = ["native-tls"
 url = "2"
 
 [build-dependencies]
+
+[dev-dependencies]
+# Matches the version mssql-tds resolves (workspace lock: 1.x) so the `Uuid`
+# type in tests is the same crate instance as `ColumnValues::Uuid`.
+uuid = "1"
