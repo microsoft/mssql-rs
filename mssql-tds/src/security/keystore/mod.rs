@@ -172,6 +172,7 @@ pub(crate) async fn decrypt_cek(
     registry: &ColumnEncryptionKeyStoreProviderRegistry,
     cache: &CekCache,
     entry: &CekTableEntry,
+    trusted_key_paths: &[String],
 ) -> TdsResult<Arc<Zeroizing<Vec<u8>>>> {
     if entry.encrypted_cek_values.is_empty() {
         return Err(Error::ColumnEncryptionError(
@@ -182,6 +183,29 @@ pub(crate) async fn decrypt_cek(
     let mut last_error: Option<Error> = None;
 
     for value in &entry.encrypted_cek_values {
+        // Trusted master key paths: when an allow-list is configured for this
+        // server, skip any CMK path that is not on it before attempting to use
+        // it (even a cached one), so a malicious server cannot point the client
+        // at an attacker-controlled column master key. An empty list means the
+        // server is unrestricted. Compared case-insensitively.
+        //
+        // Skip (record the error and continue) rather than return: a CEK entry
+        // may carry several CMK-wrapped values for key rotation, so a later value
+        // at a trusted path can still resolve the key. No untrusted path is ever
+        // used; if every value is untrusted this error is surfaced below.
+        if !trusted_key_paths.is_empty()
+            && !trusted_key_paths
+                .iter()
+                .any(|trusted| trusted.eq_ignore_ascii_case(&value.key_path))
+        {
+            last_error = Some(Error::ColumnEncryptionError(format!(
+                "The column master key path '{}' is not in the trusted master key paths list \
+                 configured for this server; refusing to use it to unwrap a column encryption key.",
+                value.key_path
+            )));
+            continue;
+        }
+
         let cache_key = CekCacheKey {
             provider_name: value.key_store_name.to_ascii_uppercase(),
             master_key_path: value.key_path.clone(),
@@ -272,11 +296,12 @@ impl ResolvedCekDecryptor {
         registry: &ColumnEncryptionKeyStoreProviderRegistry,
         cache: &CekCache,
         cek_table: &[CekTableEntry],
+        trusted_key_paths: &[String],
     ) -> Self {
         let mut ceks = Vec::with_capacity(cek_table.len());
         for entry in cek_table {
             ceks.push(
-                decrypt_cek(registry, cache, entry)
+                decrypt_cek(registry, cache, entry, trusted_key_paths)
                     .await
                     .map_err(|error| error.to_string()),
             );
@@ -400,11 +425,11 @@ mod tests {
 
         let entry = entry(vec![cek_value("PROVIDER", "path", &[0xAB, 0xCD])]);
 
-        let first = decrypt_cek(&registry, &cache, &entry).await.unwrap();
+        let first = decrypt_cek(&registry, &cache, &entry, &[]).await.unwrap();
         assert_eq!(first.as_slice(), vec![7u8; 32].as_slice());
 
         // Second resolution must come from the cache (provider not called again).
-        let second = decrypt_cek(&registry, &cache, &entry).await.unwrap();
+        let second = decrypt_cek(&registry, &cache, &entry, &[]).await.unwrap();
         assert_eq!(second.as_slice(), vec![7u8; 32].as_slice());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
@@ -422,7 +447,7 @@ mod tests {
             cek_value("GOOD", "p2", &[2]),
         ]);
 
-        let key = decrypt_cek(&registry, &cache, &entry).await.unwrap();
+        let key = decrypt_cek(&registry, &cache, &entry, &[]).await.unwrap();
         assert_eq!(key.as_slice(), vec![9u8; 32].as_slice());
     }
 
@@ -432,7 +457,9 @@ mod tests {
         let cache = CekCache::new();
         let entry = entry(vec![cek_value("MISSING", "p", &[1])]);
 
-        let error = decrypt_cek(&registry, &cache, &entry).await.unwrap_err();
+        let error = decrypt_cek(&registry, &cache, &entry, &[])
+            .await
+            .unwrap_err();
         assert!(matches!(error, Error::ColumnEncryptionError(_)));
     }
 
@@ -442,8 +469,77 @@ mod tests {
         let cache = CekCache::new();
         let entry = entry(vec![]);
 
-        let error = decrypt_cek(&registry, &cache, &entry).await.unwrap_err();
+        let error = decrypt_cek(&registry, &cache, &entry, &[])
+            .await
+            .unwrap_err();
         assert!(matches!(error, Error::ColumnEncryptionError(_)));
+    }
+
+    #[tokio::test]
+    async fn decrypt_cek_rejects_untrusted_key_path() {
+        let provider = Arc::new(MockProvider::new(vec![7u8; 32]));
+        let mut registry = ColumnEncryptionKeyStoreProviderRegistry::new();
+        registry.register("PROVIDER", provider.clone());
+        let cache = CekCache::new();
+        let entry = entry(vec![cek_value(
+            "PROVIDER",
+            "https://vault/keys/attacker",
+            &[0xAB],
+        )]);
+
+        // A trusted list is configured but does not include the entry's key path.
+        let trusted = vec!["https://vault/keys/trusted".to_string()];
+        let error = decrypt_cek(&registry, &cache, &entry, &trusted)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::ColumnEncryptionError(_)));
+        // The provider must never be asked to unwrap a key at an untrusted path.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decrypt_cek_allows_trusted_key_path_case_insensitively() {
+        let provider = Arc::new(MockProvider::new(vec![7u8; 32]));
+        let mut registry = ColumnEncryptionKeyStoreProviderRegistry::new();
+        registry.register("PROVIDER", provider.clone());
+        let cache = CekCache::new();
+        let entry = entry(vec![cek_value(
+            "PROVIDER",
+            "https://Vault/Keys/Trusted",
+            &[0xAB],
+        )]);
+
+        // Same path, different case — trust comparison is case-insensitive.
+        let trusted = vec!["https://vault/keys/trusted".to_string()];
+        let key = decrypt_cek(&registry, &cache, &entry, &trusted)
+            .await
+            .unwrap();
+        assert_eq!(key.as_slice(), vec![7u8; 32].as_slice());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn decrypt_cek_falls_back_from_untrusted_to_trusted_key_path() {
+        let provider = Arc::new(MockProvider::new(vec![7u8; 32]));
+        let mut registry = ColumnEncryptionKeyStoreProviderRegistry::new();
+        registry.register("PROVIDER", provider.clone());
+        let cache = CekCache::new();
+
+        // Key rotation: the entry wraps the CEK under two CMKs. The first path is
+        // untrusted and must be skipped; the second is trusted and must resolve.
+        let entry = entry(vec![
+            cek_value("PROVIDER", "https://vault/keys/attacker", &[0xAB]),
+            cek_value("PROVIDER", "https://vault/keys/trusted", &[0xCD]),
+        ]);
+
+        let trusted = vec!["https://vault/keys/trusted".to_string()];
+        let key = decrypt_cek(&registry, &cache, &entry, &trusted)
+            .await
+            .unwrap();
+        assert_eq!(key.as_slice(), vec![7u8; 32].as_slice());
+        // The provider is asked to unwrap exactly once — only for the trusted
+        // value; the untrusted path is skipped before the provider is reached.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     use crate::datatypes::column_values::ColumnValues;
@@ -487,7 +583,7 @@ mod tests {
         let cache = CekCache::new();
         let cek_table = vec![entry(vec![cek_value("PROVIDER", "path", &[0xAB])])];
 
-        let decryptor = ResolvedCekDecryptor::resolve(&registry, &cache, &cek_table).await;
+        let decryptor = ResolvedCekDecryptor::resolve(&registry, &cache, &cek_table, &[]).await;
 
         let crypto = int_crypto_metadata(0);
         let decrypted = decryptor.decrypt(&crypto, &cipher).unwrap();
@@ -501,7 +597,7 @@ mod tests {
         let cache = CekCache::new();
         let cek_table = vec![entry(vec![cek_value("FAILING", "p", &[1])])];
 
-        let decryptor = ResolvedCekDecryptor::resolve(&registry, &cache, &cek_table).await;
+        let decryptor = ResolvedCekDecryptor::resolve(&registry, &cache, &cek_table, &[]).await;
 
         // Resolution failed, but the error only surfaces when the ordinal is used.
         let error = decryptor
@@ -515,7 +611,7 @@ mod tests {
         let registry = ColumnEncryptionKeyStoreProviderRegistry::new();
         let cache = CekCache::new();
 
-        let decryptor = ResolvedCekDecryptor::resolve(&registry, &cache, &[]).await;
+        let decryptor = ResolvedCekDecryptor::resolve(&registry, &cache, &[], &[]).await;
 
         let error = decryptor.decrypt(&int_crypto_metadata(5), &[]).unwrap_err();
         assert!(matches!(error, Error::ColumnEncryptionError(_)));

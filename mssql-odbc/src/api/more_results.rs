@@ -138,6 +138,12 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             let info_messages = client.take_info_messages();
             post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
+            // The batch is fully drained, so the `sp_prepexec` `@handle` (if any)
+            // has arrived; capture it so the next execute reuses it via
+            // `sp_execute` instead of re-preparing.
+            super::exec_common::capture_prepared_handle(stmt, &mut client);
+            // TODO: surface output-param availability here once output
+            // params land.
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
                 if dbc_state.active_stmt == Some(statement_handle) {

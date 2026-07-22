@@ -834,6 +834,93 @@ mod always_encrypted {
         });
     }
 
+    // ----- ForceColumnEncryption -----
+
+    /// A parameter with `ForceColumnEncryption` set that targets an encrypted
+    /// column is encrypted normally and round-trips — the flag only changes the
+    /// failure behavior, not the success path.
+    #[tokio::test]
+    async fn force_column_encryption_encrypts_encrypted_column() {
+        ae_test!(|h| {
+            let table = h.create_encrypted_table("INT", "DETERMINISTIC").await;
+            let param = RpcParameter::new(
+                Some("@val".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(4242)),
+            )
+            .with_force_column_encryption(true);
+            h.client
+                .execute_sp_executesql(
+                    format!("INSERT INTO {table} (val) VALUES (@val);"),
+                    vec![param],
+                    None,
+                    None,
+                )
+                .await
+                .expect("force-encrypted insert into an encrypted column should succeed");
+            while h.client.move_to_next().await.unwrap() {}
+            h.client.close_query().await.unwrap();
+
+            let got = select_val(&mut h.client, &table)
+                .await
+                .expect("read back force-encrypted value");
+            assert!(matches!(got, ColumnValues::Int(4242)), "got {got:?}");
+        });
+    }
+
+    /// A parameter with `ForceColumnEncryption` set that targets a **plaintext**
+    /// column is rejected: the server reports the column as not encrypted, so the
+    /// driver refuses to send the value as plaintext (defending against a server
+    /// that downgrades an encrypted column to harvest plaintext).
+    #[tokio::test]
+    async fn force_column_encryption_rejects_plaintext_column() {
+        ae_test!(|h| {
+            let table = h.create_table("val INT NULL").await;
+            let param = RpcParameter::new(
+                Some("@val".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(1)),
+            )
+            .with_force_column_encryption(true);
+            let err = h
+                .client
+                .execute_sp_executesql(
+                    format!("INSERT INTO {table} (val) VALUES (@val);"),
+                    vec![param],
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("ForceColumnEncryption on a plaintext column must be rejected");
+            assert!(
+                matches!(&err, mssql_tds::error::Error::ColumnEncryptionError(m) if m.contains("ForceColumnEncryption")),
+                "expected a ForceColumnEncryption column-encryption error, got {err:?}"
+            );
+        });
+    }
+
+    /// A parameter with `ForceColumnEncryption` set on a connection where Always
+    /// Encrypted is not enabled is rejected before the value is sent, rather than
+    /// silently transmitting it as plaintext.
+    #[tokio::test]
+    async fn force_column_encryption_without_ae_errors() {
+        let mut client = connect_disabled().await;
+        let param = RpcParameter::new(
+            Some("@val".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(1)),
+        )
+        .with_force_column_encryption(true);
+        let err = client
+            .execute_sp_executesql("SELECT @val;".to_string(), vec![param], None, None)
+            .await
+            .expect_err("ForceColumnEncryption without Always Encrypted must be rejected");
+        assert!(
+            matches!(&err, mssql_tds::error::Error::UsageError(m) if m.contains("ForceColumnEncryption")),
+            "expected a ForceColumnEncryption usage error, got {err:?}"
+        );
+    }
+
     // ----- Stored-procedure parameter encryption -----
 
     /// A named parameter passed to [`TdsClient::execute_stored_procedure`] that
@@ -1099,6 +1186,7 @@ mod always_encrypted {
                 .execute_sp_prepexec(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
                     vec![param],
+                    None,
                     None,
                     None,
                 )

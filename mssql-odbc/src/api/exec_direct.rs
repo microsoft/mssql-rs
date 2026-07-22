@@ -5,19 +5,19 @@
 
 use tracing::{debug, error};
 
+use super::exec_common::{
+    build_named_params, claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
+};
 use super::sqlstate::*;
-use super::util::read_utf16;
+use super::util::{read_utf16, rewrite_param_markers};
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn,
-    SqlSmallInt, SqlWChar,
+    SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
 };
 use crate::error::free_errors;
-use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_PREPARED,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
-use mssql_tds::connection::tds_client::ResultSet;
 
 /// Implementation of `SQLExecDirectW`.
 ///
@@ -79,11 +79,10 @@ fn sql_exec_direct_w_safe(
 ) -> SqlReturn {
     debug!(sql = %sql, "SQLExecDirectW: executing");
 
-    // Access parent DBC
     let dbc = stmt.parent_dbc();
 
-    // Check STMT state first.
-    {
+    // Check STMT state, gather parameter values, and reset prior context.
+    let (named_params, rewritten_sql, marker_count) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -94,167 +93,52 @@ fn sql_exec_direct_w_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        // Rewrite markers and read the bound parameter buffers before mutating
+        // any state, so a binding error (07002 / HYC00) leaves the statement
+        // unchanged.
+        let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
+        let named_params =
+            match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
+                Ok(params) => params,
+                Err(rc) => return rc,
+            };
         // A new execute invalidates prior metadata/context immediately, so a
         // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.column_metadata.clear();
         stmt_state.current_row = None;
+        stmt_state.prepared_sql = None;
+        // Superseding a prepared plan orphans its server handle; release it
+        // (deferred) once we hold the client below.
+        stmt_state.orphan_prepared_handle();
+        stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-    }
-
-    // Take TdsClient out of DbcState. Lock is held only briefly — no I/O inside.
-    let mut client = {
-        let Ok(mut dbc_state) = dbc.inner.lock() else {
-            error!("SQLExecDirectW: dbc mutex poisoned");
-            return SQL_ERROR;
-        };
-
-        if dbc_state.connection_state != ConnectionState::Connected {
-            error!("SQLExecDirectW: DBC is not connected");
-            drop(dbc_state);
-            if let Ok(mut ss) = stmt.inner.lock() {
-                post_diag(&mut ss, ERR_CONNECTION_DOES_NOT_EXIST);
-            }
-            clear_exec_started(stmt);
-            return SQL_ERROR;
-        }
-
-        // HY000: another statement on this DBC already holds an open cursor.
-        if let Some(busy_stmt) = dbc_state.active_stmt
-            && busy_stmt != statement_handle
-        {
-            error!("SQLExecDirectW: connection is busy with results for another statement");
-            drop(dbc_state);
-            if let Ok(mut ss) = stmt.inner.lock() {
-                post_diag(&mut ss, ERR_CONNECTION_BUSY);
-            }
-            clear_exec_started(stmt);
-            return SQL_ERROR;
-        }
-
-        // Claim the connection before releasing the lock. Concurrent threads will
-        // now see active_stmt and get HY000 instead of "no active TDS client".
-        dbc_state.active_stmt = Some(statement_handle);
-        let Some(client) = dbc_state.client.take() else {
-            error!("SQLExecDirectW: no active TDS client");
-            dbc_state.active_stmt = None;
-            drop(dbc_state);
-            if let Ok(mut ss) = stmt.inner.lock() {
-                post_diag(&mut ss, ERR_NO_ACTIVE_TDS_CLIENT);
-            }
-            clear_exec_started(stmt);
-            return SQL_ERROR;
-        };
-
-        client
-        // dbc_state dropped here — DBC lock released before any network I/O.
+        (named_params, rewritten_sql, marker_count)
     };
 
-    // Execute the SQL batch. Neither DBC nor STMT lock is held during I/O.
-    if let Err(e) = dbc.runtime.block_on(client.execute(sql, None, None)) {
-        error!(%e, "SQLExecDirectW: execution failed");
-        let info_messages = client.take_info_messages();
-        if let Ok(mut ds) = dbc.inner.lock() {
-            ds.client = Some(client);
-            ds.active_stmt = None;
-        }
-        if let Ok(mut ss) = stmt.inner.lock() {
-            post_tds_error(&mut ss, &e, SQLSTATE_HY000);
-            post_tds_info_messages(&mut ss, &info_messages);
-        }
-        clear_exec_started(stmt);
-        return SQL_ERROR;
-    }
-
-    // Capture metadata for SQLNumResultCols / SQLDescribeCol.
-    let metadata = client.get_metadata().clone();
-    // A non-empty metadata vec means COLMETADATA was received — there is a result set
-    // (SELECT or similar). DDL / DML produces no COLMETADATA, so metadata is empty.
-    let has_result_set = !metadata.is_empty();
-
-    if !has_result_set {
-        // DDL / DML: drain trailing DONE tokens and return the connection to idle.
-        // No cursor is opened — the app can re-execute immediately without SQLCloseCursor.
-        if let Err(e) = dbc.runtime.block_on(client.close_query()) {
-            error!(%e, "SQLExecDirectW: failed to drain after DDL/DML");
-            let info_messages = client.take_info_messages();
-            if let Ok(mut ds) = dbc.inner.lock() {
-                ds.client = Some(client);
-                ds.active_stmt = None;
-            }
-            if let Ok(mut ss) = stmt.inner.lock() {
-                post_tds_error(&mut ss, &e, SQLSTATE_HY000);
-                post_tds_info_messages(&mut ss, &info_messages);
-            }
-            clear_exec_started(stmt);
-            return SQL_ERROR;
-        }
-        let Ok(mut stmt_state) = stmt.inner.lock() else {
-            error!("SQLExecDirectW: stmt mutex poisoned");
-            if let Ok(mut ds) = dbc.inner.lock() {
-                ds.client = Some(client);
-                ds.active_stmt = None;
-            }
-            clear_exec_started(stmt);
-            return SQL_ERROR;
-        };
-        stmt_state.column_metadata = metadata; // empty vec
-        stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
-        stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
-        let info_messages = client.take_info_messages();
-        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
-        drop(stmt_state);
-        if let Ok(mut ds) = dbc.inner.lock() {
-            ds.client = Some(client);
-            ds.active_stmt = None;
-        }
-        debug!("SQLExecDirectW: DDL/DML complete");
-        return if has_server_info {
-            SQL_SUCCESS_WITH_INFO
-        } else {
-            SQL_SUCCESS
-        };
-    }
-
-    // Result-bearing query: leave the result set open for SQLFetch.
-    // SQLCloseCursor / SQLFreeStmt(SQL_CLOSE) will drain the wire.
-    let Ok(mut stmt_state) = stmt.inner.lock() else {
-        error!("SQLExecDirectW: stmt mutex poisoned");
-        if let Ok(mut ds) = dbc.inner.lock() {
-            ds.client = Some(client);
-            ds.active_stmt = None;
-        }
-        clear_exec_started(stmt);
-        return SQL_ERROR;
+    let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
+        Ok(client) => client,
+        Err(rc) => return rc,
     };
-    stmt_state.column_metadata = metadata;
-    stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
-    stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-    let info_messages = client.take_info_messages();
-    let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
-    drop(stmt_state);
 
-    // Return client to DBC. active_stmt is already set from the claim above.
-    let Ok(mut dbc_state) = dbc.inner.lock() else {
-        error!("SQLExecDirectW: dbc mutex poisoned storing client");
-        clear_exec_started(stmt);
-        return SQL_ERROR;
-    };
-    dbc_state.client = Some(client);
-    drop(dbc_state);
+    // Release any handle orphaned by the reset above before running the batch.
+    flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecDirectW");
 
-    debug!("SQLExecDirectW: execution complete");
-    if has_server_info {
-        SQL_SUCCESS_WITH_INFO
+    // Parameterized text runs via sp_executesql (direct execution, no cached
+    // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
+    // STMT lock is held during I/O.
+    let exec_result: Result<(), mssql_tds::error::Error> = if marker_count > 0 {
+        dbc.runtime
+            .block_on(client.execute_sp_executesql(rewritten_sql, named_params, None, None))
     } else {
-        SQL_SUCCESS
+        dbc.runtime.block_on(client.execute(sql, None, None))
+    };
+    if let Err(e) = exec_result {
+        error!(%e, "SQLExecDirectW: execution failed");
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
-}
 
-fn clear_exec_started(stmt: &StmtHandle) {
-    if let Ok(mut stmt_state) = stmt.inner.lock() {
-        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-    }
+    finish_execute(dbc, stmt, statement_handle, client, "SQLExecDirectW")
 }
 
 #[cfg(test)]
@@ -292,5 +176,53 @@ mod tests {
         let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
         // DBC is not connected
         assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn exec_direct_clears_stale_prepared_plan() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared_sql = Some("SELECT 1".to_string());
+            state.prepared_handle = Some(42);
+            state.set_state(STMT_STATE_PREPARED);
+        }
+
+        let sql: Vec<u16> = "SELECT 2"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // Fails (not connected), but the prepared plan must already be reset.
+        assert_eq!(
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_ERROR
+        );
+
+        let state = stmt.inner.lock().unwrap();
+        assert!(state.prepared_sql.is_none());
+        assert!(state.prepared_handle.is_none());
+        assert!(!state.has_state(STMT_STATE_PREPARED));
+        // The superseded handle is queued for sp_unprepare. The flush never ran
+        // here because the connection claim failed, so it remains pending.
+        assert_eq!(state.pending_unprepare, Some(42));
+    }
+
+    #[test]
+    fn unbound_parameter_marker_returns_07002() {
+        let h = TestHandles::with_env_dbc_stmt();
+        // SQL has one marker but no parameter is bound; the failure must be
+        // posted before any state mutation and before the connection claim.
+        let sql: Vec<u16> = "SELECT ? AS v"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
+        // A binding error must leave the statement unchanged — no EXEC_STARTED.
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }
 }

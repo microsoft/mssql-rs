@@ -62,10 +62,21 @@ authoritative parity reference for this crate. Its source lives in the
 - At FFI boundaries, convert every `Result::Err` into the appropriate
   `SqlReturn` code (`SQL_ERROR`, `SQL_INVALID_HANDLE`, etc.).
 - Store diagnostic info on the handle so `SQLGetDiagRec` / `SQLGetDiagField`
-  can report it — don't discard error details. Two posters, choose by source:
-  - `post_sql_error(state, sqlstate, native, message)` — for errors the
-    driver itself raises (invalid arg, sequence error, truncation, etc.).
-    Posts exactly one record.
+  can report it — don't discard error details. Three posters, choose by source:
+  - `post_diag(state, DiagMsg)` — **preferred for driver-raised diagnostics
+    that have a canonical SQLSTATE + message.** A `DiagMsg` bundles a fixed
+    SQLSTATE with its message text into a single `ERR_*` constant in
+    `sqlstate.rs` (e.g. `ERR_INVALID_CURSOR_STATE`, `ERR_FUNCTION_SEQUENCE`,
+    `ERR_CONNECTION_DOES_NOT_EXIST`). This keeps a call site from pairing a
+    message with the wrong SQLSTATE and defines a reused message exactly once,
+    mirroring msodbcsql's `IDS_*` resource entries. In new code, prefer
+    adding/using an `ERR_*` `DiagMsg` constant over inlining `post_sql_error`
+    with a literal — especially when the same `(SQLSTATE, message)` pair
+    appears, or could appear, in more than one place.
+  - `post_sql_error(state, sqlstate, native, message)` — the lower-level
+    primitive behind `post_diag`. Use it directly only for genuinely one-off
+    or **dynamic** messages (text computed at runtime) that don't warrant a
+    constant. Posts exactly one record.
   - `post_tds_error(state, &tds_err, default_sqlstate)` — for any
     `mssql_tds::TdsError` bubbling up from the protocol layer. For
     `TdsError::SqlServerError` it fans out to one record per server-reported
@@ -125,6 +136,15 @@ Rules of thumb:
   `debug_assert!(buffer_length >= 0, ...)`) belongs in the safe core, not the
   shim. The shim should be limited to null-checks and pointer→reference
   conversion.
+- Preconditions the DM is contractually required to enforce (non-null required
+  pointers, valid length/option values, correct handle type) are checked with
+  `debug_assert!` only — **do not** promote them to a release-build
+  `if`/error-return. The assert documents the DM contract and catches
+  violations in debug builds; in release the driver trusts the DM, matching
+  msodbcsql (which asserts rather than re-validates). Asserts worded
+  *"... — DM should have rejected this"* are intentionally debug-only; leave
+  them as `debug_assert!`. Only values the DM does **not** validate (genuine
+  application inputs) get a runtime check.
 
 ## Memory management
 
@@ -259,6 +279,17 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
 - End-to-end tests that exercise the loadable `.so`/`.dll` through a real
   Driver Manager live in `tests/e2e/` as a CMake-built C++ suite (run via
   `tests/e2e/run_e2e.sh` / `.ps1`).
+- Tag any live e2e test that can only assert the observable *outcome* (a value
+  round-trips, the connection stays healthy) and cannot see the underlying TDS
+  RPC sequence with a `Benefits-from-mock-tds:` comment above the `TEST_F`,
+  noting what a byte-level mock TDS server would let it assert (e.g. that an
+  `sp_unprepare` / `sp_prepexec` `@handle` drop actually fired). Pin the exact
+  behavior with a Rust unit test meanwhile; `grep -rn Benefits-from-mock-tds`
+  surfaces every such test to tighten once mock-TDS support lands.
+- If an e2e test asserts mssql-odbc-specific behavior the full msodbcsql driver
+  does not share (e.g. a Phase-1 "not implemented" response), start it with the
+  `SKIP_IF_COMPARING_MSODBCSQL()` macro so it self-skips on the msodbcsql leg of
+  a `--compare-with-msodbcsql` run instead of failing the parity binary.
 - Every new `SQLXxx` function must have at least:
   - A success-path test.
   - A null-output-handle test.

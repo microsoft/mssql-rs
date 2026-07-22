@@ -439,7 +439,7 @@ mod tests {
             }],
         };
 
-        let plaintext = decrypt_cek(&registry, &cache, &entry).await.unwrap();
+        let plaintext = decrypt_cek(&registry, &cache, &entry, &[]).await.unwrap();
         assert_eq!(plaintext.as_ref().as_slice(), &CEK);
     }
 }
