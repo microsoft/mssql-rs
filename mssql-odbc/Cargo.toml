@@ -10,7 +10,13 @@ crate-type = ["cdylib"]
 
 [dependencies]
 mssql-tds = { path = "../mssql-tds" }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "sync",
+    "net",
+    "io-util",
+    "time",
+] }
 tracing = { version = "0.1.43", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 async-trait = "0.1"
@@ -26,5 +32,15 @@ azure_core = { version = "1.1", default-features = false, features = [
 ] }
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream"] }
 url = "2"
+# ActiveDirectoryInteractive (T3) hand-rolls the OAuth2 auth-code + PKCE flow on
+# the existing native-tls `reqwest`, avoiding a heavier OAuth crate and its own
+# TLS/crypto backend. `sha2` (pure-Rust RustCrypto) computes the PKCE S256
+# challenge; `getrandom` supplies the CSPRNG verifier/state; `base64` does the
+# base64url encoding; `serde`/`serde_json` parse the token response.
+base64 = "0.22"
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 
 [build-dependencies]

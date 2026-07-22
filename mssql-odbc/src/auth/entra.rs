@@ -35,6 +35,7 @@ use azure_identity::{
 use tokio::sync::OnceCell;
 use url::{Position, Url};
 
+use super::interactive::InteractiveTokenFactory;
 use crate::connection::odbc_authentication_transformer::TransformedAuth;
 use mssql_tds::connection::client_context::{
     ClientContext, EntraIdTokenFactory, TdsAuthenticationMethod,
@@ -156,7 +157,7 @@ impl EntraIdTokenFactory for EntraTokenFactory {
 /// Normalizes an SPN/resource into a v2 scope by ensuring a single `/.default`
 /// suffix (e.g. `https://database.windows.net/` becomes
 /// `https://database.windows.net/.default`).
-fn normalize_scope(spn: &str) -> String {
+pub(super) fn normalize_scope(spn: &str) -> String {
     let trimmed = spn.trim_end_matches('/');
     if trimmed.ends_with("/.default") {
         trimmed.to_string()
@@ -176,7 +177,7 @@ fn normalize_scope(spn: &str) -> String {
 ///
 /// Parsing goes through the `url` crate (WHATWG): the scheme and host are
 /// lowercased and the default `:443` port is dropped.
-fn split_sts_url(sts_url: &str) -> TdsResult<(String, String)> {
+pub(super) fn split_sts_url(sts_url: &str) -> TdsResult<(String, String)> {
     // The URL is server-provided (FEDAUTHINFO): tolerate surrounding whitespace.
     let url = Url::parse(sts_url.trim())
         .map_err(|e| Error::ConnectionError(format!("invalid STS URL: {sts_url} ({e})")))?;
@@ -197,7 +198,7 @@ fn split_sts_url(sts_url: &str) -> TdsResult<(String, String)> {
 
 /// Encodes a string as UTF-16LE bytes — the token format the FedAuth token
 /// message carries on the wire.
-fn encode_utf16le(s: &str) -> Vec<u8> {
+pub(super) fn encode_utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
 }
 
@@ -242,6 +243,20 @@ pub(crate) fn configure_auth(
                 TdsAuthenticationMethod::ActiveDirectoryManagedIdentity,
                 Box::new(factory),
             );
+        }
+        TdsAuthenticationMethod::ActiveDirectoryInteractive => {
+            // A non-empty UID becomes the `login_hint`; the browser flow uses the
+            // well-known public-client id and stores no secret in the context.
+            let login_hint = (!resolved.user_name.is_empty()).then_some(resolved.user_name);
+            let factory = InteractiveTokenFactory::new(login_hint);
+            context.auth_method_map.insert(
+                TdsAuthenticationMethod::ActiveDirectoryInteractive,
+                Box::new(factory),
+            );
+            // The browser sign-in (with MFA) can take minutes, so disable the
+            // login-connect deadline; the flow keeps its own inner bound
+            // (REDIRECT_TIMEOUT) and stays cancellable. See AB#46067.
+            context.connect_timeout = 0;
         }
         other => return Err(other),
     }
@@ -416,12 +431,41 @@ mod tests {
     }
 
     #[test]
+    fn configure_auth_interactive_registers_factory() {
+        let mut ctx = ClientContext::default();
+        // UID is kept as the login hint; no secret is written to the context.
+        let r = transformed(
+            TdsAuthenticationMethod::ActiveDirectoryInteractive,
+            "user@contoso.com",
+            "",
+        );
+        assert!(configure_auth(&mut ctx, r).is_ok());
+        assert!(ctx.user_name.is_empty());
+        assert!(ctx.password.is_empty());
+        assert!(
+            ctx.auth_method_map
+                .contains_key(&TdsAuthenticationMethod::ActiveDirectoryInteractive)
+        );
+        assert_eq!(
+            ctx.tds_authentication_method,
+            TdsAuthenticationMethod::ActiveDirectoryInteractive
+        );
+        // The browser flow governs its own timeout; the login-connect deadline
+        // must be disabled so MFA has time to complete.
+        assert_eq!(ctx.connect_timeout, 0);
+    }
+
+    #[test]
     fn configure_auth_unsupported_method_is_err() {
         let mut ctx = ClientContext::default();
-        let r = transformed(TdsAuthenticationMethod::ActiveDirectoryInteractive, "", "");
+        let r = transformed(
+            TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow,
+            "",
+            "",
+        );
         assert_eq!(
             configure_auth(&mut ctx, r),
-            Err(TdsAuthenticationMethod::ActiveDirectoryInteractive)
+            Err(TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow)
         );
     }
 }

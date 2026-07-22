@@ -7,5 +7,6 @@
 //! connect-flow entry point.
 
 mod entra;
+mod interactive;
 
 pub(crate) use entra::configure_auth;

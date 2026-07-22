@@ -244,11 +244,11 @@ fn do_connect(
     );
 
     // Build ClientContext. T1 wired SQL password, integrated (SSPI/GSSAPI), and
-    // pre-acquired access tokens; T2 adds Entra service principal (secret) and
-    // managed identity via an Azure-SDK token factory. Methods that still need
-    // token acquisition (AD password, interactive, device code, workload
-    // identity, default credential, AD integrated) are rejected with HYC00
-    // until a later tier.
+    // pre-acquired access tokens; T2 added Entra service principal (secret) and
+    // managed identity; T3 adds interactive (browser) sign-in — all via a token
+    // factory. Methods that still need token acquisition (AD password, device
+    // code, workload identity, default credential, AD integrated) are rejected
+    // with HYC00 until a later tier.
     let mut context = ClientContext::default();
     context.database = params.database.clone();
 
@@ -438,14 +438,14 @@ mod tests {
     }
 
     #[test]
-    fn interactive_method_not_implemented_returns_hyc00() {
-        // ActiveDirectoryInteractive is recognized but not yet implemented (T3);
-        // the gate must reject it with HYC00 before any network activity.
-        // (T2 now implements ServicePrincipal and ManagedIdentity, so those no
-        // longer hit this gate.)
+    fn device_code_method_not_implemented_returns_hyc00() {
+        // ActiveDirectoryDeviceCodeFlow is recognized but not yet implemented;
+        // the gate must reject it with HYC00 before any network activity. (T2
+        // implements ServicePrincipal and ManagedIdentity and T3 implements
+        // Interactive, so those no longer hit this gate.)
         let h = TestHandles::with_env_dbc();
         let dbc = h.dbc;
-        let conn_str: Vec<u16> = cs("Server=s;Authentication=ActiveDirectoryInteractive")
+        let conn_str: Vec<u16> = cs("Server=s;Authentication=ActiveDirectoryDeviceCodeFlow")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
