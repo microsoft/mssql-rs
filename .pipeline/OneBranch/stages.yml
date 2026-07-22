@@ -48,9 +48,9 @@ stages:
     pool:
       type: windows
       isCustom: true
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-1ES-POOL-WUS3-NVME
       demands:
-        - imageOverride -equals RUST-Win22-Sql25-1P
+        - imageOverride -equals RUST-Win22-Sql25-1P-NVME
     variables:
     - ${{ if eq(parameters.isOfficial, true) }}:
       - group: 'ESRP Federated Creds (AME)'
@@ -148,9 +148,9 @@ stages:
     pool:
       type: linux
       isCustom: true
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-1ES-POOL-WUS3-NVME
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals RUST-1ES-UBUSLIM-NVME
     variables:
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
       ob_artifactSuffix: '_linux_x64'

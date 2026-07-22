@@ -39,6 +39,20 @@ parameters:
   type: string
   default: '2025-latest'
 
+# 1ES pool + image overrides for the x64 Windows/Linux jobs. Single source of
+# truth: change these defaults to retarget every x64 job in this pipeline.
+- name: poolName
+  type: string
+  default: RUST-1ES-POOL-WUS3-NVME
+
+- name: linuxImage
+  type: string
+  default: RUST-1ES-UBUSLIM-NVME
+
+- name: windowsImage
+  type: string
+  default: RUST-Win22-Sql25-1P-NVME
+
 stages:
 - stage: EvaluateDuplicate
   displayName: Evaluate PR duplicate
@@ -47,9 +61,9 @@ stages:
   - job: Evaluate
     displayName: Check prior successful PR validation
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - bash: |
         set -euo pipefail
@@ -87,9 +101,9 @@ stages:
   - job: Build_Windows
     displayName: Build Windows
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-Win22-Sql25-1P
+        - imageOverride -equals ${{ parameters.windowsImage }}
     variables:
       # For details on this CARGO_TARGET_DIR setting, see https://eng.ms/docs/more/rust/topics/onebranch-workaround
       CARGO_TARGET_DIR: C:\cargo_target_dir
@@ -204,13 +218,16 @@ stages:
   - job: Build_Linux
     displayName: Build Linux
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
     steps:
+      - script: |
+          .pipeline/scripts/print-disk-info.sh
+        displayName: 'Print agent disk info'
       - template: cargo-authenticate-template.yml
         parameters:
           osType: Linux
@@ -377,9 +394,9 @@ stages:
   - job: Fuzz_TokenStream_Linux
     displayName: Fuzz Test Token Stream Linux (30 min)
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
@@ -398,9 +415,9 @@ stages:
   - job: Fuzz_TdsClient_Linux
     displayName: Fuzz Test TdsClient Linux (30 min)
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
@@ -419,9 +436,9 @@ stages:
   - job: Fuzz_Additional_Targets_Linux
     displayName: Fuzz Additional Targets Linux (Serial - 5 min each)
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
@@ -471,9 +488,9 @@ stages:
   - job: Build_mssql_python_Linux
     displayName: Build mssql-python (cross-repo)
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
@@ -619,9 +636,9 @@ stages:
   - job: Merge_Coverage
     displayName: Merge Rust and Python coverage
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
       - checkout: self
       - task: DownloadPipelineArtifact@2
@@ -722,9 +739,9 @@ stages:
     - job: LongHaul_BCP_Test
       displayName: Long-Haul BCP Test Ubuntu
       pool:
-        name: RUST-1ES-POOL-WUS3
+        name: ${{ parameters.poolName }}
         demands:
-          - imageOverride -equals RUST-1ES-UBUSLIM
+          - imageOverride -equals ${{ parameters.linuxImage }}
       variables:
         CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       steps:

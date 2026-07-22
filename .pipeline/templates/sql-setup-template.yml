@@ -36,8 +36,23 @@ steps:
         sqlcmd -Q "ALTER SERVER ROLE sysadmin ADD MEMBER testuser;"
         sqlcmd -S localhost,1433 -U sa -P $(SQL_PASSWORD) -Q "SELECT @@VERSION"
 
-        # Setup the same logins on the SQLDEV named instance (used by SSRP tests)
+        # Setup the same logins on the SQLDEV named instance (used by SSRP tests).
+        # Freshly-built images can leave the SQLDEV service stopped / manual-start,
+        # so ensure it is set to start automatically and is actually running before
+        # we configure its sa login. Previously this block was skipped whenever the
+        # service wasn't already running, which left sa unconfigured and broke the
+        # SSRP named-instance test (login failed for user 'sa' on HOST\SQLDEV).
         $svc = Get-Service -Name 'MSSQL$SQLDEV' -ErrorAction SilentlyContinue
+        if ($svc) {
+          echo "Ensuring SQLDEV instance is running..."
+          Set-Service -Name 'MSSQL$SQLDEV' -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service -Name 'MSSQL$SQLDEV' -ErrorAction SilentlyContinue
+          for ($i = 1; $i -le 12; $i++) {
+            $svc.Refresh()
+            if ($svc.Status -eq 'Running') { break }
+            Start-Sleep -Seconds 5
+          }
+        }
         if ($svc -and $svc.Status -eq 'Running') {
           echo "Configuring logins on SQLDEV instance..."
           sqlcmd -S "localhost\SQLDEV" -C -Q "EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'LoginMode', REG_DWORD, 2"

@@ -23,6 +23,39 @@ function Copy-To-Root-Store($cert) {
     }
 }
 
+function Restart-SqlServiceSafely($serviceName) {
+    # Freshly-provisioned images can leave SQL Server briefly in a start-pending /
+    # not-yet-stoppable state (startup database recovery), which makes a plain
+    # Restart-Service fail intermittently with "cannot be stopped"
+    # (CouldNotStopService). Wait for a steady state, then stop/start with retries.
+    $svc = Get-Service -Name $serviceName -ErrorAction Stop
+
+    for ($i = 1; $i -le 30; $i++) {
+        $svc.Refresh()
+        if ($svc.Status -eq 'Running' -or $svc.Status -eq 'Stopped') { break }
+        Write-Host "Waiting for $serviceName to reach a steady state (current: $($svc.Status))..."
+        Start-Sleep -Seconds 5
+    }
+
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            $svc.Refresh()
+            if ($svc.Status -ne 'Stopped') {
+                Stop-Service -Name $serviceName -Force -ErrorAction Stop
+                $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(120))
+            }
+            Start-Service -Name $serviceName -ErrorAction Stop
+            $svc.WaitForStatus('Running', [TimeSpan]::FromSeconds(120))
+            Write-Host "SQL service '$serviceName' restarted (attempt $attempt)."
+            return
+        } catch {
+            Write-Host "Restart attempt $attempt for '$serviceName' failed: $($_.Exception.Message)"
+            Start-Sleep -Seconds 10
+        }
+    }
+    throw "Failed to restart SQL service '$serviceName' after multiple attempts."
+}
+
 function New-And-Install-Certificates($instanceName) {
     Write-Output "Instance name received is " + $instanceName
     $certStorePath  = "Cert:\LocalMachine\My"
@@ -70,7 +103,7 @@ function New-And-Install-Certificates($instanceName) {
 
     Set-ItemProperty -Path $registryPath -Name "Certificate" -Value $thumbprint
 
-    Restart-Service -Name "MSSQLSERVER"
+    Restart-SqlServiceSafely -serviceName $instanceName
     Copy-To-Root-Store -cert $cert
 }
 

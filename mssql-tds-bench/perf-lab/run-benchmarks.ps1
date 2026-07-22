@@ -221,7 +221,7 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 }
 
 # --- git (needed for the baseline worktree) ---
-# The Windows Server perf image (RUST-Win22-Sql25-1P) normally ships git, but
+# The Windows Server perf image (RUST-Win22-Sql25-1P-NVME) normally ships git, but
 # install it if absent: winget first, then Chocolatey as a fallback.
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Write-Host '>>> git not found; installing...'

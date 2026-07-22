@@ -31,10 +31,10 @@ parameters:
       - alpine318
   - name: poolName
     type: string
-    default: 'RUST-1ES-POOL-WUS3'
+    default: 'RUST-1ES-POOL-WUS3-NVME'
   - name: poolImageOverride
     type: string
-    default: 'imageOverride -equals RUST-1ES-UBUSLIM'
+    default: 'imageOverride -equals RUST-1ES-UBUSLIM-NVME'
   - name: testTimeout
     type: number
     default: 60

@@ -2,8 +2,8 @@
 parameters:
   matrix: {}
   artifactName: 'Build_Linux'
-  poolName: 'RUST-1ES-POOL-WUS3'
-  poolImageOverride: 'imageOverride -equals RUST-1ES-UBUSLIM'
+  poolName: 'RUST-1ES-POOL-WUS3-NVME'
+  poolImageOverride: 'imageOverride -equals RUST-1ES-UBUSLIM-NVME'
 
 jobs:
   - job: Test_Matrix
