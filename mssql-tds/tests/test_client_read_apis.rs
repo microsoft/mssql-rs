@@ -9,6 +9,15 @@ mod client_based_iterators {
     use futures::lock::Mutex;
     use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+    use mssql_tds::datatypes::column_values::{
+        ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
+        SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
+    };
+    use mssql_tds::datatypes::decoder::DecimalParts;
+    use mssql_tds::datatypes::row_writer::RowWriter;
+    use mssql_tds::datatypes::sql_json::SqlJson;
+    use mssql_tds::datatypes::sql_string::SqlString;
+    use mssql_tds::datatypes::sql_vector::SqlVector;
     use mssql_tds::datatypes::sqltypes::SqlType;
     use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
     use std::sync::Arc;
@@ -16,6 +25,87 @@ mod client_based_iterators {
     #[ctor::ctor]
     fn init() {
         init_tracing();
+    }
+
+    #[derive(Default)]
+    struct SparseCaptureWriter {
+        // ODBC-style request uses 1-based column ordinals.
+        requested_column: Option<usize>,
+        captured: Vec<ColumnValues>,
+    }
+
+    impl SparseCaptureWriter {
+        fn new(col_count: usize) -> Self {
+            Self {
+                requested_column: None,
+                captured: Vec::with_capacity(col_count),
+            }
+        }
+
+        fn request_column(&mut self, requested_column: usize) {
+            self.requested_column = Some(requested_column);
+        }
+
+        fn clear_request(&mut self) {
+            self.requested_column = None;
+        }
+    }
+
+    impl RowWriter for SparseCaptureWriter {
+        fn pause_after_column(&self, col: usize) -> bool {
+            self.requested_column == Some(col + 1)
+        }
+
+        fn write_null(&mut self, col: usize) {
+            if self.requested_column == Some(col + 1) {
+                self.captured.push(ColumnValues::Null);
+            }
+        }
+
+        fn write_bool(&mut self, _col: usize, _val: bool) {}
+        fn write_u8(&mut self, _col: usize, _val: u8) {}
+        fn write_i16(&mut self, _col: usize, _val: i16) {}
+
+        fn write_i32(&mut self, col: usize, val: i32) {
+            if self.requested_column == Some(col + 1) {
+                self.captured.push(ColumnValues::Int(val));
+            }
+        }
+
+        fn write_i64(&mut self, _col: usize, _val: i64) {}
+        fn write_f32(&mut self, _col: usize, _val: f32) {}
+        fn write_f64(&mut self, _col: usize, _val: f64) {}
+
+        fn write_string(&mut self, col: usize, val: SqlString) {
+            if self.requested_column == Some(col + 1) {
+                self.captured.push(ColumnValues::String(val));
+            }
+        }
+
+        fn write_bytes(&mut self, col: usize, val: Vec<u8>) {
+            if self.requested_column == Some(col + 1) {
+                self.captured.push(ColumnValues::Bytes(val));
+            }
+        }
+
+        fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
+        fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
+        fn write_date(&mut self, _col: usize, _val: SqlDate) {}
+        fn write_time(&mut self, _col: usize, _val: SqlTime) {}
+        fn write_datetime(&mut self, _col: usize, _val: SqlDateTime) {}
+        fn write_smalldatetime(&mut self, _col: usize, _val: SqlSmallDateTime) {}
+        fn write_datetime2(&mut self, _col: usize, _val: SqlDateTime2) {}
+        fn write_datetimeoffset(&mut self, _col: usize, _val: SqlDateTimeOffset) {}
+        fn write_money(&mut self, _col: usize, _val: SqlMoney) {}
+        fn write_smallmoney(&mut self, _col: usize, _val: SqlSmallMoney) {}
+        fn write_uuid(&mut self, _col: usize, _val: uuid::Uuid) {}
+        fn write_xml(&mut self, _col: usize, _val: SqlXml) {}
+        fn write_json(&mut self, _col: usize, _val: SqlJson) {}
+        fn write_vector(&mut self, _col: usize, _val: SqlVector) {}
+
+        fn end_row(&mut self) {
+            self.requested_column = None;
+        }
     }
 
     #[tokio::test]
@@ -846,6 +936,186 @@ mod client_based_iterators {
             assert!(matches!(row[2], ColumnValues::Bytes(_)));
             assert!(matches!(row[3], ColumnValues::Xml(_)));
         }
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_two_rows_column_2_then_4_non_plp_then_plp() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "
+            SELECT
+                CAST(1 AS INT) AS c1,
+                CAST(N'row1-c2' AS NVARCHAR(100)) AS c2,
+                CAST(3 AS INT) AS c3,
+                CAST(REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)) AS c4,
+                CAST(5 AS INT) AS c5
+            UNION ALL
+            SELECT
+                CAST(11 AS INT) AS c1,
+                CAST(N'row2-c2' AS NVARCHAR(100)) AS c2,
+                CAST(13 AS INT) AS c3,
+                CAST(REPLICATE(CAST('B' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)) AS c4,
+                CAST(15 AS INT) AS c5
+        "
+        .to_string();
+        client.execute(query, None, None).await?;
+
+        let mut row1 = SparseCaptureWriter::new(5);
+        if let Some(rs) = client.get_current_resultset() {
+            row1.request_column(2);
+            assert!(rs.next_row_into(&mut row1).await?);
+            row1.request_column(4);
+            assert!(rs.next_row_into(&mut row1).await?);
+
+            let mut buf = [0u8; 2048];
+            let mut first_row_c4 = Vec::new();
+            loop {
+                let n = rs.read_active_plp_bytes(&mut buf).await?;
+                first_row_c4.extend_from_slice(&buf[..n]);
+                if rs.active_plp_reached_end() {
+                    break;
+                }
+                assert!(n > 0, "Expected progress while draining first-row c4");
+            }
+            assert_eq!(first_row_c4.len(), 9000);
+
+            // Drain remaining col 5 before advancing to row2.
+            row1.clear_request();
+            assert!(rs.next_row_into(&mut row1).await?);
+
+            let mut row2 = SparseCaptureWriter::new(5);
+            row2.request_column(2);
+            assert!(rs.next_row_into(&mut row2).await?);
+            row2.request_column(4);
+            assert!(rs.next_row_into(&mut row2).await?);
+
+            let mut second_row_c4 = Vec::new();
+            loop {
+                let n = rs.read_active_plp_bytes(&mut buf).await?;
+                second_row_c4.extend_from_slice(&buf[..n]);
+                if rs.active_plp_reached_end() {
+                    break;
+                }
+                assert!(n > 0, "Expected progress while draining second-row c4");
+            }
+            assert_eq!(second_row_c4.len(), 9000);
+
+            // Drain remaining col 5 before checking exhaustion.
+            row2.clear_request();
+            assert!(rs.next_row_into(&mut row2).await?);
+
+            assert!(!rs.next_row_into(&mut row2).await?);
+
+            assert_eq!(row1.captured.len(), 1);
+            assert!(matches!(
+                &row1.captured[0],
+                ColumnValues::String(s) if s.to_utf8_string() == "row1-c2"
+            ));
+
+            assert_eq!(row2.captured.len(), 1);
+            assert!(matches!(
+                &row2.captured[0],
+                ColumnValues::String(s) if s.to_utf8_string() == "row2-c2"
+            ));
+        }
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_two_rows_column_2_then_4_plp_then_non_plp() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "
+            SELECT
+                CAST(21 AS INT) AS c1,
+                CAST(REPLICATE(CAST(N'X' AS NVARCHAR(MAX)), 9000) AS NVARCHAR(MAX)) AS c2,
+                CAST(23 AS INT) AS c3,
+                CAST(24 AS INT) AS c4,
+                CAST(25 AS INT) AS c5
+            UNION ALL
+            SELECT
+                CAST(31 AS INT) AS c1,
+                CAST(REPLICATE(CAST(N'Y' AS NVARCHAR(MAX)), 9000) AS NVARCHAR(MAX)) AS c2,
+                CAST(33 AS INT) AS c3,
+                CAST(34 AS INT) AS c4,
+                CAST(35 AS INT) AS c5
+        "
+        .to_string();
+        client.execute(query, None, None).await?;
+
+        let mut row1 = SparseCaptureWriter::new(5);
+        if let Some(rs) = client.get_current_resultset() {
+            row1.request_column(2);
+            assert!(rs.next_row_into(&mut row1).await?);
+
+            let mut buf = [0u8; 2048];
+            let mut first_row_c2 = Vec::new();
+            loop {
+                let n = rs.read_active_plp_bytes(&mut buf).await?;
+                first_row_c2.extend_from_slice(&buf[..n]);
+                if rs.active_plp_reached_end() {
+                    break;
+                }
+                assert!(n > 0, "Expected progress while draining first-row c2");
+            }
+            assert_eq!(first_row_c2.len(), 18_000);
+
+            row1.request_column(4);
+            assert!(rs.next_row_into(&mut row1).await?);
+
+            // Drain remaining col 5 before advancing to row2.
+            row1.clear_request();
+            assert!(rs.next_row_into(&mut row1).await?);
+
+            let mut row2 = SparseCaptureWriter::new(5);
+            row2.request_column(2);
+            assert!(rs.next_row_into(&mut row2).await?);
+
+            let mut second_row_c2 = Vec::new();
+            loop {
+                let n = rs.read_active_plp_bytes(&mut buf).await?;
+                second_row_c2.extend_from_slice(&buf[..n]);
+                if rs.active_plp_reached_end() {
+                    break;
+                }
+                assert!(n > 0, "Expected progress while draining second-row c2");
+            }
+            assert_eq!(second_row_c2.len(), 18_000);
+
+            row2.request_column(4);
+            assert!(rs.next_row_into(&mut row2).await?);
+
+            // Drain remaining col 5 before checking exhaustion.
+            row2.clear_request();
+            assert!(rs.next_row_into(&mut row2).await?);
+
+            assert!(!rs.next_row_into(&mut row2).await?);
+
+            assert_eq!(row1.captured.len(), 1);
+            assert!(matches!(
+                &row1.captured[0],
+                ColumnValues::Int(v) if *v == 24
+            ));
+
+            assert_eq!(row2.captured.len(), 1);
+            assert!(matches!(
+                &row2.captured[0],
+                ColumnValues::Int(v) if *v == 34
+            ));
+        }
+
         client.close_query().await?;
         Ok(())
     }
