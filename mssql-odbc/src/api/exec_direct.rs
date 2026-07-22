@@ -275,4 +275,38 @@ mod tests {
         assert_eq!(ds.active_stmt, Some(h.stmt));
         assert!(ds.client.is_some());
     }
+
+    /// A no-row statement that also produced a message surfaces its diagnostics
+    /// with SQL_SUCCESS_WITH_INFO from the `finish_execute` no-row branch.
+    #[test]
+    fn exec_direct_norow_statement_with_message_returns_success_with_info() {
+        use crate::api::odbc_types::SQL_SUCCESS_WITH_INFO;
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_more_with_count, done_no_more, info, tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = tds_client_from_tokens(vec![
+            info(0, 0, "print in batch"),
+            done_more_with_count(1),
+            col_metadata_empty(),
+            done_no_more(),
+        ]);
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+        }
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ret = sql_exec_direct_w_safe(
+            h.stmt,
+            stmt,
+            "PRINT 'x'; UPDATE t SET x = 1; SELECT 1".to_string(),
+        );
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert!(stmt.inner.lock().unwrap().has_state(STMT_STATE_CURSOR_OPEN));
+    }
 }

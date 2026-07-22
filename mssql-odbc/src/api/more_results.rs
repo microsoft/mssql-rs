@@ -309,4 +309,27 @@ mod tests {
             ERR_NO_ACTIVE_TDS_CLIENT.state
         );
     }
+
+    /// A transport failure while advancing (the drain hits a dead connection)
+    /// surfaces as SQL_ERROR with a terminal cursor reset and the connection
+    /// released.
+    #[test]
+    fn more_results_advance_failure_resets_and_errors() {
+        let h = TestHandles::with_env_dbc_stmt();
+        // Position on a row set, then leave nothing behind it so the drain hits
+        // the end of the scripted stream and reports a closed connection.
+        let first = position_first_and_inject(&h, vec![col_metadata_empty()]);
+        assert_eq!(first, StatementResult::RowSet);
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            SQLSTATE_HY000
+        );
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+    }
 }
