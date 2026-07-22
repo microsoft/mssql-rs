@@ -6,13 +6,14 @@
 //! The block-fetch rowset controls (`SQL_ATTR_ROW_ARRAY_SIZE`,
 //! `SQL_ATTR_ROWS_FETCHED_PTR`, `SQL_ATTR_ROW_STATUS_PTR`,
 //! `SQL_ATTR_ROW_BIND_TYPE`) are stored and later consumed by the columnar
-//! fetch path. Other recognized statement attributes (cursor type, concurrency,
-//! param / descriptor controls) are accepted without effect because the driver
-//! is forward-only and read-only — exactly what mssql-python requests.
-//! `SQL_ATTR_PARAMSET_SIZE` accepts the ODBC default of 1 but rejects larger
-//! batches, since parameter arrays are not yet consumed and a silent success
-//! would execute only the first row. Unrecognized attribute identifiers fail
-//! with `HY092`.
+//! fetch path. `SQL_ATTR_CURSOR_TYPE` and `SQL_ATTR_CONCURRENCY` accept only the
+//! supported forward-only / read-only values; any other request is substituted
+//! and reported with `01S02` (option value changed) rather than silently
+//! succeeding. Other recognized statement attributes (param / descriptor
+//! controls) are accepted without effect. `SQL_ATTR_PARAMSET_SIZE` accepts the
+//! ODBC default of 1 but rejects larger batches, since parameter arrays are not
+//! yet consumed and a silent success would execute only the first row.
+//! Unrecognized attribute identifiers fail with `HY092`.
 //!
 //! Each entry point follows the crate's mandatory layering: FFI panic boundary
 //! → `unsafe` raw-handle shim → safe core (`README.md`; `num_result_cols.rs`).
@@ -25,10 +26,11 @@ use crate::api::odbc_types::{
     SQL_ATTR_PARAMSET_SIZE, SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR,
     SQL_ATTR_ROW_BIND_TYPE, SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR,
     SQL_CONCUR_READ_ONLY, SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
-    SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
+    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{
-    ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE, SQLSTATE_HYC00, post_diag,
+    ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE, SQLSTATE_01S02, SQLSTATE_HYC00,
+    post_diag,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
@@ -144,12 +146,53 @@ fn sql_set_stmt_attr_w_safe(
                 }
             }
         }
-        // Recognized attributes accepted without tracking: the driver is
-        // forward-only / read-only and these param / descriptor controls have
-        // no effect on the implemented behavior.
-        SQL_ATTR_CURSOR_TYPE
-        | SQL_ATTR_CONCURRENCY
-        | SQL_ATTR_PARAM_BIND_TYPE
+        SQL_ATTR_CURSOR_TYPE => {
+            // The driver is forward-only. Accept SQL_CURSOR_FORWARD_ONLY as-is;
+            // for any other cursor type substitute forward-only and warn with
+            // 01S02, per the ODBC contract for unsupported cursor types (a
+            // silent success would tell the caller a scrollable cursor took
+            // effect when it did not). The substituted value is what
+            // SQLGetStmtAttrW reports back.
+            if value_ptr as SqlULen == SQL_CURSOR_FORWARD_ONLY {
+                SQL_SUCCESS
+            } else {
+                debug!(
+                    requested = value_ptr as SqlULen,
+                    "SQLSetStmtAttrW: cursor type substituted with SQL_CURSOR_FORWARD_ONLY"
+                );
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_01S02,
+                    0,
+                    "Cursor type not supported; substituted SQL_CURSOR_FORWARD_ONLY",
+                );
+                SQL_SUCCESS_WITH_INFO
+            }
+        }
+        SQL_ATTR_CONCURRENCY => {
+            // The driver is read-only. Accept SQL_CONCUR_READ_ONLY as-is;
+            // substitute read-only and warn with 01S02 for any writable
+            // concurrency request.
+            if value_ptr as SqlULen == SQL_CONCUR_READ_ONLY {
+                SQL_SUCCESS
+            } else {
+                debug!(
+                    requested = value_ptr as SqlULen,
+                    "SQLSetStmtAttrW: concurrency substituted with SQL_CONCUR_READ_ONLY"
+                );
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_01S02,
+                    0,
+                    "Concurrency not supported; substituted SQL_CONCUR_READ_ONLY",
+                );
+                SQL_SUCCESS_WITH_INFO
+            }
+        }
+        // Recognized attributes accepted without tracking: these param /
+        // descriptor controls have no effect on the implemented forward-only,
+        // read-only behavior.
+        SQL_ATTR_PARAM_BIND_TYPE
         | SQL_ATTR_PARAM_STATUS_PTR
         | SQL_ATTR_PARAMS_PROCESSED_PTR
         | SQL_ATTR_ROW_BIND_OFFSET_PTR
@@ -397,6 +440,65 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
+    }
+
+    #[test]
+    fn set_cursor_type_forward_only_accepted() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret = unsafe {
+            sql_set_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_CURSOR_TYPE,
+                SQL_CURSOR_FORWARD_ONLY as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+    }
+
+    #[test]
+    fn set_cursor_type_unsupported_substituted() {
+        let h = TestHandles::with_env_dbc_stmt();
+        // Any non-forward-only cursor (e.g. SQL_CURSOR_STATIC = 3) is
+        // substituted with forward-only and reported via 01S02.
+        let ret = unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_CURSOR_TYPE, 3 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+
+        // The getter still reports the supported forward-only value.
+        let mut out: SqlULen = 999;
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_CURSOR_TYPE,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, SQL_CURSOR_FORWARD_ONLY);
+    }
+
+    #[test]
+    fn set_concurrency_unsupported_substituted() {
+        let h = TestHandles::with_env_dbc_stmt();
+        // Any writable concurrency (e.g. SQL_CONCUR_LOCK = 2) is substituted
+        // with read-only and reported via 01S02.
+        let ret = unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_CONCURRENCY, 2 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+
+        let mut out: SqlULen = 999;
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_CONCURRENCY,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, SQL_CONCUR_READ_ONLY);
     }
 
     #[test]

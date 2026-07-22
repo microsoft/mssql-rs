@@ -66,7 +66,7 @@ Both paths must share one conversion core: `ColumnValues -> requested SQL_C_* ta
 
 - Add all `SQL_C_*` constants + SQL Server extension type ids and the C interop structs (`SQL_DATE_STRUCT`, `SQL_TIME_STRUCT`, `SQL_TIMESTAMP_STRUCT`, `SQL_SS_TIME2_STRUCT`, `SQL_SS_TIMESTAMPOFFSET_STRUCT`, `SQLGUID`, `SQL_NUMERIC_STRUCT`) to `api/odbc_types.rs`.
 - Extend `StmtState` (`handles/stmt.rs`) with the block-fetch controls: `row_array_size`, `rows_fetched_ptr`, `row_status_ptr`, `row_bind_type`. (The column-bindings vector and rowset buffer land with P3, and the per-column `SQLGetData` offset with P1, where they are consumed.)
-- Implement real `SQLSetStmtAttrW` / `SQLGetStmtAttrW` that honor the rowset controls and accept cursor / concurrency / param-set attributes as no-ops (the driver is forward-only, read-only — exactly what `mssql-python` requests).
+- Implement real `SQLSetStmtAttrW` / `SQLGetStmtAttrW` that honor the rowset controls. `SQL_ATTR_CURSOR_TYPE` / `SQL_ATTR_CONCURRENCY` accept only the supported forward-only / read-only values and substitute+warn (`01S02`) otherwise; `SQL_ATTR_PARAMSET_SIZE` accepts 1 and rejects larger batches; unknown identifiers fail with `HY092`. `SQL_ATTR_APP_PARAM_DESC` requires a descriptor subsystem and is deferred (see scope boundary below).
 - Covered by unit tests only (safe-core logic at ~97% line coverage). E2e tests are intentionally deferred to P1: the P0 statement attributes are ARD/APD descriptor-backed and intercepted by the unixODBC Driver Manager, so they are not meaningfully observable through the DM until a fetch path consumes them.
 
 ### P1 — Typed SQLGetData (row-by-row) — Task [46578](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46578)
@@ -104,6 +104,10 @@ Both paths must share one conversion core: `ColumnValues -> requested SQL_C_* ta
 ## Scope boundary — batch insert
 
 §4.8 also covers **batch insert** (`executemany` via `SQL_ATTR_PARAMSET_SIZE` array binding), which is a **write** path and out of scope for this story. It is tracked separately as User Story [46576](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46576) (`mssql-odbc | Batch insert (executemany array binding)`), with dependencies on Parameter completeness ([46373](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46373)), Descriptors ([46374](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46374)), Connection & statement attributes ([46377](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46377)), and Streaming ([46378](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46378)).
+
+## Scope boundary — descriptors (`SQL_ATTR_APP_PARAM_DESC` / `SQL_C_NUMERIC` input binding)
+
+Descriptor handles are not implemented in the crate yet, so `SQLGetStmtAttrW(SQL_ATTR_APP_PARAM_DESC)` currently returns `HY092`. `mssql-python`'s `ddbc_bindings.cpp` calls this (then `SQLSetDescField` on the returned handle) only when binding a `SQL_C_NUMERIC` **input parameter**, and aborts the bind if it fails — so numeric input-parameter binding will not work until a descriptor subsystem exists. There is no correct minimal shim (a non-null fake handle would crash `SQLSetDescField`). This is deferred to the Descriptors work item [46374](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46374) (APD handle alloc/free, `SQLGetStmtAttr` returning it, and `SQLSetDescField` support for `SQL_DESC_TYPE`/`SQL_DESC_CONCISE_TYPE`/precision/scale), rather than expanding this P0 plumbing PR.
 
 ## Status
 
