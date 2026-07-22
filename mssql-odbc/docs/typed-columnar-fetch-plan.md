@@ -114,7 +114,7 @@ Descriptor handles are not implemented in the crate yet, so `SQLGetStmtAttrW(SQL
 | Phase | Task | State |
 | --- | --- | --- |
 | P0 — Prerequisites & plumbing | 46577 | Implemented (build + clippy clean, 332 tests pass) |
-| P1 — Typed SQLGetData | 46578 | Not started |
+| P1 — Typed SQLGetData | 46578 | Implemented (int/float/decimal/money/guid/date-time/char/binary + chunked streaming; 382 tests pass). `sql_variant` underlying-type resolution deferred to P2; `SQL_C_NUMERIC` output struct not yet emitted (decimal is delivered as char, which is what mssql-python requests). |
 | P2 — SQLColAttributeW | 46579 | Not started |
 | P3 — SQLBindCol + SQLFetchScroll | 46580 | Not started |
 | P4 — Exports & driver-load compat | 46581 | Not started |
