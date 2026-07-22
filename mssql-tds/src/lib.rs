@@ -98,3 +98,8 @@ pub mod token;
 // Expose internal APIs for fuzzing
 #[cfg(fuzzing)]
 pub mod fuzz_support;
+
+// Test-only helpers for driving a `TdsClient` from scripted TDS tokens. Gated
+// behind `test-util` so downstream crates can unit-test client-driven paths.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_client_support;

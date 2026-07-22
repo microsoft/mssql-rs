@@ -201,3 +201,112 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::odbc_types::{SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO};
+    use crate::api::sqlstate::ERR_NO_ACTIVE_TDS_CLIENT;
+    use crate::handles::dbc::DbcHandle;
+    use crate::test_support::TestHandles;
+    use mssql_tds::test_client_support::{
+        ScriptedToken, col_metadata_empty, done_more, done_no_more, info, tds_client_from_tokens,
+    };
+
+    /// Builds a scripted client, positions it on the batch's first statement,
+    /// then injects it into `h`'s DBC as the busy client owning `h.stmt` with an
+    /// open cursor — mirroring the state left by a successful `SQLExecDirect`.
+    /// Returns the first statement's result so callers can assert on it.
+    fn position_first_and_inject(h: &TestHandles, tokens: Vec<ScriptedToken>) -> StatementResult {
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut client = tds_client_from_tokens(tokens);
+        let first = dbc
+            .runtime
+            .block_on(client.execute_multi_statement("SELECT 1;".to_string(), None, None))
+            .unwrap();
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.set_state(STMT_STATE_CURSOR_OPEN);
+        }
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+        first
+    }
+
+    /// SQLMoreResults advances from one row set to the next, keeping the cursor
+    /// open and the connection busy on the same statement.
+    #[test]
+    fn more_results_advances_to_next_rowset() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(), // stmt1 row set
+                done_more(),          // terminates stmt1, more to come
+                col_metadata_empty(), // stmt2 row set
+            ],
+        );
+        assert_eq!(first, StatementResult::RowSet);
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+    }
+
+    /// SQLMoreResults surfaces a no-row statement result (message-bearing, zero
+    /// columns) as SQL_SUCCESS_WITH_INFO with the cursor kept open, then reports
+    /// SQL_NO_DATA and releases the connection when the batch is exhausted.
+    #[test]
+    fn more_results_surfaces_norow_then_end() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),        // stmt1 row set
+                done_more(),                 // terminates stmt1
+                info(50000, 10, "raise me"), // stmt2 message
+                done_no_more(),              // stmt2 no-row result, last in batch
+            ],
+        );
+        assert_eq!(first, StatementResult::RowSet);
+
+        // Advance onto the no-row statement result.
+        let ret = unsafe { sql_more_results(h.stmt) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(stmt.inner.lock().unwrap().column_metadata.is_empty());
+
+        // Advance again: batch exhausted -> SQL_NO_DATA, cursor closed, released.
+        let ret = unsafe { sql_more_results(h.stmt) };
+        assert_eq!(ret, SQL_NO_DATA);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+    }
+
+    /// SQLMoreResults on an open cursor whose connection has no active client
+    /// posts the no-active-client diagnostic and returns SQL_ERROR.
+    #[test]
+    fn more_results_no_active_client_errors() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.set_state(STMT_STATE_CURSOR_OPEN);
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().active_stmt = Some(h.stmt);
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            ERR_NO_ACTIVE_TDS_CLIENT.state
+        );
+    }
+}

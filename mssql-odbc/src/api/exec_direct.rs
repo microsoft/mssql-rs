@@ -231,4 +231,48 @@ mod tests {
         // A binding error must leave the statement unchanged — no EXEC_STARTED.
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }
+
+    /// A plain batch whose first statement is a no-row result (DML row count)
+    /// followed by more statements leaves the cursor open with zero columns and
+    /// the connection busy, so SQLMoreResults can advance past it (msodbcsql
+    /// statement-wise parity). Exercises the `finish_execute` no-row branch.
+    #[test]
+    fn exec_direct_norow_statement_keeps_cursor_open_and_busy() {
+        use crate::api::odbc_types::SQL_SUCCESS;
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_more_with_count, done_no_more, tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // Batch response: a DML statement (row count + MORE) then a trailing
+        // SELECT. The first statement surfaces as a no-row result with the batch
+        // still open.
+        let client = tds_client_from_tokens(vec![
+            done_more_with_count(5),
+            col_metadata_empty(),
+            done_no_more(),
+        ]);
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            // active_stmt stays None => connection idle and claimable.
+        }
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "UPDATE t SET x = 1; SELECT 1".to_string());
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let ss = stmt.inner.lock().unwrap();
+        assert!(ss.has_state(STMT_STATE_CURSOR_OPEN));
+        assert!(ss.column_metadata.is_empty());
+        drop(ss);
+
+        // Connection stays busy on this statement with the client returned.
+        let ds = dbc.inner.lock().unwrap();
+        assert_eq!(ds.active_stmt, Some(h.stmt));
+        assert!(ds.client.is_some());
+    }
 }

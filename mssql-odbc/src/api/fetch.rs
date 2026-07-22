@@ -309,4 +309,45 @@ mod tests {
         assert!(stmt_state.diag_records.is_empty());
         assert!(stmt_state.has_state(STMT_STATE_CURSOR_OPEN));
     }
+
+    /// Positioned on a no-row statement result (zero columns) with the
+    /// connection busy on this statement: SQLFetch returns SQL_ERROR with
+    /// SQLSTATE 24000, and the client is restored so the cursor can still be
+    /// advanced with SQLMoreResults.
+    #[test]
+    fn fetch_norow_result_returns_24000() {
+        use crate::api::sqlstate::SQLSTATE_24000;
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut stmt_state = stmt_handle.inner.lock().unwrap();
+            stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
+            // column_metadata left empty => no-row (0-column) result.
+        }
+
+        // A client must be present (the guard runs after it is claimed), but it
+        // is never read because the guard returns first.
+        let client = tds_client_from_tokens(vec![done_no_more()]);
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut dbc_state = dbc_handle.inner.lock().unwrap();
+            dbc_state.client = Some(client);
+            dbc_state.active_stmt = Some(h.stmt);
+        }
+
+        let ret = unsafe { sql_fetch(h.stmt) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let stmt_state = stmt_handle.inner.lock().unwrap();
+        assert_eq!(stmt_state.diag_records.len(), 1);
+        assert_eq!(stmt_state.diag_records[0].sql_state, SQLSTATE_24000);
+        drop(stmt_state);
+
+        // The client is restored and the connection stays busy on this statement.
+        let dbc_state = dbc_handle.inner.lock().unwrap();
+        assert!(dbc_state.client.is_some());
+        assert_eq!(dbc_state.active_stmt, Some(h.stmt));
+    }
 }
