@@ -11,6 +11,7 @@ mod exec_common;
 mod exec_direct;
 mod execute;
 pub(crate) mod fetch;
+pub(crate) mod fetch_convert;
 pub(crate) mod free_handle;
 mod get_data;
 mod get_diag;

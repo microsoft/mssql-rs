@@ -16,6 +16,7 @@ pub(crate) const SQLSTATE_07006: [u8; 5] = *b"07006";
 pub(crate) const SQLSTATE_07009: [u8; 5] = *b"07009";
 pub(crate) const SQLSTATE_08001: [u8; 5] = *b"08001";
 pub(crate) const SQLSTATE_08003: [u8; 5] = *b"08003";
+pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
 pub(crate) const SQLSTATE_HY000: [u8; 5] = *b"HY000";
 pub(crate) const SQLSTATE_HY003: [u8; 5] = *b"HY003";
@@ -83,6 +84,10 @@ pub(crate) const ERR_INVALID_C_DATA_TYPE: DiagMsg = DiagMsg {
 pub(crate) const ERR_RESTRICTED_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_07006,
     text: "Restricted data type attribute violation",
+};
+pub(crate) const ERR_NUMERIC_OUT_OF_RANGE: DiagMsg = DiagMsg {
+    state: SQLSTATE_22003,
+    text: "Numeric value out of range",
 };
 pub(crate) const ERR_STRING_RIGHT_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01004,

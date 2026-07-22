@@ -1,10 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Minimal SQLGetData implementation for Phase 1.
+//! SQLGetData implementation for current-row retrieval.
+//!
+//! Supports character targets (`SQL_C_CHAR` / `SQL_C_WCHAR`) via text
+//! conversion and the fixed-width integer C targets (`SQL_C_TINYINT` ..
+//! `SQL_C_SBIGINT`, `SQL_C_BIT`, signed/unsigned) via the shared
+//! [`fetch_convert`](super::fetch_convert) core. Repeated calls on the same
+//! column do not advance an offset yet (no chunked streaming).
 
 use tracing::{debug, error};
 
+use super::fetch_convert::{ConvError, convert_integer_c, is_integer_c_target};
 use super::odbc_types::{
     SQL_C_CHAR, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NULL_DATA, SQL_SUCCESS,
     SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt,
@@ -121,6 +128,38 @@ fn sql_get_data_safe(
         return SQL_ERROR;
     }
 
+    let value = &row[col_index - 1];
+    if matches!(value, ColumnValues::Null) {
+        return write_null_result(
+            target_type,
+            target_value_ptr,
+            buffer_length,
+            strlen_or_ind_ptr,
+        );
+    }
+
+    // Fixed-width integer C targets go through the shared conversion core.
+    if is_integer_c_target(target_type) {
+        return match unsafe {
+            convert_integer_c(value, target_type, target_value_ptr, strlen_or_ind_ptr)
+        } {
+            Ok(ret) => ret,
+            Err(ConvError::OutOfRange) => {
+                post_diag(&mut stmt_state, ERR_NUMERIC_OUT_OF_RANGE);
+                SQL_ERROR
+            }
+            Err(ConvError::Unsupported) => {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HYC00,
+                    0,
+                    "Column type conversion not yet implemented",
+                );
+                SQL_ERROR
+            }
+        };
+    }
+
     if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
         post_sql_error(
             &mut stmt_state,
@@ -138,23 +177,6 @@ fn sql_get_data_safe(
     } else {
         buffer_length as usize
     };
-
-    let value = &row[col_index - 1];
-    if matches!(value, ColumnValues::Null) {
-        unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
-        // Write a NUL terminator into the caller buffer when there's room. The
-        // helper handles null `dst` and zero-length uniformly.
-        if target_type == SQL_C_WCHAR {
-            unsafe {
-                copy_with_nul(target_value_ptr as *mut SqlWChar, buf_elements, &[]);
-            }
-        } else {
-            unsafe {
-                copy_with_nul(target_value_ptr as *mut u8, buf_elements, &[]);
-            }
-        }
-        return SQL_SUCCESS;
-    }
 
     let Some(as_text) = column_value_to_text(value) else {
         post_sql_error(
@@ -184,6 +206,31 @@ fn sql_get_data_safe(
             strlen_or_ind_ptr,
         )
     }
+}
+
+/// Writes the NULL indicator and a NUL terminator (for character targets) for a
+/// SQL `NULL` column value.
+fn write_null_result(
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
+    unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
+    // Write a NUL terminator into the caller buffer when there's room. The
+    // helper handles null `dst` and zero-length uniformly. Only meaningful for
+    // character targets; fixed-width targets leave the buffer untouched on NULL.
+    if target_type == SQL_C_WCHAR {
+        let buf_elements = (buffer_length as usize) / std::mem::size_of::<SqlWChar>();
+        unsafe {
+            copy_with_nul(target_value_ptr as *mut SqlWChar, buf_elements, &[]);
+        }
+    } else if target_type == SQL_C_CHAR {
+        unsafe {
+            copy_with_nul(target_value_ptr as *mut u8, buffer_length as usize, &[]);
+        }
+    }
+    SQL_SUCCESS
 }
 
 /// Writes `src` to the caller's output buffer with ODBC string semantics:
@@ -233,7 +280,7 @@ fn column_value_to_text(v: &ColumnValues) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_LONG, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::{SQL_C_BIT, SQL_C_DOUBLE, SQL_C_SLONG, SQL_NULL_HANDLE};
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::SqlString;
 
@@ -385,19 +432,131 @@ mod tests {
             s.current_row = Some(vec![ColumnValues::Int(1)]);
         }
 
+        // SQL_C_DOUBLE is not yet an implemented target type for fetch.
+        let mut out: f64 = 0.0;
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_DOUBLE,
+                (&mut out as *mut f64).cast(),
+                std::mem::size_of::<f64>() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn get_data_int_to_slong_success() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.current_row = Some(vec![ColumnValues::Int(-2_000_000)]);
+        }
+
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                std::mem::size_of::<i32>() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, -2_000_000);
+        assert_eq!(ind, std::mem::size_of::<i32>() as SqlLen);
+    }
+
+    #[test]
+    fn get_data_bigint_out_of_range_for_slong_returns_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.current_row = Some(vec![ColumnValues::BigInt(i64::from(i32::MAX) + 1)]);
+        }
+
         let mut out: i32 = 0;
         let mut ind: SqlLen = 0;
         let ret = unsafe {
             sql_get_data(
                 stmt,
                 1,
-                SQL_C_LONG,
+                SQL_C_SLONG,
                 (&mut out as *mut i32).cast(),
                 std::mem::size_of::<i32>() as SqlLen,
                 &mut ind,
             )
         };
         assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn get_data_bit_to_bit_success() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.current_row = Some(vec![ColumnValues::Bit(true)]);
+        }
+
+        let mut out: u8 = 0xFF;
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_BIT,
+                (&mut out as *mut u8).cast(),
+                std::mem::size_of::<u8>() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 1);
+        assert_eq!(ind, 1);
+    }
+
+    #[test]
+    fn get_data_null_int_column_leaves_buffer_and_sets_indicator() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.current_row = Some(vec![ColumnValues::Null]);
+        }
+
+        let mut out: i32 = 0x5A5A_5A5A;
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                std::mem::size_of::<i32>() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, SQL_NULL_DATA);
+        // Fixed-width targets leave the caller buffer untouched on NULL.
+        assert_eq!(out, 0x5A5A_5A5A);
     }
 
     #[test]
