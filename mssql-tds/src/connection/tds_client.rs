@@ -74,9 +74,10 @@ type MemoizedCellDecryptor = (
 #[derive(Debug)]
 enum ActiveRowReadState {
     Idle,
-    RowPaused(RowPauseState),
-    PlpPaused(PlpPauseState),
+    RowPaused(Box<RowPauseState>),
+    PlpPaused(Box<PlpPauseState>),
 }
+
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -2537,10 +2538,9 @@ impl TdsClient {
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
             ActiveRowReadState::Idle => {}
             ActiveRowReadState::RowPaused(pause_state) => {
-                return self.resume_row_loop(pause_state, writer).await;
+                return self.resume_row_loop(*pause_state, writer).await;
             }
-            ActiveRowReadState::PlpPaused(plp_state) => {
-                let mut plp_state = plp_state;
+            ActiveRowReadState::PlpPaused(mut plp_state) => {
                 let mut buffer = [0u8; 8192];
                 while !plp_state.reached_end() {
                     let start = Instant::now();
@@ -2590,11 +2590,12 @@ impl TdsClient {
                     return Ok(true);
                 }
                 RowReadResult::RowPaused(pause_state) => {
-                    self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+                    self.active_row_read_state =
+                        ActiveRowReadState::RowPaused(Box::new(pause_state));
                     return Ok(true);
                 }
                 RowReadResult::PlpPaused(plp_state) => {
-                    self.active_row_read_state = ActiveRowReadState::PlpPaused(plp_state);
+                    self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(plp_state));
                     return Ok(true);
                 }
                 RowReadResult::Token(token) => {
@@ -2630,17 +2631,18 @@ impl TdsClient {
                 Ok(true)
             }
             RowReadResult::RowPaused(next_pause) => {
-                self.active_row_read_state = ActiveRowReadState::RowPaused(next_pause);
+                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(next_pause));
                 Ok(true)
             }
             RowReadResult::PlpPaused(plp_state) => {
-                self.active_row_read_state = ActiveRowReadState::PlpPaused(plp_state);
+                self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(plp_state));
                 Ok(true)
             }
             RowReadResult::Token(token) => {
                 if let Some(has_row) = self.handle_row_read_token(token).await? {
                     Ok(has_row)
                 } else {
+                    // This should not happen in normal resume flow; keep as a defensive guard.
                     Err(crate::error::Error::ProtocolError(
                         "Unexpected token during row resume".to_string(),
                     ))
@@ -3226,20 +3228,32 @@ pub trait ResultSet {
 
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
+    ///
+    /// If the writer opts into [`RowWriter::pause_after_column`], this method
+    /// may return `Ok(true)` more than once for the same logical row: each pause
+    /// boundary yields control back to the caller, and [`RowWriter::end_row`]
+    /// runs only after the final resume completes the row.
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool>;
 
     /// Reads bytes from the active PLP stream captured after a `PlpPaused` result from
     /// `next_row_into`. The caller must drain the stream to completion before calling
     /// `next_row_into` again.
-    async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize>;
+    async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        let _ = out;
+        Ok(0)
+    }
 
     /// Returns `true` when the active PLP stream has been fully consumed or when
     /// there is no active PLP stream.
-    fn active_plp_reached_end(&self) -> bool;
+    fn active_plp_reached_end(&self) -> bool {
+        true
+    }
 
     /// Returns the TDS collation for the active PLP string stream, or `None` for
     /// binary types or when there is no active PLP stream.
-    fn active_plp_collation(&self) -> Option<SqlCollation>;
+    fn active_plp_collation(&self) -> Option<SqlCollation> {
+        None
+    }
 
     /// Returns `true` if the result set may still contain unread rows.
     fn maybe_has_unread_rows(&self) -> bool;
@@ -3624,11 +3638,12 @@ mod tests {
     #[test]
     fn plp_helpers_treat_non_plp_row_pause_as_no_active_stream() {
         let mut client = create_test_client();
-        client.active_row_read_state = ActiveRowReadState::RowPaused(RowPauseState {
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 1,
             columns: Vec::new(),
             nbc_null_bitmap: None,
-        });
+            decryptor: None,
+        }));
 
         assert!(client.active_plp_reached_end());
         assert!(client.active_plp_collation().is_none());

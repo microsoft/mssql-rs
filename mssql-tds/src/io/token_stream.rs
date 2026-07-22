@@ -42,10 +42,12 @@ pub(crate) enum RowReadResult {
     Token(Tokens),
     /// Row decoding paused after `paused_at_column`; call `resume_row_into` to
     /// continue from the next column.
+    ///
     RowPaused(RowPauseState),
     /// Row decoding paused at a PLP column before consuming payload bytes.
     /// Use `read_active_plp_bytes` to stream chunks and then `resume_row_into`
     /// with `plp_state.row_pause_state`.
+    ///
     PlpPaused(PlpPauseState),
 }
 
@@ -70,6 +72,9 @@ pub(crate) struct RowPauseState {
     pub(crate) columns: Vec<ColumnMetadata>,
     /// NBCROW null-bitmap (one bit per column, LSB-first).  `None` for plain ROW.
     pub(crate) nbc_null_bitmap: Option<Vec<u8>>,
+    /// Optional AE decryptor needed to continue decrypting encrypted columns
+    /// after a row pause/resume boundary.
+    pub(crate) decryptor: Option<Arc<dyn CellDecryptor>>,
 }
 
 #[derive(Debug)]
@@ -78,6 +83,7 @@ pub struct RowPauseState {
     pub next_column_index: usize,
     pub columns: Vec<ColumnMetadata>,
     pub nbc_null_bitmap: Option<Vec<u8>>,
+    pub decryptor: Option<Arc<dyn CellDecryptor>>,
 }
 
 /// Active PLP stream state captured when row decoding is paused at a PLP column.
@@ -325,6 +331,17 @@ async fn decode_row_columns<R: TdsPacketReader + Send + Sync>(
         // For PLP target columns, pause before payload consumption so callers
         // can stream SQLGetData-style chunks from wire.
         if meta.is_plp() && writer.pause_after_column(col) {
+            // TODO: Add AE-aware PLP streaming path for paused row reads.
+            // Until then, fail fast to avoid streaming ciphertext bytes to callers.
+            if meta.crypto_metadata.is_some() {
+                return Err(crate::error::Error::UnimplementedFeature {
+                    feature: "Always Encrypted paused PLP streaming".to_string(),
+                    context: format!(
+                        "Encrypted PLP column '{}' cannot be streamed via read_active_plp_bytes yet.",
+                        meta.column_name
+                    ),
+                });
+            }
             match PlpColumnStream::begin(meta, reader).await? {
                 None => {
                     writer.write_null(col);
@@ -333,6 +350,7 @@ async fn decode_row_columns<R: TdsPacketReader + Send + Sync>(
                             next_column_index: col + 1,
                             columns: columns.to_vec(),
                             nbc_null_bitmap: None,
+                            decryptor: decryptor.cloned(),
                         }));
                     }
                     return Ok(RowReadResult::RowWritten);
@@ -343,6 +361,7 @@ async fn decode_row_columns<R: TdsPacketReader + Send + Sync>(
                             next_column_index: col + 1,
                             columns: columns.to_vec(),
                             nbc_null_bitmap: None,
+                            decryptor: decryptor.cloned(),
                         },
                         plp_stream,
                     }));
@@ -350,29 +369,13 @@ async fn decode_row_columns<R: TdsPacketReader + Send + Sync>(
             }
         }
 
-        match (meta.crypto_metadata.is_some(), decryptor) {
-            (true, Some(dec)) => {
-                let value = decrypt_encrypted_column(&decoder, reader, meta, dec).await?;
-                write_column_value(writer, col, value);
-            }
-            (true, None) => {
-                tracing::info!(
-                    column = %meta.column_name,
-                    "Encrypted column has no column-encryption decryptor available \
-                     (Always Encrypted disabled for this command, or no key-store \
-                     provider registered); returning the raw ciphertext varbinary"
-                );
-                decoder.decode_into(reader, meta, col, writer).await?;
-            }
-            (false, _) => {
-                decoder.decode_into(reader, meta, col, writer).await?;
-            }
-        }
+        decode_or_decrypt_column(&decoder, reader, meta, decryptor, col, writer).await?;
         if writer.pause_after_column(col) && col + 1 < columns.len() {
             return Ok(RowReadResult::RowPaused(RowPauseState {
                 next_column_index: col + 1,
                 columns: columns.to_vec(),
                 nbc_null_bitmap: None,
+                decryptor: decryptor.cloned(),
             }));
         }
     }
@@ -394,6 +397,17 @@ async fn decode_nbcrow_columns<R: TdsPacketReader + Send + Sync>(
             writer.write_null(col);
         } else {
             if meta.is_plp() && writer.pause_after_column(col) {
+                // TODO: Add AE-aware PLP streaming path for paused row reads.
+                // Until then, fail fast to avoid streaming ciphertext bytes to callers.
+                if meta.crypto_metadata.is_some() {
+                    return Err(crate::error::Error::UnimplementedFeature {
+                        feature: "Always Encrypted paused PLP streaming".to_string(),
+                        context: format!(
+                            "Encrypted PLP column '{}' cannot be streamed via read_active_plp_bytes yet.",
+                            meta.column_name
+                        ),
+                    });
+                }
                 match PlpColumnStream::begin(meta, reader).await? {
                     None => {
                         writer.write_null(col);
@@ -402,6 +416,7 @@ async fn decode_nbcrow_columns<R: TdsPacketReader + Send + Sync>(
                                 next_column_index: col + 1,
                                 columns: columns.to_vec(),
                                 nbc_null_bitmap: Some(bitmap.to_vec()),
+                                decryptor: decryptor.cloned(),
                             }));
                         }
                         return Ok(RowReadResult::RowWritten);
@@ -412,6 +427,7 @@ async fn decode_nbcrow_columns<R: TdsPacketReader + Send + Sync>(
                                 next_column_index: col + 1,
                                 columns: columns.to_vec(),
                                 nbc_null_bitmap: Some(bitmap.to_vec()),
+                                decryptor: decryptor.cloned(),
                             },
                             plp_stream,
                         }));
@@ -419,34 +435,47 @@ async fn decode_nbcrow_columns<R: TdsPacketReader + Send + Sync>(
                 }
             }
 
-            match (meta.crypto_metadata.is_some(), decryptor) {
-                (true, Some(dec)) => {
-                    let value = decrypt_encrypted_column(&decoder, reader, meta, dec).await?;
-                    write_column_value(writer, col, value);
-                }
-                (true, None) => {
-                    tracing::info!(
-                        column = %meta.column_name,
-                        "Encrypted column has no column-encryption decryptor available \
-                         (Always Encrypted disabled for this command, or no key-store \
-                         provider registered); returning the raw ciphertext varbinary"
-                    );
-                    decoder.decode_into(reader, meta, col, writer).await?;
-                }
-                (false, _) => {
-                    decoder.decode_into(reader, meta, col, writer).await?;
-                }
-            }
+            decode_or_decrypt_column(&decoder, reader, meta, decryptor, col, writer).await?;
         }
         if writer.pause_after_column(col) && col + 1 < columns.len() {
             return Ok(RowReadResult::RowPaused(RowPauseState {
                 next_column_index: col + 1,
                 columns: columns.to_vec(),
                 nbc_null_bitmap: Some(bitmap.to_vec()),
+                decryptor: decryptor.cloned(),
             }));
         }
     }
     Ok(RowReadResult::RowWritten)
+}
+
+async fn decode_or_decrypt_column<R: TdsPacketReader + Send + Sync>(
+    decoder: &GenericDecoder,
+    reader: &mut R,
+    meta: &ColumnMetadata,
+    decryptor: Option<&Arc<dyn CellDecryptor>>,
+    col: usize,
+    writer: &mut (dyn RowWriter + Send),
+) -> TdsResult<()> {
+    match (meta.crypto_metadata.is_some(), decryptor) {
+        (true, Some(dec)) => {
+            let value = decrypt_encrypted_column(decoder, reader, meta, dec).await?;
+            write_column_value(writer, col, value);
+        }
+        (true, None) => {
+            tracing::info!(
+                column = %meta.column_name,
+                "Encrypted column has no column-encryption decryptor available \
+                 (Always Encrypted disabled for this command, or no key-store \
+                 provider registered); returning the raw ciphertext varbinary"
+            );
+            decoder.decode_into(reader, meta, col, writer).await?;
+        }
+        (false, _) => {
+            decoder.decode_into(reader, meta, col, writer).await?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
@@ -490,12 +519,30 @@ pub(crate) async fn resume_row_into_internal<R: TdsPacketReader + Send + Sync>(
         next_column_index,
         columns,
         nbc_null_bitmap,
+        decryptor,
     } = pause_state;
 
     match nbc_null_bitmap {
-        None => decode_row_columns(reader, &columns, None, next_column_index, writer).await,
+        None => {
+            decode_row_columns(
+                reader,
+                &columns,
+                decryptor.as_ref(),
+                next_column_index,
+                writer,
+            )
+            .await
+        }
         Some(bitmap) => {
-            decode_nbcrow_columns(reader, &columns, None, &bitmap, next_column_index, writer).await
+            decode_nbcrow_columns(
+                reader,
+                &columns,
+                decryptor.as_ref(),
+                &bitmap,
+                next_column_index,
+                writer,
+            )
+            .await
         }
     }
 }
