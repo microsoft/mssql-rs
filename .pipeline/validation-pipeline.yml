@@ -36,70 +36,14 @@ parameters:
   type: string
   default: '2025-latest'
 
-# ============================================================================
-# TEMPORARY HIJACK: PR validation is reduced to ONLY printing agent disk info
-# (Windows + Linux) and exiting, to confirm the NVMe disk layout without burning
-# compute on the full build/test matrix.
-# TO REVERT: delete the DiskInfo stage below and un-comment the original
-# `- template: templates/validation-stages.yml` block at the bottom of this file.
-# ============================================================================
 stages:
-- stage: DiskInfo
-  displayName: Agent disk info (validation temporarily hijacked)
-  jobs:
-  - job: DiskInfo_Linux
-    displayName: Disk info (Linux)
-    pool:
-      name: RUST-1ES-POOL-WUS3-NVME
-      demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM-NVME
-    steps:
-    - checkout: none
-    - bash: |
-        set -x
-        echo "===== LINUX AGENT DISK INFO ====="
-        uname -a
-        df -h
-        echo "--- Block devices (TRAN=nvme + ROTA=0 => NVMe SSD) ---"
-        lsblk -o NAME,SIZE,TYPE,TRAN,ROTA,FSTYPE,MOUNTPOINT,MODEL || lsblk
-        echo "--- NVMe devices ---"
-        ls -l /dev/nvme* 2>/dev/null || echo "no /dev/nvme* devices"
-        command -v nvme >/dev/null 2>&1 && nvme list 2>/dev/null || true
-        echo "--- Backing device + transport for key mounts ---"
-        for m in / /mnt /mnt/vss /mnt/azure_nvme_temp "${AGENT_WORKFOLDER:-/mnt/vss/_work}"; do
-          [ -e "$m" ] || continue
-          echo "$m -> $(findmnt -no SOURCE,FSTYPE --target "$m" 2>/dev/null)"
-        done
-      displayName: Print Linux disk info
-  - job: DiskInfo_Windows
-    displayName: Disk info (Windows)
-    pool:
-      name: RUST-1ES-POOL-WUS3-NVME
-      demands:
-        - imageOverride -equals RUST-Win22-Sql25-1P-NVME
-    steps:
-    - checkout: none
-    - powershell: |
-        Write-Host "===== WINDOWS AGENT DISK INFO ====="
-        Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version | Format-List | Out-String | Write-Host
-        Write-Host "--- Physical disks (BusType = NVMe / SATA / SAS) ---"
-        Get-PhysicalDisk | Select-Object DeviceId, FriendlyName, MediaType, BusType, @{N='SizeGB';E={[math]::Round($_.Size/1GB,1)}} | Format-Table -AutoSize | Out-String | Write-Host
-        Write-Host "--- Disks ---"
-        Get-Disk | Select-Object Number, FriendlyName, BusType, @{N='SizeGB';E={[math]::Round($_.Size/1GB,1)}}, PartitionStyle | Format-Table -AutoSize | Out-String | Write-Host
-        Write-Host "--- Volumes (drive letters + free space) ---"
-        Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter, FileSystem, @{N='SizeGB';E={[math]::Round($_.Size/1GB,1)}}, @{N='FreeGB';E={[math]::Round($_.SizeRemaining/1GB,1)}} | Format-Table -AutoSize | Out-String | Write-Host
-        Write-Host "--- Agent work folder ---"
-        Write-Host "AGENT_WORKFOLDER=$env:AGENT_WORKFOLDER  BUILD_SOURCESDIRECTORY=$env:BUILD_SOURCESDIRECTORY"
-      displayName: Print Windows disk info
-
-# ORIGINAL PR validation (restore this and delete the DiskInfo stage above to re-enable):
-# - template: templates/validation-stages.yml
-#   parameters:
-#     buildType: ${{ parameters.buildType }}
-#     RunFuzz: ${{ parameters.RunFuzz }}
-#     RunLongHaul: ${{ parameters.RunLongHaul }}
-#     sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
-#     sqlImageTag: ${{ parameters.sqlImageTag }}
-#     # PR validation for internal ADO and GitHub PRs. GitHub PRs run in the public
-#     # project, which lacks 'Magnitude Test', so exclude the infra stages here.
-#     includeInfraStages: false
+- template: templates/validation-stages.yml
+  parameters:
+    buildType: ${{ parameters.buildType }}
+    RunFuzz: ${{ parameters.RunFuzz }}
+    RunLongHaul: ${{ parameters.RunLongHaul }}
+    sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+    sqlImageTag: ${{ parameters.sqlImageTag }}
+    # PR validation for internal ADO and GitHub PRs. GitHub PRs run in the public
+    # project, which lacks 'Magnitude Test', so exclude the infra stages here.
+    includeInfraStages: false
