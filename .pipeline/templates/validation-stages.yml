@@ -237,6 +237,14 @@ stages:
         parameters:
           osType: Alpine
           architecture: x64
+      # Runs unconditionally on every Linux build (PR and non-PR).
+      - task: ComponentGovernanceComponentDetection@0
+        displayName: Component Governance detection
+        condition: always()
+        inputs:
+          scanType: Register
+          verbosity: Verbose
+          sourceScanPath: '$(Build.SourcesDirectory)'
 
   - job: Build_Linux_ARM
     displayName: Build Linux ARM
