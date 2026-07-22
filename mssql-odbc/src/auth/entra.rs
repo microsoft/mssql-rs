@@ -35,7 +35,7 @@ use azure_identity::{
 use tokio::sync::OnceCell;
 use url::{Position, Url};
 
-use super::interactive::InteractiveTokenFactory;
+use super::interactive::{CONNECT_TIMEOUT_SECS, InteractiveTokenFactory};
 use crate::connection::odbc_authentication_transformer::TransformedAuth;
 use mssql_tds::connection::client_context::{
     ClientContext, EntraIdTokenFactory, TdsAuthenticationMethod,
@@ -253,10 +253,13 @@ pub(crate) fn configure_auth(
                 TdsAuthenticationMethod::ActiveDirectoryInteractive,
                 Box::new(factory),
             );
-            // The browser sign-in (with MFA) can take minutes, so disable the
-            // login-connect deadline; the flow keeps its own inner bound
-            // (REDIRECT_TIMEOUT) and stays cancellable. See AB#46067.
-            context.connect_timeout = 0;
+            // The browser sign-in (with MFA) can take minutes, far longer than
+            // the default 15s. `connect_timeout` bounds both the outer login
+            // deadline and each TCP-connect attempt, so it must stay non-zero
+            // (zero fails the TCP connect immediately); raise it to cover the
+            // interactive flow. Mirrors SqlClient's enlarged Connect Timeout for
+            // interactive auth. See AB#46067.
+            context.connect_timeout = CONNECT_TIMEOUT_SECS;
         }
         other => return Err(other),
     }
@@ -450,9 +453,10 @@ mod tests {
             ctx.tds_authentication_method,
             TdsAuthenticationMethod::ActiveDirectoryInteractive
         );
-        // The browser flow governs its own timeout; the login-connect deadline
-        // must be disabled so MFA has time to complete.
-        assert_eq!(ctx.connect_timeout, 0);
+        // Interactive raises the login-connect budget (never zero, which would
+        // fail the TCP connect) so the browser/MFA flow has time to complete.
+        assert_eq!(ctx.connect_timeout, CONNECT_TIMEOUT_SECS);
+        assert!(ctx.connect_timeout > 15);
     }
 
     #[test]

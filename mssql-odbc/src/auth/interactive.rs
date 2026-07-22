@@ -21,9 +21,9 @@
 //! Security notes:
 //! - PKCE (`S256`) binds the authorization code to this process; the `state`
 //!   parameter is a single-use CSRF guard checked on the redirect.
-//! - No client secret is used or stored (public client). The acquired access
-//!   token is cached in-memory for the connection's lifetime only; no refresh
-//!   token is retained (silent renewal is tracked in AB#46409).
+//! - No client secret is used or stored (public client). The token is not
+//!   cached: each login (including session recovery) runs a fresh sign-in, and
+//!   no refresh token is retained. Token caching/refresh is tracked in AB#46409.
 //! - The browser is launched even under `SQL_DRIVER_NOPROMPT`: that flag governs
 //!   the ODBC DSN dialog, not the Entra sign-in, matching msodbcsql.
 //! - The STS authority comes from the server's FEDAUTHINFO; like msodbcsql and
@@ -36,7 +36,6 @@
 //!   `http://localhost` (matching MSAL.NET); hosts that resolve `localhost` only
 //!   to IPv6 `::1` are a known gap.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -46,7 +45,6 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::OnceCell;
 use tracing::{debug, info};
 use url::Url;
 
@@ -63,6 +61,15 @@ const PUBLIC_CLIENT_ID: &str = "a94f9c62-97fe-4d19-b06d-472bed8d2bcb";
 
 /// How long to wait for the user to finish signing in before giving up.
 const REDIRECT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Login-connect budget applied to interactive connections via
+/// `ClientContext.connect_timeout`. That single value bounds both the outer
+/// login deadline and each TCP-connect attempt, so it must comfortably exceed
+/// [`REDIRECT_TIMEOUT`]: the browser round-trip stays bounded while a normal
+/// reachable server still connects in milliseconds. Mirrors SqlClient's
+/// enlarged Connect Timeout for interactive auth. Splitting this into a separate
+/// login timeout (`SQL_ATTR_LOGIN_TIMEOUT`) is a planned follow-up.
+pub(super) const CONNECT_TIMEOUT_SECS: u32 = 330;
 
 /// Number of random bytes for the PKCE verifier and the `state` value; 32 bytes
 /// base64url-encode to a 43-character string (within the 43–128 PKCE range).
@@ -81,18 +88,11 @@ const MAX_REQUEST_BYTES: usize = 8192;
 pub(crate) struct InteractiveTokenFactory {
     /// Optional `login_hint` (the ODBC `UID`, typically `user@tenant`).
     login_hint: Option<String>,
-    /// Token acquired once per connection and reused so session-recovery
-    /// re-login does not pop a second browser prompt. Shared across clones of
-    /// this factory. No refresh token is kept; see the module security note.
-    token: Arc<OnceCell<String>>,
 }
 
 impl InteractiveTokenFactory {
     pub(crate) fn new(login_hint: Option<String>) -> Self {
-        Self {
-            login_hint,
-            token: Arc::new(OnceCell::new()),
-        }
+        Self { login_hint }
     }
 }
 
@@ -104,24 +104,21 @@ impl EntraIdTokenFactory for InteractiveTokenFactory {
         sts_url: String,
         _auth_method: TdsAuthenticationMethod,
     ) -> TdsResult<Vec<u8>> {
-        let login_hint = self.login_hint.clone();
-        let token = self
-            .token
-            .get_or_try_init(|| async move {
-                let (authority, tenant) = split_sts_url(&sts_url)?;
-                let scope = normalize_scope(&spn);
-                acquire_interactive_token(
-                    &authority,
-                    &tenant,
-                    PUBLIC_CLIENT_ID,
-                    &scope,
-                    login_hint.as_deref(),
-                )
-                .await
-            })
-            .await?;
+        // No token cache: like the service-principal path, each login runs the
+        // flow fresh so session recovery cannot reuse an expired token. Token
+        // caching/refresh is tracked in AB#46409.
+        let (authority, tenant) = split_sts_url(&sts_url)?;
+        let scope = normalize_scope(&spn);
+        let token = acquire_interactive_token(
+            &authority,
+            &tenant,
+            PUBLIC_CLIENT_ID,
+            &scope,
+            self.login_hint.as_deref(),
+        )
+        .await?;
 
-        Ok(encode_utf16le(token))
+        Ok(encode_utf16le(&token))
     }
 }
 
@@ -239,7 +236,7 @@ async fn acquire_interactive_token(
     debug!(%authorize_url, "interactive authorize URL");
     open_browser(authorize_url.as_str()).map_err(|e| {
         Error::ConnectionError(format!(
-            "failed to launch a browser for interactive sign-in: {e}. Open this URL manually to continue: {authorize_url}"
+            "failed to launch a browser for interactive sign-in: {e}"
         ))
     })?;
 
@@ -478,18 +475,24 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn open_browser(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("open")
-        .arg(url)
-        .spawn()
-        .map(|_| ())
+    reap(std::process::Command::new("open").arg(url).spawn()?);
+    Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn open_browser(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("xdg-open")
-        .arg(url)
-        .spawn()
-        .map(|_| ())
+    reap(std::process::Command::new("xdg-open").arg(url).spawn()?);
+    Ok(())
+}
+
+/// `open`/`xdg-open` exit as soon as they hand the URL to the browser, but a
+/// dropped `Child` is never waited on and would linger as a zombie. Reap it on a
+/// detached thread so the sign-in flow is not blocked.
+#[cfg(unix)]
+fn reap(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 #[cfg(test)]
