@@ -58,7 +58,7 @@ For each key/value pair, repeated until end of input:
    - *Mapped* — a key we act on. First occurrence stores the value; duplicates are
      discarded (**first-wins**).
    - *Ignored* — recognized by msodbcsql but not acted on here (e.g. `Driver`,
-     `DSN`, `ApplicationIntent`, `OEMToANSI`). No warning.
+     `DSN`, `QuotedId`, `OEMToANSI`). No warning.
    - *Unknown* — not in the table. Raises an `01S00` warning, but **parsing
      continues** to the next pair; the value is parsed and discarded. Never fails
      and never halts the scan.
@@ -131,15 +131,61 @@ Only an invalid **value** on a recognized, validated key is a hard error: msodbc
 returns `E_FAIL` (→ `Err(InvalidAttrValue)`) and the connect fails. Unknown or
 invalid *keywords* never fail.
 
+## Mapped connection attributes
+
+`MAPPED_KEYS` is the single source of truth for the keywords the parser acts on.
+Each maps (case-insensitively) to a `ConnectionParams` field, which
+`driver_connect` then wires into the mssql-tds `ClientContext` / `EncryptionOptions`.
+Several spellings can share one slot, giving first-wins semantics across the whole
+synonym group (e.g. `Server` / `Addr` / `Address`).
+
+| Connection-string key(s) | mssql-tds landing spot | Value handling |
+|--------------------------|------------------------|----------------|
+| `Server` / `Addr` / `Address` | `create_client(server)` | verbatim (`server,port`) |
+| `Database` | `ClientContext::database` | verbatim |
+| `UID` | `ClientContext::user_name` | verbatim |
+| `PWD` | `ClientContext::password` | verbatim, redacted in logs |
+| `Authentication` | auth resolution | recognized-keyword set |
+| `Trusted_Connection` | integrated auth | `Yes` / `No` |
+| `Encrypt` | `EncryptionOptions::mode` | `Yes` / `Mandatory` / `No` / `Optional` / `Strict` |
+| `TrustServerCertificate` | `EncryptionOptions::trust_server_certificate` | `Yes` / `No` |
+| `HostnameInCertificate` | `EncryptionOptions::host_name_in_cert` | verbatim |
+| `ServerCertificate` | `EncryptionOptions::server_certificate` (path) | verbatim path |
+| `ServerSPN` | `ClientContext::server_spn` | verbatim |
+| `ApplicationIntent` | `ClientContext::application_intent` | `ReadOnly` / `ReadWrite` |
+| `MultiSubnetFailover` | `ClientContext::multi_subnet_failover` | `Yes` / `No` |
+| `IpAddressPreference` | `ClientContext::ipaddress_preference` | `IPv4First` / `IPv6First` / `UsePlatformDefault` |
+| `ConnectRetryCount` | `ClientContext::connect_retry_count` | integer |
+| `ConnectRetryInterval` | `ClientContext::connect_retry_interval` | integer |
+| `KeepAlive` | `ClientContext::keep_alive_in_ms` (×1000) | integer, seconds |
+| `KeepAliveInterval` | `ClientContext::keep_alive_interval_in_ms` (×1000) | integer, seconds |
+| `PacketSize` | `ClientContext::packet_size` (u16) | integer, bytes |
+
+This mirrors the canonical keyword set that mssql-python normalizes to before it
+hands the string to the driver, so a mssql-python application can target mssql-odbc
+without changing its connection strings.
+
 ## Value validation
 
 Whole-value, case-insensitive, exact match (not prefix, not `y`/`1`):
 
-- **Yes/No** keys (`TrustServerCertificate`, `Trusted_Connection`): `Yes` | `No`.
+- **Yes/No** keys (`TrustServerCertificate`, `Trusted_Connection`,
+  `MultiSubnetFailover`): `Yes` | `No`.
 - **`Encrypt`**: `Yes` | `Mandatory` | `No` | `Optional` | `Strict`.
+- **`ApplicationIntent`**: `ReadOnly` | `ReadWrite`.
+- **`IpAddressPreference`**: `IPv4First` | `IPv6First` | `UsePlatformDefault`.
+- **Integer** keys (`ConnectRetryCount`, `ConnectRetryInterval`, `KeepAlive`,
+  `KeepAliveInterval`, `PacketSize`): a non-negative integer. Documented ranges are
+  **not** enforced at parse time — out-of-range clamping is left to mssql-tds so the
+  parser cannot diverge from the native driver. A non-numeric or negative value is a
+  hard error (`E_FAIL`).
 - **`Authentication`**: delegated to `is_recognized_keyword`
   (`odbc_supported_auth_keywords.rs`) so the accept/reject set never drifts from
   mssql-tds. An empty value is a recognized reset.
+
+Pass-through string keys (`Server`/`Addr`/`Address`, `Database`, `UID`, `PWD`,
+`ServerSPN`, `HostnameInCertificate`, `ServerCertificate`) are stored verbatim with
+no value validation, exactly as msodbcsql does.
 
 ## Keys we recognize but do not act on
 

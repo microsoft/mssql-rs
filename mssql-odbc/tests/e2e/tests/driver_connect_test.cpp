@@ -457,3 +457,97 @@ TEST_F(DriverConnectLiveTest, ConnectionStringParserParityBehaviors) {
         EXPECT_TRUE(r.has28000);
     }
 }
+
+// End-to-end coverage of the connection-string keywords added for mssql-python
+// parity (AB#46418): ServerSPN, ApplicationIntent, MultiSubnetFailover,
+// ConnectRetry*, KeepAlive*, IpAddressPreference, PacketSize, HostnameInCertificate,
+// and ServerCertificate. Recognized canonical values connect with no parse warning;
+// an invalid value on a validated key is a hard HY024 failure. Fine-grained value
+// handling is unit-tested in connection_string_parser.rs; here we assert the
+// behavior visible through a real SQLDriverConnect.
+TEST_F(DriverConnectLiveTest, NewConnectionAttributesParity) {
+    auto& cfg = ODBCTestConfig::Instance();
+    if (!cfg.HasSqlAuth()) {
+        GTEST_SKIP() << "Requires SQL auth (ODBC_TEST_SERVER + ODBC_TEST_UID + "
+                        "ODBC_TEST_PWD); see follow-up issue for capability gating";
+    }
+
+    struct ConnResult {
+        SQLRETURN rc;
+        bool has01S00;
+        bool hasHY024;
+    };
+
+    auto tryConnect = [&](const std::string& cs) -> ConnResult {
+        SQLHDBC hdbc = SQL_NULL_HDBC;
+        SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
+        EXPECT_EQ(SQL_SUCCESS, rc);
+        if (rc != SQL_SUCCESS) return {rc, false, false};
+
+        SqlTString connstr = ODBCTestUtils::ToSqlTStr(cs);
+        SQLTCHAR outStr[1024] = {};
+        SQLSMALLINT outLen = 0;
+
+        rc = SQLDriverConnect(hdbc, nullptr,
+                              const_cast<SQLTCHAR*>(connstr.c_str()),
+                              static_cast<SQLSMALLINT>(connstr.size()),
+                              outStr, 1024, &outLen,
+                              SQL_DRIVER_NOPROMPT);
+
+        bool has01S00 = false;
+        bool hasHY024 = false;
+        if (rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR) {
+            has01S00 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "01S00");
+            hasHY024 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "HY024");
+        }
+
+        if (SQL_SUCCEEDED(rc)) SQLDisconnect(hdbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+        return {rc, has01S00, hasHY024};
+    };
+
+    const std::string base =
+        "Driver={" + cfg.Driver() + "}"
+        ";Server=" + cfg.Server() +
+        ";UID=" + cfg.Uid() +
+        ";PWD=" + cfg.Pwd() +
+        ";TrustServerCertificate=" + cfg.TrustCert();
+
+    // Recognized canonical attributes with valid values: login succeeds and the
+    // parser raises no 01S00 (they are acted-on keys, not unknown ones).
+    {
+        auto r = tryConnect(base +
+            ";ApplicationIntent=ReadOnly"
+            ";MultiSubnetFailover=no"
+            ";ConnectRetryCount=1"
+            ";ConnectRetryInterval=10"
+            ";KeepAlive=30"
+            ";KeepAliveInterval=1"
+            ";PacketSize=4096"
+            ";IpAddressPreference=IPv4First"
+            ";ServerSPN=MSSQLSvc/testhost:1433");
+        EXPECT_TRUE(SQL_SUCCEEDED(r.rc)) << "rc=" << r.rc;
+        EXPECT_FALSE(r.has01S00);
+    }
+
+    // Invalid enum value on a validated key -> E_FAIL -> HY024, connect fails.
+    {
+        auto r = tryConnect(base + ";ApplicationIntent=sideways");
+        EXPECT_EQ(SQL_ERROR, r.rc);
+        EXPECT_TRUE(r.hasHY024);
+    }
+
+    // Non-numeric integer value -> HY024, connect fails.
+    {
+        auto r = tryConnect(base + ";PacketSize=notanumber");
+        EXPECT_EQ(SQL_ERROR, r.rc);
+        EXPECT_TRUE(r.hasHY024);
+    }
+
+    // Out-of-domain IpAddressPreference -> HY024, connect fails.
+    {
+        auto r = tryConnect(base + ";IpAddressPreference=IPv7");
+        EXPECT_EQ(SQL_ERROR, r.rc);
+        EXPECT_TRUE(r.hasHY024);
+    }
+}

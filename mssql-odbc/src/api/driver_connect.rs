@@ -20,9 +20,11 @@ use crate::handles::DbcHandle;
 use crate::handles::dbc::{ConnectionState, DbcState};
 use crate::handles::{HandleType, handle_from_raw};
 
-use mssql_tds::connection::client_context::ClientContext;
+use mssql_tds::connection::client_context::{ClientContext, IPAddressPreference};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+use mssql_tds::message::login_options::ApplicationIntent;
+use std::path::PathBuf;
 
 use super::util::read_utf16;
 use crate::auth::configure_auth;
@@ -278,9 +280,52 @@ fn do_connect(
             Some(e) if e.eq_ignore_ascii_case("strict") => EncryptionSetting::Strict,
             _ => EncryptionSetting::On, // ODBC default
         },
-        host_name_in_cert: None,
-        server_certificate: None,
+        host_name_in_cert: params.host_name_in_certificate.clone(),
+        server_certificate: params.server_certificate.as_deref().map(PathBuf::from),
     };
+
+    // Transport, routing, and TLS-identity options. Values were validated during
+    // parsing, so the enum mappings below fall through to their default variant.
+    if let Some(server_spn) = &params.server_spn {
+        context.server_spn = Some(server_spn.clone());
+    }
+    if let Some(intent) = &params.application_intent {
+        context.application_intent = if intent.eq_ignore_ascii_case("readonly") {
+            ApplicationIntent::ReadOnly
+        } else {
+            ApplicationIntent::ReadWrite
+        };
+    }
+    if let Some(multi_subnet_failover) = params.multi_subnet_failover {
+        context.multi_subnet_failover = multi_subnet_failover;
+    }
+    if let Some(count) = params.connect_retry_count {
+        context.connect_retry_count = count;
+    }
+    if let Some(interval) = params.connect_retry_interval {
+        context.connect_retry_interval = interval;
+    }
+    // ODBC expresses KeepAlive/KeepAliveInterval in seconds; mssql-tds stores
+    // milliseconds. Saturate so an out-of-range value can't overflow.
+    if let Some(secs) = params.keep_alive {
+        context.keep_alive_in_ms = secs.saturating_mul(1000);
+    }
+    if let Some(secs) = params.keep_alive_interval {
+        context.keep_alive_interval_in_ms = secs.saturating_mul(1000);
+    }
+    if let Some(pref) = &params.ip_address_preference {
+        context.ipaddress_preference = if pref.eq_ignore_ascii_case("ipv6first") {
+            IPAddressPreference::IPv6First
+        } else if pref.eq_ignore_ascii_case("useplatformdefault") {
+            IPAddressPreference::UsePlatformDefault
+        } else {
+            IPAddressPreference::IPv4First
+        };
+    }
+    // Parsed leniently as u32; mssql-tds owns range clamping (valid 512–32768).
+    if let Some(size) = params.packet_size {
+        context.packet_size = u16::try_from(size).unwrap_or(u16::MAX);
+    }
 
     // Connect via mssql-tds (lock is NOT held - the 'Connecting' state prevents races)
     let provider = TdsConnectionProvider::new();
