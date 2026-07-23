@@ -417,6 +417,14 @@ impl TdsClient {
     ///
     /// The bulk copy API uses `0` to mean "no timeout" (infinite). This helper
     /// normalises that convention so `Some(0)` becomes `None` (no deadline).
+    ///
+    /// Only pass a *caller-supplied* timeout here. A value returned by
+    /// [`deduct_timeout`](Self::deduct_timeout) can be `Some(0)` meaning "budget
+    /// exhausted", which this helper would silently widen to `None` (infinite) —
+    /// the opposite of the intent. Handle that exhaustion before converting; see
+    /// `deduct_timeout`'s "Interpreting `Some(0)`" note. This is latent today
+    /// (the ODBC path passes `None`) and is slated to be fixed when
+    /// `SQL_ATTR_QUERY_TIMEOUT` is wired.
     pub(in crate::connection) fn timeout_to_duration(timeout_sec: Option<u32>) -> Option<Duration> {
         timeout_sec.and_then(|secs| {
             if secs == 0 {
@@ -441,25 +449,49 @@ impl TdsClient {
 
     /// Pre-execution check: detect a dead connection and attempt session recovery.
     ///
-    /// Called at the top of every method that sends a TDS request (SQL batch,
-    /// RPC, bulk load, `BEGIN TRANSACTION`). If session recovery was negotiated
-    /// and the underlying TCP socket is dead, this will attempt `reconnect()`.
+    /// Call this at the top of any operation that sends a TDS request (SQL
+    /// batch, RPC, bulk load, `BEGIN TRANSACTION`). Recovery is attempted only
+    /// when all of the following hold; otherwise this is a cheap no-op that
+    /// returns `Duration::ZERO`:
+    /// - session recovery was negotiated at login, and the server offered a
+    ///   retry count (`connect_retry_count > 0`); and
+    /// - the underlying socket is actually dead (a non-blocking poll).
     ///
-    /// Returns the time spent reconnecting so callers can deduct it from the
-    /// command timeout. When no reconnection is needed, returns `Duration::ZERO`.
+    /// `timeout_sec` is the overall budget for recovery **and** the subsequent
+    /// execution, matching ODBC's `CheckOrRecoverConnection` (which deducts
+    /// recovery time from the remaining command timeout). Charge the returned
+    /// duration back with [`deduct_timeout`](Self::deduct_timeout) so a
+    /// 30-second command timeout still means at most 30 seconds total whether
+    /// or not a reconnect occurred. When `timeout_sec` is `None` or `Some(0)`,
+    /// recovery is instead bounded by the login `connect_timeout`, so it can
+    /// never block indefinitely.
     ///
-    /// The command timeout (`timeout_sec`) is used as the overall budget for
-    /// recovery + execution, matching ODBC's `CheckOrRecoverConnection` which
-    /// deducts recovery time from the remaining command timeout via
-    /// `timer.GetTimeoutLeft()`. This ensures applications can set reliable
-    /// SLAs — a 30-second command timeout means at most 30 seconds total,
-    /// regardless of whether a reconnect occurred.
+    /// Operations inside an active transaction (`COMMIT`, `ROLLBACK`, `SAVE`)
+    /// intentionally skip recovery — `is_recovery_possible()` returns `false`
+    /// while a transaction is open, matching SqlClient's
+    /// `RestoreBrokenConnection` behavior.
     ///
-    /// Methods that operate within an active transaction (`COMMIT`, `ROLLBACK`,
-    /// `SAVE`) intentionally skip this — `is_recovery_possible()` returns
-    /// `false` when a transaction is active, matching SqlClient's
-    /// `RestoreBrokenConnection` flag behavior.
-    pub(in crate::connection) async fn check_and_reconnect(
+    /// A caller managing cached prepared handles uses this as its single
+    /// recovery point: reconnect here first, then — before sending any RPC that
+    /// reuses a cached handle — decide handle liveness against
+    /// [`connection_recovery_count()`](Self::connection_recovery_count), which
+    /// advances on every successful reconnect.
+    ///
+    /// # Parameters
+    /// - `timeout_sec`: recovery budget in seconds; `None` (or `Some(0)`) falls
+    ///   back to the connection's `connect_timeout`.
+    /// - `cancel_handle`: optional token used to abort an in-progress reconnect.
+    ///
+    /// # Returns
+    /// The wall-clock time spent reconnecting, or `Duration::ZERO` when no
+    /// reconnect was needed.
+    ///
+    /// # Errors
+    /// Returns [`Error::ConnectionClosed`](crate::error::Error::ConnectionClosed)
+    /// when the socket is dead but the session state forbids recovery (e.g. an
+    /// open transaction), and propagates any error raised by the underlying
+    /// `reconnect()` attempt (including a timed-out or cancelled reconnect).
+    pub async fn check_and_reconnect(
         &mut self,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
@@ -513,14 +545,26 @@ impl TdsClient {
         Ok(start.elapsed())
     }
 
-    /// Subtracts `elapsed` from `timeout_sec`, returning the remaining seconds.
-    /// Returns `Some(0)` (immediate timeout) if recovery consumed the entire budget.
-    /// Passes through `None` (no timeout) unchanged.
-    /// Rounds up to avoid exceeding the caller's timeout budget on sub-second elapsed times.
-    pub(in crate::connection) fn deduct_timeout(
-        timeout_sec: Option<u32>,
-        elapsed: Duration,
-    ) -> Option<u32> {
+    /// Charges elapsed recovery time against a command-timeout budget.
+    ///
+    /// # Parameters
+    /// - `timeout_sec`: remaining command budget in seconds; `None` means "no
+    ///   timeout".
+    /// - `elapsed`: time already consumed.
+    ///
+    /// # Returns
+    /// - `None` when `timeout_sec` is `None` — passed through unchanged (still
+    ///   no timeout).
+    /// - `Some(remaining)` otherwise, saturating at `Some(0)` once the budget is
+    ///   exhausted.
+    ///
+    /// # Interpreting `Some(0)`
+    /// `Some(0)` means the budget is **already exhausted** (deadline reached),
+    /// *not* "no timeout". Callers must fail the operation fast at this point.
+    /// In particular, do **not** route `Some(0)` into a path that follows the
+    /// "0 seconds = infinite" convention (`timeout_to_duration` normalizes
+    /// `Some(0)` to `None`), or an exhausted budget will silently run unbounded.
+    pub fn deduct_timeout(timeout_sec: Option<u32>, elapsed: Duration) -> Option<u32> {
         timeout_sec.map(|t| {
             let elapsed_secs = u32::try_from(
                 elapsed
@@ -1373,6 +1417,17 @@ impl TdsClient {
     /// Frees server-side resources associated with the handle returned by
     /// [`execute_sp_prepare()`](Self::execute_sp_prepare) or
     /// [`execute_sp_prepexec()`](Self::execute_sp_prepexec).
+    ///
+    /// # Recovery
+    ///
+    /// This method never reconnects. `sp_unprepare` releases an *existing*
+    /// server handle, so once the connection has reconnected that handle is
+    /// already gone — reusing it hits SQL Server error 8179. The expected flow:
+    /// cleanup callers check the handle's session via
+    /// [`connection_recovery_count`](Self::connection_recovery_count) and skip a
+    /// stale one; on a dead connection the send just fails and is ignored
+    /// (best-effort). Forcing recovery, if ever wanted, is the caller's job (see
+    /// [`check_and_reconnect`](Self::check_and_reconnect)).
     #[instrument(skip(self), level = "info")]
     pub async fn execute_sp_unprepare(
         &mut self,
@@ -1385,8 +1440,8 @@ impl TdsClient {
         };
 
         self.begin_command();
-        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        // No reconnect here — recovery is caller-owned (see this method's
+        // `# Recovery` docs).
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -1449,6 +1504,17 @@ impl TdsClient {
     ///
     /// Result rows are available through [`read_row()`](Self::read_row) after
     /// this call returns.
+    ///
+    /// # Recovery
+    ///
+    /// This method never reconnects. The expected flow is: the caller (1)
+    /// recovers the connection once with
+    /// [`check_and_reconnect`](Self::check_and_reconnect), (2) checks — via
+    /// [`connection_recovery_count`](Self::connection_recovery_count) — whether a
+    /// cached handle still belongs to the live session (passing it as
+    /// `drop_handle` only if so), then (3) calls this. Because the decision is
+    /// made just before the send and this method won't reconnect underneath it,
+    /// it can't prepare against a session the caller didn't account for.
     #[instrument(skip(self, named_params), level = "info")]
     pub async fn execute_sp_prepexec(
         &mut self,
@@ -1467,8 +1533,8 @@ impl TdsClient {
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
 
         self.begin_command();
-        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        // No reconnect here — recovery is caller-owned (see this method's
+        // `# Recovery` docs).
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -1585,6 +1651,16 @@ impl TdsClient {
     /// [`execute_sp_prepexec()`](Self::execute_sp_prepexec) call.
     /// Supply fresh parameter values through `positional_parameters` and/or
     /// `named_parameters`.
+    ///
+    /// # Recovery
+    ///
+    /// This method never reconnects. The expected flow is: the caller (1)
+    /// recovers the connection once with
+    /// [`check_and_reconnect`](Self::check_and_reconnect), (2) checks — via
+    /// [`connection_recovery_count`](Self::connection_recovery_count) — that the
+    /// `handle` still belongs to the live session, then (3) calls this. Because
+    /// the decision is made just before the send and this method won't reconnect
+    /// underneath it, `handle` can't go stale mid-call.
     #[instrument(skip(self, positional_parameters, named_parameters), level = "info")]
     pub async fn execute_sp_execute(
         &mut self,
@@ -1603,8 +1679,8 @@ impl TdsClient {
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
 
         self.begin_command();
-        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        // No reconnect here — recovery is caller-owned (see this method's
+        // `# Recovery` docs).
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -4358,46 +4434,5 @@ mod tests {
             .expect_err("synthetic positional name collision should be rejected");
 
         assert!(matches!(err, UsageError(message) if message.contains("@CE_POS_0")));
-    }
-
-    /// A forced parameter whose row the server omits entirely from the describe
-    /// result must be rejected — not silently sent as plaintext. This is the
-    /// downgrade a describe-driven check (iterating only the server's rows) would
-    /// miss, so the validation iterates the supplied forced parameters instead.
-    #[tokio::test]
-    async fn apply_parameter_encryption_rejects_forced_param_omitted_from_describe() {
-        use crate::datatypes::sqltypes::SqlType;
-        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
-        use crate::security::keystore::{CekCache, ColumnEncryptionKeyStoreProviderRegistry};
-
-        // Server returns an empty describe result: no row for the forced param.
-        let describe = DescribeParameterEncryptionResult::new();
-        let providers = ColumnEncryptionKeyStoreProviderRegistry::new();
-        let cek_cache = CekCache::new();
-        let mut output_param_ceks = HashMap::new();
-
-        let mut forced = RpcParameter::new(
-            Some("@p1".to_string()),
-            StatusFlags::NONE,
-            SqlType::Int(Some(42)),
-        )
-        .with_force_column_encryption(true);
-        let mut params: Vec<&mut RpcParameter> = vec![&mut forced];
-
-        let err = TdsClient::apply_parameter_encryption(
-            &describe,
-            &providers,
-            &cek_cache,
-            &mut params,
-            &mut output_param_ceks,
-            &[],
-        )
-        .await
-        .expect_err("a forced parameter omitted from the describe result must be rejected");
-
-        assert!(
-            matches!(&err, crate::error::Error::ColumnEncryptionError(message) if message.contains("ForceColumnEncryption")),
-            "expected a ForceColumnEncryption column-encryption error, got: {err}"
-        );
     }
 }

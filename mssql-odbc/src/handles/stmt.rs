@@ -29,6 +29,22 @@ pub(crate) struct StmtHandle {
     pub(crate) inner: Mutex<StmtState>,
 }
 
+/// A server-side prepared-statement handle tagged with the session it was
+/// created in.
+///
+/// After a transparent reconnect the server has a fresh session and restarts
+/// prepared-handle numbering, so the cached `id` is meaningless on the new
+/// session (reuse yields SQL Server error 8179, or silently aliases another
+/// statement's handle). `session_epoch` records the connection's
+/// [`connection_recovery_count`](mssql_tds::connection::tds_client::TdsClient::connection_recovery_count)
+/// at capture; the handle is only live while it still matches the connection's
+/// current epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedHandle {
+    pub(crate) id: i32,
+    pub(crate) session_epoch: u32,
+}
+
 /// Mutable state within a statement handle, protected by `inner`.
 #[derive(Debug)]
 pub(crate) struct StmtState {
@@ -41,18 +57,16 @@ pub(crate) struct StmtState {
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
     pub(crate) bound_params: Vec<Option<BoundParam>>,
-    /// Server-side prepared-statement handle from `sp_prepare`, cached so
-    /// subsequent `SQLExecute` calls reuse it via `sp_execute`. `None`
-    /// until the first execute prepares it.
-    pub(crate) prepared_handle: Option<i32>,
+    /// Server-side prepared-statement handle from `sp_prepare` / `sp_prepexec`,
+    /// cached so subsequent `SQLExecute` calls reuse it via `sp_execute`.
+    pub(crate) prepared_handle: Option<PreparedHandle>,
     /// A prepared handle orphaned by a re-prepare / rebind / `SQLExecDirect`
     /// that must be released with `sp_unprepare`. The drop is deferred to the
     /// next point that already holds the TDS client (execute / exec-direct) or
-    /// to statement free, so bind/prepare stay I/O-free — mirroring msodbcsql's
-    /// deferred `hPrepDropDeferred`. Invariant: this is `None` whenever
-    /// `prepared_handle` is `Some` (a new handle can only be acquired by an
+    /// to statement free, so bind/prepare stay I/O-free. Invariant: this is `None`
+    /// whenever `prepared_handle` is `Some` (a new handle can only be acquired by an
     /// execute, which flushes any pending drop first).
-    pub(crate) pending_unprepare: Option<i32>,
+    pub(crate) pending_unprepare: Option<PreparedHandle>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
     /// Statement lifecycle/status flags used for ODBC API state checks.
