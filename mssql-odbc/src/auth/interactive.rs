@@ -59,15 +59,20 @@ use mssql_tds::error::Error;
 /// driver and needs no per-app registration.
 const PUBLIC_CLIENT_ID: &str = "a94f9c62-97fe-4d19-b06d-472bed8d2bcb";
 
-/// How long to wait for the user to finish signing in before giving up.
+/// Fallback browser-wait timeout, used by [`wait_for_redirect_bounded`] only
+/// when no effective login timeout is available. In normal operation the
+/// interactive arm installs a `ClientContext.login_timeout` (the app's
+/// `SQL_ATTR_LOGIN_TIMEOUT` or [`LOGIN_TIMEOUT_SECS`]) and the wait is bounded by
+/// that value instead, so an app timeout above or below this default is honored.
 const REDIRECT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default overall login deadline for interactive connections, installed via
 /// `ClientContext.login_timeout` when the application has not set its own
-/// `SQL_ATTR_LOGIN_TIMEOUT`. It must comfortably exceed [`REDIRECT_TIMEOUT`] so
-/// the browser round-trip fits, while the separate (default) `connect_timeout`
-/// keeps bounding each TCP-connect attempt — an unreachable server still fails
-/// fast. Mirrors msodbcsql's separate login vs. connection timeouts.
+/// `SQL_ATTR_LOGIN_TIMEOUT`. It bounds both the provider login deadline and the
+/// browser-redirect wait (via [`wait_for_redirect_bounded`]), giving the user a
+/// generous sign-in window, while the separate (default) `connect_timeout` keeps
+/// bounding each TCP-connect attempt so an unreachable server still fails fast.
+/// Mirrors msodbcsql's separate login vs. connection timeouts.
 pub(super) const LOGIN_TIMEOUT_SECS: u32 = 330;
 
 /// Number of random bytes for the PKCE verifier and the `state` value; 32 bytes
@@ -81,17 +86,31 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound on bytes read while looking for the HTTP request line.
 const MAX_REQUEST_BYTES: usize = 8192;
 
+/// Upper bound on the `/token` response body. Entra token responses are a few
+/// KB (a JWT plus a small JSON envelope). Because the STS authority comes from
+/// the server's FEDAUTHINFO, a hostile or misbehaving authority could otherwise
+/// stream an unbounded body into memory; this caps that exposure.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// Acquires an Entra ID access token via the interactive (browser) flow during
 /// the FedAuth handshake.
 #[derive(Clone)]
 pub(crate) struct InteractiveTokenFactory {
     /// Optional `login_hint` (the ODBC `UID`, typically `user@tenant`).
     login_hint: Option<String>,
+    /// Effective overall login timeout (seconds) from `ClientContext`, used to
+    /// bound the browser-redirect wait so an app `SQL_ATTR_LOGIN_TIMEOUT` is
+    /// honored. `Some(0)` means wait indefinitely; `None` falls back to
+    /// [`REDIRECT_TIMEOUT`].
+    login_timeout: Option<u32>,
 }
 
 impl InteractiveTokenFactory {
-    pub(crate) fn new(login_hint: Option<String>) -> Self {
-        Self { login_hint }
+    pub(crate) fn new(login_hint: Option<String>, login_timeout: Option<u32>) -> Self {
+        Self {
+            login_hint,
+            login_timeout,
+        }
     }
 }
 
@@ -114,6 +133,7 @@ impl EntraIdTokenFactory for InteractiveTokenFactory {
             PUBLIC_CLIENT_ID,
             &scope,
             self.login_hint.as_deref(),
+            self.login_timeout,
         )
         .await?;
 
@@ -206,6 +226,7 @@ async fn acquire_interactive_token(
     client_id: &str,
     scope: &str,
     login_hint: Option<&str>,
+    login_timeout: Option<u32>,
 ) -> TdsResult<String> {
     let pkce = generate_pkce()?;
     let state = random_base64url(RANDOM_BYTES)?;
@@ -248,11 +269,7 @@ async fn acquire_interactive_token(
         ))
     })?;
 
-    let code = tokio::time::timeout(REDIRECT_TIMEOUT, wait_for_redirect(&listener, &state))
-        .await
-        .map_err(|_| {
-            Error::ConnectionError("timed out waiting for interactive sign-in".into())
-        })??;
+    let code = wait_for_redirect_bounded(&listener, &state, login_timeout).await?;
 
     exchange_code_for_token(
         authority,
@@ -264,6 +281,37 @@ async fn acquire_interactive_token(
         &pkce.verifier,
     )
     .await
+}
+
+/// Derives the browser-redirect wait cap from the effective login timeout.
+/// `Some(0)` → `None` (wait indefinitely, honoring an infinite
+/// `SQL_ATTR_LOGIN_TIMEOUT`); `Some(n)` → `n` seconds; `None` → [`REDIRECT_TIMEOUT`].
+fn redirect_wait_cap(login_timeout: Option<u32>) -> Option<Duration> {
+    match login_timeout {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(u64::from(secs))),
+        None => Some(REDIRECT_TIMEOUT),
+    }
+}
+
+/// Waits for the browser redirect, bounding the wait by the effective login
+/// timeout so an application `SQL_ATTR_LOGIN_TIMEOUT` is honored instead of a
+/// fixed cap. The provider's own login deadline (derived from the same timeout)
+/// still bounds the whole connect attempt; this is the module-local half of that
+/// budget and the sole bound when the login timeout is infinite.
+async fn wait_for_redirect_bounded(
+    listener: &TcpListener,
+    expected_state: &str,
+    login_timeout: Option<u32>,
+) -> TdsResult<String> {
+    match redirect_wait_cap(login_timeout) {
+        Some(dur) => tokio::time::timeout(dur, wait_for_redirect(listener, expected_state))
+            .await
+            .map_err(|_| {
+                Error::ConnectionError("timed out waiting for interactive sign-in".into())
+            })?,
+        None => wait_for_redirect(listener, expected_state).await,
+    }
 }
 
 /// Accepts loopback connections until the OAuth redirect with a matching `state`
@@ -438,10 +486,7 @@ async fn exchange_code_for_token(
         .map_err(|e| Error::ConnectionError(format!("token request failed: {e}")))?;
 
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| Error::ConnectionError(format!("failed to read token response: {e}")))?;
+    let bytes = read_body_capped(response, MAX_TOKEN_RESPONSE_BYTES).await?;
     let body = String::from_utf8_lossy(&bytes);
 
     if !status.is_success() {
@@ -454,6 +499,34 @@ async fn exchange_code_for_token(
     }
 
     parse_token_response(body.as_ref())
+}
+
+/// Reads a response body into memory, rejecting anything larger than `cap`
+/// bytes. The advertised `Content-Length` gives an early exit; the body is then
+/// streamed so a server that omits or understates the header still cannot exceed
+/// the cap.
+async fn read_body_capped(mut response: reqwest::Response, cap: usize) -> TdsResult<Vec<u8>> {
+    if let Some(len) = response.content_length()
+        && len > cap as u64
+    {
+        return Err(Error::ConnectionError(format!(
+            "token response too large: {len} bytes exceeds the {cap}-byte limit"
+        )));
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| Error::ConnectionError(format!("failed to read token response: {e}")))?
+    {
+        if buf.len() + chunk.len() > cap {
+            return Err(Error::ConnectionError(format!(
+                "token response exceeded the {cap}-byte limit"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 fn parse_token_response(body: &str) -> TdsResult<String> {
@@ -498,9 +571,19 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 /// detached thread so the sign-in flow is not blocked.
 #[cfg(unix)]
 fn reap(mut child: std::process::Child) {
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
+    // `Builder::spawn` reports an OS thread-creation failure as an `Err` instead
+    // of panicking the way `thread::spawn` does; a shared library must never
+    // unwind across the FFI boundary. If the reaper can't start we drop the
+    // child (detaching it) and move on — a rare zombie beats a panic, and the
+    // browser helper is short-lived and exits on its own.
+    let spawned = std::thread::Builder::new()
+        .name("odbc-browser-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    if let Err(e) = spawned {
+        debug!("could not spawn browser-reaper thread ({e}); skipping wait");
+    }
 }
 
 #[cfg(test)]
@@ -662,5 +745,24 @@ mod tests {
     #[test]
     fn parse_token_response_rejects_empty_access_token() {
         assert!(parse_token_response(r#"{"access_token":""}"#).is_err());
+    }
+
+    #[test]
+    fn redirect_wait_cap_zero_is_infinite() {
+        // An app-set infinite SQL_ATTR_LOGIN_TIMEOUT (0) removes the local cap;
+        // the provider deadline (also infinite) is the only remaining bound.
+        assert_eq!(redirect_wait_cap(Some(0)), None);
+    }
+
+    #[test]
+    fn redirect_wait_cap_uses_login_timeout_seconds() {
+        // Honors app values both above and below the historical fixed 300s cap.
+        assert_eq!(redirect_wait_cap(Some(600)), Some(Duration::from_secs(600)));
+        assert_eq!(redirect_wait_cap(Some(30)), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn redirect_wait_cap_falls_back_when_unset() {
+        assert_eq!(redirect_wait_cap(None), Some(REDIRECT_TIMEOUT));
     }
 }

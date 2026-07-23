@@ -14,7 +14,8 @@ use crate::api::odbc_types::{
     SQL_ATTR_LOGIN_TIMEOUT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
     SqlPointer, SqlReturn,
 };
-use crate::error::{free_errors, post_sql_error};
+use crate::api::util::write_if_some;
+use crate::error::free_errors;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 
 /// Login timeout reported when the application has not set
@@ -40,6 +41,8 @@ pub(crate) unsafe fn sql_get_connect_attr_w(
         ?connection_handle,
         attribute,
         ?value_ptr,
+        buffer_length,
+        ?string_length_ptr,
         "SQLGetConnectAttrW called",
     );
 
@@ -58,8 +61,8 @@ unsafe fn sql_get_connect_attr_w_impl(
     connection_handle: SqlHandle,
     attribute: SqlInteger,
     value_ptr: SqlPointer,
-    _buffer_length: SqlInteger,
-    _string_length_ptr: *mut SqlInteger,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
     if connection_handle.is_null() {
         error!("SQLGetConnectAttrW: connection_handle is null");
@@ -73,6 +76,16 @@ unsafe fn sql_get_connect_attr_w_impl(
         "SQLGetConnectAttrW: handle is not a DBC"
     );
 
+    sql_get_connect_attr_w_safe(dbc, attribute, value_ptr, buffer_length, string_length_ptr)
+}
+
+fn sql_get_connect_attr_w_safe(
+    dbc: &DbcHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    _buffer_length: SqlInteger,
+    _string_length_ptr: *mut SqlInteger,
+) -> SqlReturn {
     let Ok(mut state) = dbc.inner.lock() else {
         error!("SQLGetConnectAttrW: dbc mutex poisoned");
         return SQL_ERROR;
@@ -83,19 +96,14 @@ unsafe fn sql_get_connect_attr_w_impl(
         SQL_ATTR_LOGIN_TIMEOUT => {
             if value_ptr.is_null() {
                 error!("SQLGetConnectAttrW: SQL_ATTR_LOGIN_TIMEOUT value pointer is null");
-                post_sql_error(
-                    &mut state,
-                    SQLSTATE_HY009,
-                    0,
-                    "SQL_ATTR_LOGIN_TIMEOUT value pointer is null",
-                );
+                post_diag(&mut state, ERR_INVALID_NULL_POINTER);
                 return SQL_ERROR;
             }
             // SQLUINTEGER attribute: write the current value into the caller's
             // buffer. `Some(0)` reflects an app-set "wait indefinitely"; an
             // unset attribute reports the driver default.
             let secs = state.login_timeout.unwrap_or(DEFAULT_LOGIN_TIMEOUT_SECS);
-            unsafe { (value_ptr as *mut u32).write_unaligned(secs) };
+            unsafe { write_if_some(value_ptr as *mut u32, secs) };
             debug!(secs, "SQLGetConnectAttrW: login timeout returned");
             SQL_SUCCESS
         }

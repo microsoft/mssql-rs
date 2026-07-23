@@ -248,11 +248,6 @@ pub(crate) fn configure_auth(
             // A non-empty UID becomes the `login_hint`; the browser flow uses the
             // well-known public-client id and stores no secret in the context.
             let login_hint = (!resolved.user_name.is_empty()).then_some(resolved.user_name);
-            let factory = InteractiveTokenFactory::new(login_hint);
-            context.auth_method_map.insert(
-                TdsAuthenticationMethod::ActiveDirectoryInteractive,
-                Box::new(factory),
-            );
             // The browser sign-in (with MFA) can take minutes, far longer than
             // the default 15s login deadline. Raise the overall login timeout
             // while leaving `connect_timeout` (the per-TCP-connect cap) at its
@@ -263,6 +258,13 @@ pub(crate) fn configure_auth(
             if context.login_timeout.is_none() {
                 context.login_timeout = Some(LOGIN_TIMEOUT_SECS);
             }
+            // Build the factory with the effective login timeout so the browser
+            // wait is bounded by the same budget as the provider login deadline.
+            let factory = InteractiveTokenFactory::new(login_hint, context.login_timeout);
+            context.auth_method_map.insert(
+                TdsAuthenticationMethod::ActiveDirectoryInteractive,
+                Box::new(factory),
+            );
         }
         other => return Err(other),
     }
