@@ -8,6 +8,7 @@ use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
 
 use super::{DbcHandle, HandleType, HasObjectType};
+use crate::api::odbc_types::{SqlULen, SqlUSmallInt};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 
@@ -55,6 +56,26 @@ pub(crate) struct StmtState {
     pub(crate) pending_unprepare: Option<i32>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
+    /// The 1-based column of the in-progress `SQLGetData` streaming read, or 0
+    /// when no read is active. Used to detect resumption vs. a new column.
+    pub(crate) getdata_col: SqlUSmallInt,
+    /// Bytes/elements of the current `getdata_col` value already returned by
+    /// prior `SQLGetData` calls. `usize::MAX` marks a value that has been fully
+    /// returned (so a further call yields `SQL_NO_DATA`). Reset on each fetch.
+    pub(crate) getdata_offset: usize,
+    /// Rowset size for block fetches (`SQL_ATTR_ROW_ARRAY_SIZE`). Defaults to 1
+    /// (single-row). Consumed by the columnar `SQLFetchScroll` path.
+    pub(crate) row_array_size: SqlULen,
+    /// Application buffer that receives the count of rows fetched by a block
+    /// fetch (`SQL_ATTR_ROWS_FETCHED_PTR`); null when unset. The application
+    /// owns this buffer and must keep it valid across the fetch.
+    pub(crate) rows_fetched_ptr: *mut SqlULen,
+    /// Application array that receives per-row status codes
+    /// (`SQL_ATTR_ROW_STATUS_PTR`); null when unset.
+    pub(crate) row_status_ptr: *mut SqlUSmallInt,
+    /// Row binding orientation (`SQL_ATTR_ROW_BIND_TYPE`): `SQL_BIND_BY_COLUMN`
+    /// (0) for column-wise arrays, otherwise a row-struct byte size.
+    pub(crate) row_bind_type: SqlULen,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
 }
@@ -70,6 +91,13 @@ impl StmtState {
 
     pub(crate) fn clear_state(&mut self, mask: u32) {
         self.state_flags &= !mask;
+    }
+
+    /// Clears the `SQLGetData` streaming cursor. Called whenever the current
+    /// row changes so a new row's columns are read from the start.
+    pub(crate) fn reset_getdata(&mut self) {
+        self.getdata_col = 0;
+        self.getdata_offset = 0;
     }
 
     /// Moves the cached `prepared_handle` (if any) into `pending_unprepare` so
@@ -116,6 +144,12 @@ impl StmtHandle {
                 prepared_handle: None,
                 pending_unprepare: None,
                 current_row: None,
+                getdata_col: 0,
+                getdata_offset: 0,
+                row_array_size: 1,
+                rows_fetched_ptr: std::ptr::null_mut(),
+                row_status_ptr: std::ptr::null_mut(),
+                row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
                 state_flags: 0,
             }),
         }

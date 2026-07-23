@@ -11,6 +11,7 @@ mod exec_common;
 mod exec_direct;
 mod execute;
 pub(crate) mod fetch;
+pub(crate) mod fetch_convert;
 pub(crate) mod free_handle;
 mod get_data;
 mod get_diag;
@@ -20,6 +21,7 @@ pub(crate) mod odbc_types;
 mod prepare;
 pub(crate) mod set_connect_attr;
 pub(crate) mod set_env_attr;
+pub(crate) mod set_stmt_attr;
 pub(crate) mod sqlstate;
 pub(crate) mod util;
 
