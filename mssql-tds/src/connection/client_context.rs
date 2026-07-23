@@ -225,7 +225,16 @@ pub struct ClientContext {
     /// Note: Not yet implemented internally - this field is reserved for future use.
     pub connect_retry_interval: u32,
     /// Connection timeout in seconds.
+    ///
+    /// Bounds each individual TCP-connect attempt (the network reach), not the
+    /// whole login. See [`Self::login_timeout`] for the overall login deadline.
     pub connect_timeout: u32,
+    /// Overall login deadline in seconds, covering the network connect, the TDS
+    /// handshake, and any auth token acquisition (e.g. the interactive browser
+    /// flow). `None` falls back to [`Self::connect_timeout`] (preserving the
+    /// historical single-knob behavior); `Some(0)` disables the deadline (wait
+    /// indefinitely). Maps to the ODBC `SQL_ATTR_LOGIN_TIMEOUT` attribute.
+    pub login_timeout: Option<u32>,
     /// Initial database catalog.
     pub database: String,
     /// The original data source string used to create this connection.
@@ -464,6 +473,7 @@ impl ClientContext {
             connect_retry_count: 1,
             connect_retry_interval: 10,
             connect_timeout: 15,
+            login_timeout: None,
             database: "".to_string(),
             data_source: data_source.to_string(),
             keep_alive_in_ms: 30_000, // 30 seconds (SQL Server default)
@@ -526,6 +536,7 @@ impl ClientContext {
             connect_retry_count: 1,
             connect_retry_interval: 10,
             connect_timeout: 15,
+            login_timeout: None,
             database: "".to_string(),
             data_source: "".to_string(),
             keep_alive_in_ms: 30_000, // 30 seconds (SQL Server default)
@@ -771,6 +782,7 @@ impl Clone for ClientContext {
             connect_retry_count: self.connect_retry_count,
             connect_retry_interval: self.connect_retry_interval,
             connect_timeout: self.connect_timeout,
+            login_timeout: self.login_timeout,
             database: self.database.clone(),
             data_source: self.data_source.clone(),
             keep_alive_in_ms: self.keep_alive_in_ms,
@@ -1120,6 +1132,7 @@ mod tests {
         assert_eq!(ctx.data_source, "tcp:myserver,1433");
         // Other defaults should still be set
         assert_eq!(ctx.connect_timeout, 15);
+        assert_eq!(ctx.login_timeout, None);
         assert_eq!(ctx.packet_size, 8000);
         assert_eq!(ctx.application_name, "TDSX Rust Client");
     }

@@ -35,6 +35,7 @@ use azure_identity::{
 use tokio::sync::OnceCell;
 use url::{Position, Url};
 
+use super::interactive::{InteractiveTokenFactory, LOGIN_TIMEOUT_SECS};
 use crate::connection::odbc_authentication_transformer::TransformedAuth;
 use mssql_tds::connection::client_context::{
     ClientContext, EntraIdTokenFactory, TdsAuthenticationMethod,
@@ -156,7 +157,7 @@ impl EntraIdTokenFactory for EntraTokenFactory {
 /// Normalizes an SPN/resource into a v2 scope by ensuring a single `/.default`
 /// suffix (e.g. `https://database.windows.net/` becomes
 /// `https://database.windows.net/.default`).
-fn normalize_scope(spn: &str) -> String {
+pub(super) fn normalize_scope(spn: &str) -> String {
     let trimmed = spn.trim_end_matches('/');
     if trimmed.ends_with("/.default") {
         trimmed.to_string()
@@ -176,7 +177,7 @@ fn normalize_scope(spn: &str) -> String {
 ///
 /// Parsing goes through the `url` crate (WHATWG): the scheme and host are
 /// lowercased and the default `:443` port is dropped.
-fn split_sts_url(sts_url: &str) -> TdsResult<(String, String)> {
+pub(super) fn split_sts_url(sts_url: &str) -> TdsResult<(String, String)> {
     // The URL is server-provided (FEDAUTHINFO): tolerate surrounding whitespace.
     let url = Url::parse(sts_url.trim())
         .map_err(|e| Error::ConnectionError(format!("invalid STS URL: {sts_url} ({e})")))?;
@@ -197,7 +198,7 @@ fn split_sts_url(sts_url: &str) -> TdsResult<(String, String)> {
 
 /// Encodes a string as UTF-16LE bytes — the token format the FedAuth token
 /// message carries on the wire.
-fn encode_utf16le(s: &str) -> Vec<u8> {
+pub(super) fn encode_utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
 }
 
@@ -240,6 +241,28 @@ pub(crate) fn configure_auth(
             let factory = EntraTokenFactory::new(CredentialConfig::ManagedIdentity { client_id });
             context.auth_method_map.insert(
                 TdsAuthenticationMethod::ActiveDirectoryManagedIdentity,
+                Box::new(factory),
+            );
+        }
+        TdsAuthenticationMethod::ActiveDirectoryInteractive => {
+            // A non-empty UID becomes the `login_hint`; the browser flow uses the
+            // well-known public-client id and stores no secret in the context.
+            let login_hint = (!resolved.user_name.is_empty()).then_some(resolved.user_name);
+            // The browser sign-in (with MFA) can take minutes, far longer than
+            // the default 15s login deadline. Raise the overall login timeout
+            // while leaving `connect_timeout` (the per-TCP-connect cap) at its
+            // default, so an unreachable server still fails fast. An app-set
+            // SQL_ATTR_LOGIN_TIMEOUT (already applied to the context) takes
+            // precedence. Mirrors msodbcsql's separate login vs. connection
+            // timeouts. See AB#46067.
+            if context.login_timeout.is_none() {
+                context.login_timeout = Some(LOGIN_TIMEOUT_SECS);
+            }
+            // Build the factory with the effective login timeout so the browser
+            // wait is bounded by the same budget as the provider login deadline.
+            let factory = InteractiveTokenFactory::new(login_hint, context.login_timeout);
+            context.auth_method_map.insert(
+                TdsAuthenticationMethod::ActiveDirectoryInteractive,
                 Box::new(factory),
             );
         }
@@ -416,12 +439,59 @@ mod tests {
     }
 
     #[test]
+    fn configure_auth_interactive_registers_factory() {
+        let mut ctx = ClientContext::default();
+        // UID is kept as the login hint; no secret is written to the context.
+        let r = transformed(
+            TdsAuthenticationMethod::ActiveDirectoryInteractive,
+            "user@contoso.com",
+            "",
+        );
+        assert!(configure_auth(&mut ctx, r).is_ok());
+        assert!(ctx.user_name.is_empty());
+        assert!(ctx.password.is_empty());
+        assert!(
+            ctx.auth_method_map
+                .contains_key(&TdsAuthenticationMethod::ActiveDirectoryInteractive)
+        );
+        assert_eq!(
+            ctx.tds_authentication_method,
+            TdsAuthenticationMethod::ActiveDirectoryInteractive
+        );
+        // Interactive raises the overall login deadline so the browser/MFA flow
+        // has time to complete, while leaving the per-TCP-connect cap
+        // (`connect_timeout`) at its default so an unreachable server fails fast.
+        assert_eq!(ctx.login_timeout, Some(LOGIN_TIMEOUT_SECS));
+        const { assert!(LOGIN_TIMEOUT_SECS > 15) };
+        assert_eq!(ctx.connect_timeout, 15);
+    }
+
+    #[test]
+    fn configure_auth_interactive_preserves_app_login_timeout() {
+        // An app-set SQL_ATTR_LOGIN_TIMEOUT (applied to the context before auth
+        // config) must win over the interactive default.
+        let mut ctx = ClientContext::default();
+        ctx.login_timeout = Some(60);
+        let r = transformed(
+            TdsAuthenticationMethod::ActiveDirectoryInteractive,
+            "user@contoso.com",
+            "",
+        );
+        assert!(configure_auth(&mut ctx, r).is_ok());
+        assert_eq!(ctx.login_timeout, Some(60));
+    }
+
+    #[test]
     fn configure_auth_unsupported_method_is_err() {
         let mut ctx = ClientContext::default();
-        let r = transformed(TdsAuthenticationMethod::ActiveDirectoryInteractive, "", "");
+        let r = transformed(
+            TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow,
+            "",
+            "",
+        );
         assert_eq!(
             configure_auth(&mut ctx, r),
-            Err(TdsAuthenticationMethod::ActiveDirectoryInteractive)
+            Err(TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow)
         );
     }
 }

@@ -3,9 +3,10 @@
 
 //! Implementation of SQLSetConnectAttrW.
 //!
-//! Currently handles the msodbcsql-specific `SQL_COPT_SS_ACCESS_TOKEN`
-//! attribute, which supplies a pre-acquired Entra access token before
-//! connecting. Other attributes are accepted as no-ops for now.
+//! Handles the msodbcsql-specific `SQL_COPT_SS_ACCESS_TOKEN` attribute (a
+//! pre-acquired Entra access token) and `SQL_ATTR_LOGIN_TIMEOUT` (the login
+//! deadline applied at connect time). Other standard attributes are accepted as
+//! no-ops for now.
 
 use tracing::{debug, error};
 
@@ -116,13 +117,20 @@ unsafe fn sql_set_connect_attr_w_impl(
                 }
             }
         }
+        SQL_ATTR_LOGIN_TIMEOUT => {
+            // Integer attribute: the SQLUINTEGER value is passed by value in the
+            // pointer slot (not a pointer to it). Store it so SQLDriverConnect
+            // can apply it to the TDS login deadline. `0` means "wait
+            // indefinitely" (mapped to no deadline at connect time).
+            let secs = value_ptr as usize as u32;
+            state.login_timeout = Some(secs);
+            debug!(secs, "SQLSetConnectAttrW: login timeout stored");
+            SQL_SUCCESS
+        }
         // Standard attributes the Driver Manager sets before connecting that we
         // accept (and currently ignore) so the connect handshake is not broken.
-        // TODO: honor these (timeouts, packet size, access mode) once wired.
-        SQL_ATTR_ACCESS_MODE
-        | SQL_ATTR_LOGIN_TIMEOUT
-        | SQL_ATTR_CONNECTION_TIMEOUT
-        | SQL_ATTR_PACKET_SIZE => SQL_SUCCESS,
+        // TODO: honor these (connection timeout, packet size, access mode) once wired.
+        SQL_ATTR_ACCESS_MODE | SQL_ATTR_CONNECTION_TIMEOUT | SQL_ATTR_PACKET_SIZE => SQL_SUCCESS,
         // Any other attribute is genuinely unsupported: surface a clear error
         // (HYC00) instead of silently pretending it took effect.
         _ => {
@@ -257,8 +265,35 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         // A standard connection attribute the DM sets pre-connect is accepted.
         let ret = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_ATTR_CONNECTION_TIMEOUT, std::ptr::null_mut(), 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+    }
+
+    #[test]
+    fn login_timeout_is_stored() {
+        let h = TestHandles::with_env_dbc();
+        // Integer attributes carry the value by value in the pointer slot.
+        let ret = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_ATTR_LOGIN_TIMEOUT, 45usize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.login_timeout, Some(45));
+    }
+
+    #[test]
+    fn login_timeout_zero_is_stored_as_infinite() {
+        let h = TestHandles::with_env_dbc();
+        // 0 is a valid value meaning "wait indefinitely"; it must be stored as
+        // Some(0), not treated as unset.
+        let ret = unsafe {
             sql_set_connect_attr_w(h.dbc, SQL_ATTR_LOGIN_TIMEOUT, std::ptr::null_mut(), 0)
         };
         assert_eq!(ret, SQL_SUCCESS);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.login_timeout, Some(0));
     }
 }

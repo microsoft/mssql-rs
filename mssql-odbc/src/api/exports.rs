@@ -472,14 +472,22 @@ pub unsafe extern "C" fn SQLSetConnectAttrW(
 /// - Output pointers must be valid and writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLGetConnectAttrW(
-    _connection_handle: SqlHandle,
-    _attribute: SqlInteger,
-    _value_ptr: SqlPointer,
-    _buffer_length: SqlInteger,
-    _string_length_ptr: *mut SqlInteger,
+    connection_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
     crate::init_tracing();
-    SQL_SUCCESS
+    unsafe {
+        super::get_connect_attr::sql_get_connect_attr_w(
+            connection_handle,
+            attribute,
+            value_ptr,
+            buffer_length,
+            string_length_ptr,
+        )
+    }
 }
 
 /// Sets a statement attribute.
