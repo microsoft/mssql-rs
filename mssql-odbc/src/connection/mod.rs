@@ -14,4 +14,4 @@ pub(crate) mod odbc_authentication_transformer;
 pub(crate) mod odbc_authentication_validator;
 mod odbc_supported_auth_keywords;
 
-pub(crate) use connection_string_parser::parse_connection_string;
+pub(crate) use connection_string_parser::{ConnectionParams, parse_connection_string};

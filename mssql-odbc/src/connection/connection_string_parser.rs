@@ -33,16 +33,6 @@ use std::fmt;
 use crate::connection::odbc_supported_auth_keywords::is_recognized_keyword;
 use tracing::warn;
 
-// Connection string keys (lowercase for matching)
-const KEY_SERVER: &str = "server";
-const KEY_DATABASE: &str = "database";
-const KEY_UID: &str = "uid";
-const KEY_PWD: &str = "pwd";
-const KEY_TRUST_SRV_CERT: &str = "trustservercertificate";
-const KEY_ENCRYPT: &str = "encrypt";
-const KEY_AUTHENTICATION: &str = "authentication";
-const KEY_TRUSTED_CONNECTION: &str = "trusted_connection";
-
 // Recognized msodbcsql keywords we accept but do not act on. Mirrors the
 // non-acted-on entries of msodbcsql's `x_rgLookup` table (including synonyms and
 // deprecated keys). Recognized keys never raise the 01S00 "invalid attribute"
@@ -63,8 +53,6 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
     "language",
     "network",
     "net",
-    "address",
-    "addr",
     "mars_connection",
     "failover_partner",
     "failoverpartnerspn",
@@ -78,11 +66,6 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
     "quotedid",
     "ansinpw",
     "attachdbfilename",
-    "serverspn",
-    "applicationintent",
-    "multisubnetfailover",
-    "connectretrycount",
-    "connectretryinterval",
     "clientcertificate",
     "columnencryption",
     "transparentnetworkipresolution",
@@ -92,17 +75,11 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
     "keystorelocation",
     "usefmtonly",
     "clientkey",
-    "keepalive",
-    "keepaliveinterval",
     "replication",
     "longasmax",
-    "hostnameincertificate",
     "getdataextensions",
-    "ipaddresspreference",
-    "servercertificate",
     "retryexec",
     "concatnullyieldsnull",
-    "packetsize",
     "vectortypesupport",
     // Deprecated keys kept for back-compat (msodbcsql KEY_UNUSED entries).
     "oemtoansi",
@@ -117,6 +94,11 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
 // Valid attribute values
 const YES_NO: &[&str] = &["yes", "no"];
 const ENCRYPT_VALUES: &[&str] = &["yes", "mandatory", "no", "optional", "strict"];
+const APPLICATION_INTENT_VALUES: &[&str] = &["ReadOnly", "ReadWrite"];
+const IP_ADDRESS_PREFERENCE_VALUES: &[&str] = &["IPv4First", "IPv6First", "UsePlatformDefault"];
+// Shown in the diagnostic when a numeric attribute (PacketSize, ConnectRetryCount,
+// …) is given a non-numeric or negative value.
+const INTEGER_EXPECTED: &[&str] = &["a non-negative integer"];
 
 // Recognized `Authentication=` keywords (mirrors `auth_method_from_keyword`).
 // Used only for the diagnostic hint; the accept/reject decision is delegated to
@@ -144,6 +126,17 @@ enum ConnAttrKey {
     Encrypt,
     Authentication,
     TrustedConnection,
+    ServerSpn,
+    ApplicationIntent,
+    MultiSubnetFailover,
+    ConnectRetryCount,
+    ConnectRetryInterval,
+    KeepAlive,
+    KeepAliveInterval,
+    IpAddressPreference,
+    PacketSize,
+    HostNameInCert,
+    ServerCertificate,
     Count,
 }
 
@@ -201,6 +194,17 @@ pub(crate) struct ConnectionParams {
     pub(crate) encrypt: Option<String>,
     pub(crate) authentication: Option<String>,
     pub(crate) trusted_connection: Option<bool>,
+    pub(crate) server_spn: Option<String>,
+    pub(crate) application_intent: Option<String>,
+    pub(crate) multi_subnet_failover: Option<bool>,
+    pub(crate) connect_retry_count: Option<u32>,
+    pub(crate) connect_retry_interval: Option<u32>,
+    pub(crate) keep_alive: Option<u32>,
+    pub(crate) keep_alive_interval: Option<u32>,
+    pub(crate) ip_address_preference: Option<String>,
+    pub(crate) packet_size: Option<u32>,
+    pub(crate) host_name_in_certificate: Option<String>,
+    pub(crate) server_certificate: Option<String>,
 }
 
 impl ConnectionParams {
@@ -208,13 +212,13 @@ impl ConnectionParams {
         let mut parts = Vec::new();
 
         if !self.server.is_empty() {
-            parts.push(format!("Server={}", self.server));
+            parts.push(format!("Server={}", quote_odbc_value(&self.server)));
         }
         if !self.database.is_empty() {
-            parts.push(format!("Database={}", self.database));
+            parts.push(format!("Database={}", quote_odbc_value(&self.database)));
         }
         if !self.uid.is_empty() {
-            parts.push(format!("UID={}", self.uid));
+            parts.push(format!("UID={}", quote_odbc_value(&self.uid)));
         }
         if !self.pwd.is_empty() {
             parts.push("PWD=******".to_string());
@@ -234,8 +238,63 @@ impl ConnectionParams {
                 if trusted_connection { "yes" } else { "no" }
             ));
         }
+        if let Some(server_spn) = &self.server_spn {
+            parts.push(format!("ServerSPN={}", quote_odbc_value(server_spn)));
+        }
+        if let Some(application_intent) = &self.application_intent {
+            parts.push(format!("ApplicationIntent={application_intent}"));
+        }
+        if let Some(multi_subnet_failover) = self.multi_subnet_failover {
+            parts.push(format!(
+                "MultiSubnetFailover={}",
+                if multi_subnet_failover { "yes" } else { "no" }
+            ));
+        }
+        if let Some(connect_retry_count) = self.connect_retry_count {
+            parts.push(format!("ConnectRetryCount={connect_retry_count}"));
+        }
+        if let Some(connect_retry_interval) = self.connect_retry_interval {
+            parts.push(format!("ConnectRetryInterval={connect_retry_interval}"));
+        }
+        if let Some(keep_alive) = self.keep_alive {
+            parts.push(format!("KeepAlive={keep_alive}"));
+        }
+        if let Some(keep_alive_interval) = self.keep_alive_interval {
+            parts.push(format!("KeepAliveInterval={keep_alive_interval}"));
+        }
+        if let Some(ip_address_preference) = &self.ip_address_preference {
+            parts.push(format!("IpAddressPreference={ip_address_preference}"));
+        }
+        if let Some(packet_size) = self.packet_size {
+            parts.push(format!("PacketSize={packet_size}"));
+        }
+        if let Some(host_name_in_certificate) = &self.host_name_in_certificate {
+            parts.push(format!(
+                "HostnameInCertificate={}",
+                quote_odbc_value(host_name_in_certificate)
+            ));
+        }
+        if let Some(server_certificate) = &self.server_certificate {
+            parts.push(format!(
+                "ServerCertificate={}",
+                quote_odbc_value(server_certificate)
+            ));
+        }
 
         parts.join(";")
+    }
+}
+
+/// Quote a free-form value for the redacted ODBC connection-string rendering used
+/// in diagnostic logs. Values containing a delimiter (`;`), brace, or `=` are
+/// wrapped in braces with any inner `}` doubled — matching the parser's
+/// brace-quoting rules — so the logged string stays unambiguous. Ordinary values
+/// are returned unchanged.
+fn quote_odbc_value(value: &str) -> String {
+    if value.contains([';', '{', '}', '=']) {
+        format!("{{{}}}", value.replace('}', "}}"))
+    } else {
+        value.to_string()
     }
 }
 
@@ -250,6 +309,17 @@ impl fmt::Debug for ConnectionParams {
             .field("encrypt", &self.encrypt)
             .field("authentication", &self.authentication)
             .field("trusted_connection", &self.trusted_connection)
+            .field("server_spn", &self.server_spn)
+            .field("application_intent", &self.application_intent)
+            .field("multi_subnet_failover", &self.multi_subnet_failover)
+            .field("connect_retry_count", &self.connect_retry_count)
+            .field("connect_retry_interval", &self.connect_retry_interval)
+            .field("keep_alive", &self.keep_alive)
+            .field("keep_alive_interval", &self.keep_alive_interval)
+            .field("ip_address_preference", &self.ip_address_preference)
+            .field("packet_size", &self.packet_size)
+            .field("host_name_in_certificate", &self.host_name_in_certificate)
+            .field("server_certificate", &self.server_certificate)
             .finish()
     }
 }
@@ -271,24 +341,45 @@ fn is_odbc_space(c: char) -> bool {
     matches!(c, ' ' | '\u{0c}' | '\n' | '\r' | '\t' | '\u{0b}')
 }
 
-// TODO: If the acted-on key set grows past ~15, collapse the `KEY_*` consts and
-// the match below into a single descriptor table (`&[{ lower, ConnAttrKey }]`)
-// that `classify_key` iterates, making it the one source of truth. Adding a
-// mapped key currently fans out across ~6 sites; only `assign_value` is
-// compiler-enforced to stay in sync — `classify_key`, the `ConnectionParams`
-// field, `fmt_as_odbc_conn_str`, and the `Debug` impl can silently drift.
+/// Connection-string keys we act on, paired with their target [`ConnectionParams`]
+/// slot. Keys are lowercase for case-insensitive matching. Several spellings may
+/// share one slot (e.g. `server`/`addr`/`address`); a shared slot yields first-wins
+/// semantics across the whole synonym group, matching msodbcsql.
+///
+/// This table is the single source of truth for *which* keys are acted on. Adding
+/// a key still requires a matching `ConnectionParams` field plus arms in
+/// `assign_value` (compiler-enforced), `fmt_as_odbc_conn_str`, and the `Debug` impl.
+const MAPPED_KEYS: &[(&str, ConnAttrKey)] = &[
+    ("server", ConnAttrKey::Server),
+    ("addr", ConnAttrKey::Server),
+    ("address", ConnAttrKey::Server),
+    ("database", ConnAttrKey::Database),
+    ("uid", ConnAttrKey::Uid),
+    ("pwd", ConnAttrKey::Pwd),
+    ("trustservercertificate", ConnAttrKey::TrustServerCert),
+    ("encrypt", ConnAttrKey::Encrypt),
+    ("authentication", ConnAttrKey::Authentication),
+    ("trusted_connection", ConnAttrKey::TrustedConnection),
+    ("serverspn", ConnAttrKey::ServerSpn),
+    ("applicationintent", ConnAttrKey::ApplicationIntent),
+    ("multisubnetfailover", ConnAttrKey::MultiSubnetFailover),
+    ("connectretrycount", ConnAttrKey::ConnectRetryCount),
+    ("connectretryinterval", ConnAttrKey::ConnectRetryInterval),
+    ("keepalive", ConnAttrKey::KeepAlive),
+    ("keepaliveinterval", ConnAttrKey::KeepAliveInterval),
+    ("ipaddresspreference", ConnAttrKey::IpAddressPreference),
+    ("packetsize", ConnAttrKey::PacketSize),
+    ("hostnameincertificate", ConnAttrKey::HostNameInCert),
+    ("servercertificate", ConnAttrKey::ServerCertificate),
+];
+
 fn classify_key(lower: &str) -> KeyClass {
-    match lower {
-        KEY_SERVER => KeyClass::Mapped(ConnAttrKey::Server),
-        KEY_DATABASE => KeyClass::Mapped(ConnAttrKey::Database),
-        KEY_UID => KeyClass::Mapped(ConnAttrKey::Uid),
-        KEY_PWD => KeyClass::Mapped(ConnAttrKey::Pwd),
-        KEY_TRUST_SRV_CERT => KeyClass::Mapped(ConnAttrKey::TrustServerCert),
-        KEY_ENCRYPT => KeyClass::Mapped(ConnAttrKey::Encrypt),
-        KEY_AUTHENTICATION => KeyClass::Mapped(ConnAttrKey::Authentication),
-        KEY_TRUSTED_CONNECTION => KeyClass::Mapped(ConnAttrKey::TrustedConnection),
-        _ if KNOWN_IGNORED_KEYS.contains(&lower) => KeyClass::Ignored,
-        _ => KeyClass::Unknown,
+    if let Some((_, slot)) = MAPPED_KEYS.iter().find(|(name, _)| *name == lower) {
+        KeyClass::Mapped(*slot)
+    } else if KNOWN_IGNORED_KEYS.contains(&lower) {
+        KeyClass::Ignored
+    } else {
+        KeyClass::Unknown
     }
 }
 
@@ -332,6 +423,40 @@ fn assign_value(
             validate_attr(lower, value, YES_NO)?;
             params.trusted_connection = Some(is_yes(value));
         }
+        ConnAttrKey::ServerSpn => params.server_spn = Some(value.to_string()),
+        ConnAttrKey::ApplicationIntent => {
+            validate_attr(lower, value, APPLICATION_INTENT_VALUES)?;
+            params.application_intent = Some(value.to_string());
+        }
+        ConnAttrKey::MultiSubnetFailover => {
+            validate_attr(lower, value, YES_NO)?;
+            params.multi_subnet_failover = Some(is_yes(value));
+        }
+        ConnAttrKey::ConnectRetryCount => {
+            params.connect_retry_count = Some(parse_uint(lower, value)?);
+        }
+        ConnAttrKey::ConnectRetryInterval => {
+            params.connect_retry_interval = Some(parse_uint(lower, value)?);
+        }
+        ConnAttrKey::KeepAlive => {
+            params.keep_alive = Some(parse_uint(lower, value)?);
+        }
+        ConnAttrKey::KeepAliveInterval => {
+            params.keep_alive_interval = Some(parse_uint(lower, value)?);
+        }
+        ConnAttrKey::IpAddressPreference => {
+            validate_attr(lower, value, IP_ADDRESS_PREFERENCE_VALUES)?;
+            params.ip_address_preference = Some(value.to_string());
+        }
+        ConnAttrKey::PacketSize => {
+            params.packet_size = Some(parse_uint(lower, value)?);
+        }
+        ConnAttrKey::HostNameInCert => {
+            params.host_name_in_certificate = Some(value.to_string());
+        }
+        ConnAttrKey::ServerCertificate => {
+            params.server_certificate = Some(value.to_string());
+        }
         ConnAttrKey::Count => {}
     }
     Ok(())
@@ -353,7 +478,7 @@ fn assign_value(
 /// ```text
 /// "Server=host;UID=sa;PWD=p"      -> server="host", uid="sa", pwd="p", no warnings
 /// "Server=host;Foo=1;UID=sa"      -> Foo is unknown: warns, discarded; UID still set
-/// "Server=host;ApplicationIntent=ReadOnly" -> recognized-but-ignored: no warning
+/// "Server=host;QuotedId=yes"       -> recognized-but-ignored: no warning
 /// "Server=host;PWD={p;w=d}"       -> braces quote ';' and '=': pwd="p;w=d"
 /// "Server=host;PWD={a}}b}"        -> "}}" escapes one '}': pwd="a}b"
 /// "Server=host;Encrypt=banana"    -> Err(InvalidAttrValue): validated key, bad value
@@ -544,6 +669,19 @@ pub(crate) fn parse_connection_string(
 
 fn is_yes(value: &str) -> bool {
     value.eq_ignore_ascii_case("yes")
+}
+
+/// Parse a non-negative integer attribute value. Rejects non-numeric or negative
+/// input with `InvalidAttrValue` (msodbcsql `E_FAIL`). Per-key ranges (e.g.
+/// PacketSize 512–32768) are not enforced here — the driver clamps out-of-range
+/// values to the range mssql-tds accepts when mapping onto the client context
+/// (see `apply_connection_params`), matching msodbcsql's clamping behavior.
+fn parse_uint(key: &str, value: &str) -> Result<u32, InvalidAttrValue> {
+    value.parse::<u32>().map_err(|_| InvalidAttrValue {
+        key: key.to_string(),
+        value: value.to_string(),
+        expected: INTEGER_EXPECTED,
+    })
 }
 
 #[cfg(test)]
@@ -1072,14 +1210,9 @@ mod tests {
             "WSID",
             "Language",
             "Network",
-            "Address",
             "MARS_Connection",
             "AutoTranslate",
             "QuotedId",
-            "ApplicationIntent",
-            "MultiSubnetFailover",
-            "ConnectRetryCount",
-            "PacketSize",
             "ColumnEncryption",
             "TransparentNetworkIPResolution",
             "OEMToANSI",
@@ -1090,6 +1223,173 @@ mod tests {
             assert_eq!(p.server, "h", "key {key}");
             assert_eq!(p.uid, "u", "key {key}");
         }
+    }
+
+    #[test]
+    fn addr_and_address_map_to_server() {
+        for key in ["Addr", "Address", "ADDR", "address"] {
+            let s = format!("{key}=host1;UID=u;<PW>=p");
+            let (p, warn) = parse_connection_string(&cs(&s)).unwrap();
+            assert!(!warn, "{key} should map cleanly to Server");
+            assert_eq!(p.server, "host1", "key {key}");
+        }
+    }
+
+    #[test]
+    fn server_and_address_share_one_slot_first_wins() {
+        let (p, warn) = parse_connection_string("Server=first;Address=second;UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "first");
+
+        let (p, warn) = parse_connection_string("Address=first;Server=second;UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "first");
+    }
+
+    #[test]
+    fn string_pass_through_keys_are_stored_verbatim() {
+        let (p, warn) = parse_connection_string(
+            "Server=h;ServerSPN=MSSQLSvc/host:1433;HostnameInCertificate=cn.example.com;ServerCertificate=C:\\certs\\srv.pem;UID=u",
+        )
+        .unwrap();
+        assert!(!warn);
+        assert_eq!(p.server_spn.as_deref(), Some("MSSQLSvc/host:1433"));
+        assert_eq!(
+            p.host_name_in_certificate.as_deref(),
+            Some("cn.example.com")
+        );
+        assert_eq!(p.server_certificate.as_deref(), Some("C:\\certs\\srv.pem"));
+    }
+
+    #[test]
+    fn application_intent_is_validated() {
+        for (val, expected) in [("ReadOnly", "ReadOnly"), ("readwrite", "readwrite")] {
+            let s = format!("Server=h;ApplicationIntent={val};UID=u");
+            let (p, warn) = parse_connection_string(&s).unwrap();
+            assert!(!warn);
+            assert_eq!(p.application_intent.as_deref(), Some(expected));
+        }
+        let err = parse_connection_string("Server=h;ApplicationIntent=sideways;UID=u").unwrap_err();
+        assert_eq!(err.key, "applicationintent");
+        assert_eq!(err.value, "sideways");
+    }
+
+    #[test]
+    fn multi_subnet_failover_is_yes_no() {
+        let (p, _) = parse_connection_string("Server=h;MultiSubnetFailover=Yes;UID=u").unwrap();
+        assert_eq!(p.multi_subnet_failover, Some(true));
+        let (p, _) = parse_connection_string("Server=h;MultiSubnetFailover=no;UID=u").unwrap();
+        assert_eq!(p.multi_subnet_failover, Some(false));
+        let err = parse_connection_string("Server=h;MultiSubnetFailover=maybe;UID=u").unwrap_err();
+        assert_eq!(err.key, "multisubnetfailover");
+    }
+
+    #[test]
+    fn ip_address_preference_is_validated() {
+        for val in ["IPv4First", "ipv6first", "UsePlatformDefault"] {
+            let s = format!("Server=h;IpAddressPreference={val};UID=u");
+            let (p, warn) = parse_connection_string(&s).unwrap();
+            assert!(!warn);
+            assert_eq!(p.ip_address_preference.as_deref(), Some(val));
+        }
+        let err = parse_connection_string("Server=h;IpAddressPreference=IPv7;UID=u").unwrap_err();
+        assert_eq!(err.key, "ipaddresspreference");
+    }
+
+    #[test]
+    fn integer_keys_parse_and_reject_non_numeric() {
+        let (p, warn) = parse_connection_string(
+            "Server=h;ConnectRetryCount=3;ConnectRetryInterval=20;KeepAlive=45;KeepAliveInterval=7;PacketSize=8192;UID=u",
+        )
+        .unwrap();
+        assert!(!warn);
+        assert_eq!(p.connect_retry_count, Some(3));
+        assert_eq!(p.connect_retry_interval, Some(20));
+        assert_eq!(p.keep_alive, Some(45));
+        assert_eq!(p.keep_alive_interval, Some(7));
+        assert_eq!(p.packet_size, Some(8192));
+
+        for key in [
+            "ConnectRetryCount",
+            "ConnectRetryInterval",
+            "KeepAlive",
+            "KeepAliveInterval",
+            "PacketSize",
+        ] {
+            let s = format!("Server=h;{key}=lots;UID=u");
+            let err = parse_connection_string(&s).unwrap_err();
+            assert_eq!(err.key, key.to_ascii_lowercase(), "key {key}");
+            assert_eq!(err.value, "lots");
+        }
+    }
+
+    #[test]
+    fn integer_keys_reject_negative_values() {
+        let err = parse_connection_string("Server=h;ConnectRetryCount=-1;UID=u").unwrap_err();
+        assert_eq!(err.key, "connectretrycount");
+        assert_eq!(err.value, "-1");
+    }
+
+    #[test]
+    fn new_keys_are_case_insensitive() {
+        let (p, warn) =
+            parse_connection_string("server=h;APPLICATIONINTENT=ReadOnly;packetsize=512;UID=u")
+                .unwrap();
+        assert!(!warn);
+        assert_eq!(p.application_intent.as_deref(), Some("ReadOnly"));
+        assert_eq!(p.packet_size, Some(512));
+    }
+
+    #[test]
+    fn new_key_first_occurrence_wins() {
+        let (p, warn) =
+            parse_connection_string("Server=h;PacketSize=512;PacketSize=1024;UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.packet_size, Some(512));
+    }
+
+    #[test]
+    fn fmt_as_odbc_conn_str_includes_new_keys() {
+        let (p, _) = parse_connection_string(
+            "Server=h;ApplicationIntent=ReadOnly;MultiSubnetFailover=yes;ConnectRetryCount=2;ConnectRetryInterval=10;KeepAlive=30;KeepAliveInterval=1;PacketSize=4096;IpAddressPreference=IPv4First;ServerSPN=svc;HostnameInCertificate=cn;ServerCertificate=/tmp/c.pem;UID=u",
+        )
+        .unwrap();
+        let out = p.fmt_as_odbc_conn_str();
+        for expected in [
+            "ApplicationIntent=ReadOnly",
+            "MultiSubnetFailover=yes",
+            "ConnectRetryCount=2",
+            "ConnectRetryInterval=10",
+            "KeepAlive=30",
+            "KeepAliveInterval=1",
+            "PacketSize=4096",
+            "IpAddressPreference=IPv4First",
+            "ServerSPN=svc",
+            "HostnameInCertificate=cn",
+            "ServerCertificate=/tmp/c.pem",
+        ] {
+            assert!(out.contains(expected), "missing {expected} in {out}");
+        }
+    }
+
+    #[test]
+    fn fmt_as_odbc_conn_str_quotes_values_with_delimiters() {
+        let (p, _) = parse_connection_string("Server=h;Database={my;db};UID=u").unwrap();
+        assert_eq!(p.database, "my;db");
+        let out = p.fmt_as_odbc_conn_str();
+        // The `;` in the value would otherwise split the logged pair into two.
+        assert!(
+            out.contains("Database={my;db}"),
+            "delimiter value not brace-quoted in {out}"
+        );
+    }
+
+    #[test]
+    fn quote_odbc_value_wraps_and_escapes() {
+        assert_eq!(quote_odbc_value("plain"), "plain");
+        assert_eq!(quote_odbc_value("a;b"), "{a;b}");
+        assert_eq!(quote_odbc_value("a}b"), "{a}}b}");
+        assert_eq!(quote_odbc_value("k=v"), "{k=v}");
     }
 
     #[test]
