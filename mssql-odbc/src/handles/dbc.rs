@@ -63,6 +63,9 @@ pub(crate) struct DbcState {
     /// Pre-connect access token set via `SQL_COPT_SS_ACCESS_TOKEN`.
     /// Consumed by `SQLDriverConnect` to select `AccessToken` authentication.
     pub(crate) access_token: Option<String>,
+    /// Login timeout in seconds set via `SQL_ATTR_LOGIN_TIMEOUT`. Applied to the
+    /// TDS login deadline at connect time. `Some(0)` means wait indefinitely.
+    pub(crate) login_timeout: Option<u32>,
 }
 
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
@@ -79,6 +82,7 @@ impl std::fmt::Debug for DbcState {
                 "access_token",
                 &self.access_token.as_ref().map(|_| "<REDACTED>"),
             )
+            .field("login_timeout", &self.login_timeout)
             .finish()
     }
 }
@@ -105,6 +109,7 @@ impl DbcHandle {
                 active_stmt: None,
                 client: None,
                 access_token: None,
+                login_timeout: None,
             }),
         }
     }

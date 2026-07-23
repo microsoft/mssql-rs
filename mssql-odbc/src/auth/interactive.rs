@@ -62,14 +62,13 @@ const PUBLIC_CLIENT_ID: &str = "a94f9c62-97fe-4d19-b06d-472bed8d2bcb";
 /// How long to wait for the user to finish signing in before giving up.
 const REDIRECT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Login-connect budget applied to interactive connections via
-/// `ClientContext.connect_timeout`. That single value bounds both the outer
-/// login deadline and each TCP-connect attempt, so it must comfortably exceed
-/// [`REDIRECT_TIMEOUT`]: the browser round-trip stays bounded while a normal
-/// reachable server still connects in milliseconds. Mirrors SqlClient's
-/// enlarged Connect Timeout for interactive auth. Splitting this into a separate
-/// login timeout (`SQL_ATTR_LOGIN_TIMEOUT`) is a planned follow-up.
-pub(super) const CONNECT_TIMEOUT_SECS: u32 = 330;
+/// Default overall login deadline for interactive connections, installed via
+/// `ClientContext.login_timeout` when the application has not set its own
+/// `SQL_ATTR_LOGIN_TIMEOUT`. It must comfortably exceed [`REDIRECT_TIMEOUT`] so
+/// the browser round-trip fits, while the separate (default) `connect_timeout`
+/// keeps bounding each TCP-connect attempt — an unreachable server still fails
+/// fast. Mirrors msodbcsql's separate login vs. connection timeouts.
+pub(super) const LOGIN_TIMEOUT_SECS: u32 = 330;
 
 /// Number of random bytes for the PKCE verifier and the `state` value; 32 bytes
 /// base64url-encode to a 43-character string (within the 43–128 PKCE range).

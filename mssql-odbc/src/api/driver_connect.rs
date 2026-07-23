@@ -252,6 +252,13 @@ fn do_connect(
     let mut context = ClientContext::default();
     context.database = params.database.clone();
 
+    // Apply an app-set SQL_ATTR_LOGIN_TIMEOUT before configuring auth so an
+    // explicit login timeout takes precedence over any method-specific default
+    // (e.g. the larger default the interactive browser flow installs).
+    if let Some(secs) = state.login_timeout {
+        context.login_timeout = Some(secs);
+    }
+
     if let Err(method) = configure_auth(&mut context, resolved) {
         error!(
             ?method,

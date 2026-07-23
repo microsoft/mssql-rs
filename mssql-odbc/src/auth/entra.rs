@@ -35,7 +35,7 @@ use azure_identity::{
 use tokio::sync::OnceCell;
 use url::{Position, Url};
 
-use super::interactive::{CONNECT_TIMEOUT_SECS, InteractiveTokenFactory};
+use super::interactive::{InteractiveTokenFactory, LOGIN_TIMEOUT_SECS};
 use crate::connection::odbc_authentication_transformer::TransformedAuth;
 use mssql_tds::connection::client_context::{
     ClientContext, EntraIdTokenFactory, TdsAuthenticationMethod,
@@ -254,12 +254,15 @@ pub(crate) fn configure_auth(
                 Box::new(factory),
             );
             // The browser sign-in (with MFA) can take minutes, far longer than
-            // the default 15s. `connect_timeout` bounds both the outer login
-            // deadline and each TCP-connect attempt, so it must stay non-zero
-            // (zero fails the TCP connect immediately); raise it to cover the
-            // interactive flow. Mirrors SqlClient's enlarged Connect Timeout for
-            // interactive auth. See AB#46067.
-            context.connect_timeout = CONNECT_TIMEOUT_SECS;
+            // the default 15s login deadline. Raise the overall login timeout
+            // while leaving `connect_timeout` (the per-TCP-connect cap) at its
+            // default, so an unreachable server still fails fast. An app-set
+            // SQL_ATTR_LOGIN_TIMEOUT (already applied to the context) takes
+            // precedence. Mirrors msodbcsql's separate login vs. connection
+            // timeouts. See AB#46067.
+            if context.login_timeout.is_none() {
+                context.login_timeout = Some(LOGIN_TIMEOUT_SECS);
+            }
         }
         other => return Err(other),
     }
@@ -453,10 +456,27 @@ mod tests {
             ctx.tds_authentication_method,
             TdsAuthenticationMethod::ActiveDirectoryInteractive
         );
-        // Interactive raises the login-connect budget (never zero, which would
-        // fail the TCP connect) so the browser/MFA flow has time to complete.
-        assert_eq!(ctx.connect_timeout, CONNECT_TIMEOUT_SECS);
-        assert!(ctx.connect_timeout > 15);
+        // Interactive raises the overall login deadline so the browser/MFA flow
+        // has time to complete, while leaving the per-TCP-connect cap
+        // (`connect_timeout`) at its default so an unreachable server fails fast.
+        assert_eq!(ctx.login_timeout, Some(LOGIN_TIMEOUT_SECS));
+        const { assert!(LOGIN_TIMEOUT_SECS > 15) };
+        assert_eq!(ctx.connect_timeout, 15);
+    }
+
+    #[test]
+    fn configure_auth_interactive_preserves_app_login_timeout() {
+        // An app-set SQL_ATTR_LOGIN_TIMEOUT (applied to the context before auth
+        // config) must win over the interactive default.
+        let mut ctx = ClientContext::default();
+        ctx.login_timeout = Some(60);
+        let r = transformed(
+            TdsAuthenticationMethod::ActiveDirectoryInteractive,
+            "user@contoso.com",
+            "",
+        );
+        assert!(configure_auth(&mut ctx, r).is_ok());
+        assert_eq!(ctx.login_timeout, Some(60));
     }
 
     #[test]

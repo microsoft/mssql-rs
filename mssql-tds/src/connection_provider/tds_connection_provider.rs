@@ -269,8 +269,16 @@ impl TdsConnectionProvider {
 
             let connect_retry_count = context.connect_retry_count;
             let connect_retry_interval = Duration::from_secs(context.connect_retry_interval.into());
-            let deadline = match context.connect_timeout {
-                1.. => Some(Instant::now() + Duration::from_secs(context.connect_timeout.into())),
+            // The outer login deadline bounds the whole connect (network + TDS
+            // handshake + auth token acquisition). It uses `login_timeout` when
+            // set, else falls back to `connect_timeout` so callers that only set
+            // the historical single knob keep the same behavior. `0` (either
+            // field) means "no deadline". `connect_timeout` still bounds each
+            // individual TCP-connect attempt, so an unreachable host fails fast
+            // even when the login deadline is large (e.g. interactive sign-in).
+            let login_timeout = context.login_timeout.unwrap_or(context.connect_timeout);
+            let deadline = match login_timeout {
+                1.. => Some(Instant::now() + Duration::from_secs(login_timeout.into())),
                 _ => None,
             };
 
