@@ -155,11 +155,11 @@ synonym group (e.g. `Server` / `Addr` / `Address`).
 | `ApplicationIntent` | `ClientContext::application_intent` | `ReadOnly` / `ReadWrite` |
 | `MultiSubnetFailover` | `ClientContext::multi_subnet_failover` | `Yes` / `No` |
 | `IpAddressPreference` | `ClientContext::ipaddress_preference` | `IPv4First` / `IPv6First` / `UsePlatformDefault` |
-| `ConnectRetryCount` | `ClientContext::connect_retry_count` | integer |
-| `ConnectRetryInterval` | `ClientContext::connect_retry_interval` | integer |
-| `KeepAlive` | `ClientContext::keep_alive_in_ms` (×1000) | integer, seconds |
-| `KeepAliveInterval` | `ClientContext::keep_alive_interval_in_ms` (×1000) | integer, seconds |
-| `PacketSize` | `ClientContext::packet_size` (u16) | integer, bytes |
+| `ConnectRetryCount` | `ClientContext::connect_retry_count` | integer, clamped to 0–255 |
+| `ConnectRetryInterval` | `ClientContext::connect_retry_interval` | integer, clamped to 1–60 (seconds) |
+| `KeepAlive` | `ClientContext::keep_alive_in_ms` (×1000) | integer, seconds (saturating) |
+| `KeepAliveInterval` | `ClientContext::keep_alive_interval_in_ms` (×1000) | integer, seconds (saturating) |
+| `PacketSize` | `ClientContext::packet_size` (u16) | integer bytes, clamped to 512–32768 |
 
 This mirrors the canonical keyword set that mssql-python normalizes to before it
 hands the string to the driver, so a mssql-python application can target mssql-odbc
@@ -175,10 +175,14 @@ Whole-value, case-insensitive, exact match (not prefix, not `y`/`1`):
 - **`ApplicationIntent`**: `ReadOnly` | `ReadWrite`.
 - **`IpAddressPreference`**: `IPv4First` | `IPv6First` | `UsePlatformDefault`.
 - **Integer** keys (`ConnectRetryCount`, `ConnectRetryInterval`, `KeepAlive`,
-  `KeepAliveInterval`, `PacketSize`): a non-negative integer. Documented ranges are
-  **not** enforced at parse time — out-of-range clamping is left to mssql-tds so the
-  parser cannot diverge from the native driver. A non-numeric or negative value is a
-  hard error (`E_FAIL`).
+  `KeepAliveInterval`, `PacketSize`): a non-negative integer. The parser accepts any
+  `u32` and does **not** range-check; a non-numeric or negative value is a hard error
+  (`E_FAIL`). Out-of-range values are clamped when mapped onto the `ClientContext`
+  (`apply_connection_params` in `driver_connect.rs`) — `ConnectRetryCount` to 0–255,
+  `ConnectRetryInterval` to 1–60, `PacketSize` to 512–32768 (the range mssql-tds
+  accepts), and `KeepAlive`/`KeepAliveInterval` saturate on the ×1000 conversion.
+  Clamping mirrors msodbcsql, which silently clamps rather than rejecting, and keeps
+  the downstream `connect_retry_count + 1` in mssql-tds from overflowing.
 - **`Authentication`**: delegated to `is_recognized_keyword`
   (`odbc_supported_auth_keywords.rs`) so the accept/reject set never drifts from
   mssql-tds. An empty value is a recognized reset.

@@ -212,13 +212,13 @@ impl ConnectionParams {
         let mut parts = Vec::new();
 
         if !self.server.is_empty() {
-            parts.push(format!("Server={}", self.server));
+            parts.push(format!("Server={}", quote_odbc_value(&self.server)));
         }
         if !self.database.is_empty() {
-            parts.push(format!("Database={}", self.database));
+            parts.push(format!("Database={}", quote_odbc_value(&self.database)));
         }
         if !self.uid.is_empty() {
-            parts.push(format!("UID={}", self.uid));
+            parts.push(format!("UID={}", quote_odbc_value(&self.uid)));
         }
         if !self.pwd.is_empty() {
             parts.push("PWD=******".to_string());
@@ -239,7 +239,7 @@ impl ConnectionParams {
             ));
         }
         if let Some(server_spn) = &self.server_spn {
-            parts.push(format!("ServerSPN={server_spn}"));
+            parts.push(format!("ServerSPN={}", quote_odbc_value(server_spn)));
         }
         if let Some(application_intent) = &self.application_intent {
             parts.push(format!("ApplicationIntent={application_intent}"));
@@ -269,13 +269,32 @@ impl ConnectionParams {
             parts.push(format!("PacketSize={packet_size}"));
         }
         if let Some(host_name_in_certificate) = &self.host_name_in_certificate {
-            parts.push(format!("HostnameInCertificate={host_name_in_certificate}"));
+            parts.push(format!(
+                "HostnameInCertificate={}",
+                quote_odbc_value(host_name_in_certificate)
+            ));
         }
         if let Some(server_certificate) = &self.server_certificate {
-            parts.push(format!("ServerCertificate={server_certificate}"));
+            parts.push(format!(
+                "ServerCertificate={}",
+                quote_odbc_value(server_certificate)
+            ));
         }
 
         parts.join(";")
+    }
+}
+
+/// Quote a free-form value for the redacted ODBC connection-string rendering used
+/// in diagnostic logs. Values containing a delimiter (`;`), brace, or `=` are
+/// wrapped in braces with any inner `}` doubled — matching the parser's
+/// brace-quoting rules — so the logged string stays unambiguous. Ordinary values
+/// are returned unchanged.
+fn quote_odbc_value(value: &str) -> String {
+    if value.contains([';', '{', '}', '=']) {
+        format!("{{{}}}", value.replace('}', "}}"))
+    } else {
+        value.to_string()
     }
 }
 
@@ -653,9 +672,10 @@ fn is_yes(value: &str) -> bool {
 }
 
 /// Parse a non-negative integer attribute value. Rejects non-numeric or negative
-/// input with `InvalidAttrValue` (msodbcsql `E_FAIL`). Documented per-key ranges
-/// (e.g. PacketSize 512–32767) are intentionally not enforced here; range handling
-/// is left to mssql-tds so the parser does not diverge from the native driver.
+/// input with `InvalidAttrValue` (msodbcsql `E_FAIL`). Per-key ranges (e.g.
+/// PacketSize 512–32768) are not enforced here — the driver clamps out-of-range
+/// values to the range mssql-tds accepts when mapping onto the client context
+/// (see `apply_connection_params`), matching msodbcsql's clamping behavior.
 fn parse_uint(key: &str, value: &str) -> Result<u32, InvalidAttrValue> {
     value.parse::<u32>().map_err(|_| InvalidAttrValue {
         key: key.to_string(),
@@ -1350,6 +1370,26 @@ mod tests {
         ] {
             assert!(out.contains(expected), "missing {expected} in {out}");
         }
+    }
+
+    #[test]
+    fn fmt_as_odbc_conn_str_quotes_values_with_delimiters() {
+        let (p, _) = parse_connection_string("Server=h;Database={my;db};UID=u").unwrap();
+        assert_eq!(p.database, "my;db");
+        let out = p.fmt_as_odbc_conn_str();
+        // The `;` in the value would otherwise split the logged pair into two.
+        assert!(
+            out.contains("Database={my;db}"),
+            "delimiter value not brace-quoted in {out}"
+        );
+    }
+
+    #[test]
+    fn quote_odbc_value_wraps_and_escapes() {
+        assert_eq!(quote_odbc_value("plain"), "plain");
+        assert_eq!(quote_odbc_value("a;b"), "{a;b}");
+        assert_eq!(quote_odbc_value("a}b"), "{a}}b}");
+        assert_eq!(quote_odbc_value("k=v"), "{k=v}");
     }
 
     #[test]

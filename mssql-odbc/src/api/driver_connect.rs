@@ -30,7 +30,7 @@ use super::util::read_utf16;
 use crate::auth::configure_auth;
 use crate::connection::odbc_authentication_transformer::transform_auth;
 use crate::connection::odbc_authentication_validator::validate_auth;
-use crate::connection::parse_connection_string;
+use crate::connection::{ConnectionParams, parse_connection_string};
 
 /// Implementation of `SQLDriverConnectW`.
 ///
@@ -280,52 +280,11 @@ fn do_connect(
             Some(e) if e.eq_ignore_ascii_case("strict") => EncryptionSetting::Strict,
             _ => EncryptionSetting::On, // ODBC default
         },
-        host_name_in_cert: params.host_name_in_certificate.clone(),
-        server_certificate: params.server_certificate.as_deref().map(PathBuf::from),
+        host_name_in_cert: None,
+        server_certificate: None,
     };
 
-    // Transport, routing, and TLS-identity options. Values were validated during
-    // parsing, so the enum mappings below fall through to their default variant.
-    if let Some(server_spn) = &params.server_spn {
-        context.server_spn = Some(server_spn.clone());
-    }
-    if let Some(intent) = &params.application_intent {
-        context.application_intent = if intent.eq_ignore_ascii_case("readonly") {
-            ApplicationIntent::ReadOnly
-        } else {
-            ApplicationIntent::ReadWrite
-        };
-    }
-    if let Some(multi_subnet_failover) = params.multi_subnet_failover {
-        context.multi_subnet_failover = multi_subnet_failover;
-    }
-    if let Some(count) = params.connect_retry_count {
-        context.connect_retry_count = count;
-    }
-    if let Some(interval) = params.connect_retry_interval {
-        context.connect_retry_interval = interval;
-    }
-    // ODBC expresses KeepAlive/KeepAliveInterval in seconds; mssql-tds stores
-    // milliseconds. Saturate so an out-of-range value can't overflow.
-    if let Some(secs) = params.keep_alive {
-        context.keep_alive_in_ms = secs.saturating_mul(1000);
-    }
-    if let Some(secs) = params.keep_alive_interval {
-        context.keep_alive_interval_in_ms = secs.saturating_mul(1000);
-    }
-    if let Some(pref) = &params.ip_address_preference {
-        context.ipaddress_preference = if pref.eq_ignore_ascii_case("ipv6first") {
-            IPAddressPreference::IPv6First
-        } else if pref.eq_ignore_ascii_case("useplatformdefault") {
-            IPAddressPreference::UsePlatformDefault
-        } else {
-            IPAddressPreference::IPv4First
-        };
-    }
-    // Parsed leniently as u32; mssql-tds owns range clamping (valid 512–32768).
-    if let Some(size) = params.packet_size {
-        context.packet_size = u16::try_from(size).unwrap_or(u16::MAX);
-    }
+    apply_connection_params(&mut context, &params);
 
     // Connect via mssql-tds (lock is NOT held - the 'Connecting' state prevents races)
     let provider = TdsConnectionProvider::new();
@@ -373,6 +332,69 @@ fn do_connect(
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
+    }
+}
+
+/// `ConnectRetryCount` is valid over 0–255; clamping keeps the downstream
+/// `connect_retry_count + 1` in `mssql-tds` from overflowing.
+const MAX_CONNECT_RETRY_COUNT: u32 = 255;
+/// `ConnectRetryInterval` is valid over 1–60 seconds.
+const MIN_CONNECT_RETRY_INTERVAL: u32 = 1;
+const MAX_CONNECT_RETRY_INTERVAL: u32 = 60;
+/// TDS packet-size range accepted by `mssql-tds` (`DefaultClientContextValidator`).
+const MIN_PACKET_SIZE: u32 = 512;
+const MAX_PACKET_SIZE: u32 = 32768;
+
+/// Maps parsed [`ConnectionParams`] onto a [`ClientContext`]. Integer values are
+/// clamped to the ranges `mssql-tds` accepts — mirroring msodbcsql, which clamps
+/// out-of-range values rather than rejecting them — and enum strings (already
+/// validated during parsing) fall through to their default variant. Kept separate
+/// from `do_connect` so the mapping is unit-testable without a live server.
+fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParams) {
+    context.encryption_options.host_name_in_cert = params.host_name_in_certificate.clone();
+    context.encryption_options.server_certificate =
+        params.server_certificate.as_deref().map(PathBuf::from);
+
+    if let Some(server_spn) = &params.server_spn {
+        context.server_spn = Some(server_spn.clone());
+    }
+    if let Some(intent) = &params.application_intent {
+        context.application_intent = if intent.eq_ignore_ascii_case("readonly") {
+            ApplicationIntent::ReadOnly
+        } else {
+            ApplicationIntent::ReadWrite
+        };
+    }
+    if let Some(multi_subnet_failover) = params.multi_subnet_failover {
+        context.multi_subnet_failover = multi_subnet_failover;
+    }
+    if let Some(count) = params.connect_retry_count {
+        context.connect_retry_count = count.min(MAX_CONNECT_RETRY_COUNT);
+    }
+    if let Some(interval) = params.connect_retry_interval {
+        context.connect_retry_interval =
+            interval.clamp(MIN_CONNECT_RETRY_INTERVAL, MAX_CONNECT_RETRY_INTERVAL);
+    }
+    // ODBC expresses KeepAlive/KeepAliveInterval in seconds; mssql-tds stores
+    // milliseconds. Saturate so a large value can't overflow.
+    if let Some(secs) = params.keep_alive {
+        context.keep_alive_in_ms = secs.saturating_mul(1000);
+    }
+    if let Some(secs) = params.keep_alive_interval {
+        context.keep_alive_interval_in_ms = secs.saturating_mul(1000);
+    }
+    if let Some(pref) = &params.ip_address_preference {
+        context.ipaddress_preference = if pref.eq_ignore_ascii_case("ipv6first") {
+            IPAddressPreference::IPv6First
+        } else if pref.eq_ignore_ascii_case("useplatformdefault") {
+            IPAddressPreference::UsePlatformDefault
+        } else {
+            IPAddressPreference::IPv4First
+        };
+    }
+    if let Some(size) = params.packet_size {
+        context.packet_size =
+            u16::try_from(size.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE)).unwrap_or(u16::MAX);
     }
 }
 
@@ -620,5 +642,133 @@ mod tests {
                 "mode {mode} should post HY110"
             );
         }
+    }
+
+    #[test]
+    fn apply_params_maps_tls_identity_fields() {
+        let mut ctx = ClientContext::default();
+        let params = ConnectionParams {
+            host_name_in_certificate: Some("cn.contoso.com".to_string()),
+            server_certificate: Some("/etc/ssl/server.pem".to_string()),
+            ..Default::default()
+        };
+        apply_connection_params(&mut ctx, &params);
+        assert_eq!(
+            ctx.encryption_options.host_name_in_cert.as_deref(),
+            Some("cn.contoso.com")
+        );
+        assert_eq!(
+            ctx.encryption_options.server_certificate,
+            Some(PathBuf::from("/etc/ssl/server.pem"))
+        );
+    }
+
+    #[test]
+    fn apply_params_clamps_connect_retry_count() {
+        let mut ctx = ClientContext::default();
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                connect_retry_count: Some(u32::MAX),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.connect_retry_count, MAX_CONNECT_RETRY_COUNT);
+        // The downstream `connect_retry_count + 1` in mssql-tds must not overflow.
+        assert!(ctx.connect_retry_count.checked_add(1).is_some());
+    }
+
+    #[test]
+    fn apply_params_clamps_connect_retry_interval() {
+        let mut ctx = ClientContext::default();
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                connect_retry_interval: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.connect_retry_interval, MIN_CONNECT_RETRY_INTERVAL);
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                connect_retry_interval: Some(9_999),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.connect_retry_interval, MAX_CONNECT_RETRY_INTERVAL);
+    }
+
+    #[test]
+    fn apply_params_clamps_packet_size_to_tds_range() {
+        let mut ctx = ClientContext::default();
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                packet_size: Some(100),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.packet_size, 512);
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                packet_size: Some(70_000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.packet_size, 32768);
+    }
+
+    #[test]
+    fn apply_params_maps_keepalive_seconds_to_millis() {
+        let mut ctx = ClientContext::default();
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                keep_alive: Some(30),
+                keep_alive_interval: Some(5),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.keep_alive_in_ms, 30_000);
+        assert_eq!(ctx.keep_alive_interval_in_ms, 5_000);
+    }
+
+    #[test]
+    fn apply_params_maps_validated_enums() {
+        let mut ctx = ClientContext::default();
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                application_intent: Some("ReadOnly".to_string()),
+                ip_address_preference: Some("IPv6First".to_string()),
+                multi_subnet_failover: Some(true),
+                server_spn: Some("MSSQLSvc/host:1433".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            ctx.application_intent,
+            ApplicationIntent::ReadOnly
+        ));
+        assert!(matches!(
+            ctx.ipaddress_preference,
+            IPAddressPreference::IPv6First
+        ));
+        assert!(ctx.multi_subnet_failover);
+        assert_eq!(ctx.server_spn.as_deref(), Some("MSSQLSvc/host:1433"));
+    }
+
+    #[test]
+    fn apply_params_leaves_unset_fields_at_defaults() {
+        let mut ctx = ClientContext::default();
+        let before_packet = ctx.packet_size;
+        let before_retry = ctx.connect_retry_count;
+        apply_connection_params(&mut ctx, &ConnectionParams::default());
+        assert_eq!(ctx.packet_size, before_packet);
+        assert_eq!(ctx.connect_retry_count, before_retry);
+        assert_eq!(ctx.encryption_options.host_name_in_cert, None);
+        assert_eq!(ctx.encryption_options.server_certificate, None);
     }
 }
