@@ -135,6 +135,20 @@ impl TdsConnectionProvider {
             let mut exec_context = ExecutionContext::new();
             let mut cache_key: Option<(String, String)> = None;
 
+            // Compute the overall login deadline up front so it bounds every
+            // phase of login — the shared-memory shortcut below, SSRP/LocalDB
+            // resolution, and the connect/retry loop — not just the final
+            // transport attempts. `login_timeout` falls back to `connect_timeout`
+            // for callers that only set the historical single knob; `0` means
+            // "no deadline". `connect_timeout` still bounds each individual
+            // TCP-connect attempt, so an unreachable host fails fast even when
+            // the login budget is large (e.g. interactive sign-in).
+            let login_timeout = context.login_timeout.unwrap_or(context.connect_timeout);
+            let deadline = match login_timeout {
+                1.. => Some(Instant::now() + Duration::from_secs(login_timeout.into())),
+                _ => None,
+            };
+
             // Try Shared Memory before SSRP for local named instances (Windows only).
             // SM doesn't need instance resolution — it uses the name directly.
             // If SM succeeds, we skip SSRP entirely. This matches ODBC/SNI behavior.
@@ -143,10 +157,12 @@ impl TdsConnectionProvider {
                 && let Some(sm_transport) = action_chain.first_shared_memory_transport()
             {
                 debug!("Trying Shared Memory before SSRP");
-                let timeout_duration = match context.connect_timeout {
-                    1.. => Some(Duration::from_secs(context.connect_timeout.into())),
-                    _ => None,
-                };
+                // Bound the shared-memory attempt (which wraps the full TDS/auth
+                // handshake) by the remaining login budget rather than
+                // `connect_timeout`, so interactive sign-in against a local named
+                // instance isn't cancelled after the default 15s.
+                let timeout_duration =
+                    deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
                 let connect_future =
                     Self::connect_with_transport_context(context, &sm_transport, None);
                 let sm_result = match timeout_duration.as_ref() {
@@ -269,18 +285,6 @@ impl TdsConnectionProvider {
 
             let connect_retry_count = context.connect_retry_count;
             let connect_retry_interval = Duration::from_secs(context.connect_retry_interval.into());
-            // The outer login deadline bounds the whole connect (network + TDS
-            // handshake + auth token acquisition). It uses `login_timeout` when
-            // set, else falls back to `connect_timeout` so callers that only set
-            // the historical single knob keep the same behavior. `0` (either
-            // field) means "no deadline". `connect_timeout` still bounds each
-            // individual TCP-connect attempt, so an unreachable host fails fast
-            // even when the login deadline is large (e.g. interactive sign-in).
-            let login_timeout = context.login_timeout.unwrap_or(context.connect_timeout);
-            let deadline = match login_timeout {
-                1.. => Some(Instant::now() + Duration::from_secs(login_timeout.into())),
-                _ => None,
-            };
 
             let cancellation_token = cancel_handle.map(|handle| handle.cancel_token.child_token());
 

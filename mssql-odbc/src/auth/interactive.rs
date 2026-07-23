@@ -232,7 +232,16 @@ async fn acquire_interactive_token(
     })?;
 
     info!("launching browser for interactive Entra sign-in");
-    debug!(%authorize_url, "interactive authorize URL");
+    // Log only the endpoint components. The query string carries the CSRF
+    // `state`, PKCE `challenge`, and the user's `login_hint`; keeping it out of
+    // the logs avoids persisting account-identifying data and prevents anyone
+    // with debug-log access from replaying `state` against the local callback.
+    debug!(
+        scheme = authorize_url.scheme(),
+        host = authorize_url.host_str().unwrap_or("?"),
+        path = authorize_url.path(),
+        "built interactive authorize URL (query redacted)"
+    );
     open_browser(authorize_url.as_str()).map_err(|e| {
         Error::ConnectionError(format!(
             "failed to launch a browser for interactive sign-in: {e}"
