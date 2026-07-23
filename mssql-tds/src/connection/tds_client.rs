@@ -1036,10 +1036,9 @@ impl TdsClient {
     ///
     /// Sends an `sp_executesql`-style RPC request for the named procedure.
     /// Parameters can be supplied positionally, by name, or both. If the
-    /// procedure returns result sets, iterate rows with
-    /// [`move_to_next()`](Self::move_to_next) and
-    /// [`column_value()`](Self::column_value). After all result sets are
-    /// consumed, retrieve output parameters with
+    /// procedure returns result sets, read the rows of each and move between
+    /// result sets with [`advance_to_rows()`](Self::advance_to_rows). After all
+    /// result sets are consumed, retrieve output parameters with
     /// [`get_return_values()`](Self::get_return_values).
     ///
     /// Only one batch may be active at a time — calling this while a previous
@@ -2867,7 +2866,7 @@ impl TdsClient {
     ///
     /// Values accumulate as the token stream is read; call this after the
     /// result set is fully consumed (e.g. after [`close_query()`](Self::close_query)
-    /// or after [`move_to_next()`](Self::move_to_next) returns `false`).
+    /// or after [`advance_to_rows()`](Self::advance_to_rows) returns `false`).
     pub fn get_return_values(&self) -> Vec<ReturnValue> {
         self.return_values.clone()
     }
@@ -3802,7 +3801,7 @@ mod tests {
     }
 
     /// Regression test for a hang: after positioning on the batch's final row
-    /// set, calling `move_to_next_statement` without reading its rows must drain
+    /// set, calling `advance` without reading its rows must drain
     /// them, observe the terminal DONE (which closes the batch), and return
     /// `End` — instead of issuing another token read that would block forever on
     /// an already-finished batch. The whole exchange is bounded by a timeout so a

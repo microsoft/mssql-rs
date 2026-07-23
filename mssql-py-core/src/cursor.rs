@@ -4,7 +4,7 @@
 use mssql_tds::connection::bulk_copy::{
     BulkCopy, ColumnMapping as TdsColumnMapping, ColumnMappingSource,
 };
-use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, TdsClient};
+use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementResult, TdsClient};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use pyo3::prelude::*;
@@ -61,7 +61,7 @@ impl PyCoreCursor {
                 }
 
                 // Execute with 30 second timeout
-                client
+                let first = client
                     .execute(
                         query,
                         ExecuteOptions {
@@ -77,6 +77,21 @@ impl PyCoreCursor {
                             e
                         ))
                     })?;
+
+                // The unified execute stops on the first statement boundary,
+                // which may be a no-row statement (e.g. a leading DDL/DML in a
+                // multi-statement batch). This cursor exposes the first
+                // row-returning result set, so collapse forward to it — matching
+                // the pre-statement-wise behavior fetchone/fetchall expect.
+                if !matches!(first, StatementResult::Rows) {
+                    client.advance_to_rows().await.map_err(|e| {
+                        error!("execute: Failed to advance to first result set: {}", e);
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Query execution failed: {}",
+                            e
+                        ))
+                    })?;
+                }
 
                 info!("execute: Query executed successfully");
                 Ok::<_, PyErr>(())

@@ -147,8 +147,8 @@ impl TdsTransport for TokenReplayTransport {
 
 /// Builds a [`TdsClient`] whose transport replays `tokens`. Combine with the
 /// public statement-wise navigation API
-/// ([`TdsClient::execute_multi_statement`](crate::connection::tds_client::TdsClient::execute_multi_statement)
-/// / [`move_to_next_statement`](crate::connection::tds_client::TdsClient::move_to_next_statement))
+/// ([`TdsClient::execute`](crate::connection::tds_client::TdsClient::execute)
+/// / [`advance`](crate::connection::tds_client::TdsClient::advance))
 /// to position the client on a scripted result before handing it to a
 /// consumer under test.
 pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {

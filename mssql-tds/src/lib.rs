@@ -31,7 +31,7 @@
 //!
 //! ```rust,no_run
 //! use mssql_tds::connection::client_context::ClientContext;
-//! use mssql_tds::connection::tds_client::ResultSetClient;
+//! use mssql_tds::connection::tds_client::ResultSet;
 //! use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 //! use mssql_tds::core::TdsResult;
 //!
@@ -47,12 +47,10 @@
 //!         .create_client(context, "tcp:localhost,1433", None)
 //!         .await?;
 //!
-//!     client
-//!         .execute("SELECT 1 AS value".into(), None, None)
-//!         .await?;
+//!     client.execute("SELECT 1 AS value".into(), ()).await?;
 //!
-//!     if let Some(rs) = client.get_current_resultset() {
-//!         while let Some(row) = rs.next_row().await? {
+//!     if client.on_rows() {
+//!         while let Some(row) = client.next_row().await? {
 //!             println!("{row:?}");
 //!         }
 //!     }

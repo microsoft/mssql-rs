@@ -72,13 +72,19 @@ impl Connection {
     #[napi]
     pub async fn execute(&self, query: String) -> napi::Result<()> {
         let mut client = self.tds_client.lock().await;
-        let result = client.execute(query, ()).await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => Err(napi::Error::from_reason(format!(
-                "Failed to execute query: {e}"
-            ))),
+        let first = client
+            .execute(query, ())
+            .await
+            .map_err(|e| napi::Error::from_reason(format!("Failed to execute query: {e}")))?;
+        // Collapse to the first row-returning result set so `fetch_chunk` sees
+        // it, as `query_raw` does. The unified execute stops on the first
+        // statement boundary, which may be a no-row statement.
+        if !matches!(first, StatementResult::Rows) {
+            client.advance_to_rows().await.map_err(|e| {
+                napi::Error::from_reason(format!("Failed to advance to first result set: {e}"))
+            })?;
         }
+        Ok(())
     }
 
     #[napi]
@@ -110,14 +116,21 @@ impl Connection {
             .collect();
 
         let rpc_params = rpc_params?;
-        let result = client.execute_sp_executesql(query, rpc_params, ()).await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => Err(napi::Error::from_reason(format!(
-                "Failed to execute query with parameters: {e}"
-            ))),
+        let first = client
+            .execute_sp_executesql(query, rpc_params, ())
+            .await
+            .map_err(|e| {
+                napi::Error::from_reason(format!("Failed to execute query with parameters: {e}"))
+            })?;
+        // Collapse to the first row-returning result set (as `query_raw` does)
+        // so the subsequent `fetch_chunk` in `createResultFast` sees it; a
+        // leading DML count would otherwise leave the client off `on_rows`.
+        if !matches!(first, StatementResult::Rows) {
+            client.advance_to_rows().await.map_err(|e| {
+                napi::Error::from_reason(format!("Failed to advance to first result set: {e}"))
+            })?;
         }
+        Ok(())
     }
 
     /// Executes a stored procedure with named parameters.
@@ -152,16 +165,18 @@ impl Connection {
 
         let named_params = named_params?;
 
-        let result = client
+        let first = client
             .execute_stored_procedure(stored_proc_name, None, Some(named_params), ())
-            .await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => Err(napi::Error::from_reason(format!(
-                "Failed to execute stored proc: {e}"
-            ))),
+            .await
+            .map_err(|e| napi::Error::from_reason(format!("Failed to execute stored proc: {e}")))?;
+        // Position on the first row-returning result set so `createResultFast`
+        // sees it (this method's contract, per the doc comment above).
+        if !matches!(first, StatementResult::Rows) {
+            client.advance_to_rows().await.map_err(|e| {
+                napi::Error::from_reason(format!("Failed to advance to first result set: {e}"))
+            })?;
         }
+        Ok(())
     }
 
     /// Executes a query and returns all result sets as binary `Buffer`s,
