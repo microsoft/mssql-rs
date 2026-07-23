@@ -421,7 +421,10 @@ mod tests {
         {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared_sql = Some("SELECT ?".to_string());
-            state.prepared_handle = Some(42);
+            state.prepared_handle = Some(crate::handles::stmt::PreparedHandle {
+                id: 42,
+                session_epoch: 0,
+            });
         }
         let mut buf: Vec<u8> = b"abc\0".to_vec();
         let mut ind: SqlLen = crate::api::odbc_types::SQL_NTS as SqlLen;
@@ -446,6 +449,12 @@ mod tests {
         let state = stmt.inner.lock().unwrap();
         assert!(state.prepared_sql.is_some());
         assert!(state.prepared_handle.is_none());
-        assert_eq!(state.pending_unprepare, Some(42));
+        assert_eq!(
+            state.pending_unprepare,
+            Some(crate::handles::stmt::PreparedHandle {
+                id: 42,
+                session_epoch: 0,
+            })
+        );
     }
 }

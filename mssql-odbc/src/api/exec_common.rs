@@ -20,7 +20,8 @@ use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlH
 use crate::error::post_sql_error;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
+    PreparedHandle, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+    StmtState,
 };
 use crate::handles::{DbcHandle, StmtHandle};
 use crate::params::convert::{ParamConvError, bound_param_to_rpc};
@@ -157,6 +158,10 @@ pub(super) fn fail_with_tds(
 /// leaked handle is freed when the connection closes, and must not fail the
 /// caller's execution.
 ///
+/// A handle whose `session_epoch` no longer matches the connection's is skipped:
+/// a transparent reconnect already discarded it server-side, so an `sp_unprepare`
+/// would target a nonexistent handle on the new session.
+///
 /// No lock is held across the network I/O.
 pub(super) fn flush_pending_unprepare(
     dbc: &DbcHandle,
@@ -174,11 +179,15 @@ pub(super) fn flush_pending_unprepare(
     let Some(handle) = handle else {
         return;
     };
+    if handle.session_epoch != client.connection_recovery_count() {
+        // Orphan from a superseded session — already gone server-side.
+        return;
+    }
     if let Err(e) = dbc
         .runtime
-        .block_on(client.execute_sp_unprepare(handle, ()))
+        .block_on(client.execute_sp_unprepare(handle.id, ()))
     {
-        error!(%e, handle, "{op}: sp_unprepare failed — handle leaked until disconnect");
+        error!(%e, handle = handle.id, "{op}: sp_unprepare failed — handle leaked until disconnect");
     }
 }
 
@@ -233,13 +242,14 @@ pub(super) unsafe fn build_named_params(
 /// drained via `close_query`. Capture-if-absent: the handle is stable for the
 /// prepared plan, and `sp_execute` re-runs don't re-issue it.
 pub(super) fn capture_prepared_handle(stmt: &StmtHandle, client: &mut TdsClient) {
-    let Some(handle) = client.take_prepared_statement_handle() else {
+    let Some(id) = client.take_prepared_statement_handle() else {
         return;
     };
+    let session_epoch = client.connection_recovery_count();
     if let Ok(mut stmt_state) = stmt.inner.lock()
         && stmt_state.prepared_handle.is_none()
     {
-        stmt_state.prepared_handle = Some(handle);
+        stmt_state.prepared_handle = Some(PreparedHandle { id, session_epoch });
     }
 }
 

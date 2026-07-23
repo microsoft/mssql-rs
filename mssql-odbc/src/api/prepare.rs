@@ -165,7 +165,10 @@ mod tests {
         {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared_sql = Some("SELECT 1".to_string());
-            state.prepared_handle = Some(42);
+            state.prepared_handle = Some(crate::handles::stmt::PreparedHandle {
+                id: 42,
+                session_epoch: 0,
+            });
             state.set_state(STMT_STATE_PREPARED);
         }
 
@@ -182,7 +185,13 @@ mod tests {
         assert_eq!(state.prepared_sql.as_deref(), Some("SELECT 2"));
         assert!(state.prepared_handle.is_none());
         // The old handle is queued for release at the next execute.
-        assert_eq!(state.pending_unprepare, Some(42));
+        assert_eq!(
+            state.pending_unprepare,
+            Some(crate::handles::stmt::PreparedHandle {
+                id: 42,
+                session_epoch: 0,
+            })
+        );
     }
 
     #[test]
