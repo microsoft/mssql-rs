@@ -68,6 +68,124 @@ pub unsafe extern "C" fn SQLSetEnvAttr(
     }
 }
 
+/// Retrieves an attribute from an environment handle.
+///
+/// # Safety
+/// - `environment_handle` must be a valid ENV handle.
+/// - Output pointers must be valid and writable for the requested attribute.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetEnvAttr(
+    environment_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::get_env_attr::sql_get_env_attr(
+            environment_handle,
+            attribute,
+            value_ptr,
+            buffer_length,
+            string_length_ptr,
+        )
+    }
+}
+
+/// Sets a connection attribute.
+///
+/// # Safety
+/// - `connection_handle` must be a valid DBC handle.
+/// - `attribute` must be a valid connection attribute identifier.
+/// - `value_ptr` validity depends on the attribute type.
+/// - `string_length` is used only for string-type attributes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLSetConnectAttrW(
+    connection_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    string_length: SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::set_connect_attr::sql_set_connect_attr_w(
+            connection_handle,
+            attribute,
+            value_ptr,
+            string_length,
+        )
+    }
+}
+
+/// Retrieves a statement attribute.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle.
+/// - `attribute` must be a valid statement attribute identifier.
+/// - Output pointers must be valid and writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetStmtAttrW(
+    statement_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::get_stmt_attr::sql_get_stmt_attr_w(
+            statement_handle,
+            attribute,
+            value_ptr,
+            buffer_length,
+            string_length_ptr,
+        )
+    }
+}
+
+/// Reports whether a specific ODBC function is supported by this driver.
+///
+/// # Safety
+/// - `connection_handle` must be a valid DBC handle.
+/// - `supported_ptr` must be writable as required by `function_id`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetFunctions(
+    connection_handle: SqlHandle,
+    function_id: SqlUSmallInt,
+    supported_ptr: *mut SqlUSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::get_functions::sql_get_functions(connection_handle, function_id, supported_ptr)
+    }
+}
+
+/// Retrieves driver/data-source capability information.
+///
+/// # Safety
+/// - `connection_handle` must be a valid DBC handle.
+/// - Output pointers must be valid and writable for the requested info type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetInfoW(
+    connection_handle: SqlHandle,
+    info_type: SqlUSmallInt,
+    info_value_ptr: SqlPointer,
+    buffer_length: SqlSmallInt,
+    string_length_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::get_info::sql_get_info_w(
+            connection_handle,
+            info_type,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+        )
+    }
+}
+
 // ---- Diagnostics -----------------------------------------------------------
 
 /// Retrieves a diagnostic record (SQLSTATE, native error, message) previously
@@ -141,6 +259,40 @@ pub unsafe extern "C" fn SQLGetDiagFieldW(
 }
 
 // ---- Connection management --------------------------------------------------
+
+/// Establishes a connection to a data source using a DSN, user, and password.
+///
+/// Exists mainly so the Windows Driver Manager can resolve this mandatory core
+/// function; the driver's primary connect path is [`SQLDriverConnectW`].
+///
+/// # Safety
+/// - `connection_handle` must be a valid DBC handle from [`SQLAllocHandle`].
+/// - `server_name`, `user_name`, and `authentication` (if non-null) must each point
+///   to a valid UTF-16 buffer of the corresponding length (or be null-terminated
+///   when the length is `SQL_NTS`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLConnectW(
+    connection_handle: SqlHandle,
+    server_name: *const SqlWChar,
+    name_length1: SqlSmallInt,
+    user_name: *const SqlWChar,
+    name_length2: SqlSmallInt,
+    authentication: *const SqlWChar,
+    name_length3: SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::connect::sql_connect_w(
+            connection_handle,
+            server_name,
+            name_length1,
+            user_name,
+            name_length2,
+            authentication,
+            name_length3,
+        )
+    }
+}
 
 /// Establishes a connection to a data source.
 ///
@@ -439,31 +591,6 @@ pub unsafe extern "C" fn SQLRowCount(
 
 // ---- Attribute management (TO-BE-IMPLEMENTED) --------------------------------
 
-/// Sets a connection attribute.
-///
-/// # Safety
-/// - `connection_handle` must be a valid DBC handle.
-/// - `attribute` must be a valid connection attribute identifier.
-/// - `value_ptr` validity depends on the attribute type.
-/// - `string_length` is used only for string-type attributes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn SQLSetConnectAttrW(
-    connection_handle: SqlHandle,
-    attribute: SqlInteger,
-    value_ptr: SqlPointer,
-    string_length: SqlInteger,
-) -> SqlReturn {
-    crate::init_tracing();
-    unsafe {
-        super::set_connect_attr::sql_set_connect_attr_w(
-            connection_handle,
-            attribute,
-            value_ptr,
-            string_length,
-        )
-    }
-}
-
 /// Retrieves a connection attribute.
 ///
 /// # Safety
@@ -472,14 +599,22 @@ pub unsafe extern "C" fn SQLSetConnectAttrW(
 /// - Output pointers must be valid and writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLGetConnectAttrW(
-    _connection_handle: SqlHandle,
-    _attribute: SqlInteger,
-    _value_ptr: SqlPointer,
-    _buffer_length: SqlInteger,
-    _string_length_ptr: *mut SqlInteger,
+    connection_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
     crate::init_tracing();
-    SQL_SUCCESS
+    tracing::debug!(
+        ?connection_handle,
+        attribute,
+        ?value_ptr,
+        buffer_length,
+        ?string_length_ptr,
+        "SQLGetConnectAttrW called (stub)",
+    );
+    super::odbc_types::SQL_ERROR
 }
 
 /// Sets a statement attribute.
@@ -491,31 +626,20 @@ pub unsafe extern "C" fn SQLGetConnectAttrW(
 /// - `string_length` is used only for string-type attributes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLSetStmtAttrW(
-    _statement_handle: SqlHandle,
-    _attribute: SqlInteger,
-    _value_ptr: SqlPointer,
-    _string_length: SqlInteger,
+    statement_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    string_length: SqlInteger,
 ) -> SqlReturn {
     crate::init_tracing();
-    SQL_SUCCESS
-}
-
-/// Retrieves a statement attribute.
-///
-/// # Safety
-/// - `statement_handle` must be a valid STMT handle.
-/// - `attribute` must be a valid statement attribute identifier.
-/// - Output pointers must be valid and writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn SQLGetStmtAttrW(
-    _statement_handle: SqlHandle,
-    _attribute: SqlInteger,
-    _value_ptr: SqlPointer,
-    _buffer_length: SqlInteger,
-    _string_length_ptr: *mut SqlInteger,
-) -> SqlReturn {
-    crate::init_tracing();
-    SQL_SUCCESS
+    tracing::debug!(
+        ?statement_handle,
+        attribute,
+        ?value_ptr,
+        string_length,
+        "SQLSetStmtAttrW called (stub)",
+    );
+    super::odbc_types::SQL_ERROR
 }
 
 // ---- Descriptor and parameter management (TO-BE-IMPLEMENTED) -----------------
@@ -529,15 +653,24 @@ pub unsafe extern "C" fn SQLGetStmtAttrW(
 /// - Output pointers must be valid and writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLGetDescFieldW(
-    _descriptor_handle: SqlHandle,
-    _record_number: SqlSmallInt,
-    _field_identifier: SqlSmallInt,
-    _value_ptr: SqlPointer,
-    _buffer_length: SqlInteger,
-    _string_length_ptr: *mut SqlInteger,
+    descriptor_handle: SqlHandle,
+    record_number: SqlSmallInt,
+    field_identifier: SqlSmallInt,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
     crate::init_tracing();
-    SQL_SUCCESS
+    tracing::debug!(
+        ?descriptor_handle,
+        record_number,
+        field_identifier,
+        ?value_ptr,
+        buffer_length,
+        ?string_length_ptr,
+        "SQLGetDescFieldW called (stub)",
+    );
+    super::odbc_types::SQL_ERROR
 }
 
 /// Cancels the processing of the statement.

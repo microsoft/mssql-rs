@@ -57,6 +57,25 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Unicode build mode (must come after googletest so the vendored gtest build
+# is not compiled with UNICODE/_UNICODE).
+# Windows defaults to ON because mssql-odbc phase-1 exports only wide (W)
+# entrypoints. Applies to odbc_test_lib and every test target defined below.
+# ---------------------------------------------------------------------------
+if(WIN32)
+    set(_odbc_e2e_unicode_default ON)
+else()
+    set(_odbc_e2e_unicode_default OFF)
+endif()
+option(ODBC_E2E_FORCE_UNICODE "Build e2e tests with UNICODE/_UNICODE" ${_odbc_e2e_unicode_default})
+if(ODBC_E2E_FORCE_UNICODE)
+    add_compile_definitions(UNICODE _UNICODE)
+    message(STATUS "ODBC e2e tests: UNICODE/_UNICODE enabled")
+else()
+    message(STATUS "ODBC e2e tests: UNICODE/_UNICODE disabled (platform default TCHAR mode)")
+endif()
+
+# ---------------------------------------------------------------------------
 # odbc_test_lib  –  shared fixture + helpers (static library)
 # ---------------------------------------------------------------------------
 add_library(odbc_test_lib STATIC

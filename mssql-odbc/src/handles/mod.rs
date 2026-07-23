@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 pub(crate) mod dbc;
+pub(crate) mod desc;
 mod env;
 pub(crate) mod stmt;
 

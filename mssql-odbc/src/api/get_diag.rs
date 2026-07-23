@@ -15,7 +15,9 @@ use std::mem;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_DIAG_MESSAGE_TEXT, SQL_DIAG_NATIVE, SQL_DIAG_NUMBER, SQL_DIAG_SQLSTATE, SQL_ERROR,
+    SQL_DIAG_CLASS_ORIGIN, SQL_DIAG_CONNECTION_NAME, SQL_DIAG_DYNAMIC_FUNCTION_CODE,
+    SQL_DIAG_MESSAGE_TEXT, SQL_DIAG_NATIVE, SQL_DIAG_NUMBER, SQL_DIAG_SERVER_NAME,
+    SQL_DIAG_SQLSTATE, SQL_DIAG_SUBCLASS_ORIGIN, SQL_DIAG_UNKNOWN_STATEMENT, SQL_ERROR,
     SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_NO_DATA,
     SQL_SQLSTATE_SIZE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer,
     SqlReturn, SqlSmallInt, SqlWChar,
@@ -151,7 +153,10 @@ pub(crate) unsafe fn sql_get_diag_field_w(
 /// Returns `true` if `diag_identifier` is a header diagnostic field. Header
 /// fields are scoped to the handle (not a specific record).
 fn is_diag_header_field(diag_identifier: SqlSmallInt) -> bool {
-    matches!(diag_identifier, SQL_DIAG_NUMBER)
+    matches!(
+        diag_identifier,
+        SQL_DIAG_NUMBER | SQL_DIAG_DYNAMIC_FUNCTION_CODE
+    )
 }
 
 /// Handles header diagnostic fields (`SQL_DIAG_NUMBER`, etc.). Validates
@@ -186,6 +191,12 @@ unsafe fn handle_header_field(
             }
             SQL_SUCCESS
         }
+        SQL_DIAG_DYNAMIC_FUNCTION_CODE => {
+            // We don't track per-statement dynamic-function codes; report an
+            // unclassified statement.
+            unsafe { write_if_some(diag_info_ptr as *mut SqlInteger, SQL_DIAG_UNKNOWN_STATEMENT) };
+            SQL_SUCCESS
+        }
         _ => {
             error!(
                 diag_identifier,
@@ -194,6 +205,28 @@ unsafe fn handle_header_field(
             SQL_ERROR
         }
     }
+}
+
+/// Returns the standards body that defined a SQLSTATE's class/subclass, per the
+/// `SQL_DIAG_CLASS_ORIGIN` / `SQL_DIAG_SUBCLASS_ORIGIN` contract. Mirrors
+/// msodbcsql: `"ODBC 3.0"` for ODBC-defined states, otherwise `"ISO 9075"`.
+///
+/// Class origin is ODBC-defined only for the `IM` class. Subclass origin is
+/// ODBC-defined for `IM*`, any `*S*` subclass, and the `HYT*` / `HY1*` /
+/// `HY095`–`HY099` states.
+fn diag_origin(sql_state: &[u8; SQL_SQLSTATE_SIZE], is_subclass: bool) -> &'static str {
+    let odbc_defined = (sql_state[0] == b'I' && sql_state[1] == b'M')
+        || (is_subclass
+            && (sql_state[2] == b'S'
+                || (sql_state[0] == b'H'
+                    && sql_state[1] == b'Y'
+                    && (sql_state[2] == b'T'
+                        || sql_state[2] == b'1'
+                        || (sql_state[2] == b'0'
+                            && sql_state[3] == b'9'
+                            && sql_state[4] >= b'5')))));
+
+    if odbc_defined { "ODBC 3.0" } else { "ISO 9075" }
 }
 
 /// Handles per-record diagnostic fields (`SQL_DIAG_SQLSTATE`,
@@ -246,6 +279,21 @@ unsafe fn handle_record_field(
             let utf16: Vec<u16> = rec.message.encode_utf16().collect();
             unsafe {
                 write_utf16_field_bytes(diag_info_ptr, buffer_length, string_length_ptr, &utf16)
+            }
+        }
+        SQL_DIAG_CLASS_ORIGIN | SQL_DIAG_SUBCLASS_ORIGIN => {
+            let origin = diag_origin(&rec.sql_state, diag_identifier == SQL_DIAG_SUBCLASS_ORIGIN);
+            let utf16: Vec<u16> = origin.encode_utf16().collect();
+            unsafe {
+                write_utf16_field_bytes(diag_info_ptr, buffer_length, string_length_ptr, &utf16)
+            }
+        }
+        SQL_DIAG_CONNECTION_NAME | SQL_DIAG_SERVER_NAME => {
+            // TODO: msodbcsql returns the DSN name for SQL_DIAG_SERVER_NAME and a
+            // "NetConn: <handle>" string for SQL_DIAG_CONNECTION_NAME.
+            let empty: [u16; 0] = [];
+            unsafe {
+                write_utf16_field_bytes(diag_info_ptr, buffer_length, string_length_ptr, &empty)
             }
         }
         _ => {
@@ -466,6 +514,28 @@ mod tests {
     fn utf16_to_string(buf: &[u16]) -> String {
         let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
         String::from_utf16(&buf[..len]).unwrap()
+    }
+
+    #[test]
+    fn diag_origin_matches_msodbcsql() {
+        // Class origin: ODBC-defined only for the IM class.
+        assert_eq!(diag_origin(b"IM001", false), "ODBC 3.0");
+        assert_eq!(diag_origin(b"HY000", false), "ISO 9075");
+        assert_eq!(diag_origin(b"42S02", false), "ISO 9075");
+        assert_eq!(diag_origin(b"08001", false), "ISO 9075");
+
+        // Subclass origin: ODBC-defined for IM*, any *S* subclass, and
+        // HYT*/HY1*/HY095-HY099.
+        assert_eq!(diag_origin(b"IM001", true), "ODBC 3.0");
+        assert_eq!(diag_origin(b"42S02", true), "ODBC 3.0");
+        assert_eq!(diag_origin(b"HYT00", true), "ODBC 3.0");
+        assert_eq!(diag_origin(b"HY104", true), "ODBC 3.0");
+        assert_eq!(diag_origin(b"HY095", true), "ODBC 3.0");
+        assert_eq!(diag_origin(b"HY099", true), "ODBC 3.0");
+        // HY000 and HY094 are ISO-defined subclasses (not in the ODBC ranges).
+        assert_eq!(diag_origin(b"HY000", true), "ISO 9075");
+        assert_eq!(diag_origin(b"HY094", true), "ISO 9075");
+        assert_eq!(diag_origin(b"08001", true), "ISO 9075");
     }
 
     #[test]
@@ -1032,6 +1102,147 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn diag_field_class_origin_selects_odbc_or_iso() {
+        // IM class → ODBC-defined origin.
+        let env = alloc_env();
+        push_diag(env, *b"IM001", 0, "driver error");
+        let mut buf = [0u16; 16];
+        let mut string_len: SqlSmallInt = 0;
+        let ret = unsafe {
+            sql_get_diag_field_w(
+                SQL_HANDLE_ENV,
+                env,
+                1,
+                SQL_DIAG_CLASS_ORIGIN,
+                buf.as_mut_ptr() as SqlPointer,
+                (buf.len() * mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                &mut string_len,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(utf16_to_string(&buf), "ODBC 3.0");
+        assert_eq!(string_len, 16); // 8 chars × 2 bytes
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+
+        // Non-ODBC class → ISO-defined origin.
+        let env2 = alloc_env();
+        push_diag(env2, *b"HY000", 0, "general error");
+        let mut buf2 = [0u16; 16];
+        let ret2 = unsafe {
+            sql_get_diag_field_w(
+                SQL_HANDLE_ENV,
+                env2,
+                1,
+                SQL_DIAG_CLASS_ORIGIN,
+                buf2.as_mut_ptr() as SqlPointer,
+                (buf2.len() * mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret2, SQL_SUCCESS);
+        assert_eq!(utf16_to_string(&buf2), "ISO 9075");
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env2) };
+    }
+
+    #[test]
+    fn diag_field_subclass_origin_differs_from_class_origin() {
+        // 42S02: the class is ISO-defined but the "S" subclass is ODBC-defined.
+        let env = alloc_env();
+        push_diag(env, *b"42S02", 0, "table not found");
+
+        let mut class_buf = [0u16; 16];
+        let class_ret = unsafe {
+            sql_get_diag_field_w(
+                SQL_HANDLE_ENV,
+                env,
+                1,
+                SQL_DIAG_CLASS_ORIGIN,
+                class_buf.as_mut_ptr() as SqlPointer,
+                (class_buf.len() * mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(class_ret, SQL_SUCCESS);
+        assert_eq!(utf16_to_string(&class_buf), "ISO 9075");
+
+        let mut sub_buf = [0u16; 16];
+        let sub_ret = unsafe {
+            sql_get_diag_field_w(
+                SQL_HANDLE_ENV,
+                env,
+                1,
+                SQL_DIAG_SUBCLASS_ORIGIN,
+                sub_buf.as_mut_ptr() as SqlPointer,
+                (sub_buf.len() * mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(sub_ret, SQL_SUCCESS);
+        assert_eq!(utf16_to_string(&sub_buf), "ODBC 3.0");
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn diag_field_dynamic_function_code_is_header_field() {
+        let env = alloc_env();
+        // Header field: RecNumber=0 → SUCCESS, integer 0 (SQL_DIAG_UNKNOWN_STATEMENT).
+        let mut code: SqlInteger = -1;
+        let ret = unsafe {
+            sql_get_diag_field_w(
+                SQL_HANDLE_ENV,
+                env,
+                0,
+                SQL_DIAG_DYNAMIC_FUNCTION_CODE,
+                &mut code as *mut SqlInteger as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(code, 0);
+
+        // Non-zero RecNumber is invalid for a header field.
+        let ret_bad = unsafe {
+            sql_get_diag_field_w(
+                SQL_HANDLE_ENV,
+                env,
+                1,
+                SQL_DIAG_DYNAMIC_FUNCTION_CODE,
+                &mut code as *mut SqlInteger as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret_bad, SQL_ERROR);
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn diag_field_connection_and_server_name_return_empty_success() {
+        let env = alloc_env();
+        push_diag(env, *b"HY000", 0, "err");
+        for id in [SQL_DIAG_CONNECTION_NAME, SQL_DIAG_SERVER_NAME] {
+            let mut buf = [0xFFFFu16; 8];
+            let mut string_len: SqlSmallInt = -1;
+            let ret = unsafe {
+                sql_get_diag_field_w(
+                    SQL_HANDLE_ENV,
+                    env,
+                    1,
+                    id,
+                    buf.as_mut_ptr() as SqlPointer,
+                    (buf.len() * mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                    &mut string_len,
+                )
+            };
+            assert_eq!(ret, SQL_SUCCESS);
+            assert_eq!(string_len, 0);
+            assert_eq!(buf[0], 0); // NUL-terminated empty string
+        }
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 }
