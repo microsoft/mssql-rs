@@ -70,6 +70,10 @@ mod rpc_results {
             .await
             .unwrap();
 
+        // Drain to the end of the batch so the output-parameter RETURNVALUE
+        // tokens are collected (they arrive after the proc body's statements).
+        connection.advance_to_rows().await.unwrap();
+
         let returned_parameters = connection.get_return_values();
         assert_eq!(returned_parameters.len(), 1);
         let returned_parameter = returned_parameters.first().unwrap();
@@ -424,6 +428,12 @@ mod rpc_results {
             .execute_sp_executesql(insert_sql.to_string(), insert_params, ())
             .await
             .expect("seed row insert via sp_executesql");
+        // Statement-wise execute leaves the batch positioned on the INSERT's
+        // row count; drain it so the connection is idle for the prepare cycle.
+        connection
+            .advance_to_rows()
+            .await
+            .expect("drain seed insert");
 
         let cases: Vec<(&str, &str, SqlType)> = vec![
             ("nvc", "@nvc", SqlType::NVarchar(Some(nvc_val.clone()), 50)),
