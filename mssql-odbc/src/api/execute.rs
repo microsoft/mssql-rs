@@ -6,6 +6,7 @@
 
 use tracing::{debug, error};
 
+use mssql_tds::connection::tds_client::StatementResult;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{build_named_params, claim_connection, fail_with_tds, finish_execute};
@@ -66,22 +67,17 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
         Err(rc) => return rc,
     };
 
-    match exec.handle {
+    let exec_result = match exec.handle {
         // Already prepared: reuse the cached server handle (msodbcsql
         // `cmdp.hPrepCurrent`) via sp_execute. No pending prepared handle drop can
         // exist here. (StmtState invariant: `pending_unprepare` is set only when
         // `prepared_handle` is None), so nothing to release.
-        Some(handle) => {
-            if let Err(e) = dbc.runtime.block_on(client.execute_sp_execute(
-                handle,
-                None,
-                Some(exec.named_params),
-                (),
-            )) {
-                error!(%e, "SQLExecute: sp_execute failed");
-                return fail_with_tds(dbc, stmt, statement_handle, client, &e);
-            }
-        }
+        Some(handle) => dbc.runtime.block_on(client.execute_sp_execute(
+            handle,
+            None,
+            Some(exec.named_params),
+            (),
+        )),
         // First execute / re-prepare: prepare and run in one round trip via
         // sp_prepexec (deferred-prepare path). A prepared handle superseded
         // by a prior rebind / re-prepare is dropped in the same RPC by passing
@@ -92,20 +88,33 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
         // with data-at-execution (DAE) parameters, which sp_prepexec can't
         // carry. Phase 1 rejects DAE params at bind time, so that case can't
         // occur here yet - add the sp_prepare branch when DAE support lands.
-        None => {
-            if let Err(e) = dbc.runtime.block_on(client.execute_sp_prepexec(
-                exec.rewritten_sql,
-                exec.named_params,
-                exec.drop_handle,
-                (),
-            )) {
-                error!(%e, "SQLExecute: sp_prepexec failed");
-                return fail_with_tds(dbc, stmt, statement_handle, client, &e);
-            }
-            // The prepared handle is captured once the batch is drained (see
-            // `capture_prepared_handle`): for a result-returning statement the
-            // `@handle` RETURNVALUE arrives after the result set, so it is read
-            // at drain time (SQLCloseCursor, or the DDL finish path), not here.
+        None => dbc.runtime.block_on(client.execute_sp_prepexec(
+            exec.rewritten_sql,
+            exec.named_params,
+            exec.drop_handle,
+            (),
+        )),
+    };
+
+    let stmt_result = match exec_result {
+        Ok(result) => result,
+        Err(e) => {
+            error!(%e, "SQLExecute: prepared execution failed");
+            return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+        }
+    };
+
+    // A prepared statement runs a single SQL statement. If it produced no result
+    // set (DML / no-row), drain its trailing tokens so the statement is left idle
+    // and immediately re-executable (msodbcsql parity) instead of leaving a
+    // 0-column cursor open — matching how the pre-statement-wise path collapsed
+    // no-row results. A row-returning statement keeps its cursor open for
+    // SQLFetch; its `@handle` RETURNVALUE (sp_prepexec) is captured later at
+    // drain time (SQLCloseCursor / the DDL finish path).
+    if !matches!(stmt_result, StatementResult::Rows) {
+        if let Err(e) = dbc.runtime.block_on(client.advance_to_rows()) {
+            error!(%e, "SQLExecute: draining no-row prepared result failed");
+            return fail_with_tds(dbc, stmt, statement_handle, client, &e);
         }
     }
 
