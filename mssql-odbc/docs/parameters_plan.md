@@ -32,7 +32,7 @@ in the ODBC Driver 18 (Rust).
   `session_epoch` at capture. `SQLExecute` performs the single recovery up front
   (`check_and_reconnect`, mirroring msodbcsql `GetBatchCtxOrRecover`), then
   predictively re-evaluates handle liveness against the post-recovery epoch
-  (`classify_handles`, mirroring `FIsReprepareRequired`): a handle from a
+  (`plan_execution`, mirroring `FIsReprepareRequired`): a handle from a
   superseded session is dropped — the cached handle is re-prepared fresh and a
   stale piggyback drop is skipped (the server already discarded it). No RPC
   recovers again after the decision, so the send is bound to the same session

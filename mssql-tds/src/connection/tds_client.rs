@@ -4435,4 +4435,45 @@ mod tests {
 
         assert!(matches!(err, UsageError(message) if message.contains("@CE_POS_0")));
     }
+
+    /// A forced parameter whose row the server omits entirely from the describe
+    /// result must be rejected — not silently sent as plaintext. This is the
+    /// downgrade a describe-driven check (iterating only the server's rows) would
+    /// miss, so the validation iterates the supplied forced parameters instead.
+    #[tokio::test]
+    async fn apply_parameter_encryption_rejects_forced_param_omitted_from_describe() {
+        use crate::datatypes::sqltypes::SqlType;
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+        use crate::security::keystore::{CekCache, ColumnEncryptionKeyStoreProviderRegistry};
+
+        // Server returns an empty describe result: no row for the forced param.
+        let describe = DescribeParameterEncryptionResult::new();
+        let providers = ColumnEncryptionKeyStoreProviderRegistry::new();
+        let cek_cache = CekCache::new();
+        let mut output_param_ceks = HashMap::new();
+
+        let mut forced = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(42)),
+        )
+        .with_force_column_encryption(true);
+        let mut params: Vec<&mut RpcParameter> = vec![&mut forced];
+
+        let err = TdsClient::apply_parameter_encryption(
+            &describe,
+            &providers,
+            &cek_cache,
+            &mut params,
+            &mut output_param_ceks,
+            &[],
+        )
+        .await
+        .expect_err("a forced parameter omitted from the describe result must be rejected");
+
+        assert!(
+            matches!(&err, crate::error::Error::ColumnEncryptionError(message) if message.contains("ForceColumnEncryption")),
+            "expected a ForceColumnEncryption column-encryption error, got: {err}"
+        );
+    }
 }
