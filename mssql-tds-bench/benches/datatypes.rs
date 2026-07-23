@@ -33,7 +33,7 @@ fn bench_query(c: &mut Criterion, name: &str, query: &str) {
         b.iter(|| {
             rt.block_on(async {
                 client
-                    .execute(query.clone(), None, None)
+                    .execute(query.clone(), ())
                     .await
                     .expect("execute failed");
                 drain(&mut client).await;
@@ -64,12 +64,12 @@ fn bench_decode_rows(
 
     rt.block_on(async {
         client
-            .execute(create_sql.to_string(), None, None)
+            .execute(create_sql.to_string(), ())
             .await
             .expect("create table failed");
         client.close_query().await.expect("close_query failed");
         client
-            .execute(fill_sql.to_string(), None, None)
+            .execute(fill_sql.to_string(), ())
             .await
             .expect("fill table failed");
         client.close_query().await.expect("close_query failed");
@@ -82,7 +82,7 @@ fn bench_decode_rows(
         b.iter(|| {
             rt.block_on(async {
                 client
-                    .execute(query.clone(), None, None)
+                    .execute(query.clone(), ())
                     .await
                     .expect("execute failed");
                 drain(&mut client).await;
@@ -190,8 +190,7 @@ fn lob(c: &mut Criterion) {
             client
                 .execute(
                     format!("CREATE TABLE {table} (payload VARCHAR(MAX) NOT NULL)"),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("create lob table failed");
@@ -202,8 +201,7 @@ fn lob(c: &mut Criterion) {
                         "INSERT INTO {table} (payload) \
                          SELECT REPLICATE(CAST('X' AS VARCHAR(MAX)), {bytes})"
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("fill lob table failed");
@@ -216,7 +214,7 @@ fn lob(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     client
-                        .execute(query.clone(), None, None)
+                        .execute(query.clone(), ())
                         .await
                         .expect("execute failed");
                     drain(&mut client).await;

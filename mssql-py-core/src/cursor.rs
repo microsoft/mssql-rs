@@ -4,7 +4,7 @@
 use mssql_tds::connection::bulk_copy::{
     BulkCopy, ColumnMapping as TdsColumnMapping, ColumnMappingSource,
 };
-use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, TdsClient};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use pyo3::prelude::*;
@@ -48,10 +48,10 @@ impl PyCoreCursor {
                 let mut client = tds_client.lock().await;
                 info!("execute: Locked TDS client");
 
-                // Close any open result set before executing new query
-                if let Some(resultset) = client.get_current_resultset() {
+                // Close any open batch before executing a new query
+                if client.has_open_batch() {
                     info!(" execute: Closing previous result set before new query");
-                    resultset.close().await.map_err(|e| {
+                    client.close_query().await.map_err(|e| {
                         error!("execute: Failed to close previous result set: {}", e);
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
                             "Failed to close previous result set: {}",
@@ -61,13 +61,22 @@ impl PyCoreCursor {
                 }
 
                 // Execute with 30 second timeout
-                client.execute(query, Some(30), None).await.map_err(|e| {
-                    error!("execute: Failed to execute query: {}", e);
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Query execution failed: {}",
-                        e
-                    ))
-                })?;
+                client
+                    .execute(
+                        query,
+                        ExecuteOptions {
+                            timeout: Some(30),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("execute: Failed to execute query: {}", e);
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Query execution failed: {}",
+                            e
+                        ))
+                    })?;
 
                 info!("execute: Query executed successfully");
                 Ok::<_, PyErr>(())
@@ -94,11 +103,11 @@ impl PyCoreCursor {
                 let mut client = tds_client.lock().await;
                 info!("fetchone: Locked TDS client");
 
-                if let Some(resultset) = client.get_current_resultset() {
+                if client.on_rows() {
                     info!("fetchone: Got resultset, fetching next row");
-                    let col_count = resultset.get_metadata().len();
+                    let col_count = client.get_metadata().len();
                     let mut writer = crate::row_writer::PyRowWriter::new(col_count);
-                    let has_row = resultset.next_row_into(&mut writer).await.map_err(|e| {
+                    let has_row = client.next_row_into(&mut writer).await.map_err(|e| {
                         error!("fetchone: Failed to fetch row: {}", e);
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
                             "Failed to fetch row: {}",
@@ -110,7 +119,7 @@ impl PyCoreCursor {
                         return Ok(Some(writer));
                     } else {
                         info!("No more rows, closing result set");
-                        resultset.close().await.map_err(|e| {
+                        client.close_query().await.map_err(|e| {
                             error!("fetchone: Failed to close result set: {}", e);
                             pyo3::exceptions::PyRuntimeError::new_err(format!(
                                 "Failed to close result set: {}",

@@ -12,7 +12,7 @@ mod common;
 #[cfg(test)]
 mod multi_subnet_failover_tests {
     use mssql_tds::connection::client_context::ClientContext;
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionSetting, TdsResult};
 
@@ -59,7 +59,7 @@ mod multi_subnet_failover_tests {
     /// Execute a simple query and verify we get results
     async fn test_simple_query(client: &mut TdsClient) -> TdsResult<()> {
         let query = "SELECT @@VERSION AS version";
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         let mut has_results = false;
         loop {
@@ -70,7 +70,7 @@ mod multi_subnet_failover_tests {
                 }
             }
 
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }

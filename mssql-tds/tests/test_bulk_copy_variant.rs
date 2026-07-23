@@ -8,7 +8,7 @@ mod bulk_copy_variant_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::{
         ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
@@ -77,8 +77,7 @@ mod bulk_copy_variant_tests {
             .execute(
                 "CREATE TABLE #VariantIntTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -131,8 +130,7 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #VariantIntTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -163,12 +161,8 @@ mod bulk_copy_variant_tests {
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
         client
-            .execute(
-                "CREATE TABLE #VariantFloatMoneyTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
+            .execute("CREATE TABLE #VariantFloatMoneyTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
+                    .to_string(), ())
             .await
             .unwrap();
 
@@ -216,8 +210,7 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #VariantFloatMoneyTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -274,8 +267,7 @@ mod bulk_copy_variant_tests {
             .execute(
                 "CREATE TABLE #VariantDecimalTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -319,8 +311,7 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #VariantDecimalTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -367,12 +358,8 @@ mod bulk_copy_variant_tests {
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
         client
-            .execute(
-                "CREATE TABLE #VariantStringBytesTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
+            .execute("CREATE TABLE #VariantStringBytesTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
+                    .to_string(), ())
             .await
             .unwrap();
 
@@ -406,8 +393,7 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #VariantStringBytesTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -443,8 +429,7 @@ mod bulk_copy_variant_tests {
             .execute(
                 "CREATE TABLE #VariantDateTimeTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -523,8 +508,7 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #VariantDateTimeTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -602,8 +586,7 @@ mod bulk_copy_variant_tests {
             .execute(
                 "CREATE TABLE #VariantUuidNullTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -636,8 +619,7 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #VariantUuidNullTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -671,12 +653,8 @@ mod bulk_copy_variant_tests {
 
         // Create temp table with sql_variant column
         client
-            .execute(
-                "CREATE TABLE #BulkCopyVariantUnsupportedTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
+            .execute("CREATE TABLE #BulkCopyVariantUnsupportedTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
+                    .to_string(), ())
             .await
             .unwrap();
 
@@ -720,12 +698,8 @@ mod bulk_copy_variant_tests {
 
         // Create temp table with sql_variant column
         client
-            .execute(
-                "CREATE TABLE #BulkCopyVariantEdgeCaseTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
+            .execute("CREATE TABLE #BulkCopyVariantEdgeCaseTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
+                    .to_string(), ())
             .await
             .unwrap();
 
@@ -868,8 +842,7 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #BulkCopyVariantEdgeCaseTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -960,12 +933,8 @@ mod bulk_copy_variant_tests {
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
         client
-            .execute(
-                "CREATE TABLE #VariantOversizedTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
+            .execute("CREATE TABLE #VariantOversizedTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
+                    .to_string(), ())
             .await
             .unwrap();
 

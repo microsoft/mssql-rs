@@ -32,7 +32,7 @@ fn parameterized_sp_executesql(c: &mut Criterion) {
                     SqlType::Int(Some(42)),
                 )];
                 client
-                    .execute_sp_executesql("SELECT @id AS v".to_string(), params, None, None)
+                    .execute_sp_executesql("SELECT @id AS v".to_string(), params, ())
                     .await
                     .expect("sp_executesql failed");
                 drain(&mut client).await;
@@ -55,8 +55,7 @@ fn stored_procedure(c: &mut Criterion) {
             .execute(
                 "CREATE PROCEDURE #bench_proc AS BEGIN SET NOCOUNT ON; SELECT 1 AS v; END"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("create temp proc failed");
@@ -67,7 +66,7 @@ fn stored_procedure(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 client
-                    .execute_stored_procedure("#bench_proc".to_string(), None, None, None, None)
+                    .execute_stored_procedure("#bench_proc".to_string(), None, None, ())
                     .await
                     .expect("exec proc failed");
                 drain(&mut client).await;
@@ -94,8 +93,7 @@ fn stored_procedure_output(c: &mut Criterion) {
                 "CREATE PROCEDURE #bench_proc_out @x INT, @y INT OUTPUT AS \
                  BEGIN SET NOCOUNT ON; SET @y = @x * 2; END"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("create temp proc failed");
@@ -118,13 +116,7 @@ fn stored_procedure_output(c: &mut Criterion) {
                     ),
                 ];
                 client
-                    .execute_stored_procedure(
-                        "#bench_proc_out".to_string(),
-                        None,
-                        Some(params),
-                        None,
-                        None,
-                    )
+                    .execute_stored_procedure("#bench_proc_out".to_string(), None, Some(params), ())
                     .await
                     .expect("exec proc failed");
                 // Read the OUTPUT parameter, then reset for the next iteration.

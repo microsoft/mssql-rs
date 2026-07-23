@@ -14,7 +14,7 @@ mod common;
 use common::{build_tcp_datasource, create_context, init_tracing};
 use mssql_tds::{
     connection::client_context::ClientContext,
-    connection::tds_client::{ResultSet, ResultSetClient},
+    connection::tds_client::ResultSet,
     connection_provider::tds_connection_provider::TdsConnectionProvider,
     core::{EncryptionOptions, EncryptionSetting},
 };
@@ -153,7 +153,7 @@ async fn connect_and_query() {
         .expect("Connection failed");
 
     client
-        .execute("SELECT 1 AS val".to_string(), None, None)
+        .execute("SELECT 1 AS val".to_string(), ())
         .await
         .expect("Query failed");
 

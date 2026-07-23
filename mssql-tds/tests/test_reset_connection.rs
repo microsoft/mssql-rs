@@ -24,7 +24,7 @@ mod reset_connection {
     /// Execute a statement that yields no result rows (SET / DDL / DML) and
     /// fully drain the response.
     async fn exec_drain(conn: &mut TdsClient, sql: &str) {
-        conn.execute(sql.to_string(), None, None).await.unwrap();
+        conn.execute(sql.to_string(), ()).await.unwrap();
         // `get_scalar_value` drains every result set and closes the batch; the
         // returned value is irrelevant for non-SELECT statements.
         let _ = get_scalar_value(conn).await.unwrap();
@@ -32,7 +32,7 @@ mod reset_connection {
 
     /// Execute a scalar `SELECT` and return its single `int` value.
     async fn select_int(conn: &mut TdsClient, sql: &str) -> i32 {
-        conn.execute(sql.to_string(), None, None).await.unwrap();
+        conn.execute(sql.to_string(), ()).await.unwrap();
         match get_scalar_value(conn).await.unwrap() {
             Some(ColumnValues::Int(v)) => v,
             other => panic!("expected a single Int scalar for `{sql}`, got {other:?}"),
@@ -103,7 +103,7 @@ mod reset_connection {
         // server error can surface either from `execute` or while draining.
         conn.prepare_reset_connection(false);
         let exec = conn
-            .execute("SELECT col FROM #reset_probe".to_string(), None, None)
+            .execute("SELECT col FROM #reset_probe".to_string(), ())
             .await;
         let errored = if exec.is_err() {
             true

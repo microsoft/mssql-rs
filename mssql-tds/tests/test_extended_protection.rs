@@ -28,7 +28,7 @@ use std::env;
 mod common;
 
 use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
-use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+use mssql_tds::connection::tds_client::ResultSet;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -80,7 +80,7 @@ async fn epa_channel_binding_login_succeeds() -> TdsResult<()> {
     // Confirm we authenticated over an encrypted Windows-auth connection.
     let query = "SELECT auth_scheme, CAST(encrypt_option AS varchar(10)) \
                  FROM sys.dm_exec_connections WHERE session_id = @@SPID";
-    connection.execute(query.to_string(), None, None).await?;
+    connection.execute(query.to_string(), ()).await?;
     let rs = connection
         .get_current_resultset()
         .expect("connection-properties query should produce a result set");

@@ -9,7 +9,7 @@ mod query_result_reads {
         ExpectedQueryResultType, begin_connection, build_tcp_datasource,
         connect_query_and_validate, run_query_and_check_results,
     };
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::error::Error::{SqlServerError, UsageError};
 
@@ -148,8 +148,7 @@ mod query_result_reads {
 
                 SELECT id, nchar_val, ntext_val FROM #NTextValidation ORDER BY id;"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -162,7 +161,7 @@ mod query_result_reads {
                     all_rows.push(row);
                 }
             }
-            if !connection.move_to_next().await.unwrap() {
+            if !connection.advance_to_rows().await.unwrap() {
                 break;
             }
         }
@@ -291,14 +290,19 @@ mod query_result_reads {
                     SELECT * FROM #dummy;
                     "
                     .to_string(),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .unwrap();
 
             // SAFE PATTERN: Collect ALL result sets upfront (JavaScript pattern)
             let mut all_result_sets = Vec::new();
+            // `execute()` positions on the first navigable result statement-wise;
+            // the leading INSERT surfaces its row count first, so collapse to the
+            // first row-returning result set before collecting.
+            if !connection.on_rows() {
+                connection.advance_to_rows().await.unwrap();
+            }
             loop {
                 let mut current_result_rows = Vec::new();
 
@@ -312,7 +316,7 @@ mod query_result_reads {
                 all_result_sets.push(current_result_rows);
 
                 // Try to move to next result set
-                if !connection.move_to_next().await.unwrap() {
+                if !connection.advance_to_rows().await.unwrap() {
                     break; // No more result sets
                 }
             }
@@ -371,7 +375,7 @@ mod query_result_reads {
         {
             // Use a query similar to JavaScript tests: multiple SELECTs only
             connection
-                .execute("SELECT 1, 2; SELECT 10, 20, 30;".to_string(), None, None)
+                .execute("SELECT 1, 2; SELECT 10, 20, 30;".to_string(), ())
                 .await
                 .unwrap();
 
@@ -390,7 +394,7 @@ mod query_result_reads {
                 all_result_sets.push(current_result_rows);
 
                 // Try to move to next result set
-                if !connection.move_to_next().await.unwrap() {
+                if !connection.advance_to_rows().await.unwrap() {
                     break; // No more result sets
                 }
             }
@@ -459,8 +463,7 @@ mod query_result_reads {
                 INSERT INTO #dummy VALUES(10),(20);
                 SELECT * FROM #dummy;"
                         .to_string(),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .unwrap();
@@ -508,8 +511,7 @@ mod query_result_reads {
                 INSERT INTO #dummy VALUES(10),(20);
                 SELECT * FROM #dummy;"
                         .to_string(),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .unwrap();
@@ -522,7 +524,7 @@ mod query_result_reads {
         }
 
         // Try to reuse the connection - should fail because previous query wasn't closed
-        let expected_error = connection.execute("SELECT 1".to_string(), None, None).await;
+        let expected_error = connection.execute("SELECT 1".to_string(), ()).await;
         match expected_error {
             Ok(_) => panic!("Expected error but got success."),
             Err(UsageError(_)) => {
@@ -547,8 +549,7 @@ mod query_result_reads {
                 SELECT 1 UNION ALL SELECT 2;
                 SELECT 2;"
                         .to_string(),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .unwrap();
@@ -561,7 +562,7 @@ mod query_result_reads {
             }
 
             // With TdsClient, move_to_next() automatically drains remaining rows - this should succeed
-            let second_result = connection.move_to_next().await;
+            let second_result = connection.advance_to_rows().await;
             assert!(second_result.is_ok());
             assert!(second_result.unwrap()); // Should return true as there is a next result set
 
@@ -588,8 +589,7 @@ mod query_result_reads {
                 INSERT INTO #dummy VALUES('10'),('abcd');
                 SELECT CAST(StrColumn AS Int) FROM #dummy;"
                         .to_string(),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .unwrap();
@@ -597,7 +597,7 @@ mod query_result_reads {
             // Try to skip the first result (CREATE TABLE)
             // The error from the later SELECT CAST might appear at any point
             let mut error_found = false;
-            let first_move = connection.move_to_next().await;
+            let first_move = connection.advance_to_rows().await;
 
             if first_move.is_err() {
                 // Error encountered on first move
@@ -612,7 +612,7 @@ mod query_result_reads {
 
             // If no error yet, try moving past INSERT
             let move_result = if !error_found {
-                connection.move_to_next().await
+                connection.advance_to_rows().await
             } else {
                 // Already found error, skip remaining checks
                 return;
@@ -674,17 +674,16 @@ mod query_result_reads {
                 INSERT INTO #dummy VALUES(1/0),(10);
                 SELECT CAST(StrColumn AS Int) FROM #dummy;"
                         .to_string(),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
 
             // The error might occur during execute() or during result iteration
             match execute_result {
-                Ok(()) => {
+                Ok(_) => {
                     // If execute succeeded, the error should appear when we try to move to results
                     // Skip the first result (CREATE TABLE)
-                    let first_move = connection.move_to_next().await;
+                    let first_move = connection.advance_to_rows().await;
                     match first_move {
                         Err(SqlServerError { .. }) => {
                             // Expected error occurred on first move
@@ -692,7 +691,7 @@ mod query_result_reads {
                         Err(e) => panic!("Expected SqlServerError, got: {e:?}"),
                         Ok(_) => {
                             // First move succeeded, error should occur on second move (INSERT result)
-                            let error_result = connection.move_to_next().await;
+                            let error_result = connection.advance_to_rows().await;
                             match error_result {
                                 Err(SqlServerError { .. }) => {
                                     // Expected error

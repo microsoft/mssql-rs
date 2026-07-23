@@ -174,7 +174,7 @@ pub(super) fn flush_pending_unprepare(
     };
     if let Err(e) = dbc
         .runtime
-        .block_on(client.execute_sp_unprepare(handle, None, None))
+        .block_on(client.execute_sp_unprepare(handle, ()))
     {
         error!(%e, handle, "{op}: sp_unprepare failed — handle leaked until disconnect");
     }

@@ -13,7 +13,7 @@ mod bulk_copy_varying_columns_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::ColumnValues;
 
@@ -87,8 +87,7 @@ mod bulk_copy_varying_columns_tests {
                     col3 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create temp table");
@@ -129,9 +128,7 @@ mod bulk_copy_varying_columns_tests {
             err_msg
         );
 
-        let select_result = client
-            .execute("SELECT 1 AS test_col".to_string(), None, None)
-            .await;
+        let select_result = client.execute("SELECT 1 AS test_col".to_string(), ()).await;
         assert!(
             select_result.is_ok(),
             "Connection should still be usable after bulk copy error"
@@ -150,8 +147,7 @@ mod bulk_copy_varying_columns_tests {
                     col3 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create temp table");
@@ -192,9 +188,7 @@ mod bulk_copy_varying_columns_tests {
             err_msg
         );
 
-        let select_result = client
-            .execute("SELECT 1 AS test_col".to_string(), None, None)
-            .await;
+        let select_result = client.execute("SELECT 1 AS test_col".to_string(), ()).await;
         assert!(
             select_result.is_ok(),
             "Connection should still be usable after bulk copy error"
@@ -213,8 +207,7 @@ mod bulk_copy_varying_columns_tests {
                     col3 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create temp table");
@@ -267,8 +260,7 @@ mod bulk_copy_varying_columns_tests {
         client
             .execute(
                 "SELECT COUNT(*) FROM #BulkCopyConsistentTest".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to count rows");

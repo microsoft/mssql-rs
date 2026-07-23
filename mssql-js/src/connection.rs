@@ -4,7 +4,7 @@
 use std::{fmt::Debug, sync::Arc};
 
 use mssql_tds::{
-    connection::tds_client::{ResultSet, ResultSetClient, TdsClient},
+    connection::tds_client::{ResultSet, StatementResult, TdsClient},
     message::{
         parameters::rpc_parameters::{RpcParameter, StatusFlags},
         transaction_management::TransactionIsolationLevel,
@@ -72,7 +72,7 @@ impl Connection {
     #[napi]
     pub async fn execute(&self, query: String) -> napi::Result<()> {
         let mut client = self.tds_client.lock().await;
-        let result = client.execute(query, None, None).await;
+        let result = client.execute(query, ()).await;
         match result {
             Ok(_) => Ok(()),
             Err(e) => Err(napi::Error::from_reason(format!(
@@ -110,9 +110,7 @@ impl Connection {
             .collect();
 
         let rpc_params = rpc_params?;
-        let result = client
-            .execute_sp_executesql(query, rpc_params, None, None)
-            .await;
+        let result = client.execute_sp_executesql(query, rpc_params, ()).await;
 
         match result {
             Ok(_) => Ok(()),
@@ -155,7 +153,7 @@ impl Connection {
         let named_params = named_params?;
 
         let result = client
-            .execute_stored_procedure(stored_proc_name, None, Some(named_params), None, None)
+            .execute_stored_procedure(stored_proc_name, None, Some(named_params), ())
             .await;
 
         match result {
@@ -174,21 +172,22 @@ impl Connection {
     pub async fn query_raw(&self, query: String) -> napi::Result<Vec<Buffer>> {
         let mut client = self.tds_client.lock().await;
 
-        client
-            .execute(query, None, None)
+        // Statement-wise execute, then collapse to row-returning result sets.
+        let first = client
+            .execute(query, ())
             .await
             .map_err(|e| napi::Error::from_reason(format!("Failed to execute query: {e}")))?;
+        let mut has_rows = matches!(first, StatementResult::Rows);
+        if !has_rows {
+            has_rows = client.advance_to_rows().await.map_err(|e| {
+                napi::Error::from_reason(format!("Failed to advance to next result set: {e}"))
+            })?;
+        }
 
         let mut buffers: Vec<Buffer> = Vec::new();
 
-        loop {
-            let result_set = client.get_current_resultset();
-            if result_set.is_none() {
-                break;
-            }
-            let result_set = result_set.unwrap();
-
-            let metadata = result_set.get_metadata().clone();
+        while has_rows {
+            let metadata = client.get_metadata().clone();
             let col_count = metadata.len() as u16;
 
             let mut writer = BinaryRowWriter::new(col_count);
@@ -197,7 +196,7 @@ impl Connection {
             let col_name_indices = writer.intern_column_names(&col_names);
             let col_type_ids: Vec<u8> = metadata.iter().map(|m| m.data_type as u8).collect();
 
-            while result_set
+            while client
                 .next_row_into(&mut writer)
                 .await
                 .map_err(|e| napi::Error::from_reason(format!("Failed to read row: {e}")))?
@@ -210,20 +209,9 @@ impl Connection {
                 0,
             )));
 
-            let has_next = client.move_to_next().await.map_err(|e| {
+            has_rows = client.advance_to_rows().await.map_err(|e| {
                 napi::Error::from_reason(format!("Failed to advance to next result set: {e}"))
             })?;
-            if !has_next {
-                break;
-            }
-        }
-
-        // If no result sets at all (e.g. DML-only), close and return empty vec
-        if buffers.is_empty() {
-            client
-                .close_query()
-                .await
-                .map_err(|e| napi::Error::from_reason(format!("Failed to close query: {e}")))?;
         }
 
         Ok(buffers)
@@ -238,13 +226,11 @@ impl Connection {
     pub async fn fetch_chunk(&self, byte_budget: u32) -> napi::Result<Option<ChunkResult>> {
         let mut client = self.tds_client.lock().await;
 
-        let result_set = client.get_current_resultset();
-        if result_set.is_none() {
+        if !client.on_rows() {
             return Ok(None);
         }
-        let result_set = result_set.unwrap();
 
-        let metadata = result_set.get_metadata().clone();
+        let metadata = client.get_metadata().clone();
         let col_count = metadata.len() as u16;
 
         let mut writer = BinaryRowWriter::new(col_count);
@@ -257,7 +243,7 @@ impl Connection {
         let mut has_more = false;
 
         loop {
-            let had_row = result_set
+            let had_row = client
                 .next_row_into(&mut writer)
                 .await
                 .map_err(|e| napi::Error::from_reason(format!("Failed to read row: {e}")))?;
@@ -282,7 +268,7 @@ impl Connection {
     #[instrument]
     pub async fn next_result_set(&self) -> napi::Result<bool> {
         let mut client = self.tds_client.lock().await;
-        let result = client.move_to_next().await;
+        let result = client.advance_to_rows().await;
         match result {
             Ok(has_next) => Ok(has_next),
             Err(e) => Err(napi::Error::from_reason(format!(

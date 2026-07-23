@@ -129,15 +129,14 @@ fn sql_exec_direct_w_safe(
     // STMT lock is held during I/O.
     let exec_result: Result<(), mssql_tds::error::Error> = if marker_count > 0 {
         dbc.runtime
-            .block_on(client.execute_sp_executesql(rewritten_sql, named_params, None, None))
+            .block_on(client.execute_sp_executesql(rewritten_sql, named_params, ()))
+            .map(|_| ())
     } else {
         // Statement-wise navigation: position on the batch's first statement
         // (msodbcsql parity) so no-row statements (PRINT / RAISERROR / DML) are
         // individually navigable via SQLMoreResults. finish_execute inspects the
         // resulting client state.
-        dbc.runtime
-            .block_on(client.execute_multi_statement(sql, None, None))
-            .map(|_| ())
+        dbc.runtime.block_on(client.execute(sql, ())).map(|_| ())
     };
     if let Err(e) = exec_result {
         error!(%e, "SQLExecDirectW: execution failed");

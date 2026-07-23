@@ -465,7 +465,7 @@ impl CursorClient for TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         rpc.serialize(&mut pw).await?;
 
-        let metadata = self.move_to_column_metadata().await?;
+        let metadata = self.next_rowset().await?;
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
             self.current_result_set_has_been_read_till_end = true;
@@ -1103,7 +1103,7 @@ impl TdsClient {
         // Clear any stale return status so a missing ReturnStatus token surfaces
         // as Succeeded rather than the previous RPC's status.
         self.last_return_status = ReturnStatus::NotReceived;
-        let metadata = self.move_to_column_metadata().await?;
+        let metadata = self.next_rowset().await?;
         self.current_metadata = metadata;
         let server_errors = self.drain_stream().await?;
         self.execution_context.set_has_open_batch(false);

@@ -76,8 +76,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 handle,
                 None,
                 Some(exec.named_params),
-                None,
-                None,
+                (),
             )) {
                 error!(%e, "SQLExecute: sp_execute failed");
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
@@ -98,8 +97,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 exec.rewritten_sql,
                 exec.named_params,
                 exec.drop_handle,
-                None,
-                None,
+                (),
             )) {
                 error!(%e, "SQLExecute: sp_prepexec failed");
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);

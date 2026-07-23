@@ -10,7 +10,7 @@ mod transport_protocols {
     use mssql_tds::connection::client_context::ClientContext;
     #[cfg(windows)]
     use mssql_tds::connection::client_context::TdsAuthenticationMethod;
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
     use std::env;
@@ -102,7 +102,7 @@ mod transport_protocols {
     /// Execute a simple query and verify we get results
     async fn test_simple_query(client: &mut TdsClient) -> TdsResult<()> {
         let query = "SELECT @@VERSION AS version";
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         let mut has_results = false;
         loop {
@@ -113,7 +113,7 @@ mod transport_protocols {
                 }
             }
 
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -479,13 +479,13 @@ mod transport_protocols {
 
         for query in queries {
             println!("Executing: {query}");
-            client.execute(query.to_string(), None, None).await?;
+            client.execute(query.to_string(), ()).await?;
 
             while let Some(resultset) = client.get_current_resultset() {
                 while let Some(_row) = resultset.next_row().await? {}
             }
 
-            if client.move_to_next().await? {
+            if client.advance_to_rows().await? {
                 // Process any additional result sets
             }
 

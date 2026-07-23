@@ -8,7 +8,7 @@ mod bulk_copy_integration_tests {
     use crate::common::{begin_connection, build_tcp_datasource, get_scalar_value, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::{
         ColumnValues, SqlDateTime2, SqlDateTimeOffset, SqlMoney, SqlTime,
@@ -97,8 +97,7 @@ mod bulk_copy_integration_tests {
                     value3 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -142,11 +141,7 @@ mod bulk_copy_integration_tests {
 
         // Check actual row count in database before assertion
         client
-            .execute(
-                "SELECT COUNT(*) as cnt FROM #BulkCopyTest".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) as cnt FROM #BulkCopyTest".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -166,8 +161,7 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT id, value1, value2, value3 FROM #BulkCopyTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -236,8 +230,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'TR') IS NOT NULL DROP TRIGGER {}",
                         trigger_name, trigger_name
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -247,8 +240,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
                         dest_table, dest_table
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -268,8 +260,7 @@ mod bulk_copy_integration_tests {
                 )",
                     dest_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -283,8 +274,7 @@ mod bulk_copy_integration_tests {
                     "CREATE TRIGGER {} ON {} AFTER INSERT AS PRINT N'bulk copy trigger info';",
                     trigger_name, dest_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create trigger");
@@ -360,8 +350,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'TR') IS NOT NULL DROP TRIGGER {}",
                         trigger_name, trigger_name
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -371,8 +360,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
                         dest_table, dest_table
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -391,8 +379,7 @@ mod bulk_copy_integration_tests {
                 )",
                     dest_table, timestamp
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -404,8 +391,7 @@ mod bulk_copy_integration_tests {
                     "CREATE TRIGGER {} ON {} AFTER INSERT AS PRINT N'midfail trigger info';",
                     trigger_name, dest_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create trigger");
@@ -470,8 +456,7 @@ mod bulk_copy_integration_tests {
                     value3 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -506,11 +491,7 @@ mod bulk_copy_integration_tests {
 
         // Verify count
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkCopyLarge".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkCopyLarge".to_string(), ())
             .await
             .expect("Failed to select count");
 
@@ -534,8 +515,7 @@ mod bulk_copy_integration_tests {
                     value2 INT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -641,8 +621,7 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT id, value1, value2 FROM #BulkCopyNulls ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -691,8 +670,7 @@ mod bulk_copy_integration_tests {
                     value1 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -725,8 +703,7 @@ mod bulk_copy_integration_tests {
                     value2 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -900,8 +877,7 @@ mod bulk_copy_integration_tests {
                     large_value VARCHAR(MAX)
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -938,8 +914,7 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT id, LEN(large_value) as len FROM #BulkCopyLargeString".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select from table");
@@ -982,8 +957,7 @@ mod bulk_copy_integration_tests {
                     value3 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -1030,8 +1004,7 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT COUNT(*) as cnt FROM #BulkCopyTableLock".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to count rows");
@@ -1055,8 +1028,7 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT id, value1, value2, value3 FROM #BulkCopyTableLock ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -1107,7 +1079,7 @@ mod bulk_copy_integration_tests {
             table_name, table_name
         );
         client
-            .execute(drop_sql, None, None)
+            .execute(drop_sql, ())
             .await
             .expect("Failed to drop test table");
         client.close_query().await.ok();
@@ -1124,7 +1096,7 @@ mod bulk_copy_integration_tests {
         );
 
         client
-            .execute(create_sql, None, None)
+            .execute(create_sql, ())
             .await
             .expect("Failed to create test table");
         client.close_query().await.expect("Failed to close query");
@@ -1145,7 +1117,7 @@ mod bulk_copy_integration_tests {
 
         // Get the session ID of the bulk copy connection
         client
-            .execute("SELECT @@SPID as session_id".to_string(), None, None)
+            .execute("SELECT @@SPID as session_id".to_string(), ())
             .await
             .expect("Failed to get session ID");
 
@@ -1212,7 +1184,7 @@ mod bulk_copy_integration_tests {
 
         while attempts < max_attempts {
             lock_monitor_client
-                .execute(lock_query.clone(), None, None)
+                .execute(lock_query.clone(), ())
                 .await
                 .expect("Failed to query locks");
 
@@ -1266,7 +1238,7 @@ mod bulk_copy_integration_tests {
 
         // Verify data was inserted
         lock_monitor_client
-            .execute(format!("SELECT COUNT(*) FROM {}", table_name), None, None)
+            .execute(format!("SELECT COUNT(*) FROM {}", table_name), ())
             .await
             .expect("Failed to count rows");
 
@@ -1283,7 +1255,7 @@ mod bulk_copy_integration_tests {
 
         // Cleanup - drop the persistent table
         lock_monitor_client
-            .execute(format!("DROP TABLE {}", table_name), None, None)
+            .execute(format!("DROP TABLE {}", table_name), ())
             .await
             .expect("Failed to drop test table");
         lock_monitor_client.close_query().await.ok();
@@ -1365,7 +1337,7 @@ mod bulk_copy_integration_tests {
             table_name, table_name
         );
         client
-            .execute(drop_sql, None, None)
+            .execute(drop_sql, ())
             .await
             .expect("Failed to drop test table");
         client.close_query().await.ok();
@@ -1382,7 +1354,7 @@ mod bulk_copy_integration_tests {
         );
 
         client
-            .execute(create_sql, None, None)
+            .execute(create_sql, ())
             .await
             .expect("Failed to create test table");
         client.close_query().await.expect("Failed to close query");
@@ -1426,8 +1398,7 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 format!("SELECT id, name, value FROM {} ORDER BY id", table_name),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -1474,7 +1445,7 @@ mod bulk_copy_integration_tests {
 
         // Cleanup - drop the table
         client
-            .execute(format!("DROP TABLE {}", table_name), None, None)
+            .execute(format!("DROP TABLE {}", table_name), ())
             .await
             .expect("Failed to drop test table");
         client.close_query().await.ok();
@@ -1497,7 +1468,7 @@ mod bulk_copy_integration_tests {
             table_name, table_name
         );
         client
-            .execute(drop_sql, None, None)
+            .execute(drop_sql, ())
             .await
             .expect("Failed to drop test table");
         client.close_query().await.ok();
@@ -1513,7 +1484,7 @@ mod bulk_copy_integration_tests {
         );
 
         client
-            .execute(create_sql, None, None)
+            .execute(create_sql, ())
             .await
             .expect("Failed to create test table");
         client.close_query().await.expect("Failed to close query");
@@ -1601,8 +1572,7 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 format!("SELECT id, name, value FROM {} ORDER BY id", table_name),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -1649,7 +1619,7 @@ mod bulk_copy_integration_tests {
 
         // Cleanup - drop the table
         client
-            .execute(format!("DROP TABLE {}", table_name), None, None)
+            .execute(format!("DROP TABLE {}", table_name), ())
             .await
             .expect("Failed to drop test table");
         client.close_query().await.ok();
@@ -1737,8 +1707,7 @@ mod bulk_copy_integration_tests {
                     col3 NVARCHAR(100)
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table with CHECK constraint");
@@ -1814,8 +1783,7 @@ mod bulk_copy_integration_tests {
                     col3 NVARCHAR(100)
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table with CHECK constraint");
@@ -1867,8 +1835,7 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT col1, col2 FROM #BulkCopyNoCheckConstraint WHERE col2 >= 500".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to query invalid data");
@@ -1993,8 +1960,7 @@ mod bulk_copy_integration_tests {
                     value INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table with DEFAULT constraint");
@@ -2045,8 +2011,7 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT id, name FROM #BulkCopyKeepNulls WHERE id = 2".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to query data");
@@ -2100,8 +2065,7 @@ mod bulk_copy_integration_tests {
                     value INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table with DEFAULT constraint");
@@ -2152,8 +2116,7 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT id, name FROM #BulkCopyNoKeepNulls WHERE id = 2".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to query data");
@@ -2300,8 +2263,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'TR') IS NOT NULL DROP TRIGGER {}",
                         trigger_name, trigger_name
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -2313,8 +2275,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
                         dest_table, dest_table
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -2326,8 +2287,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
                         marker_table, marker_table
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -2347,8 +2307,7 @@ mod bulk_copy_integration_tests {
                 )",
                     dest_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create destination table");
@@ -2364,8 +2323,7 @@ mod bulk_copy_integration_tests {
                 )",
                     marker_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create marker table");
@@ -2383,8 +2341,7 @@ mod bulk_copy_integration_tests {
                 INSERT INTO {} VALUES (333)",
                     trigger_name, dest_table, marker_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create trigger");
@@ -2423,11 +2380,7 @@ mod bulk_copy_integration_tests {
         // Verify the trigger fired by checking the marker table
         // The trigger inserts value 333 when rows are inserted
         client
-            .execute(
-                format!("SELECT marker_value FROM {}", marker_table),
-                None,
-                None,
-            )
+            .execute(format!("SELECT marker_value FROM {}", marker_table), ())
             .await
             .expect("Failed to query marker table");
 
@@ -2482,8 +2435,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'TR') IS NOT NULL DROP TRIGGER {}",
                         trigger_name, trigger_name
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -2493,8 +2445,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
                         dest_table, dest_table
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -2504,8 +2455,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
                         marker_table, marker_table
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -2525,8 +2475,7 @@ mod bulk_copy_integration_tests {
                 )",
                     dest_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create destination table");
@@ -2537,8 +2486,7 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 format!("CREATE TABLE {} (marker_value INT)", marker_table),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create marker table");
@@ -2554,8 +2502,7 @@ mod bulk_copy_integration_tests {
                 INSERT INTO {} VALUES (333)",
                     trigger_name, dest_table, marker_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create trigger");
@@ -2584,7 +2531,7 @@ mod bulk_copy_integration_tests {
 
         // Check marker table - should be EMPTY because trigger didn't fire
         client
-            .execute(format!("SELECT COUNT(*) FROM {}", marker_table), None, None)
+            .execute(format!("SELECT COUNT(*) FROM {}", marker_table), ())
             .await
             .expect("Failed to query marker table");
 
@@ -2685,10 +2632,7 @@ mod bulk_copy_integration_tests {
     async fn test_bulk_copy_diverse_types() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
-        client.execute(
-            "CREATE TABLE #BulkDiverse (id INT NOT NULL, nvarchar_val NVARCHAR(200), int_val INT, datetime2_val DATETIME2(3), varbinary_val VARBINARY(100))".to_string(),
-            None, None,
-        ).await.unwrap();
+        client.execute("CREATE TABLE #BulkDiverse (id INT NOT NULL, nvarchar_val NVARCHAR(200), int_val INT, datetime2_val DATETIME2(3), varbinary_val VARBINARY(100))".to_string(), ()).await.unwrap();
         client.close_query().await.unwrap();
 
         let rows: Vec<DiverseRow> = (0..5)
@@ -2713,7 +2657,7 @@ mod bulk_copy_integration_tests {
         }
 
         client
-            .execute("SELECT COUNT(*) FROM #BulkDiverse".to_string(), None, None)
+            .execute("SELECT COUNT(*) FROM #BulkDiverse".to_string(), ())
             .await
             .unwrap();
         let count = get_scalar_value(&mut client).await.unwrap();
@@ -2774,10 +2718,7 @@ mod bulk_copy_integration_tests {
     async fn test_bulk_copy_nullable_max_types() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
-        client.execute(
-            "CREATE TABLE #BulkNullable (id INT NOT NULL, nvarchar_max_val NVARCHAR(MAX), varbinary_max_val VARBINARY(MAX))".to_string(),
-            None, None,
-        ).await.unwrap();
+        client.execute("CREATE TABLE #BulkNullable (id INT NOT NULL, nvarchar_max_val NVARCHAR(MAX), varbinary_max_val VARBINARY(MAX))".to_string(), ()).await.unwrap();
         client.close_query().await.unwrap();
 
         let rows = vec![
@@ -2804,7 +2745,7 @@ mod bulk_copy_integration_tests {
         }
 
         client
-            .execute("SELECT COUNT(*) FROM #BulkNullable".to_string(), None, None)
+            .execute("SELECT COUNT(*) FROM #BulkNullable".to_string(), ())
             .await
             .unwrap();
         let count = get_scalar_value(&mut client).await.unwrap();
@@ -2865,10 +2806,7 @@ mod bulk_copy_integration_tests {
     async fn test_bulk_copy_time_and_datetimeoffset() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
-        client.execute(
-            "CREATE TABLE #BulkTime (id INT NOT NULL, time_val TIME(4), dto_val DATETIMEOFFSET(2))".to_string(),
-            None, None,
-        ).await.unwrap();
+        client.execute("CREATE TABLE #BulkTime (id INT NOT NULL, time_val TIME(4), dto_val DATETIMEOFFSET(2))".to_string(), ()).await.unwrap();
         client.close_query().await.unwrap();
 
         let rows = vec![
@@ -2914,7 +2852,7 @@ mod bulk_copy_integration_tests {
         }
 
         client
-            .execute("SELECT COUNT(*) FROM #BulkTime".to_string(), None, None)
+            .execute("SELECT COUNT(*) FROM #BulkTime".to_string(), ())
             .await
             .unwrap();
         let count = get_scalar_value(&mut client).await.unwrap();
@@ -2975,8 +2913,7 @@ mod bulk_copy_integration_tests {
             .execute(
                 "CREATE TABLE #BulkMoney (id INT NOT NULL, bigint_val BIGINT, money_val MONEY)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -3007,7 +2944,7 @@ mod bulk_copy_integration_tests {
         }
 
         client
-            .execute("SELECT COUNT(*) FROM #BulkMoney".to_string(), None, None)
+            .execute("SELECT COUNT(*) FROM #BulkMoney".to_string(), ())
             .await
             .unwrap();
         let count = get_scalar_value(&mut client).await.unwrap();

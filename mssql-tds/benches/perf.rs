@@ -28,7 +28,7 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use mssql_tds::{
     connection::{
         client_context::ClientContext,
-        tds_client::{ResultSet, ResultSetClient, TdsClient},
+        tds_client::{ResultSet, TdsClient},
     },
     connection_provider::tds_connection_provider::TdsConnectionProvider,
     core::{EncryptionOptions, EncryptionSetting},
@@ -86,13 +86,13 @@ fn fetch_large_encrypted(c: &mut Criterion) {
     group.bench_function("fetch_large_encrypted", |b| {
         b.iter(|| {
             rt.block_on(async {
-                client.execute(query.clone(), None, None).await.unwrap();
+                client.execute(query.clone(), ()).await.unwrap();
                 let mut _row_count = 0u64;
                 loop {
                     while client.next_row().await.unwrap().is_some() {
                         _row_count += 1;
                     }
-                    if !client.move_to_next().await.unwrap() {
+                    if !client.advance_to_rows().await.unwrap() {
                         break;
                     }
                 }
@@ -158,14 +158,14 @@ fn iter_rows(c: &mut Criterion) {
                     .await
                     .unwrap();
 
-                client.execute(iter_rows_query(), None, None).await.unwrap();
+                client.execute(iter_rows_query(), ()).await.unwrap();
 
                 let mut _row_count = 0u64;
                 loop {
                     while client.next_row().await.unwrap().is_some() {
                         _row_count += 1;
                     }
-                    if !client.move_to_next().await.unwrap() {
+                    if !client.advance_to_rows().await.unwrap() {
                         break;
                     }
                 }
@@ -195,7 +195,7 @@ fn connect_fetch_multiple_packets(c: &mut Criterion) {
 
                 let mut _row_count = 0;
                 client
-                    .execute(QUERY_TO_BENCHMARK.to_string(), None, None)
+                    .execute(QUERY_TO_BENCHMARK.to_string(), ())
                     .await
                     .unwrap();
                 // let mut row_count = 0;
@@ -204,7 +204,7 @@ fn connect_fetch_multiple_packets(c: &mut Criterion) {
                         _row_count += 1;
                     }
 
-                    if !client.move_to_next().await.unwrap() {
+                    if !client.advance_to_rows().await.unwrap() {
                         break;
                     }
                 }

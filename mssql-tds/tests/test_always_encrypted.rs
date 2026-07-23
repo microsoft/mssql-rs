@@ -36,7 +36,7 @@ mod always_encrypted {
     use mssql_tds::connection::client_context::{
         ColumnEncryptionSetting, ExecutionColumnEncryptionSetting,
     };
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::{
@@ -74,8 +74,8 @@ mod always_encrypted {
 
     /// Runs a non-query statement and drains any (empty) result.
     async fn run_statement(client: &mut TdsClient, sql: &str) -> TdsResult<()> {
-        client.execute(sql.to_string(), None, None).await?;
-        while client.move_to_next().await? {}
+        client.execute(sql.to_string(), ()).await?;
+        while client.advance_to_rows().await? {}
         client.close_query().await?;
         Ok(())
     }
@@ -106,7 +106,7 @@ mod always_encrypted {
     /// (or an error, so failure-path tests can assert decryption failures).
     async fn select_val(client: &mut TdsClient, table: &str) -> TdsResult<ColumnValues> {
         client
-            .execute(format!("SELECT val FROM {table};"), None, None)
+            .execute(format!("SELECT val FROM {table};"), ())
             .await?;
         let (_metadata, row) = get_first_row(client).await?;
         assert_eq!(row.len(), 1, "expected a single column");
@@ -231,12 +231,11 @@ mod always_encrypted {
                 .execute_sp_executesql(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
                     vec![param],
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("encrypted insert");
-            while self.client.move_to_next().await.unwrap() {}
+            while self.client.advance_to_rows().await.unwrap() {}
             self.client.close_query().await.unwrap();
         }
 
@@ -318,7 +317,7 @@ mod always_encrypted {
         /// as a vector of its first `ncols` (transparently decrypted) values.
         async fn query_rows(&mut self, select_sql: &str, ncols: usize) -> Vec<Vec<ColumnValues>> {
             self.client
-                .execute(select_sql.to_string(), None, None)
+                .execute(select_sql.to_string(), ())
                 .await
                 .expect("select rows");
             let mut rows = Vec::new();
@@ -853,12 +852,11 @@ mod always_encrypted {
                 .execute_sp_executesql(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
                     vec![param],
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("force-encrypted insert into an encrypted column should succeed");
-            while h.client.move_to_next().await.unwrap() {}
+            while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             let got = select_val(&mut h.client, &table)
@@ -887,8 +885,7 @@ mod always_encrypted {
                 .execute_sp_executesql(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
                     vec![param],
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect_err("ForceColumnEncryption on a plaintext column must be rejected");
@@ -912,7 +909,7 @@ mod always_encrypted {
         )
         .with_force_column_encryption(true);
         let err = client
-            .execute_sp_executesql("SELECT @val;".to_string(), vec![param], None, None)
+            .execute_sp_executesql("SELECT @val;".to_string(), vec![param], ())
             .await
             .expect_err("ForceColumnEncryption without Always Encrypted must be rejected");
         assert!(
@@ -948,10 +945,10 @@ mod always_encrypted {
                 SqlType::Int(Some(321)),
             );
             h.client
-                .execute_stored_procedure(proc.clone(), None, Some(vec![param]), None, None)
+                .execute_stored_procedure(proc.clone(), None, Some(vec![param]), ())
                 .await
                 .expect("execute stored procedure with encrypted parameter");
-            while h.client.move_to_next().await.unwrap() {}
+            while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             let got = select_val(&mut h.client, &table)
@@ -994,10 +991,10 @@ mod always_encrypted {
                 SqlType::Int(None),
             );
             h.client
-                .execute_stored_procedure(proc.clone(), None, Some(vec![out_param]), None, None)
+                .execute_stored_procedure(proc.clone(), None, Some(vec![out_param]), ())
                 .await
                 .expect("execute stored procedure with encrypted output parameter");
-            while h.client.move_to_next().await.unwrap() {}
+            while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             let return_values = h.client.get_return_values();
@@ -1035,10 +1032,10 @@ mod always_encrypted {
             // Unnamed (positional) parameter: bound to @val by position.
             let param = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(321)));
             h.client
-                .execute_stored_procedure(proc.clone(), Some(vec![param]), None, None, None)
+                .execute_stored_procedure(proc.clone(), Some(vec![param]), None, ())
                 .await
                 .expect("execute stored procedure with positional encrypted parameter");
-            while h.client.move_to_next().await.unwrap() {}
+            while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             let got = select_val(&mut h.client, &table)
@@ -1085,12 +1082,11 @@ mod always_encrypted {
                     proc.clone(),
                     Some(vec![positional]),
                     Some(vec![named]),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("execute stored procedure with mixed positional/named encrypted params");
-            while h.client.move_to_next().await.unwrap() {}
+            while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             let rows = h.query_rows(&format!("SELECT a, b FROM {table};"), 2).await;
@@ -1127,7 +1123,7 @@ mod always_encrypted {
             let out_param = RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None));
             let err = h
                 .client
-                .execute_stored_procedure(proc.clone(), Some(vec![out_param]), None, None, None)
+                .execute_stored_procedure(proc.clone(), Some(vec![out_param]), None, ())
                 .await
                 .expect_err("encrypted positional OUTPUT parameter must be rejected");
             assert!(
@@ -1154,10 +1150,10 @@ mod always_encrypted {
 
             let out_param = RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None));
             h.client
-                .execute_stored_procedure(proc.clone(), Some(vec![out_param]), None, None, None)
+                .execute_stored_procedure(proc.clone(), Some(vec![out_param]), None, ())
                 .await
                 .expect("plaintext positional OUTPUT parameter should be accepted");
-            while h.client.move_to_next().await.unwrap() {}
+            while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             let return_values = h.client.get_return_values();
@@ -1187,12 +1183,11 @@ mod always_encrypted {
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
                     vec![param],
                     None,
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("sp_prepexec with encrypted parameter");
-            while h.client.move_to_next().await.unwrap() {}
+            while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             let got = select_val(&mut h.client, &table)
@@ -1222,8 +1217,7 @@ mod always_encrypted {
                 .execute_sp_prepare(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
                     vec![decl],
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("sp_prepare with encrypted parameter");
@@ -1235,15 +1229,15 @@ mod always_encrypted {
                     SqlType::Int(Some(v)),
                 );
                 h.client
-                    .execute_sp_execute(handle, None, Some(vec![param]), None, None)
+                    .execute_sp_execute(handle, None, Some(vec![param]), ())
                     .await
                     .expect("sp_execute with encrypted named parameter");
-                while h.client.move_to_next().await.unwrap() {}
+                while h.client.advance_to_rows().await.unwrap() {}
                 h.client.close_query().await.unwrap();
             }
 
             h.client
-                .execute_sp_unprepare(handle, None, None)
+                .execute_sp_unprepare(handle, ())
                 .await
                 .expect("unprepare");
 
@@ -1280,8 +1274,7 @@ mod always_encrypted {
                 .execute_sp_prepare(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
                     vec![decl],
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("sp_prepare");
@@ -1289,14 +1282,14 @@ mod always_encrypted {
             // Positional (unnamed) value, matched to the declared @val by ordinal.
             let param = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(999)));
             h.client
-                .execute_sp_execute(handle, Some(vec![param]), None, None, None)
+                .execute_sp_execute(handle, Some(vec![param]), None, ())
                 .await
                 .expect("sp_execute with positional encrypted parameter");
-            while h.client.move_to_next().await.unwrap() {}
+            while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             h.client
-                .execute_sp_unprepare(handle, None, None)
+                .execute_sp_unprepare(handle, ())
                 .await
                 .expect("unprepare");
 
@@ -1341,8 +1334,7 @@ mod always_encrypted {
                 .execute_sp_prepare(
                     format!("INSERT INTO {table} (a, b) VALUES (@a, @b);"),
                     decls,
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("sp_prepare two encrypted params");
@@ -1359,14 +1351,14 @@ mod always_encrypted {
                 SqlType::Int(Some(22)),
             )];
             h.client
-                .execute_sp_execute(handle, Some(positional), Some(named), None, None)
+                .execute_sp_execute(handle, Some(positional), Some(named), ())
                 .await
                 .expect("sp_execute with mixed positional and named encrypted params");
-            while h.client.move_to_next().await.unwrap() {}
+            while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             h.client
-                .execute_sp_unprepare(handle, None, None)
+                .execute_sp_unprepare(handle, ())
                 .await
                 .expect("unprepare");
 
@@ -1398,7 +1390,7 @@ mod always_encrypted {
             );
             let err = h
                 .client
-                .execute_sp_execute(999_999, None, Some(vec![param]), None, None)
+                .execute_sp_execute(999_999, None, Some(vec![param]), ())
                 .await
                 .expect_err("sp_execute with an unprepared handle must error under AE");
             assert!(
@@ -1425,10 +1417,10 @@ mod always_encrypted {
                     SqlType::Int(Some(v)),
                 );
                 h.client
-                    .execute_sp_executesql(sql.clone(), vec![param], None, None)
+                    .execute_sp_executesql(sql.clone(), vec![param], ())
                     .await
                     .expect("encrypted insert");
-                while h.client.move_to_next().await.unwrap() {}
+                while h.client.advance_to_rows().await.unwrap() {}
                 h.client.close_query().await.unwrap();
             }
             let describes = h.client.describe_round_trips() - before;
@@ -1504,11 +1496,7 @@ mod always_encrypted {
 
             // Read back over the AE-enabled connection: values are decrypted.
             h.client
-                .execute(
-                    format!("SELECT id, val FROM {table} ORDER BY id;"),
-                    None,
-                    None,
-                )
+                .execute(format!("SELECT id, val FROM {table} ORDER BY id;"), ())
                 .await
                 .expect("select decrypted values");
             let mut got = Vec::new();
@@ -1532,7 +1520,7 @@ mod always_encrypted {
             // raw varbinary, not the plaintext int.
             let mut plain = connect_disabled().await;
             plain
-                .execute(format!("SELECT val FROM {table} WHERE id = 1;"), None, None)
+                .execute(format!("SELECT val FROM {table} WHERE id = 1;"), ())
                 .await
                 .expect("select ciphertext with AE disabled");
             let (_metadata, row) = get_first_row(&mut plain).await.expect("ciphertext row");
@@ -1581,11 +1569,7 @@ mod always_encrypted {
     async fn read_ciphertext(table: &str, id: i32) -> Vec<u8> {
         let mut plain = connect_disabled().await;
         plain
-            .execute(
-                format!("SELECT val FROM {table} WHERE id = {id};"),
-                None,
-                None,
-            )
+            .execute(format!("SELECT val FROM {table} WHERE id = {id};"), ())
             .await
             .expect("select ciphertext with AE disabled");
         let (_metadata, row) = get_first_row(&mut plain).await.expect("ciphertext row");
@@ -2055,11 +2039,7 @@ mod always_encrypted {
             // Read only the FIRST encrypted row of a multi-row result set, then
             // abandon the rest.
             h.client
-                .execute(
-                    format!("SELECT id, val FROM {table} ORDER BY id;"),
-                    None,
-                    None,
-                )
+                .execute(format!("SELECT id, val FROM {table} ORDER BY id;"), ())
                 .await
                 .expect("first select");
             let first = {
@@ -2207,12 +2187,13 @@ mod always_encrypted {
             h.insert_encrypted(&table, SqlType::Int(Some(4242))).await;
 
             h.client
-                .execute_sp_executesql_with_encryption_setting(
+                .execute_sp_executesql(
                     format!("SELECT val FROM {table};"),
                     vec![],
-                    ExecutionColumnEncryptionSetting::ResultSetOnly,
-                    None,
-                    None,
+                    mssql_tds::connection::tds_client::ExecuteOptions {
+                        column_encryption: ExecutionColumnEncryptionSetting::ResultSetOnly,
+                        ..Default::default()
+                    },
                 )
                 .await
                 .expect("select under ResultSetOnly");

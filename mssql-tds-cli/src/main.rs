@@ -15,7 +15,7 @@ use rustyline::hint::Hinter;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{CompletionType, Config, Editor, error::ReadlineError};
 
-use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+use mssql_tds::connection::tds_client::{ResultSet, StatementResult, TdsClient};
 use mssql_tds::core::TdsResult;
 
 #[tokio::main]
@@ -109,38 +109,37 @@ impl Session {
             "No active connection",
         ))?;
 
-        // Execute the SQL batch
-        connection.execute(sql_command, None, None).await?;
-
-        // Iterate through all result sets
+        // Execute the SQL batch and iterate through all results, statement-wise.
+        let mut result = connection.execute(sql_command, ()).await?;
         loop {
-            // Check if there's a current result set
-            if let Some(resultset) = connection.get_current_resultset() {
-                // Read all rows from this result set
-                let mut row_count = 0;
-                while let Some(row) = resultset.next_row().await? {
-                    row_count += 1;
-                    // Print each column value
-                    for value in row.iter() {
-                        print!("{value:?} | ");
+            match result {
+                StatementResult::Rows => {
+                    // Read all rows from this result set
+                    let mut row_count = 0;
+                    while let Some(row) = connection.next_row().await? {
+                        row_count += 1;
+                        // Print each column value
+                        for value in row.iter() {
+                            print!("{value:?} | ");
+                        }
+                        println!();
                     }
-                    println!();
-                }
 
-                if row_count == 0 {
-                    println!("(0 rows affected)");
-                } else {
-                    println!("({row_count} rows affected)");
+                    if row_count == 0 {
+                        println!("(0 rows affected)");
+                    } else {
+                        println!("({row_count} rows affected)");
+                    }
                 }
-            } else {
-                // No result set means DML operation
-                println!("Command completed successfully");
+                StatementResult::NoRows { rows_affected } => match rows_affected {
+                    Some(n) => println!("({n} rows affected)"),
+                    None => println!("Command completed successfully"),
+                },
+                StatementResult::End => break,
             }
 
-            // Try to move to the next result set
-            if !connection.move_to_next().await? {
-                break; // No more result sets
-            }
+            // Advance to the next result.
+            result = connection.advance().await?;
         }
         Ok(())
     }

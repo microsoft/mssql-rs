@@ -180,7 +180,7 @@ fn test_has_valid_credentials() {
 mod e2e {
     use super::*;
     use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
 
@@ -263,7 +263,7 @@ mod e2e {
         println!("Executing query: {}", query);
 
         client
-            .execute(query.to_string(), None, None)
+            .execute(query.to_string(), ())
             .await
             .expect("Failed to execute query");
 
@@ -291,7 +291,11 @@ mod e2e {
         }
 
         // Move to completion
-        while client.move_to_next().await.expect("Failed to move to next") {}
+        while client
+            .advance_to_rows()
+            .await
+            .expect("Failed to move to next")
+        {}
 
         println!("=== Kerberos E2E Connection Test PASSED ===");
     }
@@ -318,7 +322,7 @@ mod e2e {
 
         // Query 1: Get server version
         client
-            .execute("SELECT @@VERSION".to_string(), None, None)
+            .execute("SELECT @@VERSION".to_string(), ())
             .await
             .expect("Query 1 failed");
         if let Some(rs) = client.get_current_resultset()
@@ -326,11 +330,11 @@ mod e2e {
         {
             println!("SQL Server Version: {:?}", row[0]);
         }
-        while client.move_to_next().await.expect("Failed") {}
+        while client.advance_to_rows().await.expect("Failed") {}
 
         // Query 2: Get current time
         client
-            .execute("SELECT GETDATE() AS ServerTime".to_string(), None, None)
+            .execute("SELECT GETDATE() AS ServerTime".to_string(), ())
             .await
             .expect("Query 2 failed");
         if let Some(rs) = client.get_current_resultset()
@@ -338,15 +342,14 @@ mod e2e {
         {
             println!("Server Time: {:?}", row[0]);
         }
-        while client.move_to_next().await.expect("Failed") {}
+        while client.advance_to_rows().await.expect("Failed") {}
 
         // Query 3: Get authentication info
         client
             .execute(
                 "SELECT auth_scheme FROM sys.dm_exec_connections WHERE session_id = @@SPID"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Query 3 failed");
@@ -362,7 +365,7 @@ mod e2e {
                 auth_scheme
             );
         }
-        while client.move_to_next().await.expect("Failed") {}
+        while client.advance_to_rows().await.expect("Failed") {}
 
         println!("✓ Multiple queries on Kerberos connection succeeded!");
     }
@@ -395,7 +398,7 @@ mod e2e {
 
         // Verify connection works
         client
-            .execute("SELECT 1 AS Test".to_string(), None, None)
+            .execute("SELECT 1 AS Test".to_string(), ())
             .await
             .expect("Query failed");
         if let Some(rs) = client.get_current_resultset()
@@ -403,7 +406,7 @@ mod e2e {
         {
             println!("Explicit SPN test result: {:?}", row[0]);
         }
-        while client.move_to_next().await.expect("Failed") {}
+        while client.advance_to_rows().await.expect("Failed") {}
 
         println!("✓ Connection with explicit SPN succeeded!");
     }
@@ -462,7 +465,7 @@ mod e2e {
         println!("Executing query: {}", query);
 
         client
-            .execute(query.to_string(), None, None)
+            .execute(query.to_string(), ())
             .await
             .expect("Failed to execute query");
 
@@ -492,7 +495,11 @@ mod e2e {
             panic!("No result set or rows returned from query");
         }
 
-        while client.move_to_next().await.expect("Failed to move to next") {}
+        while client
+            .advance_to_rows()
+            .await
+            .expect("Failed to move to next")
+        {}
 
         println!("=== Kerberos IP Address Connection Test PASSED ===");
         println!("✓ Reverse DNS lookup correctly resolved IP to FQDN for SPN construction!");

@@ -6,7 +6,7 @@ mod common;
 
 mod rpc_results {
     use crate::common::{begin_connection, build_tcp_datasource, get_scalar_value, init_tracing};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::datatypes::column_values::{ColumnValues, SqlDateTime2, SqlTime};
     use mssql_tds::datatypes::decoder::DecimalParts;
     use mssql_tds::datatypes::sql_string::SqlString;
@@ -65,8 +65,7 @@ mod rpc_results {
                 stored_procedure_query.to_string(),
                 None,
                 Some(named_parameters),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -120,8 +119,7 @@ mod rpc_results {
                 stored_procedure_query.to_string(),
                 None,
                 Some(named_parameters),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -131,7 +129,7 @@ mod rpc_results {
             if let Some(resultset) = connection.get_current_resultset() {
                 while resultset.next_row().await.unwrap().is_some() {}
             }
-            if !connection.move_to_next().await.unwrap() {
+            if !connection.advance_to_rows().await.unwrap() {
                 break;
             }
         }
@@ -164,7 +162,7 @@ mod rpc_results {
         let named_parameters = vec![database_id_param, compat_level_param];
 
         connection
-            .execute_sp_executesql(query.to_string(), named_parameters, None, None)
+            .execute_sp_executesql(query.to_string(), named_parameters, ())
             .await
             .unwrap();
 
@@ -191,7 +189,7 @@ mod rpc_results {
         let named_parameters = vec![database_id_param];
 
         connection
-            .execute_sp_executesql(query.to_string(), named_parameters, None, None)
+            .execute_sp_executesql(query.to_string(), named_parameters, ())
             .await
             .unwrap();
 
@@ -224,14 +222,14 @@ mod rpc_results {
         let named_parameters = vec![database_id_param, compat_level_param];
 
         let handle = connection
-            .execute_sp_prepare(query.to_string(), named_parameters, None, None)
+            .execute_sp_prepare(query.to_string(), named_parameters, ())
             .await
             .unwrap();
 
         assert!(handle > 0);
 
         // This should simply complete and be successful.
-        let result = connection.execute_sp_unprepare(handle, None, None).await;
+        let result = connection.execute_sp_unprepare(handle, ()).await;
         assert!(result.is_ok());
     }
 
@@ -256,14 +254,14 @@ mod rpc_results {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
         let handle = connection
-            .execute_sp_prepare(query.to_string(), vec![db_name_param], None, None)
+            .execute_sp_prepare(query.to_string(), vec![db_name_param], ())
             .await
             .expect("sp_prepare should succeed for an NVARCHAR-parameterized statement");
 
         assert!(handle > 0, "expected a positive prepared statement handle");
 
         connection
-            .execute_sp_unprepare(handle, None, None)
+            .execute_sp_unprepare(handle, ())
             .await
             .expect("sp_unprepare should succeed");
     }
@@ -278,7 +276,7 @@ mod rpc_results {
     async fn test_sp_unprepare_surfaces_server_error_on_invalid_handle() {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
-        let res = connection.execute_sp_unprepare(0, None, None).await;
+        let res = connection.execute_sp_unprepare(0, ()).await;
 
         match res {
             Ok(()) => panic!("Expected sp_unprepare to fail for handle 0"),
@@ -312,7 +310,7 @@ mod rpc_results {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
         let res = connection
-            .execute_sp_prepare(invalid_sql.to_string(), vec![], None, None)
+            .execute_sp_prepare(invalid_sql.to_string(), vec![], ())
             .await;
 
         match res {
@@ -423,7 +421,7 @@ mod rpc_results {
         ];
 
         connection
-            .execute_sp_executesql(insert_sql.to_string(), insert_params, None, None)
+            .execute_sp_executesql(insert_sql.to_string(), insert_params, ())
             .await
             .expect("seed row insert via sp_executesql");
 
@@ -473,7 +471,7 @@ mod rpc_results {
         let param = RpcParameter::new(Some(param_name.to_string()), StatusFlags::NONE, value);
 
         let handle = connection
-            .execute_sp_prepare(sql.clone(), vec![param.clone()], None, None)
+            .execute_sp_prepare(sql.clone(), vec![param.clone()], ())
             .await
             .unwrap_or_else(|err| {
                 panic!("sp_prepare failed for column `{column}`: {err}");
@@ -484,7 +482,7 @@ mod rpc_results {
         );
 
         connection
-            .execute_sp_execute(handle, None, Some(vec![param]), None, None)
+            .execute_sp_execute(handle, None, Some(vec![param]), ())
             .await
             .unwrap_or_else(|err| {
                 panic!("sp_execute failed for column `{column}`: {err}");
@@ -500,7 +498,7 @@ mod rpc_results {
         };
 
         connection
-            .execute_sp_unprepare(handle, None, None)
+            .execute_sp_unprepare(handle, ())
             .await
             .unwrap_or_else(|err| {
                 panic!("sp_unprepare failed for column `{column}`: {err}");
@@ -529,13 +527,7 @@ mod rpc_results {
         let named_parameters = vec![database_id_param, compat_level_param];
 
         connection
-            .execute_sp_prepexec(
-                query.to_string(),
-                named_parameters.clone(),
-                None,
-                None,
-                None,
-            )
+            .execute_sp_prepexec(query.to_string(), named_parameters.clone(), None, ())
             .await
             .unwrap();
 
@@ -546,7 +538,7 @@ mod rpc_results {
 
         // Move to next result set to consume remaining tokens (including the
         // `@handle` return value).
-        connection.move_to_next().await.unwrap();
+        connection.advance_to_rows().await.unwrap();
 
         // The sp_prepexec `@handle` is captured into `prepared_statement_handle`
         // during the drain above and is deliberately NOT surfaced through
@@ -562,7 +554,7 @@ mod rpc_results {
 
         // Execute the prepared statement again
         connection
-            .execute_sp_execute(retrieved_handle, None, Some(named_parameters), None, None)
+            .execute_sp_execute(retrieved_handle, None, Some(named_parameters), ())
             .await
             .unwrap();
 
@@ -573,9 +565,7 @@ mod rpc_results {
             unreachable!("Expected a string value");
         }
 
-        let result = connection
-            .execute_sp_unprepare(retrieved_handle, None, None)
-            .await;
+        let result = connection.execute_sp_unprepare(retrieved_handle, ()).await;
         assert!(result.is_ok());
     }
 
@@ -589,14 +579,14 @@ mod rpc_results {
         drop_handle: Option<i32>,
     ) -> i32 {
         connection
-            .execute_sp_prepexec(sql.to_string(), vec![], drop_handle, None, None)
+            .execute_sp_prepexec(sql.to_string(), vec![], drop_handle, ())
             .await
             .unwrap();
 
         if let Some(resultset) = connection.get_current_resultset() {
             while resultset.next_row().await.unwrap().is_some() {}
         }
-        connection.move_to_next().await.unwrap();
+        connection.advance_to_rows().await.unwrap();
 
         // The `@handle` RETURNVALUE arrives after the result set and is captured
         // into `prepared_statement_handle` during the drain above — it is not
@@ -628,7 +618,7 @@ mod rpc_results {
 
         // The returned handle runs the NEW statement.
         connection
-            .execute_sp_execute(h2, None, None, None, None)
+            .execute_sp_execute(h2, None, None, ())
             .await
             .unwrap();
         let scalar = get_scalar_value(&mut connection).await.unwrap();
@@ -637,10 +627,7 @@ mod rpc_results {
             "re-prepared handle should run SELECT 2, got {scalar:?}"
         );
 
-        connection
-            .execute_sp_unprepare(h2, None, None)
-            .await
-            .unwrap();
+        connection.execute_sp_unprepare(h2, ()).await.unwrap();
     }
 
     // Executes the query and reads till the end of the result.
@@ -648,14 +635,14 @@ mod rpc_results {
         connection: &mut mssql_tds::connection::tds_client::TdsClient,
         query: String,
     ) -> TdsResult<()> {
-        connection.execute(query, None, None).await?;
+        connection.execute(query, ()).await?;
 
         // Drain all result sets
         loop {
             if let Some(resultset) = connection.get_current_resultset() {
                 while resultset.next_row().await?.is_some() {}
             }
-            if !connection.move_to_next().await? {
+            if !connection.advance_to_rows().await? {
                 break;
             }
         }

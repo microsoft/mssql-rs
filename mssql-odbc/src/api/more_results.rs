@@ -92,8 +92,8 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         client
     };
 
-    match dbc.runtime.block_on(client.move_to_next_statement()) {
-        Ok(StatementResult::RowSet) => {
+    match dbc.runtime.block_on(client.advance()) {
+        Ok(StatementResult::Rows) => {
             // Positioned on a new row-returning result set. Refresh metadata,
             // clear row state, keep CURSOR_OPEN and active_stmt set.
             let metadata = client.get_metadata().clone();
@@ -183,7 +183,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             SQL_NO_DATA
         }
         Err(e) => {
-            error!(%e, "SQLMoreResults: move_to_next_statement failed");
+            error!(%e, "SQLMoreResults: advance failed");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 // Treat as terminal: clear cursor state and post diagnostic.
                 reset_cursor_state(&mut stmt_state);
@@ -223,7 +223,7 @@ mod tests {
         let mut client = tds_client_from_tokens(tokens);
         let first = dbc
             .runtime
-            .block_on(client.execute_multi_statement("SELECT 1;".to_string(), None, None))
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
             .unwrap();
         {
             let mut ss = stmt.inner.lock().unwrap();
@@ -250,7 +250,7 @@ mod tests {
                 col_metadata_empty(), // stmt2 row set
             ],
         );
-        assert_eq!(first, StatementResult::RowSet);
+        assert_eq!(first, StatementResult::Rows);
 
         let ret = unsafe { sql_more_results(h.stmt) };
         assert_eq!(ret, SQL_SUCCESS);
@@ -274,7 +274,7 @@ mod tests {
                 done_no_more(),              // stmt2 no-row result, last in batch
             ],
         );
-        assert_eq!(first, StatementResult::RowSet);
+        assert_eq!(first, StatementResult::Rows);
 
         // Advance onto the no-row statement result.
         let ret = unsafe { sql_more_results(h.stmt) };
@@ -319,7 +319,7 @@ mod tests {
         // Position on a row set, then leave nothing behind it so the drain hits
         // the end of the scripted stream and reports a closed connection.
         let first = position_first_and_inject(&h, vec![col_metadata_empty()]);
-        assert_eq!(first, StatementResult::RowSet);
+        assert_eq!(first, StatementResult::Rows);
 
         let ret = unsafe { sql_more_results(h.stmt) };
         assert_eq!(ret, SQL_ERROR);
