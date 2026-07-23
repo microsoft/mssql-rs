@@ -11,10 +11,13 @@
 //! leaving the SQLSTATE posting to the caller (whose diagnostic target differs
 //! between the two fetch paths).
 //!
-//! Scope so far: the fixed-width integer C targets from an integer source
-//! column (`tinyint` / `smallint` / `int` / `bigint` / `bit`). Unhandled
-//! source/target pairs return [`ConvError::Unsupported`] so callers can fall
-//! back to their existing paths (e.g. the character conversion in `get_data`).
+//! Scope: the fixed-width integer C targets, floating-point targets
+//! (`SQL_C_FLOAT` / `SQL_C_DOUBLE`), `SQL_C_GUID`, and the date/time C structs
+//! (`SQL_C_TYPE_DATE` / `TIME` / `TIMESTAMP`, `SQL_C_SS_TIME2`,
+//! `SQL_C_SS_TIMESTAMPOFFSET`), plus an ISO-style text formatter for date/time
+//! character output. Unhandled source/target pairs return
+//! [`ConvError::Unsupported`] so callers can fall back to their existing paths
+//! (e.g. the character conversion in `get_data`).
 
 use super::odbc_types::{
     SQL_C_BIT, SQL_C_DATE, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_LONG, SQL_C_SBIGINT,
@@ -114,12 +117,13 @@ pub(crate) unsafe fn convert_integer_c(
     }
 
     let ret = match target_type {
-        // SQL_C_TINYINT is signed per the ODBC C type mapping (same as
-        // SQL_C_STINYINT); SQL_C_UTINYINT is the unsigned form.
-        SQL_C_STINYINT | SQL_C_TINYINT => unsafe {
-            write_fixed(target_value_ptr, narrow!(i8), strlen_or_ind_ptr)
+        // SQL_C_TINYINT maps to an unsigned SQLCHAR (SQL Server `tinyint` is
+        // 0-255 and mssql-python fetches it unsigned); only SQL_C_STINYINT is
+        // the signed form.
+        SQL_C_STINYINT => unsafe { write_fixed(target_value_ptr, narrow!(i8), strlen_or_ind_ptr) },
+        SQL_C_TINYINT | SQL_C_UTINYINT => unsafe {
+            write_fixed(target_value_ptr, narrow!(u8), strlen_or_ind_ptr)
         },
-        SQL_C_UTINYINT => unsafe { write_fixed(target_value_ptr, narrow!(u8), strlen_or_ind_ptr) },
         SQL_C_SSHORT | SQL_C_SHORT => unsafe {
             write_fixed(target_value_ptr, narrow!(i16), strlen_or_ind_ptr)
         },
@@ -182,10 +186,15 @@ pub(crate) unsafe fn convert_float_c(
         return Err(ConvError::Unsupported);
     };
     let ret = match target_type {
-        // SQL_C_FLOAT is 32-bit; the narrowing follows the ODBC contract (the
-        // driver may lose precision, mirroring the C cast an application would
-        // perform itself).
-        SQL_C_FLOAT => unsafe { write_fixed(target_value_ptr, v as f32, strlen_or_ind_ptr) },
+        // SQL_C_FLOAT is 32-bit. A finite value outside the f32 range must be
+        // reported as an overflow (22003) rather than silently becoming
+        // infinity; a source that is already infinite passes through.
+        SQL_C_FLOAT => {
+            if v.is_finite() && v.abs() > f64::from(f32::MAX) {
+                return Err(ConvError::OutOfRange);
+            }
+            unsafe { write_fixed(target_value_ptr, v as f32, strlen_or_ind_ptr) }
+        }
         SQL_C_DOUBLE => unsafe { write_fixed(target_value_ptr, v, strlen_or_ind_ptr) },
         _ => return Err(ConvError::Unsupported),
     };
@@ -719,6 +728,51 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ConvError::Unsupported);
+    }
+
+    #[test]
+    fn tinyint_c_target_is_unsigned() {
+        // SQL_C_TINYINT is unsigned: 200 (> i8::MAX) must round-trip.
+        let mut out: u8 = 0;
+        let mut ind: SqlLen = 0;
+        let ret = conv(
+            &ColumnValues::TinyInt(200),
+            SQL_C_TINYINT,
+            (&mut out as *mut u8).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 200);
+    }
+
+    #[test]
+    fn signed_tinyint_target_rejects_over_127() {
+        let mut out: i8 = 0;
+        let mut ind: SqlLen = 0;
+        let err = conv(
+            &ColumnValues::TinyInt(200),
+            SQL_C_STINYINT,
+            (&mut out as *mut i8).cast(),
+            &mut ind,
+        )
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
+    }
+
+    #[test]
+    fn float_target_overflow_is_out_of_range() {
+        // A finite f64 beyond the f32 range must report 22003, not infinity.
+        let mut out: f32 = 0.0;
+        let mut ind: SqlLen = 0;
+        let err = conv_f(
+            &ColumnValues::Float(1.0e40),
+            SQL_C_FLOAT,
+            (&mut out as *mut f32).cast(),
+            &mut ind,
+        )
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
     }
 
     // ---- GUID ------------------------------------------------------------
