@@ -27,6 +27,18 @@ in the ODBC Driver 18 (Rust).
   supersede and `SQLFreeHandle(STMT)` still issue a standalone `sp_unprepare`
   (`flush_pending_unprepare` / best-effort), since neither runs an `sp_prepexec`
   to ride along.
+- **Stale-handle invalidation after transparent reconnect** — every cached
+  handle (`prepared_handle` and `pending_unprepare`) carries the connection's
+  `session_epoch` at capture. `SQLExecute` performs the single recovery up front
+  (`check_and_reconnect`, mirroring msodbcsql `GetBatchCtxOrRecover`), then
+  predictively re-evaluates handle liveness against the post-recovery epoch
+  (`plan_execution`, mirroring `FIsReprepareRequired`): a handle from a
+  superseded session is dropped — the cached handle is re-prepared fresh and a
+  stale piggyback drop is skipped (the server already discarded it). No RPC
+  recovers again after the decision, so the send is bound to the same session
+  and can never fire a handle from a dead one (no reliance on server error 8179).
+  The standalone `sp_unprepare` paths (`flush_pending_unprepare`,
+  `SQLFreeHandle(STMT)`) skip a stale handle the same way.
 - **Lifecycle** — `SQL_RESET_PARAMS` clears bindings; `SQLCloseCursor` /
   `SQLFreeStmt(SQL_CLOSE)` preserve the handle; re-`SQLPrepare` and rebind
   orphan it for release.
@@ -48,6 +60,12 @@ semantics. Files: `src/connection/tds_client.rs`, `tests/test_rpc_results.rs`,
 - `execute_sp_prepexec` gained a `drop_handle: Option<i32>` argument — the handle
   sent as the by-reference `@handle` input for the piggybacked unprepare (per the
   `sp_unprepare` bullet above).
+- `connection_recovery_count()` doubles as the connection's session epoch, and
+  `check_and_reconnect()` is now public so the caller can own the single
+  recovery point. `execute_sp_execute` / `execute_sp_prepexec` no longer recover
+  internally: the ODBC layer reconnects first, decides handle liveness against
+  `connection_recovery_count()`, then sends — so no reconnect can slip between
+  the decision and the send and turn the chosen handle stale (Bug 2 fix).
 - Handle capture via new `expecting_prepare_handle` / `prepared_statement_handle`
   fields and `take_prepared_statement_handle()`. The `@handle` RETURNVALUE is
   routed to that field and **not** surfaced through `get_return_values()` /
@@ -108,13 +126,6 @@ semantics. Files: `src/connection/tds_client.rs`, `tests/test_rpc_results.rs`,
   `RpcParameter` from `ParameterType`, converting the C value to that SQL/TDS
   type. This pairs with the type-matrix work above and lets `is_valid_conversion`
   finally use its `_sql_type` argument.
-- **Improve the `mssql-tds` prepared-handle interface.** Today the ODBC layer
-  must call `client.take_prepared_statement_handle()` *after* `close_query` to
-  pick up the captured handle — an implicit two-step contract that's easy to
-  get wrong. Make the TDS API express this directly, e.g. have `close_query`
-  return any captured handle, or expose a single
-  `close_query_and_take_handle()`, so callers don't have to know the handle was
-  stashed before the `return_values` clear.
 - **Deferred features:** output params (`SQL_PARAM_OUTPUT`), data-at-exec
   (`SQLParamData` / `SQLPutData`), parameter arrays (`SQL_ATTR_PARAMSET_SIZE`),
   and TVPs. For DAE specifically, fall back to `sp_prepare` + `sp_execute` since
@@ -125,17 +136,3 @@ semantics. Files: `src/connection/tds_client.rs`, `tests/test_rpc_results.rs`,
   1`) and a server parameter-count limit. We only handle ad-hoc T-SQL via
   `sp_prepexec` today; add the canonical-RPC branch with the same param-count /
   array-size guards when procedure-call syntax is supported.
-- **Prepared-handle invalidation after transparent reconnect (next PR).**
-  `execute_sp_execute` / `execute_sp_prepexec` reconnect internally via
-  `check_and_reconnect`; after a transparent reconnect the cached `prepared_handle`
-  (and any deferred drop handle) belongs to the dead session. SQL Server restarts
-  prepared-handle numbering per session, so reuse fails with error 8179 ("Could
-  not find prepared statement with handle") or silently aliases another
-  statement's handle. Fix: thread the recovery generation through the
-  prepared-handle API — `PreparedHandle { id, generation }` stamped at prepare and
-  checked inside the TDS execute methods right after recovery (mirrors msodbcsql's
-  per-`LPSTMT` `dwConnectionId` + `FIsReprepareRequired`), returning a
-  `PreparedHandleStale` error the ODBC layer re-prepares on. The generation must
-  live with the handle's holder (`StmtState`), not a connection-side set, since
-  per-session handle reuse would otherwise alias handles. Touches only `mssql-odbc`
-  + `mssql-tds` (no FFI bindings).

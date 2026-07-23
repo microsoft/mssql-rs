@@ -12,7 +12,7 @@ use crate::api::odbc_types::{
 };
 use crate::api::sqlstate::SQLSTATE_HY000;
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
+use crate::handles::stmt::{PreparedHandle, STMT_STATE_CURSOR_OPEN};
 use crate::handles::{DbcHandle, EnvHandle, HandleType, StmtHandle, free_handle, handle_from_raw};
 
 /// Implementation of [`SQLFreeHandle`](super::exports::SQLFreeHandle).
@@ -212,7 +212,7 @@ fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &Dbc
         super::close_cursor::drain_and_release(stmt, handle);
     }
 
-    let handles: Vec<i32> = match stmt.inner.lock() {
+    let handles: Vec<PreparedHandle> = match stmt.inner.lock() {
         Ok(mut stmt_state) => [
             stmt_state.prepared_handle.take(),
             stmt_state.pending_unprepare.take(),
@@ -232,12 +232,17 @@ fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &Dbc
         return;
     };
 
-    for handle in handles {
+    let session_epoch = client.connection_recovery_count();
+    for prepared in handles {
+        if prepared.session_epoch != session_epoch {
+            // Handle from a superseded session — already gone server-side.
+            continue;
+        }
         if let Err(e) = dbc
             .runtime
-            .block_on(client.execute_sp_unprepare(handle, None, None))
+            .block_on(client.execute_sp_unprepare(prepared.id, None, None))
         {
-            error!(%e, handle, "SQLFreeHandle(STMT): sp_unprepare failed — handle leaked until disconnect");
+            error!(%e, handle = prepared.id, "SQLFreeHandle(STMT): sp_unprepare failed — handle leaked until disconnect");
         }
     }
 

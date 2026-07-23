@@ -508,6 +508,111 @@ mod connectivity {
             Ok(())
         }
 
+        // ── Prepared-Handle Invalidation Across Reconnect ─────────────
+
+        /// A prepared-statement handle belongs to the session that created it.
+        /// After a transparent reconnect the server-side handle is gone, so
+        /// reusing it via `sp_execute` fails with error 8179 ("Could not find
+        /// prepared statement with handle"), while a fresh `sp_prepexec` on the
+        /// recovered session succeeds.
+        ///
+        /// This is the hazard the ODBC layer's epoch gate (`plan_execution`)
+        /// prevents: it stamps each handle with the recovery count and
+        /// re-prepares instead of reusing a handle from a superseded session.
+        /// Recovery is caller-owned here — we drive it via `check_and_reconnect`,
+        /// exactly as `SQLExecute` does, and the RPCs never self-recover.
+        #[tokio::test]
+        async fn stale_prepared_handle_after_reconnect_is_invalidated()
+        -> Result<(), Box<dyn std::error::Error>> {
+            use mssql_tds::connection::tds_client::ResultSetClient;
+            use mssql_tds::datatypes::sqltypes::SqlType;
+            use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+            let make_param = || {
+                RpcParameter::new(
+                    Some("@P1".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(7)),
+                )
+            };
+
+            let provider = TdsConnectionProvider {};
+            let mut client = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            assert!(
+                client.is_session_recovery_enabled(),
+                "session recovery must be negotiated for this scenario"
+            );
+
+            // Prepare + execute "SELECT @P1" and capture the server-side handle.
+            client
+                .execute_sp_prepexec(
+                    "SELECT @P1".to_string(),
+                    vec![make_param()],
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            if let Some(resultset) = client.get_current_resultset() {
+                while resultset.next_row().await?.is_some() {}
+            }
+            client.move_to_next().await?;
+            let handle = client
+                .take_prepared_statement_handle()
+                .expect("sp_prepexec should capture the @handle during drain");
+            assert!(handle > 0);
+
+            // Kill the owning session from a second connection, then force
+            // recovery through the caller-owned entry point.
+            let spid = get_spid(&mut client).await?;
+            let mut killer = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            exec_and_drain(&mut killer, &format!("KILL {}", spid)).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            client.check_and_reconnect(None, None).await?;
+            assert_eq!(
+                client.connection_recovery_count(),
+                1,
+                "connection should have reconnected exactly once"
+            );
+
+            // Reusing the pre-reconnect handle must fail: it lived in the dead
+            // session, so the new session rejects it with error 8179.
+            let reuse = client
+                .execute_sp_execute(handle, None, Some(vec![make_param()]), None, None)
+                .await;
+            let err = reuse.expect_err("sp_execute on a superseded-session handle must fail");
+            assert!(
+                err.to_string()
+                    .to_lowercase()
+                    .contains("prepared statement"),
+                "expected a 'could not find prepared statement' (8179) error, got: {err}"
+            );
+
+            // A fresh prepare on the recovered session works — the statement
+            // remains usable once the caller re-prepares.
+            client
+                .execute_sp_prepexec(
+                    "SELECT @P1".to_string(),
+                    vec![make_param()],
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            let value = get_scalar_value(&mut client).await?;
+            assert!(
+                matches!(value, Some(ColumnValues::Int(7))),
+                "fresh prepare should return the parameter value, got {value:?}"
+            );
+
+            Ok(())
+        }
+
         // ── Recovery Blocked by Transaction ───────────────────────────
 
         /// When a transaction is active and the connection is killed, recovery
