@@ -36,7 +36,7 @@ fn prepared_execute(c: &mut Criterion) {
             SqlType::Int(None),
         )];
         client
-            .execute_sp_prepare("SELECT @id AS v".to_string(), decls, None, None)
+            .execute_sp_prepare("SELECT @id AS v".to_string(), decls, ())
             .await
             .expect("sp_prepare failed")
     });
@@ -50,7 +50,7 @@ fn prepared_execute(c: &mut Criterion) {
                     SqlType::Int(Some(42)),
                 )];
                 client
-                    .execute_sp_execute(handle, None, Some(params), None, None)
+                    .execute_sp_execute(handle, None, Some(params), ())
                     .await
                     .expect("sp_execute failed");
                 drain(&mut client).await;
@@ -61,7 +61,7 @@ fn prepared_execute(c: &mut Criterion) {
     // Release the handle (un-measured).
     rt.block_on(async {
         client
-            .execute_sp_unprepare(handle, None, None)
+            .execute_sp_unprepare(handle, ())
             .await
             .expect("sp_unprepare failed");
     });
@@ -89,12 +89,12 @@ fn prepared_prepexec(c: &mut Criterion) {
                     SqlType::Int(Some(42)),
                 )];
                 client
-                    .execute_sp_prepexec("SELECT @id AS v".to_string(), params, None, None, None)
+                    .execute_sp_prepexec("SELECT @id AS v".to_string(), params, None, ())
                     .await
                     .expect("sp_prepexec failed");
                 let handle = drain_capture_handle(&mut client).await;
                 client
-                    .execute_sp_unprepare(handle, None, None)
+                    .execute_sp_unprepare(handle, ())
                     .await
                     .expect("sp_unprepare failed");
             });
@@ -114,7 +114,7 @@ fn batched_statements(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 client
-                    .execute("SELECT 1; SELECT 2; SELECT 3".to_string(), None, None)
+                    .execute("SELECT 1; SELECT 2; SELECT 3".to_string(), ())
                     .await
                     .expect("batch failed");
                 drain(&mut client).await;

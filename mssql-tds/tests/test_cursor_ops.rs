@@ -10,7 +10,7 @@ mod common;
 
 use common::{begin_connection, build_tcp_datasource};
 use mssql_tds::connection::cursor_ops::CursorClient;
-use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+use mssql_tds::connection::tds_client::ResultSet;
 use mssql_tds::cursor::{
     CursorConcurrency, CursorOperation, CursorOptionCode, CursorOptionValue, CursorScrollOption,
     CursorStatus, FetchDirection, FetchStatus,
@@ -27,8 +27,7 @@ async fn setup_temp_table(
     client
         .execute(
             "CREATE TABLE #ct (id INT PRIMARY KEY, name NVARCHAR(50), value INT)".to_string(),
-            None,
-            None,
+            (),
         )
         .await
         .unwrap();
@@ -42,7 +41,7 @@ async fn setup_temp_table(
             }
             sql.push_str(&format!("({i}, 'row_{i}', {0})", i * 10));
         }
-        client.execute(sql, None, None).await.unwrap();
+        client.execute(sql, ()).await.unwrap();
         client.close_query().await.unwrap();
     }
 }
@@ -808,10 +807,7 @@ async fn cursor_open_invalid_sql() {
     );
 
     // Connection should still be usable after the error
-    client
-        .execute("SELECT 1".to_string(), None, None)
-        .await
-        .unwrap();
+    client.execute("SELECT 1".to_string(), ()).await.unwrap();
     client.close_query().await.unwrap();
     client.close_connection().await.unwrap();
 }
@@ -848,10 +844,7 @@ async fn cursor_double_close() {
     );
 
     // Connection should still be usable
-    client
-        .execute("SELECT 1".to_string(), None, None)
-        .await
-        .unwrap();
+    client.execute("SELECT 1".to_string(), ()).await.unwrap();
     client.close_query().await.unwrap();
     client.close_connection().await.unwrap();
 }
@@ -1327,10 +1320,7 @@ async fn cursor_prepexec_invalid_sql() {
     );
 
     // Connection should still be usable after the error.
-    client
-        .execute("SELECT 1".to_string(), None, None)
-        .await
-        .unwrap();
+    client.execute("SELECT 1".to_string(), ()).await.unwrap();
     client.close_query().await.unwrap();
     client.close_connection().await.unwrap();
 }
@@ -1344,10 +1334,7 @@ async fn cursor_unprepare_invalid_handle() {
     // critical thing is no panic and a still-usable connection afterwards.
     let _ = client.cursor_unprepare(999999, None, None).await;
 
-    client
-        .execute("SELECT 1".to_string(), None, None)
-        .await
-        .unwrap();
+    client.execute("SELECT 1".to_string(), ()).await.unwrap();
     client.close_query().await.unwrap();
     client.close_connection().await.unwrap();
 }
@@ -1410,11 +1397,7 @@ async fn cursor_positioned_update() {
 
     // Verify the row was modified.
     client
-        .execute(
-            format!("SELECT value FROM #ct WHERE id = {first_id}"),
-            None,
-            None,
-        )
+        .execute(format!("SELECT value FROM #ct WHERE id = {first_id}"), ())
         .await
         .unwrap();
     let verify = read_all_rows(&mut client).await;
@@ -1473,8 +1456,7 @@ async fn cursor_positioned_delete() {
     client
         .execute(
             format!("SELECT COUNT(*) FROM #ct WHERE id = {first_id}"),
-            None,
-            None,
+            (),
         )
         .await
         .unwrap();
@@ -1687,7 +1669,7 @@ async fn next_cursor_row_rejects_non_cursor_result() {
     // An ordinary query result has no trailing rowstat column, so next_cursor_row
     // must refuse to strip a real data column.
     client
-        .execute("SELECT id FROM #ct ORDER BY id".to_string(), None, None)
+        .execute("SELECT id FROM #ct ORDER BY id".to_string(), ())
         .await
         .unwrap();
     let result = client.next_cursor_row().await;

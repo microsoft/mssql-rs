@@ -136,7 +136,7 @@ mod rpc_datatypes {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
         connection
-            .execute_sp_executesql(query.to_string(), named_parameters, None, None)
+            .execute_sp_executesql(query.to_string(), named_parameters, ())
             .await
             .unwrap();
 
@@ -254,7 +254,7 @@ mod rpc_datatypes {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
         connection
-            .execute_sp_executesql(query.to_string(), named_parameters, None, None)
+            .execute_sp_executesql(query.to_string(), named_parameters, ())
             .await
             .unwrap();
 
@@ -301,7 +301,7 @@ mod rpc_datatypes {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
         connection
-            .execute_sp_executesql(query.to_string(), named_parameters, None, None)
+            .execute_sp_executesql(query.to_string(), named_parameters, ())
             .await
             .unwrap();
 
@@ -335,7 +335,7 @@ mod rpc_datatypes {
         );
         named_parameters.push(param);
         let result = client
-            .execute_sp_executesql(query, named_parameters, None, None)
+            .execute_sp_executesql(query, named_parameters, ())
             .await;
 
         assert!(
@@ -400,7 +400,7 @@ mod rpc_datatypes {
         // This would fail with "TDS packet length 8000 exceeds negotiated max packet size 4096"
         // if the buffer's max_packet_size wasn't updated in notify_session_setting_change
         client
-            .execute_sp_executesql(query, named_parameters, None, None)
+            .execute_sp_executesql(query, named_parameters, ())
             .await?;
 
         let (metadata, first_row) = get_first_row(&mut client).await?;
@@ -455,9 +455,7 @@ mod rpc_datatypes {
             .map(|(name, val)| RpcParameter::new(Some(format!("@{name}")), StatusFlags::NONE, val))
             .collect();
 
-        client
-            .execute_sp_executesql(select, rpc_params, None, None)
-            .await?;
+        client.execute_sp_executesql(select, rpc_params, ()).await?;
         let (_meta, row) = get_first_row(client).await?;
         Ok(row)
     }

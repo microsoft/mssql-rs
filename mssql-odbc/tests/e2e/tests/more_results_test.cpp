@@ -99,7 +99,8 @@ TEST_F(MoreResultsLiveTest, TrailingInfoBetweenResultSetsSurfacesWithHint) {
     rc = SQLFetch(stmt_);
     ASSERT_EQ(SQL_NO_DATA, rc);
 
-    // Advancing past the PRINT surfaces it with a SQL_SUCCESS_WITH_INFO hint.
+    // Advancing lands on the PRINT statement's own (0-column) result and
+    // surfaces its message with a SQL_SUCCESS_WITH_INFO hint (msodbcsql parity).
     rc = SQLMoreResults(stmt_);
     ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
 
@@ -113,6 +114,16 @@ TEST_F(MoreResultsLiveTest, TrailingInfoBetweenResultSetsSurfacesWithHint) {
     ASSERT_TRUE(diagRc == SQL_SUCCESS || diagRc == SQL_SUCCESS_WITH_INFO);
     std::string text = ODBCTestUtils::ToNarrow(SqlTString(message));
     EXPECT_NE(std::string::npos, text.find("between result sets info"));
+
+    // The PRINT result has zero columns, so fetching from it is a cursor-state
+    // error (24000), exactly like msodbcsql.
+    rc = SQLFetch(stmt_);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+
+    // Advance again to reach the second SELECT.
+    rc = SQLMoreResults(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 
     // The second result set is positioned and readable.
     rc = SQLFetch(stmt_);

@@ -23,7 +23,7 @@ mod bulk_copy_transaction_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::message::transaction_management::TransactionIsolationLevel;
@@ -90,8 +90,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "CREATE TABLE #BulkTxnDefault (id INT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -116,11 +115,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify data was committed (autocommit behavior)
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkTxnDefault".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkTxnDefault".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -146,8 +141,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "CREATE TABLE #BulkTxnInternal (id INT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -173,11 +167,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify data was committed
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkTxnInternal".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkTxnInternal".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -204,8 +194,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "CREATE TABLE #BulkTxnConflict (id INT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -267,8 +256,7 @@ mod bulk_copy_transaction_tests {
             .execute(
                 "CREATE TABLE #BulkTxnSqlConflict (id INT NOT NULL, value INT NOT NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -276,7 +264,7 @@ mod bulk_copy_transaction_tests {
 
         // Begin a transaction using SQL command (not API)
         client
-            .execute("BEGIN TRANSACTION".to_string(), None, None)
+            .execute("BEGIN TRANSACTION".to_string(), ())
             .await
             .expect("Failed to begin SQL transaction");
         client.close_query().await.expect("Failed to close query");
@@ -299,9 +287,7 @@ mod bulk_copy_transaction_tests {
         );
 
         // Rollback the SQL transaction to clean up
-        let _ = client
-            .execute("ROLLBACK TRANSACTION".to_string(), None, None)
-            .await;
+        let _ = client.execute("ROLLBACK TRANSACTION".to_string(), ()).await;
         let _ = client.close_query().await;
     }
 
@@ -320,8 +306,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "CREATE TABLE #BulkTxnExternal (id INT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -353,11 +338,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify data is visible within the transaction
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkTxnExternal".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkTxnExternal".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -380,11 +361,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify data was rolled back
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkTxnExternal".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkTxnExternal".to_string(), ())
             .await
             .expect("Failed to count rows after rollback");
 
@@ -414,8 +391,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "CREATE TABLE #BulkTxnBatch (id INT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -445,7 +421,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify all data was committed
         client
-            .execute("SELECT COUNT(*) FROM #BulkTxnBatch".to_string(), None, None)
+            .execute("SELECT COUNT(*) FROM #BulkTxnBatch".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -471,8 +447,7 @@ mod bulk_copy_transaction_tests {
             .execute(
                 "CREATE TABLE #BulkTxnSingleBatch (id INT NOT NULL, value INT NOT NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -503,11 +478,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify all data was inserted
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkTxnSingleBatch".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkTxnSingleBatch".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -532,8 +503,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "CREATE TABLE #BulkTxnCommit (id INT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -567,11 +537,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify data persists after commit
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkTxnCommit".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkTxnCommit".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -662,8 +628,7 @@ mod bulk_copy_transaction_tests {
                         "CREATE TABLE {} (id INT NOT NULL, value INT NOT NULL)",
                         table_name
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("Failed to create test table");
@@ -696,7 +661,7 @@ mod bulk_copy_transaction_tests {
 
             // Verify count
             client
-                .execute(format!("SELECT COUNT(*) FROM {}", table_name), None, None)
+                .execute(format!("SELECT COUNT(*) FROM {}", table_name), ())
                 .await
                 .expect("Failed to count rows");
 
@@ -730,8 +695,7 @@ mod bulk_copy_transaction_tests {
             .execute(
                 "CREATE TABLE #BulkTxnAllOrNothing (id INT NOT NULL, value INT NOT NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -766,11 +730,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify data exists within transaction
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkTxnAllOrNothing".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkTxnAllOrNothing".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -793,11 +753,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify ALL data is gone (all 3 batches rolled back together)
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkTxnAllOrNothing".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkTxnAllOrNothing".to_string(), ())
             .await
             .expect("Failed to count rows after rollback");
 
@@ -828,8 +784,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "CREATE TABLE #BulkTxnSingleRow (id INT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -859,11 +814,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify all data was committed
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkTxnSingleRow".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkTxnSingleRow".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -888,8 +839,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "CREATE TABLE #BulkTxnCleanup (id INT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -921,7 +871,7 @@ mod bulk_copy_transaction_tests {
 
         // Connection should be usable for normal operations
         client
-            .execute("SELECT 1".to_string(), None, None)
+            .execute("SELECT 1".to_string(), ())
             .await
             .expect("Connection should be usable after bulk copy");
         client.close_query().await.expect("Failed to close query");
@@ -940,8 +890,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "CREATE TABLE #BulkTxnSequential (id INT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -985,11 +934,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify all data was committed
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkTxnSequential".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkTxnSequential".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -1031,8 +976,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "CREATE TABLE #BulkAutocommit (id INT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -1076,11 +1020,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify all data is committed (cannot be rolled back - autocommit)
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkAutocommit".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkAutocommit".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -1106,8 +1046,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "INSERT INTO #BulkAutocommit (id, value) VALUES (99, 9900)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to insert");
@@ -1122,11 +1061,7 @@ mod bulk_copy_transaction_tests {
         // Verify: The original 12 autocommitted rows should still be there
         // Only the row we inserted in the transaction (99) should be rolled back
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkAutocommit".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkAutocommit".to_string(), ())
             .await
             .expect("Failed to count rows after rollback");
 
@@ -1160,8 +1095,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "CREATE TABLE #BulkDoneToken (id INT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -1194,11 +1128,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify all rows are in the table
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkDoneToken".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkDoneToken".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -1213,8 +1143,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "SELECT id, value FROM #BulkDoneToken ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select rows");
@@ -1261,8 +1190,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "CREATE TABLE #BulkMultiBatch (id INT NOT NULL, value INT NOT NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -1295,11 +1223,7 @@ mod bulk_copy_transaction_tests {
 
         // Verify row count
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkMultiBatch".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkMultiBatch".to_string(), ())
             .await
             .expect("Failed to count rows");
 
@@ -1314,8 +1238,7 @@ mod bulk_copy_transaction_tests {
         client
             .execute(
                 "SELECT MIN(id), MAX(id) FROM #BulkMultiBatch".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to get min/max");

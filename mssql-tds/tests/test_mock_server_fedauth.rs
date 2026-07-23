@@ -184,7 +184,7 @@ mod mock_server_fedauth_tests {
         let mut client = provider.create_client(context, &datasource, None).await?;
 
         // Execute a simple SELECT 1 query
-        client.execute("SELECT 1".to_string(), None, None).await?;
+        client.execute("SELECT 1".to_string(), ()).await?;
 
         println!("Successfully executed query with access token authentication");
 
@@ -424,7 +424,7 @@ mod mock_server_fedauth_tests {
 
         let provider = TdsConnectionProvider {};
         let mut client = provider.create_client(context, &datasource, None).await?;
-        client.execute("SELECT 1".to_string(), None, None).await?;
+        client.execute("SELECT 1".to_string(), ()).await?;
         drop(client);
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

@@ -7,7 +7,7 @@ use std::env;
 use std::sync::Once;
 
 use dotenv::dotenv;
-use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
 use mssql_tds::core::{EncryptionOptions, TdsResult};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
@@ -151,38 +151,38 @@ pub async fn validate_results(
     let mut expected_index = 0;
     println!("Before looping.");
 
-    loop {
-        if let Some(resultset) = client.get_current_resultset() {
-            println!("Current index {expected_index:?}");
-            assert!(expected_index < expected_results.len());
+    let mut has_rows = client.on_rows();
+    if !has_rows {
+        has_rows = client.advance_to_rows().await?;
+    }
+    while has_rows {
+        println!("Current index {expected_index:?}");
+        assert!(expected_index < expected_results.len());
 
-            let expected = &expected_results[expected_index];
-            match expected {
-                ExpectedQueryResultType::Result(expected_row_count) => {
-                    let mut actual_rows: u64 = 0;
-                    println!("Columns: {:?}", resultset.get_metadata());
+        let expected = &expected_results[expected_index];
+        match expected {
+            ExpectedQueryResultType::Result(expected_row_count) => {
+                let mut actual_rows: u64 = 0;
+                println!("Columns: {:?}", client.get_metadata());
 
-                    while let Some(row) = resultset.next_row().await? {
-                        print!("Row {actual_rows:?}: ");
-                        for cell in row {
-                            print!("{cell:?},");
-                        }
-                        println!();
-                        actual_rows += 1;
+                while let Some(row) = client.next_row().await? {
+                    print!("Row {actual_rows:?}: ");
+                    for cell in row {
+                        print!("{cell:?},");
                     }
-                    assert_eq!(actual_rows, *expected_row_count);
+                    println!();
+                    actual_rows += 1;
                 }
-                ExpectedQueryResultType::Update(_expected_row_count) => {
-                    // For DML statements, we just drain any rows if present
-                    while resultset.next_row().await?.is_some() {}
-                }
+                assert_eq!(actual_rows, *expected_row_count);
             }
-            expected_index += 1;
+            ExpectedQueryResultType::Update(_expected_row_count) => {
+                // For DML statements, we just drain any rows if present
+                while client.next_row().await?.is_some() {}
+            }
         }
+        expected_index += 1;
 
-        if !client.move_to_next().await? {
-            break;
-        }
+        has_rows = client.advance_to_rows().await?;
     }
 
     client.close_query().await?;
@@ -194,7 +194,7 @@ pub async fn run_query_and_check_results(
     query: String,
     expected_results: &[ExpectedQueryResultType],
 ) {
-    client.execute(query, None, None).await.unwrap();
+    client.execute(query, ()).await.unwrap();
     validate_results(client, expected_results).await.unwrap();
 }
 
@@ -212,18 +212,19 @@ pub async fn connect_query_and_validate(
 pub async fn get_scalar_value(client: &mut TdsClient) -> TdsResult<Option<ColumnValues>> {
     let mut result = None;
 
-    loop {
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await?
+    let mut has_rows = client.on_rows();
+    if !has_rows {
+        has_rows = client.advance_to_rows().await?;
+    }
+    while has_rows {
+        if let Some(row) = client.next_row().await?
             && !row.is_empty()
         {
             result = Some(row[0].clone());
             break;
         }
 
-        if !client.move_to_next().await? {
-            break;
-        }
+        has_rows = client.advance_to_rows().await?;
     }
 
     client.close_query().await?;
@@ -238,21 +239,21 @@ pub async fn get_first_row(
     let mut result: Vec<ColumnValues> = Vec::new();
     let mut metadata: Vec<ColumnMetadata> = Vec::new();
 
-    loop {
-        if let Some(resultset) = client.get_current_resultset() {
-            if metadata.is_empty() {
-                metadata = resultset.get_metadata().clone();
-            }
-
-            if let Some(row) = resultset.next_row().await? {
-                result = row;
-                break;
-            }
+    let mut has_rows = client.on_rows();
+    if !has_rows {
+        has_rows = client.advance_to_rows().await?;
+    }
+    while has_rows {
+        if metadata.is_empty() {
+            metadata = client.get_metadata().clone();
         }
 
-        if !client.move_to_next().await? {
+        if let Some(row) = client.next_row().await? {
+            result = row;
             break;
         }
+
+        has_rows = client.advance_to_rows().await?;
     }
 
     client.close_query().await?;

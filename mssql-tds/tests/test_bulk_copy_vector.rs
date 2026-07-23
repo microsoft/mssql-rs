@@ -10,7 +10,7 @@ mod bulk_copy_vector_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::datatypes::sql_vector::SqlVector;
@@ -83,8 +83,7 @@ mod bulk_copy_vector_tests {
             .execute(
                 "CREATE TABLE #BulkCopyVectorTest (id INT NOT NULL, vector_col VECTOR(3) NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -132,8 +131,7 @@ mod bulk_copy_vector_tests {
         client
             .execute(
                 "SELECT id, vector_col FROM #BulkCopyVectorTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -196,12 +194,8 @@ mod bulk_copy_vector_tests {
 
         // Create temp table with multiple VECTOR columns
         client
-            .execute(
-                "CREATE TABLE #BulkCopyMultiVectorTest (id INT NOT NULL, vec1 VECTOR(2), vec2 VECTOR(3), vec3 VECTOR(4) NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
+            .execute("CREATE TABLE #BulkCopyMultiVectorTest (id INT NOT NULL, vec1 VECTOR(2), vec2 VECTOR(3), vec3 VECTOR(4) NULL)"
+                    .to_string(), ())
             .await
             .unwrap();
 
@@ -321,8 +315,7 @@ mod bulk_copy_vector_tests {
         client
             .execute(
                 "SELECT id, vec1, vec2, vec3 FROM #BulkCopyMultiVectorTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -383,8 +376,7 @@ mod bulk_copy_vector_tests {
                     "CREATE TABLE {} (id INT NOT NULL, embedding VECTOR(1998))",
                     table_name
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -419,8 +411,7 @@ mod bulk_copy_vector_tests {
         client
             .execute(
                 format!("SELECT id, embedding FROM {} ORDER BY id", table_name),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
@@ -491,8 +482,7 @@ mod bulk_copy_vector_tests {
             .execute(
                 "CREATE TABLE #BulkCopyVectorMismatchTest (id INT NOT NULL, vector_col VECTOR(3))"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();

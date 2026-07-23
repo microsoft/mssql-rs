@@ -27,7 +27,7 @@ fn simple_select_one_row(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 client
-                    .execute("SELECT 1".to_string(), None, None)
+                    .execute("SELECT 1".to_string(), ())
                     .await
                     .expect("execute failed");
                 drain(&mut client).await;
@@ -60,7 +60,7 @@ fn select_n_rows(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     client
-                        .execute(query.clone(), None, None)
+                        .execute(query.clone(), ())
                         .await
                         .expect("execute failed");
                     drain(&mut client).await;
@@ -92,8 +92,7 @@ fn single_insert(c: &mut Criterion) {
         let mut conn = client.borrow_mut();
         conn.execute(
             "CREATE TABLE #bench_insert (id INT NOT NULL, name NVARCHAR(100) NOT NULL)".to_string(),
-            None,
-            None,
+            (),
         )
         .await
         .expect("create temp table failed");
@@ -108,7 +107,7 @@ fn single_insert(c: &mut Criterion) {
                 // and drift the measurement upward).
                 rt.block_on(async {
                     let mut conn = client.borrow_mut();
-                    conn.execute("TRUNCATE TABLE #bench_insert".to_string(), None, None)
+                    conn.execute("TRUNCATE TABLE #bench_insert".to_string(), ())
                         .await
                         .expect("truncate failed");
                     conn.close_query().await.expect("close_query failed");
@@ -119,8 +118,7 @@ fn single_insert(c: &mut Criterion) {
                     let mut conn = client.borrow_mut();
                     conn.execute(
                         "INSERT INTO #bench_insert (id, name) VALUES (1, N'benchmark')".to_string(),
-                        None,
-                        None,
+                        (),
                     )
                     .await
                     .expect("insert failed");

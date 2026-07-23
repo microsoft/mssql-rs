@@ -196,7 +196,7 @@ impl SessionSettings {
 }
 
 // Helper function for fuzzing and tests to create test settings
-#[cfg(any(fuzzing, test))]
+#[cfg(any(fuzzing, test, feature = "test-util"))]
 pub(crate) fn create_test_negotiated_settings_internal() -> NegotiatedSettings {
     let session_settings = SessionSettings {
         packet_size: 4096,

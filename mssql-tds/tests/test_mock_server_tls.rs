@@ -18,7 +18,7 @@ mod mock_server_tls_tests {
     #[cfg(not(windows))]
     use mssql_mock_tds::create_test_identity;
     use mssql_tds::connection::client_context::ClientContext;
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
     #[cfg(not(windows))]
@@ -222,7 +222,7 @@ mod mock_server_tls_tests {
         let mut client = provider.create_client(context, &datasource, None).await?;
 
         // Execute SELECT 1 over encrypted connection
-        client.execute("SELECT 1".to_string(), None, None).await?;
+        client.execute("SELECT 1".to_string(), ()).await?;
 
         // Read result
         let mut row_count = 0;
@@ -331,7 +331,7 @@ mod mock_server_tls_tests {
         let mut client = provider.create_client(context, &datasource, None).await?;
 
         // Execute query
-        client.execute("SELECT 1".to_string(), None, None).await?;
+        client.execute("SELECT 1".to_string(), ()).await?;
 
         let mut row_count = 0;
         if let Some(resultset) = client.get_current_resultset() {
@@ -390,7 +390,7 @@ mod mock_server_tls_tests {
 
         // Execute multiple queries
         for i in 1..=3 {
-            client.execute("SELECT 1".to_string(), None, None).await?;
+            client.execute("SELECT 1".to_string(), ()).await?;
 
             let mut row_count = 0;
             if let Some(resultset) = client.get_current_resultset() {
@@ -453,7 +453,7 @@ mod mock_server_tls_tests {
                 .create_client(context.clone(), &datasource, None)
                 .await?;
 
-            client.execute("SELECT 1".to_string(), None, None).await?;
+            client.execute("SELECT 1".to_string(), ()).await?;
             client.close_query().await?;
             client.close_connection().await?;
 
@@ -524,7 +524,7 @@ mod mock_server_tls_tests {
 
         // Execute the custom query
         client
-            .execute("SELECT id, age FROM users".to_string(), None, None)
+            .execute("SELECT id, age FROM users".to_string(), ())
             .await?;
 
         let mut row_count = 0;

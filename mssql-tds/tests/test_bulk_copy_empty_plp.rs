@@ -8,7 +8,7 @@ mod bulk_copy_empty_plp_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::datatypes::sql_string::SqlString;
@@ -115,8 +115,7 @@ mod bulk_copy_empty_plp_tests {
                     tail INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create temp table");
@@ -167,8 +166,7 @@ mod bulk_copy_empty_plp_tests {
             .execute(
                 "SELECT id, nvc_max, vc_max, vb_max, tail FROM #BulkCopyEmptyPlp ORDER BY id"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to query temp table");

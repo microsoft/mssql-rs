@@ -17,7 +17,7 @@ use std::env;
 mod common;
 
 use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
-use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+use mssql_tds::connection::tds_client::ResultSet;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -106,7 +106,7 @@ async fn test_windows_integrated_auth_connection() -> TdsResult<()> {
 
     // Verify the authentication scheme
     let query = "SELECT auth_scheme FROM sys.dm_exec_connections WHERE session_id = @@SPID";
-    connection.execute(query.to_string(), None, None).await?;
+    connection.execute(query.to_string(), ()).await?;
 
     if let Some(resultset) = connection.get_current_resultset()
         && let Some(row) = resultset.next_row().await?
@@ -169,7 +169,7 @@ async fn test_localdb_integrated_auth_connection() -> TdsResult<()> {
 
     // Verify the authentication scheme
     let query = "SELECT auth_scheme FROM sys.dm_exec_connections WHERE session_id = @@SPID";
-    connection.execute(query.to_string(), None, None).await?;
+    connection.execute(query.to_string(), ()).await?;
 
     if let Some(resultset) = connection.get_current_resultset()
         && let Some(row) = resultset.next_row().await?
@@ -186,7 +186,7 @@ async fn test_localdb_integrated_auth_connection() -> TdsResult<()> {
 
     // Also verify we're connected to LocalDB by checking the server name
     let query = "SELECT @@SERVERNAME, @@VERSION";
-    connection.execute(query.to_string(), None, None).await?;
+    connection.execute(query.to_string(), ()).await?;
 
     if let Some(resultset) = connection.get_current_resultset()
         && let Some(row) = resultset.next_row().await?
@@ -234,8 +234,7 @@ async fn test_ssrp_named_pipe_integrated_auth() -> TdsResult<()> {
         .execute(
             "SELECT net_transport FROM sys.dm_exec_connections WHERE session_id = @@SPID"
                 .to_string(),
-            None,
-            None,
+            (),
         )
         .await?;
 
@@ -276,8 +275,7 @@ async fn connect_and_get_transport(datasource: &str) -> TdsResult<String> {
         .execute(
             "SELECT net_transport FROM sys.dm_exec_connections WHERE session_id = @@SPID"
                 .to_string(),
-            None,
-            None,
+            (),
         )
         .await?;
 
@@ -363,9 +361,7 @@ async fn test_sspi_localhost_select_one() -> TdsResult<()> {
         .create_client(context, "tcp:localhost,1433", None)
         .await?;
 
-    client
-        .execute("SELECT 1 AS val".to_string(), None, None)
-        .await?;
+    client.execute("SELECT 1 AS val".to_string(), ()).await?;
 
     let mut got_result = false;
     if let Some(rs) = client.get_current_resultset()
@@ -416,7 +412,7 @@ async fn test_sspi_named_instance_select_one() -> TdsResult<()> {
     let mut client = provider.create_client(context, &datasource, None).await?;
 
     client
-        .execute("SELECT @@SERVICENAME AS svc".to_string(), None, None)
+        .execute("SELECT @@SERVICENAME AS svc".to_string(), ())
         .await?;
 
     if let Some(rs) = client.get_current_resultset()
@@ -430,9 +426,7 @@ async fn test_sspi_named_instance_select_one() -> TdsResult<()> {
     }
     client.close_query().await?;
 
-    client
-        .execute("SELECT 1 AS val".to_string(), None, None)
-        .await?;
+    client.execute("SELECT 1 AS val".to_string(), ()).await?;
 
     let mut got_result = false;
     if let Some(rs) = client.get_current_resultset()

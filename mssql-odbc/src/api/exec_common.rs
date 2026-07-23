@@ -174,7 +174,7 @@ pub(super) fn flush_pending_unprepare(
     };
     if let Err(e) = dbc
         .runtime
-        .block_on(client.execute_sp_unprepare(handle, None, None))
+        .block_on(client.execute_sp_unprepare(handle, ()))
     {
         error!(%e, handle, "{op}: sp_unprepare failed — handle leaked until disconnect");
     }
@@ -260,8 +260,36 @@ pub(super) fn finish_execute(
     let metadata = client.get_metadata().clone();
     let has_result_set = !metadata.is_empty();
 
+    if !has_result_set && client.has_open_batch() {
+        // Statement-wise navigation: positioned on a no-row statement result
+        // (PRINT / low-severity RAISERROR / DDL / DML) with more statements still
+        // pending on the wire. Keep the connection busy and leave a 0-column
+        // cursor open so SQLMoreResults can advance past it (and SQLFetch returns
+        // 24000). Do NOT drain the wire — that would collapse the rest of the
+        // batch. Matches msodbcsql.
+        let info_messages = client.take_info_messages();
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("{op}: stmt mutex poisoned on no-row result");
+            return_client_busy(dbc, client);
+            return SQL_ERROR;
+        };
+        stmt_state.column_metadata = metadata; // empty (0 columns)
+        stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
+        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+        drop(stmt_state);
+        return_client_busy(dbc, client);
+        return if has_server_info {
+            SQL_SUCCESS_WITH_INFO
+        } else {
+            SQL_SUCCESS
+        };
+    }
+
     if !has_result_set {
-        // DDL / DML: drain trailing DONE tokens and return to idle.
+        // DDL / DML (last / only statement): drain trailing DONE tokens and
+        // return to idle so the statement can re-execute without an explicit
+        // close.
         if let Err(e) = dbc.runtime.block_on(client.close_query()) {
             error!(%e, "{op}: failed to drain after DDL/DML");
             return fail_with_tds(dbc, stmt, statement_handle, client, &e);

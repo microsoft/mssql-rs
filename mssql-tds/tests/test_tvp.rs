@@ -23,7 +23,7 @@ mod tvp_tests {
     use futures::future::FutureExt;
 
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::datatypes::column_values::{
         ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
         SqlSmallMoney, SqlTime,
@@ -44,8 +44,8 @@ mod tvp_tests {
 
     /// Runs a statement that returns no result set (DDL) and finishes the batch.
     async fn exec_ddl(client: &mut TdsClient, sql: String) {
-        client.execute(sql, None, None).await.unwrap();
-        while client.move_to_next().await.unwrap() {}
+        client.execute(sql, ()).await.unwrap();
+        while client.advance_to_rows().await.unwrap() {}
         client.close_query().await.unwrap();
     }
 
@@ -57,7 +57,7 @@ mod tvp_tests {
         params: Vec<RpcParameter>,
     ) -> Vec<Vec<ColumnValues>> {
         client
-            .execute_sp_executesql(sql.to_string(), params, None, None)
+            .execute_sp_executesql(sql.to_string(), params, ())
             .await
             .unwrap();
 
@@ -68,7 +68,7 @@ mod tvp_tests {
                     rows.push(row);
                 }
             }
-            if !client.move_to_next().await.unwrap() {
+            if !client.advance_to_rows().await.unwrap() {
                 break;
             }
         }
@@ -86,7 +86,7 @@ mod tvp_tests {
         params: Vec<RpcParameter>,
     ) -> Result<Vec<Vec<ColumnValues>>, String> {
         client
-            .execute_sp_executesql(sql.to_string(), params, None, None)
+            .execute_sp_executesql(sql.to_string(), params, ())
             .await
             .map_err(|e| e.to_string())?;
 
@@ -97,7 +97,7 @@ mod tvp_tests {
                     rows.push(row);
                 }
             }
-            if !client.move_to_next().await.map_err(|e| e.to_string())? {
+            if !client.advance_to_rows().await.map_err(|e| e.to_string())? {
                 break;
             }
         }
@@ -122,11 +122,11 @@ mod tvp_tests {
     /// mid-stream; surfacing that error would only mask the original failure.
     async fn try_drop_type(client: &mut TdsClient, type_name: &str) {
         if client
-            .execute(format!("DROP TYPE IF EXISTS {type_name}"), None, None)
+            .execute(format!("DROP TYPE IF EXISTS {type_name}"), ())
             .await
             .is_ok()
         {
-            while client.move_to_next().await.unwrap_or(false) {}
+            while client.advance_to_rows().await.unwrap_or(false) {}
             let _ = client.close_query().await;
         }
     }

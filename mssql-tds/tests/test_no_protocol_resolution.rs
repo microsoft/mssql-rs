@@ -16,7 +16,7 @@ mod common;
 mod no_protocol_resolution {
     use dotenv::dotenv;
     use mssql_tds::connection::client_context::ClientContext;
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
     use std::env;
@@ -118,7 +118,7 @@ mod no_protocol_resolution {
     /// Execute a simple query and verify we get results
     async fn test_simple_query(client: &mut TdsClient) -> TdsResult<()> {
         let query = "SELECT @@VERSION AS version, @@SERVERNAME AS servername";
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         let mut has_results = false;
         let mut row_count = 0;
@@ -131,7 +131,7 @@ mod no_protocol_resolution {
                 }
             }
 
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -605,7 +605,7 @@ mod no_protocol_resolution {
             create_client_with_trust_cert(&datasource, EncryptionSetting::On, true).await?;
 
         let query = "SELECT @@SERVICENAME AS svc";
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         let mut service_name = String::new();
         loop {
@@ -615,7 +615,7 @@ mod no_protocol_resolution {
             {
                 service_name = s.to_utf8_string();
             }
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }

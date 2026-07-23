@@ -52,11 +52,7 @@ mod bulk_copy_timeout_tests {
             .collect::<Vec<_>>()
             .join(", ");
         client
-            .execute(
-                format!("CREATE TABLE #bcp_timeout_513 ({col_defs})"),
-                None,
-                None,
-            )
+            .execute(format!("CREATE TABLE #bcp_timeout_513 ({col_defs})"), ())
             .await
             .expect("Failed to create table");
         client.close_query().await.expect("Failed to close query");

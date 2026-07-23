@@ -39,8 +39,7 @@ fn packet_size_sensitivity(c: &mut Criterion) {
             client
                 .execute(
                     "CREATE TABLE #packet_payload (payload VARCHAR(MAX) NOT NULL)".to_string(),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("create packet payload table failed");
@@ -51,8 +50,7 @@ fn packet_size_sensitivity(c: &mut Criterion) {
                         "INSERT INTO #packet_payload (payload) \
                          SELECT REPLICATE(CAST('X' AS VARCHAR(MAX)), {READ_BYTES})"
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("fill packet payload table failed");
@@ -67,7 +65,7 @@ fn packet_size_sensitivity(c: &mut Criterion) {
                 b.iter(|| {
                     rt.block_on(async {
                         client
-                            .execute(query.clone(), None, None)
+                            .execute(query.clone(), ())
                             .await
                             .expect("execute failed");
                         drain(&mut client).await;
@@ -104,7 +102,7 @@ fn row_iteration_throughput(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 client
-                    .execute(query.clone(), None, None)
+                    .execute(query.clone(), ())
                     .await
                     .expect("execute failed");
                 drain(&mut client).await;

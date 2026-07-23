@@ -98,6 +98,38 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         client
     };
 
+    // At this point the connection is owned by this statement (`active_stmt`
+    // was `Some(self)`) and the client has been taken. A no-row statement
+    // result (PRINT / low-severity RAISERROR / DDL / DML) is positioned with
+    // zero columns: there is nothing to fetch, so return 24000 (invalid cursor
+    // state), matching msodbcsql. This is checked only after the busy-with-
+    // other-statement (HY000) and already-drained (SQL_NO_DATA) cases above,
+    // because those take precedence even when the column metadata is empty.
+    {
+        let no_columns = match stmt.inner.lock() {
+            Ok(ss) => ss.column_metadata.is_empty(),
+            Err(_) => {
+                error!("SQLFetch: stmt mutex poisoned checking no-row result");
+                if let Ok(mut ds) = dbc.inner.lock() {
+                    ds.client = Some(client);
+                }
+                return SQL_ERROR;
+            }
+        };
+        if no_columns {
+            error!("SQLFetch: current result has no columns (no-row statement)");
+            // Restore the client so the connection stays busy on this statement;
+            // the application can still call SQLMoreResults to advance.
+            if let Ok(mut ds) = dbc.inner.lock() {
+                ds.client = Some(client);
+            }
+            if let Ok(mut ss) = stmt.inner.lock() {
+                post_diag(&mut ss, ERR_INVALID_CURSOR_STATE);
+            }
+            return SQL_ERROR;
+        }
+    }
+
     let fetch_result = dbc.runtime.block_on(client.next_row());
 
     match fetch_result {
@@ -276,5 +308,46 @@ mod tests {
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert!(stmt_state.diag_records.is_empty());
         assert!(stmt_state.has_state(STMT_STATE_CURSOR_OPEN));
+    }
+
+    /// Positioned on a no-row statement result (zero columns) with the
+    /// connection busy on this statement: SQLFetch returns SQL_ERROR with
+    /// SQLSTATE 24000, and the client is restored so the cursor can still be
+    /// advanced with SQLMoreResults.
+    #[test]
+    fn fetch_norow_result_returns_24000() {
+        use crate::api::sqlstate::SQLSTATE_24000;
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut stmt_state = stmt_handle.inner.lock().unwrap();
+            stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
+            // column_metadata left empty => no-row (0-column) result.
+        }
+
+        // A client must be present (the guard runs after it is claimed), but it
+        // is never read because the guard returns first.
+        let client = tds_client_from_tokens(vec![done_no_more()]);
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut dbc_state = dbc_handle.inner.lock().unwrap();
+            dbc_state.client = Some(client);
+            dbc_state.active_stmt = Some(h.stmt);
+        }
+
+        let ret = unsafe { sql_fetch(h.stmt) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let stmt_state = stmt_handle.inner.lock().unwrap();
+        assert_eq!(stmt_state.diag_records.len(), 1);
+        assert_eq!(stmt_state.diag_records[0].sql_state, SQLSTATE_24000);
+        drop(stmt_state);
+
+        // The client is restored and the connection stays busy on this statement.
+        let dbc_state = dbc_handle.inner.lock().unwrap();
+        assert!(dbc_state.client.is_some());
+        assert_eq!(dbc_state.active_stmt, Some(h.stmt));
     }
 }

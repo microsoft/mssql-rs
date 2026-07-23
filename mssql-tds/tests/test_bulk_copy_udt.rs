@@ -19,7 +19,7 @@ mod bulk_copy_udt_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::ColumnValues;
 
@@ -80,8 +80,7 @@ mod bulk_copy_udt_tests {
         client
             .execute(
                 "CREATE TABLE #BulkCopyUdtSrc (id INT NOT NULL, g geometry NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create source table");
@@ -95,8 +94,7 @@ mod bulk_copy_udt_tests {
                  (3, NULL), \
                  (4, geometry::STGeomFromText('POLYGON((0 0, 0 5, 5 5, 5 0, 0 0))', 0))"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to seed source table");
@@ -106,8 +104,7 @@ mod bulk_copy_udt_tests {
         client
             .execute(
                 "SELECT id, g FROM #BulkCopyUdtSrc ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select source data");
@@ -143,8 +140,7 @@ mod bulk_copy_udt_tests {
         client
             .execute(
                 "CREATE TABLE #BulkCopyUdtDst (id INT NOT NULL, g geometry NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create destination table");
@@ -166,8 +162,7 @@ mod bulk_copy_udt_tests {
         client
             .execute(
                 "SELECT id, g FROM #BulkCopyUdtDst ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select destination data");
