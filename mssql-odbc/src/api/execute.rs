@@ -111,11 +111,11 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
     // no-row results. A row-returning statement keeps its cursor open for
     // SQLFetch; its `@handle` RETURNVALUE (sp_prepexec) is captured later at
     // drain time (SQLCloseCursor / the DDL finish path).
-    if !matches!(stmt_result, StatementResult::Rows) {
-        if let Err(e) = dbc.runtime.block_on(client.advance_to_rows()) {
-            error!(%e, "SQLExecute: draining no-row prepared result failed");
-            return fail_with_tds(dbc, stmt, statement_handle, client, &e);
-        }
+    if !matches!(stmt_result, StatementResult::Rows)
+        && let Err(e) = dbc.runtime.block_on(client.advance_to_rows())
+    {
+        error!(%e, "SQLExecute: draining no-row prepared result failed");
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
     finish_execute(dbc, stmt, statement_handle, client, "SQLExecute")
