@@ -4,7 +4,7 @@
 //! Implementation of SQLExecute — execute a prepared statement with the
 //! currently bound parameter values.
 
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 use mssql_tds::connection::tds_client::{ExecuteOptions, StatementResult, TdsClient};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
@@ -93,6 +93,12 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
     // Keep recovery + execution within one command-timeout budget.
     let timeout_sec = TdsClient::deduct_timeout(timeout_sec, reconnect_elapsed);
     let session_epoch = client.connection_recovery_count();
+    if !reconnect_elapsed.is_zero() {
+        debug!(
+            ?reconnect_elapsed,
+            session_epoch, "SQLExecute: connection recovered before execute"
+        );
+    }
 
     // msodbcsql `FIsReprepareRequired`: reuse vs. reprepare, judged by epoch.
     let stmt_result = match plan_execution(exec.handle, exec.drop_handle, session_epoch) {

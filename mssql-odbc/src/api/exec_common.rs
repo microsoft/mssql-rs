@@ -7,7 +7,7 @@
 //! execution paths stay in lockstep. None of these helpers hold a lock across
 //! network I/O.
 
-use tracing::error;
+use tracing::{debug, error};
 
 use std::collections::VecDeque;
 
@@ -179,8 +179,15 @@ pub(super) fn flush_pending_unprepare(
     let Some(handle) = handle else {
         return;
     };
-    if handle.session_epoch != client.connection_recovery_count() {
+    let current_epoch = client.connection_recovery_count();
+    if handle.session_epoch != current_epoch {
         // Orphan from a superseded session — already gone server-side.
+        debug!(
+            handle = handle.id,
+            handle_epoch = handle.session_epoch,
+            current_epoch,
+            "{op}: skipping stale pending unprepare (session changed, handle already released server-side)"
+        );
         return;
     }
     if let Err(e) = dbc
