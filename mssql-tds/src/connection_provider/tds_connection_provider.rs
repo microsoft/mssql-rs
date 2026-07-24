@@ -135,14 +135,16 @@ impl TdsConnectionProvider {
             let mut exec_context = ExecutionContext::new();
             let mut cache_key: Option<(String, String)> = None;
 
-            // Compute the overall login deadline up front so it bounds every
-            // phase of login — the shared-memory shortcut below, SSRP/LocalDB
-            // resolution, and the connect/retry loop — not just the final
-            // transport attempts. `login_timeout` falls back to `connect_timeout`
-            // for callers that only set the historical single knob; `0` means
-            // "no deadline". `connect_timeout` still bounds each individual
-            // TCP-connect attempt, so an unreachable host fails fast even when
-            // the login budget is large (e.g. interactive sign-in).
+            // Compute the overall login deadline up front. It bounds the
+            // shared-memory shortcut below and the connect/retry loop — the phases
+            // that run the TDS/auth handshake. Name resolution is bounded
+            // separately and is not covered by this deadline: SSRP uses its own
+            // `ssrp_timeout_ms` (default 1s) and LocalDB resolution is a local pipe
+            // lookup. `login_timeout` falls back to `connect_timeout` for callers
+            // that only set the historical single knob; `0` means "no deadline".
+            // `connect_timeout` still bounds each individual TCP-connect attempt,
+            // so an unreachable host fails fast even when the login budget is large
+            // (e.g. interactive sign-in).
             let login_timeout = context.login_timeout.unwrap_or(context.connect_timeout);
             let deadline = match login_timeout {
                 1.. => Some(Instant::now() + Duration::from_secs(login_timeout.into())),
