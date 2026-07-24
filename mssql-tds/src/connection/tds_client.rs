@@ -2839,7 +2839,7 @@ impl TdsClient {
                         return Err(crate::error::Error::UsageError(
                             "Unexpected ColMetadata token encountered while reading rows. \
                              This typically indicates the API was not used correctly - \
-                             you may need to call move_to_next() to advance to the next result set."
+                             you may need to call advance_to_rows() to advance to the next result set."
                                 .to_string(),
                         ));
                     }
