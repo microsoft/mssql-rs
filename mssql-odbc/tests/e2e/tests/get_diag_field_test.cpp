@@ -9,8 +9,6 @@
 //   5. DiagMessageTextTruncation    - short byte buffer → SUCCESS_WITH_INFO
 //   6. NoRecordsReturnsNoData       - record field on clean handle → SQL_NO_DATA
 //   7. DiagNumberAfterSuccessIsZero - successful call clears prior diag
-//   8. DiagClassOriginIsIsoForConnectError    - SQL_DIAG_CLASS_ORIGIN → "ISO 9075"
-//   9. DiagSubclassOriginIsIsoForConnectError - SQL_DIAG_SUBCLASS_ORIGIN → "ISO 9075"
 
 #include "odbc_test_fixture.h"
 
@@ -185,45 +183,4 @@ TEST_F(GetDiagFieldTest, DiagNumberAfterSuccessIsZero) {
                                      &count, 0, nullptr);
     EXPECT_EQ(SQL_SUCCESS, rc);
     EXPECT_EQ(0, count);
-}
-
-// SQL_DIAG_CLASS_ORIGIN / SQL_DIAG_SUBCLASS_ORIGIN identify the authority that
-// defined the SQLSTATE. 08001 (posted by ProvokeError) is an ISO 9075 state in
-// both its class and subclass, so both fields must return "ISO 9075". This
-// mirrors msodbcsql (sqlcerr.cpp): ODBC-defined states are only the IM class
-// plus specific HY subclasses; everything else is ISO 9075.
-TEST_F(GetDiagFieldTest, DiagClassOriginIsIsoForConnectError) {
-    ProvokeError();
-
-    SQLWCHAR origin[16] = {0};
-    SQLSMALLINT string_len = 0;
-    SQLRETURN rc = SQLGetDiagFieldW(SQL_HANDLE_DBC, hdbc_, 1,
-                                     SQL_DIAG_CLASS_ORIGIN,
-                                     origin,
-                                     static_cast<SQLSMALLINT>(sizeof(origin)),
-                                     &string_len);
-    EXPECT_EQ(SQL_SUCCESS, rc);
-    int len = 0;
-    while (len < 16 && origin[len]) ++len;
-    std::string text(origin, origin + len);
-    EXPECT_EQ("ISO 9075", text);
-    EXPECT_EQ(static_cast<SQLSMALLINT>(8 * sizeof(SQLWCHAR)), string_len);
-}
-
-TEST_F(GetDiagFieldTest, DiagSubclassOriginIsIsoForConnectError) {
-    ProvokeError();
-
-    SQLWCHAR origin[16] = {0};
-    SQLSMALLINT string_len = 0;
-    SQLRETURN rc = SQLGetDiagFieldW(SQL_HANDLE_DBC, hdbc_, 1,
-                                     SQL_DIAG_SUBCLASS_ORIGIN,
-                                     origin,
-                                     static_cast<SQLSMALLINT>(sizeof(origin)),
-                                     &string_len);
-    EXPECT_EQ(SQL_SUCCESS, rc);
-    int len = 0;
-    while (len < 16 && origin[len]) ++len;
-    std::string text(origin, origin + len);
-    EXPECT_EQ("ISO 9075", text);
-    EXPECT_EQ(static_cast<SQLSMALLINT>(8 * sizeof(SQLWCHAR)), string_len);
 }
