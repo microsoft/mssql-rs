@@ -52,6 +52,7 @@ use super::entra::{encode_utf16le, normalize_scope, split_sts_url};
 use mssql_tds::connection::client_context::{EntraIdTokenFactory, TdsAuthenticationMethod};
 use mssql_tds::core::TdsResult;
 use mssql_tds::error::Error;
+use mssql_tds::security::SecurityError;
 
 /// Well-known Microsoft public-client id used by msodbcsql / `SqlClient` for
 /// ActiveDirectory Interactive. It is registered with an `http://localhost`
@@ -348,8 +349,12 @@ async fn wait_for_redirect(listener: &TcpListener, expected_state: &str) -> TdsR
                     "Sign-in failed. You can close this window and return to your application.",
                 )
                 .await;
-                return Err(Error::ConnectionError(format!(
-                    "interactive sign-in failed: {detail}"
+                // Terminal auth decision (user cancelled, denied consent,
+                // `access_denied`, …), not a transient transport fault: use a
+                // non-transient security error so the connect-retry loop does not
+                // silently relaunch the browser.
+                return Err(Error::Security(SecurityError::AuthenticationDenied(
+                    format!("interactive sign-in failed: {detail}"),
                 )));
             }
             RedirectOutcome::Unrelated => {
@@ -359,16 +364,33 @@ async fn wait_for_redirect(listener: &TcpListener, expected_state: &str) -> TdsR
     }
 }
 
-/// Reads an incoming request up to the end of the request line (first CRLF),
-/// bounded by [`READ_TIMEOUT`] and [`MAX_REQUEST_BYTES`], and returns its query
-/// string. Returns `None` on timeout, EOF, error, or a request with no query.
-async fn read_request_query(stream: &mut tokio::net::TcpStream) -> Option<String> {
+/// Reads an incoming request up to the end of the request line (first CRLF) and
+/// returns its query string. The whole read is bounded by a single
+/// [`READ_TIMEOUT`] deadline — not a per-read timeout — so a client that dribbles
+/// bytes cannot keep resetting the timer and hold this sequential handler open,
+/// starving the real browser callback (worst under an infinite login timeout).
+/// Also bounded by [`MAX_REQUEST_BYTES`]. Returns `None` on timeout, EOF, error,
+/// or a request with no query.
+async fn read_request_query<S>(stream: &mut S) -> Option<String>
+where
+    S: AsyncReadExt + Unpin,
+{
+    read_request_query_within(stream, READ_TIMEOUT).await
+}
+
+/// [`read_request_query`] with an explicit overall budget so the deadline
+/// behavior can be unit-tested without waiting the full [`READ_TIMEOUT`].
+async fn read_request_query_within<S>(stream: &mut S, budget: Duration) -> Option<String>
+where
+    S: AsyncReadExt + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + budget;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
-        let n = match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk)).await {
+        let n = match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
             Ok(Ok(n)) if n > 0 => n,
-            _ => break, // EOF, read error, or timeout
+            _ => break, // EOF, read error, or overall-deadline timeout
         };
         buf.extend_from_slice(&chunk[..n]);
         if let Some(end) = buf.windows(2).position(|w| w == b"\r\n") {
@@ -493,8 +515,12 @@ async fn exchange_code_for_token(
         let detail = serde_json::from_str::<TokenErrorResponse>(body.as_ref())
             .map(|e| format!("{}: {}", e.error, e.error_description))
             .unwrap_or_else(|_| body.into_owned());
-        return Err(Error::ConnectionError(format!(
-            "interactive token exchange failed ({status}): {detail}"
+        // Token-endpoint failures (RFC 6749 §5.2: `invalid_grant`, …) are
+        // authorization failures, and relaunching the browser is not a valid
+        // recovery, so classify them non-transient to keep them out of connect
+        // retries.
+        return Err(Error::Security(SecurityError::AuthenticationDenied(
+            format!("interactive token exchange failed ({status}): {detail}"),
         )));
     }
 
@@ -764,5 +790,46 @@ mod tests {
     #[test]
     fn redirect_wait_cap_falls_back_when_unset() {
         assert_eq!(redirect_wait_cap(None), Some(REDIRECT_TIMEOUT));
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    #[test]
+    fn read_request_query_returns_query_for_complete_line() {
+        block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(256);
+            client
+                .write_all(b"GET /?code=abc&state=xyz HTTP/1.1\r\n")
+                .await
+                .unwrap();
+            let query = read_request_query_within(&mut server, Duration::from_secs(5)).await;
+            assert_eq!(query.as_deref(), Some("code=abc&state=xyz"));
+        });
+    }
+
+    #[test]
+    fn read_request_query_is_bounded_by_a_single_overall_deadline() {
+        // A client that sends one byte and then stalls without completing the
+        // request line must be cut off by the overall deadline, not kept alive by a
+        // per-read timer that resets on each byte.
+        block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(64);
+            client.write_all(b"G").await.unwrap();
+            let start = tokio::time::Instant::now();
+            let query = read_request_query_within(&mut server, Duration::from_millis(150)).await;
+            let elapsed = start.elapsed();
+            assert!(query.is_none());
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "expected the overall deadline to fire quickly, took {elapsed:?}"
+            );
+            drop(client);
+        });
     }
 }
