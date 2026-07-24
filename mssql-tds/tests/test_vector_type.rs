@@ -840,10 +840,8 @@ mod vector_integration_tests {
 
         client.execute(create_table.to_string(), ()).await.unwrap();
 
-        // Consume any result sets from the setup
-        while client.on_rows() {
-            client.advance_to_rows().await.unwrap();
-        }
+        // Drain the setup batch to the end (no-row statements included).
+        while client.advance_to_rows().await.unwrap() {}
 
         // Now query with Vector parameter
         let values = vec![1.0f32, 2.0f32, 3.0f32];
@@ -1024,10 +1022,8 @@ mod vector_integration_tests {
 
         client.execute(create_proc.to_string(), ()).await.unwrap();
 
-        // Consume result sets from CREATE PROCEDURE
-        while client.on_rows() {
-            client.advance_to_rows().await.unwrap();
-        }
+        // Drain the setup batch to the end (no-row statements included).
+        while client.advance_to_rows().await.unwrap() {}
 
         // Call the procedure with output parameter
         let output_param = RpcParameter::new(
@@ -1047,6 +1043,9 @@ mod vector_integration_tests {
             .unwrap();
 
         // Get output parameter value
+        // Drain to the end of the batch so the output-parameter RETURNVALUE
+        // tokens are collected (they arrive after the proc body's statements).
+        client.advance_to_rows().await.unwrap();
         let output_params = client.retrieve_output_params().unwrap().unwrap();
         assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
 
@@ -1088,10 +1087,8 @@ mod vector_integration_tests {
 
         client.execute(create_proc.to_string(), ()).await.unwrap();
 
-        // Consume result sets from CREATE PROCEDURE
-        while client.on_rows() {
-            client.advance_to_rows().await.unwrap();
-        }
+        // Drain the setup batch to the end (no-row statements included).
+        while client.advance_to_rows().await.unwrap() {}
 
         // Prepare input and output parameters
         let input_vector = SqlVector::try_from_f32(vec![10.5f32, 20.5f32, 30.5f32]).unwrap();
@@ -1114,6 +1111,9 @@ mod vector_integration_tests {
             .unwrap();
 
         // Get output parameter value
+        // Drain to the end of the batch so the output-parameter RETURNVALUE
+        // tokens are collected (they arrive after the proc body's statements).
+        client.advance_to_rows().await.unwrap();
         let output_params = client.retrieve_output_params().unwrap().unwrap();
         assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
 
@@ -1152,10 +1152,8 @@ mod vector_integration_tests {
 
         client.execute(create_proc.to_string(), ()).await.unwrap();
 
-        // Consume result sets from CREATE PROCEDURE
-        while client.on_rows() {
-            client.advance_to_rows().await.unwrap();
-        }
+        // Drain the setup batch to the end (no-row statements included).
+        while client.advance_to_rows().await.unwrap() {}
 
         // Call the procedure with output parameter
         let output_param = RpcParameter::new(
@@ -1175,6 +1173,9 @@ mod vector_integration_tests {
             .unwrap();
 
         // Get output parameter value - should be NULL
+        // Drain to the end of the batch so the output-parameter RETURNVALUE
+        // tokens are collected (they arrive after the proc body's statements).
+        client.advance_to_rows().await.unwrap();
         let output_params = client.retrieve_output_params().unwrap().unwrap();
         assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
 
@@ -1216,10 +1217,8 @@ mod vector_integration_tests {
 
         client.execute(create_proc, ()).await.unwrap();
 
-        // Consume result sets from CREATE PROCEDURE
-        while client.on_rows() {
-            client.advance_to_rows().await.unwrap();
-        }
+        // Drain the setup batch to the end (no-row statements included).
+        while client.advance_to_rows().await.unwrap() {}
 
         // Call the procedure with output parameter
         let output_param = RpcParameter::new(
@@ -1239,6 +1238,9 @@ mod vector_integration_tests {
             .unwrap();
 
         // Get output parameter value
+        // Drain to the end of the batch so the output-parameter RETURNVALUE
+        // tokens are collected (they arrive after the proc body's statements).
+        client.advance_to_rows().await.unwrap();
         let output_params = client.retrieve_output_params().unwrap().unwrap();
         assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
 
