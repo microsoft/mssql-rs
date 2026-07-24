@@ -31,7 +31,7 @@ use crate::{
     },
     datatypes::column_values::ColumnValues,
     handler::handler_factory::NegotiatedSettings,
-    io::token_stream::{ParserContext, RowReadResult},
+    io::token_stream::{ParserContext, PlpPauseState, RowPauseState, RowReadResult},
     message::{batch::SqlBatch, messages::Request},
     token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, EnvChangeTokenSubType, Tokens},
 };
@@ -70,6 +70,13 @@ type MemoizedCellDecryptor = (
     Arc<ColMetadataToken>,
     Option<Arc<dyn crate::security::cell_decryptor::CellDecryptor>>,
 );
+
+#[derive(Debug)]
+enum ActiveRowReadState {
+    Idle,
+    RowPaused(Box<RowPauseState>),
+    PlpPaused(Box<PlpPauseState>),
+}
 
 /// Active TDS connection to a SQL Server instance.
 ///
@@ -148,6 +155,9 @@ pub struct TdsClient {
 
     /// Empty metadata vector for returning when no metadata is available
     empty_metadata: Vec<ColumnMetadata>,
+
+    // Active PLP stream state when row decoding paused at a PLP target column.
+    active_row_read_state: ActiveRowReadState,
 }
 
 impl TdsClient {
@@ -191,6 +201,7 @@ impl TdsClient {
             remaining_request_timeout: None,
             cancel_handle: None,
             empty_metadata: Vec::new(),
+            active_row_read_state: ActiveRowReadState::Idle,
         }
     }
 
@@ -2730,8 +2741,47 @@ impl TdsClient {
         Ok(Some(decryptor))
     }
 
+    pub(crate) fn active_plp_collation(&self) -> Option<SqlCollation> {
+        match &self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => plp_state.collation(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn active_plp_reached_end(&self) -> bool {
+        match &self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => plp_state.reached_end(),
+            _ => true,
+        }
+    }
+
+    pub(crate) async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        let ActiveRowReadState::PlpPaused(plp_state) = &mut self.active_row_read_state else {
+            return Ok(0);
+        };
+
+        let start = Instant::now();
+        let read = self
+            .transport
+            .read_active_plp_bytes(
+                plp_state,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+                out,
+            )
+            .await?;
+        self.update_remaining_timeout(start);
+        Ok(read)
+    }
+
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
+    ///
+    /// If a prior call paused mid-row, this method first resumes and completes
+    /// that same logical row before reading tokens for a subsequent row. If row
+    /// decoding was paused on a PLP column and the caller did not finish draining
+    /// it via `read_active_plp_bytes`, this method drains the remaining PLP bytes
+    /// before resuming the row.
     ///
     /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
     /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
@@ -2745,6 +2795,39 @@ impl TdsClient {
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
             ));
         }
+
+        match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
+            ActiveRowReadState::Idle => {}
+            ActiveRowReadState::RowPaused(pause_state) => {
+                return self.resume_row_loop(*pause_state, writer).await;
+            }
+            ActiveRowReadState::PlpPaused(mut plp_state) => {
+                let mut buffer = [0u8; 8192];
+                while !plp_state.reached_end() {
+                    let start = Instant::now();
+                    let read = self
+                        .transport
+                        .read_active_plp_bytes(
+                            &mut plp_state,
+                            self.remaining_request_timeout,
+                            self.cancel_handle.as_ref(),
+                            &mut buffer,
+                        )
+                        .await?;
+                    self.update_remaining_timeout(start);
+
+                    if read == 0 && !plp_state.reached_end() {
+                        return Err(crate::error::Error::ProtocolError(
+                            "Active PLP drain made no progress before end-of-stream".to_string(),
+                        ));
+                    }
+                }
+                return self
+                    .resume_row_loop(plp_state.row_pause_state, writer)
+                    .await;
+            }
+        }
+
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
         let decryptor = self.resolve_cell_decryptor(&metadata).await?;
         let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
@@ -2767,87 +2850,142 @@ impl TdsClient {
                     info!("Row Received");
                     return Ok(true);
                 }
-                RowReadResult::Token(token) => match token {
-                    Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
-                        info!("done while get_next_row: {:?}", done);
-
-                        if done.has_error() {
-                            return Err(crate::error::Error::ProtocolError(
-                                "Server reported error in DONE token without preceding ERROR token"
-                                    .to_string(),
-                            ));
-                        }
-
-                        let count = self.count_map.entry(done.cur_cmd).or_insert(0);
-                        *count = count.saturating_add(done.row_count);
-
-                        self.current_result_set_has_been_read_till_end = true;
-                        if !done.has_more() {
-                            info!("No more rows for current command: {:?}", done.cur_cmd);
-                            self.execution_context.set_has_open_batch(false);
-                        }
-                        return Ok(false);
+                RowReadResult::RowPaused(pause_state) => {
+                    self.active_row_read_state =
+                        ActiveRowReadState::RowPaused(Box::new(pause_state));
+                    return Ok(true);
+                }
+                RowReadResult::PlpPaused(plp_state) => {
+                    self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(plp_state));
+                    return Ok(true);
+                }
+                RowReadResult::Token(token) => {
+                    if let Some(has_row) = self.handle_row_read_token(token).await? {
+                        return Ok(has_row);
                     }
-                    Tokens::Order(order_token) => {
-                        info!(?order_token);
-                        continue;
-                    }
-                    Tokens::EnvChange(env_change) => {
-                        info!(?env_change);
-                        if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                            self.recovery_context.session_state_table.reset();
-                        }
-                        self.execution_context
-                            .capture_change_property(&env_change, &mut self.negotiated_settings)?;
-                        continue;
-                    }
-                    Tokens::SessionState(session_state) => {
-                        self.recovery_context
-                            .process_session_state(&session_state)?;
-                        continue;
-                    }
-                    Tokens::ReturnValue(return_value_token) => {
-                        let return_value = self.finalize_return_value(return_value_token)?;
-                        self.push_return_value(return_value);
-                        continue;
-                    }
-                    Tokens::Error(error_token) => {
-                        info!(?error_token);
-                        let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
-                        let drain_errors = self.drain_stream().await?;
-                        all_errors.extend(drain_errors);
-                        // The error drained the rest of the batch to its terminal
-                        // DONE, so the connection is idle again. Clear the batch
-                        // state so a subsequent `close_query` / `advance` does not
-                        // block trying to read a stream that is already consumed.
-                        self.execution_context.set_has_open_batch(false);
-                        self.current_result_set_has_been_read_till_end = true;
-                        self.current_metadata = None;
-                        return Err(crate::error::Error::from_sql_errors(all_errors));
-                    }
-                    Tokens::ColMetadata(_) => {
-                        return Err(crate::error::Error::UsageError(
-                            "Unexpected ColMetadata token encountered while reading rows. \
-                             This typically indicates the API was not used correctly - \
-                             you may need to call advance_to_rows() to advance to the next result set."
-                                .to_string(),
-                        ));
-                    }
-                    Tokens::Info(info_token) => {
-                        info!(?info_token);
-                        self.capture_info_message(&info_token);
-                        continue;
-                    }
-                    Tokens::TabName | Tokens::ColInfo => {
-                        continue;
-                    }
-                    _ => {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "Unexpected token while finding the next row: {token:?}"
-                        )));
-                    }
-                },
+                }
             }
+        }
+    }
+
+    async fn resume_row_loop(
+        &mut self,
+        pause_state: RowPauseState,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<bool> {
+        let current = pause_state;
+        let start = Instant::now();
+        let result = self
+            .transport
+            .resume_row_into(
+                current,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+                writer,
+            )
+            .await?;
+        self.update_remaining_timeout(start);
+        match result {
+            RowReadResult::RowWritten => {
+                writer.end_row();
+                info!("Row Received");
+                Ok(true)
+            }
+            RowReadResult::RowPaused(next_pause) => {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(next_pause));
+                Ok(true)
+            }
+            RowReadResult::PlpPaused(plp_state) => {
+                self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(plp_state));
+                Ok(true)
+            }
+            RowReadResult::Token(token) => {
+                if let Some(has_row) = self.handle_row_read_token(token).await? {
+                    Ok(has_row)
+                } else {
+                    // This should not happen in normal resume flow; keep as a defensive guard.
+                    Err(crate::error::Error::ProtocolError(
+                        "Unexpected token during row resume".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn handle_row_read_token(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
+        match token {
+            Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
+                info!("done while get_next_row: {:?}", done);
+
+                if done.has_error() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "Server reported error in DONE token without preceding ERROR token"
+                            .to_string(),
+                    ));
+                }
+
+                let count = self.count_map.entry(done.cur_cmd).or_insert(0);
+                *count = count.saturating_add(done.row_count);
+
+                self.current_result_set_has_been_read_till_end = true;
+                if !done.has_more() {
+                    info!("No more rows for current command: {:?}", done.cur_cmd);
+                    self.execution_context.set_has_open_batch(false);
+                }
+                Ok(Some(false))
+            }
+            Tokens::Order(order_token) => {
+                info!(?order_token);
+                Ok(None)
+            }
+            Tokens::EnvChange(env_change) => {
+                info!(?env_change);
+                if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                    self.recovery_context.session_state_table.reset();
+                }
+                self.execution_context
+                    .capture_change_property(&env_change, &mut self.negotiated_settings)?;
+                Ok(None)
+            }
+            Tokens::SessionState(session_state) => {
+                self.recovery_context
+                    .process_session_state(&session_state)?;
+                Ok(None)
+            }
+            Tokens::ReturnValue(return_value_token) => {
+                let return_value = self.finalize_return_value(return_value_token)?;
+                self.push_return_value(return_value);
+                Ok(None)
+            }
+            Tokens::Error(error_token) => {
+                info!(?error_token);
+                let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
+                let drain_errors = self.drain_stream().await?;
+                all_errors.extend(drain_errors);
+                // The error drained the rest of the batch to its terminal
+                // DONE, so the connection is idle again. Clear the batch
+                // state so a subsequent `close_query` / `advance` does not
+                // block trying to read a stream that is already consumed.
+                self.execution_context.set_has_open_batch(false);
+                self.current_result_set_has_been_read_till_end = true;
+                self.current_metadata = None;
+                Err(crate::error::Error::from_sql_errors(all_errors))
+            }
+            Tokens::ColMetadata(_) => Err(crate::error::Error::UsageError(
+                "Unexpected ColMetadata token encountered while reading rows. \
+                     This typically indicates the API was not used correctly - \
+                     you may need to call advance_to_rows() to advance to the next result set."
+                    .to_string(),
+            )),
+            Tokens::Info(info_token) => {
+                info!(?info_token);
+                self.capture_info_message(&info_token);
+                Ok(None)
+            }
+            Tokens::TabName | Tokens::ColInfo => Ok(None),
+            _ => Err(crate::error::Error::ProtocolError(format!(
+                "Unexpected token while finding the next row: {token:?}"
+            ))),
         }
     }
 
@@ -2956,6 +3094,7 @@ impl TdsClient {
         self.expecting_prepare_handle = false;
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
+        self.active_row_read_state = ActiveRowReadState::Idle;
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
         Ok(())
@@ -3285,6 +3424,18 @@ impl ResultSet for TdsClient {
         }
     }
 
+    async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        TdsClient::read_active_plp_bytes(self, out).await
+    }
+
+    fn active_plp_reached_end(&self) -> bool {
+        TdsClient::active_plp_reached_end(self)
+    }
+
+    fn active_plp_collation(&self) -> Option<SqlCollation> {
+        TdsClient::active_plp_collation(self)
+    }
+
     fn maybe_has_unread_rows(&self) -> bool {
         !self.current_result_set_has_been_read_till_end
     }
@@ -3403,7 +3554,32 @@ pub trait ResultSet {
 
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
+    ///
+    /// If the writer opts into [`RowWriter::pause_after_column`], this method
+    /// may return `Ok(true)` more than once for the same logical row: each pause
+    /// boundary yields control back to the caller, and [`RowWriter::end_row`]
+    /// runs only after the final resume completes the row.
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool>;
+
+    /// Reads bytes from the active PLP stream captured after a `PlpPaused` result from
+    /// `next_row_into`. The caller must drain the stream to completion before calling
+    /// `next_row_into` again.
+    async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        let _ = out;
+        Ok(0)
+    }
+
+    /// Returns `true` when the active PLP stream has been fully consumed or when
+    /// there is no active PLP stream.
+    fn active_plp_reached_end(&self) -> bool {
+        true
+    }
+
+    /// Returns the TDS collation for the active PLP string stream, or `None` for
+    /// binary types or when there is no active PLP stream.
+    fn active_plp_collation(&self) -> Option<SqlCollation> {
+        None
+    }
 
     /// Returns `true` if the result set may still contain unread rows.
     fn maybe_has_unread_rows(&self) -> bool;
@@ -3422,7 +3598,9 @@ mod tests {
     use crate::core::{CancelHandle, TdsResult};
     use crate::datatypes::row_writer::RowWriter;
     use crate::io::reader_writer::{NetworkReader, NetworkWriter};
-    use crate::io::token_stream::{ParserContext, RowReadResult, TdsTokenStreamReader};
+    use crate::io::token_stream::{
+        ParserContext, RowPauseState, RowReadResult, TdsTokenStreamReader,
+    };
     use crate::token::tokens::{
         ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
     };
@@ -3439,6 +3617,8 @@ mod tests {
         /// Every byte handed to `send` (request framing + payload), so tests can
         /// assert what was actually written to the wire.
         sent: Arc<std::sync::Mutex<Vec<u8>>>,
+        packet_data: Vec<u8>,
+        packet_pos: usize,
     }
 
     impl TestTransport {
@@ -3448,6 +3628,8 @@ mod tests {
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                packet_data: Vec::new(),
+                packet_pos: 0,
             }
         }
 
@@ -3457,7 +3639,32 @@ mod tests {
                 pending_tokens: VecDeque::from(tokens),
                 reset_mode: ResetConnectionMode::None,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                packet_data: Vec::new(),
+                packet_pos: 0,
             }
+        }
+
+        fn with_packet_data(packet_data: Vec<u8>) -> Self {
+            Self {
+                closed: false,
+                pending_tokens: VecDeque::new(),
+                reset_mode: ResetConnectionMode::None,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                packet_data,
+                packet_pos: 0,
+            }
+        }
+
+        fn take_packet_bytes(&mut self, count: usize) -> TdsResult<&[u8]> {
+            if self.packet_pos + count > self.packet_data.len() {
+                return Err(crate::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "End of data",
+                )));
+            }
+            let slice = &self.packet_data[self.packet_pos..self.packet_pos + count];
+            self.packet_pos += count;
+            Ok(slice)
         }
     }
 
@@ -3490,6 +3697,26 @@ mod tests {
             if let Some(tok) = self.pending_tokens.pop_front() {
                 return Ok(RowReadResult::Token(tok));
             }
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+
+        async fn resume_row_into(
+            &mut self,
+            _pause_state: RowPauseState,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+            _writer: &mut (dyn RowWriter + Send),
+        ) -> TdsResult<RowReadResult> {
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+
+        async fn read_active_plp_bytes(
+            &mut self,
+            _plp_state: &mut PlpPauseState,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+            _out: &mut [u8],
+        ) -> TdsResult<usize> {
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
     }
@@ -3553,6 +3780,81 @@ mod tests {
         }
         fn is_connection_dead(&self) -> bool {
             true
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::io::packet_reader::TdsPacketReader for TestTransport {
+        async fn read_byte(&mut self) -> TdsResult<u8> {
+            Ok(self.take_packet_bytes(1)?[0])
+        }
+        async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint40(&mut self) -> TdsResult<u64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_float32(&mut self) -> TdsResult<f32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_float64(&mut self) -> TdsResult<f64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int16(&mut self) -> TdsResult<i16> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint16(&mut self) -> TdsResult<u16> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint24(&mut self) -> TdsResult<u32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int32(&mut self) -> TdsResult<i32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint32(&mut self) -> TdsResult<u32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int64(&mut self) -> TdsResult<i64> {
+            Ok(i64::from_le_bytes(
+                self.take_packet_bytes(8)?.try_into().unwrap(),
+            ))
+        }
+        async fn read_uint64(&mut self) -> TdsResult<u64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_bytes(&mut self, _buf: &mut [u8]) -> TdsResult<usize> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_u8_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_u16_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_varchar_u16_length(&mut self) -> TdsResult<Option<String>> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_varchar_u8_length(&mut self) -> TdsResult<String> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_unicode(&mut self, _len: usize) -> TdsResult<String> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_unicode_with_byte_length(&mut self, _len: usize) -> TdsResult<String> {
+            unimplemented!("TestTransport")
+        }
+        async fn skip_bytes(&mut self, _count: usize) -> TdsResult<()> {
+            unimplemented!("TestTransport")
+        }
+        async fn cancel_read_stream(&mut self) -> TdsResult<()> {
+            unimplemented!("TestTransport")
+        }
+        fn reset_reader(&mut self) {
+            self.packet_pos = 0;
         }
     }
 
@@ -3835,6 +4137,88 @@ mod tests {
             TdsClient::timeout_to_duration(Some(30)),
             Some(Duration::from_secs(30))
         );
+    }
+
+    // ── PLP streaming lifecycle contract tests ──
+
+    #[tokio::test]
+    async fn plp_read_bytes_no_active_stream_returns_zero() {
+        let mut client = create_test_client();
+        let mut buf = [0u8; 4];
+
+        let read = client.read_active_plp_bytes(&mut buf).await.unwrap();
+
+        assert_eq!(read, 0);
+    }
+
+    #[test]
+    fn plp_reached_end_returns_true_when_no_stream_active() {
+        let client = create_test_client();
+
+        assert!(client.active_plp_reached_end());
+    }
+
+    #[test]
+    fn plp_collation_returns_none_when_no_stream_active() {
+        let client = create_test_client();
+        assert!(client.active_plp_collation().is_none());
+    }
+
+    #[tokio::test]
+    async fn active_plp_collation_reports_stream_collation_when_paused() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let metadata = crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::partial_len(
+                crate::datatypes::sqldatatypes::TdsDataType::BigVarChar,
+                0xFFFF,
+                Some(collation),
+            )
+            .unwrap(),
+            data_type: crate::datatypes::sqldatatypes::TdsDataType::BigVarChar,
+            column_name: "c1".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+        let mut reader = TestTransport::with_packet_data((-2_i64).to_le_bytes().to_vec());
+        let plp_stream = crate::datatypes::decoder::PlpColumnStream::begin(&metadata, &mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        let row_pause_state = RowPauseState {
+            next_column_index: 1,
+            columns: vec![metadata],
+            nbc_null_bitmap: None,
+            decryptor: None,
+        };
+
+        let mut client = create_test_client();
+        client.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(PlpPauseState {
+            row_pause_state,
+            plp_stream,
+        }));
+
+        assert_eq!(client.active_plp_collation(), Some(collation));
+    }
+
+    #[test]
+    fn plp_helpers_treat_non_plp_row_pause_as_no_active_stream() {
+        let mut client = create_test_client();
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 1,
+            columns: Vec::new(),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+
+        assert!(client.active_plp_reached_end());
+        assert!(client.active_plp_collation().is_none());
     }
 
     #[test]

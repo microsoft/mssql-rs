@@ -28,7 +28,9 @@ use crate::core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult};
 use crate::datatypes::row_writer::RowWriter;
 use crate::handler::handler_factory::create_test_negotiated_settings_internal;
 use crate::io::reader_writer::{NetworkReader, NetworkWriter};
-use crate::io::token_stream::{ParserContext, RowReadResult, TdsTokenStreamReader};
+use crate::io::token_stream::{
+    ParserContext, PlpPauseState, RowPauseState, RowReadResult, TdsTokenStreamReader,
+};
 use crate::message::messages::ResetConnectionMode;
 use crate::token::tokens::{
     ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
@@ -81,6 +83,29 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         if let Some(tok) = self.pending_tokens.pop_front() {
             return Ok(RowReadResult::Token(tok));
         }
+        Err(crate::error::Error::ConnectionClosed("test".to_string()))
+    }
+
+    // The scripted transport surfaces every queued token as a control token and
+    // has no row bytes, so it never produces a `RowPaused` / `PlpPaused` result;
+    // these resume paths are therefore unreachable for it.
+    async fn resume_row_into(
+        &mut self,
+        _pause_state: RowPauseState,
+        _remaining_request_timeout: Option<Duration>,
+        _cancel_handle: Option<&CancelHandle>,
+        _writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult> {
+        Err(crate::error::Error::ConnectionClosed("test".to_string()))
+    }
+
+    async fn read_active_plp_bytes(
+        &mut self,
+        _plp_state: &mut PlpPauseState,
+        _remaining_request_timeout: Option<Duration>,
+        _cancel_handle: Option<&CancelHandle>,
+        _out: &mut [u8],
+    ) -> TdsResult<usize> {
         Err(crate::error::Error::ConnectionClosed("test".to_string()))
     }
 }

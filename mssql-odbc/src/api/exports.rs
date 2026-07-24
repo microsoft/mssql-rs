@@ -491,13 +491,20 @@ pub unsafe extern "C" fn SQLGetConnectAttrW(
 /// - `string_length` is used only for string-type attributes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLSetStmtAttrW(
-    _statement_handle: SqlHandle,
-    _attribute: SqlInteger,
-    _value_ptr: SqlPointer,
-    _string_length: SqlInteger,
+    statement_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    string_length: SqlInteger,
 ) -> SqlReturn {
     crate::init_tracing();
-    SQL_SUCCESS
+    unsafe {
+        super::set_stmt_attr::sql_set_stmt_attr_w(
+            statement_handle,
+            attribute,
+            value_ptr,
+            string_length,
+        )
+    }
 }
 
 /// Retrieves a statement attribute.
@@ -508,14 +515,22 @@ pub unsafe extern "C" fn SQLSetStmtAttrW(
 /// - Output pointers must be valid and writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLGetStmtAttrW(
-    _statement_handle: SqlHandle,
-    _attribute: SqlInteger,
-    _value_ptr: SqlPointer,
-    _buffer_length: SqlInteger,
-    _string_length_ptr: *mut SqlInteger,
+    statement_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
     crate::init_tracing();
-    SQL_SUCCESS
+    unsafe {
+        super::set_stmt_attr::sql_get_stmt_attr_w(
+            statement_handle,
+            attribute,
+            value_ptr,
+            buffer_length,
+            string_length_ptr,
+        )
+    }
 }
 
 // ---- Descriptor and parameter management (TO-BE-IMPLEMENTED) -----------------

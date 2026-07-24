@@ -84,6 +84,7 @@ Every `.rs` file must start with:
 - **Tracing:** `tracing` crate (`debug!`, `error!`, `info!`, `trace!`, `#[instrument]`)
 - **Cancellation:** `CancelHandle` wrapping `tokio_util::CancellationToken`
 - **Authentication:** Two-phase resolution (validate inputs → resolve method) in `connection/`. Kerberos/GSSAPI for integrated auth cross-platform.
+- **Async state size:** Box new non-primitive fields in long-lived client-context structs when it keeps async state smaller.
 
 ### FFI Patterns
 
