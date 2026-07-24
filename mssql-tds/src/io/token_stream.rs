@@ -1109,11 +1109,13 @@ mod tests {
         }
     }
 
-    struct PauseOnFirstColumnWriter;
+    struct PauseAtColumnWriter {
+        pause_at: usize,
+    }
 
-    impl RowWriter for PauseOnFirstColumnWriter {
+    impl RowWriter for PauseAtColumnWriter {
         fn pause_after_column(&self, col: usize) -> bool {
-            col == 0
+            col == self.pause_at
         }
 
         fn write_null(&mut self, _col: usize) {}
@@ -1141,6 +1143,33 @@ mod tests {
         fn write_json(&mut self, _col: usize, _val: SqlJson) {}
         fn write_vector(&mut self, _col: usize, _val: SqlVector) {}
         fn end_row(&mut self) {}
+    }
+
+    fn plp_varbinary_metadata(
+        column_name: &str,
+        crypto_metadata: Option<crate::query::metadata::CryptoMetadata>,
+    ) -> ColumnMetadata {
+        ColumnMetadata {
+            user_type: 0,
+            flags: if crypto_metadata.is_some() { 0x0800 } else { 0 },
+            data_type: TdsDataType::BigVarBinary,
+            type_info: TypeInfo::partial_len(TdsDataType::BigVarBinary, 0xFFFF, None).unwrap(),
+            column_name: column_name.to_string(),
+            multi_part_name: None,
+            crypto_metadata,
+        }
+    }
+
+    fn ae_crypto_metadata() -> crate::query::metadata::CryptoMetadata {
+        crate::query::metadata::CryptoMetadata {
+            cek_table_ordinal: 0,
+            base_data_type: TdsDataType::BigVarBinary,
+            base_type_info: TypeInfo::partial_len(TdsDataType::BigVarBinary, 0xFFFF, None).unwrap(),
+            cipher_algorithm_id: 2,
+            cipher_algorithm_name: None,
+            encryption_type: 1,
+            normalization_rule_version: 1,
+        }
     }
 
     #[tokio::test]
@@ -1174,7 +1203,7 @@ mod tests {
         packet.extend_from_slice(&(-2_i64).to_le_bytes());
         let mut reader = TestByteReader::new(packet);
         let registry = GenericTokenParserRegistry::default();
-        let mut writer = PauseOnFirstColumnWriter;
+        let mut writer = PauseAtColumnWriter { pause_at: 0 };
 
         let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
             .await
@@ -1186,6 +1215,75 @@ mod tests {
                 assert!(!plp_state.reached_end());
             }
             _ => panic!("expected PlpPaused"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nbcrow_pause_and_plp_resume_path_is_exercised() {
+        let context = ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: 2,
+                columns: vec![
+                    ColumnMetadata {
+                        user_type: 0,
+                        flags: 0,
+                        data_type: TdsDataType::Int4,
+                        type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                        column_name: "c1".to_string(),
+                        multi_part_name: None,
+                        crypto_metadata: None,
+                    },
+                    plp_varbinary_metadata("c2", None),
+                ],
+                cek_table: vec![],
+            }),
+            None,
+        );
+
+        let mut packet = vec![TokenType::NbcRow as u8, 0b0000_0001];
+        packet.extend_from_slice(&(-2_i64).to_le_bytes());
+        let mut reader = TestByteReader::new(packet);
+        let registry = GenericTokenParserRegistry::default();
+        let mut writer = PauseAtColumnWriter { pause_at: 1 };
+
+        let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+            .await
+            .unwrap();
+
+        match result {
+            RowReadResult::PlpPaused(plp_state) => {
+                assert!(plp_state.collation().is_none());
+                assert!(!plp_state.reached_end());
+            }
+            _ => panic!("expected PlpPaused"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ae_paused_plp_streaming_fails_fast() {
+        let context = ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: 1,
+                columns: vec![plp_varbinary_metadata("c1", Some(ae_crypto_metadata()))],
+                cek_table: vec![],
+            }),
+            None,
+        );
+
+        let mut reader = TestByteReader::new(vec![TokenType::Row as u8]);
+        let registry = GenericTokenParserRegistry::default();
+        let mut writer = PauseAtColumnWriter { pause_at: 0 };
+
+        let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer).await;
+
+        match result {
+            Err(crate::error::Error::UnimplementedFeature { feature, context }) => {
+                assert_eq!(feature, "Always Encrypted paused PLP streaming");
+                assert!(context.contains("Encrypted PLP column 'c1' cannot be streamed"));
+                assert!(context.contains("read_active_plp_bytes"));
+            }
+            Err(err) => panic!("expected UnimplementedFeature, got: {err:?}"),
+            Ok(_) => panic!("expected AE paused PLP streaming to fail"),
         }
     }
 

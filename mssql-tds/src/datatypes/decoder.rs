@@ -3112,7 +3112,8 @@ mod test {
         use crate::core::TdsResult;
         use crate::datatypes::column_values::{ColumnValues, SqlDateTime, SqlSmallDateTime};
         use crate::datatypes::decoder::{
-            GenericDecoder, PlpChunkStreamReader, PlpColumnStream, SqlTypeDecode,
+            GenericDecoder, MAX_PLP_SIZE, PlpChunkReadLength, PlpChunkStreamReader,
+            PlpColumnStream, SqlTypeDecode,
         };
         use crate::datatypes::row_writer::DefaultRowWriter;
         use crate::datatypes::sqldatatypes::{
@@ -3901,6 +3902,44 @@ mod test {
             assert!(
                 err.to_string()
                     .contains("PLP stream ended before declared length was reached"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn plp_chunk_stream_reader_chunk_count_limit_errors() {
+            let mut stream = PlpChunkStreamReader {
+                length: PlpChunkReadLength::Unknown,
+                chunk_remaining: 0,
+                reached_end: false,
+                total_read: 0,
+                chunks_seen: GenericDecoder::MAX_PLP_CHUNKS,
+            };
+            let mut reader = ByteReader::new(vec![1, 0, 0, 0]);
+            let mut out = [0u8; 1];
+
+            let err = stream.read_into(&mut reader, &mut out).await.unwrap_err();
+            assert!(
+                err.to_string().contains("Too many PLP chunks"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn plp_chunk_stream_reader_accumulated_size_limit_errors() {
+            let mut stream = PlpChunkStreamReader {
+                length: PlpChunkReadLength::Known((MAX_PLP_SIZE as u64) + 1),
+                chunk_remaining: 0,
+                reached_end: false,
+                total_read: MAX_PLP_SIZE,
+                chunks_seen: 0,
+            };
+            let mut reader = ByteReader::new(vec![1, 0, 0, 0]);
+            let mut out = [0u8; 1];
+
+            let err = stream.read_into(&mut reader, &mut out).await.unwrap_err();
+            assert!(
+                err.to_string().contains("PLP accumulated size"),
                 "unexpected error: {err}"
             );
         }

@@ -3479,6 +3479,8 @@ mod tests {
         /// Every byte handed to `send` (request framing + payload), so tests can
         /// assert what was actually written to the wire.
         sent: Arc<std::sync::Mutex<Vec<u8>>>,
+        packet_data: Vec<u8>,
+        packet_pos: usize,
     }
 
     impl TestTransport {
@@ -3488,6 +3490,8 @@ mod tests {
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                packet_data: Vec::new(),
+                packet_pos: 0,
             }
         }
 
@@ -3497,7 +3501,32 @@ mod tests {
                 pending_tokens: VecDeque::from(tokens),
                 reset_mode: ResetConnectionMode::None,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                packet_data: Vec::new(),
+                packet_pos: 0,
             }
+        }
+
+        fn with_packet_data(packet_data: Vec<u8>) -> Self {
+            Self {
+                closed: false,
+                pending_tokens: VecDeque::new(),
+                reset_mode: ResetConnectionMode::None,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                packet_data,
+                packet_pos: 0,
+            }
+        }
+
+        fn take_packet_bytes(&mut self, count: usize) -> TdsResult<&[u8]> {
+            if self.packet_pos + count > self.packet_data.len() {
+                return Err(crate::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "End of data",
+                )));
+            }
+            let slice = &self.packet_data[self.packet_pos..self.packet_pos + count];
+            self.packet_pos += count;
+            Ok(slice)
         }
     }
 
@@ -3611,7 +3640,7 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::io::packet_reader::TdsPacketReader for TestTransport {
         async fn read_byte(&mut self) -> TdsResult<u8> {
-            unimplemented!("TestTransport")
+            Ok(self.take_packet_bytes(1)?[0])
         }
         async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
             unimplemented!("TestTransport")
@@ -3644,7 +3673,9 @@ mod tests {
             unimplemented!("TestTransport")
         }
         async fn read_int64(&mut self) -> TdsResult<i64> {
-            unimplemented!("TestTransport")
+            Ok(i64::from_le_bytes(
+                self.take_packet_bytes(8)?.try_into().unwrap(),
+            ))
         }
         async fn read_uint64(&mut self) -> TdsResult<u64> {
             unimplemented!("TestTransport")
@@ -3677,7 +3708,7 @@ mod tests {
             unimplemented!("TestTransport")
         }
         fn reset_reader(&mut self) {
-            unimplemented!("TestTransport")
+            self.packet_pos = 0;
         }
     }
 
@@ -3825,8 +3856,50 @@ mod tests {
     #[test]
     fn plp_collation_returns_none_when_no_stream_active() {
         let client = create_test_client();
-
         assert!(client.active_plp_collation().is_none());
+    }
+
+    #[tokio::test]
+    async fn active_plp_collation_reports_stream_collation_when_paused() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let metadata = crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::partial_len(
+                crate::datatypes::sqldatatypes::TdsDataType::BigVarChar,
+                0xFFFF,
+                Some(collation),
+            )
+            .unwrap(),
+            data_type: crate::datatypes::sqldatatypes::TdsDataType::BigVarChar,
+            column_name: "c1".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+        let mut reader = TestTransport::with_packet_data((-2_i64).to_le_bytes().to_vec());
+        let plp_stream = crate::datatypes::decoder::PlpColumnStream::begin(&metadata, &mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        let row_pause_state = RowPauseState {
+            next_column_index: 1,
+            columns: vec![metadata],
+            nbc_null_bitmap: None,
+            decryptor: None,
+        };
+
+        let mut client = create_test_client();
+        client.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(PlpPauseState {
+            row_pause_state,
+            plp_stream,
+        }));
+
+        assert_eq!(client.active_plp_collation(), Some(collation));
     }
 
     #[test]

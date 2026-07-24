@@ -32,7 +32,9 @@ pub trait RowWriter {
     ///
     /// Writers that support incremental PLP reads (for example an ODBC-facing
     /// writer serving `SQLGetData`) should override this and return the number
-    /// of bytes copied into `out`.
+    /// of bytes copied into `out`. The default hooks are forward-looking API
+    /// surface for incremental consumers and are not yet wired through a
+    /// concrete product writer in this crate.
     fn read_active_plp_bytes(&mut self, _out: &mut [u8]) -> TdsResult<usize> {
         Ok(0)
     }
