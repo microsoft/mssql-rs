@@ -49,17 +49,33 @@ $DriverRegKey  = "HKLM:\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server
 $DriversRegKey = "HKLM:\Software\ODBC\ODBCINST.INI\ODBC Drivers"
 $DriverName    = "ODBC Driver 18 for SQL Server"
 
-# Track whether we modified the registry so cleanup knows what to do.
+# Track whether we modified the registry so cleanup knows what to do. Each value
+# is snapshotted independently (did it exist, and its prior value) so a partial
+# or custom pre-existing registration is restored exactly, not left pointing at
+# the test DLL or a stray "Installed" entry.
 $script:OrigDriver = $null
 $script:OrigSetup  = $null
 $script:HadExistingKey = $false
+$script:HadDriverValue = $false
+$script:HadSetupValue = $false
+$script:HadDriversListEntry = $false
+$script:OrigDriversListValue = $null
 $script:Registered = $false
 
 function Save-OriginalRegistration {
     if (Test-Path $DriverRegKey) {
         $script:HadExistingKey = $true
-        $script:OrigDriver = (Get-ItemProperty -Path $DriverRegKey -Name "Driver" -ErrorAction SilentlyContinue).Driver
-        $script:OrigSetup  = (Get-ItemProperty -Path $DriverRegKey -Name "Setup"  -ErrorAction SilentlyContinue).Setup
+        $d = Get-ItemProperty -Path $DriverRegKey -Name "Driver" -ErrorAction SilentlyContinue
+        if ($null -ne $d) { $script:HadDriverValue = $true; $script:OrigDriver = $d.Driver }
+        $s = Get-ItemProperty -Path $DriverRegKey -Name "Setup" -ErrorAction SilentlyContinue
+        if ($null -ne $s) { $script:HadSetupValue = $true; $script:OrigSetup = $s.Setup }
+    }
+    if (Test-Path $DriversRegKey) {
+        $e = Get-ItemProperty -Path $DriversRegKey -Name $DriverName -ErrorAction SilentlyContinue
+        if ($null -ne $e) {
+            $script:HadDriversListEntry = $true
+            $script:OrigDriversListValue = $e.$DriverName
+        }
     }
 }
 
@@ -85,20 +101,33 @@ function Restore-Registration {
     if (-not $script:Registered) { return }
 
     if ($script:HadExistingKey) {
-        if ($script:OrigDriver) {
+        # Restore each value we may have overwritten, or remove it if it did not
+        # exist before we ran (leaving a Driver/Setup value behind would point a
+        # pre-existing key at the test DLL).
+        if ($script:HadDriverValue) {
             Set-ItemProperty -Path $DriverRegKey -Name "Driver" -Value $script:OrigDriver
+        } else {
+            Remove-ItemProperty -Path $DriverRegKey -Name "Driver" -ErrorAction SilentlyContinue
         }
-        if ($script:OrigSetup) {
+        if ($script:HadSetupValue) {
             Set-ItemProperty -Path $DriverRegKey -Name "Setup" -Value $script:OrigSetup
+        } else {
+            Remove-ItemProperty -Path $DriverRegKey -Name "Setup" -ErrorAction SilentlyContinue
         }
         Write-Host "[  DRIVER ] Restored original HKLM registration"
     } else {
         Remove-Item -Path $DriverRegKey -Force -ErrorAction SilentlyContinue
-        if (Test-Path $DriversRegKey) {
-            Remove-ItemProperty -Path $DriversRegKey -Name $DriverName -ErrorAction SilentlyContinue
-        }
         Write-Host "[  DRIVER ] Removed HKLM registration (no prior driver)"
     }
+
+    # Restore or remove the "ODBC Drivers" list entry independently of the driver
+    # key above, since the two can pre-exist in either combination.
+    if ($script:HadDriversListEntry) {
+        Set-ItemProperty -Path $DriversRegKey -Name $DriverName -Value $script:OrigDriversListValue
+    } elseif (Test-Path $DriversRegKey) {
+        Remove-ItemProperty -Path $DriversRegKey -Name $DriverName -ErrorAction SilentlyContinue
+    }
+
     $script:Registered = $false
 }
 
@@ -140,14 +169,18 @@ function Get-JunitResults([string]$Path) {
     foreach ($tc in $doc.SelectNodes("//testcase")) {
         $name = $tc.GetAttribute("name")
         if (-not $name) { $name = "<unnamed>" }
-        $failed = $false
+        $status = "PASS"
         foreach ($child in $tc.ChildNodes) {
             if ($child.LocalName -eq "failure" -or $child.LocalName -eq "error") {
-                $failed = $true
+                $status = "FAIL"
                 break
             }
+            if ($child.LocalName -eq "skipped") {
+                $status = "SKIP"
+                # keep scanning: a failure child (if any) outranks a skip
+            }
         }
-        $map[$name] = if ($failed) { "FAIL" } else { "PASS" }
+        $map[$name] = $status
     }
     return $map
 }
@@ -158,13 +191,17 @@ function Write-ParityReport([string]$RustXml, [string]$MsXml) {
     $ms   = Get-JunitResults $MsXml
     $names = @($rust.Keys + $ms.Keys | Sort-Object -Unique)
 
+    # Verdicts describe only the observed outcome pairing, not a root cause: a
+    # per-test PASS/FAIL divergence does not by itself establish which side is
+    # wrong, and a shared failure does not prove the test is buggy. Flag both for
+    # investigation rather than asserting blame.
     $verdict = {
         param($r, $m)
-        if ($r -eq "PASS" -and $m -eq "PASS") { return @("parity", "ok") }
-        if ($r -eq "FAIL" -and $m -eq "PASS") { return @("FIX mssql-odbc", "bug") }
-        if ($r -eq "PASS" -and $m -eq "FAIL") { return @("mssql-odbc bug, but test hides it (msodbcsql fails)", "warn") }
-        if ($r -eq "FAIL" -and $m -eq "FAIL") { return @("test bug (both fail)", "warn") }
-        return @("missing run", "warn")
+        if ($r -eq "SKIP" -or $m -eq "SKIP") { return @("skipped (not compared)", "skip") }
+        if ($r -eq "PASS" -and $m -eq "PASS") { return @("parity", "parity") }
+        if ($r -eq "FAIL" -and $m -eq "FAIL") { return @("shared failure - investigate", "shared") }
+        if ($r -ne $m) { return @("divergence - investigate", "divergence") }
+        return @("missing run - investigate", "divergence")
     }
 
     $width = 4
@@ -175,7 +212,7 @@ function Write-ParityReport([string]$RustXml, [string]$MsXml) {
     Write-Host ("{0}  {1,-10}  {2,-10}  Verdict" -f "Test".PadRight($width), "mssql-odbc", "msodbcsql")
     Write-Host ("{0}  {1}  {2}  {3}" -f ('-' * $width), ('-' * 10), ('-' * 10), ('-' * 30))
 
-    $counts = @{ ok = 0; bug = 0; warn = 0 }
+    $counts = @{ parity = 0; divergence = 0; shared = 0; skip = 0 }
     foreach ($n in $names) {
         $r = if ($rust.ContainsKey($n)) { $rust[$n] } else { "MISSING" }
         $m = if ($ms.ContainsKey($n)) { $ms[$n] } else { "MISSING" }
@@ -184,7 +221,7 @@ function Write-ParityReport([string]$RustXml, [string]$MsXml) {
         Write-Host ("{0}  {1,-10}  {2,-10}  {3}" -f $n.PadRight($width), $r, $m, $res[0])
     }
     Write-Host ""
-    Write-Host ("Summary: {0} parity, {1} mssql-odbc bug(s), {2} test issue(s)" -f $counts.ok, $counts.bug, $counts.warn)
+    Write-Host ("Summary: {0} parity, {1} divergence(s), {2} shared failure(s), {3} skipped" -f $counts.parity, $counts.divergence, $counts.shared, $counts.skip)
 }
 
 try {

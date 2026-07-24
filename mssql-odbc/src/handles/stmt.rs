@@ -8,7 +8,7 @@ use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
 
 use super::desc::{DescHandle, DescKind};
-use super::{DbcHandle, HandleType, HasObjectType, handle_to_raw};
+use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 
@@ -161,13 +161,13 @@ impl HasObjectType for StmtHandle {
 
 impl Drop for StmtHandle {
     fn drop(&mut self) {
-        // Free the four implicit descriptors owned by this statement. These are
-        // never handed to `SQLFreeHandle` (they are implicit), so dropping the
-        // statement is the single owner responsible for reclaiming them.
+        // Free the four implicit descriptors owned by this statement through the
+        // centralized deallocation path so each one's object type is stamped
+        // `Invalid` (use-after-free detection) rather than raw `Box::from_raw`.
+        // These are never handed to `SQLFreeHandle` (they are implicit), so
+        // dropping the statement is the single owner responsible for them.
         for raw in [self.ard, self.apd, self.ird, self.ipd] {
-            if !raw.is_null() {
-                drop(unsafe { Box::from_raw(raw as *mut DescHandle) });
-            }
+            unsafe { free_handle::<DescHandle>(raw) };
         }
     }
 }

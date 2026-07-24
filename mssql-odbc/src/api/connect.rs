@@ -107,20 +107,31 @@ unsafe fn sql_connect_w_impl(
 }
 
 /// Build a connection string from the `SQLConnect` triple. Returns `None` when no
-/// server was supplied so the shared connect path posts the same null-input
-/// diagnostic it uses for `SQLDriverConnectW`.
+/// data source name was supplied so the shared connect path posts the same
+/// null-input diagnostic it uses for `SQLDriverConnectW`.
+///
+/// TODO: resolve the DSN's stored attributes (Server, Database, Encrypt, ...)
+/// from the system information (registry on Windows, `odbc.ini` on Linux) and
+/// merge them here. `DSN` is currently a recognized-but-ignored keyword in the
+/// connection-string parser, so until that resolver exists a `SQLConnect` call
+/// yields no server and fails with `08001`.
+///
+/// Known limitation: values are inserted verbatim without ODBC brace-escaping,
+/// so a DSN/UID/PWD containing `;`, `=`, or `{`/`}` will be misparsed. This is
+/// acceptable for now because `SQLConnect` is non-functional until the DSN
+/// resolver above lands.
 fn build_connection_string(
-    server: Option<String>,
+    dsn: Option<String>,
     uid: Option<String>,
     pwd: Option<String>,
 ) -> Option<String> {
-    let server = server?;
-    let mut s = format!("Server={server};");
+    let dsn = dsn?;
+    let mut s = format!("DSN={dsn};");
     if let Some(uid) = uid {
         s.push_str(&format!("UID={uid};"));
     }
     if let Some(pwd) = pwd {
-        // Avoid cred scan error
+        // Named constant avoids a literal `PWD=` token tripping credential scans.
         const PWD_KEYWORD: &str = "PWD";
         s.push_str(&format!("{PWD_KEYWORD}={pwd};"));
     }
@@ -134,27 +145,27 @@ mod tests {
     use crate::test_support::cs;
 
     #[test]
-    fn builds_server_uid_pwd() {
+    fn builds_dsn_uid_pwd() {
         assert_eq!(
             build_connection_string(
-                Some("host".into()),
+                Some("mydsn".into()),
                 Some("user".into()),
                 Some("secret".into())
             ),
-            Some("Server=host;UID=user;PWD=secret;".to_string())
+            Some(cs("DSN=mydsn;UID=user;<PW>=secret;"))
         );
     }
 
     #[test]
     fn omits_missing_credentials() {
         assert_eq!(
-            build_connection_string(Some("host".into()), None, None),
-            Some("Server=host;".to_string())
+            build_connection_string(Some("mydsn".into()), None, None),
+            Some("DSN=mydsn;".to_string())
         );
     }
 
     #[test]
-    fn none_without_server() {
+    fn none_without_dsn() {
         assert_eq!(
             build_connection_string(None, Some("user".into()), Some("secret".into())),
             None
@@ -162,18 +173,18 @@ mod tests {
     }
 
     #[test]
-    fn builds_server_pwd_without_uid() {
+    fn builds_dsn_pwd_without_uid() {
         assert_eq!(
-            build_connection_string(Some("host".into()), None, Some("secret".into())),
-            Some(cs("Server=host;<PW>=secret;"))
+            build_connection_string(Some("mydsn".into()), None, Some("secret".into())),
+            Some(cs("DSN=mydsn;<PW>=secret;"))
         );
     }
 
     #[test]
-    fn builds_server_uid_without_pwd() {
+    fn builds_dsn_uid_without_pwd() {
         assert_eq!(
-            build_connection_string(Some("host".into()), Some("user".into()), None),
-            Some("Server=host;UID=user;".to_string())
+            build_connection_string(Some("mydsn".into()), Some("user".into()), None),
+            Some("DSN=mydsn;UID=user;".to_string())
         );
     }
 

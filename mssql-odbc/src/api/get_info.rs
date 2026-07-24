@@ -15,7 +15,7 @@ use crate::api::odbc_types::{
     SQL_ODBC_SQL_CONFORMANCE, SQL_ODBC_VER, SQL_OSC_CORE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
     SqlHandle, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
-use crate::api::sqlstate::{ERR_STRING_RIGHT_TRUNCATION, post_diag};
+use crate::api::sqlstate::{ERR_INVALID_INFO_TYPE, ERR_STRING_RIGHT_TRUNCATION, post_diag};
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
@@ -178,9 +178,8 @@ fn sql_get_info_w_safe(
             "03.80.0000",
         ),
         _ => {
-            // Keep unsupported info-types explicit; callers can probe support
-            // by handling SQL_ERROR.
             error!(info_type, "SQLGetInfoW: unsupported info type");
+            post_diag(&mut state, ERR_INVALID_INFO_TYPE);
             SQL_ERROR
         }
     }
@@ -437,5 +436,13 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         let (rc, _, _) = get_u16(h.dbc, 65000);
         assert_eq!(rc, SQL_ERROR);
+
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc_ref.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_INVALID_INFO_TYPE.state
+        );
     }
 }
