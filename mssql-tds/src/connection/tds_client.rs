@@ -1975,16 +1975,6 @@ impl TdsClient {
         self.current_metadata.is_some()
     }
 
-    /// Test-only compatibility shim: returns `Some(self)` while positioned on a
-    /// row-returning result set, otherwise `None`. Gated behind the `test-util`
-    /// feature — it is **not** part of the shipped API. Production code uses
-    /// [`on_rows`](Self::on_rows) plus the [`ResultSet`] row-reading methods, and
-    /// navigates with [`advance`](Self::advance) / [`advance_to_rows`](Self::advance_to_rows).
-    #[cfg(feature = "test-util")]
-    pub fn get_current_resultset(&mut self) -> Option<&mut Self> {
-        if self.on_rows() { Some(self) } else { None }
-    }
-
     /// Positions on the first navigable result after a request has been sent to
     /// the wire. Shared tail of the `execute*` entry points.
     async fn position_on_first_result(&mut self) -> TdsResult<StatementResult> {

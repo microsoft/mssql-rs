@@ -150,8 +150,8 @@ mod connectivity {
         let command = "select 1".to_string();
         connection.execute(command, ()).await.unwrap();
 
-        if let Some(resultset) = connection.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if connection.on_rows() {
+            while let Some(row) = connection.next_row().await.unwrap() {
                 for cell in row {
                     print!("{cell:?},");
                 }
@@ -172,8 +172,8 @@ mod connectivity {
         let command = "select 1".to_string();
         connection.execute(command, ()).await.unwrap();
 
-        if let Some(resultset) = connection.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if connection.on_rows() {
+            while let Some(row) = connection.next_row().await.unwrap() {
                 for cell in row {
                     print!("{cell:?},");
                 }
@@ -223,8 +223,8 @@ mod connectivity {
         let command = "select 1".to_string();
         connection.execute(command, ()).await.unwrap();
 
-        if let Some(resultset) = connection.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if connection.on_rows() {
+            while let Some(row) = connection.next_row().await.unwrap() {
                 for cell in row {
                     print!("{cell:?},");
                 }

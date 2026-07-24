@@ -265,8 +265,8 @@ mod bulk_copy_varying_columns_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset
+        if client.on_rows() {
+            let row = client
                 .next_row()
                 .await
                 .expect("Failed to read count")

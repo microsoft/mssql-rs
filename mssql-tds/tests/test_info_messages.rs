@@ -55,10 +55,11 @@ mod info_message_tests {
             "INFO messages should include low-severity RAISERROR output: {messages:?}"
         );
 
-        let resultset = connection
-            .get_current_resultset()
-            .expect("query should be positioned on a result set");
-        let row = resultset
+        assert!(
+            connection.on_rows(),
+            "query should be positioned on a result set"
+        );
+        let row = connection
             .next_row()
             .await
             .unwrap()
@@ -89,7 +90,7 @@ mod info_message_tests {
             "INFO-only batch should not open a result set"
         );
         assert!(
-            connection.get_current_resultset().is_none(),
+            !connection.on_rows(),
             "INFO-only batch should not open a result set"
         );
 
@@ -119,10 +120,11 @@ mod info_message_tests {
             .await
             .unwrap();
 
-        let resultset = connection
-            .get_current_resultset()
-            .expect("query should be positioned on a result set");
-        let row = resultset
+        assert!(
+            connection.on_rows(),
+            "query should be positioned on a result set"
+        );
+        let row = connection
             .next_row()
             .await
             .unwrap()
@@ -173,10 +175,11 @@ mod info_message_tests {
             connection.info_messages()
         );
 
-        let resultset = connection
-            .get_current_resultset()
-            .expect("query should be positioned on a result set");
-        let row = resultset
+        assert!(
+            connection.on_rows(),
+            "query should be positioned on a result set"
+        );
+        let row = connection
             .next_row()
             .await
             .unwrap()

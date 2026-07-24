@@ -145,8 +145,8 @@ mod bulk_copy_bigint_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read count")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read count")
         {
             println!("DEBUG: Actual rows in database: {:?}", row[0]);
         }
@@ -168,8 +168,8 @@ mod bulk_copy_bigint_tests {
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -253,8 +253,8 @@ mod bulk_copy_bigint_tests {
             .await
             .expect("Failed to select count");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(100));
         }
@@ -385,8 +385,8 @@ mod bulk_copy_bigint_tests {
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -621,8 +621,8 @@ mod bulk_copy_bigint_tests {
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {

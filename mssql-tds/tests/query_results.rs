@@ -156,8 +156,8 @@ mod query_result_reads {
         // Collect all result sets
         let mut all_rows = Vec::new();
         loop {
-            if let Some(resultset) = connection.get_current_resultset() {
-                while let Some(row) = resultset.next_row().await.unwrap() {
+            if connection.on_rows() {
+                while let Some(row) = connection.next_row().await.unwrap() {
                     all_rows.push(row);
                 }
             }
@@ -307,8 +307,8 @@ mod query_result_reads {
                 let mut current_result_rows = Vec::new();
 
                 // Fully consume current result set
-                if let Some(resultset) = connection.get_current_resultset() {
-                    while let Some(row) = resultset.next_row().await.unwrap() {
+                if connection.on_rows() {
+                    while let Some(row) = connection.next_row().await.unwrap() {
                         current_result_rows.push(row);
                     }
                 }
@@ -385,8 +385,8 @@ mod query_result_reads {
                 let mut current_result_rows = Vec::new();
 
                 // Fully consume current result set
-                if let Some(resultset) = connection.get_current_resultset() {
-                    while let Some(row) = resultset.next_row().await.unwrap() {
+                if connection.on_rows() {
+                    while let Some(row) = connection.next_row().await.unwrap() {
                         current_result_rows.push(row);
                     }
                 }
@@ -470,7 +470,7 @@ mod query_result_reads {
 
             // Just get the first result set, then close
             let _result_number = 0;
-            if connection.get_current_resultset().is_some() {
+            if connection.on_rows() {
                 // Found first result, now close without consuming
             }
             connection.close_query().await.unwrap();
@@ -518,7 +518,7 @@ mod query_result_reads {
 
             // Just get the first result without closing
             let _result_number = 0;
-            if connection.get_current_resultset().is_some() {
+            if connection.on_rows() {
                 // Found first result, exit scope without closing
             }
         }
@@ -555,9 +555,9 @@ mod query_result_reads {
                 .unwrap();
 
             // Get the first result set and read one row
-            if let Some(resultset) = connection.get_current_resultset() {
+            if connection.on_rows() {
                 // Get the first row and explicitly don't finish consuming the result set
-                let row = resultset.next_row().await.unwrap();
+                let row = connection.next_row().await.unwrap();
                 assert!(row.is_some());
             }
 
@@ -567,8 +567,8 @@ mod query_result_reads {
             assert!(second_result.unwrap()); // Should return true as there is a next result set
 
             // Verify we can read from the second result set
-            if let Some(resultset) = connection.get_current_resultset() {
-                let row = resultset.next_row().await.unwrap();
+            if connection.on_rows() {
+                let row = connection.next_row().await.unwrap();
                 assert!(row.is_some());
             }
 
@@ -625,13 +625,13 @@ mod query_result_reads {
                 }
                 Ok(_) => {
                     // move_to_next succeeded, error should appear during row iteration
-                    if let Some(resultset) = connection.get_current_resultset() {
+                    if connection.on_rows() {
                         // Try to read first row
-                        let first_row = resultset.next_row().await;
+                        let first_row = connection.next_row().await;
                         match first_row {
                             Ok(Some(_)) => {
                                 // First row succeeded (CAST('10' AS Int)), second row should error
-                                let row_result = resultset.next_row().await;
+                                let row_result = connection.next_row().await;
                                 match row_result {
                                     Err(SqlServerError { .. }) => {
                                         error_found = true;

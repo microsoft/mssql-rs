@@ -268,8 +268,8 @@ mod e2e {
             .expect("Failed to execute query");
 
         // Get the result
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to get row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to get row")
         {
             println!("Query returned a result set");
             let current_user = &row[0];
@@ -325,8 +325,8 @@ mod e2e {
             .execute("SELECT @@VERSION".to_string(), ())
             .await
             .expect("Query 1 failed");
-        if let Some(rs) = client.get_current_resultset()
-            && let Some(row) = rs.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             println!("SQL Server Version: {:?}", row[0]);
         }
@@ -337,8 +337,8 @@ mod e2e {
             .execute("SELECT GETDATE() AS ServerTime".to_string(), ())
             .await
             .expect("Query 2 failed");
-        if let Some(rs) = client.get_current_resultset()
-            && let Some(row) = rs.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             println!("Server Time: {:?}", row[0]);
         }
@@ -353,8 +353,8 @@ mod e2e {
             )
             .await
             .expect("Query 3 failed");
-        if let Some(rs) = client.get_current_resultset()
-            && let Some(row) = rs.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             let auth_scheme = format!("{:?}", row[0]);
             println!("Authentication Scheme: {}", auth_scheme);
@@ -401,8 +401,8 @@ mod e2e {
             .execute("SELECT 1 AS Test".to_string(), ())
             .await
             .expect("Query failed");
-        if let Some(rs) = client.get_current_resultset()
-            && let Some(row) = rs.next_row().await.expect("Failed")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed")
         {
             println!("Explicit SPN test result: {:?}", row[0]);
         }
@@ -469,8 +469,8 @@ mod e2e {
             .await
             .expect("Failed to execute query");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to get row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to get row")
         {
             let current_user = format!("{:?}", row[0]);
             let auth_scheme = format!("{:?}", row[1]);

@@ -220,12 +220,11 @@ mod client_based_iterators {
             .execute_stored_procedure(proc_name, None, Some(named_parameters), ())
             .await?;
         let mut binding = client.lock().await;
-        let result_set = binding.get_current_resultset();
-        if let Some(result_set) = result_set {
-            let _ = result_set.get_metadata();
+        if binding.on_rows() {
+            let _ = binding.get_metadata();
             let mut row_count = 0;
 
-            while (result_set.next_row().await?).is_some() {
+            while (binding.next_row().await?).is_some() {
                 row_count += 1;
             }
             assert_eq!(
@@ -271,10 +270,8 @@ mod client_based_iterators {
         client.execute(query.to_string(), ()).await?;
 
         // Get metadata and verify it was parsed correctly
-        let resultset = client
-            .get_current_resultset()
-            .expect("Expected a resultset");
-        let metadata = resultset.get_metadata();
+        assert!(client.on_rows(), "Expected a resultset");
+        let metadata = client.get_metadata();
 
         // Verify we have 6 columns
         assert_eq!(metadata.len(), 6, "Expected 6 date/time columns");
@@ -332,7 +329,7 @@ mod client_based_iterators {
         );
 
         // Also verify we can read the actual values
-        let row = resultset.next_row().await?.expect("Expected a row");
+        let row = client.next_row().await?.expect("Expected a row");
 
         // Just verify we got values of the right types
         match &row[0] {
@@ -698,8 +695,8 @@ mod client_based_iterators {
             .to_string();
 
         client.execute(query, ()).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        if client.on_rows() {
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 15);
 
             use mssql_tds::datatypes::column_values::ColumnValues;
@@ -751,9 +748,9 @@ mod client_based_iterators {
             .to_string();
 
         client.execute(query, ()).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let meta = resultset.get_metadata().clone();
-            let row = resultset.next_row().await?.expect("expected a row");
+        if client.on_rows() {
+            let meta = client.get_metadata().clone();
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 4);
             for col in &row {
                 assert!(matches!(
@@ -791,8 +788,8 @@ mod client_based_iterators {
             .to_string();
 
         client.execute(query, ()).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        if client.on_rows() {
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 3);
             for col in &row {
                 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -825,8 +822,8 @@ mod client_based_iterators {
         );
 
         client.execute(query, ()).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        if client.on_rows() {
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 4);
             use mssql_tds::datatypes::column_values::ColumnValues;
             match &row[0] {

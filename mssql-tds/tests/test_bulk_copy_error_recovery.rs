@@ -150,8 +150,8 @@ mod bulk_copy_error_recovery_tests {
         );
 
         // Verify we can read the result and consume the entire result set
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset
+        if client.on_rows() {
+            let row = client
                 .next_row()
                 .await
                 .expect("Failed to read row")
@@ -159,12 +159,7 @@ mod bulk_copy_error_recovery_tests {
             assert_eq!(row[0], ColumnValues::Int(1));
 
             // Consume remaining rows to close the result set
-            while resultset
-                .next_row()
-                .await
-                .expect("Failed reading")
-                .is_some()
-            {}
+            while client.next_row().await.expect("Failed reading").is_some() {}
         }
 
         // Also verify we can do another operation (insert)
@@ -185,8 +180,8 @@ mod bulk_copy_error_recovery_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset
+        if client.on_rows() {
+            let row = client
                 .next_row()
                 .await
                 .expect("Failed to read count")
@@ -315,8 +310,8 @@ mod bulk_copy_error_recovery_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset
+        if client.on_rows() {
+            let row = client
                 .next_row()
                 .await
                 .expect("Failed to read count")

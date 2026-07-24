@@ -321,8 +321,8 @@ mod always_encrypted {
                 .await
                 .expect("select rows");
             let mut rows = Vec::new();
-            if let Some(resultset) = self.client.get_current_resultset() {
-                while let Some(row) = resultset.next_row().await.expect("read row") {
+            if self.client.on_rows() {
+                while let Some(row) = self.client.next_row().await.expect("read row") {
                     rows.push((0..ncols).map(|i| row[i].clone()).collect());
                 }
             }
@@ -1500,8 +1500,8 @@ mod always_encrypted {
                 .await
                 .expect("select decrypted values");
             let mut got = Vec::new();
-            if let Some(resultset) = h.client.get_current_resultset() {
-                while let Some(row) = resultset.next_row().await.expect("read row") {
+            if h.client.on_rows() {
+                while let Some(row) = h.client.next_row().await.expect("read row") {
                     got.push((row[0].clone(), row[1].clone()));
                 }
             }
@@ -2043,11 +2043,9 @@ mod always_encrypted {
                 .await
                 .expect("first select");
             let first = {
-                let rs = h
+                assert!(h.client.on_rows(), "result set present");
+                let row = h
                     .client
-                    .get_current_resultset()
-                    .expect("result set present");
-                let row = rs
                     .next_row()
                     .await
                     .expect("read first row")

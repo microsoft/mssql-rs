@@ -63,8 +63,8 @@ mod tvp_tests {
 
         let mut rows = Vec::new();
         loop {
-            if let Some(resultset) = client.get_current_resultset() {
-                while let Some(row) = resultset.next_row().await.unwrap() {
+            if client.on_rows() {
+                while let Some(row) = client.next_row().await.unwrap() {
                     rows.push(row);
                 }
             }
@@ -92,8 +92,8 @@ mod tvp_tests {
 
         let mut rows = Vec::new();
         loop {
-            if let Some(resultset) = client.get_current_resultset() {
-                while let Some(row) = resultset.next_row().await.map_err(|e| e.to_string())? {
+            if client.on_rows() {
+                while let Some(row) = client.next_row().await.map_err(|e| e.to_string())? {
                     rows.push(row);
                 }
             }

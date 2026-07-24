@@ -81,10 +81,11 @@ async fn epa_channel_binding_login_succeeds() -> TdsResult<()> {
     let query = "SELECT auth_scheme, CAST(encrypt_option AS varchar(10)) \
                  FROM sys.dm_exec_connections WHERE session_id = @@SPID";
     connection.execute(query.to_string(), ()).await?;
-    let rs = connection
-        .get_current_resultset()
-        .expect("connection-properties query should produce a result set");
-    let row = rs
+    assert!(
+        connection.on_rows(),
+        "connection-properties query should produce a result set"
+    );
+    let row = connection
         .next_row()
         .await?
         .expect("sys.dm_exec_connections should return a row for the current session");

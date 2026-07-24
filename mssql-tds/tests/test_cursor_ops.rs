@@ -51,8 +51,8 @@ async fn read_all_rows(
     client: &mut mssql_tds::connection::tds_client::TdsClient,
 ) -> Vec<Vec<ColumnValues>> {
     let mut rows = Vec::new();
-    if let Some(rs) = client.get_current_resultset() {
-        while let Some(row) = rs.next_row().await.unwrap() {
+    if client.on_rows() {
+        while let Some(row) = client.next_row().await.unwrap() {
             rows.push(row);
         }
     }

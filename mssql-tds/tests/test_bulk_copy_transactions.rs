@@ -119,8 +119,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(3), "Expected 3 rows committed");
         }
@@ -171,8 +171,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(3), "Expected 3 rows committed");
         }
@@ -342,8 +342,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(
                 row[0],
@@ -365,8 +365,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows after rollback");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(
                 row[0],
@@ -425,8 +425,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(10), "Expected 10 rows committed");
         }
@@ -482,8 +482,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(100), "Expected 100 rows");
         }
@@ -541,8 +541,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(2), "Expected 2 rows after commit");
         }
@@ -665,8 +665,8 @@ mod bulk_copy_transaction_tests {
                 .await
                 .expect("Failed to count rows");
 
-            if let Some(resultset) = client.get_current_resultset()
-                && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+            if client.on_rows()
+                && let Some(row) = client.next_row().await.expect("Failed to read row")
             {
                 assert_eq!(
                     row[0],
@@ -734,8 +734,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(
                 row[0],
@@ -757,8 +757,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows after rollback");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(
                 row[0],
@@ -818,8 +818,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(5), "Expected 5 rows committed");
         }
@@ -938,8 +938,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(
                 row[0],
@@ -1024,8 +1024,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(
                 row[0],
@@ -1065,8 +1065,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows after rollback");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(
                 row[0],
@@ -1132,8 +1132,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(15), "Expected 15 rows in table");
         }
@@ -1149,8 +1149,8 @@ mod bulk_copy_transaction_tests {
             .expect("Failed to select rows");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 let expected_id = row_count;
                 let expected_value = row_count * 10;
@@ -1227,8 +1227,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(100), "Expected 100 rows");
         }
@@ -1243,8 +1243,8 @@ mod bulk_copy_transaction_tests {
             .await
             .expect("Failed to get min/max");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(1), "Min ID should be 1");
             assert_eq!(row[1], ColumnValues::Int(100), "Max ID should be 100");

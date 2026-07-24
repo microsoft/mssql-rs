@@ -110,8 +110,8 @@ mod bulk_copy_udt_tests {
             .expect("Failed to select source data");
 
         let mut source_rows: Vec<UdtRow> = Vec::new();
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 let id = match &row[0] {
                     ColumnValues::Int(v) => *v,
                     other => panic!("unexpected id type: {:?}", other),
@@ -168,8 +168,8 @@ mod bulk_copy_udt_tests {
             .expect("Failed to select destination data");
 
         let mut row_count = 0usize;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 let expected = &source_rows[row_count];
                 assert_eq!(row[0], ColumnValues::Int(expected.id));
                 match (&row[1], &expected.udt) {

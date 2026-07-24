@@ -60,8 +60,8 @@ mod encryption_tests {
 
         let mut has_result = false;
         loop {
-            if let Some(resultset) = client.get_current_resultset() {
-                while let Some(_row) = resultset.next_row().await? {
+            if client.on_rows() {
+                while let Some(_row) = client.next_row().await? {
                     has_result = true;
                 }
             }

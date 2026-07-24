@@ -130,8 +130,8 @@ mod rpc_results {
 
         // Drain all result sets
         loop {
-            if let Some(resultset) = connection.get_current_resultset() {
-                while resultset.next_row().await.unwrap().is_some() {}
+            if connection.on_rows() {
+                while connection.next_row().await.unwrap().is_some() {}
             }
             if !connection.advance_to_rows().await.unwrap() {
                 break;
@@ -542,8 +542,8 @@ mod rpc_results {
             .unwrap();
 
         // Read the result set
-        if let Some(resultset) = connection.get_current_resultset() {
-            while resultset.next_row().await.unwrap().is_some() {}
+        if connection.on_rows() {
+            while connection.next_row().await.unwrap().is_some() {}
         }
 
         // Move to next result set to consume remaining tokens (including the
@@ -593,8 +593,8 @@ mod rpc_results {
             .await
             .unwrap();
 
-        if let Some(resultset) = connection.get_current_resultset() {
-            while resultset.next_row().await.unwrap().is_some() {}
+        if connection.on_rows() {
+            while connection.next_row().await.unwrap().is_some() {}
         }
         connection.advance_to_rows().await.unwrap();
 
@@ -649,8 +649,8 @@ mod rpc_results {
 
         // Drain all result sets
         loop {
-            if let Some(resultset) = connection.get_current_resultset() {
-                while resultset.next_row().await?.is_some() {}
+            if connection.on_rows() {
+                while connection.next_row().await?.is_some() {}
             }
             if !connection.advance_to_rows().await? {
                 break;

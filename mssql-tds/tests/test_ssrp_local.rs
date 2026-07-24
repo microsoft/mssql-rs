@@ -68,8 +68,8 @@ mod ssrp_local {
 
         let mut instance_name = String::new();
         loop {
-            if let Some(rs) = client.get_current_resultset()
-                && let Some(row) = rs.next_row().await?
+            if client.on_rows()
+                && let Some(row) = client.next_row().await?
                 && let ColumnValues::String(s) = &row[0]
             {
                 instance_name = s.to_utf8_string();
@@ -110,8 +110,8 @@ mod ssrp_local {
 
         let mut instance_name = String::new();
         loop {
-            if let Some(rs) = client.get_current_resultset()
-                && let Some(row) = rs.next_row().await?
+            if client.on_rows()
+                && let Some(row) = client.next_row().await?
                 && let ColumnValues::String(s) = &row[0]
             {
                 instance_name = s.to_utf8_string();

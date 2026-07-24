@@ -34,15 +34,15 @@ mod vector_integration_tests {
         client.execute(query.to_string(), ()).await.unwrap();
 
         // Get the result set
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             // Verify metadata
-            let columns = resultset.get_metadata();
+            let columns = client.get_metadata();
             assert_eq!(columns.len(), 1);
             assert_eq!(columns[0].column_name, "VectorColumn");
 
             // Read the row
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 assert_eq!(row.len(), 1);
 
@@ -90,15 +90,15 @@ mod vector_integration_tests {
         let query = "SELECT CAST('[1.0, 2.0, 3.0]' AS VECTOR(3, float16)) AS VectorColumn";
         client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             // Verify metadata
-            let columns = resultset.get_metadata();
+            let columns = client.get_metadata();
             assert_eq!(columns.len(), 1);
             assert_eq!(columns[0].column_name, "VectorColumn");
 
             // Read the row
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 assert_eq!(row.len(), 1);
 
@@ -135,11 +135,9 @@ mod vector_integration_tests {
 
         client.execute(query.to_string(), ()).await.unwrap();
 
-        let resultset = client
-            .get_current_resultset()
-            .expect("Expected a result set");
+        assert!(client.on_rows(), "Expected a result set");
 
-        let metadata = resultset.get_metadata();
+        let metadata = client.get_metadata();
         assert_eq!(metadata.len(), 2);
 
         // Expected metadata values for VECTOR(3), Float32 base type
@@ -193,11 +191,9 @@ mod vector_integration_tests {
 
         client.execute(query.to_string(), ()).await.unwrap();
 
-        let resultset = client
-            .get_current_resultset()
-            .expect("Expected a result set");
+        assert!(client.on_rows(), "Expected a result set");
 
-        let metadata = resultset.get_metadata();
+        let metadata = client.get_metadata();
         assert_eq!(metadata.len(), 2);
 
         // Expected metadata values for VECTOR(3, float16), Float16 base type
@@ -233,9 +229,9 @@ mod vector_integration_tests {
 
         client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
@@ -266,9 +262,9 @@ mod vector_integration_tests {
 
         client.execute(query, ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
@@ -318,9 +314,9 @@ mod vector_integration_tests {
 
         client.execute(query, ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
@@ -351,9 +347,9 @@ mod vector_integration_tests {
 
         client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Null => {
@@ -375,9 +371,9 @@ mod vector_integration_tests {
 
         client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
@@ -409,12 +405,12 @@ mod vector_integration_tests {
 
         client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
-            let columns = resultset.get_metadata();
+        if client.on_rows() {
+            let columns = client.get_metadata();
             assert_eq!(columns.len(), 3);
 
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 assert_eq!(row.len(), 3);
 
@@ -488,8 +484,8 @@ mod vector_integration_tests {
         let expected_values = [Some(vec![1.0, 2.0, 3.0]), Some(vec![4.0, 5.0, 6.0]), None];
 
         let mut row_index = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 assert_eq!(row.len(), 2);
 
                 // Check Id
@@ -550,9 +546,9 @@ mod vector_integration_tests {
 
         client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Null => {
@@ -614,8 +610,8 @@ mod vector_integration_tests {
         let expected_v16 = [Some(vec![1.0, 2.0]), None, Some(vec![3.0, 4.0])];
 
         let mut row_index = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 assert_eq!(row.len(), 3);
 
                 // Check Id
@@ -675,9 +671,9 @@ mod vector_integration_tests {
 
         client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
@@ -704,9 +700,9 @@ mod vector_integration_tests {
 
         client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
@@ -751,9 +747,9 @@ mod vector_integration_tests {
             .await
             .unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(returned_vector) => {
@@ -796,9 +792,9 @@ mod vector_integration_tests {
             .await
             .unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 assert_eq!(row.len(), 2);
 
@@ -845,7 +841,7 @@ mod vector_integration_tests {
         client.execute(create_table.to_string(), ()).await.unwrap();
 
         // Consume any result sets from the setup
-        while client.get_current_resultset().is_some() {
+        while client.on_rows() {
             client.advance_to_rows().await.unwrap();
         }
 
@@ -867,11 +863,11 @@ mod vector_integration_tests {
             .await
             .unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
             let mut found_ids = vec![];
 
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Int(id) => {
@@ -919,9 +915,9 @@ mod vector_integration_tests {
             .await
             .unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(returned_vector) => {
@@ -974,9 +970,9 @@ mod vector_integration_tests {
             .await
             .unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 assert_eq!(row.len(), 2);
 
@@ -1029,7 +1025,7 @@ mod vector_integration_tests {
         client.execute(create_proc.to_string(), ()).await.unwrap();
 
         // Consume result sets from CREATE PROCEDURE
-        while client.get_current_resultset().is_some() {
+        while client.on_rows() {
             client.advance_to_rows().await.unwrap();
         }
 
@@ -1093,7 +1089,7 @@ mod vector_integration_tests {
         client.execute(create_proc.to_string(), ()).await.unwrap();
 
         // Consume result sets from CREATE PROCEDURE
-        while client.get_current_resultset().is_some() {
+        while client.on_rows() {
             client.advance_to_rows().await.unwrap();
         }
 
@@ -1157,7 +1153,7 @@ mod vector_integration_tests {
         client.execute(create_proc.to_string(), ()).await.unwrap();
 
         // Consume result sets from CREATE PROCEDURE
-        while client.get_current_resultset().is_some() {
+        while client.on_rows() {
             client.advance_to_rows().await.unwrap();
         }
 
@@ -1221,7 +1217,7 @@ mod vector_integration_tests {
         client.execute(create_proc, ()).await.unwrap();
 
         // Consume result sets from CREATE PROCEDURE
-        while client.get_current_resultset().is_some() {
+        while client.on_rows() {
             client.advance_to_rows().await.unwrap();
         }
 

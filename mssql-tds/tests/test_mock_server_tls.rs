@@ -226,8 +226,8 @@ mod mock_server_tls_tests {
 
         // Read result
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await? {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await? {
                 row_count += 1;
                 println!("Row over TLS: {:?}", row);
             }
@@ -334,8 +334,8 @@ mod mock_server_tls_tests {
         client.execute("SELECT 1".to_string(), ()).await?;
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await? {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await? {
                 row_count += 1;
                 println!("Row over Strict TLS: {:?}", row);
             }
@@ -393,8 +393,8 @@ mod mock_server_tls_tests {
             client.execute("SELECT 1".to_string(), ()).await?;
 
             let mut row_count = 0;
-            if let Some(resultset) = client.get_current_resultset() {
-                while let Some(_row) = resultset.next_row().await? {
+            if client.on_rows() {
+                while let Some(_row) = client.next_row().await? {
                     row_count += 1;
                 }
             }
@@ -528,8 +528,8 @@ mod mock_server_tls_tests {
             .await?;
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await? {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await? {
                 row_count += 1;
                 println!("Custom query row over TLS: {:?}", row);
             }

@@ -63,9 +63,9 @@ mod multi_subnet_failover_tests {
 
         let mut has_results = false;
         loop {
-            if let Some(resultset) = client.get_current_resultset() {
+            if client.on_rows() {
                 has_results = true;
-                while let Some(_row) = resultset.next_row().await? {
+                while let Some(_row) = client.next_row().await? {
                     // We got at least one row, which is what we expect
                 }
             }

@@ -165,8 +165,8 @@ mod mock_server_tests {
 
         // Read results
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await? {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await? {
                 row_count += 1;
                 println!("Row: {row:?}");
 
@@ -229,8 +229,8 @@ mod mock_server_tests {
         client.execute("SELECT 1".to_string(), ()).await?;
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(_row) = resultset.next_row().await? {
+        if client.on_rows() {
+            while let Some(_row) = client.next_row().await? {
                 row_count += 1;
             }
         }
@@ -359,8 +359,8 @@ mod mock_server_tests {
 
         // Read results
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await? {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await? {
                 row_count += 1;
                 println!("Row: {row:?}");
 
@@ -445,8 +445,8 @@ mod mock_server_tests {
 
         // Read results
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await? {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await? {
                 row_count += 1;
                 println!("Row with NULLs: {row:?}");
                 assert_eq!(row.len(), 3, "Expected 3 columns");
@@ -735,8 +735,8 @@ mod mock_server_tests {
 
             // Read result
             let mut row_count = 0;
-            if let Some(resultset) = client.get_current_resultset() {
-                while let Some(_row) = resultset.next_row().await? {
+            if client.on_rows() {
+                while let Some(_row) = client.next_row().await? {
                     row_count += 1;
                 }
             }
@@ -844,8 +844,8 @@ mod mock_server_tests {
 
             // Read result
             let mut row_count = 0;
-            if let Some(resultset) = client.get_current_resultset() {
-                while let Some(_row) = resultset.next_row().await? {
+            if client.on_rows() {
+                while let Some(_row) = client.next_row().await? {
                     row_count += 1;
                 }
             }
@@ -992,8 +992,8 @@ mod mock_server_tests {
             .await?;
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await? {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await? {
                 row_count += 1;
                 assert_eq!(row.len(), 2, "Expected 2 columns");
             }

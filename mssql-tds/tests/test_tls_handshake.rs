@@ -157,8 +157,8 @@ async fn connect_and_query() {
         .await
         .expect("Query failed");
 
-    if let Some(rs) = client.get_current_resultset() {
-        let row = rs.next_row().await.unwrap();
+    if client.on_rows() {
+        let row = client.next_row().await.unwrap();
         assert!(row.is_some(), "Expected a result row");
         println!("connect_and_query: SELECT 1 returned a row — connection is usable");
     }

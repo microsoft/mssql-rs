@@ -149,8 +149,8 @@ mod bulk_copy_integration_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read count")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read count")
         {
             println!("DEBUG: Actual rows in database: {:?}", row[0]);
         }
@@ -601,13 +601,13 @@ mod bulk_copy_integration_tests {
                 .await
                 .expect("Failed to query");
 
-            let resultset = client.get_current_resultset().expect("No resultset");
-            let row1 = resultset
+            assert!(client.on_rows(), "No resultset");
+            let row1 = client
                 .next_row()
                 .await
                 .expect("Failed to read")
                 .expect("No row");
-            let row2 = resultset
+            let row2 = client
                 .next_row()
                 .await
                 .expect("Failed to read")

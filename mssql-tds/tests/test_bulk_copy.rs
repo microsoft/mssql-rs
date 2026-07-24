@@ -145,8 +145,8 @@ mod bulk_copy_integration_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read count")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read count")
         {
             println!("DEBUG: Actual rows in database: {:?}", row[0]);
         }
@@ -167,8 +167,8 @@ mod bulk_copy_integration_tests {
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -495,8 +495,8 @@ mod bulk_copy_integration_tests {
             .await
             .expect("Failed to select count");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(100));
         }
@@ -627,8 +627,8 @@ mod bulk_copy_integration_tests {
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -920,8 +920,8 @@ mod bulk_copy_integration_tests {
             .expect("Failed to select from table");
 
         let mut rows_returned = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 let id = match &row[0] {
                     ColumnValues::Int(v) => *v,
                     _ => panic!("Expected Int for id"),
@@ -1009,8 +1009,8 @@ mod bulk_copy_integration_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read count")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read count")
         {
             assert_eq!(
                 row[0],
@@ -1034,8 +1034,8 @@ mod bulk_copy_integration_tests {
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -1121,11 +1121,8 @@ mod bulk_copy_integration_tests {
             .await
             .expect("Failed to get session ID");
 
-        let session_id: i32 = if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset
-                .next_row()
-                .await
-                .expect("Failed to read session ID")
+        let session_id: i32 = if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read session ID")
         {
             match row[0] {
                 ColumnValues::SmallInt(id) => id as i32,
@@ -1188,8 +1185,12 @@ mod bulk_copy_integration_tests {
                 .await
                 .expect("Failed to query locks");
 
-            if let Some(resultset) = lock_monitor_client.get_current_resultset() {
-                while let Some(row) = resultset.next_row().await.expect("Failed to read lock row") {
+            if lock_monitor_client.on_rows() {
+                while let Some(row) = lock_monitor_client
+                    .next_row()
+                    .await
+                    .expect("Failed to read lock row")
+                {
                     println!("Lock detected:");
                     println!("  Session ID: {:?}", row[0]);
                     println!("  Resource Type: {:?}", row[1]);
@@ -1242,8 +1243,11 @@ mod bulk_copy_integration_tests {
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = lock_monitor_client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read count")
+        if lock_monitor_client.on_rows()
+            && let Some(row) = lock_monitor_client
+                .next_row()
+                .await
+                .expect("Failed to read count")
         {
             assert_eq!(
                 row[0],
@@ -1404,8 +1408,8 @@ mod bulk_copy_integration_tests {
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -1578,8 +1582,8 @@ mod bulk_copy_integration_tests {
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -1841,8 +1845,8 @@ mod bulk_copy_integration_tests {
             .expect("Failed to query invalid data");
 
         let mut found_invalid = false;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 if row[0] == ColumnValues::Int(65) && row[1] == ColumnValues::Int(500) {
                     found_invalid = true;
                     println!(
@@ -2017,8 +2021,8 @@ mod bulk_copy_integration_tests {
             .expect("Failed to query data");
 
         let mut found_null = false;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 if row[0] == ColumnValues::Int(2) {
                     // Check that name is NULL (preserved), not 'DefaultName'
                     match &row[1] {
@@ -2122,8 +2126,8 @@ mod bulk_copy_integration_tests {
             .expect("Failed to query data");
 
         let mut found_default = false;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 if row[0] == ColumnValues::Int(2) {
                     // Check that name is 'DefaultName' (replaced), not NULL
                     match &row[1] {
@@ -2385,8 +2389,8 @@ mod bulk_copy_integration_tests {
             .expect("Failed to query marker table");
 
         let mut trigger_fired = false;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 if let ColumnValues::Int(333) = row[0] {
                     trigger_fired = true;
                     println!("Confirmed: Trigger fired and inserted marker value 333");
@@ -2535,8 +2539,8 @@ mod bulk_copy_integration_tests {
             .await
             .expect("Failed to query marker table");
 
-        let marker_count = if let Some(resultset) = client.get_current_resultset() {
-            if let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        let marker_count = if client.on_rows() {
+            if let Some(row) = client.next_row().await.expect("Failed to read row") {
                 match row[0] {
                     ColumnValues::Int(count) => count,
                     _ => -1,

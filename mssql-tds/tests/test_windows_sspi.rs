@@ -108,8 +108,8 @@ async fn test_windows_integrated_auth_connection() -> TdsResult<()> {
     let query = "SELECT auth_scheme FROM sys.dm_exec_connections WHERE session_id = @@SPID";
     connection.execute(query.to_string(), ()).await?;
 
-    if let Some(resultset) = connection.get_current_resultset()
-        && let Some(row) = resultset.next_row().await?
+    if connection.on_rows()
+        && let Some(row) = connection.next_row().await?
     {
         let auth_scheme = format!("{:?}", row.first());
         println!("✓ Authentication scheme: {}", auth_scheme);
@@ -171,8 +171,8 @@ async fn test_localdb_integrated_auth_connection() -> TdsResult<()> {
     let query = "SELECT auth_scheme FROM sys.dm_exec_connections WHERE session_id = @@SPID";
     connection.execute(query.to_string(), ()).await?;
 
-    if let Some(resultset) = connection.get_current_resultset()
-        && let Some(row) = resultset.next_row().await?
+    if connection.on_rows()
+        && let Some(row) = connection.next_row().await?
     {
         let auth_scheme = format!("{:?}", row.first());
         println!("✓ Authentication scheme: {}", auth_scheme);
@@ -188,8 +188,8 @@ async fn test_localdb_integrated_auth_connection() -> TdsResult<()> {
     let query = "SELECT @@SERVERNAME, @@VERSION";
     connection.execute(query.to_string(), ()).await?;
 
-    if let Some(resultset) = connection.get_current_resultset()
-        && let Some(row) = resultset.next_row().await?
+    if connection.on_rows()
+        && let Some(row) = connection.next_row().await?
     {
         let server_name = format!("{:?}", row.first());
         let version = format!("{:?}", row.get(1));
@@ -239,8 +239,8 @@ async fn test_ssrp_named_pipe_integrated_auth() -> TdsResult<()> {
         .await?;
 
     let mut transport = String::new();
-    if let Some(rs) = client.get_current_resultset()
-        && let Some(row) = rs.next_row().await?
+    if client.on_rows()
+        && let Some(row) = client.next_row().await?
         && let ColumnValues::String(s) = &row[0]
     {
         transport = s.to_string();
@@ -280,8 +280,8 @@ async fn connect_and_get_transport(datasource: &str) -> TdsResult<String> {
         .await?;
 
     let mut transport = String::new();
-    if let Some(rs) = client.get_current_resultset()
-        && let Some(row) = rs.next_row().await?
+    if client.on_rows()
+        && let Some(row) = client.next_row().await?
         && let ColumnValues::String(s) = &row[0]
     {
         transport = s.to_string();
@@ -364,8 +364,8 @@ async fn test_sspi_localhost_select_one() -> TdsResult<()> {
     client.execute("SELECT 1 AS val".to_string(), ()).await?;
 
     let mut got_result = false;
-    if let Some(rs) = client.get_current_resultset()
-        && let Some(row) = rs.next_row().await?
+    if client.on_rows()
+        && let Some(row) = client.next_row().await?
     {
         assert_eq!(
             row[0],
@@ -415,8 +415,8 @@ async fn test_sspi_named_instance_select_one() -> TdsResult<()> {
         .execute("SELECT @@SERVICENAME AS svc".to_string(), ())
         .await?;
 
-    if let Some(rs) = client.get_current_resultset()
-        && let Some(row) = rs.next_row().await?
+    if client.on_rows()
+        && let Some(row) = client.next_row().await?
     {
         let svc = format!("{:?}", row.first());
         assert!(
@@ -429,8 +429,8 @@ async fn test_sspi_named_instance_select_one() -> TdsResult<()> {
     client.execute("SELECT 1 AS val".to_string(), ()).await?;
 
     let mut got_result = false;
-    if let Some(rs) = client.get_current_resultset()
-        && let Some(row) = rs.next_row().await?
+    if client.on_rows()
+        && let Some(row) = client.next_row().await?
     {
         assert_eq!(
             row[0],

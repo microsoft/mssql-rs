@@ -124,9 +124,9 @@ mod no_protocol_resolution {
         let mut row_count = 0;
 
         loop {
-            if let Some(resultset) = client.get_current_resultset() {
+            if client.on_rows() {
                 has_results = true;
-                while let Some(_row) = resultset.next_row().await? {
+                while let Some(_row) = client.next_row().await? {
                     row_count += 1;
                 }
             }
@@ -609,8 +609,8 @@ mod no_protocol_resolution {
 
         let mut service_name = String::new();
         loop {
-            if let Some(rs) = client.get_current_resultset()
-                && let Some(row) = rs.next_row().await?
+            if client.on_rows()
+                && let Some(row) = client.next_row().await?
                 && let mssql_tds::datatypes::column_values::ColumnValues::String(s) = &row[0]
             {
                 service_name = s.to_utf8_string();
