@@ -1030,6 +1030,91 @@ mod client_based_iterators {
     }
 
     #[tokio::test]
+    async fn sparse_two_rows_nbcrow_column_1_then_2_plp_pause_and_resume()
+    -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        // Nullable c1 forces NBCROW token emission; c2 is PLP payload.
+        let query = "
+            SELECT
+                CAST(NULL AS INT) AS c1,
+                CAST(REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)) AS c2,
+                CAST(103 AS INT) AS c3
+            UNION ALL
+            SELECT
+                CAST(NULL AS INT) AS c1,
+                CAST(REPLICATE(CAST('B' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)) AS c2,
+                CAST(203 AS INT) AS c3
+        "
+        .to_string();
+        client.execute(query, None, None).await?;
+
+        let mut row1 = SparseCaptureWriter::new(3);
+        if let Some(rs) = client.get_current_resultset() {
+            row1.request_column(1);
+            assert!(rs.next_row_into(&mut row1).await?);
+
+            row1.request_column(2);
+            assert!(rs.next_row_into(&mut row1).await?);
+            assert!(rs.active_plp_collation().is_none());
+
+            let mut buf = [0u8; 2048];
+            let mut first_row_c2 = Vec::new();
+            loop {
+                let n = rs.read_active_plp_bytes(&mut buf).await?;
+                first_row_c2.extend_from_slice(&buf[..n]);
+                if rs.active_plp_reached_end() {
+                    break;
+                }
+                assert!(n > 0, "Expected progress while draining first-row c2");
+            }
+            assert_eq!(first_row_c2.len(), 9000);
+            assert!(first_row_c2.iter().all(|b| *b == b'A'));
+
+            row1.clear_request();
+            assert!(rs.next_row_into(&mut row1).await?);
+
+            let mut row2 = SparseCaptureWriter::new(3);
+            row2.request_column(1);
+            assert!(rs.next_row_into(&mut row2).await?);
+
+            row2.request_column(2);
+            assert!(rs.next_row_into(&mut row2).await?);
+
+            let mut second_row_c2 = Vec::new();
+            loop {
+                let n = rs.read_active_plp_bytes(&mut buf).await?;
+                second_row_c2.extend_from_slice(&buf[..n]);
+                if rs.active_plp_reached_end() {
+                    break;
+                }
+                assert!(n > 0, "Expected progress while draining second-row c2");
+            }
+            assert_eq!(second_row_c2.len(), 9000);
+            assert!(second_row_c2.iter().all(|b| *b == b'B'));
+
+            row2.clear_request();
+            assert!(rs.next_row_into(&mut row2).await?);
+
+            assert!(!rs.next_row_into(&mut row1).await?);
+
+            // With paused PLP reads, column 2 is exposed via read_active_plp_bytes
+            // and is not materialized into the sparse row capture.
+            assert_eq!(row1.captured.len(), 1);
+            assert!(matches!(&row1.captured[0], ColumnValues::Null));
+
+            assert_eq!(row2.captured.len(), 1);
+            assert!(matches!(&row2.captured[0], ColumnValues::Null));
+        }
+
+        client.close_query().await?;
+        Ok(())
+    }
+    #[tokio::test]
     async fn sparse_two_rows_column_2_then_4_plp_then_non_plp() -> mssql_tds::core::TdsResult<()> {
         let context = create_context();
         let provider = TdsConnectionProvider {};
