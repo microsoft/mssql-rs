@@ -4,7 +4,7 @@
 //! Implementation of SQLExecute — execute a prepared statement with the
 //! currently bound parameter values.
 
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use mssql_tds::connection::tds_client::{ExecuteOptions, StatementResult, TdsClient};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
