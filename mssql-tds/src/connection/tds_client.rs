@@ -1095,7 +1095,6 @@ impl TdsClient {
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
-        self.return_values.clear();
         self.transport.reset_reader();
 
         // Always Encrypted: when the connection enabled column encryption and the
@@ -1220,7 +1219,6 @@ impl TdsClient {
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
-        self.return_values.clear();
         self.transport.reset_reader();
 
         let database_collation = self.negotiated_settings.database_collation;
@@ -1449,7 +1447,6 @@ impl TdsClient {
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
-        self.return_values.clear();
         self.transport.reset_reader();
 
         let database_collation = self.negotiated_settings.database_collation;
@@ -1580,7 +1577,6 @@ impl TdsClient {
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
-        self.return_values.clear();
         self.transport.reset_reader();
 
         // Always Encrypted: encrypt the supplied parameter values in place using
@@ -3045,6 +3041,10 @@ impl TdsClient {
     /// command that triggered the reconnect.
     fn begin_command(&mut self) {
         self.info_messages.clear();
+        // Clear output parameters / return values from the previous command so a
+        // fully-navigated prior RPC does not leave `get_return_values()` /
+        // `retrieve_output_params()` reporting stale values for this new command.
+        self.return_values.clear();
     }
 
     /// Returns and clears the prepared-statement handle captured from the most

@@ -7,7 +7,7 @@ use std::env;
 use std::sync::Once;
 
 use dotenv::dotenv;
-use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
+use mssql_tds::connection::tds_client::{ResultSet, StatementResult, TdsClient};
 use mssql_tds::core::{EncryptionOptions, TdsResult};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
@@ -146,44 +146,56 @@ pub async fn begin_connection(datasource: &str) -> TdsClient {
 
 pub async fn validate_results(
     client: &mut TdsClient,
+    first: StatementResult,
     expected_results: &[ExpectedQueryResultType],
 ) -> TdsResult<()> {
-    let mut expected_index = 0;
-    println!("Before looping.");
+    // Statement-wise validation. `first` is the `StatementResult` returned by the
+    // `execute*` call that produced this batch; later statements are reached with
+    // `advance()`. Pure no-op statements (DDL, `SET`, `ROLLBACK`, ...) are
+    // collapsed by the client and never surface as a boundary, so they are
+    // represented in `expected_results` as `Update(0)` and consume no boundary.
+    let mut current = first;
 
-    let mut has_rows = client.on_rows();
-    if !has_rows {
-        has_rows = client.advance_to_rows().await?;
-    }
-    while has_rows {
-        println!("Current index {expected_index:?}");
-        assert!(expected_index < expected_results.len());
-
-        let expected = &expected_results[expected_index];
+    for (i, expected) in expected_results.iter().enumerate() {
         match expected {
-            ExpectedQueryResultType::Result(expected_row_count) => {
-                let mut actual_rows: u64 = 0;
-                println!("Columns: {:?}", client.get_metadata());
-
-                while let Some(row) = client.next_row().await? {
-                    print!("Row {actual_rows:?}: ");
-                    for cell in row {
-                        print!("{cell:?},");
-                    }
-                    println!();
-                    actual_rows += 1;
+            // Collapsed no-op statement — no surfaced boundary to consume.
+            ExpectedQueryResultType::Update(0) => {}
+            ExpectedQueryResultType::Update(expected_row_count) => match current {
+                StatementResult::NoRows { rows_affected } => {
+                    assert_eq!(
+                        rows_affected,
+                        Some(*expected_row_count),
+                        "rows-affected mismatch for update at index {i}"
+                    );
+                    current = client.advance().await?;
                 }
-                assert_eq!(actual_rows, *expected_row_count);
-            }
-            ExpectedQueryResultType::Update(_expected_row_count) => {
-                // For DML statements, we just drain any rows if present
-                while client.next_row().await?.is_some() {}
-            }
+                other => {
+                    panic!("expected Update({expected_row_count}) at index {i}, got {other:?}")
+                }
+            },
+            ExpectedQueryResultType::Result(expected_row_count) => match current {
+                StatementResult::Rows => {
+                    let mut actual_rows: u64 = 0;
+                    while client.next_row().await?.is_some() {
+                        actual_rows += 1;
+                    }
+                    assert_eq!(
+                        actual_rows, *expected_row_count,
+                        "row-count mismatch for result at index {i}"
+                    );
+                    current = client.advance().await?;
+                }
+                other => {
+                    panic!("expected Result({expected_row_count}) at index {i}, got {other:?}")
+                }
+            },
         }
-        expected_index += 1;
-
-        has_rows = client.advance_to_rows().await?;
     }
+
+    assert!(
+        matches!(current, StatementResult::End),
+        "more results were produced than expected: {current:?}"
+    );
 
     client.close_query().await?;
     Ok(())
@@ -194,8 +206,10 @@ pub async fn run_query_and_check_results(
     query: String,
     expected_results: &[ExpectedQueryResultType],
 ) {
-    client.execute(query, ()).await.unwrap();
-    validate_results(client, expected_results).await.unwrap();
+    let first = client.execute(query, ()).await.unwrap();
+    validate_results(client, first, expected_results)
+        .await
+        .unwrap();
 }
 
 #[allow(dead_code)]
