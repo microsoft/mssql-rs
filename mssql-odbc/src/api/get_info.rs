@@ -440,9 +440,6 @@ mod tests {
         let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let state = dbc_ref.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1);
-        assert_eq!(
-            state.diag_records[0].sql_state,
-            ERR_INVALID_INFO_TYPE.state
-        );
+        assert_eq!(state.diag_records[0].sql_state, ERR_INVALID_INFO_TYPE.state);
     }
 }
