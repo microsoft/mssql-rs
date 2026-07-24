@@ -368,6 +368,41 @@ else
     VERDICT=$(printf "\342\234\205 No benchmark consistently slower by >=%d%% vs baseline" "$PCT")
 fi
 
+# Emit each benchmark's % change as a compact, colored "diverging bar" in a
+# GitHub/ADO-flavored markdown table (renders with color on the run Summary tab,
+# unlike the fixed-width critcmp block). Green = faster, red = slower, one square
+# per ~1%, drawn only outside ±1% so the noise rows stay clean. Reads the critcmp
+# table ($2 = base ratio, $6 = candidate ratio; % change = candidate/base - 1).
+emoji_bar_table() {
+    awk -v g="🟩" -v r="🟥" '
+        $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ {
+            m++; id[m] = $1; pct[m] = ($6 / $2 - 1) * 100;
+        }
+        END {
+            # sort indices ascending by % change (fastest first)
+            for (i = 1; i <= m; i++)
+                for (j = i + 1; j <= m; j++)
+                    if (pct[j] < pct[i]) {
+                        t = pct[i]; pct[i] = pct[j]; pct[j] = t;
+                        s = id[i];  id[i] = id[j];  id[j] = s;
+                    }
+            print "| Benchmark | faster \342\227\204 | \316\224% | \342\226\272 slower |";
+            print "|---|--:|:--:|:--|";
+            for (i = 1; i <= m; i++) {
+                p = pct[i]; a = (p < 0) ? -p : p;
+                n = int(a + 0.5); if (n > 12) n = 12;
+                gs = ""; rs = "";
+                if (p <= -1)     { for (q = 0; q < n; q++) gs = gs g; }
+                else if (p >= 1) { for (q = 0; q < n; q++) rs = rs r; }
+                if (p <= -0.05)      lbl = sprintf("%.1f", p);
+                else if (p >= 0.05)  lbl = sprintf("+%.1f", p);
+                else                 lbl = "\302\2610.0";
+                printf "| `%s` | %s | %s | %s |\n", id[i], gs, lbl, rs;
+            }
+        }
+    ' "$1"
+}
+
 # Markdown summary — the perf lab attaches results/*.md to the run's Summary tab
 # (task.uploadsummary), so the comparison renders inline on the run page. The
 # critcmp table is fixed-width, so wrap it in a fenced code block to keep it
@@ -381,6 +416,12 @@ fi
         echo "_Auto-confirm re-measured the initially-tripping benchmark(s) ${CONFIRM_RUNS}× (interleaved, offenders only). A regression is counted only when it trips in at least ${QUORUM} of ${CONFIRM_RUNS} re-runs; a benchmark that spikes once but not consistently is treated as transient noise._"
         echo ""
     fi
+    echo "### Change vs baseline"
+    echo ""
+    echo "_🟩 faster · 🟥 slower · 1 square ≈ 1% (drawn only for |Δ| ≥ 1%)_"
+    echo ""
+    emoji_bar_table "$RESULTS_DIR/comparison.txt"
+    echo ""
     echo "Baseline commit: \`${BASELINE_COMMIT}\`"
     echo ""
     echo '```'

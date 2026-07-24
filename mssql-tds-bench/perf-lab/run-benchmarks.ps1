@@ -488,6 +488,38 @@ if ($confirmed.Count -gt 0) {
     $verdict = "$check No benchmark consistently slower by >=$pct% vs baseline"
 }
 
+# Emit each benchmark's % change as a compact, colored "diverging bar" markdown
+# table (renders with color on the run Summary tab, unlike the fixed-width critcmp
+# block). Green = faster, red = slower, one square per ~1%, drawn only outside ±1%.
+function Get-EmojiBarTable {
+    param([string]$Comparison)
+    $g = [char]::ConvertFromUtf32(0x1F7E9)  # green square
+    $r = [char]::ConvertFromUtf32(0x1F7E5)  # red square
+    $rows = @()
+    foreach ($line in ($Comparison -split "\r?\n")) {
+        $f = @($line -split '\s+' | Where-Object { $_ -ne '' })
+        if ($f.Count -ge 6 -and $f[1] -match '^[0-9]+\.[0-9]+$' -and $f[5] -match '^[0-9]+\.[0-9]+$') {
+            $rows += [pscustomobject]@{ Name = $f[0]; Pct = ([double]$f[5] / [double]$f[1] - 1) * 100 }
+        }
+    }
+    $lines = @(
+        ('| Benchmark | faster ' + [char]0x25C4 + ' | ' + [char]0x0394 + '% | ' + [char]0x25BA + ' slower |')
+        '|---|--:|:--:|:--|'
+    )
+    foreach ($row in ($rows | Sort-Object Pct)) {
+        $p = $row.Pct; $n = [int][math]::Round([math]::Abs($p)); if ($n -gt 12) { $n = 12 }
+        $gs = ''; $rs = ''
+        if ($p -le -1) { $gs = $g * $n } elseif ($p -ge 1) { $rs = $r * $n }
+        if ($p -le -0.05) { $lbl = ('{0:0.0}' -f $p) }
+        elseif ($p -ge 0.05) { $lbl = ('+{0:0.0}' -f $p) }
+        else { $lbl = [char]0x00B1 + '0.0' }
+        $lines += "| ``$($row.Name)`` | $gs | $lbl | $rs |"
+    }
+    return $lines
+}
+
+$gsq = [char]::ConvertFromUtf32(0x1F7E9)
+$rsq = [char]::ConvertFromUtf32(0x1F7E5)
 $summaryLines = @(
     '## mssql-tds perf - base -> candidate'
     ''
@@ -498,6 +530,14 @@ if ($regressions.Count -gt 0) {
     $summaryLines += "_Auto-confirm re-measured the initially-tripping benchmark(s) ${confirmRuns}x (interleaved, offenders only). A regression is counted only when it trips in at least $quorum of $confirmRuns re-runs; a benchmark that spikes once but not consistently is treated as transient noise._"
     $summaryLines += ''
 }
+$summaryLines += @(
+    '### Change vs baseline'
+    ''
+    "_$gsq faster, $rsq slower; 1 square ~ 1% (drawn only for changes of at least 1%)_"
+    ''
+)
+$summaryLines += (Get-EmojiBarTable $comparison)
+$summaryLines += ''
 $summaryLines += @(
     "Baseline commit: ``$BaselineCommit``"
     ''
