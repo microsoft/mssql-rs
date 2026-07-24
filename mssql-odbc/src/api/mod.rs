@@ -4,6 +4,7 @@
 pub(crate) mod alloc_handle;
 mod bind_param;
 mod close_cursor;
+mod connect;
 mod describe_col;
 mod disconnect;
 mod driver_connect;
@@ -14,6 +15,10 @@ pub(crate) mod fetch;
 pub(crate) mod free_handle;
 mod get_data;
 mod get_diag;
+mod get_env_attr;
+mod get_functions;
+mod get_info;
+mod get_stmt_attr;
 mod more_results;
 mod num_result_cols;
 pub(crate) mod odbc_types;

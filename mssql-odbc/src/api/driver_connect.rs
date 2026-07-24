@@ -119,7 +119,7 @@ unsafe fn sql_driver_connect_w_impl(
     )
 }
 
-fn sql_driver_connect_w_safe(
+pub(crate) fn sql_driver_connect_w_safe(
     dbc: &DbcHandle,
     conn_str: Option<String>,
     out_connection_string: *mut SqlWChar,

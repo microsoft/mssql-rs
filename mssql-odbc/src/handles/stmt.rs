@@ -7,7 +7,8 @@ use std::sync::Mutex;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
 
-use super::{DbcHandle, HandleType, HasObjectType};
+use super::desc::{DescHandle, DescKind};
+use super::{DbcHandle, HandleType, HasObjectType, handle_to_raw};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 
@@ -26,6 +27,19 @@ pub(crate) struct StmtHandle {
     /// the DBC owns the STMT's lifetime, not the other way around.
     /// Mirrors msodbcsql's statement→connection back-pointer.
     pub(crate) parent_dbc: *mut c_void,
+    /// The four automatically-allocated implicit descriptors (ARD/APD/IRD/IPD),
+    /// the permanent implicit allocations (cf. msodbcsql's embedded `lpstmt->ARD`
+    /// / `cmdp.APD`, `sqlcfunc.cpp`). Set once in `new()`, freed in `Drop`, never
+    /// reassigned — hence sound as plain fields outside `inner`, same set-once
+    /// rationale as `parent_dbc`. Do NOT repurpose them into the mutable *active*
+    /// ARD/APD association that `SQLSetStmtAttr(SQL_ATTR_APP_ROW_DESC / APP_PARAM_DESC)`
+    /// swaps (msodbcsql's separate `pARD`/`pAPD`); that path is still a stub, and
+    /// when implemented its active pointer belongs in `StmtState` behind `inner`
+    /// (concurrent set/get would otherwise race). IRD/IPD are never swappable.
+    pub(crate) ard: *mut c_void,
+    pub(crate) apd: *mut c_void,
+    pub(crate) ird: *mut c_void,
+    pub(crate) ipd: *mut c_void,
     pub(crate) inner: Mutex<StmtState>,
 }
 
@@ -108,6 +122,10 @@ impl StmtHandle {
         Self {
             object_type: HandleType::Stmt,
             parent_dbc,
+            ard: handle_to_raw(Box::new(DescHandle::new(DescKind::AppRow))),
+            apd: handle_to_raw(Box::new(DescHandle::new(DescKind::AppParam))),
+            ird: handle_to_raw(Box::new(DescHandle::new(DescKind::ImpRow))),
+            ipd: handle_to_raw(Box::new(DescHandle::new(DescKind::ImpParam))),
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
@@ -138,5 +156,18 @@ impl StmtHandle {
 impl HasObjectType for StmtHandle {
     fn object_type_mut(&mut self) -> &mut HandleType {
         &mut self.object_type
+    }
+}
+
+impl Drop for StmtHandle {
+    fn drop(&mut self) {
+        // Free the four implicit descriptors owned by this statement. These are
+        // never handed to `SQLFreeHandle` (they are implicit), so dropping the
+        // statement is the single owner responsible for reclaiming them.
+        for raw in [self.ard, self.apd, self.ird, self.ipd] {
+            if !raw.is_null() {
+                drop(unsafe { Box::from_raw(raw as *mut DescHandle) });
+            }
+        }
     }
 }
