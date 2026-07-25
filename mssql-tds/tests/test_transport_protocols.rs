@@ -481,12 +481,13 @@ mod transport_protocols {
             println!("Executing: {query}");
             client.execute(query.to_string(), ()).await?;
 
-            while client.on_rows() {
+            if client.on_rows() {
                 while let Some(_row) = client.next_row().await? {}
             }
 
-            if client.advance_to_rows().await? {
-                // Process any additional result sets
+            while client.advance_to_rows().await? {
+                // Drain any additional result sets
+                while let Some(_row) = client.next_row().await? {}
             }
 
             client.close_query().await?;
