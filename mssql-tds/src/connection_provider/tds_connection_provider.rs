@@ -189,6 +189,19 @@ impl TdsConnectionProvider {
                         return Ok(client);
                     }
                     Err(err) => {
+                        // Only transient (transport-level) shared-memory failures
+                        // fall through to SSRP/TCP. A definitive failure — e.g. the
+                        // user cancelled interactive sign-in (`AuthenticationDenied`)
+                        // or the login was rejected — would recur on every transport,
+                        // and falling through would relaunch the interactive browser.
+                        // Surface it immediately.
+                        if !err.is_transient_connect_error() {
+                            debug!(
+                                "Shared Memory failed permanently ({}), not falling through",
+                                err
+                            );
+                            return Err(err);
+                        }
                         debug!("Shared Memory failed ({}), falling through to SSRP", err);
                     }
                 }

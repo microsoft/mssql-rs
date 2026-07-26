@@ -556,11 +556,15 @@ async fn read_body_capped(mut response: reqwest::Response, cap: usize) -> TdsRes
 }
 
 fn parse_token_response(body: &str) -> TdsResult<String> {
+    // A 2xx response with an unparseable body or an empty `access_token` is a
+    // definitive protocol failure, not a transient transport blip: retrying would
+    // relaunch the interactive browser without any chance of a different outcome.
+    // Classify it non-transient so it stays out of the connect retry loop.
     let token = serde_json::from_str::<TokenResponse>(body)
         .map(|token| token.access_token)
-        .map_err(|e| Error::ConnectionError(format!("failed to parse token response: {e}")))?;
+        .map_err(|e| Error::ProtocolError(format!("failed to parse token response: {e}")))?;
     if token.is_empty() {
-        return Err(Error::ConnectionError(
+        return Err(Error::ProtocolError(
             "token response contained an empty access token".into(),
         ));
     }

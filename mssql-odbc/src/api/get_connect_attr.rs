@@ -4,8 +4,9 @@
 //! Implementation of SQLGetConnectAttrW.
 //!
 //! Reports `SQL_ATTR_LOGIN_TIMEOUT` from the stored connection state so a
-//! set/get round-trip returns the configured value (matching msodbcsql). Other
-//! attributes are accepted without writing, mirroring the set-side coverage.
+//! set/get round-trip returns the configured value (matching msodbcsql). Any
+//! other attribute is unsupported and returns `HYC00` rather than claiming
+//! success without writing, mirroring the set-side (`SQLSetConnectAttrW`).
 
 use tracing::{debug, error};
 
@@ -15,7 +16,7 @@ use crate::api::odbc_types::{
     SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
-use crate::error::free_errors;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 
 /// Login timeout reported when the application has not set
@@ -107,9 +108,22 @@ fn sql_get_connect_attr_w_safe(
             debug!(secs, "SQLGetConnectAttrW: login timeout returned");
             SQL_SUCCESS
         }
-        // Attributes not backed by stored state report success without writing,
-        // matching the historical stub behavior.
-        _ => SQL_SUCCESS,
+        // Any other attribute is genuinely unsupported: surface HYC00 instead of
+        // claiming success while leaving the caller's buffer untouched. Mirrors
+        // the set-side (`sql_set_connect_attr_w`).
+        _ => {
+            error!(
+                attribute,
+                "SQLGetConnectAttrW: unsupported connection attribute"
+            );
+            post_sql_error(
+                &mut state,
+                SQLSTATE_HYC00,
+                0,
+                "Connection attribute not supported",
+            );
+            SQL_ERROR
+        }
     }
 }
 
@@ -166,6 +180,24 @@ mod tests {
                 h.dbc,
                 SQL_ATTR_LOGIN_TIMEOUT,
                 std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get, SQL_ERROR);
+    }
+
+    #[test]
+    fn unsupported_attribute_returns_error() {
+        let h = TestHandles::with_env_dbc();
+        // 1234 is an arbitrary unhandled attribute id -> HYC00, not silent
+        // success, matching the set-side.
+        let mut out: u32 = 0;
+        let get = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                1234,
+                &mut out as *mut u32 as SqlPointer,
                 0,
                 std::ptr::null_mut(),
             )
