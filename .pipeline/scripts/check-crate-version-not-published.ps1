@@ -28,15 +28,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-function Get-CargoIndexPath([string]$name) {
-    $n = $name.ToLower()
-    switch ($n.Length) {
-        1 { return "1/$n" }
-        2 { return "2/$n" }
-        3 { return "3/$($n[0])/$n" }
-        default { return "$($n.Substring(0,2))/$($n.Substring(2,2))/$n" }
-    }
-}
+. "$PSScriptRoot/Get-CargoIndexPath.ps1"
 
 $base = $IndexBaseUrl.TrimEnd('/')
 $conflict = $false

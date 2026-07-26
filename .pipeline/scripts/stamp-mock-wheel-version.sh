@@ -5,6 +5,9 @@
 # Used by every non-Windows build job (manylinux, musllinux, macOS).
 #
 # Env:
+#   WHEEL_VERSION    Precomputed version from the run's single compute step. When
+#                    set, it is stamped verbatim (all jobs share one version). When
+#                    empty, the version is computed here as a fallback.
 #   RELEASE_VERSION  "True" => publish the base version as-is (e.g. 1.0.0).
 #                    Anything else => append a .dev<date><buildId> segment.
 #   BUILD_BUILDID    Azure DevOps build id, used in the dev segment.
@@ -15,12 +18,15 @@ set -euo pipefail
 PYPROJECT="mssql-mock-tds-py/pyproject.toml"
 CARGO="mssql-mock-tds-py/Cargo.toml"
 
-BASE=$(grep -m1 -E '^version\s*=' "$PYPROJECT" | sed -E 's/.*"([^"]+)".*/\1/')
-
-case "${RELEASE_VERSION:-}" in
-  True|true|TRUE) VER="${BASE}" ;;                                    # release: publish BASE as-is
-  *) VER="${BASE}.dev$(date -u +%Y%m%d)${BUILD_BUILDID:-}" ;;         # PEP 440 dev release segment (.devN)
-esac
+if [ -n "${WHEEL_VERSION:-}" ]; then
+  VER="${WHEEL_VERSION}"                                               # shared, computed once upstream
+else
+  BASE=$(grep -m1 -E '^version\s*=' "$PYPROJECT" | sed -E 's/.*"([^"]+)".*/\1/')
+  case "${RELEASE_VERSION:-}" in
+    True|true|TRUE) VER="${BASE}" ;;                                   # release: publish BASE as-is
+    *) VER="${BASE}.dev$(date -u +%Y%m%d)${BUILD_BUILDID:-}" ;;        # PEP 440 dev release segment (.devN)
+  esac
+fi
 
 echo "Sandbox wheel version: ${VER}"
 

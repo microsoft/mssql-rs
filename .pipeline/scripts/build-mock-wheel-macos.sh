@@ -10,7 +10,9 @@
 set -euo pipefail
 
 : "${OB_OUTPUTDIRECTORY:?OB_OUTPUTDIRECTORY is required}"
-export MACOSX_DEPLOYMENT_TARGET=15.0
+# Target the oldest macOS we support so the wheel installs broadly. The retag step
+# stamps a matching macosx_11_0_universal2 platform tag.
+export MACOSX_DEPLOYMENT_TARGET=11.0
 
 WHEELS_DIR="${OB_OUTPUTDIRECTORY}/wheels"
 mkdir -p "$WHEELS_DIR"

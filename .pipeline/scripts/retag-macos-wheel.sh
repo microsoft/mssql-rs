@@ -12,7 +12,7 @@ WHEELS_DIR="${OB_OUTPUTDIRECTORY}/wheels"
 
 for whl in "$WHEELS_DIR"/*.whl; do
   echo "Re-tagging: $(basename "$whl")"
-  python -m wheel tags --platform-tag macosx_15_0_universal2 --remove "$whl"
+  python -m wheel tags --platform-tag macosx_11_0_universal2 --remove "$whl"
 done
 
 echo "Re-tagged wheels:"

@@ -6,11 +6,10 @@
   SANDBOX / TEST-ONLY helper. Stamps a prerelease version into the crate manifests.
 
 .DESCRIPTION
-  Replaces ONLY the first ^version line (the [package].version) of mssql-tds and
-  mssql-mock-tds. We do NOT reuse the shared stamp-crate-versions.ps1 because its
-  global `^version = "..."` regex also rewrites table-style dependency versions
-  such as [dependencies.uuid] version = "1.19.0", which corrupts the dependency
-  requirement and makes cargo publish fail.
+  Replaces ONLY the [package].version of mssql-tds and mssql-mock-tds. The edit is
+  scoped to the [package] table (header up to the next ^[table] or EOF), so it never
+  touches table-style dependency versions such as [dependencies.uuid] version =
+  "1.19.0" regardless of table ordering in the manifest.
 
   Emits the resolved version as the `crateVersion` pipeline variable.
 
@@ -29,9 +28,23 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Rewrites the version line inside the [package] table only. Isolating the section
+# first (up to the next ^[ header or EOF) keeps the substitution independent of
+# where [package] sits relative to other tables.
+function Set-PackageVersion {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Version)
+    $content = Get-Content $Path -Raw
+    $section = [regex]'(?ms)^\[package\].*?(?=^\[|\z)'
+    $m = $section.Match($content)
+    if (-not $m.Success) { Write-Error "No [package] section in $Path"; exit 1 }
+    $patched = [regex]::Replace($m.Value, '(?m)^(version\s*=\s*)"[^"]+"', "`${1}`"$Version`"", 1)
+    $content = $content.Substring(0, $m.Index) + $patched + $content.Substring($m.Index + $m.Length)
+    Set-Content $Path $content -NoNewline
+    Write-Host "Stamped $Path -> version = `"$Version`""
+}
+
 $date = Get-Date -Format 'yyyyMMdd'
-$rx = [regex]'(?m)^(version\s*=\s*)"[^"]+"'
-$baseVer = ([regex]'(?m)^version\s*=\s*"([^"]+)"').Match((Get-Content 'mssql-tds/Cargo.toml' -Raw)).Groups[1].Value
+$baseVer = ([regex]'(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"').Match((Get-Content 'mssql-tds/Cargo.toml' -Raw)).Groups[1].Value
 if ([string]::IsNullOrWhiteSpace($baseVer)) {
     Write-Error 'Could not read base version from mssql-tds/Cargo.toml'; exit 1
 }
@@ -45,10 +58,7 @@ else {
 
 Write-Host "Sandbox crate version: $ver"
 foreach ($f in 'mssql-tds/Cargo.toml', 'mssql-mock-tds/Cargo.toml') {
-    $c = Get-Content $f -Raw
-    $c = $rx.Replace($c, ('${1}"' + $ver + '"'), 1)
-    Set-Content $f $c -NoNewline
-    Write-Host "Stamped $f -> version = `"$ver`""
+    Set-PackageVersion -Path $f -Version $ver
 }
 
 Write-Host "##vso[task.setvariable variable=crateVersion]$ver"

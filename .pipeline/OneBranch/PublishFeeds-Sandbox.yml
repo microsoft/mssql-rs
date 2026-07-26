@@ -116,6 +116,11 @@ extends:
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
         steps:
+        # Resolve the wheel version ONCE here and publish it as an output variable so
+        # every build job stamps the identical version (no cross-job UTC-midnight skew).
+        - pwsh: .pipeline/scripts/compute-mock-wheel-version.ps1 -ReleaseVersion '${{ parameters.releaseVersion }}' -BuildId '$(Build.BuildId)'
+          name: computeVersion
+          displayName: 'Compute mock wheel version (shared by all build jobs)'
         - ${{ if and(eq(parameters.releaseVersion, true), eq(parameters.publishPython, true)) }}:
           - task: UsePythonVersion@0
             displayName: 'Use Python 3.12'
@@ -145,6 +150,7 @@ extends:
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_x64'
+          mockWheelVersion: $[ dependencies.PreflightVersionCheck.outputs['computeVersion.mockWheelVersion'] ]
           CARGO_TARGET_DIR: $(Build.SourcesDirectory)
         steps:
         - template: /.pipeline/templates/cargo-authenticate-template.yml@self
@@ -162,6 +168,7 @@ extends:
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
           displayName: 'Stamp sandbox wheel version'
           env:
+            WHEEL_VERSION: $(mockWheelVersion)
             BUILD_BUILDID: $(Build.BuildId)
             RELEASE_VERSION: ${{ parameters.releaseVersion }}
         - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
@@ -194,6 +201,7 @@ extends:
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_arm64'
+          mockWheelVersion: $[ dependencies.PreflightVersionCheck.outputs['computeVersion.mockWheelVersion'] ]
           CARGO_TARGET_DIR: $(Build.SourcesDirectory)
         steps:
         - template: /.pipeline/templates/cargo-authenticate-template.yml@self
@@ -211,6 +219,7 @@ extends:
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
           displayName: 'Stamp sandbox wheel version'
           env:
+            WHEEL_VERSION: $(mockWheelVersion)
             BUILD_BUILDID: $(Build.BuildId)
             RELEASE_VERSION: ${{ parameters.releaseVersion }}
         - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
@@ -245,6 +254,7 @@ extends:
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_musl_x64'
+          mockWheelVersion: $[ dependencies.PreflightVersionCheck.outputs['computeVersion.mockWheelVersion'] ]
           CARGO_TARGET_DIR: $(Build.SourcesDirectory)
         steps:
         - template: /.pipeline/templates/cargo-authenticate-template.yml@self
@@ -262,6 +272,7 @@ extends:
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
           displayName: 'Stamp sandbox wheel version'
           env:
+            WHEEL_VERSION: $(mockWheelVersion)
             BUILD_BUILDID: $(Build.BuildId)
             RELEASE_VERSION: ${{ parameters.releaseVersion }}
         - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
@@ -296,6 +307,7 @@ extends:
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_musl_arm64'
+          mockWheelVersion: $[ dependencies.PreflightVersionCheck.outputs['computeVersion.mockWheelVersion'] ]
           CARGO_TARGET_DIR: $(Build.SourcesDirectory)
         steps:
         - template: /.pipeline/templates/cargo-authenticate-template.yml@self
@@ -313,6 +325,7 @@ extends:
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
           displayName: 'Stamp sandbox wheel version'
           env:
+            WHEEL_VERSION: $(mockWheelVersion)
             BUILD_BUILDID: $(Build.BuildId)
             RELEASE_VERSION: ${{ parameters.releaseVersion }}
         - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
@@ -346,6 +359,7 @@ extends:
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_windows_x64'
+          mockWheelVersion: $[ dependencies.PreflightVersionCheck.outputs['computeVersion.mockWheelVersion'] ]
           CARGO_TARGET_DIR: C:\cargo_target_dir
         steps:
         - template: /.pipeline/templates/cargo-authenticate-template.yml@self
@@ -363,7 +377,7 @@ extends:
             versionSpec: '3.12'
             architecture: 'x64'
             addToPath: true
-        - pwsh: .pipeline/scripts/stamp-mock-wheel-version.ps1 -ReleaseVersion '${{ parameters.releaseVersion }}' -BuildId '$(Build.BuildId)'
+        - pwsh: .pipeline/scripts/stamp-mock-wheel-version.ps1 -Version '$(mockWheelVersion)' -ReleaseVersion '${{ parameters.releaseVersion }}' -BuildId '$(Build.BuildId)'
           displayName: 'Stamp sandbox wheel version'
         - pwsh: .pipeline/scripts/build-mock-wheel-windows.ps1 -OutputDir '$(ob_outputDirectory)'
           displayName: 'Build mock abi3 wheel (Windows x64)'
@@ -392,6 +406,7 @@ extends:
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_windows_arm64'
+          mockWheelVersion: $[ dependencies.PreflightVersionCheck.outputs['computeVersion.mockWheelVersion'] ]
           CARGO_TARGET_DIR: C:\cargo_target_dir
         steps:
         # Node.js workaround for ARM64 ADO tasks (UsePythonVersion etc. need Node).
@@ -414,7 +429,7 @@ extends:
             versionSpec: '3.12'
             architecture: 'arm64'
             addToPath: true
-        - pwsh: .pipeline/scripts/stamp-mock-wheel-version.ps1 -ReleaseVersion '${{ parameters.releaseVersion }}' -BuildId '$(Build.BuildId)'
+        - pwsh: .pipeline/scripts/stamp-mock-wheel-version.ps1 -Version '$(mockWheelVersion)' -ReleaseVersion '${{ parameters.releaseVersion }}' -BuildId '$(Build.BuildId)'
           displayName: 'Stamp sandbox wheel version'
         - pwsh: .pipeline/scripts/build-mock-wheel-windows.ps1 -OutputDir '$(ob_outputDirectory)'
           displayName: 'Build mock abi3 wheel (Windows ARM64)'
@@ -450,6 +465,7 @@ extends:
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_macos_universal2'
+          mockWheelVersion: $[ dependencies.PreflightVersionCheck.outputs['computeVersion.mockWheelVersion'] ]
           CARGO_TARGET_DIR: $(Build.SourcesDirectory)
         steps:
         - template: /.pipeline/templates/cargo-authenticate-template.yml@self
@@ -468,6 +484,7 @@ extends:
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
           displayName: 'Stamp sandbox wheel version'
           env:
+            WHEEL_VERSION: $(mockWheelVersion)
             BUILD_BUILDID: $(Build.BuildId)
             RELEASE_VERSION: ${{ parameters.releaseVersion }}
         - script: bash .pipeline/scripts/build-mock-wheel-macos.sh
@@ -583,7 +600,7 @@ extends:
         - pwsh: .pipeline/scripts/pin-mssql-tds-dep-version.ps1 -Version '$(crateVersion)'
           displayName: 'Pin mssql-tds dependency version'
         - ${{ if eq(parameters.publishCrate, true) }}:
-          - pwsh: .pipeline/scripts/cargo-publish-mock.ps1 -Registry '$(cargoRegistry)'
+          - pwsh: .pipeline/scripts/cargo-publish-mock.ps1 -Registry '$(cargoRegistry)' -SparseIndexBaseUrl '$(cargoSparseIndex)' -TdsVersion '$(crateVersion)'
             displayName: 'cargo publish (sandbox)'
             env:
               CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)

@@ -20,6 +20,7 @@ authoritative guard, so we never block a release on a transient lookup failure.
 """
 
 import base64
+import os
 import re
 import sys
 import urllib.error
@@ -117,8 +118,6 @@ def main(argv: list[str]) -> int:
     base = read_base_version(pyproject_path)
     target = normalize_version(base)
     print(f"Release preflight: checking feed for {package}=={base} (normalized {target})")
-
-    import os
 
     index_url = (argv[3] if len(argv) == 4 else os.environ.get("PIP_INDEX_URL", "")).strip()
     if not index_url:
