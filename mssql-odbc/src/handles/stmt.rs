@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
+use mssql_tds::token::tokens::SqlCollation;
 
 use super::{DbcHandle, HandleType, HasObjectType};
 use crate::error::{DiagRecord, HasDiagnostics};
@@ -27,6 +28,25 @@ pub(crate) struct StmtHandle {
     /// Mirrors msodbcsql's statement→connection back-pointer.
     pub(crate) parent_dbc: *mut c_void,
     pub(crate) inner: Mutex<StmtState>,
+}
+
+/// Decoded text from a paused PLP column, buffered for chunked `SQLGetData` delivery.
+///
+/// A single PLP column's text is decoded once from the active TDS stream; subsequent
+/// `SQLGetData` calls on the same column consume it in ODBC-buffer-sized slices.
+#[derive(Debug)]
+pub(crate) struct ActivePlpText {
+    /// Fully decoded Unicode text from the PLP stream.
+    pub(crate) decoded: String,
+    /// The C target type used for ongoing chunk delivery (`SQL_C_CHAR` or
+    /// `SQL_C_WCHAR`). Mixed target-type chunking on one stream is rejected.
+    pub(crate) target_type: Option<i16>,
+    /// Delivery offset for the selected `target_type`.
+    /// For `SQL_C_CHAR`, this is a UTF-8 byte offset into `decoded.as_bytes()`.
+    /// For `SQL_C_WCHAR`, this is a UTF-16 code-unit offset.
+    pub(crate) offset: usize,
+    // Collation of the active PLP text stream, if present on the wire.
+    pub(crate) collation: Option<SqlCollation>,
 }
 
 /// Mutable state within a statement handle, protected by `inner`.
@@ -55,6 +75,13 @@ pub(crate) struct StmtState {
     pub(crate) pending_unprepare: Option<i32>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
+    pub(crate) current_row_complete: bool,
+    /// 1-based column number of the PLP text stream currently being delivered
+    /// to the application in chunks. `None` when no PLP stream is in progress.
+    pub(crate) active_plp_column: Option<usize>,
+    /// Decoded text for the active PLP column, consumed by successive
+    /// `SQLGetData` calls. `None` when `active_plp_column` is `None`.
+    pub(crate) active_plp_text: Option<ActivePlpText>,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
 }
@@ -116,6 +143,9 @@ impl StmtHandle {
                 prepared_handle: None,
                 pending_unprepare: None,
                 current_row: None,
+                current_row_complete: false,
+                active_plp_column: None,
+                active_plp_text: None,
                 state_flags: 0,
             }),
         }

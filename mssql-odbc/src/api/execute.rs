@@ -152,6 +152,9 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.column_metadata.clear();
     stmt_state.current_row = None;
+    stmt_state.current_row_complete = false;
+    stmt_state.active_plp_column = None;
+    stmt_state.active_plp_text = None;
     stmt_state.set_state(STMT_STATE_EXEC_STARTED);
 
     Ok(Execution {

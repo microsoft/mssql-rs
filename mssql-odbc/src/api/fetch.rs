@@ -5,6 +5,7 @@
 
 use tracing::{debug, error};
 
+use super::odbc_row_writer::OdbcRowWriter;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
@@ -58,6 +59,14 @@ fn sql_fetch_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
 fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
+    let col_count = {
+        let Ok(stmt_state) = stmt.inner.lock() else {
+            error!("SQLFetch: stmt mutex poisoned while reading metadata");
+            return SQL_ERROR;
+        };
+        stmt_state.column_metadata.len()
+    };
+
     let mut client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetch: dbc mutex poisoned");
@@ -98,10 +107,17 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         client
     };
 
-    let fetch_result = dbc.runtime.block_on(client.next_row());
+    let mut writer = OdbcRowWriter::new(col_count);
+    if col_count > 0 {
+        writer.request_pause_after_column(1);
+    }
+
+    let fetch_result = dbc.runtime.block_on(client.next_row_into(&mut writer));
+    let row_complete = writer.row_complete();
+    let fetched_row = writer.into_row();
 
     match fetch_result {
-        Ok(Some(row)) => {
+        Ok(true) => {
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLFetch: stmt mutex poisoned storing row");
                 if let Ok(mut ds) = dbc.inner.lock() {
@@ -112,7 +128,10 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 }
                 return SQL_ERROR;
             };
-            stmt_state.current_row = Some(row);
+            stmt_state.current_row = Some(fetched_row);
+            stmt_state.current_row_complete = row_complete;
+            stmt_state.active_plp_column = None;
+            stmt_state.active_plp_text = None;
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();
@@ -131,7 +150,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 SQL_SUCCESS
             }
         }
-        Ok(None) => {
+        Ok(false) => {
             // End of current rowset. SQLFetch must return SQL_NO_DATA here per the
             // cursor contract, and SQL_NO_DATA cannot be upgraded to
             // SQL_SUCCESS_WITH_INFO — so this call has no way to signal "there are
@@ -169,6 +188,9 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 return SQL_ERROR;
             };
             stmt_state.current_row = None;
+            stmt_state.current_row_complete = false;
+            stmt_state.active_plp_column = None;
+            stmt_state.active_plp_text = None;
             // Don't clear CURSOR_OPEN here: the cursor stays open until
             // SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE).
             drop(stmt_state);
@@ -183,6 +205,9 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             error!(%e, "SQLFetch: row fetch failed");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.current_row = None;
+                stmt_state.current_row_complete = false;
+                stmt_state.active_plp_column = None;
+                stmt_state.active_plp_text = None;
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
                 let info_messages = client.take_info_messages();
