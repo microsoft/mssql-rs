@@ -86,6 +86,8 @@ pub const SQL_NTS: SqlSmallInt = -3;
 
 // ODBC-SQL-type identifiers.
 pub const SQL_UNKNOWN_TYPE: SqlSmallInt = 0;
+/// `SQLGetTypeInfo` sentinel requesting information for all data types.
+pub const SQL_ALL_TYPES: SqlSmallInt = 0;
 pub const SQL_CHAR: SqlSmallInt = 1;
 pub const SQL_NUMERIC: SqlSmallInt = 2;
 pub const SQL_DECIMAL: SqlSmallInt = 3;
@@ -95,6 +97,8 @@ pub const SQL_FLOAT: SqlSmallInt = 6;
 pub const SQL_REAL: SqlSmallInt = 7;
 pub const SQL_DOUBLE: SqlSmallInt = 8;
 pub const SQL_DATETIME: SqlSmallInt = 9;
+/// ODBC 2.x `SQL_TIME` concise type id (shares its value with no other id here).
+pub const SQL_TIME: SqlSmallInt = 10;
 pub const SQL_VARCHAR: SqlSmallInt = 12;
 pub const SQL_TIMESTAMP: SqlSmallInt = 11;
 pub const SQL_TYPE_DATE: SqlSmallInt = 91;
