@@ -96,12 +96,7 @@ pub struct TdsClient {
     /// changes. `None` until the first encrypted result set is seen.
     current_decryptor: Option<MemoizedCellDecryptor>,
     count_map: HashMap<CurrentCommand, u64>,
-    /// Rows affected by the most recent statement, sourced from the last DONE
-    /// token that carried the `DONE_COUNT` flag. `-1` means "unavailable" (no
-    /// count reported — e.g. DDL, `SET NOCOUNT ON`, or a forward-only SELECT
-    /// whose trailing DONE has not been read). Reset at the start of each
-    /// `execute()`. Surfaced to callers (ODBC `SQLRowCount`) via
-    /// [`last_rows_affected`](Self::last_rows_affected).
+    /// Rows affected by the most recent statement; see [`last_rows_affected`](Self::last_rows_affected).
     last_rows_affected: i64,
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,

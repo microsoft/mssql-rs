@@ -105,9 +105,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 return SQL_ERROR;
             };
             stmt_state.column_metadata = metadata;
-            // Report the affected-row count for the newly-positioned result set,
-            // not the previous statement's. `move_to_next` updated the client's
-            // count while advancing (-1 for a SELECT).
+            // Refresh the count for the newly-positioned result set (-1 for a SELECT).
             stmt_state.row_count = client.last_rows_affected();
             stmt_state.current_row = None;
             // Drain INFO only after the lock is held.
