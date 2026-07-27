@@ -364,23 +364,20 @@ pub unsafe extern "C" fn SQLMoreResults(statement_handle: SqlHandle) -> SqlRetur
     unsafe { super::more_results::sql_more_results(statement_handle) }
 }
 
-// ---- Result set processing (TO-BE-IMPLEMENTED) --------------------------------
+// ---- Result set processing --------------------------------------------------
 
 /// Returns the row count from the last INSERT, UPDATE, or DELETE statement.
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle.
-/// - `row_count_ptr` must be a valid, writable pointer to [`i64`].
+/// - `row_count_ptr` must be a valid, writable pointer to [`SqlLen`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLRowCount(
-    _statement_handle: SqlHandle,
-    row_count_ptr: *mut i64,
+    statement_handle: SqlHandle,
+    row_count_ptr: *mut SqlLen,
 ) -> SqlReturn {
     crate::init_tracing();
-    if !row_count_ptr.is_null() {
-        unsafe { *row_count_ptr = 0 };
-    }
-    SQL_SUCCESS
+    unsafe { super::row_count::sql_row_count(statement_handle, row_count_ptr) }
 }
 
 // ---- Attribute management (TO-BE-IMPLEMENTED) --------------------------------

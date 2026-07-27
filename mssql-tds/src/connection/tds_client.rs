@@ -33,7 +33,7 @@ use crate::{
     handler::handler_factory::NegotiatedSettings,
     io::token_stream::{ParserContext, RowReadResult},
     message::{batch::SqlBatch, messages::Request},
-    token::tokens::{ColMetadataToken, CurrentCommand, EnvChangeTokenSubType, Tokens},
+    token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, EnvChangeTokenSubType, Tokens},
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -89,6 +89,13 @@ pub struct TdsClient {
     /// changes. `None` until the first encrypted result set is seen.
     current_decryptor: Option<MemoizedCellDecryptor>,
     count_map: HashMap<CurrentCommand, u64>,
+    /// Rows affected by the most recent statement, sourced from the last DONE
+    /// token that carried the `DONE_COUNT` flag. `-1` means "unavailable" (no
+    /// count reported — e.g. DDL, `SET NOCOUNT ON`, or a forward-only SELECT
+    /// whose trailing DONE has not been read). Reset at the start of each
+    /// `execute()`. Surfaced to callers (ODBC `SQLRowCount`) via
+    /// [`last_rows_affected`](Self::last_rows_affected).
+    last_rows_affected: i64,
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
     info_messages: Vec<SqlInfoMessage>,
@@ -167,6 +174,7 @@ impl TdsClient {
             current_metadata: None,
             current_decryptor: None,
             count_map: HashMap::new(),
+            last_rows_affected: -1,
             return_values: Vec::new(),
             info_messages: Vec::new(),
             prepared_param_encryption: HashMap::new(),
@@ -400,6 +408,17 @@ impl TdsClient {
         self.current_metadata.as_deref()
     }
 
+    /// Rows affected by the most recently executed statement.
+    ///
+    /// Returns the row count from the last DONE token that carried the
+    /// `DONE_COUNT` flag, or `-1` when no count is available (DDL,
+    /// `SET NOCOUNT ON`, a forward-only SELECT whose trailing DONE has not been
+    /// read, or before any statement has executed). This maps directly to the
+    /// value ODBC `SQLRowCount` reports.
+    pub fn last_rows_affected(&self) -> i64 {
+        self.last_rows_affected
+    }
+
     /// Converts an `Option<u32>` timeout (where `Some(0)` means infinite) to `Option<Duration>`.
     ///
     /// The bulk copy API uses `0` to mean "no timeout" (infinite). This helper
@@ -569,6 +588,10 @@ impl TdsClient {
     ) -> TdsResult<()> {
         // Batch execution always uses the connection's Always Encrypted setting.
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
+
+        // Reset the affected-row count so a stale value from a prior execute on
+        // this connection cannot leak into `SQLRowCount` for the new statement.
+        self.last_rows_affected = -1;
 
         if self.execution_context.has_open_batch() {
             return Err(crate::error::Error::UsageError(
@@ -1759,6 +1782,13 @@ impl TdsClient {
                     // Use saturating_add to prevent integer overflow from malicious/corrupted TDS responses
                     *count = count.saturating_add(done.row_count);
                     self.current_result_set_has_been_read_till_end = true;
+
+                    // Capture the affected-row count for `SQLRowCount`, but only
+                    // when the DONE_COUNT flag is set — otherwise `row_count` is
+                    // not meaningful (DDL, SET NOCOUNT ON) and must stay -1.
+                    if done.status.contains(DoneStatus::COUNT) {
+                        self.last_rows_affected = i64::try_from(done.row_count).unwrap_or(i64::MAX);
+                    }
 
                     if !done.has_more() {
                         // No more result sets - end of batch

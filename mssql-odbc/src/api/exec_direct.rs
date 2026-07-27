@@ -99,6 +99,7 @@ fn sql_exec_direct_w_safe(
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.column_metadata.clear();
         stmt_state.current_row = None;
+        stmt_state.row_count = -1;
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
     }
 
@@ -199,6 +200,7 @@ fn sql_exec_direct_w_safe(
             return SQL_ERROR;
         };
         stmt_state.column_metadata = metadata; // empty vec
+        stmt_state.row_count = client.last_rows_affected();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
         let info_messages = client.take_info_messages();
@@ -228,6 +230,10 @@ fn sql_exec_direct_w_safe(
         return SQL_ERROR;
     };
     stmt_state.column_metadata = metadata;
+    // Result-returning statement: the row count is unavailable on a forward-only
+    // cursor, so this stays -1 (client reports -1 until the trailing DONE is
+    // read). Matches msodbcsql, which returns SQL_NO_ROWCOUNT_TOTAL for SELECT.
+    stmt_state.row_count = client.last_rows_affected();
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let info_messages = client.take_info_messages();

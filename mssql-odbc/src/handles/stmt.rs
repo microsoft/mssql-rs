@@ -40,6 +40,11 @@ pub(crate) struct StmtState {
     pub(crate) prepared_sql: Option<String>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
+    /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
+    /// means "not available" (no statement executed yet, a result-returning
+    /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
+    /// `SQL_NO_ROWCOUNT_TOTAL` default.
+    pub(crate) row_count: i64,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
 }
@@ -84,6 +89,7 @@ impl StmtHandle {
                 column_metadata: Vec::new(),
                 prepared_sql: None,
                 current_row: None,
+                row_count: -1,
                 state_flags: 0,
             }),
         }
