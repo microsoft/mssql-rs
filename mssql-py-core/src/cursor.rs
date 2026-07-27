@@ -592,15 +592,38 @@ impl PyCoreCursor {
                     options.column_mappings
                 };
 
+                // Arrow tables carry named columns, so a by-name source mapping
+                // is natural. Resolve each Arrow field name to its ordinal here
+                // (where the schema is known) so the position-only bulk-load
+                // engine only ever sees ordinals; unknown names fail fast with a
+                // clear message instead of deep inside resolution.
                 for mapping in mappings {
                     let tds_mapping = match mapping {
                         ColumnMapping::ByName {
                             source,
                             destination,
-                        } => TdsColumnMapping {
-                            source: ColumnMappingSource::Name(source),
-                            destination,
-                        },
+                        } => {
+                            let source_index = schema
+                                .fields()
+                                .iter()
+                                .position(|f| f.name().as_str() == source.as_str())
+                                .ok_or_else(|| {
+                                    let available = schema
+                                        .fields()
+                                        .iter()
+                                        .map(|f| f.name().as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    pyo3::exceptions::PyValueError::new_err(format!(
+                                        "Arrow source column '{source}' not found in schema \
+                                         (available: {available})"
+                                    ))
+                                })?;
+                            TdsColumnMapping {
+                                source: ColumnMappingSource::Ordinal(source_index),
+                                destination,
+                            }
+                        }
                         ColumnMapping::ByOrdinal {
                             source,
                             destination,

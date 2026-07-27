@@ -5,7 +5,9 @@
 
 Mirrors test_bulkcopy_uuid.py. Arrow ``fixed_size_binary(16)`` maps to SQL
 ``UNIQUEIDENTIFIER``. The 16 bytes are the UUID's raw big-endian
-(RFC 4122) representation, i.e. ``uuid.UUID.bytes``.
+(RFC 4122) representation, i.e. ``uuid.UUID.bytes``. Arrow ``utf8``/
+``large_utf8`` GUID text is also accepted (parsed into a GUID), which enables a
+``cursor.arrow()`` read-then-bulkload roundtrip.
 """
 import uuid
 
@@ -114,4 +116,51 @@ def test_cursor_bulkcopy_arrow_uuid_null_to_non_nullable_column(client_context):
     with pytest.raises(ValueError, match="(?i)non-nullable"):
         cursor.bulkcopy_arrow(table_name, source, batch_size=1000, timeout=30)
 
+    conn.close()
+
+
+@pytest.mark.integration
+def test_cursor_bulkcopy_arrow_uuid_from_string(client_context):
+    """Arrow utf8/large_utf8 GUID text maps to UNIQUEIDENTIFIER.
+
+    mssql-python's cursor.arrow() reads a GUID column as a string, so accepting
+    the text form enables a read-then-bulkload roundtrip (in addition to the
+    binary fixed_size_binary(16) form).
+    """
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "BulkCopyArrowUuidFromString"
+    cursor.execute(
+        f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL DROP TABLE {table_name}"
+    )
+    cursor.execute(f"CREATE TABLE {table_name} (id INT, uuid_col UNIQUEIDENTIFIER)")
+
+    u1 = uuid.UUID("6F9619FF-8B86-D011-B42D-00C04FC964FF")
+    u2 = uuid.uuid4()
+
+    for arrow_str_type in (pa.utf8(), pa.large_string()):
+        cursor.execute(f"TRUNCATE TABLE {table_name}")
+        source = pa.table(
+            {
+                "id": pa.array([1, 2, 3], type=pa.int32()),
+                "uuid_col": pa.array([str(u1), None, str(u2)], type=arrow_str_type),
+            }
+        )
+        result = cursor.bulkcopy_arrow(
+            table_name,
+            source,
+            batch_size=1000,
+            timeout=30,
+            column_mappings=[(0, "id"), (1, "uuid_col")],
+        )
+        assert result["rows_copied"] == 3
+
+        cursor.execute(f"SELECT id, uuid_col FROM {table_name} ORDER BY id")
+        rows = cursor.fetchall()
+        assert rows[0][1] == u1
+        assert rows[1][1] is None
+        assert rows[2][1] == u2
+
+    cursor.execute(f"DROP TABLE {table_name}")
     conn.close()

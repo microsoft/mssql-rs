@@ -10,7 +10,9 @@ Behavior parity with the tuple path:
   * Source has fewer columns than table  -> unmapped columns get NULL/DEFAULT.
   * No mappings -> auto zip-by-ordinal up to min(arrow_fields, dest_columns).
   * column_mappings=[str, ...] maps by source ordinal (index -> dest name);
-    column_mappings=[(int, str), ...] maps explicit source index -> dest name.
+    column_mappings=[(int, str), ...] maps explicit source index -> dest name;
+    column_mappings=[(str, str), ...] maps by Arrow field name -> dest name
+    (resolved against the Arrow schema; unknown names error up front).
 """
 import pytest
 import mssql_py_core
@@ -52,6 +54,75 @@ def test_bulkcopy_arrow_more_columns_than_table(client_context):
     rows = cursor.fetchall()
     assert rows[0] == (1, 100, 30)
     assert rows[3] == (4, 400, 28)
+
+    conn.close()
+
+
+@pytest.mark.integration
+def test_bulkcopy_arrow_by_name_source_mapping(client_context):
+    """By-name source mapping resolves Arrow field names to columns.
+
+    The Arrow columns are deliberately in a different order than the table to
+    prove the mapping is by name, not by position.
+    """
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "#BCArrowByName"
+    cursor.execute(
+        f"CREATE TABLE {table_name} (id INT PRIMARY KEY, name NVARCHAR(20), age INT)"
+    )
+
+    # Arrow schema order (age, id, name) differs from the table order.
+    source = pa.table(
+        {
+            "age": pa.array([30, 40], type=pa.int32()),
+            "id": pa.array([1, 2], type=pa.int32()),
+            "name": pa.array(["Alice", "Bob"], type=pa.utf8()),
+        }
+    )
+
+    result = cursor.bulkcopy_arrow(
+        table_name,
+        source,
+        batch_size=1000,
+        timeout=30,
+        column_mappings=[("id", "id"), ("name", "name"), ("age", "age")],
+    )
+    assert result["rows_copied"] == 2
+
+    cursor.execute(f"SELECT id, name, age FROM {table_name} ORDER BY id")
+    rows = cursor.fetchall()
+    assert rows[0] == (1, "Alice", 30)
+    assert rows[1] == (2, "Bob", 40)
+
+    conn.close()
+
+
+@pytest.mark.integration
+def test_bulkcopy_arrow_by_name_unknown_source_errors(client_context):
+    """A by-name mapping referencing a missing Arrow field fails fast."""
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "#BCArrowByNameBad"
+    cursor.execute(f"CREATE TABLE {table_name} (id INT, value INT)")
+
+    source = pa.table(
+        {
+            "id": pa.array([1, 2], type=pa.int32()),
+            "value": pa.array([10, 20], type=pa.int32()),
+        }
+    )
+
+    with pytest.raises(ValueError, match="(?i)not found in schema"):
+        cursor.bulkcopy_arrow(
+            table_name,
+            source,
+            batch_size=1000,
+            timeout=30,
+            column_mappings=[("id", "id"), ("nonexistent", "value")],
+        )
 
     conn.close()
 

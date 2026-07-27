@@ -129,6 +129,8 @@ pub enum ColumnPlanKind {
     Xml,
     /// Arrow `utf8`/`large_utf8` → SQL `json`.
     Json,
+    /// Arrow `utf8`/`large_utf8` GUID text → SQL `uniqueidentifier`.
+    Utf8Uuid,
     /// All-null arrow column.
     Null,
 }
@@ -247,11 +249,16 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
             }
         }
 
-        (DataType::Decimal128(_, s), S::Decimal | S::Numeric) => {
-            ColumnPlanKind::Decimal128 { scale: *s as u8 }
-        }
+        (DataType::Decimal128(_, s), S::Decimal | S::Numeric) => ColumnPlanKind::Decimal128 {
+            scale: checked_decimal_scale(*s)?,
+        },
 
         (DataType::FixedSizeBinary(16), S::UniqueIdentifier) => ColumnPlanKind::FixedBin16Uuid,
+        // Arrow utf8/large_utf8 GUID text → uniqueidentifier. mssql-python's
+        // cursor.arrow() reads a GUID column as a string, so this enables a
+        // read-then-bulkload roundtrip; the binary FixedSizeBinary(16) form is
+        // still accepted above.
+        (DataType::Utf8 | DataType::LargeUtf8, S::UniqueIdentifier) => ColumnPlanKind::Utf8Uuid,
         // Any-width fixed-size binary loads into BINARY/VARBINARY/IMAGE (the
         // extractor reads FixedSizeBinaryArray of any width; the server enforces
         // the column length), mirroring the variable-width binary arm above.
@@ -260,10 +267,12 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
         }
 
         // decimal128 → money / smallmoney (rescaled to ×10⁴ per cell).
-        (DataType::Decimal128(_, s), S::Money) => ColumnPlanKind::Money { scale: *s as u8 },
-        (DataType::Decimal128(_, s), S::SmallMoney) => {
-            ColumnPlanKind::SmallMoney { scale: *s as u8 }
-        }
+        (DataType::Decimal128(_, s), S::Money) => ColumnPlanKind::Money {
+            scale: checked_decimal_scale(*s)?,
+        },
+        (DataType::Decimal128(_, s), S::SmallMoney) => ColumnPlanKind::SmallMoney {
+            scale: checked_decimal_scale(*s)?,
+        },
 
         // tz-naive timestamp → legacy datetime / smalldatetime.
         (DataType::Timestamp(unit, tz), S::DateTime) if tz.is_none() => {
@@ -301,6 +310,32 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
 /// must not override it.
 fn pick_timestamp_scale(dest_scale: u8) -> u8 {
     dest_scale.min(7)
+}
+
+/// Arrow decimal scale is an `i8` and may be negative per the Arrow spec (a
+/// non-pyarrow producer can send it over the C data interface). SQL Server has
+/// no negative-scale decimal, and `as u8` would wrap a negative value into a
+/// large positive one, so reject it up front with a clear error.
+fn checked_decimal_scale(scale: i8) -> TdsResult<u8> {
+    if scale < 0 {
+        return Err(Error::UsageError(format!(
+            "Negative Arrow decimal scale ({scale}) is not supported"
+        )));
+    }
+    Ok(scale as u8)
+}
+
+/// SQL Server rejects NaN / ±Infinity for real/float columns. Validate here so
+/// the failure is a clear client-side error naming the column, before any rows
+/// are written, instead of an opaque server-side error mid-stream.
+fn check_finite(v: f64, dest: &BulkCopyColumnMetadata) -> TdsResult<()> {
+    if !v.is_finite() {
+        return Err(Error::UsageError(format!(
+            "Non-finite float value ({v}) is not allowed in column '{}'",
+            dest.column_name
+        )));
+    }
+    Ok(())
 }
 
 impl ColumnPlan {
@@ -364,17 +399,19 @@ impl ColumnPlan {
                 }
                 narrow_int(v as i64, dest)
             }
-            ColumnPlanKind::Float32 => match dest.sql_type {
-                SqlDbType::Real => Ok(ColumnValues::Real(
-                    downcast::<Float32Array>(arr)?.value(row_idx),
-                )),
-                _ => Ok(ColumnValues::Float(
-                    downcast::<Float32Array>(arr)?.value(row_idx) as f64,
-                )),
-            },
-            ColumnPlanKind::Float64 => Ok(ColumnValues::Float(
-                downcast::<Float64Array>(arr)?.value(row_idx),
-            )),
+            ColumnPlanKind::Float32 => {
+                let v = downcast::<Float32Array>(arr)?.value(row_idx);
+                check_finite(v as f64, dest)?;
+                match dest.sql_type {
+                    SqlDbType::Real => Ok(ColumnValues::Real(v)),
+                    _ => Ok(ColumnValues::Float(v as f64)),
+                }
+            }
+            ColumnPlanKind::Float64 => {
+                let v = downcast::<Float64Array>(arr)?.value(row_idx);
+                check_finite(v, dest)?;
+                Ok(ColumnValues::Float(v))
+            }
             ColumnPlanKind::Utf8Nvarchar => {
                 let s = downcast::<StringArray>(arr)?.value(row_idx).to_owned();
                 Ok(ColumnValues::String(SqlString::from_utf8_string(s)))
@@ -467,6 +504,16 @@ impl ColumnPlan {
                 let mut buf = [0u8; 16];
                 buf.copy_from_slice(bytes);
                 Ok(ColumnValues::Uuid(Uuid::from_bytes(buf)))
+            }
+            ColumnPlanKind::Utf8Uuid => {
+                let s = read_utf8(arr, row_idx)?;
+                let parsed = Uuid::parse_str(s.trim()).map_err(|e| {
+                    Error::UsageError(format!(
+                        "Invalid GUID string '{s}' for column '{}': {e}",
+                        dest.column_name
+                    ))
+                })?;
+                Ok(ColumnValues::Uuid(parsed))
             }
             ColumnPlanKind::Money { scale } => {
                 let raw = downcast::<Decimal128Array>(arr)?.value(row_idx);
@@ -947,6 +994,227 @@ mod tests {
         assert_eq!(
             plan.extract_value(arr.as_ref(), 0, &dest).unwrap(),
             ColumnValues::Float(3.5)
+        );
+    }
+
+    #[test]
+    fn float64_non_finite_rejected() {
+        // NaN / ±Infinity are invalid for SQL real/float; reject client-side
+        // with a column-naming error instead of failing opaquely on the server.
+        let dest = meta("v", SqlDbType::Float, true);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let arr: ArrayRef = Arc::new(Float64Array::from(vec![Some(bad)]));
+            let plan = one_col_plan(DataType::Float64, &dest);
+            let err = plan.extract_value(arr.as_ref(), 0, &dest).unwrap_err();
+            assert!(
+                format!("{err}").contains('v'),
+                "expected column name, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn float32_infinity_rejected() {
+        let dest = meta("r", SqlDbType::Real, true);
+        let arr: ArrayRef = Arc::new(Float32Array::from(vec![Some(f32::INFINITY)]));
+        let plan = one_col_plan(DataType::Float32, &dest);
+        assert!(plan.extract_value(arr.as_ref(), 0, &dest).is_err());
+    }
+
+    #[test]
+    fn decimal_negative_arrow_scale_rejected() {
+        // Arrow decimal scale is i8 and may be negative; `as u8` would wrap it
+        // into a huge positive scale. The planner must reject it up front.
+        let dest = meta_decimal("d", 18, 2);
+        let schema = Schema::new(vec![Field::new("c", DataType::Decimal128(18, -2), true)]);
+        let mappings = vec![ResolvedColumnMapping {
+            source_index: 0,
+            destination_index: 0,
+            destination_name: dest.column_name.clone(),
+            destination_type: dest.sql_type,
+        }];
+        let err = build_column_plans(&schema, std::slice::from_ref(&dest), &mappings).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("negative"));
+    }
+
+    #[test]
+    fn utf8_guid_to_uniqueidentifier() {
+        // mssql-python's cursor.arrow() reads a GUID column as text; accept it
+        // so a read-then-bulkload roundtrip works.
+        let dest = meta("g", SqlDbType::UniqueIdentifier, true);
+        let guid = "58185e0d-3a91-44d8-bc46-7107217e0a6d";
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some(guid)]));
+        let plan = one_col_plan(DataType::Utf8, &dest);
+        match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
+            ColumnValues::Uuid(u) => assert_eq!(u.to_string(), guid),
+            other => panic!("expected Uuid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn utf8_invalid_guid_rejected() {
+        let dest = meta("g", SqlDbType::UniqueIdentifier, true);
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("not-a-guid")]));
+        let plan = one_col_plan(DataType::Utf8, &dest);
+        assert!(plan.extract_value(arr.as_ref(), 0, &dest).is_err());
+    }
+
+    #[test]
+    fn bool_to_bit() {
+        let dest = meta("b", SqlDbType::Bit, true);
+        let arr: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true)]));
+        let plan = one_col_plan(DataType::Boolean, &dest);
+        assert_eq!(
+            plan.extract_value(arr.as_ref(), 0, &dest).unwrap(),
+            ColumnValues::Bit(true)
+        );
+    }
+
+    #[test]
+    fn int8_and_int16_to_int() {
+        let dest = meta("i", SqlDbType::Int, false);
+        let a8: ArrayRef = Arc::new(Int8Array::from(vec![Some(-5_i8)]));
+        assert_eq!(
+            one_col_plan(DataType::Int8, &dest)
+                .extract_value(a8.as_ref(), 0, &dest)
+                .unwrap(),
+            ColumnValues::Int(-5)
+        );
+        let a16: ArrayRef = Arc::new(Int16Array::from(vec![Some(1234_i16)]));
+        assert_eq!(
+            one_col_plan(DataType::Int16, &dest)
+                .extract_value(a16.as_ref(), 0, &dest)
+                .unwrap(),
+            ColumnValues::Int(1234)
+        );
+    }
+
+    #[test]
+    fn uint8_16_32_to_int() {
+        let dest = meta("i", SqlDbType::Int, false);
+        let a8: ArrayRef = Arc::new(UInt8Array::from(vec![Some(200_u8)]));
+        assert_eq!(
+            one_col_plan(DataType::UInt8, &dest)
+                .extract_value(a8.as_ref(), 0, &dest)
+                .unwrap(),
+            ColumnValues::Int(200)
+        );
+        let a16: ArrayRef = Arc::new(UInt16Array::from(vec![Some(40000_u16)]));
+        assert_eq!(
+            one_col_plan(DataType::UInt16, &dest)
+                .extract_value(a16.as_ref(), 0, &dest)
+                .unwrap(),
+            ColumnValues::Int(40000)
+        );
+        let a32: ArrayRef = Arc::new(UInt32Array::from(vec![Some(3_000_000_u32)]));
+        assert_eq!(
+            one_col_plan(DataType::UInt32, &dest)
+                .extract_value(a32.as_ref(), 0, &dest)
+                .unwrap(),
+            ColumnValues::Int(3_000_000)
+        );
+    }
+
+    #[test]
+    fn float32_to_real_and_float() {
+        let a: ArrayRef = Arc::new(Float32Array::from(vec![Some(1.5_f32)]));
+        let dest_real = meta("r", SqlDbType::Real, true);
+        assert_eq!(
+            one_col_plan(DataType::Float32, &dest_real)
+                .extract_value(a.as_ref(), 0, &dest_real)
+                .unwrap(),
+            ColumnValues::Real(1.5)
+        );
+        let dest_float = meta("f", SqlDbType::Float, true);
+        assert_eq!(
+            one_col_plan(DataType::Float32, &dest_float)
+                .extract_value(a.as_ref(), 0, &dest_float)
+                .unwrap(),
+            ColumnValues::Float(1.5)
+        );
+    }
+
+    #[test]
+    fn utf8_varchar_and_large_utf8_variants() {
+        let a: ArrayRef = Arc::new(StringArray::from(vec![Some("abc")]));
+        let dv = meta("v", SqlDbType::VarChar, true);
+        match one_col_plan(DataType::Utf8, &dv)
+            .extract_value(a.as_ref(), 0, &dv)
+            .unwrap()
+        {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "abc"),
+            o => panic!("expected String, got {o:?}"),
+        }
+
+        let la: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("h\u{e9}llo")]));
+        let dn = meta("n", SqlDbType::NVarChar, true);
+        match one_col_plan(DataType::LargeUtf8, &dn)
+            .extract_value(la.as_ref(), 0, &dn)
+            .unwrap()
+        {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "h\u{e9}llo"),
+            o => panic!("expected String, got {o:?}"),
+        }
+        let dlv = meta("lv", SqlDbType::VarChar, true);
+        match one_col_plan(DataType::LargeUtf8, &dlv)
+            .extract_value(la.as_ref(), 0, &dlv)
+            .unwrap()
+        {
+            ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "h\u{e9}llo"),
+            o => panic!("expected String, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_and_large_binary() {
+        let dest = meta("b", SqlDbType::VarBinary, true);
+        let a: ArrayRef = Arc::new(BinaryArray::from(vec![Some(&b"\x01\x02\x03"[..])]));
+        assert_eq!(
+            one_col_plan(DataType::Binary, &dest)
+                .extract_value(a.as_ref(), 0, &dest)
+                .unwrap(),
+            ColumnValues::Bytes(vec![1, 2, 3])
+        );
+        let la: ArrayRef = Arc::new(LargeBinaryArray::from(vec![Some(&b"\x0a\x0b"[..])]));
+        assert_eq!(
+            one_col_plan(DataType::LargeBinary, &dest)
+                .extract_value(la.as_ref(), 0, &dest)
+                .unwrap(),
+            ColumnValues::Bytes(vec![10, 11])
+        );
+    }
+
+    #[test]
+    fn date64_to_date() {
+        let dest = meta("d", SqlDbType::Date, true);
+        // 1 day past the epoch = 86_400_000 ms.
+        let a: ArrayRef = Arc::new(Date64Array::from(vec![Some(86_400_000_i64)]));
+        let v = one_col_plan(DataType::Date64, &dest)
+            .extract_value(a.as_ref(), 0, &dest)
+            .unwrap();
+        assert!(matches!(v, ColumnValues::Date(_)));
+    }
+
+    #[test]
+    fn fixed_size_binary16_to_uuid() {
+        let dest = meta("g", SqlDbType::UniqueIdentifier, true);
+        let a: ArrayRef =
+            Arc::new(FixedSizeBinaryArray::try_from_iter(std::iter::once([7u8; 16])).unwrap());
+        let v = one_col_plan(DataType::FixedSizeBinary(16), &dest)
+            .extract_value(a.as_ref(), 0, &dest)
+            .unwrap();
+        assert!(matches!(v, ColumnValues::Uuid(_)));
+    }
+
+    #[test]
+    fn null_arrow_type_yields_null() {
+        use arrow::array::NullArray;
+        let dest = meta("x", SqlDbType::Int, true);
+        let plan = one_col_plan(DataType::Null, &dest);
+        let a: ArrayRef = Arc::new(NullArray::new(1));
+        assert_eq!(
+            plan.extract_value(a.as_ref(), 0, &dest).unwrap(),
+            ColumnValues::Null
         );
     }
 
