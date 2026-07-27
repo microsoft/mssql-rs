@@ -126,3 +126,75 @@ TEST_F(GetTypeInfoLiveTest, UdtReturnsHYC00) {
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 }
+
+// The type-info cursor is fully drainable: every row fetches cleanly until
+// SQL_NO_DATA, exercising the open-cursor fetch loop over the live result set.
+TEST_F(GetTypeInfoLiveTest, DrainsAllRows) {
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_ALL_TYPES);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    int rows = 0;
+    while ((rc = SQLFetch(stmt_)) == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+        ++rows;
+    }
+    EXPECT_EQ(SQL_NO_DATA, rc);
+    EXPECT_GT(rows, 0);
+
+    rc = SQLCloseCursor(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
+
+// Filtering by SQL_INTEGER returns the `int` type row — confirms the @data_type
+// argument reaches the catalog proc and the TYPE_NAME column carries its value.
+TEST_F(GetTypeInfoLiveTest, SpecificTypeReturnsExpectedTypeName) {
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_INTEGER);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLFetch(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    char typeName[64] = {};
+    SQLLEN indicator = 0;
+    rc = SQLGetData(stmt_, 1, SQL_C_CHAR, typeName, sizeof(typeName), &indicator);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("int", std::string(typeName));
+
+    rc = SQLCloseCursor(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
+
+// After a full round trip and cursor close, the same statement re-opens a fresh
+// type-info result set — exercises the context reset in the live execute path.
+TEST_F(GetTypeInfoLiveTest, ReExecuteAfterCloseSucceeds) {
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_INTEGER);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    rc = SQLFetch(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    rc = SQLCloseCursor(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLGetTypeInfo(stmt_, SQL_ALL_TYPES);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("TYPE_NAME", DescribeColName(stmt_, 1));
+
+    rc = SQLCloseCursor(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
+
+// SQLGetTypeInfo replaces a prior query's result set on the same statement,
+// exercising the metadata reset before the catalog RPC.
+TEST_F(GetTypeInfoLiveTest, ReplacesPriorQueryResultSet) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1 AS one");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    rc = SQLCloseCursor(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLGetTypeInfo(stmt_, SQL_ALL_TYPES);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    // The new result set is the type-info contract, not the prior SELECT.
+    EXPECT_EQ("TYPE_NAME", DescribeColName(stmt_, 1));
+
+    rc = SQLCloseCursor(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}

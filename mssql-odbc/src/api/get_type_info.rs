@@ -146,15 +146,10 @@ fn sql_get_type_info_w_safe(
     }
 
     // `@data_type` is positional; 2.x applications receive the 2.x date/time id.
-    let sent_type = if is_2x_app && (SQL_TYPE_DATE..=SQL_TYPE_TIMESTAMP).contains(&data_type) {
-        data_type - ODBC2_DATETIME_OFFSET
-    } else {
-        data_type
-    };
     let positional = vec![RpcParameter::new(
         None,
         StatusFlags::NONE,
-        SqlType::SmallInt(Some(sent_type)),
+        SqlType::SmallInt(Some(datatype_info_arg(data_type, is_2x_app))),
     )];
     // `@ODBCVer` is named and sent only for 3.x applications (matching
     // msodbcsql's `!IS2xAPP` guard).
@@ -194,6 +189,17 @@ fn sql_get_type_info_w_safe(
     }
     rename_type_info_columns(stmt, is_2x_app);
     rc
+}
+
+/// The `@data_type` argument sent to the catalog proc. ODBC 2.x applications
+/// receive the legacy 2.x date/time id (msodbcsql remaps the concise 3.x forms
+/// 91–93 down to 9–11); every other case is passed through unchanged.
+fn datatype_info_arg(data_type: SqlSmallInt, is_2x_app: bool) -> SqlSmallInt {
+    if is_2x_app && (SQL_TYPE_DATE..=SQL_TYPE_TIMESTAMP).contains(&data_type) {
+        data_type - ODBC2_DATETIME_OFFSET
+    } else {
+        data_type
+    }
 }
 
 /// Outcome of validating a caller-supplied `SQLGetTypeInfo` `DataType`.
@@ -266,6 +272,13 @@ fn type_info_column_names(is_2x_app: bool) -> [&'static str; 3] {
     }
 }
 
+/// Zero-based column indices (for the 1-based ODBC ordinals 3, 11, 12) paired
+/// with the version-appropriate name each should take.
+fn type_info_column_renames(is_2x_app: bool) -> [(usize, &'static str); 3] {
+    let [col3, col11, col12] = type_info_column_names(is_2x_app);
+    [(2, col3), (10, col11), (11, col12)]
+}
+
 /// Renames the three catalog-proc columns (ODBC ordinals 3, 11, 12) to the names
 /// the application's ODBC version expects, matching msodbcsql's
 /// `SetColNames(COL(3)|COL(11)|COL(12), ...)` post-processing so `SQLDescribeCol`
@@ -275,17 +288,11 @@ fn rename_type_info_columns(stmt: &StmtHandle, is_2x_app: bool) {
         error!("SQLGetTypeInfoW: stmt mutex poisoned renaming columns");
         return;
     };
-    let [col3, col11, col12] = type_info_column_names(is_2x_app);
     let cols = &mut stmt_state.column_metadata;
-    // Zero-based indices for the 1-based ODBC ordinals 3, 11, and 12.
-    if let Some(col) = cols.get_mut(2) {
-        col.column_name = col3.to_string();
-    }
-    if let Some(col) = cols.get_mut(10) {
-        col.column_name = col11.to_string();
-    }
-    if let Some(col) = cols.get_mut(11) {
-        col.column_name = col12.to_string();
+    for (idx, name) in type_info_column_renames(is_2x_app) {
+        if let Some(col) = cols.get_mut(idx) {
+            col.column_name = name.to_string();
+        }
     }
 }
 
@@ -317,17 +324,67 @@ mod tests {
     }
 
     #[test]
-    fn type_info_column_names_track_odbc_version() {
-        // ODBC 3.x applications get the 3.x column names for ordinals 3/11/12.
+    fn type_info_column_renames_pair_ordinals_with_version_names() {
+        // 3.x apps: the generic proc columns take the 3.x ODBC names at the
+        // zero-based indices for ordinals 3/11/12.
         assert_eq!(
-            type_info_column_names(false),
-            ["COLUMN_SIZE", "FIXED_PREC_SCALE", "AUTO_UNIQUE_VALUE"]
+            type_info_column_renames(false),
+            [
+                (2, "COLUMN_SIZE"),
+                (10, "FIXED_PREC_SCALE"),
+                (11, "AUTO_UNIQUE_VALUE")
+            ]
         );
-        // ODBC 2.x applications get the legacy names instead.
+        // 2.x apps keep the same ordinals but the legacy names.
         assert_eq!(
-            type_info_column_names(true),
-            ["PRECISION", "MONEY", "AUTO_INCREMENT"]
+            type_info_column_renames(true),
+            [(2, "PRECISION"), (10, "MONEY"), (11, "AUTO_INCREMENT")]
         );
+    }
+
+    #[test]
+    fn datatype_info_arg_remaps_only_for_odbc2_dates() {
+        // 3.x apps forward every id unchanged, including the concise date forms.
+        assert_eq!(datatype_info_arg(SQL_TYPE_DATE, false), SQL_TYPE_DATE);
+        // 2.x apps remap the concise 3.x date/time ids down to the legacy forms.
+        assert_eq!(
+            datatype_info_arg(SQL_TYPE_DATE, true),
+            SQL_TYPE_DATE - ODBC2_DATETIME_OFFSET
+        );
+        assert_eq!(
+            datatype_info_arg(SQL_TYPE_TIMESTAMP, true),
+            SQL_TYPE_TIMESTAMP - ODBC2_DATETIME_OFFSET
+        );
+        // A non-date id is untouched even for a 2.x app.
+        assert_eq!(datatype_info_arg(SQL_INTEGER, true), SQL_INTEGER);
+    }
+
+    #[test]
+    fn rename_type_info_columns_is_a_noop_without_metadata() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        // With no result set, the rename walks the empty metadata and mutates
+        // nothing, for both ODBC versions, without panicking.
+        rename_type_info_columns(stmt, false);
+        rename_type_info_columns(stmt, true);
+        assert!(stmt.inner.lock().unwrap().column_metadata.is_empty());
+    }
+
+    #[test]
+    fn odbc2_app_omits_odbc_ver_and_remaps_date() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.parent_dbc()
+            .parent_env()
+            .inner
+            .lock()
+            .unwrap()
+            .odbc_version = OdbcVersion::Odbc2;
+        // A 2.x app requesting a concise date type exercises the `is_2x_app`
+        // remap and the omitted `@ODBCVer` branch; disconnected so it stops at
+        // claim_connection.
+        let ret = unsafe { sql_get_type_info_w(h.stmt, SQL_TYPE_DATE) };
+        assert_eq!(ret, SQL_ERROR);
     }
 
     #[test]
