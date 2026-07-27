@@ -192,7 +192,7 @@ fn sql_get_type_info_w_safe(
     if rc == SQL_ERROR {
         return rc;
     }
-    rename_type_info_columns(stmt);
+    rename_type_info_columns(stmt, is_2x_app);
     rc
 }
 
@@ -208,9 +208,10 @@ enum TypeClass {
 
 /// Classifies a `DataType` argument the same way msodbcsql does before issuing
 /// the catalog RPC: `SQL_ALL_TYPES` and every base/SS type the driver reports
-/// are valid, `sql_variant`'s UDT id is HYC00, and anything else is HY004. Both
-/// the ODBC 2.x (`9`/`10`/`11`) and 3.x (`91`/`92`/`93`) date/time forms are
-/// accepted so 2.x and 3.x applications are handled uniformly.
+/// (including `sql_variant`) are valid, the CLR user-defined type id
+/// (`SQL_SS_UDT`) is HYC00, and anything else is HY004. Both the ODBC 2.x
+/// (`9`/`10`/`11`) and 3.x (`91`/`92`/`93`) date/time forms are accepted so 2.x
+/// and 3.x applications are handled uniformly.
 fn classify_sql_type(data_type: SqlSmallInt) -> TypeClass {
     match data_type {
         SQL_ALL_TYPES
@@ -244,30 +245,47 @@ fn classify_sql_type(data_type: SqlSmallInt) -> TypeClass {
         | SQL_SS_TIMESTAMPOFFSET
         | SQL_SS_VARIANT
         | SQL_SS_XML => TypeClass::Valid,
+        // Unlike the SS types above, SQL_SS_UDT has no internal "MAPPED" form,
+        // so msodbcsql's `fSqlTypeT <= SQL_TYPE_DRIVER_START` guard sends it to
+        // HYC00 — UDTs are not surfaced as ODBC data types.
         SQL_SS_UDT => TypeClass::Udt,
         _ => TypeClass::Invalid,
     }
 }
 
-/// Renames the three catalog-proc columns that `sp_datatype_info_*` emits under
-/// their legacy names to the ODBC 3.x names, matching msodbcsql's
+/// ODBC column names for the three type-info ordinals (3, 11, 12) that
+/// `sp_datatype_info_*` emits under generic names. ODBC 2.x and 3.x applications
+/// expect different names for these columns, so the choice mirrors the
+/// application's declared ODBC version — matching msodbcsql's version-aware
+/// `SetColNames` post-processing.
+fn type_info_column_names(is_2x_app: bool) -> [&'static str; 3] {
+    if is_2x_app {
+        ["PRECISION", "MONEY", "AUTO_INCREMENT"]
+    } else {
+        ["COLUMN_SIZE", "FIXED_PREC_SCALE", "AUTO_UNIQUE_VALUE"]
+    }
+}
+
+/// Renames the three catalog-proc columns (ODBC ordinals 3, 11, 12) to the names
+/// the application's ODBC version expects, matching msodbcsql's
 /// `SetColNames(COL(3)|COL(11)|COL(12), ...)` post-processing so `SQLDescribeCol`
 /// reports identical column names.
-fn rename_type_info_columns(stmt: &StmtHandle) {
+fn rename_type_info_columns(stmt: &StmtHandle, is_2x_app: bool) {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLGetTypeInfoW: stmt mutex poisoned renaming columns");
         return;
     };
+    let [col3, col11, col12] = type_info_column_names(is_2x_app);
     let cols = &mut stmt_state.column_metadata;
     // Zero-based indices for the 1-based ODBC ordinals 3, 11, and 12.
     if let Some(col) = cols.get_mut(2) {
-        col.column_name = "COLUMN_SIZE".to_string();
+        col.column_name = col3.to_string();
     }
     if let Some(col) = cols.get_mut(10) {
-        col.column_name = "FIXED_PREC_SCALE".to_string();
+        col.column_name = col11.to_string();
     }
     if let Some(col) = cols.get_mut(11) {
-        col.column_name = "AUTO_UNIQUE_VALUE".to_string();
+        col.column_name = col12.to_string();
     }
 }
 
@@ -282,6 +300,34 @@ mod tests {
     fn null_handle_returns_invalid_handle() {
         let ret = unsafe { sql_get_type_info_w(SQL_NULL_HANDLE, SQL_ALL_TYPES) };
         assert_eq!(ret, SQL_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn type_info_column_names_are_version_aware() {
+        // ODBC 3.x names (the mssql-python swap target).
+        assert_eq!(
+            type_info_column_names(false),
+            ["COLUMN_SIZE", "FIXED_PREC_SCALE", "AUTO_UNIQUE_VALUE"]
+        );
+        // ODBC 2.x apps expect the legacy names for the same ordinals.
+        assert_eq!(
+            type_info_column_names(true),
+            ["PRECISION", "MONEY", "AUTO_INCREMENT"]
+        );
+    }
+
+    #[test]
+    fn type_info_column_names_track_odbc_version() {
+        // ODBC 3.x applications get the 3.x column names for ordinals 3/11/12.
+        assert_eq!(
+            type_info_column_names(false),
+            ["COLUMN_SIZE", "FIXED_PREC_SCALE", "AUTO_UNIQUE_VALUE"]
+        );
+        // ODBC 2.x applications get the legacy names instead.
+        assert_eq!(
+            type_info_column_names(true),
+            ["PRECISION", "MONEY", "AUTO_INCREMENT"]
+        );
     }
 
     #[test]
