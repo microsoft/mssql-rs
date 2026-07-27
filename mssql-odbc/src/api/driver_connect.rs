@@ -335,21 +335,19 @@ fn do_connect(
     }
 }
 
-/// `ConnectRetryCount` is valid over 0–255; clamping keeps the downstream
-/// `connect_retry_count + 1` in `mssql-tds` from overflowing.
-const MAX_CONNECT_RETRY_COUNT: u32 = 255;
-/// `ConnectRetryInterval` is valid over 1–60 seconds.
-const MIN_CONNECT_RETRY_INTERVAL: u32 = 1;
-const MAX_CONNECT_RETRY_INTERVAL: u32 = 60;
 /// TDS packet-size range accepted by `mssql-tds` (`DefaultClientContextValidator`).
+/// Unlike `ConnectRetryCount` / `ConnectRetryInterval` (which the parser rejects
+/// out-of-range to match msodbcsql), `PacketSize` is clamped to this range.
 const MIN_PACKET_SIZE: u32 = 512;
 const MAX_PACKET_SIZE: u32 = 32768;
 
-/// Maps parsed [`ConnectionParams`] onto a [`ClientContext`]. Integer values are
-/// clamped to the ranges `mssql-tds` accepts — mirroring msodbcsql, which clamps
-/// out-of-range values rather than rejecting them — and enum strings (already
-/// validated during parsing) fall through to their default variant. Kept separate
-/// from `do_connect` so the mapping is unit-testable without a live server.
+/// Maps parsed [`ConnectionParams`] onto a [`ClientContext`]. `ConnectRetryCount`
+/// and `ConnectRetryInterval` are already range-validated during parsing;
+/// `PacketSize` is clamped here to the range `mssql-tds` accepts. Enum strings are
+/// mapped to their variant with a default fallback — validated during parsing,
+/// except `IpAddressPreference`, whose unknown values fall back to `IPv4First`
+/// (matching msodbcsql). Kept separate from `do_connect` so the mapping is
+/// unit-testable without a live server.
 fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParams) {
     context.encryption_options.host_name_in_cert = params.host_name_in_certificate.clone();
     context.encryption_options.server_certificate =
@@ -369,11 +367,10 @@ fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParam
         context.multi_subnet_failover = multi_subnet_failover;
     }
     if let Some(count) = params.connect_retry_count {
-        context.connect_retry_count = count.min(MAX_CONNECT_RETRY_COUNT);
+        context.connect_retry_count = count;
     }
     if let Some(interval) = params.connect_retry_interval {
-        context.connect_retry_interval =
-            interval.clamp(MIN_CONNECT_RETRY_INTERVAL, MAX_CONNECT_RETRY_INTERVAL);
+        context.connect_retry_interval = interval;
     }
     // ODBC expresses KeepAlive/KeepAliveInterval in seconds; mssql-tds stores
     // milliseconds. Saturate so a large value can't overflow.
@@ -664,39 +661,35 @@ mod tests {
     }
 
     #[test]
-    fn apply_params_clamps_connect_retry_count() {
+    fn apply_params_passes_through_connect_retry_values() {
+        // The parser range-validates these, so the mapping stores them verbatim.
         let mut ctx = ClientContext::default();
         apply_connection_params(
             &mut ctx,
             &ConnectionParams {
-                connect_retry_count: Some(u32::MAX),
+                connect_retry_count: Some(255),
+                connect_retry_interval: Some(60),
                 ..Default::default()
             },
         );
-        assert_eq!(ctx.connect_retry_count, MAX_CONNECT_RETRY_COUNT);
-        // The downstream `connect_retry_count + 1` in mssql-tds must not overflow.
-        assert!(ctx.connect_retry_count.checked_add(1).is_some());
+        assert_eq!(ctx.connect_retry_count, 255);
+        assert_eq!(ctx.connect_retry_interval, 60);
     }
 
     #[test]
-    fn apply_params_clamps_connect_retry_interval() {
+    fn apply_params_falls_back_unknown_ip_preference_to_ipv4first() {
         let mut ctx = ClientContext::default();
         apply_connection_params(
             &mut ctx,
             &ConnectionParams {
-                connect_retry_interval: Some(0),
+                ip_address_preference: Some("IPv7".to_string()),
                 ..Default::default()
             },
         );
-        assert_eq!(ctx.connect_retry_interval, MIN_CONNECT_RETRY_INTERVAL);
-        apply_connection_params(
-            &mut ctx,
-            &ConnectionParams {
-                connect_retry_interval: Some(9_999),
-                ..Default::default()
-            },
-        );
-        assert_eq!(ctx.connect_retry_interval, MAX_CONNECT_RETRY_INTERVAL);
+        assert!(matches!(
+            ctx.ipaddress_preference,
+            IPAddressPreference::IPv4First
+        ));
     }
 
     #[test]

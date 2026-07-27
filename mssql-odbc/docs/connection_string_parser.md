@@ -154,9 +154,9 @@ synonym group (e.g. `Server` / `Addr` / `Address`).
 | `ServerSPN` | `ClientContext::server_spn` | verbatim |
 | `ApplicationIntent` | `ClientContext::application_intent` | `ReadOnly` / `ReadWrite` |
 | `MultiSubnetFailover` | `ClientContext::multi_subnet_failover` | `Yes` / `No` |
-| `IpAddressPreference` | `ClientContext::ipaddress_preference` | `IPv4First` / `IPv6First` / `UsePlatformDefault` |
-| `ConnectRetryCount` | `ClientContext::connect_retry_count` | integer, clamped to 0–255 |
-| `ConnectRetryInterval` | `ClientContext::connect_retry_interval` | integer, clamped to 1–60 (seconds) |
+| `IpAddressPreference` | `ClientContext::ipaddress_preference` | `IPv4First` / `IPv6First` / `UsePlatformDefault`; unknown → `IPv4First` |
+| `ConnectRetryCount` | `ClientContext::connect_retry_count` | integer 0–255 (rejected if out of range) |
+| `ConnectRetryInterval` | `ClientContext::connect_retry_interval` | integer 1–60 seconds (rejected if out of range) |
 | `KeepAlive` | `ClientContext::keep_alive_in_ms` (×1000) | integer, seconds (saturating) |
 | `KeepAliveInterval` | `ClientContext::keep_alive_interval_in_ms` (×1000) | integer, seconds (saturating) |
 | `PacketSize` | `ClientContext::packet_size` (u16) | integer bytes, clamped to 512–32768 |
@@ -173,16 +173,17 @@ Whole-value, case-insensitive, exact match (not prefix, not `y`/`1`):
   `MultiSubnetFailover`): `Yes` | `No`.
 - **`Encrypt`**: `Yes` | `Mandatory` | `No` | `Optional` | `Strict`.
 - **`ApplicationIntent`**: `ReadOnly` | `ReadWrite`.
-- **`IpAddressPreference`**: `IPv4First` | `IPv6First` | `UsePlatformDefault`.
+- **`IpAddressPreference`**: `IPv4First` | `IPv6First` | `UsePlatformDefault`. Unknown
+  values are **not** rejected — they are accepted and fall back to `IPv4First` when
+  mapped onto the `ClientContext`, matching msodbcsql.
 - **Integer** keys (`ConnectRetryCount`, `ConnectRetryInterval`, `KeepAlive`,
-  `KeepAliveInterval`, `PacketSize`): a non-negative integer. The parser accepts any
-  `u32` and does **not** range-check; a non-numeric or negative value is a hard error
-  (`E_FAIL`). Out-of-range values are clamped when mapped onto the `ClientContext`
-  (`apply_connection_params` in `driver_connect.rs`) — `ConnectRetryCount` to 0–255,
-  `ConnectRetryInterval` to 1–60, `PacketSize` to 512–32768 (the range mssql-tds
-  accepts), and `KeepAlive`/`KeepAliveInterval` saturate on the ×1000 conversion.
-  Clamping mirrors msodbcsql, which silently clamps rather than rejecting, and keeps
-  the downstream `connect_retry_count + 1` in mssql-tds from overflowing.
+  `KeepAliveInterval`, `PacketSize`): a non-negative integer; a non-numeric or negative
+  value is a hard error (`E_FAIL`). Range handling then differs per key, matching
+  msodbcsql: `ConnectRetryCount` (0–255) and `ConnectRetryInterval` (1–60) are
+  **range-validated at parse time and rejected** when out of range, while `PacketSize`
+  is **clamped** to 512–32768 (the range mssql-tds accepts) when mapped onto the
+  `ClientContext` (`apply_connection_params` in `driver_connect.rs`).
+  `KeepAlive`/`KeepAliveInterval` saturate on the ×1000 seconds→ms conversion.
 - **`Authentication`**: delegated to `is_recognized_keyword`
   (`odbc_supported_auth_keywords.rs`) so the accept/reject set never drifts from
   mssql-tds. An empty value is a recognized reset.

@@ -95,10 +95,18 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
 const YES_NO: &[&str] = &["yes", "no"];
 const ENCRYPT_VALUES: &[&str] = &["yes", "mandatory", "no", "optional", "strict"];
 const APPLICATION_INTENT_VALUES: &[&str] = &["ReadOnly", "ReadWrite"];
-const IP_ADDRESS_PREFERENCE_VALUES: &[&str] = &["IPv4First", "IPv6First", "UsePlatformDefault"];
 // Shown in the diagnostic when a numeric attribute (PacketSize, ConnectRetryCount,
 // …) is given a non-numeric or negative value.
 const INTEGER_EXPECTED: &[&str] = &["a non-negative integer"];
+
+// msodbcsql range-validates ConnectRetryCount / ConnectRetryInterval at parse time
+// and rejects out-of-range values (E_FAIL) — see sqlcconn.cpp — so we mirror that
+// here rather than clamping downstream.
+const CONNECT_RETRY_COUNT_MAX: u32 = 255;
+const CONNECT_RETRY_INTERVAL_MIN: u32 = 1;
+const CONNECT_RETRY_INTERVAL_MAX: u32 = 60;
+const CONNECT_RETRY_COUNT_EXPECTED: &[&str] = &["an integer in the range 0 to 255"];
+const CONNECT_RETRY_INTERVAL_EXPECTED: &[&str] = &["an integer in the range 1 to 60"];
 
 // Recognized `Authentication=` keywords (mirrors `auth_method_from_keyword`).
 // Used only for the diagnostic hint; the accept/reject decision is delegated to
@@ -433,10 +441,22 @@ fn assign_value(
             params.multi_subnet_failover = Some(is_yes(value));
         }
         ConnAttrKey::ConnectRetryCount => {
-            params.connect_retry_count = Some(parse_uint(lower, value)?);
+            params.connect_retry_count = Some(parse_uint_in_range(
+                lower,
+                value,
+                0,
+                CONNECT_RETRY_COUNT_MAX,
+                CONNECT_RETRY_COUNT_EXPECTED,
+            )?);
         }
         ConnAttrKey::ConnectRetryInterval => {
-            params.connect_retry_interval = Some(parse_uint(lower, value)?);
+            params.connect_retry_interval = Some(parse_uint_in_range(
+                lower,
+                value,
+                CONNECT_RETRY_INTERVAL_MIN,
+                CONNECT_RETRY_INTERVAL_MAX,
+                CONNECT_RETRY_INTERVAL_EXPECTED,
+            )?);
         }
         ConnAttrKey::KeepAlive => {
             params.keep_alive = Some(parse_uint(lower, value)?);
@@ -445,7 +465,8 @@ fn assign_value(
             params.keep_alive_interval = Some(parse_uint(lower, value)?);
         }
         ConnAttrKey::IpAddressPreference => {
-            validate_attr(lower, value, IP_ADDRESS_PREFERENCE_VALUES)?;
+            // msodbcsql accepts any value and falls back unknown ones to IPv4First
+            // at connect time (see `apply_connection_params`); no parse-time reject.
             params.ip_address_preference = Some(value.to_string());
         }
         ConnAttrKey::PacketSize => {
@@ -672,16 +693,39 @@ fn is_yes(value: &str) -> bool {
 }
 
 /// Parse a non-negative integer attribute value. Rejects non-numeric or negative
-/// input with `InvalidAttrValue` (msodbcsql `E_FAIL`). Per-key ranges (e.g.
-/// PacketSize 512–32768) are not enforced here — the driver clamps out-of-range
-/// values to the range mssql-tds accepts when mapping onto the client context
-/// (see `apply_connection_params`), matching msodbcsql's clamping behavior.
+/// input with `InvalidAttrValue` (msodbcsql `E_FAIL`). Range handling is per-key:
+/// `ConnectRetryCount` / `ConnectRetryInterval` are range-validated at parse time
+/// via [`parse_uint_in_range`] (msodbcsql rejects out-of-range values here);
+/// `PacketSize` is instead clamped to the range mssql-tds accepts when mapping onto
+/// the client context (see `apply_connection_params`).
 fn parse_uint(key: &str, value: &str) -> Result<u32, InvalidAttrValue> {
     value.parse::<u32>().map_err(|_| InvalidAttrValue {
         key: key.to_string(),
         value: value.to_string(),
         expected: INTEGER_EXPECTED,
     })
+}
+
+/// Like [`parse_uint`], but also rejects values outside the inclusive `[min, max]`
+/// range with `InvalidAttrValue` (E_FAIL), mirroring msodbcsql's parse-time range
+/// validation for `ConnectRetryCount` / `ConnectRetryInterval`.
+fn parse_uint_in_range(
+    key: &str,
+    value: &str,
+    min: u32,
+    max: u32,
+    expected: &'static [&'static str],
+) -> Result<u32, InvalidAttrValue> {
+    let parsed = parse_uint(key, value)?;
+    if (min..=max).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(InvalidAttrValue {
+            key: key.to_string(),
+            value: value.to_string(),
+            expected,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1285,15 +1329,43 @@ mod tests {
     }
 
     #[test]
-    fn ip_address_preference_is_validated() {
+    fn ip_address_preference_accepts_any_value() {
         for val in ["IPv4First", "ipv6first", "UsePlatformDefault"] {
             let s = format!("Server=h;IpAddressPreference={val};UID=u");
             let (p, warn) = parse_connection_string(&s).unwrap();
             assert!(!warn);
             assert_eq!(p.ip_address_preference.as_deref(), Some(val));
         }
-        let err = parse_connection_string("Server=h;IpAddressPreference=IPv7;UID=u").unwrap_err();
-        assert_eq!(err.key, "ipaddresspreference");
+        // msodbcsql falls back unknown values to IPv4First at connect time rather
+        // than rejecting them at parse; the raw value is stored verbatim here.
+        let (p, warn) = parse_connection_string("Server=h;IpAddressPreference=IPv7;UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.ip_address_preference.as_deref(), Some("IPv7"));
+    }
+
+    #[test]
+    fn connect_retry_values_reject_out_of_range() {
+        let err = parse_connection_string("Server=h;ConnectRetryCount=256;UID=u").unwrap_err();
+        assert_eq!(err.key, "connectretrycount");
+        assert_eq!(err.value, "256");
+
+        for bad in ["0", "61"] {
+            let s = format!("Server=h;ConnectRetryInterval={bad};UID=u");
+            let err = parse_connection_string(&s).unwrap_err();
+            assert_eq!(err.key, "connectretryinterval", "interval {bad}");
+        }
+
+        // Boundary values are accepted (count 0..=255, interval 1..=60).
+        let (p, _) =
+            parse_connection_string("Server=h;ConnectRetryCount=0;ConnectRetryInterval=1;UID=u")
+                .unwrap();
+        assert_eq!(p.connect_retry_count, Some(0));
+        assert_eq!(p.connect_retry_interval, Some(1));
+        let (p, _) =
+            parse_connection_string("Server=h;ConnectRetryCount=255;ConnectRetryInterval=60;UID=u")
+                .unwrap();
+        assert_eq!(p.connect_retry_count, Some(255));
+        assert_eq!(p.connect_retry_interval, Some(60));
     }
 
     #[test]
