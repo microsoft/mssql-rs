@@ -5,12 +5,14 @@
 
 use tracing::{debug, error};
 
+use super::exec_common::{return_client_idle, try_claim_idle_client};
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DBC_INFO_TOKEN, SQL_HANDLE_DESC, SQL_HANDLE_ENV,
     SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
 };
 use crate::api::sqlstate::SQLSTATE_HY000;
 use crate::error::{free_errors, post_sql_error};
+use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{DbcHandle, EnvHandle, HandleType, StmtHandle, free_handle, handle_from_raw};
 
 /// Implementation of [`SQLFreeHandle`](super::exports::SQLFreeHandle).
@@ -152,6 +154,11 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
 
     // Lock parent DBC and try to unregister.
     let dbc = unsafe { handle_from_raw::<DbcHandle>(stmt.parent_dbc) };
+
+    // Best-effort: release any server-side prepared handle(s) before the
+    // statement is dropped, while the connection is still live and idle.
+    best_effort_unprepare_on_free(handle, stmt, dbc);
+
     {
         // Lock scope for DBC mutex - so that we unlock before deallocating the STMT
         let Ok(mut dbc_state) = dbc.inner.lock() else {
@@ -175,6 +182,66 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
 
     unsafe { free_handle::<StmtHandle>(handle) };
     SQL_SUCCESS
+}
+
+/// Releases a statement's cached and pending prepared handles with
+/// `sp_unprepare` before the statement is freed, so server-side plans don't
+/// leak for the lifetime of the connection (mirrors msodbcsql dropping the
+/// prepared handle on statement drop).
+///
+/// If the statement still has an open cursor, its result set is drained first
+/// (via `close_cursor::drain_and_release`) so the trailing `@handle` token is
+/// captured and the connection goes idle. The unprepare itself is best-effort
+/// and non-fatal: it acts only when the connection is live and idle, reusing
+/// [`try_claim_idle_client`] / [`return_client_idle`]. If the connection is
+/// disconnected or busy with another statement, the handles are left for the
+/// server to reclaim when the connection closes. No lock is held across I/O.
+fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &DbcHandle) {
+    // If a cursor is still open, drain it first: `drain_and_release` reads the
+    // trailing `@handle` token (capturing `prepared_handle`), returns the
+    // client, and clears `active_stmt` — leaving the connection idle so the
+    // unprepare below can claim it. Without this, a `prepare -> SQLExecute
+    // (SELECT) -> SQLFreeHandle` sequence (no `SQLCloseCursor`) would skip the
+    // unprepare and leak the handle.
+    let cursor_open = stmt
+        .inner
+        .lock()
+        .map(|s| s.has_state(STMT_STATE_CURSOR_OPEN))
+        .unwrap_or(false);
+    if cursor_open {
+        super::close_cursor::drain_and_release(stmt, handle);
+    }
+
+    let handles: Vec<i32> = match stmt.inner.lock() {
+        Ok(mut stmt_state) => [
+            stmt_state.prepared_handle.take(),
+            stmt_state.pending_unprepare.take(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        Err(_) => return,
+    };
+    if handles.is_empty() {
+        return;
+    }
+
+    // Claim the client only if connected and idle; otherwise skip and let the
+    // server reclaim the handles when the connection closes.
+    let Some(mut client) = try_claim_idle_client(dbc, handle) else {
+        return;
+    };
+
+    for handle in handles {
+        if let Err(e) = dbc
+            .runtime
+            .block_on(client.execute_sp_unprepare(handle, None, None))
+        {
+            error!(%e, handle, "SQLFreeHandle(STMT): sp_unprepare failed — handle leaked until disconnect");
+        }
+    }
+
+    return_client_idle(dbc, handle, client);
 }
 
 #[cfg(test)]

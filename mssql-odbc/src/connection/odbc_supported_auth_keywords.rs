@@ -7,16 +7,22 @@ use mssql_tds::connection::client_context::TdsAuthenticationMethod;
 ///
 /// Case-insensitive. Returns `None` for unrecognized or empty values.
 /// `SqlPassword` collapses to `Password` (same Login7 on the wire).
-/// `ActiveDirectoryMSI` collapses to `ActiveDirectoryManagedIdentity` (legacy alias).
+/// `ActiveDirectoryMSI` and `ActiveDirectoryManagedIdentity` both collapse to the
+/// canonical `ActiveDirectoryManagedIdentity` method.
 pub fn auth_method_from_keyword(value: &str) -> Option<TdsAuthenticationMethod> {
     match value.to_lowercase().as_str() {
         "sqlpassword" => Some(TdsAuthenticationMethod::Password),
         "activedirectoryintegrated" => Some(TdsAuthenticationMethod::ActiveDirectoryIntegrated),
         "activedirectorypassword" => Some(TdsAuthenticationMethod::ActiveDirectoryPassword),
         "activedirectoryinteractive" => Some(TdsAuthenticationMethod::ActiveDirectoryInteractive),
-        // msodbcsql exposes only the ActiveDirectoryMSI keyword; it resolves to the
-        // canonical ManagedIdentity method (mssql-tds has no separate MSI workflow). #46177
-        "activedirectorymsi" => Some(TdsAuthenticationMethod::ActiveDirectoryManagedIdentity),
+        // The classic C++ msodbcsql driver exposes only ActiveDirectoryMSI (dlgattr.h);
+        // it resolves to the canonical ManagedIdentity method (mssql-tds has no separate
+        // MSI workflow). #46177. We additionally accept ActiveDirectoryManagedIdentity as a
+        // deliberate exceed-parity alias, matching MS Learn docs and sibling drivers
+        // (JDBC/.NET/go-sqlcmd); msodbcsql and mssql-python accept only the MSI spelling. #46066
+        "activedirectorymsi" | "activedirectorymanagedidentity" => {
+            Some(TdsAuthenticationMethod::ActiveDirectoryManagedIdentity)
+        }
         "activedirectoryserviceprincipal" => {
             Some(TdsAuthenticationMethod::ActiveDirectoryServicePrincipal)
         }
@@ -76,6 +82,16 @@ mod tests {
         // canonical ManagedIdentity method (no separate MSI workflow in mssql-tds).
         assert_eq!(
             auth_method_from_keyword("ActiveDirectoryMSI"),
+            Some(TdsAuthenticationMethod::ActiveDirectoryManagedIdentity)
+        );
+    }
+
+    #[test]
+    fn managed_identity_alias_maps_to_managed_identity() {
+        // Exceed-parity alias (#46066): msodbcsql accepts only ActiveDirectoryMSI, but we
+        // also accept ActiveDirectoryManagedIdentity to match MS docs and sibling drivers.
+        assert_eq!(
+            auth_method_from_keyword("ActiveDirectoryManagedIdentity"),
             Some(TdsAuthenticationMethod::ActiveDirectoryManagedIdentity)
         );
     }

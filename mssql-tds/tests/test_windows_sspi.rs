@@ -308,7 +308,7 @@ async fn test_tcp_prefix_uses_tcp_transport() -> TdsResult<()> {
     let instance = env::var("DB_INSTANCE").unwrap_or_else(|_| r"localhost\SQLDEV".to_string());
     let datasource = format!("tcp:{instance}");
 
-    let transport = connect_and_get_transport(&datasource).await?;
+    let transport = Box::pin(connect_and_get_transport(&datasource)).await?;
     assert_eq!(
         transport, "TCP",
         "tcp: prefix should use TCP transport, got {transport}"
@@ -328,7 +328,7 @@ async fn test_np_prefix_uses_named_pipe_transport() -> TdsResult<()> {
     let instance = env::var("DB_INSTANCE").unwrap_or_else(|_| r"localhost\SQLDEV".to_string());
     let datasource = format!("np:{instance}");
 
-    let transport = connect_and_get_transport(&datasource).await?;
+    let transport = Box::pin(connect_and_get_transport(&datasource)).await?;
     assert_eq!(
         transport, "Named pipe",
         "np: prefix should use Named pipe transport, got {transport}"

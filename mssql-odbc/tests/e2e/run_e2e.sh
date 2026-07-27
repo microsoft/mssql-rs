@@ -234,7 +234,10 @@ run_tests() {
     local rc=0
     (
         cd "$BUILD_DIR"
-        ODBCSYSINI="$ini_dir" ctest "${CTEST_ARGS[@]}" --output-junit "$junit_out"
+        # ODBC_TEST_TARGET tells tests which driver implementation this leg runs
+        # against ("mssql-odbc" or "msodbcsql") so mssql-odbc-specific tests can
+        # SKIP_IF_COMPARING_MSODBCSQL() on the reference-driver leg.
+        ODBC_TEST_TARGET="$label" ODBCSYSINI="$ini_dir" ctest "${CTEST_ARGS[@]}" --output-junit "$junit_out"
     ) || rc=$?
     return $rc
 }

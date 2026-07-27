@@ -834,6 +834,93 @@ mod always_encrypted {
         });
     }
 
+    // ----- ForceColumnEncryption -----
+
+    /// A parameter with `ForceColumnEncryption` set that targets an encrypted
+    /// column is encrypted normally and round-trips — the flag only changes the
+    /// failure behavior, not the success path.
+    #[tokio::test]
+    async fn force_column_encryption_encrypts_encrypted_column() {
+        ae_test!(|h| {
+            let table = h.create_encrypted_table("INT", "DETERMINISTIC").await;
+            let param = RpcParameter::new(
+                Some("@val".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(4242)),
+            )
+            .with_force_column_encryption(true);
+            h.client
+                .execute_sp_executesql(
+                    format!("INSERT INTO {table} (val) VALUES (@val);"),
+                    vec![param],
+                    None,
+                    None,
+                )
+                .await
+                .expect("force-encrypted insert into an encrypted column should succeed");
+            while h.client.move_to_next().await.unwrap() {}
+            h.client.close_query().await.unwrap();
+
+            let got = select_val(&mut h.client, &table)
+                .await
+                .expect("read back force-encrypted value");
+            assert!(matches!(got, ColumnValues::Int(4242)), "got {got:?}");
+        });
+    }
+
+    /// A parameter with `ForceColumnEncryption` set that targets a **plaintext**
+    /// column is rejected: the server reports the column as not encrypted, so the
+    /// driver refuses to send the value as plaintext (defending against a server
+    /// that downgrades an encrypted column to harvest plaintext).
+    #[tokio::test]
+    async fn force_column_encryption_rejects_plaintext_column() {
+        ae_test!(|h| {
+            let table = h.create_table("val INT NULL").await;
+            let param = RpcParameter::new(
+                Some("@val".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(1)),
+            )
+            .with_force_column_encryption(true);
+            let err = h
+                .client
+                .execute_sp_executesql(
+                    format!("INSERT INTO {table} (val) VALUES (@val);"),
+                    vec![param],
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("ForceColumnEncryption on a plaintext column must be rejected");
+            assert!(
+                matches!(&err, mssql_tds::error::Error::ColumnEncryptionError(m) if m.contains("ForceColumnEncryption")),
+                "expected a ForceColumnEncryption column-encryption error, got {err:?}"
+            );
+        });
+    }
+
+    /// A parameter with `ForceColumnEncryption` set on a connection where Always
+    /// Encrypted is not enabled is rejected before the value is sent, rather than
+    /// silently transmitting it as plaintext.
+    #[tokio::test]
+    async fn force_column_encryption_without_ae_errors() {
+        let mut client = connect_disabled().await;
+        let param = RpcParameter::new(
+            Some("@val".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(1)),
+        )
+        .with_force_column_encryption(true);
+        let err = client
+            .execute_sp_executesql("SELECT @val;".to_string(), vec![param], None, None)
+            .await
+            .expect_err("ForceColumnEncryption without Always Encrypted must be rejected");
+        assert!(
+            matches!(&err, mssql_tds::error::Error::UsageError(m) if m.contains("ForceColumnEncryption")),
+            "expected a ForceColumnEncryption usage error, got {err:?}"
+        );
+    }
+
     // ----- Stored-procedure parameter encryption -----
 
     /// A named parameter passed to [`TdsClient::execute_stored_procedure`] that
@@ -1099,6 +1186,7 @@ mod always_encrypted {
                 .execute_sp_prepexec(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
                     vec![param],
+                    None,
                     None,
                     None,
                 )
@@ -2181,6 +2269,153 @@ mod always_encrypted {
                 result.is_err(),
                 "decryption must fail when no master key is registered, got {result:?}"
             );
+        });
+    }
+
+    /// Paused PLP streaming is not implemented for encrypted PLP-typed columns. If a
+    /// row writer requests a pause at such a column, the read must fail fast
+    /// with `UnimplementedFeature` rather than exposing ciphertext through the
+    /// PLP streaming API.
+    #[tokio::test]
+    async fn encrypted_plp_pause_streaming_fails_fast_under_ae() {
+        ae_test!(|h| {
+            struct PauseAtFirstColumnWriter;
+
+            impl mssql_tds::datatypes::row_writer::RowWriter for PauseAtFirstColumnWriter {
+                fn pause_after_column(&self, col: usize) -> bool {
+                    col == 0
+                }
+
+                fn write_null(&mut self, _col: usize) {}
+                fn write_bool(&mut self, _col: usize, _val: bool) {}
+                fn write_u8(&mut self, _col: usize, _val: u8) {}
+                fn write_i16(&mut self, _col: usize, _val: i16) {}
+                fn write_i32(&mut self, _col: usize, _val: i32) {}
+                fn write_i64(&mut self, _col: usize, _val: i64) {}
+                fn write_f32(&mut self, _col: usize, _val: f32) {}
+                fn write_f64(&mut self, _col: usize, _val: f64) {}
+                fn write_string(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::sql_string::SqlString,
+                ) {
+                }
+                fn write_bytes(&mut self, _col: usize, _val: Vec<u8>) {}
+                fn write_decimal(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::decoder::DecimalParts,
+                ) {
+                }
+                fn write_numeric(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::decoder::DecimalParts,
+                ) {
+                }
+                fn write_date(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::column_values::SqlDate,
+                ) {
+                }
+                fn write_time(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::column_values::SqlTime,
+                ) {
+                }
+                fn write_datetime(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::column_values::SqlDateTime,
+                ) {
+                }
+                fn write_smalldatetime(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::column_values::SqlSmallDateTime,
+                ) {
+                }
+                fn write_datetime2(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::column_values::SqlDateTime2,
+                ) {
+                }
+                fn write_datetimeoffset(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::column_values::SqlDateTimeOffset,
+                ) {
+                }
+                fn write_money(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::column_values::SqlMoney,
+                ) {
+                }
+                fn write_smallmoney(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::column_values::SqlSmallMoney,
+                ) {
+                }
+                fn write_uuid(&mut self, _col: usize, _val: uuid::Uuid) {}
+                fn write_xml(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::column_values::SqlXml,
+                ) {
+                }
+                fn write_json(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::sql_json::SqlJson,
+                ) {
+                }
+                fn write_vector(
+                    &mut self,
+                    _col: usize,
+                    _val: mssql_tds::datatypes::sql_vector::SqlVector,
+                ) {
+                }
+                fn end_row(&mut self) {}
+            }
+            let table = h
+                .create_encrypted_table("VARBINARY(MAX)", "RANDOMIZED")
+                .await;
+            let payload = vec![0xAB_u8; 9000];
+            h.insert_encrypted(&table, SqlType::VarBinaryMax(Some(payload)))
+                .await;
+
+            h.client
+                .execute(format!("SELECT val FROM {table};"), None, None)
+                .await
+                .expect("select encrypted varbinary(max)");
+
+            let err = {
+                let rs = h
+                    .client
+                    .get_current_resultset()
+                    .expect("result set present");
+                let mut writer = PauseAtFirstColumnWriter;
+                rs.next_row_into(&mut writer)
+                    .await
+                    .expect_err("paused AE PLP streaming must fail fast")
+            };
+
+            assert!(
+                matches!(
+                    &err,
+                    mssql_tds::error::Error::UnimplementedFeature { feature, context }
+                        if feature == "Always Encrypted paused PLP streaming"
+                            && context.contains("read_active_plp_bytes")
+                ),
+                "expected UnimplementedFeature for AE paused PLP path, got {err:?}"
+            );
+
+            let _ = h.client.close_query().await;
         });
     }
 }

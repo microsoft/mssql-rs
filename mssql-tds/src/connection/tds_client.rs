@@ -31,7 +31,7 @@ use crate::{
     },
     datatypes::column_values::ColumnValues,
     handler::handler_factory::NegotiatedSettings,
-    io::token_stream::{ParserContext, RowReadResult},
+    io::token_stream::{ParserContext, PlpPauseState, RowPauseState, RowReadResult},
     message::{batch::SqlBatch, messages::Request},
     token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, EnvChangeTokenSubType, Tokens},
 };
@@ -70,6 +70,13 @@ type MemoizedCellDecryptor = (
     Arc<ColMetadataToken>,
     Option<Arc<dyn crate::security::cell_decryptor::CellDecryptor>>,
 );
+
+#[derive(Debug)]
+enum ActiveRowReadState {
+    Idle,
+    RowPaused(Box<RowPauseState>),
+    PlpPaused(Box<PlpPauseState>),
+}
 
 /// Active TDS connection to a SQL Server instance.
 ///
@@ -138,6 +145,15 @@ pub struct TdsClient {
     /// result-decryption paths to honor per-command overrides.
     current_command_ce_setting: crate::connection::client_context::ExecutionColumnEncryptionSetting,
 
+    /// Set while an `sp_prepexec` is in flight, cleared once its `@handle`
+    /// output parameter (RETURNVALUE ordinal 0) has been captured.
+    expecting_prepare_handle: bool,
+    /// Prepared-statement handle from the most recent `sp_prepexec`, surfaced
+    /// via [`take_prepared_statement_handle`](Self::take_prepared_statement_handle).
+    /// Kept separately because [`close_query`](Self::close_query) clears
+    /// `return_values` once the batch has been drained.
+    prepared_statement_handle: Option<i32>,
+
     /// The remaining request timeout for operations. This is updated after each token read.
     pub(in crate::connection) remaining_request_timeout: Option<Duration>,
 
@@ -146,6 +162,9 @@ pub struct TdsClient {
 
     /// Empty metadata vector for returning when no metadata is available
     empty_metadata: Vec<ColumnMetadata>,
+
+    // Active PLP stream state when row decoding paused at a PLP target column.
+    active_row_read_state: ActiveRowReadState,
 }
 
 impl TdsClient {
@@ -185,9 +204,12 @@ impl TdsClient {
             current_result_set_has_been_read_till_end: false,
             current_command_ce_setting:
                 crate::connection::client_context::ExecutionColumnEncryptionSetting::default(),
+            expecting_prepare_handle: false,
+            prepared_statement_handle: None,
             remaining_request_timeout: None,
             cancel_handle: None,
             empty_metadata: Vec::new(),
+            active_row_read_state: ActiveRowReadState::Idle,
         }
     }
 
@@ -315,6 +337,8 @@ impl TdsClient {
                     // drop their cached Always Encrypted metadata to avoid
                     // encrypting a later sp_execute with a stale describe result.
                     self.prepared_param_encryption.clear();
+                    self.expecting_prepare_handle = false;
+                    self.prepared_statement_handle = None;
                     self.current_result_set_has_been_read_till_end = false;
                     self.remaining_request_timeout = None;
                     self.cancel_handle = None;
@@ -723,6 +747,7 @@ impl TdsClient {
         // Always Encrypted: when the connection enabled column encryption and the
         // server acknowledged the feature, ask the server which parameters need
         // encryption and encrypt them in place before sending the real RPC.
+        self.ensure_force_column_encryption_supported(named_params.iter())?;
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
                 &sql,
@@ -874,7 +899,7 @@ impl TdsClient {
             if encrypt_bulk_copy && !passthrough_ciphertext {
                 use crate::security::keystore::decrypt_cek;
 
-                let (providers, cek_cache) = {
+                let (providers, cek_cache, trusted_key_paths) = {
                     let client_context =
                         self.recovery_context
                             .client_context
@@ -888,6 +913,9 @@ impl TdsClient {
                     (
                         client_context.column_encryption_key_store_providers.clone(),
                         client_context.cek_cache.clone(),
+                        client_context
+                            .trusted_key_paths_for_current_server()
+                            .to_vec(),
                     )
                 };
 
@@ -895,7 +923,13 @@ impl TdsClient {
                 for col in &mapped_column_metadata {
                     match &col.encryption {
                         Some(enc) => {
-                            let cek = decrypt_cek(&providers, &cek_cache, &enc.cek_entry).await?;
+                            let cek = decrypt_cek(
+                                &providers,
+                                &cek_cache,
+                                &enc.cek_entry,
+                                &trusted_key_paths,
+                            )
+                            .await?;
                             ceks.push(Some(cek));
                         }
                         None => ceks.push(None),
@@ -1127,6 +1161,12 @@ impl TdsClient {
         // form of the call) and encrypt them in place before sending the real
         // stored-procedure RPC. Positional parameters are described under
         // synthetic names bound by position; named parameters bind by name.
+        self.ensure_force_column_encryption_supported(
+            positional_parameters
+                .iter()
+                .flatten()
+                .chain(named_parameters.iter().flatten()),
+        )?;
         let has_positional = positional_parameters
             .as_ref()
             .is_some_and(|p| !p.is_empty());
@@ -1432,6 +1472,15 @@ impl TdsClient {
     /// is stored internally and can be retrieved with
     /// [`get_return_values()`](Self::get_return_values).
     ///
+    /// `drop_handle` piggybacks a prepared-handle release onto this call: when
+    /// `Some(h)`, `h` is sent as the input value of the by-reference `@handle`
+    /// parameter, so the server drops that prior prepared statement before
+    /// preparing the new one - replacing a separate `sp_unprepare` round trip.
+    /// `None` prepares fresh (the `@handle` input is NULL). Either way the new
+    /// handle is returned in the `@handle` RETURNVALUE (ordinal 0). This mirrors
+    /// the reference ODBC/`SqlClient` drivers, which send the retained handle as
+    /// the `sp_prepexec` in/out `@handle` argument.
+    ///
     /// Result rows are available through [`read_row()`](Self::read_row) after
     /// this call returns.
     #[instrument(skip(self, named_params), level = "info")]
@@ -1439,6 +1488,7 @@ impl TdsClient {
         &mut self,
         sql: String,
         mut named_params: Vec<RpcParameter>,
+        drop_handle: Option<i32>,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
@@ -1466,6 +1516,11 @@ impl TdsClient {
         let sql_statement_value =
             SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql.clone())));
 
+        // Reset any prepared handle from a prior operation. The capture flag is
+        // armed just before the send below so a failure while building the RPC
+        // cannot leave it set.
+        self.prepared_statement_handle = None;
+
         // Create the parameter list for sp_prepexec
         let statement_parameter = RpcParameter::new(None, StatusFlags::NONE, sql_statement_value);
 
@@ -1480,6 +1535,7 @@ impl TdsClient {
         // sending the real RPC. The `@params` declaration keeps each parameter's
         // original type; only the value is replaced with ciphertext plus cipher
         // metadata.
+        self.ensure_force_column_encryption_supported(named_params.iter())?;
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
                 &sql,
@@ -1501,7 +1557,10 @@ impl TdsClient {
 
         let params_parameter = RpcParameter::new(None, StatusFlags::NONE, params_as_sql_string);
 
-        let handle_value = SqlType::Int(None);
+        // The by-reference `@handle`: NULL input prepares fresh; a `Some(h)`
+        // input tells the server to drop prepared statement `h` before
+        // preparing. The new handle comes back as the `@handle` RETURNVALUE captured during drain.
+        let handle_value = SqlType::Int(drop_handle);
 
         let handle_parameter = RpcParameter::new(None, StatusFlags::BY_REF_VALUE, handle_value);
 
@@ -1519,11 +1578,27 @@ impl TdsClient {
             &self.execution_context,
         );
 
+        // Clear the flag on any send/read failure so a leaked
+        // `true` cannot miscapture the first Int RETURNVALUE of a later
+        // operation as a prepared handle.
+        self.expecting_prepare_handle = true;
+
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut packet_writer).await?;
+        let serialize_result = rpc.serialize(&mut packet_writer).await;
+        drop(packet_writer);
+        if let Err(e) = serialize_result {
+            self.expecting_prepare_handle = false;
+            return Err(e);
+        }
 
-        let metadata = self.move_to_column_metadata().await?;
+        let metadata = match self.move_to_column_metadata().await {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                self.expecting_prepare_handle = false;
+                return Err(e);
+            }
+        };
         // No metadata means no rows were returned, so we set has_open_batch to false.
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
@@ -1576,13 +1651,19 @@ impl TdsClient {
         // the metadata captured when the statement was prepared, then send the
         // real RPC. sp_execute never describes — the metadata must already have
         // been cached by execute_sp_prepare on this connection.
+        self.ensure_force_column_encryption_supported(
+            positional_parameters
+                .iter()
+                .flatten()
+                .chain(named_parameters.iter().flatten()),
+        )?;
         if self.should_encrypt_parameters()
             && (positional_parameters
                 .as_ref()
                 .is_some_and(|p| !p.is_empty())
                 || named_parameters.as_ref().is_some_and(|p| !p.is_empty()))
         {
-            let (providers, cek_cache) = self.cloned_ce_key_material()?;
+            let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
             let describe = self
                 .prepared_param_encryption
                 .get(&handle)
@@ -1610,6 +1691,7 @@ impl TdsClient {
                 &cek_cache,
                 &mut param_refs,
                 &mut self.output_param_ceks,
+                &trusted_key_paths,
             )
             .await?;
         }
@@ -1652,6 +1734,22 @@ impl TdsClient {
             self.execution_context.set_has_open_batch(true);
         }
         Ok(())
+    }
+
+    /// Collects a return value, capturing the `sp_prepexec` `@handle`
+    /// (RETURNVALUE ordinal 0) the first time one arrives while a prepare is in
+    /// flight. Every `Tokens::ReturnValue` is funnelled through here so capture
+    /// works regardless of which drain path reads the stream.
+    fn push_return_value(&mut self, return_value: ReturnValue) {
+        if self.expecting_prepare_handle
+            && return_value.param_ordinal == 0
+            && let ColumnValues::Int(handle) = &return_value.value
+        {
+            self.prepared_statement_handle = Some(*handle);
+            self.expecting_prepare_handle = false;
+            return;
+        }
+        self.return_values.push(return_value);
     }
 
     #[instrument(skip(self), level = "info")]
@@ -1710,7 +1808,7 @@ impl TdsClient {
                 }
                 Tokens::ReturnValue(return_value_token) => {
                     let return_value = self.finalize_return_value(return_value_token)?;
-                    self.return_values.push(return_value);
+                    self.push_return_value(return_value);
                 }
                 Tokens::ReturnStatus(return_status) => {
                     self.last_return_status = ReturnStatus::Received(return_status.value);
@@ -1832,7 +1930,7 @@ impl TdsClient {
                 }
                 Tokens::ReturnValue(return_value_token) => {
                     let return_value = self.finalize_return_value(return_value_token)?;
-                    self.return_values.push(return_value);
+                    self.push_return_value(return_value);
                 }
                 Tokens::ReturnStatus(return_status) => {
                     self.last_return_status = ReturnStatus::Received(return_status.value);
@@ -1889,6 +1987,27 @@ impl TdsClient {
     fn should_encrypt_parameters(&self) -> bool {
         self.negotiated_settings.is_column_encryption_supported()
             && self.effective_command_ce_setting() == ExecutionColumnEncryptionSetting::Enabled
+    }
+
+    /// Enforces the ForceColumnEncryption precondition: if any supplied parameter
+    /// requires encryption but Always Encrypted is not enabled for this command,
+    /// fail rather than sending it as plaintext. The per-parameter downgrade
+    /// check (server reports the column plaintext) is enforced separately in
+    /// [`apply_parameter_encryption`](Self::apply_parameter_encryption).
+    fn ensure_force_column_encryption_supported<'p>(
+        &self,
+        params: impl IntoIterator<Item = &'p RpcParameter>,
+    ) -> TdsResult<()> {
+        if !self.should_encrypt_parameters()
+            && params.into_iter().any(|p| p.force_column_encryption())
+        {
+            return Err(crate::error::Error::UsageError(
+                "A parameter has ForceColumnEncryption set, but Always Encrypted is not enabled \
+                 for this command; enable column encryption on the connection, or clear the flag."
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns `true` when the connection negotiated Always Encrypted and
@@ -2145,13 +2264,14 @@ impl TdsClient {
             .describe_parameters_cached(sql, params_decl, has_output, timeout_sec, cancel_handle)
             .await?;
 
-        let (providers, cek_cache) = self.cloned_ce_key_material()?;
+        let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
         Self::apply_parameter_encryption(
             &describe,
             &providers,
             &cek_cache,
             params,
             &mut self.output_param_ceks,
+            &trusted_key_paths,
         )
         .await
     }
@@ -2200,13 +2320,15 @@ impl TdsClient {
     }
 
     /// Clones the `Arc` handles to the column-master-key provider registry and
-    /// the CEK cache from the client context, so the parameter-encryption paths
+    /// the CEK cache from the client context, plus the trusted master key path
+    /// allow-list for the connected server, so the parameter-encryption paths
     /// can pass them around without holding a borrow on `self`.
     fn cloned_ce_key_material(
         &self,
     ) -> TdsResult<(
         std::sync::Arc<crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry>,
         std::sync::Arc<crate::security::keystore::CekCache>,
+        Vec<String>,
     )> {
         let client_context = self
             .recovery_context
@@ -2220,7 +2342,34 @@ impl TdsClient {
         Ok((
             client_context.column_encryption_key_store_providers.clone(),
             client_context.cek_cache.clone(),
+            client_context
+                .trusted_key_paths_for_current_server()
+                .to_vec(),
         ))
+    }
+
+    /// Matches a `sp_describe_parameter_encryption` result entry to a supplied
+    /// parameter: by name first (case-insensitively, like a T-SQL identifier),
+    /// otherwise falling back to the *unnamed* parameter at the describe's
+    /// 1-based ordinal (the positional case). Requiring the ordinal slot to be
+    /// unnamed keeps a named parameter from being matched by position.
+    fn match_describe_param_index(
+        params: &[&mut RpcParameter],
+        info: &crate::security::describe_parameter_encryption::ParameterEncryptionInfo,
+    ) -> Option<usize> {
+        params
+            .iter()
+            .position(|p| {
+                p.name
+                    .as_deref()
+                    .map(|n| n.eq_ignore_ascii_case(&info.parameter_name))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                (info.parameter_ordinal as usize)
+                    .checked_sub(1)
+                    .filter(|&i| i < params.len() && params[i].name.is_none())
+            })
     }
 
     /// Encrypts, in place, the parameters that a prior
@@ -2241,6 +2390,7 @@ impl TdsClient {
         cek_cache: &crate::security::keystore::CekCache,
         params: &mut [&mut RpcParameter],
         output_param_ceks: &mut HashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>,
+        trusted_key_paths: &[String],
     ) -> TdsResult<()> {
         use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
         use crate::security::encryption::encrypt_parameter;
@@ -2250,6 +2400,43 @@ impl TdsClient {
         // command's parameters, so a previous command's keys cannot leak into
         // this one's output-parameter decryption.
         output_param_ceks.clear();
+
+        // ForceColumnEncryption: every supplied parameter that demands
+        // encryption must be reported as encrypted by the server. Validate before
+        // any work — and before the "nothing encrypted" early return below — so a
+        // server that downgrades a forced parameter is caught rather than
+        // silently sending its value as plaintext. A downgrade takes two forms,
+        // both rejected here: the server reports the parameter's target column as
+        // plaintext, or it omits a row for the parameter entirely (which would
+        // otherwise slip past a describe-driven check and be serialized in the
+        // clear).
+        //
+        // This is a server-trust failure — the "compromised server downgrades to
+        // harvest plaintext" threat this flag defends against — so it is a
+        // `ColumnEncryptionError`, matching the "parameter not supplied" mismatch
+        // below and the trusted-master-key-path rejection in `decrypt_cek`. It is
+        // deliberately distinct from the caller-misconfiguration case (the flag
+        // set while Always Encrypted is off) that
+        // `ensure_force_column_encryption_supported` reports as a `UsageError`.
+        for index in 0..params.len() {
+            if !params[index].force_column_encryption() {
+                continue;
+            }
+            let reported_encrypted = describe.parameters.iter().any(|info| {
+                info.is_encrypted() && Self::match_describe_param_index(params, info) == Some(index)
+            });
+            if !reported_encrypted {
+                let name = params[index]
+                    .name
+                    .as_deref()
+                    .unwrap_or("<positional>")
+                    .to_string();
+                return Err(crate::error::Error::ColumnEncryptionError(format!(
+                    "Parameter {name} has ForceColumnEncryption set, but the server did not \
+                     report it as encrypted; refusing to send it as plaintext.",
+                )));
+            }
+        }
 
         // Nothing to do when the server reports no encrypted parameters.
         if !describe.parameters.iter().any(|p| p.is_encrypted()) {
@@ -2268,25 +2455,7 @@ impl TdsClient {
                 ))
             })?;
 
-            // Match by name first; otherwise fall back to the unnamed parameter at
-            // this describe ordinal (the positional case). Requiring the ordinal
-            // slot to be unnamed keeps a named parameter from being matched by
-            // position.
-            let index = params
-                .iter()
-                .position(|p| {
-                    p.name
-                        .as_deref()
-                        .map(|n| n.eq_ignore_ascii_case(&info.parameter_name))
-                        .unwrap_or(false)
-                })
-                .or_else(|| {
-                    (info.parameter_ordinal as usize)
-                        .checked_sub(1)
-                        .filter(|&i| i < params.len() && params[i].name.is_none())
-                });
-
-            let Some(index) = index else {
+            let Some(index) = Self::match_describe_param_index(params, info) else {
                 return Err(crate::error::Error::ColumnEncryptionError(format!(
                     "sp_describe_parameter_encryption returned encryption info for parameter {} \
                      that was not supplied to the call",
@@ -2311,7 +2480,8 @@ impl TdsClient {
                 ));
             }
 
-            let plaintext_cek = decrypt_cek(providers, cek_cache, cek_entry).await?;
+            let plaintext_cek =
+                decrypt_cek(providers, cek_cache, cek_entry, trusted_key_paths).await?;
 
             // An encrypted RETURNVALUE output parameter carries no CEK table and
             // reuses the CEK that encrypted the matching input parameter. Retain
@@ -2492,6 +2662,7 @@ impl TdsClient {
             &client_context.column_encryption_key_store_providers,
             &client_context.cek_cache,
             &metadata.cek_table,
+            client_context.trusted_key_paths_for_current_server(),
         )
         .await;
         let decryptor: Arc<dyn CellDecryptor> = Arc::new(resolved);
@@ -2499,8 +2670,47 @@ impl TdsClient {
         Ok(Some(decryptor))
     }
 
+    pub(crate) fn active_plp_collation(&self) -> Option<SqlCollation> {
+        match &self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => plp_state.collation(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn active_plp_reached_end(&self) -> bool {
+        match &self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => plp_state.reached_end(),
+            _ => true,
+        }
+    }
+
+    pub(crate) async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        let ActiveRowReadState::PlpPaused(plp_state) = &mut self.active_row_read_state else {
+            return Ok(0);
+        };
+
+        let start = Instant::now();
+        let read = self
+            .transport
+            .read_active_plp_bytes(
+                plp_state,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+                out,
+            )
+            .await?;
+        self.update_remaining_timeout(start);
+        Ok(read)
+    }
+
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
+    ///
+    /// If a prior call paused mid-row, this method first resumes and completes
+    /// that same logical row before reading tokens for a subsequent row. If row
+    /// decoding was paused on a PLP column and the caller did not finish draining
+    /// it via `read_active_plp_bytes`, this method drains the remaining PLP bytes
+    /// before resuming the row.
     ///
     /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
     /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
@@ -2514,6 +2724,39 @@ impl TdsClient {
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
             ));
         }
+
+        match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
+            ActiveRowReadState::Idle => {}
+            ActiveRowReadState::RowPaused(pause_state) => {
+                return self.resume_row_loop(*pause_state, writer).await;
+            }
+            ActiveRowReadState::PlpPaused(mut plp_state) => {
+                let mut buffer = [0u8; 8192];
+                while !plp_state.reached_end() {
+                    let start = Instant::now();
+                    let read = self
+                        .transport
+                        .read_active_plp_bytes(
+                            &mut plp_state,
+                            self.remaining_request_timeout,
+                            self.cancel_handle.as_ref(),
+                            &mut buffer,
+                        )
+                        .await?;
+                    self.update_remaining_timeout(start);
+
+                    if read == 0 && !plp_state.reached_end() {
+                        return Err(crate::error::Error::ProtocolError(
+                            "Active PLP drain made no progress before end-of-stream".to_string(),
+                        ));
+                    }
+                }
+                return self
+                    .resume_row_loop(plp_state.row_pause_state, writer)
+                    .await;
+            }
+        }
+
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
         let decryptor = self.resolve_cell_decryptor(&metadata).await?;
         let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
@@ -2536,80 +2779,135 @@ impl TdsClient {
                     info!("Row Received");
                     return Ok(true);
                 }
-                RowReadResult::Token(token) => match token {
-                    Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
-                        info!("done while get_next_row: {:?}", done);
-
-                        if done.has_error() {
-                            return Err(crate::error::Error::ProtocolError(
-                                "Server reported error in DONE token without preceding ERROR token"
-                                    .to_string(),
-                            ));
-                        }
-
-                        let count = self.count_map.entry(done.cur_cmd).or_insert(0);
-                        *count = count.saturating_add(done.row_count);
-
-                        self.current_result_set_has_been_read_till_end = true;
-                        if !done.has_more() {
-                            info!("No more rows for current command: {:?}", done.cur_cmd);
-                            self.execution_context.set_has_open_batch(false);
-                        }
-                        return Ok(false);
+                RowReadResult::RowPaused(pause_state) => {
+                    self.active_row_read_state =
+                        ActiveRowReadState::RowPaused(Box::new(pause_state));
+                    return Ok(true);
+                }
+                RowReadResult::PlpPaused(plp_state) => {
+                    self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(plp_state));
+                    return Ok(true);
+                }
+                RowReadResult::Token(token) => {
+                    if let Some(has_row) = self.handle_row_read_token(token).await? {
+                        return Ok(has_row);
                     }
-                    Tokens::Order(order_token) => {
-                        info!(?order_token);
-                        continue;
-                    }
-                    Tokens::EnvChange(env_change) => {
-                        info!(?env_change);
-                        if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                            self.recovery_context.session_state_table.reset();
-                        }
-                        self.execution_context
-                            .capture_change_property(&env_change, &mut self.negotiated_settings)?;
-                        continue;
-                    }
-                    Tokens::SessionState(session_state) => {
-                        self.recovery_context
-                            .process_session_state(&session_state)?;
-                        continue;
-                    }
-                    Tokens::ReturnValue(return_value_token) => {
-                        let return_value = self.finalize_return_value(return_value_token)?;
-                        self.return_values.push(return_value);
-                        continue;
-                    }
-                    Tokens::Error(error_token) => {
-                        info!(?error_token);
-                        let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
-                        let drain_errors = self.drain_stream().await?;
-                        all_errors.extend(drain_errors);
-                        return Err(crate::error::Error::from_sql_errors(all_errors));
-                    }
-                    Tokens::ColMetadata(_) => {
-                        return Err(crate::error::Error::UsageError(
-                            "Unexpected ColMetadata token encountered while reading rows. \
-                             This typically indicates the API was not used correctly - \
-                             you may need to call move_to_next() to advance to the next result set."
-                                .to_string(),
-                        ));
-                    }
-                    Tokens::Info(info_token) => {
-                        info!(?info_token);
-                        self.capture_info_message(&info_token);
-                        continue;
-                    }
-                    Tokens::TabName | Tokens::ColInfo => {
-                        continue;
-                    }
-                    _ => {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "Unexpected token while finding the next row: {token:?}"
-                        )));
-                    }
-                },
+                }
             }
+        }
+    }
+
+    async fn resume_row_loop(
+        &mut self,
+        pause_state: RowPauseState,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<bool> {
+        let current = pause_state;
+        let start = Instant::now();
+        let result = self
+            .transport
+            .resume_row_into(
+                current,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+                writer,
+            )
+            .await?;
+        self.update_remaining_timeout(start);
+        match result {
+            RowReadResult::RowWritten => {
+                writer.end_row();
+                info!("Row Received");
+                Ok(true)
+            }
+            RowReadResult::RowPaused(next_pause) => {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(next_pause));
+                Ok(true)
+            }
+            RowReadResult::PlpPaused(plp_state) => {
+                self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(plp_state));
+                Ok(true)
+            }
+            RowReadResult::Token(token) => {
+                if let Some(has_row) = self.handle_row_read_token(token).await? {
+                    Ok(has_row)
+                } else {
+                    // This should not happen in normal resume flow; keep as a defensive guard.
+                    Err(crate::error::Error::ProtocolError(
+                        "Unexpected token during row resume".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn handle_row_read_token(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
+        match token {
+            Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
+                info!("done while get_next_row: {:?}", done);
+
+                if done.has_error() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "Server reported error in DONE token without preceding ERROR token"
+                            .to_string(),
+                    ));
+                }
+
+                let count = self.count_map.entry(done.cur_cmd).or_insert(0);
+                *count = count.saturating_add(done.row_count);
+
+                self.current_result_set_has_been_read_till_end = true;
+                if !done.has_more() {
+                    info!("No more rows for current command: {:?}", done.cur_cmd);
+                    self.execution_context.set_has_open_batch(false);
+                }
+                Ok(Some(false))
+            }
+            Tokens::Order(order_token) => {
+                info!(?order_token);
+                Ok(None)
+            }
+            Tokens::EnvChange(env_change) => {
+                info!(?env_change);
+                if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                    self.recovery_context.session_state_table.reset();
+                }
+                self.execution_context
+                    .capture_change_property(&env_change, &mut self.negotiated_settings)?;
+                Ok(None)
+            }
+            Tokens::SessionState(session_state) => {
+                self.recovery_context
+                    .process_session_state(&session_state)?;
+                Ok(None)
+            }
+            Tokens::ReturnValue(return_value_token) => {
+                let return_value = self.finalize_return_value(return_value_token)?;
+                self.push_return_value(return_value);
+                Ok(None)
+            }
+            Tokens::Error(error_token) => {
+                info!(?error_token);
+                let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
+                let drain_errors = self.drain_stream().await?;
+                all_errors.extend(drain_errors);
+                Err(crate::error::Error::from_sql_errors(all_errors))
+            }
+            Tokens::ColMetadata(_) => Err(crate::error::Error::UsageError(
+                "Unexpected ColMetadata token encountered while reading rows. \
+                     This typically indicates the API was not used correctly - \
+                     you may need to call move_to_next() to advance to the next result set."
+                    .to_string(),
+            )),
+            Tokens::Info(info_token) => {
+                info!(?info_token);
+                self.capture_info_message(&info_token);
+                Ok(None)
+            }
+            Tokens::TabName | Tokens::ColInfo => Ok(None),
+            _ => Err(crate::error::Error::ProtocolError(format!(
+                "Unexpected token while finding the next row: {token:?}"
+            ))),
         }
     }
 
@@ -2671,6 +2969,13 @@ impl TdsClient {
         self.info_messages.clear();
     }
 
+    /// Returns and clears the prepared-statement handle captured from the most
+    /// recent `sp_prepexec` (its `@handle` output parameter, RETURNVALUE
+    /// ordinal 0).
+    pub fn take_prepared_statement_handle(&mut self) -> Option<i32> {
+        self.prepared_statement_handle.take()
+    }
+
     /// Retrieves a snapshot of the output parameters (including return values)
     /// that have been retrieved from the result stream.
     ///
@@ -2704,10 +3009,14 @@ impl TdsClient {
         // PRINT after the last result set), and the caller drains them via
         // `take_info_messages()` after this returns (see the ODBC
         // `drain_and_release` path). Clearing them here would discard them.
+        // The sp_prepexec @handle, if any, was captured during the drain above
+        // (see push_return_value) and survives this clear.
         self.current_metadata = None;
         self.return_values.clear();
+        self.expecting_prepare_handle = false;
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
+        self.active_row_read_state = ActiveRowReadState::Idle;
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
         Ok(())
@@ -3037,6 +3346,18 @@ impl ResultSet for TdsClient {
         }
     }
 
+    async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        TdsClient::read_active_plp_bytes(self, out).await
+    }
+
+    fn active_plp_reached_end(&self) -> bool {
+        TdsClient::active_plp_reached_end(self)
+    }
+
+    fn active_plp_collation(&self) -> Option<SqlCollation> {
+        TdsClient::active_plp_collation(self)
+    }
+
     fn maybe_has_unread_rows(&self) -> bool {
         !self.current_result_set_has_been_read_till_end
     }
@@ -3107,7 +3428,32 @@ pub trait ResultSet {
 
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
+    ///
+    /// If the writer opts into [`RowWriter::pause_after_column`], this method
+    /// may return `Ok(true)` more than once for the same logical row: each pause
+    /// boundary yields control back to the caller, and [`RowWriter::end_row`]
+    /// runs only after the final resume completes the row.
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool>;
+
+    /// Reads bytes from the active PLP stream captured after a `PlpPaused` result from
+    /// `next_row_into`. The caller must drain the stream to completion before calling
+    /// `next_row_into` again.
+    async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        let _ = out;
+        Ok(0)
+    }
+
+    /// Returns `true` when the active PLP stream has been fully consumed or when
+    /// there is no active PLP stream.
+    fn active_plp_reached_end(&self) -> bool {
+        true
+    }
+
+    /// Returns the TDS collation for the active PLP string stream, or `None` for
+    /// binary types or when there is no active PLP stream.
+    fn active_plp_collation(&self) -> Option<SqlCollation> {
+        None
+    }
 
     /// Returns `true` if the result set may still contain unread rows.
     fn maybe_has_unread_rows(&self) -> bool;
@@ -3144,7 +3490,9 @@ mod tests {
     use crate::core::{CancelHandle, TdsResult};
     use crate::datatypes::row_writer::RowWriter;
     use crate::io::reader_writer::{NetworkReader, NetworkWriter};
-    use crate::io::token_stream::{ParserContext, RowReadResult, TdsTokenStreamReader};
+    use crate::io::token_stream::{
+        ParserContext, RowPauseState, RowReadResult, TdsTokenStreamReader,
+    };
     use crate::token::tokens::{
         ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
     };
@@ -3158,6 +3506,11 @@ mod tests {
         closed: bool,
         pending_tokens: VecDeque<Tokens>,
         reset_mode: ResetConnectionMode,
+        /// Every byte handed to `send` (request framing + payload), so tests can
+        /// assert what was actually written to the wire.
+        sent: Arc<std::sync::Mutex<Vec<u8>>>,
+        packet_data: Vec<u8>,
+        packet_pos: usize,
     }
 
     impl TestTransport {
@@ -3166,6 +3519,9 @@ mod tests {
                 closed: false,
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                packet_data: Vec::new(),
+                packet_pos: 0,
             }
         }
 
@@ -3174,7 +3530,33 @@ mod tests {
                 closed: false,
                 pending_tokens: VecDeque::from(tokens),
                 reset_mode: ResetConnectionMode::None,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                packet_data: Vec::new(),
+                packet_pos: 0,
             }
+        }
+
+        fn with_packet_data(packet_data: Vec<u8>) -> Self {
+            Self {
+                closed: false,
+                pending_tokens: VecDeque::new(),
+                reset_mode: ResetConnectionMode::None,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                packet_data,
+                packet_pos: 0,
+            }
+        }
+
+        fn take_packet_bytes(&mut self, count: usize) -> TdsResult<&[u8]> {
+            if self.packet_pos + count > self.packet_data.len() {
+                return Err(crate::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "End of data",
+                )));
+            }
+            let slice = &self.packet_data[self.packet_pos..self.packet_pos + count];
+            self.packet_pos += count;
+            Ok(slice)
         }
     }
 
@@ -3201,6 +3583,26 @@ mod tests {
         ) -> TdsResult<RowReadResult> {
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
+
+        async fn resume_row_into(
+            &mut self,
+            _pause_state: RowPauseState,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+            _writer: &mut (dyn RowWriter + Send),
+        ) -> TdsResult<RowReadResult> {
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+
+        async fn read_active_plp_bytes(
+            &mut self,
+            _plp_state: &mut PlpPauseState,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+            _out: &mut [u8],
+        ) -> TdsResult<usize> {
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
     }
 
     #[async_trait]
@@ -3215,7 +3617,8 @@ mod tests {
 
     #[async_trait]
     impl NetworkWriter for TestTransport {
-        async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
+        async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
+            self.sent.lock().unwrap().extend_from_slice(data);
             Ok(())
         }
         fn packet_size(&self) -> u32 {
@@ -3261,6 +3664,81 @@ mod tests {
         }
         fn is_connection_dead(&self) -> bool {
             true
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::io::packet_reader::TdsPacketReader for TestTransport {
+        async fn read_byte(&mut self) -> TdsResult<u8> {
+            Ok(self.take_packet_bytes(1)?[0])
+        }
+        async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint40(&mut self) -> TdsResult<u64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_float32(&mut self) -> TdsResult<f32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_float64(&mut self) -> TdsResult<f64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int16(&mut self) -> TdsResult<i16> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint16(&mut self) -> TdsResult<u16> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint24(&mut self) -> TdsResult<u32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int32(&mut self) -> TdsResult<i32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint32(&mut self) -> TdsResult<u32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int64(&mut self) -> TdsResult<i64> {
+            Ok(i64::from_le_bytes(
+                self.take_packet_bytes(8)?.try_into().unwrap(),
+            ))
+        }
+        async fn read_uint64(&mut self) -> TdsResult<u64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_bytes(&mut self, _buf: &mut [u8]) -> TdsResult<usize> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_u8_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_u16_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_varchar_u16_length(&mut self) -> TdsResult<Option<String>> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_varchar_u8_length(&mut self) -> TdsResult<String> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_unicode(&mut self, _len: usize) -> TdsResult<String> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_unicode_with_byte_length(&mut self, _len: usize) -> TdsResult<String> {
+            unimplemented!("TestTransport")
+        }
+        async fn skip_bytes(&mut self, _count: usize) -> TdsResult<()> {
+            unimplemented!("TestTransport")
+        }
+        async fn cancel_read_stream(&mut self) -> TdsResult<()> {
+            unimplemented!("TestTransport")
+        }
+        fn reset_reader(&mut self) {
+            self.packet_pos = 0;
         }
     }
 
@@ -3322,6 +3800,24 @@ mod tests {
         )
     }
 
+    /// Builds a client whose transport replays `tokens` and captures every byte
+    /// written to the wire, returning the shared capture buffer alongside it.
+    fn create_capturing_client(tokens: Vec<Tokens>) -> (TdsClient, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let transport = Box::new(TestTransport::with_tokens(tokens));
+        let sent = Arc::clone(&transport.sent);
+        let negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let execution_context = crate::connection::execution_context::ExecutionContext::new();
+        let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        let client = TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            client_context,
+        );
+        (client, sent)
+    }
+
     fn done_no_more() -> Tokens {
         Tokens::Done(DoneToken {
             status: DoneStatus::FINAL,
@@ -3366,6 +3862,88 @@ mod tests {
             TdsClient::timeout_to_duration(Some(30)),
             Some(Duration::from_secs(30))
         );
+    }
+
+    // ── PLP streaming lifecycle contract tests ──
+
+    #[tokio::test]
+    async fn plp_read_bytes_no_active_stream_returns_zero() {
+        let mut client = create_test_client();
+        let mut buf = [0u8; 4];
+
+        let read = client.read_active_plp_bytes(&mut buf).await.unwrap();
+
+        assert_eq!(read, 0);
+    }
+
+    #[test]
+    fn plp_reached_end_returns_true_when_no_stream_active() {
+        let client = create_test_client();
+
+        assert!(client.active_plp_reached_end());
+    }
+
+    #[test]
+    fn plp_collation_returns_none_when_no_stream_active() {
+        let client = create_test_client();
+        assert!(client.active_plp_collation().is_none());
+    }
+
+    #[tokio::test]
+    async fn active_plp_collation_reports_stream_collation_when_paused() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let metadata = crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::partial_len(
+                crate::datatypes::sqldatatypes::TdsDataType::BigVarChar,
+                0xFFFF,
+                Some(collation),
+            )
+            .unwrap(),
+            data_type: crate::datatypes::sqldatatypes::TdsDataType::BigVarChar,
+            column_name: "c1".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+        let mut reader = TestTransport::with_packet_data((-2_i64).to_le_bytes().to_vec());
+        let plp_stream = crate::datatypes::decoder::PlpColumnStream::begin(&metadata, &mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        let row_pause_state = RowPauseState {
+            next_column_index: 1,
+            columns: vec![metadata],
+            nbc_null_bitmap: None,
+            decryptor: None,
+        };
+
+        let mut client = create_test_client();
+        client.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(PlpPauseState {
+            row_pause_state,
+            plp_stream,
+        }));
+
+        assert_eq!(client.active_plp_collation(), Some(collation));
+    }
+
+    #[test]
+    fn plp_helpers_treat_non_plp_row_pause_as_no_active_stream() {
+        let mut client = create_test_client();
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 1,
+            columns: Vec::new(),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+
+        assert!(client.active_plp_reached_end());
+        assert!(client.active_plp_collation().is_none());
     }
 
     #[test]
@@ -3936,10 +4514,132 @@ mod tests {
     #[tokio::test]
     async fn execute_sp_prepexec_clears_stale_metadata_when_no_result_set() {
         assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
-            c.execute_sp_prepexec("UPDATE t SET v = 1".to_string(), Vec::new(), None, None)
-                .await
+            c.execute_sp_prepexec(
+                "UPDATE t SET v = 1".to_string(),
+                Vec::new(),
+                None,
+                None,
+                None,
+            )
+            .await
         })
         .await;
+    }
+
+    // The `@handle` positional parameter of sp_prepexec serializes as:
+    //   0x00  positional name length
+    //   0x01  status flags = BY_REF_VALUE
+    //   0x26  TYPE_INFO type byte = INTN
+    //   0x04  TYPE_INFO max size = 4
+    //   value: length byte then little-endian bytes (length 0x00 for NULL).
+    // These tests pin the byte the current selection controls: `drop_handle`
+    // becomes the input value of that by-reference `@handle`.
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_sends_drop_handle_as_byref_handle_input() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .execute_sp_prepexec(
+                "UPDATE t SET v = 1".to_string(),
+                Vec::new(),
+                Some(0x5152_5354),
+                None,
+                None,
+            )
+            .await
+            .expect("sp_prepexec should succeed against the queued DONE token");
+
+        let bytes = sent.lock().unwrap().clone();
+        let expected = [0x00, 0x01, 0x26, 0x04, 0x04, 0x54, 0x53, 0x52, 0x51];
+        assert!(
+            bytes.windows(expected.len()).any(|w| w == expected),
+            "Some(handle) must be sent as the by-reference @handle input so the server \
+             drops the prior prepared statement"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_sends_null_handle_when_no_drop_handle() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .execute_sp_prepexec(
+                "UPDATE t SET v = 1".to_string(),
+                Vec::new(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("sp_prepexec should succeed against the queued DONE token");
+
+        let bytes = sent.lock().unwrap().clone();
+        let expected_null = [0x00, 0x01, 0x26, 0x04, 0x00];
+        assert!(
+            bytes
+                .windows(expected_null.len())
+                .any(|w| w == expected_null),
+            "None must send a NULL @handle input so the server prepares fresh"
+        );
+    }
+
+    /// Builds an `Int` RETURNVALUE for exercising `push_return_value` directly.
+    /// The column metadata is irrelevant to the capture logic (which only
+    /// inspects the value), so a minimal INT4 descriptor is used.
+    fn int_return_value(ordinal: u16, value: i32) -> ReturnValue {
+        use crate::datatypes::sqldatatypes::{
+            FixedLengthTypes, TdsDataType, TypeInfo, TypeInfoVariant,
+        };
+        use crate::token::tokenitems::ReturnValueStatus;
+
+        ReturnValue {
+            param_ordinal: ordinal,
+            param_name: String::new(),
+            value: ColumnValues::Int(value),
+            column_metadata: Box::new(ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::IntN,
+                type_info: TypeInfo {
+                    tds_type: TdsDataType::IntN,
+                    length: 4,
+                    type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+                },
+                column_name: String::new(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            }),
+            status: ReturnValueStatus::OutputParam,
+        }
+    }
+
+    #[test]
+    fn push_return_value_captures_handle_then_surfaces_following_output_params() {
+        let mut client = create_test_client();
+        client.expecting_prepare_handle = true;
+
+        // First value = the sp_prepexec @handle: captured into the dedicated
+        // field and NOT surfaced as a user output parameter — mirroring
+        // msodbcsql, which routes it to hPrepCurrent, not the output-param path.
+        client.push_return_value(int_return_value(0, 0x0102_0304));
+
+        assert_eq!(client.prepared_statement_handle, Some(0x0102_0304));
+        assert!(!client.expecting_prepare_handle, "flag must be one-shot");
+        assert!(
+            client.return_values.is_empty(),
+            "the internal handle must not appear in return_values"
+        );
+        assert!(client.get_return_values().is_empty());
+
+        // Subsequent values are genuine output params and must be surfaced.
+        client.push_return_value(int_return_value(1, 7));
+        assert_eq!(client.return_values.len(), 1);
+        assert!(matches!(
+            client.return_values[0].value,
+            ColumnValues::Int(7)
+        ));
+
+        // The captured handle stays retrievable independently of return_values.
+        assert_eq!(client.take_prepared_statement_handle(), Some(0x0102_0304));
     }
 
     #[tokio::test]
@@ -4072,5 +4772,46 @@ mod tests {
             .expect_err("synthetic positional name collision should be rejected");
 
         assert!(matches!(err, UsageError(message) if message.contains("@CE_POS_0")));
+    }
+
+    /// A forced parameter whose row the server omits entirely from the describe
+    /// result must be rejected — not silently sent as plaintext. This is the
+    /// downgrade a describe-driven check (iterating only the server's rows) would
+    /// miss, so the validation iterates the supplied forced parameters instead.
+    #[tokio::test]
+    async fn apply_parameter_encryption_rejects_forced_param_omitted_from_describe() {
+        use crate::datatypes::sqltypes::SqlType;
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+        use crate::security::keystore::{CekCache, ColumnEncryptionKeyStoreProviderRegistry};
+
+        // Server returns an empty describe result: no row for the forced param.
+        let describe = DescribeParameterEncryptionResult::new();
+        let providers = ColumnEncryptionKeyStoreProviderRegistry::new();
+        let cek_cache = CekCache::new();
+        let mut output_param_ceks = HashMap::new();
+
+        let mut forced = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(42)),
+        )
+        .with_force_column_encryption(true);
+        let mut params: Vec<&mut RpcParameter> = vec![&mut forced];
+
+        let err = TdsClient::apply_parameter_encryption(
+            &describe,
+            &providers,
+            &cek_cache,
+            &mut params,
+            &mut output_param_ceks,
+            &[],
+        )
+        .await
+        .expect_err("a forced parameter omitted from the describe result must be rejected");
+
+        assert!(
+            matches!(&err, crate::error::Error::ColumnEncryptionError(message) if message.contains("ForceColumnEncryption")),
+            "expected a ForceColumnEncryption column-encryption error, got: {err}"
+        );
     }
 }

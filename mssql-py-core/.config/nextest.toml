@@ -1,0 +1,5 @@
+# mssql-py-core is excluded from the root Cargo workspace, so it does not pick
+# up the workspace-level .config/nextest.toml. This standalone config gives the
+# crate a `ci` profile that emits JUnit for the CI test-results tab.
+[profile.ci.junit]
+path = "junit.xml"

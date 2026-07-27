@@ -77,10 +77,284 @@ pub(crate) unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> St
     String::from_utf16_lossy(slice)
 }
 
+/// Rewrites ODBC `?` parameter markers to SQL Server named markers (`@P1`,
+/// `@P2`, …) and returns the rewritten SQL together with the marker count.
+///
+/// `?` inside string literals (`'…'`), quoted identifiers (`"…"` / `[…]`), and
+/// comments (`-- …` to end of line, `/* … */`) is left untouched. `''`, `""`,
+/// and `]]` are treated as escaped quote characters, not delimiters. Markers are
+/// numbered 1-based in source order, matching the `@P1…` names used to build the
+/// `sp_prepare` parameter declaration.
+///
+/// This intentionally mirrors msodbcsql's marker lexer
+/// (`ComputeParamInfo` / `CParamOffsetInfo::GetParameterInfo` in `sqlccmd.cpp`)
+/// for behavioral parity, including two deliberate quirks that differ from a
+/// strict T-SQL lexer:
+/// - **Block comments do not nest** — scanning stops at the first `*/`, so a `?`
+///   between an inner `*/` and the outer `*/` in `/* … /* … */ ? … */` is
+///   treated as a marker
+/// - **`--(* … *)--` vendor canonical-extension escape is not a comment** — a
+///   `--` that opens `--(*`, or that is immediately preceded by `*)`, is passed
+///   through rather than starting a line comment. A shared consequence is that
+///   `COUNT(*)--…` is *not* treated as a line comment (a `?` inside it is
+///   counted), matching msodbcsql.
+pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
+    #[derive(PartialEq)]
+    enum State {
+        Normal,
+        SingleQuote,
+        DoubleQuote,
+        Bracket,
+        LineComment,
+        BlockComment,
+    }
+
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut count: usize = 0;
+    let mut state = State::Normal;
+    // The two preceding characters, used to detect the `*)--` close of an ODBC
+    // canonical-extension escape
+    let mut prev1: Option<char> = None;
+    let mut prev2: Option<char> = None;
+    let mut chars = sql.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match state {
+            State::Normal => match c {
+                '?' => {
+                    count += 1;
+                    out.push_str("@P");
+                    out.push_str(&count.to_string());
+                }
+                '\'' => {
+                    state = State::SingleQuote;
+                    out.push(c);
+                }
+                '"' => {
+                    state = State::DoubleQuote;
+                    out.push(c);
+                }
+                '[' => {
+                    state = State::Bracket;
+                    out.push(c);
+                }
+                '-' if chars.peek() == Some(&'-') => {
+                    // A `--` is a line comment unless it opens (`--(*`) or closes
+                    // (`*)--`, detected via the two preceding chars) an ODBC vendor
+                    // canonical extension, which is passed through as normal text.
+                    let starts_canonical_extension = matches!(chars.clone().nth(1), Some('('))
+                        && matches!(chars.clone().nth(2), Some('*'));
+                    let ends_canonical_extension =
+                        matches!(prev2, Some('*')) && matches!(prev1, Some(')'));
+
+                    if !starts_canonical_extension && !ends_canonical_extension {
+                        out.push(c);
+                        if let Some(n) = chars.next() {
+                            out.push(n);
+                        }
+                        state = State::LineComment;
+                    } else {
+                        out.push(c);
+                    }
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    out.push(c);
+                    if let Some(n) = chars.next() {
+                        out.push(n);
+                    }
+                    state = State::BlockComment;
+                }
+                _ => out.push(c),
+            },
+            State::SingleQuote => {
+                out.push(c);
+                if c == '\'' {
+                    // Doubled single quotes -> escaped quote, not the end of the literal
+                    if chars.peek() == Some(&'\'') {
+                        if let Some(n) = chars.next() {
+                            out.push(n);
+                        }
+                    } else {
+                        // lone quote → end of literal
+                        state = State::Normal;
+                    }
+                }
+            }
+            State::DoubleQuote => {
+                out.push(c);
+                if c == '"' {
+                    if chars.peek() == Some(&'"') {
+                        if let Some(n) = chars.next() {
+                            out.push(n);
+                        }
+                    } else {
+                        state = State::Normal;
+                    }
+                }
+            }
+            State::Bracket => {
+                out.push(c);
+                if c == ']' {
+                    if chars.peek() == Some(&']') {
+                        if let Some(n) = chars.next() {
+                            out.push(n);
+                        }
+                    } else {
+                        state = State::Normal;
+                    }
+                }
+            }
+            State::LineComment => {
+                out.push(c);
+                if c == '\n' || c == '\r' {
+                    state = State::Normal;
+                }
+            }
+            State::BlockComment => {
+                // Non-nesting: the first `*/` closes the comment (msodbcsql parity).
+                out.push(c);
+                if c == '*' && chars.peek() == Some(&'/') {
+                    if let Some(n) = chars.next() {
+                        out.push(n);
+                    }
+                    state = State::Normal;
+                }
+            }
+        }
+
+        prev2 = prev1;
+        prev1 = Some(c);
+    }
+
+    (out, count)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{copy_with_nul, read_utf16, write_if_some};
+    use super::{copy_with_nul, read_utf16, rewrite_param_markers, write_if_some};
     use crate::api::odbc_types::{SQL_NTS, SqlWChar};
+
+    #[test]
+    fn rewrite_no_markers_is_unchanged() {
+        let (out, n) = rewrite_param_markers("SELECT 1");
+        assert_eq!(out, "SELECT 1");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn rewrite_single_marker() {
+        let (out, n) = rewrite_param_markers("SELECT * FROM t WHERE id = ?");
+        assert_eq!(out, "SELECT * FROM t WHERE id = @P1");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rewrite_multiple_markers_numbered_in_order() {
+        let (out, n) = rewrite_param_markers("a = ? AND b = ? OR c = ?");
+        assert_eq!(out, "a = @P1 AND b = @P2 OR c = @P3");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn rewrite_skips_single_quoted_literal() {
+        let (out, n) = rewrite_param_markers("SELECT '?' AS q, col WHERE x = ?");
+        assert_eq!(out, "SELECT '?' AS q, col WHERE x = @P1");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rewrite_skips_escaped_quote_in_literal() {
+        let (out, n) = rewrite_param_markers("WHERE a = '''?''' AND b = ?");
+        assert_eq!(out, "WHERE a = '''?''' AND b = @P1");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rewrite_skips_bracket_identifier() {
+        let (out, n) = rewrite_param_markers("SELECT [a?b] FROM t WHERE x = ?");
+        assert_eq!(out, "SELECT [a?b] FROM t WHERE x = @P1");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rewrite_skips_double_quoted_identifier() {
+        let (out, n) = rewrite_param_markers("SELECT \"a?b\" WHERE x = ?");
+        assert_eq!(out, "SELECT \"a?b\" WHERE x = @P1");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rewrite_skips_doubled_double_quote_in_identifier() {
+        let (out, n) = rewrite_param_markers("SELECT \"a\"\"?\"\"b\" WHERE x = ?");
+        assert_eq!(out, "SELECT \"a\"\"?\"\"b\" WHERE x = @P1");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rewrite_skips_doubled_bracket_in_identifier() {
+        let (out, n) = rewrite_param_markers("SELECT [a]]?]]b] WHERE x = ?");
+        assert_eq!(out, "SELECT [a]]?]]b] WHERE x = @P1");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rewrite_skips_line_comment() {
+        let (out, n) = rewrite_param_markers("SELECT 1 -- ? not a param\nWHERE x = ?");
+        assert_eq!(out, "SELECT 1 -- ? not a param\nWHERE x = @P1");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rewrite_line_comment_ends_on_carriage_return() {
+        let (out, n) = rewrite_param_markers("SELECT 1 -- ? not a param\rWHERE x = ?");
+        assert_eq!(out, "SELECT 1 -- ? not a param\rWHERE x = @P1");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rewrite_skips_block_comment_until_first_close() {
+        // Block comments do not nest (msodbcsql parity)
+        let (out, n) = rewrite_param_markers("/* a /* ? */ ? */ x = ?");
+        assert_eq!(out, "/* a /* ? */ @P1 */ x = @P2");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn rewrite_count_star_line_comment_is_not_a_comment_msodbcsql_parity() {
+        // Known quirk shared with msodbcsql: a `--` immediately preceded by `*)`
+        // is treated as the close of a `--(* … *)--` canonical extension, not a
+        // line comment. So `COUNT(*)--…` is NOT a comment and a `?` inside it is
+        // counted as a marker. (A strict T-SQL lexer would treat it as a comment.)
+        let (out, n) = rewrite_param_markers("SELECT COUNT(*)--has a ? here\nWHERE a = ?");
+        assert_eq!(out, "SELECT COUNT(*)--has a @P1 here\nWHERE a = @P2");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn rewrite_does_not_treat_canonical_extension_comment_syntax_as_comment() {
+        let (out, n) = rewrite_param_markers(
+            "SELECT --(* vendor (foo) product (bar) extension*)-- WHERE x = ?",
+        );
+        assert_eq!(
+            out,
+            "SELECT --(* vendor (foo) product (bar) extension*)-- WHERE x = @P1"
+        );
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rewrite_supports_question_equal_pattern() {
+        let (out, n) = rewrite_param_markers("?= EXEC dbo.p ?");
+        assert_eq!(out, "@P1= EXEC dbo.p @P2");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn rewrite_supports_odbc_call_escape_with_return_marker() {
+        let (out, n) = rewrite_param_markers("{?= call dbo.p(?)}");
+        assert_eq!(out, "{@P1= call dbo.p(@P2)}");
+        assert_eq!(n, 2);
+    }
 
     #[test]
     fn write_if_some_writes_through_non_null_ptr() {

@@ -127,6 +127,7 @@ const AUTHENTICATION_VALUES: &[&str] = &[
     "ActiveDirectoryPassword",
     "ActiveDirectoryInteractive",
     "ActiveDirectoryMSI",
+    "ActiveDirectoryManagedIdentity",
     "ActiveDirectoryServicePrincipal",
     "ActiveDirectoryDefault",
     "ActiveDirectoryDeviceCodeFlow",
@@ -791,6 +792,7 @@ mod tests {
             "ActiveDirectoryDefault",
             "ActiveDirectoryDeviceCodeFlow",
             "ActiveDirectoryWorkloadIdentity",
+            "ActiveDirectoryManagedIdentity",
         ] {
             let (p, warn) =
                 parse_connection_string(&format!("Server=h;UID=u;PWD=p;Authentication={kw}"))
@@ -822,14 +824,19 @@ mod tests {
     }
 
     #[test]
-    fn authentication_managed_identity_is_rejected() {
-        // ActiveDirectoryManagedIdentity is NOT an ODBC keyword — msodbcsql only
-        // accepts ActiveDirectoryMSI (dlgattr.h), which maps to the same method.
-        // Matches the mssql-python driver's behavior. See bug #46177.
-        let err = parse_connection_string("Server=h;Authentication=ActiveDirectoryManagedIdentity")
-            .unwrap_err();
-        assert_eq!(err.key, "authentication");
-        assert_eq!(err.value, "ActiveDirectoryManagedIdentity");
+    fn authentication_managed_identity_is_accepted() {
+        // Exceed-parity (#46066): the classic C++ msodbcsql driver accepts only
+        // ActiveDirectoryMSI (dlgattr.h), but we also accept ActiveDirectoryManagedIdentity
+        // to match MS Learn docs and sibling drivers (JDBC/.NET/go-sqlcmd). Managed identity
+        // needs no UID/PWD.
+        let (p, warn) =
+            parse_connection_string("Server=h;Authentication=ActiveDirectoryManagedIdentity")
+                .unwrap();
+        assert_eq!(
+            p.authentication.as_deref(),
+            Some("ActiveDirectoryManagedIdentity")
+        );
+        assert!(!warn);
     }
 
     #[test]

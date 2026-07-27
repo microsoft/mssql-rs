@@ -6,15 +6,16 @@ mod common;
 
 mod connectivity {
 
-    use std::{collections::HashMap, env};
+    use std::{collections::HashMap, env, sync::Arc};
 
+    use azure_core::cloud::{CloudConfiguration, CustomConfiguration};
     use azure_core::credentials::TokenCredential;
+    use azure_core::http::ClientOptions;
     use mssql_tds::connection::client_context::CloneableEntraIdTokenFactory;
 
     use crate::common::{create_context, get_scalar_value, init_tracing};
     use azure_identity::{
-        DefaultAzureCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
-        TokenCredentialOptions,
+        DeveloperToolsCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
     };
     use dotenv::dotenv;
     use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
@@ -32,14 +33,7 @@ mod connectivity {
     const SCOPE: &str = "https://database.windows.net/.default";
 
     async fn generate_access_token() -> String {
-        // let azclicred = AzureCliCredential::new();
-
-        let mut credential_options = TokenCredentialOptions::default();
-        credential_options.set_authority_host(
-            "https://login.windows.net/E8F4741A-817A-403A-B28F-200D2B07D656".to_string(),
-        );
-
-        let credential = DefaultAzureCredential::new();
+        let credential = DeveloperToolsCredential::new(None);
 
         let token_response = credential.unwrap().get_token(&[SCOPE], None).await;
 
@@ -53,10 +47,15 @@ mod connectivity {
         sts: String,
         auth_method: &TdsAuthenticationMethod,
     ) -> String {
-        // let azclicred = AzureCliCredential::new();
         let scopes = &[spn.as_ref()];
-        let mut credential_options = TokenCredentialOptions::default();
-        credential_options.set_authority_host(sts);
+        // `CustomConfiguration` is `#[non_exhaustive]`, so it must be built by
+        // mutating a default; the field-reassign lint does not fire on it.
+        let mut custom = CustomConfiguration::default();
+        custom.authority_host = sts;
+        let client_options = ClientOptions {
+            cloud: Some(Arc::new(CloudConfiguration::Custom(custom))),
+            ..Default::default()
+        };
         let token_response = match auth_method {
             TdsAuthenticationMethod::Password => todo!(),
             TdsAuthenticationMethod::SSPI => todo!(),
@@ -66,14 +65,14 @@ mod connectivity {
             TdsAuthenticationMethod::ActiveDirectoryServicePrincipal => todo!(),
             TdsAuthenticationMethod::ActiveDirectoryManagedIdentity => {
                 let options = ManagedIdentityCredentialOptions {
-                    credential_options,
+                    client_options,
                     user_assigned_id: None,
                 };
                 let vm_credential = ManagedIdentityCredential::new(Some(options)).unwrap();
                 vm_credential.get_token(scopes, None).await
             }
             TdsAuthenticationMethod::ActiveDirectoryDefault => {
-                let credential = DefaultAzureCredential::new();
+                let credential = DeveloperToolsCredential::new(None);
                 credential.unwrap().get_token(scopes, None).await
             }
             TdsAuthenticationMethod::ActiveDirectoryMSI => todo!(),

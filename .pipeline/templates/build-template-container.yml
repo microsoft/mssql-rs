@@ -466,6 +466,47 @@ steps:
       testResultsFiles: $(Build.SourcesDirectory)/mssql-js/junit.xml
       testRunTitle: $(System.PhaseName)-Js
 
+# mssql-py-core is outside the workspace, so its Rust unit tests are not part of
+# the mssql-tds nextest run above. Run them in the build container and publish
+# the JUnit results to the ADO test tab. Pure unit tests, so no SQL Server needed.
+- script: |
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
+
+    bash .pipeline/scripts/docker-cargo-run.sh --rm \
+      -v $PWD:/workspace \
+      -v $HOME/.cargo/registry:/root/.cargo/registry \
+      -v $HOME/.cargo/git:/root/.cargo/git \
+      -w /workspace \
+      $BUILD_IMAGE \
+      /workspace/.pipeline/scripts/containerized-pycore-rust-test.sh
+  displayName: Run Rust unit tests (mssql-py-core)
+  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), ne('${{ parameters.architecture }}', 'ARM64'))
+  env:
+    CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+    CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+- task: PublishTestResults@2
+  condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'), ne('${{ parameters.architecture }}', 'ARM64'))
+  displayName: Publish mssql-py-core Rust test results
+  inputs:
+    testResultsFormat: JUnit
+    testResultsFiles: $(Build.SourcesDirectory)/mssql-py-core/target/nextest/ci/junit.xml
+    testRunTitle: $(System.PhaseName)-PyCore-Rust
+    failTaskOnFailedTests: false
+    publishRunAttachments: true
+
+# Cobertura from the mssql-py-core Rust unit tests (produced by the step above).
+# Merged with the mssql-py-core Python coverage under the same crate prefix in
+# the Coverage stage, since ADO does not merge coverage across stages/jobs.
+- ${{ if eq(parameters.collectPythonCoverage, true) }}:
+  - task: PublishPipelineArtifact@1
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Publish mssql-py-core Rust Cobertura coverage artifact
+    continueOnError: true
+    inputs:
+      targetPath: $(Build.SourcesDirectory)/target/pycore-rust-cobertura.xml
+      artifactName: CoberturaCoveragePyCoreRust
+
 - script: |
     BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     

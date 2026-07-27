@@ -10,8 +10,21 @@ crate-type = ["cdylib"]
 
 [dependencies]
 mssql-tds = { path = "../mssql-tds" }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tracing = { version = "0.1.43", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+async-trait = "0.1"
+# The azure SDK only ships a rustls-based reqwest transport (its `reqwest_rustls`
+# default), which drags in the vulnerable `ring` crate. Disable those defaults and
+# force reqwest onto native-tls (OpenSSL/Schannel), matching mssql-tds's TLS stack.
+azure_identity = { version = "1.0", default-features = false, features = ["tokio"] }
+azure_core = { version = "1.1", default-features = false, features = [
+    "reqwest",
+    "reqwest_deflate",
+    "reqwest_gzip",
+    "tokio",
+] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream"] }
+url = "2"
 
 [build-dependencies]

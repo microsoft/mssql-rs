@@ -20,11 +20,12 @@ use crate::handles::DbcHandle;
 use crate::handles::dbc::{ConnectionState, DbcState};
 use crate::handles::{HandleType, handle_from_raw};
 
-use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
+use mssql_tds::connection::client_context::ClientContext;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
 
 use super::util::read_utf16;
+use crate::auth::configure_auth;
 use crate::connection::odbc_authentication_transformer::transform_auth;
 use crate::connection::odbc_authentication_validator::validate_auth;
 use crate::connection::parse_connection_string;
@@ -242,34 +243,29 @@ fn do_connect(
         state.access_token.as_deref(),
     );
 
-    // T1 wires SQL password, integrated (SSPI/GSSAPI), and pre-acquired access
-    // tokens. Entra methods that require token acquisition are not yet available.
-    match &resolved.method {
-        TdsAuthenticationMethod::Password
-        | TdsAuthenticationMethod::SSPI
-        | TdsAuthenticationMethod::AccessToken => {}
-        other => {
-            error!(
-                ?other,
-                "SQLDriverConnectW: authentication method not implemented"
-            );
-            post_sql_error(
-                state,
-                SQLSTATE_HYC00,
-                0,
-                format!("Authentication method {other:?} is not yet supported"),
-            );
-            return SQL_ERROR;
-        }
+    // Build ClientContext. T1 wired SQL password, integrated (SSPI/GSSAPI), and
+    // pre-acquired access tokens; T2 adds Entra service principal (secret) and
+    // managed identity via an Azure-SDK token factory. Methods that still need
+    // token acquisition (AD password, interactive, device code, workload
+    // identity, default credential, AD integrated) are rejected with HYC00
+    // until a later tier.
+    let mut context = ClientContext::default();
+    context.database = params.database.clone();
+
+    if let Err(method) = configure_auth(&mut context, resolved) {
+        error!(
+            ?method,
+            "SQLDriverConnectW: authentication method not implemented"
+        );
+        post_sql_error(
+            state,
+            SQLSTATE_HYC00,
+            0,
+            format!("Authentication method {method:?} is not yet supported"),
+        );
+        return SQL_ERROR;
     }
 
-    // Build ClientContext
-    let mut context = ClientContext::default();
-    context.user_name = resolved.user_name;
-    context.password = resolved.password;
-    context.access_token = resolved.access_token;
-    context.database = params.database.clone();
-    context.tds_authentication_method = resolved.method;
     context.encryption_options = EncryptionOptions {
         trust_server_certificate: params.trust_server_certificate,
         mode: match params.encrypt.as_deref() {
@@ -442,12 +438,14 @@ mod tests {
     }
 
     #[test]
-    fn entra_method_not_implemented_returns_hyc00() {
-        // ActiveDirectoryMSI validates fine but needs token acquisition (T2);
+    fn interactive_method_not_implemented_returns_hyc00() {
+        // ActiveDirectoryInteractive is recognized but not yet implemented (T3);
         // the gate must reject it with HYC00 before any network activity.
+        // (T2 now implements ServicePrincipal and ManagedIdentity, so those no
+        // longer hit this gate.)
         let h = TestHandles::with_env_dbc();
         let dbc = h.dbc;
-        let conn_str: Vec<u16> = cs("Server=s;Authentication=ActiveDirectoryMSI")
+        let conn_str: Vec<u16> = cs("Server=s;Authentication=ActiveDirectoryInteractive")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
