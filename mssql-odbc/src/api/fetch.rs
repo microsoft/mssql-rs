@@ -109,7 +109,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
 
     let mut writer = OdbcRowWriter::new(col_count);
     if col_count > 0 {
-        writer.request_pause_after_column(1);
+        writer.request_pause_before_first_column();
     }
 
     let fetch_result = dbc.runtime.block_on(client.next_row_into(&mut writer));
@@ -131,7 +131,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             stmt_state.current_row = Some(fetched_row);
             stmt_state.current_row_complete = row_complete;
             stmt_state.active_plp_column = None;
-            stmt_state.active_plp_text = None;
+            stmt_state.active_plp_target_type = None;
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();
@@ -190,7 +190,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             stmt_state.current_row = None;
             stmt_state.current_row_complete = false;
             stmt_state.active_plp_column = None;
-            stmt_state.active_plp_text = None;
+            stmt_state.active_plp_target_type = None;
             // Don't clear CURSOR_OPEN here: the cursor stays open until
             // SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE).
             drop(stmt_state);
@@ -207,7 +207,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 stmt_state.current_row = None;
                 stmt_state.current_row_complete = false;
                 stmt_state.active_plp_column = None;
-                stmt_state.active_plp_text = None;
+                stmt_state.active_plp_target_type = None;
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
                 let info_messages = client.take_info_messages();

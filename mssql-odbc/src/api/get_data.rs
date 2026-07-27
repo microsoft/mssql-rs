@@ -15,15 +15,12 @@ use super::sqlstate::*;
 use crate::api::odbc_types::SqlWChar;
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::stmt::{ActivePlpText, STMT_STATE_CURSOR_OPEN};
+use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::ResultSet;
-use mssql_tds::datatypes::row_writer::RowWriter;
-use mssql_tds::token::tokens::SqlCollation;
 use mssql_tds::datatypes::column_values::ColumnValues;
-use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
-use mssql_tds::datatypes::sqldatatypes::TdsDataType;
-use mssql_tds::query::metadata::ColumnMetadata;
+#[cfg(test)]
+use mssql_tds::datatypes::sql_string::SqlString;
 
 /// Implements SQLGetData for current-row retrieval.
 ///
@@ -134,17 +131,19 @@ fn sql_get_data_safe(
         return SQL_ERROR;
     }
 
-    // Continuation: app is calling SQLGetData again on the same PLP column to get
-    // the next chunk. Deliver from the already-decoded text in active_plp_text.
-    // Do this before borrowing current_row so we can still mutate stmt_state below.
+    // Continuation: app is calling SQLGetData again on the same PLP column to
+    // get the next chunk from the active wire stream.
     if stmt_state.active_plp_column == Some(col_index) {
-        return deliver_plp_chunk(
-            &mut stmt_state,
+        drop(stmt_state);
+        return stream_active_plp_chunk(
+            stmt,
+            statement_handle,
             col_index,
             target_type,
             target_value_ptr,
             buffer_length,
             strlen_or_ind_ptr,
+            false,
         );
     }
 
@@ -152,7 +151,7 @@ fn sql_get_data_safe(
     // incorrect usage per the ODBC spec — clear the stale stream state.
     if stmt_state.active_plp_column.is_some() {
         stmt_state.active_plp_column = None;
-        stmt_state.active_plp_text = None;
+        stmt_state.active_plp_target_type = None;
     }
 
     let Some(row) = stmt_state.current_row.as_ref() else {
@@ -172,8 +171,8 @@ fn sql_get_data_safe(
             error!("SQLGetData: stmt mutex poisoned after row resume");
             return SQL_ERROR;
         };
-        // Column still missing from row → the decoder paused on a PLP column.
-        // Load the PLP bytes from the ResultSet stream and cache the decoded text.
+        // Column still missing from row -> decoder paused on a PLP column.
+        // Stream this column directly from the active PLP reader.
         let col_in_row = reopened_stmt_state
             .current_row
             .as_ref()
@@ -181,21 +180,15 @@ fn sql_get_data_safe(
             .unwrap_or(false);
         if !col_in_row && !reopened_stmt_state.current_row_complete {
             drop(reopened_stmt_state);
-            let rc = load_plp_stream(stmt, statement_handle, col_index);
-            if rc != SQL_SUCCESS {
-                return rc;
-            }
-            let Ok(mut s) = stmt.inner.lock() else {
-                error!("SQLGetData: stmt mutex poisoned after PLP load");
-                return SQL_ERROR;
-            };
-            return deliver_plp_chunk(
-                &mut s,
+            return stream_active_plp_chunk(
+                stmt,
+                statement_handle,
                 col_index,
                 target_type,
                 target_value_ptr,
                 buffer_length,
                 strlen_or_ind_ptr,
+                true,
             );
         }
         return write_column_as_text(
@@ -405,32 +398,77 @@ fn resume_row_to_column(
     }
 }
 
-/// Drains the active PLP stream from the `ResultSet` (i.e., `TdsClient`), decodes
-/// the raw bytes into a Unicode `String`, and caches the result in
-/// `stmt_state.active_plp_text` so that successive `SQLGetData` calls can deliver
-/// it in application-buffer-sized chunks without re-reading the wire.
+/// Reads and returns one SQLGetData chunk directly from the active PLP stream.
 ///
-/// This follows the same read path as `SparseCaptureWriter` in the TDS integration
-/// tests: `pause_after_column` stops the decoder at the PLP column, and the caller
-/// then calls `ResultSet::read_active_plp_bytes` directly — the PLP data never
-/// flows through any `RowWriter::write_*` method.
-fn load_plp_stream(
+/// This never buffers the full PLP payload in ODBC-layer memory. The TDS
+/// client remains the owner of stream state between repeated calls.
+fn stream_active_plp_chunk(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
-    column_number: usize,
+    col_index: usize,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+    starting_new_stream: bool,
 ) -> SqlReturn {
-    let metadata = {
-        let Ok(stmt_state) = stmt.inner.lock() else {
-            error!("SQLGetData: stmt mutex poisoned while reading column metadata for PLP");
+    if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
+        if let Ok(mut s) = stmt.inner.lock() {
+            post_sql_error(&mut s, SQLSTATE_HYC00, 0, "Target type not yet implemented");
+        }
+        return SQL_ERROR;
+    }
+
+    {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLGetData: stmt mutex poisoned while preparing PLP stream read");
             return SQL_ERROR;
         };
-        stmt_state.column_metadata.get(column_number - 1).cloned()
+
+        if starting_new_stream {
+            stmt_state.active_plp_column = Some(col_index);
+            stmt_state.active_plp_target_type = None;
+        }
+
+        if stmt_state.active_plp_column != Some(col_index) {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_24000,
+                0,
+                "No active PLP stream for this column",
+            );
+            return SQL_ERROR;
+        }
+
+        if let Some(existing_target) = stmt_state.active_plp_target_type
+            && existing_target != target_type
+        {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HYC00,
+                0,
+                "Switching SQLGetData target type during PLP streaming is not supported",
+            );
+            return SQL_ERROR;
+        }
+    }
+
+    let payload_capacity = if target_type == SQL_C_WCHAR {
+        (buffer_length as usize).saturating_sub(std::mem::size_of::<SqlWChar>())
+    } else {
+        (buffer_length as usize).saturating_sub(1)
     };
+    let max_read = if target_type == SQL_C_WCHAR {
+        payload_capacity & !1
+    } else {
+        payload_capacity
+    };
+    let mut payload = vec![0u8; max_read];
 
     let dbc = stmt.parent_dbc();
     let mut client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
-            error!("SQLGetData: dbc mutex poisoned while loading PLP stream");
+            error!("SQLGetData: dbc mutex poisoned while reading PLP stream");
             return SQL_ERROR;
         };
 
@@ -455,218 +493,65 @@ fn load_plp_stream(
         client
     };
 
-    let stream_collation = client.active_plp_collation();
+    let read_result = dbc.runtime.block_on(client.read_active_plp_bytes(&mut payload));
+    let reached_end = client.active_plp_reached_end();
 
-    // Read all remaining PLP chunks from the wire via ResultSet::read_active_plp_bytes.
-    let mut plp_bytes: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        match dbc
-            .runtime
-            .block_on(client.read_active_plp_bytes(&mut chunk))
-        {
-            Ok(n) => {
-                if n > 0 {
-                    plp_bytes.extend_from_slice(&chunk[..n]);
-                }
-                if client.active_plp_reached_end() {
-                    break;
-                }
-            }
-            Err(e) => {
-                if let Ok(mut dbc_state) = dbc.inner.lock() {
-                    dbc_state.client = Some(client);
-                    dbc_state.active_stmt = Some(statement_handle);
-                }
-                if let Ok(mut s) = stmt.inner.lock() {
-                    s.clear_state(STMT_STATE_CURSOR_OPEN);
-                    post_tds_error(&mut s, &e, SQLSTATE_HY000);
-                }
-                return SQL_ERROR;
-            }
-        }
-    }
-
-    // Put client back. Its internal state is now PlpPaused(completed) — subsequent
-    // calls to next_row_into will advance past the PLP column to decode further columns.
     if let Ok(mut dbc_state) = dbc.inner.lock() {
         dbc_state.client = Some(client);
         dbc_state.active_stmt = Some(statement_handle);
     }
 
-    // Decode raw bytes to Unicode text according to the TDS column type.
-    let decoded = plp_bytes_to_string(metadata.as_ref(), stream_collation, &plp_bytes);
-
-    let Ok(mut s) = stmt.inner.lock() else {
-        error!("SQLGetData: stmt mutex poisoned while storing decoded PLP text");
-        return SQL_ERROR;
-    };
-    s.active_plp_column = Some(column_number);
-    s.active_plp_text = Some(ActivePlpText {
-        decoded,
-        target_type: None,
-        offset: 0,
-        collation: stream_collation,
-    });
-    SQL_SUCCESS
-}
-
-/// Deliver the next chunk from the cached PLP text in `active_plp_text` to the
-/// caller's ODBC output buffer.
-///
-/// Repeated `SQLGetData` calls on a PLP column each get one buffer-sized slice.
-/// Truncation is reported via `SQL_SUCCESS_WITH_INFO` + indicator `SQL_NO_TOTAL`;
-/// the final chunk returns `SQL_SUCCESS` with the byte count of the data written.
-fn deliver_plp_chunk(
-    stmt_state: &mut crate::handles::stmt::StmtState,
-    col_index: usize,
-    target_type: SqlSmallInt,
-    target_value_ptr: SqlPointer,
-    buffer_length: SqlLen,
-    strlen_or_ind_ptr: *mut SqlLen,
-) -> SqlReturn {
-    let (decoded, stream_target_type, stream_offset, stream_collation) = {
-        let Some(plp) = stmt_state.active_plp_text.as_ref() else {
-            post_sql_error(
-                stmt_state,
-                SQLSTATE_24000,
-                0,
-                "No active PLP stream for this column",
-            );
-            return SQL_ERROR;
-        };
-        (
-            plp.decoded.clone(),
-            plp.target_type,
-            plp.offset,
-            plp.collation,
-        )
-    };
-
-    if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
-        post_sql_error(
-            stmt_state,
-            SQLSTATE_HYC00,
-            0,
-            "Target type not yet implemented",
-        );
-        return SQL_ERROR;
-    }
-
-    if let Some(existing_target) = stream_target_type
-        && existing_target != target_type
-    {
-        post_sql_error(
-            stmt_state,
-            SQLSTATE_HYC00,
-            0,
-            "Switching SQLGetData target type during PLP streaming is not supported",
-        );
-        return SQL_ERROR;
-    }
-
-    let mut writer = OdbcRowWriter::new(0);
-    writer.set_active_plp_text(decoded, stream_collation);
-    writer.set_active_plp_target_type(target_type);
-    writer.set_active_plp_offset(stream_offset);
-    let remaining_len = writer.active_plp_remaining_len();
-
-    let payload_capacity = if target_type == SQL_C_WCHAR {
-        (buffer_length as usize).saturating_sub(std::mem::size_of::<SqlWChar>())
-    } else {
-        (buffer_length as usize).saturating_sub(1)
-    };
-
-    let mut payload = vec![0u8; payload_capacity];
-    let copied = match RowWriter::read_active_plp_bytes(&mut writer, &mut payload) {
+    let read = match read_result {
         Ok(n) => n,
-        Err(_) => {
-            post_sql_error(stmt_state, SQLSTATE_HY000, 0, "Failed to read PLP chunk");
+        Err(e) => {
+            if let Ok(mut s) = stmt.inner.lock() {
+                s.clear_state(STMT_STATE_CURSOR_OPEN);
+                post_tds_error(&mut s, &e, SQLSTATE_HY000);
+            }
             return SQL_ERROR;
         }
     };
 
     if target_type == SQL_C_WCHAR {
-        let units: Vec<u16> = payload[..copied]
+        let usable = read & !1;
+        let units: Vec<u16> = payload[..usable]
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
         let buf_elements = (buffer_length as usize) / std::mem::size_of::<SqlWChar>();
         unsafe {
             copy_with_nul(target_value_ptr as *mut SqlWChar, buf_elements, &units);
+            write_if_some(strlen_or_ind_ptr, usable as SqlLen);
         }
     } else {
         unsafe {
             copy_with_nul(
                 target_value_ptr as *mut u8,
                 buffer_length as usize,
-                &payload[..copied],
+                &payload[..read],
             );
+            write_if_some(strlen_or_ind_ptr, read as SqlLen);
         }
     }
 
-    if RowWriter::active_plp_reached_end(&writer) {
-        unsafe { write_if_some(strlen_or_ind_ptr, remaining_len as SqlLen) };
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("SQLGetData: stmt mutex poisoned while finalizing PLP stream read");
+        return SQL_ERROR;
+    };
+
+    if reached_end {
         stmt_state.active_plp_column = None;
-        stmt_state.active_plp_text = None;
+        stmt_state.active_plp_target_type = None;
         return SQL_SUCCESS;
     }
 
-    if let Some(plp) = stmt_state.active_plp_text.as_mut() {
-        plp.target_type = Some(target_type);
-        plp.offset = writer.active_plp_offset();
-    }
     stmt_state.active_plp_column = Some(col_index);
+    stmt_state.active_plp_target_type = Some(target_type);
     unsafe { write_if_some(strlen_or_ind_ptr, SQL_NO_TOTAL) };
-    post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+    post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
 
     SQL_SUCCESS_WITH_INFO
 }
-fn plp_bytes_to_string(
-    metadata: Option<&ColumnMetadata>,
-    stream_collation: Option<SqlCollation>,
-    bytes: &[u8],
-) -> String {
-    let Some(meta) = metadata else {
-        // No metadata: treat as UTF-16LE (most common PLP text type).
-        return decode_utf16le(bytes);
-    };
-    match meta.data_type {
-        TdsDataType::NChar | TdsDataType::NVarChar | TdsDataType::NText => decode_utf16le(bytes),
-        TdsDataType::Char
-        | TdsDataType::VarChar
-        | TdsDataType::Text
-        | TdsDataType::BigChar
-        | TdsDataType::BigVarChar => {
-            let encoding = stream_collation
-                .or_else(|| meta.get_collation())
-                .map(EncodingType::LcidBased)
-                .unwrap_or(EncodingType::Utf8);
-            let sql_str = SqlString::new(bytes.to_vec(), encoding);
-            sql_str.to_utf8_string()
-        }
-        // All other PLP types (varbinary(max), xml, json …) are binary;
-        // represent as a lossless Latin-1 string so column_value_to_text
-        // can reformat if needed.
-        _ => bytes.iter().map(|b| *b as char).collect(),
-    }
-}
-
-fn decode_utf16le(bytes: &[u8]) -> String {
-    let (decoded, _, _) = encoding_rs::UTF_16LE.decode(bytes);
-    decoded.into_owned()
-}
-
-/// Writes `src` to the caller's output buffer with ODBC string semantics:
-/// the indicator (when present) reports the untruncated byte length, the
-/// payload is NUL-terminated within the buffer, and truncation is reported via
-/// SQLSTATE 01004 + `SQL_SUCCESS_WITH_INFO`.
-///
-/// `buf_elements` is the buffer capacity in units of `T` (not bytes).
-///
-/// The caller-provided pointers are written through small `unsafe` blocks
-/// inside this function; both pointer arguments are obligations of the FFI
-/// caller (validated against the buffer length passed by the DM).
 fn write_string_result<T: Copy + Default>(
     stmt_state: &mut crate::handles::stmt::StmtState,
     src: &[T],
@@ -706,7 +591,6 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_LONG, SQL_NULL_HANDLE};
     use crate::test_support::TestHandles;
-    use mssql_tds::datatypes::sql_string::SqlString;
 
     #[test]
     fn get_data_null_handle() {

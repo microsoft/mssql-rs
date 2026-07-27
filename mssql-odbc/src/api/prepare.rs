@@ -117,7 +117,7 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     stmt_state.current_row = None;
     stmt_state.current_row_complete = false;
     stmt_state.active_plp_column = None;
-    stmt_state.active_plp_text = None;
+    stmt_state.active_plp_target_type = None;
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.set_state(STMT_STATE_PREPARED);
 

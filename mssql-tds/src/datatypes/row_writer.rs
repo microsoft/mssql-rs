@@ -19,6 +19,14 @@ use uuid::Uuid;
 /// enabling consumers (Arrow writers, N-API binary encoders, etc.) to
 /// receive values without going through the intermediate `ColumnValues` enum.
 pub trait RowWriter {
+    /// Returns `true` to pause row decoding before any column bytes are read.
+    ///
+    /// This lets callers observe row availability (ROW/NBCROW token seen)
+    /// without immediately materializing the first column.
+    fn pause_before_first_column(&self) -> bool {
+        false
+    }
+
     /// Returns `true` to pause row decoding after reading column `col`.
     ///
     /// Writers that need incremental column fetch behavior (for example,

@@ -10,34 +10,24 @@ use mssql_tds::datatypes::row_writer::RowWriter;
 use mssql_tds::datatypes::sql_json::SqlJson;
 use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::datatypes::sql_vector::SqlVector;
-use mssql_tds::core::TdsResult;
-use mssql_tds::token::tokens::SqlCollation;
-
-use super::odbc_types::SQL_C_WCHAR;
 
 /// ODBC-oriented row writer that supports pausing row decode after a requested
 /// column while preserving already materialized columns.
 #[derive(Debug)]
 pub(crate) struct OdbcRowWriter {
     row: Vec<ColumnValues>,
+    pause_before_first_column: bool,
     pause_after_column: Option<usize>,
     row_complete: bool,
-    active_plp_text: Option<String>,
-    active_plp_collation: Option<SqlCollation>,
-    active_plp_target_type: Option<i16>,
-    active_plp_offset: usize,
 }
 
 impl OdbcRowWriter {
     pub(crate) fn new(col_count: usize) -> Self {
         Self {
             row: Vec::with_capacity(col_count),
+            pause_before_first_column: false,
             pause_after_column: None,
             row_complete: false,
-            active_plp_text: None,
-            active_plp_collation: None,
-            active_plp_target_type: None,
-            active_plp_offset: 0,
         }
     }
 
@@ -51,51 +41,16 @@ impl OdbcRowWriter {
         self.pause_after_column = Some(column_number);
     }
 
+    pub(crate) fn request_pause_before_first_column(&mut self) {
+        self.pause_before_first_column = true;
+    }
+
     pub(crate) fn into_row(self) -> Vec<ColumnValues> {
         self.row
     }
 
     pub(crate) fn row_complete(&self) -> bool {
         self.row_complete
-    }
-
-    pub(crate) fn set_active_plp_text(&mut self, decoded: String, collation: Option<SqlCollation>) {
-        self.active_plp_text = Some(decoded);
-        self.active_plp_collation = collation;
-        self.active_plp_target_type = None;
-        self.active_plp_offset = 0;
-    }
-
-    pub(crate) fn set_active_plp_target_type(&mut self, target_type: i16) {
-        self.active_plp_target_type = Some(target_type);
-    }
-
-    pub(crate) fn set_active_plp_offset(&mut self, offset: usize) {
-        self.active_plp_offset = offset;
-    }
-
-    pub(crate) fn active_plp_offset(&self) -> usize {
-        self.active_plp_offset
-    }
-
-    pub(crate) fn active_plp_remaining_len(&self) -> usize {
-        let bytes = self.active_plp_encoded_bytes();
-        let start = self.active_plp_offset.min(bytes.len());
-        bytes.len().saturating_sub(start)
-    }
-
-    fn active_plp_encoded_bytes(&self) -> Vec<u8> {
-        let Some(text) = self.active_plp_text.as_ref() else {
-            return Vec::new();
-        };
-
-        match self.active_plp_target_type {
-            Some(SQL_C_WCHAR) => text
-                .encode_utf16()
-                .flat_map(|u| u.to_le_bytes())
-                .collect(),
-            _ => text.as_bytes().to_vec(),
-        }
     }
 
     fn set_column(&mut self, col: usize, value: ColumnValues) {
@@ -114,39 +69,12 @@ impl OdbcRowWriter {
 }
 
 impl RowWriter for OdbcRowWriter {
+    fn pause_before_first_column(&self) -> bool {
+        self.pause_before_first_column
+    }
+
     fn pause_after_column(&self, col: usize) -> bool {
         self.pause_after_column == Some(col + 1)
-    }
-
-    fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
-        if out.is_empty() {
-            return Ok(0);
-        }
-
-        let bytes = self.active_plp_encoded_bytes();
-        let start = self.active_plp_offset.min(bytes.len());
-        let mut copy_len = out.len().min(bytes.len().saturating_sub(start));
-
-        if self.active_plp_target_type == Some(SQL_C_WCHAR) && (copy_len % 2 != 0) {
-            copy_len -= 1;
-        }
-
-        if copy_len == 0 {
-            return Ok(0);
-        }
-
-        out[..copy_len].copy_from_slice(&bytes[start..start + copy_len]);
-        self.active_plp_offset = start + copy_len;
-        Ok(copy_len)
-    }
-
-    fn active_plp_reached_end(&self) -> bool {
-        let bytes = self.active_plp_encoded_bytes();
-        self.active_plp_offset >= bytes.len()
-    }
-
-    fn active_plp_collation(&self) -> Option<SqlCollation> {
-        self.active_plp_collation
     }
 
     fn write_null(&mut self, col: usize) {
@@ -247,6 +175,7 @@ impl RowWriter for OdbcRowWriter {
 
     fn end_row(&mut self) {
         self.row_complete = true;
+        self.pause_before_first_column = false;
         self.pause_after_column = None;
     }
 }

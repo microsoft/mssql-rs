@@ -109,7 +109,7 @@ fn sql_exec_direct_w_safe(
         stmt_state.current_row = None;
         stmt_state.current_row_complete = false;
         stmt_state.active_plp_column = None;
-        stmt_state.active_plp_text = None;
+        stmt_state.active_plp_target_type = None;
         stmt_state.prepared_sql = None;
         // Superseding a prepared plan orphans its server handle; release it
         // (deferred) once we hold the client below.
