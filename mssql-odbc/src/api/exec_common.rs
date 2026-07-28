@@ -9,6 +9,8 @@
 
 use tracing::error;
 
+use std::collections::VecDeque;
+
 use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
@@ -268,13 +270,19 @@ pub(super) fn finish_execute(
         }
         capture_prepared_handle(stmt, &mut client);
         let info_messages = client.take_info_messages();
+        // A pure-DML batch (UPDATE; DELETE; INSERT) yields one count per
+        // statement. Report the first here; queue the rest for SQLMoreResults to
+        // step through, matching msodbcsql's one result set per DML statement.
+        let mut dml_counts: VecDeque<i64> = client.take_dml_result_counts().into();
+        let first_count = dml_counts.pop_front().unwrap_or(-1);
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned");
             return_client_idle(dbc, statement_handle, client);
             return SQL_ERROR;
         };
         stmt_state.column_metadata = metadata; // empty
-        stmt_state.row_count = client.last_rows_affected();
+        stmt_state.row_count = first_count;
+        stmt_state.pending_row_counts = dml_counts;
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
@@ -296,6 +304,7 @@ pub(super) fn finish_execute(
     };
     stmt_state.column_metadata = metadata;
     stmt_state.row_count = client.last_rows_affected();
+    stmt_state.pending_row_counts.clear();
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);

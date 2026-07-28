@@ -54,6 +54,13 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        // A pure-DML batch queued one row count per statement; step through them
+        // in memory (no cursor or connection) before falling back to the wire.
+        if let Some(next) = stmt_state.pending_row_counts.pop_front() {
+            stmt_state.row_count = next;
+            debug!("SQLMoreResults: advanced to next DML result set");
+            return SQL_SUCCESS;
+        }
         stmt_state.has_state(STMT_STATE_CURSOR_OPEN)
     };
 
@@ -172,5 +179,49 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             }
             SQL_ERROR
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::ptr;
+
+    use super::*;
+    use crate::handles::handle_from_raw;
+    use crate::test_support::TestHandles;
+
+    #[test]
+    fn null_handle_returns_invalid_handle() {
+        let rc = unsafe { sql_more_results(ptr::null_mut()) };
+        assert_eq!(rc, SQL_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn no_cursor_and_no_pending_returns_no_data() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let rc = unsafe { sql_more_results(h.stmt) };
+        assert_eq!(rc, SQL_NO_DATA);
+    }
+
+    #[test]
+    fn pending_dml_counts_stepped_then_exhausted() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut s = stmt.inner.lock().unwrap();
+            s.row_count = 3;
+            s.pending_row_counts = VecDeque::from(vec![2, 1]);
+        }
+
+        // Each SQLMoreResults surfaces the next DML statement's count in memory.
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(stmt.inner.lock().unwrap().row_count, 2);
+
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(stmt.inner.lock().unwrap().row_count, 1);
+
+        // Queue drained and no cursor open -> end of batch.
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
     }
 }

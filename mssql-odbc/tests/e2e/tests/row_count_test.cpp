@@ -128,6 +128,30 @@ TEST_F(RowCountLiveTest, RowCountResetsBetweenExecutes) {
     EXPECT_EQ(-1, RowCount());
 }
 
+// A pure-DML batch surfaces each statement as its own result set: SQLRowCount
+// reports UPDATE(3), then DELETE(2), then INSERT(1) as SQLMoreResults steps
+// through, then SQL_NO_DATA — matching msodbcsql.
+TEST_F(RowCountLiveTest, MultiDmlBatchReportsPerStatementCounts) {
+    Exec("CREATE TABLE #rc_multi(id int, age int)");
+    Exec("INSERT INTO #rc_multi VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60)");
+    Exec("UPDATE #rc_multi SET age = 99 WHERE id <= 3; "
+         "DELETE FROM #rc_multi WHERE id IN (4, 5); "
+         "INSERT INTO #rc_multi VALUES (20, 45);");
+
+    EXPECT_EQ(3, RowCount());
+
+    SQLRETURN rc = SQLMoreResults(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, RowCount());
+
+    rc = SQLMoreResults(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, RowCount());
+
+    rc = SQLMoreResults(stmt_);
+    EXPECT_EQ(SQL_NO_DATA, rc);
+}
+
 // SQLRowCount tracks the currently-positioned result set: after SQLMoreResults
 // advances to the next SELECT, the count reflects that result set (-1), not a
 // stale value from the previous one.

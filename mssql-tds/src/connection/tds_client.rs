@@ -98,6 +98,12 @@ pub struct TdsClient {
     count_map: HashMap<CurrentCommand, u64>,
     /// Rows affected by the most recent statement; see [`last_rows_affected`](Self::last_rows_affected).
     last_rows_affected: i64,
+    /// Per-statement affected-row counts captured (in order) from every counted
+    /// DONE token seen since the last COLMETADATA or command start. For a
+    /// pure-DML batch (`UPDATE; DELETE; INSERT`) this holds one entry per
+    /// statement so the ODBC layer can surface each as its own result set via
+    /// [`take_dml_result_counts`](Self::take_dml_result_counts).
+    dml_result_counts: Vec<i64>,
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
     info_messages: Vec<SqlInfoMessage>,
@@ -189,6 +195,7 @@ impl TdsClient {
             current_decryptor: None,
             count_map: HashMap::new(),
             last_rows_affected: -1,
+            dml_result_counts: Vec::new(),
             return_values: Vec::new(),
             info_messages: Vec::new(),
             prepared_param_encryption: HashMap::new(),
@@ -436,6 +443,15 @@ impl TdsClient {
     /// value ODBC `SQLRowCount` reports.
     pub fn last_rows_affected(&self) -> i64 {
         self.last_rows_affected
+    }
+
+    /// Drains the per-statement affected-row counts captured since the last
+    /// COLMETADATA (or command start), in statement order. Used by the ODBC
+    /// layer to surface each DML statement in a pure-DML batch as its own
+    /// result set. Returns an empty vec when the batch produced no counted DONE
+    /// (e.g. DDL, `SET NOCOUNT ON`).
+    pub fn take_dml_result_counts(&mut self) -> Vec<i64> {
+        std::mem::take(&mut self.dml_result_counts)
     }
 
     /// Converts an `Option<u32>` timeout (where `Some(0)` means infinite) to `Option<Duration>`.
@@ -1856,6 +1872,7 @@ impl TdsClient {
                     // captured from a preceding DONE-only (DML) result in the
                     // same batch so it is not misreported for this SELECT.
                     self.last_rows_affected = -1;
+                    self.dml_result_counts.clear();
                     break;
                 }
                 Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
@@ -1879,9 +1896,13 @@ impl TdsClient {
 
                     // Capture the affected-row count for `SQLRowCount`, but only
                     // when the DONE_COUNT flag is set — otherwise `row_count` is
-                    // not meaningful (DDL, SET NOCOUNT ON) and must stay -1.
+                    // not meaningful (DDL, SET NOCOUNT ON) and must stay -1. Each
+                    // counted DONE is also appended in order so a pure-DML batch
+                    // surfaces one count per statement.
                     if done.status.contains(DoneStatus::COUNT) {
-                        self.last_rows_affected = i64::try_from(done.row_count).unwrap_or(i64::MAX);
+                        let count = i64::try_from(done.row_count).unwrap_or(i64::MAX);
+                        self.last_rows_affected = count;
+                        self.dml_result_counts.push(count);
                     }
 
                     if !done.has_more() {
@@ -2969,6 +2990,7 @@ impl TdsClient {
         // leak into `SQLRowCount` when this command reports none (DDL /
         // `SET NOCOUNT ON` / SELECT).
         self.last_rows_affected = -1;
+        self.dml_result_counts.clear();
     }
 
     /// Returns and clears the prepared-statement handle captured from the most
@@ -4585,6 +4607,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    #[tokio::test]
+    async fn multi_dml_batch_captures_each_statement_count() {
+        // A pure-DML batch surfaces one count per statement, in order.
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Update, 3, true),
+            done_count(CurrentCommand::Delete, 2, true),
+            done_count(CurrentCommand::Insert, 1, false),
+        ]);
+        client
+            .execute(
+                "UPDATE t SET x=1; DELETE FROM t; INSERT INTO t VALUES (1)".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.take_dml_result_counts(), vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn select_clears_preceding_dml_counts() {
+        // UPDATE (counted, has_more) then SELECT: landing on COLMETADATA clears
+        // the buffered DML counts so they are not surfaced for the SELECT.
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Update, 7, true),
+            empty_col_metadata(),
+            done_no_more(),
+        ]);
+        client
+            .execute("UPDATE t SET x=1; SELECT * FROM t".to_string(), None, None)
+            .await
+            .unwrap();
+        assert!(client.take_dml_result_counts().is_empty());
     }
 
     #[tokio::test]
