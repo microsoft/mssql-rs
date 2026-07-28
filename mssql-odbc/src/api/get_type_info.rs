@@ -48,6 +48,14 @@ const ODBC_VER_KATMAI: u8 = 3;
 /// proc for 2.x applications.
 const ODBC2_DATETIME_OFFSET: SqlSmallInt = SQL_TYPE_DATE - SQL_DATETIME;
 
+/// Bit 0 of the COLMETADATA flags word marks a column nullable (`fNullable`).
+const COLMETA_NULLABLE_FLAG: u16 = 0x01;
+
+/// 1-based ODBC ordinals of the `SQLGetTypeInfo` columns the ODBC specification
+/// defines as NOT NULL. msodbcsql clears their nullable flag so `SQLDescribeCol`
+/// reports `SQL_NO_NULLS` for them.
+const TYPE_INFO_NOT_NULL_COLUMNS: [usize; 7] = [1, 2, 7, 8, 9, 11, 16];
+
 /// Implementation of `SQLGetTypeInfoW`.
 ///
 /// # Safety
@@ -112,12 +120,8 @@ fn sql_get_type_info_w_safe(
         };
         free_errors(&mut stmt_state);
 
-        if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
-            error!("SQLGetTypeInfoW: statement has an active execute or open cursor");
-            post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
-            return SQL_ERROR;
-        }
-
+        // msodbcsql validates the requested type before the cursor/exec state, so
+        // an invalid type reports HY004/HYC00 even when a cursor is also open.
         match classify_sql_type(data_type) {
             TypeClass::Valid => {}
             TypeClass::Udt => {
@@ -130,6 +134,12 @@ fn sql_get_type_info_w_safe(
                 post_diag(&mut stmt_state, ERR_INVALID_SQL_DATA_TYPE);
                 return SQL_ERROR;
             }
+        }
+
+        if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
+            error!("SQLGetTypeInfoW: statement has an active execute or open cursor");
+            post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
+            return SQL_ERROR;
         }
 
         // A new query invalidates prior metadata/context immediately, so a later
@@ -188,6 +198,7 @@ fn sql_get_type_info_w_safe(
         return rc;
     }
     rename_type_info_columns(stmt, is_2x_app);
+    clear_type_info_nullable(stmt);
     rc
 }
 
@@ -296,6 +307,22 @@ fn rename_type_info_columns(stmt: &StmtHandle, is_2x_app: bool) {
     }
 }
 
+/// Clears the nullable flag on the type-info columns the ODBC spec guarantees
+/// are NOT NULL, matching msodbcsql's `ClearNullable` post-processing so
+/// `SQLDescribeCol` reports `SQL_NO_NULLS` for them.
+fn clear_type_info_nullable(stmt: &StmtHandle) {
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("SQLGetTypeInfoW: stmt mutex poisoned clearing nullable");
+        return;
+    };
+    let cols = &mut stmt_state.column_metadata;
+    for ordinal in TYPE_INFO_NOT_NULL_COLUMNS {
+        if let Some(col) = cols.get_mut(ordinal - 1) {
+            col.flags &= !COLMETA_NULLABLE_FLAG;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +411,16 @@ mod tests {
     }
 
     #[test]
+    fn clear_type_info_nullable_is_a_noop_without_metadata() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        // No result set: the walk over the not-null ordinals mutates nothing and
+        // does not panic on the empty metadata.
+        clear_type_info_nullable(stmt);
+        assert!(stmt.inner.lock().unwrap().column_metadata.is_empty());
+    }
+
+    #[test]
     fn odbc2_app_omits_odbc_ver_and_remaps_date() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -445,5 +482,19 @@ mod tests {
 
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_24000);
+    }
+
+    #[test]
+    fn invalid_type_wins_over_open_cursor() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().set_state(STMT_STATE_CURSOR_OPEN);
+
+        // msodbcsql validates the type before the cursor state, so an invalid
+        // type reports HY004 even with a cursor open.
+        let ret = unsafe { sql_get_type_info_w(h.stmt, 999) };
+        assert_eq!(ret, SQL_ERROR);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY004);
     }
 }

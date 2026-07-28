@@ -91,6 +91,30 @@ TEST_F(GetTypeInfoLiveTest, ColumnNamesMatchOdbcContract) {
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
 
+// The columns the ODBC spec defines as NOT NULL report SQL_NO_NULLS, matching
+// msodbcsql's ClearNullable post-processing.
+TEST_F(GetTypeInfoLiveTest, NotNullColumnsReportNoNulls) {
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_ALL_TYPES);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    for (SQLUSMALLINT col : {1, 2, 7, 8, 9, 11, 16}) {
+        SQLTCHAR name[128] = {};
+        SQLSMALLINT nameLen = 0;
+        SQLSMALLINT dataType = 0;
+        SQLULEN columnSize = 0;
+        SQLSMALLINT decimalDigits = 0;
+        SQLSMALLINT nullable = -1;
+        rc = SQLDescribeCol(stmt_, col, name,
+                            static_cast<SQLSMALLINT>(sizeof(name) / sizeof(SQLTCHAR)),
+                            &nameLen, &dataType, &columnSize, &decimalDigits, &nullable);
+        ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(SQL_NO_NULLS, nullable) << "column " << col << " must be NOT NULL";
+    }
+
+    rc = SQLCloseCursor(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
+
 // Filtering by a specific type returns only rows whose DATA_TYPE matches.
 TEST_F(GetTypeInfoLiveTest, SpecificTypeFilters) {
     SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_INTEGER);
