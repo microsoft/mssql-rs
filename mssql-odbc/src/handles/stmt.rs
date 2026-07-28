@@ -8,7 +8,9 @@ use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
 
 use super::{DbcHandle, HandleType, HasObjectType};
+use crate::api::odbc_types::{SqlULen, SqlUSmallInt};
 use crate::error::{DiagRecord, HasDiagnostics};
+use crate::params::BoundParam;
 
 pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
 pub(crate) const STMT_STATE_PREPARED: u32 = 0x0000_0200;
@@ -35,11 +37,38 @@ pub(crate) struct StmtState {
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
     /// SQL text stored by `SQLPrepare`, awaiting execution. The server-side
-    /// prepare is deferred (msodbcsql parity) — bundled into `SQLExecute` via
-    /// `sp_prepexec`, or triggered lazily if metadata is needed first.
+    /// prepare is deferred to `SQLExecute`.
     pub(crate) prepared_sql: Option<String>,
+    /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
+    /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
+    pub(crate) bound_params: Vec<Option<BoundParam>>,
+    /// Server-side prepared-statement handle from `sp_prepare`, cached so
+    /// subsequent `SQLExecute` calls reuse it via `sp_execute`. `None`
+    /// until the first execute prepares it.
+    pub(crate) prepared_handle: Option<i32>,
+    /// A prepared handle orphaned by a re-prepare / rebind / `SQLExecDirect`
+    /// that must be released with `sp_unprepare`. The drop is deferred to the
+    /// next point that already holds the TDS client (execute / exec-direct) or
+    /// to statement free, so bind/prepare stay I/O-free — mirroring msodbcsql's
+    /// deferred `hPrepDropDeferred`. Invariant: this is `None` whenever
+    /// `prepared_handle` is `Some` (a new handle can only be acquired by an
+    /// execute, which flushes any pending drop first).
+    pub(crate) pending_unprepare: Option<i32>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
+    /// Rowset size for block fetches (`SQL_ATTR_ROW_ARRAY_SIZE`). Defaults to 1
+    /// (single-row). Consumed by the columnar `SQLFetchScroll` path.
+    pub(crate) row_array_size: SqlULen,
+    /// Application buffer that receives the count of rows fetched by a block
+    /// fetch (`SQL_ATTR_ROWS_FETCHED_PTR`); null when unset. The application
+    /// owns this buffer and must keep it valid across the fetch.
+    pub(crate) rows_fetched_ptr: *mut SqlULen,
+    /// Application array that receives per-row status codes
+    /// (`SQL_ATTR_ROW_STATUS_PTR`); null when unset.
+    pub(crate) row_status_ptr: *mut SqlUSmallInt,
+    /// Row binding orientation (`SQL_ATTR_ROW_BIND_TYPE`): `SQL_BIND_BY_COLUMN`
+    /// (0) for column-wise arrays, otherwise a row-struct byte size.
+    pub(crate) row_bind_type: SqlULen,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
 }
@@ -55,6 +84,20 @@ impl StmtState {
 
     pub(crate) fn clear_state(&mut self, mask: u32) {
         self.state_flags &= !mask;
+    }
+
+    /// Moves the cached `prepared_handle` (if any) into `pending_unprepare` so
+    /// the next execute / exec-direct (or statement free) releases it with
+    /// `sp_unprepare`. Called by re-prepare, rebind, and `SQLExecDirect` when
+    /// the current prepared plan is superseded. No network I/O.
+    pub(crate) fn orphan_prepared_handle(&mut self) {
+        if let Some(handle) = self.prepared_handle.take() {
+            debug_assert!(
+                self.pending_unprepare.is_none(),
+                "orphan_prepared_handle: a pending unprepare already exists"
+            );
+            self.pending_unprepare = Some(handle);
+        }
     }
 }
 
@@ -83,7 +126,14 @@ impl StmtHandle {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
                 prepared_sql: None,
+                bound_params: Vec::new(),
+                prepared_handle: None,
+                pending_unprepare: None,
                 current_row: None,
+                row_array_size: 1,
+                rows_fetched_ptr: std::ptr::null_mut(),
+                row_status_ptr: std::ptr::null_mut(),
+                row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
                 state_flags: 0,
             }),
         }

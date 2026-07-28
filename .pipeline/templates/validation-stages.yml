@@ -652,13 +652,20 @@ stages:
           buildType: 'current'
           artifactName: 'CoberturaCoveragePython'
           targetPath: '$(Pipeline.Workspace)/cov-python'
+      - task: DownloadPipelineArtifact@2
+        displayName: Download Rust (mssql-py-core) coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoveragePyCoreRust'
+          targetPath: '$(Pipeline.Workspace)/cov-pycore-rust'
       - bash: |
           set -euo pipefail
           mkdir -p "$(Build.SourcesDirectory)/target"
           inputs=()
-          # Each OS emits its mssql-tds report with repo-root-relative paths, so
-          # the same source file lines up across reports and coverage is unioned:
-          # a line covered on any OS counts as covered in the merged result.
+          # Each OS emits its mssql-tds + mssql-odbc report with repo-root-relative
+          # paths, so the same source file lines up across reports and coverage is
+          # unioned: a line covered on any OS counts as covered in the merged result.
           for report in \
             "$(Pipeline.Workspace)/cov-rust-windows/cobertura.xml" \
             "$(Pipeline.Workspace)/cov-rust-linux/cobertura.xml" \
@@ -667,9 +674,12 @@ stages:
           done
           # mssql-py-core coverage is measured from within its own crate
           # directory, so prefix its relative filenames to make them repo-root
-          # relative in the merged report.
+          # relative in the merged report. Both the Python bindings coverage and
+          # the Rust unit test coverage use the same crate prefix so they union.
           py="$(Pipeline.Workspace)/cov-python/pycore-cobertura.xml"
           [ -f "$py" ] && inputs+=("$py::mssql-py-core")
+          pyrust="$(Pipeline.Workspace)/cov-pycore-rust/pycore-rust-cobertura.xml"
+          [ -f "$pyrust" ] && inputs+=("$pyrust::mssql-py-core")
           if [ ${#inputs[@]} -eq 0 ]; then
             echo "##vso[task.logissue type=warning]No coverage inputs found to merge"
             exit 0

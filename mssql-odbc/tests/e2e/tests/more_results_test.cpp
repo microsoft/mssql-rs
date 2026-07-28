@@ -79,6 +79,56 @@ TEST_F(MoreResultsLiveTest, MultipleSelectBatchAdvances) {
     EXPECT_EQ(SQL_NO_DATA, rc);
 }
 
+// An informational message emitted between two result sets (here a PRINT)
+// surfaces as a diagnostic on the SQLMoreResults call that advances past it,
+// and that call returns SQL_SUCCESS_WITH_INFO so the application is told to read
+// it. This is the boundary where end-of-rowset INFO is surfaced with a
+// return-code hint: SQLFetch returns SQL_NO_DATA at end of rows and cannot carry
+// a "read diagnostics" hint, so the driver defers such messages to the next
+// boundary-reporting call (SQLMoreResults advance, or SQLCloseCursor) rather than
+// posting them under SQL_NO_DATA where many applications never read them.
+TEST_F(MoreResultsLiveTest, TrailingInfoBetweenResultSetsSurfacesWithHint) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SELECT 1 AS a; PRINT N'between result sets info'; SELECT 2 AS b;");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    // Drain the first result set.
+    rc = SQLFetch(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    rc = SQLFetch(stmt_);
+    ASSERT_EQ(SQL_NO_DATA, rc);
+
+    // Advancing past the PRINT surfaces it with a SQL_SUCCESS_WITH_INFO hint.
+    rc = SQLMoreResults(stmt_);
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+
+    SQLTCHAR state[8] = {};
+    SQLINTEGER native = 0;
+    SQLTCHAR message[512] = {};
+    SQLSMALLINT messageLen = 0;
+    SQLRETURN diagRc = SQLGetDiagRec(
+        SQL_HANDLE_STMT, stmt_, 1, state, &native, message,
+        static_cast<SQLSMALLINT>(sizeof(message) / sizeof(SQLTCHAR)), &messageLen);
+    ASSERT_TRUE(diagRc == SQL_SUCCESS || diagRc == SQL_SUCCESS_WITH_INFO);
+    std::string text = ODBCTestUtils::ToNarrow(SqlTString(message));
+    EXPECT_NE(std::string::npos, text.find("between result sets info"));
+
+    // The second result set is positioned and readable.
+    rc = SQLFetch(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    SQLCHAR buf[16] = {0};
+    SQLLEN ind = 0;
+    rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_STREQ("2", reinterpret_cast<const char*>(buf));
+    rc = SQLFetch(stmt_);
+    ASSERT_EQ(SQL_NO_DATA, rc);
+
+    rc = SQLMoreResults(stmt_);
+    EXPECT_EQ(SQL_NO_DATA, rc);
+}
+
 // SQLMoreResults called before consuming rows of rs1 drains and advances.
 TEST_F(MoreResultsLiveTest, BeforeFetchDrainsAndAdvances) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr(

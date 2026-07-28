@@ -205,6 +205,257 @@ mod bulk_copy_integration_tests {
         // Temp table will be automatically dropped when connection closes
     }
 
+    /// Bulk copy is a composite operation (metadata retrieval + optional internal
+    /// transaction + one or more bulk-load batches). INFO tokens emitted while the
+    /// bulk load runs — here via an AFTER INSERT trigger's `PRINT`, which surfaces
+    /// because `fire_triggers` is enabled — must be captured and remain retrievable
+    /// via `info_messages()` once the whole operation completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bulk_copy_captures_info_messages_from_fired_trigger() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        // Unique permanent-table names: SQL Server does not allow triggers on
+        // temporary tables, so we create (and clean up) real tables.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dest_table = format!("BulkCopyInfoTrigger_{}", timestamp);
+        let trigger_name = format!("TR_BulkCopyInfo_{}", timestamp);
+
+        async fn cleanup(
+            client: &mut mssql_tds::connection::tds_client::TdsClient,
+            trigger_name: &str,
+            dest_table: &str,
+        ) {
+            let _ = client
+                .execute(
+                    format!(
+                        "IF OBJECT_ID('{}', 'TR') IS NOT NULL DROP TRIGGER {}",
+                        trigger_name, trigger_name
+                    ),
+                    None,
+                    None,
+                )
+                .await;
+            let _ = client.close_query().await;
+            let _ = client
+                .execute(
+                    format!(
+                        "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
+                        dest_table, dest_table
+                    ),
+                    None,
+                    None,
+                )
+                .await;
+            let _ = client.close_query().await;
+        }
+
+        // Initial cleanup in case a previous run left objects behind.
+        cleanup(&mut client, &trigger_name, &dest_table).await;
+
+        client
+            .execute(
+                format!(
+                    "CREATE TABLE {} (
+                    id INT NOT NULL,
+                    value1 INT NOT NULL,
+                    value2 INT NOT NULL,
+                    value3 INT NOT NULL
+                )",
+                    dest_table
+                ),
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to create test table");
+        client.close_query().await.expect("Failed to close query");
+
+        // AFTER INSERT trigger emitting an informational (PRINT) message. It only
+        // fires during the bulk load because the bulk copy enables FIRE_TRIGGERS.
+        client
+            .execute(
+                format!(
+                    "CREATE TRIGGER {} ON {} AFTER INSERT AS PRINT N'bulk copy trigger info';",
+                    trigger_name, dest_table
+                ),
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to create trigger");
+        client.close_query().await.expect("Failed to close query");
+
+        let test_data = vec![
+            TestUser {
+                id: 1,
+                value1: 100,
+                value2: 200,
+                value3: 300,
+            },
+            TestUser {
+                id: 2,
+                value1: 101,
+                value2: 201,
+                value3: 301,
+            },
+        ];
+
+        let result = {
+            let bulk_copy = BulkCopy::new(&mut client, dest_table.as_str());
+            bulk_copy
+                .batch_size(1000)
+                .fire_triggers(true)
+                .write_to_server_zerocopy(&test_data)
+                .await
+                .expect("Bulk copy failed")
+        };
+
+        assert_eq!(result.rows_affected, 2, "Expected 2 rows to be inserted");
+
+        let surfaced = client
+            .info_messages()
+            .iter()
+            .any(|message| message.message.contains("bulk copy trigger info"));
+
+        cleanup(&mut client, &trigger_name, &dest_table).await;
+
+        assert!(
+            surfaced,
+            "bulk copy should surface INFO tokens emitted during the bulk load"
+        );
+    }
+
+    /// On a mid-stream bulk-copy failure, INFO captured for the batches that
+    /// completed before the failure must remain retrievable via `info_messages()`
+    /// alongside the returned error — INFO and ERROR are separate, complementary
+    /// channels. Here batch 1 (id = 1) fires an AFTER INSERT trigger `PRINT` and
+    /// commits, then batch 2 (id = 2) violates a CHECK constraint and fails;
+    /// `batch_size(1)` forces the two rows into separate batches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bulk_copy_retains_prior_batch_info_after_midstream_failure() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dest_table = format!("BulkCopyMidFail_{}", timestamp);
+        let trigger_name = format!("TR_BulkCopyMidFail_{}", timestamp);
+
+        async fn cleanup(
+            client: &mut mssql_tds::connection::tds_client::TdsClient,
+            trigger_name: &str,
+            dest_table: &str,
+        ) {
+            let _ = client
+                .execute(
+                    format!(
+                        "IF OBJECT_ID('{}', 'TR') IS NOT NULL DROP TRIGGER {}",
+                        trigger_name, trigger_name
+                    ),
+                    None,
+                    None,
+                )
+                .await;
+            let _ = client.close_query().await;
+            let _ = client
+                .execute(
+                    format!(
+                        "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
+                        dest_table, dest_table
+                    ),
+                    None,
+                    None,
+                )
+                .await;
+            let _ = client.close_query().await;
+        }
+
+        cleanup(&mut client, &trigger_name, &dest_table).await;
+
+        client
+            .execute(
+                format!(
+                    "CREATE TABLE {} (
+                    id INT NOT NULL,
+                    value1 INT NOT NULL CONSTRAINT CK_BulkCopyMidFail_{} CHECK (value1 < 500),
+                    value2 INT NOT NULL,
+                    value3 INT NOT NULL
+                )",
+                    dest_table, timestamp
+                ),
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to create test table");
+        client.close_query().await.expect("Failed to close query");
+
+        client
+            .execute(
+                format!(
+                    "CREATE TRIGGER {} ON {} AFTER INSERT AS PRINT N'midfail trigger info';",
+                    trigger_name, dest_table
+                ),
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to create trigger");
+        client.close_query().await.expect("Failed to close query");
+
+        let test_data = vec![
+            TestUser {
+                id: 1,
+                value1: 100, // valid: 100 < 500
+                value2: 200,
+                value3: 300,
+            },
+            TestUser {
+                id: 2,
+                value1: 500, // invalid: 500 is NOT < 500, violates CHECK
+                value2: 201,
+                value3: 301,
+            },
+        ];
+
+        let result = {
+            let bulk_copy = BulkCopy::new(&mut client, dest_table.as_str());
+            bulk_copy
+                .batch_size(1) // one row per batch: batch 1 commits, batch 2 fails
+                .fire_triggers(true)
+                .check_constraints(true)
+                .write_to_server_zerocopy(&test_data)
+                .await
+        };
+
+        assert!(
+            result.is_err(),
+            "batch 2 should fail the CHECK constraint (error 547)"
+        );
+
+        // The trigger PRINT from the batch that completed before the failure must
+        // still be retrievable after the error.
+        let retained = client
+            .info_messages()
+            .iter()
+            .any(|message| message.message.contains("midfail trigger info"));
+
+        cleanup(&mut client, &trigger_name, &dest_table).await;
+
+        assert!(
+            retained,
+            "INFO from the batch that completed before the failure must remain retrievable"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_bulk_copy_large_batch() {
         let mut client = begin_connection(&build_tcp_datasource()).await;

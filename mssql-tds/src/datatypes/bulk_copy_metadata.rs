@@ -183,15 +183,24 @@ impl SqlDbType {
     /// - JSON: Returns 0xE7 (NVarChar) because SQL Server doesn't support sending
     ///   JSON type directly in bulk copy operations. JSON data must be sent as
     ///   NVARCHAR(MAX) with UTF-16LE encoding.
+    /// - UDT: Returns 0xA5 (BigVarBinary) because a CLR UDT's wire form is its
+    ///   `IBinarySerialize` payload, i.e. `varbinary(max)`. Sending the UDT type
+    ///   token (0xF0) has no valid COLMETADATA representation for bulk copy and
+    ///   fails with "Unsupported TDS type for bulk copy: 0xF0". Streaming the
+    ///   serialized bytes as varbinary(max) lets SQL Server materialize the UDT
+    ///   on insert (matching pyodbc/python-tds and the statement-text side, which
+    ///   already emits `varbinary`).
     ///
-    /// This makes the intention explicit in code: XML/JSON are their respective types,
-    /// but for bulk copy purposes we transmit them as NVARCHAR.
+    /// This makes the intention explicit in code: XML/JSON/UDT are their respective
+    /// types, but for bulk copy purposes we transmit them as NVARCHAR/VARBINARY.
     pub fn to_bulk_copy_tds_type(&self) -> u8 {
         match self {
             // XML must be sent as NVARCHAR(MAX) in bulk copy
             SqlDbType::Xml => 0xE7, // TdsDataType::NVarChar - TDS spec requirement
             // JSON must be sent as NVARCHAR(MAX) in bulk copy
             SqlDbType::Json => 0xE7, // TdsDataType::NVarChar - bulk copy workaround
+            // Custom CLR UDT must be sent as VARBINARY(MAX) in bulk copy
+            SqlDbType::Udt => 0xA5, // TdsDataType::BigVarBinary - UDT serialized form
             // All other types use their standard TDS type
             _ => self.to_tds_type(),
         }
@@ -684,7 +693,20 @@ impl BulkCopyColumnMetadata {
             // XML must be sent as NVARCHAR(MAX) in bulk copy, but we report it as XML type
             // in INSERT BULK statement. This is similar to ODBC bulk copy behavior.
             SqlDbType::Xml => "xml".to_string(),
-            SqlDbType::Udt => format!("varbinary({})", self.length),
+            // A CLR UDT is loaded via its varbinary serialized form. Custom UDT
+            // columns arrive as PLP (varbinary(max)); mirror the VarBinary arm so
+            // the INSERT BULK statement type matches the varbinary wire type
+            // emitted by `to_bulk_copy_tds_type()`.
+            SqlDbType::Udt => {
+                if self.is_plp() {
+                    "varbinary(max)".to_string()
+                } else {
+                    // Fallback only: production UDT columns always parse to
+                    // PartialLen -> TypeLength::Plp, so this branch is not reached
+                    // in practice; kept as a defensive default.
+                    format!("varbinary({})", self.length)
+                }
+            }
             SqlDbType::Variant => "sql_variant".to_string(),
             SqlDbType::Json => "nvarchar(max)".to_string(),
             SqlDbType::Vector => {
@@ -1190,9 +1212,14 @@ mod tests {
     }
 
     #[test]
-    fn to_bulk_copy_tds_type_xml_json_override() {
+    fn to_bulk_copy_tds_type_overrides() {
+        // XML and JSON are streamed as NVARCHAR(MAX) (0xE7) for bulk copy.
         assert_eq!(SqlDbType::Xml.to_bulk_copy_tds_type(), 0xE7);
         assert_eq!(SqlDbType::Json.to_bulk_copy_tds_type(), 0xE7);
+        // Custom CLR UDT is streamed as VARBINARY(MAX) (0xA5) for bulk copy,
+        // even though its native type token is 0xF0 (GH-667).
+        assert_eq!(SqlDbType::Udt.to_bulk_copy_tds_type(), 0xA5);
+        // Non-overridden types fall through to their standard TDS type.
         assert_eq!(
             SqlDbType::Int.to_bulk_copy_tds_type(),
             SqlDbType::Int.to_tds_type()
@@ -1419,10 +1446,28 @@ mod tests {
             .with_length(16, TypeLength::Fixed(16));
         assert_eq!(meta.get_sql_type_definition().unwrap(), "binary(16)");
 
-        // UDT
-        let meta = BulkCopyColumnMetadata::new("c", SqlDbType::Udt, 0xF0)
-            .with_length(256, TypeLength::Variable(256));
+        // UDT - `get_sql_type_definition()` keys off `sql_type` and ignores
+        // `tds_type`, so the token below does not affect the assertion; it is set
+        // to the overridden bulk-copy value (0xA5) purely for fixture fidelity
+        // with the production `From<&ColumnMetadata>` path.
+        let meta = BulkCopyColumnMetadata::new(
+            "c",
+            SqlDbType::Udt,
+            SqlDbType::Udt.to_bulk_copy_tds_type(),
+        )
+        .with_length(256, TypeLength::Variable(256));
         assert_eq!(meta.get_sql_type_definition().unwrap(), "varbinary(256)");
+
+        // UDT (PLP) - custom CLR UDT columns arrive as PartialLen and must map to
+        // varbinary(max) so the INSERT BULK type matches the varbinary wire type
+        // emitted for bulk copy (GH-667).
+        let meta = BulkCopyColumnMetadata::new(
+            "c",
+            SqlDbType::Udt,
+            SqlDbType::Udt.to_bulk_copy_tds_type(),
+        )
+        .with_length(8000, TypeLength::Plp);
+        assert_eq!(meta.get_sql_type_definition().unwrap(), "varbinary(max)");
     }
 
     #[test]

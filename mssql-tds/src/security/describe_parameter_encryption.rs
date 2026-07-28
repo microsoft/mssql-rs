@@ -57,7 +57,6 @@ pub(crate) const ENCRYPTION_TYPE_PLAINTEXT: u8 = 0;
 #[derive(Debug, Clone)]
 pub(crate) struct ParameterEncryptionInfo {
     /// 1-based ordinal of the parameter within the statement.
-    #[allow(dead_code)]
     pub parameter_ordinal: i32,
     /// Parameter name including the leading `@` (e.g. `@p1`).
     pub parameter_name: String,

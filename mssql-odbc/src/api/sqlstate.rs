@@ -5,19 +5,27 @@
 
 use crate::error::{HasDiagnostics, post_sql_error};
 use mssql_tds::error::Error as TdsError;
+use mssql_tds::error::SqlInfoMessage;
 
+pub(crate) const SQLSTATE_01000: [u8; 5] = *b"01000";
 pub(crate) const SQLSTATE_01004: [u8; 5] = *b"01004";
 pub(crate) const SQLSTATE_01S00: [u8; 5] = *b"01S00";
+pub(crate) const SQLSTATE_01S02: [u8; 5] = *b"01S02";
+pub(crate) const SQLSTATE_07002: [u8; 5] = *b"07002";
+pub(crate) const SQLSTATE_07006: [u8; 5] = *b"07006";
 pub(crate) const SQLSTATE_07009: [u8; 5] = *b"07009";
 pub(crate) const SQLSTATE_08001: [u8; 5] = *b"08001";
 pub(crate) const SQLSTATE_08003: [u8; 5] = *b"08003";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
 pub(crate) const SQLSTATE_HY000: [u8; 5] = *b"HY000";
+pub(crate) const SQLSTATE_HY003: [u8; 5] = *b"HY003";
+pub(crate) const SQLSTATE_HY004: [u8; 5] = *b"HY004";
 pub(crate) const SQLSTATE_HYC00: [u8; 5] = *b"HYC00";
 pub(crate) const SQLSTATE_HY009: [u8; 5] = *b"HY009";
 pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
 pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
+pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
 
@@ -60,6 +68,22 @@ pub(crate) const ERR_INVALID_DESCRIPTOR_INDEX: DiagMsg = DiagMsg {
     state: SQLSTATE_07009,
     text: "Invalid descriptor index",
 };
+pub(crate) const ERR_UNBOUND_PARAMETER: DiagMsg = DiagMsg {
+    state: SQLSTATE_07002,
+    text: "COUNT field incorrect or syntax error",
+};
+pub(crate) const ERR_INVALID_SQL_DATA_TYPE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY004,
+    text: "Invalid SQL data type",
+};
+pub(crate) const ERR_INVALID_C_DATA_TYPE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY003,
+    text: "Invalid application buffer type",
+};
+pub(crate) const ERR_RESTRICTED_DATA_TYPE: DiagMsg = DiagMsg {
+    state: SQLSTATE_07006,
+    text: "Restricted data type attribute violation",
+};
 pub(crate) const ERR_STRING_RIGHT_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01004,
     text: "String data, right truncation",
@@ -80,12 +104,23 @@ pub(crate) const ERR_INVALID_CONNECTION_STRING_ATTRIBUTE: DiagMsg = DiagMsg {
     state: SQLSTATE_01S00,
     text: "Invalid connection string attribute",
 };
+pub(crate) const ERR_INVALID_STRING_OR_BUFFER_LENGTH: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY090,
+    text: "Invalid string or buffer length",
+};
 
 /// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with
 /// native error 0. For server-originated errors use [`post_tds_error`].
 pub(crate) fn post_diag(state: &mut impl HasDiagnostics, msg: DiagMsg) {
     post_sql_error(state, msg.state, 0, msg.text);
 }
+
+/// Sub-source tag msodbcsql inserts after the driver prefix for diagnostics
+/// that originate inside the SQL Server engine (errors and info/PRINT
+/// messages), yielding the full
+/// `[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]<message>`. The
+/// driver prefix itself is added by [`post_sql_error`].
+const SERVER_DIAG_SUBSOURCE: &str = "[SQL Server]";
 
 /// SQL Server engine error number → ODBC 3.x SQLSTATE.
 ///
@@ -234,7 +269,10 @@ pub(crate) fn sqlstate_for_sql_error(error_number: u32) -> Option<[u8; 5]> {
 /// [`DiagRecord`](crate::error::DiagRecord) each. Each record's SQLSTATE
 /// comes from [`sqlstate_for_sql_error`]; any error number not in the map
 /// falls back to `default`. Native error and message are taken straight
-/// from the server-reported error.
+/// from the server-reported error. Any informational/warning messages the
+/// server sent alongside the errors are posted after the error records so a
+/// failing call still surfaces the full server diagnostic set (matching
+/// msodbcsql).
 ///
 /// For any non-`SqlServerError` variant (transport, TLS, redirect, protocol,
 /// timeout, …), pushes a single record with `default`, native error 0, and
@@ -244,16 +282,53 @@ pub(crate) fn sqlstate_for_sql_error(error_number: u32) -> Option<[u8; 5]> {
 /// typically `08001` for connect-time failures and `HY000` for general
 /// execution / fetch failures.
 pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, default: [u8; 5]) {
-    if let TdsError::SqlServerError { errors } = err
-        && !errors.is_empty()
-    {
-        for e in errors {
-            let sqlstate = sqlstate_for_sql_error(e.number).unwrap_or(default);
-            post_sql_error(state, sqlstate, e.number as i32, e.message.clone());
+    if let TdsError::SqlServerError { diagnostics } = err {
+        if diagnostics.errors.is_empty() {
+            // An error return must surface at least one error record. If the
+            // server diagnostics unexpectedly carried no ERROR tokens, post a
+            // default record from the error's Display text so the caller still
+            // sees a primary failure.
+            post_sql_error(state, default, 0, err.to_string());
+        } else {
+            for e in &diagnostics.errors {
+                let sqlstate = sqlstate_for_sql_error(e.number).unwrap_or(default);
+                let native = i32::try_from(e.number).unwrap_or(i32::MAX);
+                post_sql_error(
+                    state,
+                    sqlstate,
+                    native,
+                    format!("{SERVER_DIAG_SUBSOURCE}{}", e.message),
+                );
+            }
         }
+        // Informational/warning records follow the primary error record(s).
+        post_tds_info_messages(state, &diagnostics.info_messages);
         return;
     }
     post_sql_error(state, default, 0, err.to_string());
+}
+
+/// Post one ODBC diagnostic record per SQL Server INFO token.
+///
+/// Returns `true` when at least one record was posted. The caller can use that
+/// to return `SQL_SUCCESS_WITH_INFO` for successful APIs that observed server
+/// messages.
+pub(crate) fn post_tds_info_messages(
+    state: &mut impl HasDiagnostics,
+    messages: &[SqlInfoMessage],
+) -> bool {
+    for message in messages {
+        let sqlstate = sqlstate_for_sql_error(message.number).unwrap_or(SQLSTATE_01000);
+        let native = i32::try_from(message.number).unwrap_or(i32::MAX);
+        post_sql_error(
+            state,
+            sqlstate,
+            native,
+            format!("{SERVER_DIAG_SUBSOURCE}{}", message.message),
+        );
+    }
+
+    !messages.is_empty()
 }
 
 #[cfg(test)]
@@ -306,7 +381,7 @@ mod tests {
         assert_eq!(sqlstate_for_sql_error(u32::MAX), None);
     }
 
-    use mssql_tds::error::SqlErrorInfo;
+    use mssql_tds::error::{SqlErrorInfo, SqlInfoMessage};
 
     fn sql_error(number: u32, message: &str) -> SqlErrorInfo {
         SqlErrorInfo {
@@ -336,32 +411,91 @@ mod tests {
     #[test]
     fn post_tds_error_single_server_error_posts_one_record() {
         let mut s = FakeState::default();
-        let err = TdsError::SqlServerError {
-            errors: vec![sql_error(18456, "Login failed for user 'x'.")],
-        };
+        let err = TdsError::from_sql_errors(vec![sql_error(18456, "Login failed for user 'x'.")]);
         post_tds_error(&mut s, &err, SQLSTATE_08001);
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, *b"28000");
         assert_eq!(s.records[0].native_error, 18456);
-        assert_eq!(s.records[0].message, "Login failed for user 'x'.");
+        assert_eq!(
+            s.records[0].message,
+            format!(
+                "{}{SERVER_DIAG_SUBSOURCE}Login failed for user 'x'.",
+                crate::error::diag::DRIVER_DIAG_PREFIX
+            )
+        );
     }
 
     #[test]
     fn post_tds_error_posts_one_record_per_server_error_in_order() {
         // 18456 → 28000 (mapped); 4060 → fallback (not in our map).
         let mut s = FakeState::default();
-        let err = TdsError::SqlServerError {
-            errors: vec![
-                sql_error(18456, "Login failed."),
-                sql_error(4060, "Cannot open database 'foo'."),
-            ],
-        };
+        let err = TdsError::from_sql_errors(vec![
+            sql_error(18456, "Login failed."),
+            sql_error(4060, "Cannot open database 'foo'."),
+        ]);
         post_tds_error(&mut s, &err, SQLSTATE_08001);
         assert_eq!(s.records.len(), 2);
         assert_eq!(s.records[0].sql_state, *b"28000");
         assert_eq!(s.records[0].native_error, 18456);
         assert_eq!(s.records[1].sql_state, SQLSTATE_08001); // fallback
         assert_eq!(s.records[1].native_error, 4060);
+    }
+
+    #[test]
+    fn post_tds_error_fans_out_errors_then_info_messages() {
+        // A failing operation that also carried an INFO/warning message must
+        // surface both: errors first (record 1 = primary failure), then info.
+        use mssql_tds::error::SqlServerDiagnostics;
+        let mut s = FakeState::default();
+        let diagnostics = SqlServerDiagnostics::new(
+            vec![sql_error(18456, "Login failed.")],
+            vec![SqlInfoMessage {
+                message: "Changed database context to 'master'.".into(),
+                state: 1,
+                class: 10,
+                number: 5701,
+                server_name: Some("srv".into()),
+                proc_name: None,
+                line_number: Some(1),
+            }],
+        );
+        let err = TdsError::from_sql_diagnostics(diagnostics);
+        post_tds_error(&mut s, &err, SQLSTATE_08001);
+        assert_eq!(s.records.len(), 2);
+        assert_eq!(s.records[0].sql_state, *b"28000");
+        assert_eq!(s.records[0].native_error, 18456);
+        assert_eq!(s.records[1].sql_state, *b"01000");
+        assert_eq!(s.records[1].native_error, 5701);
+    }
+
+    #[test]
+    fn post_tds_error_info_only_diagnostics_still_posts_primary_error() {
+        // A SqlServerError that unexpectedly carries only INFO messages (no
+        // ERROR tokens) must still surface a primary error record for the error
+        // return, followed by the info record(s).
+        use mssql_tds::error::SqlServerDiagnostics;
+        let mut s = FakeState::default();
+        let diagnostics = SqlServerDiagnostics::new(
+            vec![],
+            vec![SqlInfoMessage {
+                message: "info only".into(),
+                state: 1,
+                class: 10,
+                number: 5701,
+                server_name: None,
+                proc_name: None,
+                line_number: Some(1),
+            }],
+        );
+        let err = TdsError::from_sql_diagnostics(diagnostics);
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 2);
+        // Record 1 is the synthesized primary error (default state, native 0).
+        assert_eq!(s.records[0].sql_state, SQLSTATE_HY000);
+        assert_eq!(s.records[0].native_error, 0);
+        // Record 2 is the info message.
+        assert_eq!(s.records[1].sql_state, *b"01000");
+        assert_eq!(s.records[1].native_error, 5701);
     }
 
     #[test]
@@ -377,11 +511,64 @@ mod tests {
     #[test]
     fn post_tds_error_empty_server_error_vec_falls_back() {
         let mut s = FakeState::default();
-        let err = TdsError::SqlServerError { errors: vec![] };
+        let err = TdsError::from_sql_errors(vec![]);
         post_tds_error(&mut s, &err, SQLSTATE_HY000);
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_HY000);
         assert_eq!(s.records[0].native_error, 0);
+    }
+
+    #[test]
+    fn post_tds_info_messages_posts_records_and_reports_presence() {
+        let mut s = FakeState::default();
+        let messages = vec![
+            SqlInfoMessage {
+                message: "Changed database context to 'master'.".into(),
+                state: 1,
+                class: 10,
+                number: 5701,
+                server_name: Some("server".into()),
+                proc_name: None,
+                line_number: Some(1),
+            },
+            SqlInfoMessage {
+                message: "hello from PRINT".into(),
+                state: 1,
+                class: 0,
+                number: 0,
+                server_name: Some("server".into()),
+                proc_name: None,
+                line_number: Some(1),
+            },
+        ];
+
+        assert!(post_tds_info_messages(&mut s, &messages));
+        assert_eq!(s.records.len(), 2);
+        assert_eq!(s.records[0].sql_state, *b"01000");
+        assert_eq!(s.records[0].native_error, 5701);
+        assert_eq!(
+            s.records[0].message,
+            format!(
+                "{}{SERVER_DIAG_SUBSOURCE}Changed database context to 'master'.",
+                crate::error::diag::DRIVER_DIAG_PREFIX
+            )
+        );
+        assert_eq!(s.records[1].sql_state, SQLSTATE_01000);
+        assert_eq!(s.records[1].native_error, 0);
+        assert_eq!(
+            s.records[1].message,
+            format!(
+                "{}{SERVER_DIAG_SUBSOURCE}hello from PRINT",
+                crate::error::diag::DRIVER_DIAG_PREFIX
+            )
+        );
+    }
+
+    #[test]
+    fn post_tds_info_messages_empty_returns_false() {
+        let mut s = FakeState::default();
+        assert!(!post_tds_info_messages(&mut s, &[]));
+        assert!(s.records.is_empty());
     }
 
     #[test]
@@ -391,6 +578,33 @@ mod tests {
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_08003);
         assert_eq!(s.records[0].native_error, 0);
-        assert_eq!(s.records[0].message, "Connection does not exist");
+        assert_eq!(
+            s.records[0].message,
+            format!(
+                "{}Connection does not exist",
+                crate::error::diag::DRIVER_DIAG_PREFIX
+            )
+        );
+    }
+
+    #[test]
+    fn driver_raised_error_carries_only_driver_prefix() {
+        let mut s = FakeState::default();
+        post_sql_error(&mut s, SQLSTATE_HY000, 0, "Something broke");
+        assert_eq!(
+            s.records[0].message,
+            "[Microsoft][ODBC Driver 18 for SQL Server]Something broke"
+        );
+    }
+
+    #[test]
+    fn server_error_carries_driver_and_sql_server_prefix() {
+        let mut s = FakeState::default();
+        let err = TdsError::from_sql_errors(vec![sql_error(18456, "Login failed for user 'x'.")]);
+        post_tds_error(&mut s, &err, SQLSTATE_08001);
+        assert_eq!(
+            s.records[0].message,
+            "[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Login failed for user 'x'."
+        );
     }
 }

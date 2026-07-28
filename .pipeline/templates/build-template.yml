@@ -130,8 +130,8 @@ steps:
 
   - script: |
         export CERT_HOST_NAME="sql1"
-        cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --no-fail-fast --profile ci --success-output immediate
-    displayName: Run tests (mssql-tds package only)
+        cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --package mssql-odbc --no-fail-fast --profile ci --success-output immediate
+    displayName: Run tests (mssql-tds and mssql-odbc packages)
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
@@ -146,17 +146,10 @@ steps:
       testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
       testRunTitle: $(System.PhaseName)
 
-  - script: cargo llvm-cov report --package mssql-tds --lcov --output-path "$(Build.SourcesDirectory)/target/lcov.info"
+  - script: cargo llvm-cov report --package mssql-tds --package mssql-odbc --lcov --output-path "$(Build.SourcesDirectory)/target/lcov.info"
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
     workingDirectory: "$(Build.SourcesDirectory)"
-    displayName: Save code coverage in lcov format (mssql-tds package only)
-
-  - ${{ if eq(parameters.osType, 'Linux') }}:
-    - bash: |
-        echo "Running mssql-py-core Rust unit tests..."
-        cd mssql-py-core && cargo test --frozen -- --show-output
-      displayName: Run Rust unit tests (mssql-py-core)
-      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Save code coverage in lcov format (mssql-tds and mssql-odbc)
 
   - ${{ if eq(parameters.osType, 'Linux') }}:
     - bash: |
@@ -173,10 +166,10 @@ steps:
   # with the mssql-py-core Python report and publishes the single combined
   # report to the ADO coverage tab, because ADO does not merge coverage across
   # stages/jobs. The merged report is what the GitHub diff-cover workflow uses.
-  - script: cargo llvm-cov report --package mssql-tds --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
+  - script: cargo llvm-cov report --package mssql-tds --package mssql-odbc --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
     workingDirectory: "$(Build.SourcesDirectory)"
-    displayName: Save code coverage in Cobertura format (mssql-tds package only)
+    displayName: Save code coverage in Cobertura format (mssql-tds and mssql-odbc)
 
   - task: PublishPipelineArtifact@1
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))

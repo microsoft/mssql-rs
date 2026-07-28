@@ -15,7 +15,7 @@ use tokio::time::error::Elapsed;
 ///
 /// SQL Server can return multiple errors for a single batch execution.
 /// This struct represents one error from the stream. The full collection
-/// is available via `Error::SqlServerError { errors }`.
+/// is available via [`SqlServerDiagnostics`] inside `Error::SqlServerError`.
 #[derive(Debug, Clone)]
 pub struct SqlErrorInfo {
     /// Error message text returned by the server.
@@ -61,6 +61,78 @@ impl From<&crate::token::tokens::ErrorToken> for SqlErrorInfo {
             proc_name: Some(token.proc_name.clone()),
             line_number: Some(token.line_number as i32),
         }
+    }
+}
+
+/// A single informational message returned by SQL Server.
+///
+/// SQL Server can return multiple INFO tokens for one request. These tokens
+/// carry warning or informational messages such as PRINT output, database or
+/// language changes, and low-severity RAISERROR output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlInfoMessage {
+    /// Message text returned by the server.
+    pub message: String,
+    /// Message state, used by the server to indicate specific conditions.
+    pub state: u8,
+    /// Severity class of the message (maps to TDS `Class` field).
+    pub class: i32,
+    /// Server-defined message number.
+    pub number: u32,
+    /// Name of the server that generated the message.
+    pub server_name: Option<String>,
+    /// Name of the stored procedure that generated the message.
+    pub proc_name: Option<String>,
+    /// Line number in the batch or procedure where the message occurred.
+    pub line_number: Option<i32>,
+}
+
+impl From<&crate::token::tokens::InfoToken> for SqlInfoMessage {
+    fn from(token: &crate::token::tokens::InfoToken) -> Self {
+        Self {
+            message: token.message.clone(),
+            state: token.state,
+            class: token.severity as i32,
+            number: token.number,
+            server_name: Some(token.server_name.clone()),
+            proc_name: Some(token.proc_name.clone()),
+            line_number: Some(token.line_number as i32),
+        }
+    }
+}
+
+/// Diagnostics reported by SQL Server for a single operation.
+///
+/// SQL Server can send multiple `ERROR` and `INFO` tokens for one request
+/// (batch, RPC, or login). This groups both categories so a failed operation
+/// can carry the complete server-reported diagnostic set — errors that caused
+/// the failure plus any informational/warning messages that preceded them —
+/// rather than only the first error.
+#[derive(Debug, Clone, Default)]
+pub struct SqlServerDiagnostics {
+    /// Server-reported errors, in the order TDS delivered them.
+    pub errors: Vec<SqlErrorInfo>,
+    /// Server-reported informational/warning messages, in wire order.
+    pub info_messages: Vec<SqlInfoMessage>,
+}
+
+impl SqlServerDiagnostics {
+    /// Create a diagnostics set from errors and informational messages.
+    pub fn new(errors: Vec<SqlErrorInfo>, info_messages: Vec<SqlInfoMessage>) -> Self {
+        Self {
+            errors,
+            info_messages,
+        }
+    }
+
+    /// Returns `true` if any server error was reported.
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    /// Returns `true` if neither errors nor informational messages are present.
+    pub fn is_empty(&self) -> bool {
+        self.errors.is_empty() && self.info_messages.is_empty()
     }
 }
 
@@ -125,11 +197,19 @@ pub enum Error {
     #[error("Operation Cancelled Error: {0}")]
     OperationCancelledError(String),
 
-    /// One or more errors returned by SQL Server.
-    #[error("{}", SqlServerError::format_errors(errors))]
+    /// One or more errors returned by SQL Server, plus any informational
+    /// messages that accompanied them.
+    ///
+    /// `diagnostics.info_messages` is only populated on the **login** path,
+    /// where a failed connect has no live `TdsClient` to drain. Statement, RPC,
+    /// and batch failures are built via [`Error::from_sql_errors`] and leave
+    /// `info_messages` **empty**; any INFO those commands emitted is retained on
+    /// the client and must be read separately via
+    /// `TdsClient::take_info_messages()`.
+    #[error("{}", SqlServerError::format_errors(&diagnostics.errors))]
     SqlServerError {
-        /// Ordered list of server-reported errors.
-        errors: Vec<SqlErrorInfo>,
+        /// Server-reported diagnostics (errors and informational messages).
+        diagnostics: SqlServerDiagnostics,
     },
 
     /// Caller misused the API (e.g., invalid parameter combination).
@@ -290,13 +370,21 @@ impl Error {
     /// Create a `SqlServerError` from a single `SqlErrorInfo`.
     pub fn from_sql_error(error: SqlErrorInfo) -> Self {
         Error::SqlServerError {
-            errors: vec![error],
+            diagnostics: SqlServerDiagnostics::new(vec![error], Vec::new()),
         }
     }
 
     /// Create a `SqlServerError` from multiple `SqlErrorInfo`s.
     pub fn from_sql_errors(errors: Vec<SqlErrorInfo>) -> Self {
-        Error::SqlServerError { errors }
+        Error::SqlServerError {
+            diagnostics: SqlServerDiagnostics::new(errors, Vec::new()),
+        }
+    }
+
+    /// Create a `SqlServerError` from a full set of server diagnostics
+    /// (errors plus informational messages).
+    pub fn from_sql_diagnostics(diagnostics: SqlServerDiagnostics) -> Self {
+        Error::SqlServerError { diagnostics }
     }
 
     /// Whether this error is transient for connection open retry purposes.
@@ -318,7 +406,8 @@ impl Error {
             | Error::TimeoutError(_)
             | Error::ConnectionClosed(_) => true,
 
-            Error::SqlServerError { errors } => errors
+            Error::SqlServerError { diagnostics } => diagnostics
+                .errors
                 .iter()
                 .any(|e| TRANSIENT_SQL_ERROR_NUMBERS.contains(&e.number)),
 
@@ -610,5 +699,77 @@ mod tests {
     fn security_error_is_not_transient() {
         let err = Error::Security(SecurityError::NotSupported("SSPI".to_string()));
         assert!(!err.is_transient_connect_error());
+    }
+
+    // ── SqlServerDiagnostics wrapper ──
+
+    fn sample_error(number: u32, message: &str) -> SqlErrorInfo {
+        SqlErrorInfo {
+            message: message.to_string(),
+            state: 1,
+            class: 16,
+            number,
+            server_name: None,
+            proc_name: None,
+            line_number: None,
+        }
+    }
+
+    fn sample_info(number: u32, message: &str) -> SqlInfoMessage {
+        SqlInfoMessage {
+            message: message.to_string(),
+            state: 1,
+            class: 10,
+            number,
+            server_name: None,
+            proc_name: None,
+            line_number: None,
+        }
+    }
+
+    #[test]
+    fn diagnostics_helpers_report_contents() {
+        let empty = SqlServerDiagnostics::default();
+        assert!(empty.is_empty());
+        assert!(!empty.has_errors());
+
+        let info_only = SqlServerDiagnostics::new(vec![], vec![sample_info(5701, "db context")]);
+        assert!(!info_only.is_empty());
+        assert!(!info_only.has_errors());
+
+        let with_errors =
+            SqlServerDiagnostics::new(vec![sample_error(18456, "login failed")], vec![]);
+        assert!(!with_errors.is_empty());
+        assert!(with_errors.has_errors());
+    }
+
+    #[test]
+    fn from_sql_diagnostics_preserves_errors_and_info() {
+        let diagnostics = SqlServerDiagnostics::new(
+            vec![sample_error(18456, "login failed")],
+            vec![sample_info(5701, "changed database context")],
+        );
+        let err = Error::from_sql_diagnostics(diagnostics);
+        match &err {
+            Error::SqlServerError { diagnostics } => {
+                assert_eq!(diagnostics.errors.len(), 1);
+                assert_eq!(diagnostics.errors[0].number, 18456);
+                assert_eq!(diagnostics.info_messages.len(), 1);
+                assert_eq!(diagnostics.info_messages[0].number, 5701);
+            }
+            other => panic!("Expected SqlServerError, got: {other:?}"),
+        }
+        // Display surfaces the error text (info messages are diagnostics, not the failure reason).
+        assert!(err.to_string().contains("login failed"));
+    }
+
+    #[test]
+    fn diagnostics_transient_detection_reads_errors() {
+        // 40501 is transient; the wrapper must still classify it as such.
+        let err = Error::from_sql_diagnostics(SqlServerDiagnostics::new(
+            vec![sample_error(40501, "service busy")],
+            vec![sample_info(5701, "db context")],
+        ));
+        assert!(err.is_transient_connect_error());
     }
 }

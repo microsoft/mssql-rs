@@ -52,20 +52,22 @@ impl<T: SqlTypeDecode + Sync, P: TdsPacketReader + Send + Sync> TokenParser<P>
         let type_info = read_type_info(reader, TdsDataType::try_from(tds_type)?).await?;
 
         // Per [MS-TDS] an encrypted RETURNVALUE is laid out as
-        // `TYPE_INFO || CryptoMetaData || Value`. Encrypted output-parameter
-        // decryption is not implemented yet, but we must still consume the
-        // `CryptoMetaData` block so the token stream stays aligned — otherwise
-        // those bytes would be decoded as the value and desync the whole stream.
+        // `TYPE_INFO || CryptoMetaData || Value`, where `TYPE_INFO` is the
+        // encrypted wire type (`varbinary`) and `CryptoMetaData` carries the
+        // base (plaintext) type plus cipher parameters. RETURNVALUE carries no
+        // CEK table, so `parse_crypto_metadata` is called with
+        // `has_cek_table = false`. The value on the wire is the ciphertext; it
+        // is decoded below as `varbinary` and decrypted by the connection, which
+        // holds the parameter's column encryption key (an encrypted output
+        // parameter reuses the CEK resolved when the matching input parameter
+        // was encrypted).
         const FLAG_ENCRYPTED: u16 = 0x0800;
-        if flags & FLAG_ENCRYPTED != 0 {
-            let _crypto = super::colmetadata_parser::parse_crypto_metadata(reader, false).await?;
-            return Err(crate::error::Error::UnimplementedFeature {
-                feature: "Always Encrypted output parameters".into(),
-                context: "Encrypted RETURNVALUE decryption is not yet implemented".into(),
-            });
-        }
+        let crypto_metadata = if flags & FLAG_ENCRYPTED != 0 {
+            Some(super::colmetadata_parser::parse_crypto_metadata(reader, false).await?)
+        } else {
+            None
+        };
 
-        // TODO: Crypto metadata
         let column_metadata = ColumnMetadata {
             user_type,
             flags,
@@ -73,8 +75,11 @@ impl<T: SqlTypeDecode + Sync, P: TdsPacketReader + Send + Sync> TokenParser<P>
             type_info,
             column_name: param_name.clone(),
             multi_part_name: None,
-            crypto_metadata: None,
+            crypto_metadata,
         };
+        // For an encrypted parameter this decodes the ciphertext as `varbinary`
+        // (the wire type); the connection then decrypts it into the real value.
+        // For a plaintext parameter it decodes the value directly.
         let value = self.decoder.decode(reader, &column_metadata).await?;
 
         Ok(Tokens::from(ReturnValueToken {

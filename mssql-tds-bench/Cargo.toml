@@ -1,0 +1,64 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "mssql-tds-bench"
+version = "0.1.0"
+edition = "2024"
+description = "Fixed Criterion harness for benchmarking mssql-tds with a swappable dependency"
+license = "MIT"
+publish = false
+
+# Exclude the library target from `cargo bench` so its (empty) libtest harness
+# does not intercept Criterion's `--save-baseline` argument. Only the
+# `[[bench]]` targets below (harness = false) should run under `cargo bench`.
+[lib]
+bench = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The library under test. This dependency line always points at ../mssql-tds.
+# The perf-lab testScript holds the harness constant and swaps only the SOURCE
+# at ../mssql-tds in place between runs — candidate = the working tree, baseline =
+# a checkout of the commit pinned in perf-lab/baseline-commit.txt — so mssql-tds
+# is the only variable.
+#
+# The harness code, Criterion version, and toolchain stay byte-for-byte identical
+# across both runs, so any statistically significant delta is attributable to
+# mssql-tds itself.
+mssql-tds = { path = "../mssql-tds" }
+
+async-trait = "0.1.89"
+criterion = "0.5"
+tokio = { version = "1.48.0", features = ["full"] }
+dotenv = "0.15"
+
+[[bench]]
+name = "connection"
+harness = false
+
+[[bench]]
+name = "query_rows"
+harness = false
+
+[[bench]]
+name = "query_procs"
+harness = false
+
+[[bench]]
+name = "query_prepared"
+harness = false
+
+[[bench]]
+name = "datatypes"
+harness = false
+
+[[bench]]
+name = "bulk"
+harness = false
+
+[[bench]]
+name = "tds_specific"
+harness = false
