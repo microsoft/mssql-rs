@@ -608,10 +608,6 @@ impl TdsClient {
         // Batch execution always uses the connection's Always Encrypted setting.
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
 
-        // Reset the affected-row count so a stale value from a prior execute on
-        // this connection cannot leak into `SQLRowCount` for the new statement.
-        self.last_rows_affected = -1;
-
         if self.execution_context.has_open_batch() {
             return Err(crate::error::Error::UsageError(
                 ALREADY_EXECUTING_ERROR.to_string(),
@@ -1855,6 +1851,11 @@ impl TdsClient {
                     info!(?md);
                     col_metadata = Some(Arc::new(md));
                     self.current_result_set_has_been_read_till_end = false;
+                    // Positioning on a row-returning result: its count is
+                    // unavailable on a forward-only cursor. Clear any count
+                    // captured from a preceding DONE-only (DML) result in the
+                    // same batch so it is not misreported for this SELECT.
+                    self.last_rows_affected = -1;
                     break;
                 }
                 Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
@@ -2962,6 +2963,12 @@ impl TdsClient {
     /// command that triggered the reconnect.
     fn begin_command(&mut self) {
         self.info_messages.clear();
+        // Every execution RPC path (plain batch, sp_executesql, sp_execute,
+        // sp_prepexec, stored proc) funnels through here, so reset the
+        // affected-row count for the new command. A prior DML count must not
+        // leak into `SQLRowCount` when this command reports none (DDL /
+        // `SET NOCOUNT ON` / SELECT).
+        self.last_rows_affected = -1;
     }
 
     /// Returns and clears the prepared-statement handle captured from the most
@@ -3821,6 +3828,21 @@ mod tests {
         })
     }
 
+    /// A DONE token carrying the `DONE_COUNT` flag (a DML row count). `more`
+    /// sets `DONE_MORE` so it is treated as a non-terminal result in a batch.
+    fn done_count(cmd: CurrentCommand, rows: u64, more: bool) -> Tokens {
+        let status = if more {
+            DoneStatus::COUNT | DoneStatus::MORE
+        } else {
+            DoneStatus::COUNT
+        };
+        Tokens::Done(DoneToken {
+            status,
+            cur_cmd: cmd,
+            row_count: rows,
+        })
+    }
+
     fn info_token(number: u32, severity: u8, message: &str) -> Tokens {
         Tokens::Info(InfoToken {
             number,
@@ -4486,6 +4508,83 @@ mod tests {
             client.execution_context.has_open_batch(),
             "result-set => has_open_batch must be true"
         );
+    }
+
+    // ── SQLRowCount plumbing: last_rows_affected capture / reset ──
+
+    #[tokio::test]
+    async fn execute_captures_dml_affected_row_count() {
+        let mut client =
+            create_test_client_with_tokens(vec![done_count(CurrentCommand::Update, 5, false)]);
+        client
+            .execute("UPDATE t SET x = 1".to_string(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(client.last_rows_affected(), 5);
+    }
+
+    #[tokio::test]
+    async fn execute_reports_no_row_count_for_ddl() {
+        // A DONE without the COUNT flag (DDL / SET NOCOUNT ON) leaves it at -1.
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client
+            .execute("CREATE TABLE t(i int)".to_string(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    #[tokio::test]
+    async fn execute_reports_no_row_count_for_select() {
+        // Landing on COLMETADATA (a forward-only result set) reports -1.
+        let mut client = create_test_client_with_tokens(vec![empty_col_metadata(), done_no_more()]);
+        client
+            .execute("SELECT 1".to_string(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    #[tokio::test]
+    async fn dml_then_select_batch_reports_no_row_count_for_select() {
+        // UPDATE (counted, has_more) then SELECT: the COLMETADATA the client
+        // lands on must clear the UPDATE count so SQLRowCount reports -1 for the
+        // forward-only SELECT, not the DML count. (Copilot review AB thread.)
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Update, 7, true),
+            empty_col_metadata(),
+            done_no_more(),
+        ]);
+        client
+            .execute(
+                "UPDATE t SET x = 1; SELECT * FROM t".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    #[tokio::test]
+    async fn row_count_resets_between_commands() {
+        // A DML count from one command must not leak into the next command that
+        // reports none. begin_command (on every execute* path) resets it.
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Delete, 4, false),
+            done_no_more(),
+        ]);
+        client
+            .execute("DELETE FROM t".to_string(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(client.last_rows_affected(), 4);
+        // The second command is a DDL (no count) and must start fresh at -1.
+        client
+            .execute("CREATE TABLE u(i int)".to_string(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(client.last_rows_affected(), -1);
     }
 
     #[tokio::test]

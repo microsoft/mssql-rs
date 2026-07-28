@@ -104,6 +104,30 @@ TEST_F(RowCountLiveTest, NoCountSuppressesRowCount) {
     EXPECT_EQ(-1, RowCount());
 }
 
+// A DML statement followed by a SELECT in the same batch: the forward-only
+// SELECT the cursor lands on must report -1, not the DML's count. Guards the
+// review fix that clears the count when positioning on COLMETADATA.
+TEST_F(RowCountLiveTest, DmlThenSelectBatchReportsMinusOneForSelect) {
+    Exec("CREATE TABLE #rc_mix(i int)");
+    Exec("INSERT INTO #rc_mix VALUES (1), (2), (3)");
+    Exec("UPDATE #rc_mix SET i = i + 1; SELECT * FROM #rc_mix;");
+    EXPECT_EQ(-1, RowCount());
+
+    SQLRETURN rc = SQLCloseCursor(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
+
+// The count from one execute must not leak into the next statement that reports
+// none. A DDL after a counted INSERT reports -1, not the INSERT's count.
+TEST_F(RowCountLiveTest, RowCountResetsBetweenExecutes) {
+    Exec("CREATE TABLE #rc_a(i int)");
+    Exec("INSERT INTO #rc_a VALUES (1), (2), (3)");
+    EXPECT_EQ(3, RowCount());
+
+    Exec("CREATE TABLE #rc_b(i int)");
+    EXPECT_EQ(-1, RowCount());
+}
+
 // SQLRowCount tracks the currently-positioned result set: after SQLMoreResults
 // advances to the next SELECT, the count reflects that result set (-1), not a
 // stale value from the previous one.

@@ -114,4 +114,20 @@ mod tests {
         assert_eq!(rc, SQL_SUCCESS);
         assert_eq!(count, 7);
     }
+
+    #[test]
+    fn poisoned_mutex_returns_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        // Poison the stmt mutex by panicking while it is held.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = stmt_handle.inner.lock().unwrap();
+            panic!("poison the stmt lock");
+        }));
+
+        let mut count: SqlLen = 0;
+        let rc = unsafe { sql_row_count(h.stmt, &mut count) };
+        assert_eq!(rc, SQL_ERROR);
+    }
 }
