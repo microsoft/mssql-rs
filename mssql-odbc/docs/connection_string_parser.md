@@ -137,11 +137,16 @@ invalid *keywords* never fail.
 Each maps (case-insensitively) to a `ConnectionParams` field, which
 `driver_connect` then wires into the mssql-tds `ClientContext` / `EncryptionOptions`.
 Several spellings can share one slot, giving first-wins semantics across the whole
-synonym group (e.g. `Server` / `Addr` / `Address`).
+synonym group (e.g. `Server` / `Addr` / `Address`). The `Server` group is the one
+exception to plain first-wins: a non-empty `Address` / `Addr` takes precedence over
+`Server` regardless of position, and an empty `Address` falls back to `Server`,
+matching the SQL Server Native Client ODBC spec. (This only affects callers that
+pass both keys directly; mssql-python collapses the group to a single canonical
+`Server` before it reaches the driver.)
 
 | Connection-string key(s) | mssql-tds landing spot | Value handling |
 |--------------------------|------------------------|----------------|
-| `Server` / `Addr` / `Address` | `create_client(server)` | verbatim (`server,port`) |
+| `Server` / `Addr` / `Address` | `create_client(server)` | verbatim (`server,port`); `Address`/`Addr` wins over `Server` |
 | `Database` | `ClientContext::database` | verbatim |
 | `UID` | `ClientContext::user_name` | verbatim |
 | `PWD` | `ClientContext::password` | verbatim, redacted in logs |

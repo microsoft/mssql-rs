@@ -351,8 +351,11 @@ fn is_odbc_space(c: char) -> bool {
 
 /// Connection-string keys we act on, paired with their target [`ConnectionParams`]
 /// slot. Keys are lowercase for case-insensitive matching. Several spellings may
-/// share one slot (e.g. `server`/`addr`/`address`); a shared slot yields first-wins
-/// semantics across the whole synonym group, matching msodbcsql.
+/// share one slot; a shared slot yields first-wins semantics across the synonym
+/// group, matching msodbcsql. The `server`/`addr`/`address` group is the one
+/// exception — a non-empty `Address`/`Addr` takes precedence over `Server`
+/// regardless of position (SNAC ODBC spec), so it is resolved in
+/// `parse_connection_string` rather than through this table's first-wins path.
 ///
 /// This table is the single source of truth for *which* keys are acted on. Adding
 /// a key still requires a matching `ConnectionParams` field plus arms in
@@ -402,6 +405,9 @@ fn assign_value(
     value: &str,
 ) -> Result<(), InvalidAttrValue> {
     match slot {
+        // The server/addr/address group is resolved in `parse_connection_string`
+        // (Address takes precedence over Server), so this arm is never reached; it
+        // only keeps the match exhaustive.
         ConnAttrKey::Server => params.server = value.to_string(),
         ConnAttrKey::Database => params.database = value.to_string(),
         ConnAttrKey::Uid => params.uid = value.to_string(),
@@ -524,8 +530,13 @@ pub(crate) fn parse_connection_string(
     let mut params = ConnectionParams::default();
     // One "already seen" flag per acted-on key so the *first* occurrence of a
     // recognized key wins and later duplicates are ignored (e.g. in
-    // "Server=a;Server=b" the stored server is "a").
+    // "Database=a;Database=b" the stored database is "a"). The `server`/`addr`/
+    // `address` group is the exception: it is resolved out-of-band below so a
+    // non-empty Address/Addr can take precedence over Server (SNAC ODBC spec),
+    // while still applying first-wins within each spelling.
     let mut seen_slots = [false; ConnAttrKey::COUNT];
+    let mut server_kw: Option<String> = None;
+    let mut address_kw: Option<String> = None;
     let mut has_warnings = false;
 
     loop {
@@ -580,7 +591,15 @@ pub(crate) fn parse_connection_string(
         // gets a slot to receive the value; everything else parses the value but
         // discards it (mirrors msodbcsql leaving `lpszValue` unstored). `target`
         // is `Some(slot)` only when we will actually store the value.
+        // Set when this iteration's key is in the `server`/`addr`/`address` group;
+        // the value is captured after Phase 4 so Address can take precedence over
+        // Server once both values are known.
+        let mut server_group_is_addr: Option<bool> = None;
         let target = match classify_key(&lower) {
+            KeyClass::Mapped(ConnAttrKey::Server) => {
+                server_group_is_addr = Some(lower == "addr" || lower == "address");
+                None
+            }
             KeyClass::Mapped(slot) => {
                 let idx = slot.idx();
                 if seen_slots[idx] {
@@ -666,7 +685,18 @@ pub(crate) fn parse_connection_string(
         // brace-close checks, so a value with trailing junk is still stored before
         // we stop. An invalid value on a validated key fails immediately (E_FAIL)
         // and aborts the whole parse via the `?`.
-        if let Some(slot) = target {
+        if let Some(is_addr) = server_group_is_addr {
+            // First-wins within each spelling; the Address-vs-Server precedence is
+            // resolved after the loop from `server_kw`/`address_kw`.
+            let captured = if is_addr {
+                &mut address_kw
+            } else {
+                &mut server_kw
+            };
+            if captured.is_none() {
+                *captured = Some(value.clone());
+            }
+        } else if let Some(slot) = target {
             assign_value(&mut params, slot, &lower, &value)?;
         }
 
@@ -684,6 +714,14 @@ pub(crate) fn parse_connection_string(
             i += 1;
         }
     }
+
+    // Resolve the `server`/`addr`/`address` group: a non-empty Address/Addr wins
+    // over Server regardless of position (SNAC ODBC spec); an empty or absent
+    // Address falls back to Server.
+    params.server = match address_kw {
+        Some(addr) if !addr.is_empty() => addr,
+        _ => server_kw.unwrap_or_default(),
+    };
 
     Ok((params, has_warnings))
 }
@@ -1280,13 +1318,35 @@ mod tests {
     }
 
     #[test]
-    fn server_and_address_share_one_slot_first_wins() {
-        let (p, warn) = parse_connection_string("Server=first;Address=second;UID=u").unwrap();
+    fn address_takes_precedence_over_server() {
+        // SNAC ODBC spec: a non-empty Address/Addr wins over Server regardless of
+        // position. (mssql-python never sends both — it collapses the synonym group
+        // first — so this only affects direct ODBC callers.)
+        for s in [
+            "Server=srv;Address=addr;UID=u",
+            "Address=addr;Server=srv;UID=u",
+            "Server=srv;Addr=addr;UID=u",
+            "Addr=addr;Server=srv;UID=u",
+        ] {
+            let (p, warn) = parse_connection_string(s).unwrap();
+            assert!(!warn, "input: {s}");
+            assert_eq!(p.server, "addr", "input: {s}");
+        }
+    }
+
+    #[test]
+    fn empty_address_falls_back_to_server() {
+        let (p, warn) = parse_connection_string("Server=srv;Address=;UID=u").unwrap();
         assert!(!warn);
+        assert_eq!(p.server, "srv");
+    }
+
+    #[test]
+    fn server_group_is_first_wins_within_each_spelling() {
+        let (p, _) = parse_connection_string("Server=first;Server=second;UID=u").unwrap();
         assert_eq!(p.server, "first");
 
-        let (p, warn) = parse_connection_string("Address=first;Server=second;UID=u").unwrap();
-        assert!(!warn);
+        let (p, _) = parse_connection_string("Address=first;Address=second;UID=u").unwrap();
         assert_eq!(p.server, "first");
     }
 

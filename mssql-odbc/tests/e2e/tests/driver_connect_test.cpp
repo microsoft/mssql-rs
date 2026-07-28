@@ -544,10 +544,12 @@ TEST_F(DriverConnectLiveTest, NewConnectionAttributesParity) {
         EXPECT_TRUE(r.hasHY024);
     }
 
-    // Out-of-domain IpAddressPreference -> HY024, connect fails.
+    // Out-of-domain IpAddressPreference is accepted and falls back to IPv4First
+    // at connect time (msodbcsql parity), so the parser raises no error and the
+    // connection succeeds without an 01S00 warning.
     {
         auto r = tryConnect(base + ";IpAddressPreference=IPv7");
-        EXPECT_EQ(SQL_ERROR, r.rc);
-        EXPECT_TRUE(r.hasHY024);
+        EXPECT_TRUE(SQL_SUCCEEDED(r.rc)) << "rc=" << r.rc;
+        EXPECT_FALSE(r.has01S00);
     }
 }
