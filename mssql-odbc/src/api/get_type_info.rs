@@ -120,8 +120,16 @@ fn sql_get_type_info_w_safe(
         };
         free_errors(&mut stmt_state);
 
-        // msodbcsql validates the requested type before the cursor/exec state, so
-        // an invalid type reports HY004/HYC00 even when a cursor is also open.
+        // The cursor/exec state is checked before the data type, matching
+        // msodbcsql (sqlcdd.cpp): an open cursor yields 24000 even for an invalid
+        // type. The Driver Manager likewise rejects an open cursor with 24000
+        // before the call reaches the driver.
+        if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
+            error!("SQLGetTypeInfoW: statement has an active execute or open cursor");
+            post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
+            return SQL_ERROR;
+        }
+
         match classify_sql_type(data_type) {
             TypeClass::Valid => {}
             TypeClass::Udt => {
@@ -134,12 +142,6 @@ fn sql_get_type_info_w_safe(
                 post_diag(&mut stmt_state, ERR_INVALID_SQL_DATA_TYPE);
                 return SQL_ERROR;
             }
-        }
-
-        if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
-            error!("SQLGetTypeInfoW: statement has an active execute or open cursor");
-            post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
-            return SQL_ERROR;
         }
 
         // A new query invalidates prior metadata/context immediately, so a later
@@ -485,16 +487,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_type_wins_over_open_cursor() {
+    fn open_cursor_wins_over_invalid_type() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().set_state(STMT_STATE_CURSOR_OPEN);
 
-        // msodbcsql validates the type before the cursor state, so an invalid
-        // type reports HY004 even with a cursor open.
+        // msodbcsql checks cursor state before the data type, so an open cursor
+        // reports 24000 even when the type is also invalid.
         let ret = unsafe { sql_get_type_info_w(h.stmt, 999) };
         assert_eq!(ret, SQL_ERROR);
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY004);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_24000);
     }
 }

@@ -143,6 +143,22 @@ TEST_F(GetTypeInfoLiveTest, InvalidTypeReturnsHY004) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY004");
 }
 
+// A failed call (invalid type -> HY004) leaves the statement clean, so a
+// subsequent valid call on the same handle succeeds and opens a result set.
+TEST_F(GetTypeInfoLiveTest, RecoversAfterInvalidType) {
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, 999);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY004");
+
+    rc = SQLGetTypeInfo(stmt_, SQL_INTEGER);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    rc = SQLFetch(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLCloseCursor(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
+
 // A user-defined type is not reported as an ODBC type (HYC00), matching
 // msodbcsql.
 TEST_F(GetTypeInfoLiveTest, UdtReturnsHYC00) {
