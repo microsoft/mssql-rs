@@ -152,6 +152,37 @@ TEST_F(RowCountLiveTest, MultiDmlBatchReportsPerStatementCounts) {
     EXPECT_EQ(SQL_NO_DATA, rc);
 }
 
+// A prepared DML statement reports its affected-row count after both the
+// initial SQLExecute (sp_prepexec path) and a re-execution with a new parameter
+// value (sp_execute path) — matching msodbcsql. Uses a varchar parameter since
+// SQLBindParameter currently supports char/wchar C types.
+TEST_F(RowCountLiveTest, PreparedDmlReportsAffectedRows) {
+    Exec("CREATE TABLE #rc_prep(name varchar(10), touched int)");
+    Exec("INSERT INTO #rc_prep VALUES ('a',0),('b',0),('c',0),('d',0)");
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "UPDATE #rc_prep SET touched = touched + 1 WHERE name <= ?");
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // Value is read by reference at each SQLExecute, so the same binding is
+    // reused with a different value below.
+    SQLCHAR param[8] = "b";
+    SQLLEN ind = SQL_NTS;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
+                                   sizeof(param), 0, param, sizeof(param), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // Initial execute → sp_prepexec: name <= 'b' updates 'a','b'.
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, RowCount());
+
+    // Re-execute with a new value → sp_execute: name <= 'd' updates all four.
+    std::strcpy(reinterpret_cast<char*>(param), "d");
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(4, RowCount());
+}
+
 // SQLRowCount tracks the currently-positioned result set: after SQLMoreResults
 // advances to the next SELECT, the count reflects that result set (-1), not a
 // stale value from the previous one.
