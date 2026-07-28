@@ -354,7 +354,8 @@ fn is_odbc_space(c: char) -> bool {
 /// share one slot; a shared slot yields first-wins semantics across the synonym
 /// group, matching msodbcsql. The `server`/`addr`/`address` group is the one
 /// exception — a non-empty `Address`/`Addr` takes precedence over `Server`
-/// regardless of position (SNAC ODBC spec), so it is resolved in
+/// regardless of position (msodbcsql `sqlcconn.cpp` builds its login target from
+/// `KEY_ADDR` when Address has a value, else `KEY_SERVER`), so it is resolved in
 /// `parse_connection_string` rather than through this table's first-wins path.
 ///
 /// This table is the single source of truth for *which* keys are acted on. Adding
@@ -532,7 +533,7 @@ pub(crate) fn parse_connection_string(
     // recognized key wins and later duplicates are ignored (e.g. in
     // "Database=a;Database=b" the stored database is "a"). The `server`/`addr`/
     // `address` group is the exception: it is resolved out-of-band below so a
-    // non-empty Address/Addr can take precedence over Server (SNAC ODBC spec),
+    // non-empty Address/Addr can take precedence over Server (msodbcsql parity),
     // while still applying first-wins within each spelling.
     let mut seen_slots = [false; ConnAttrKey::COUNT];
     let mut server_kw: Option<String> = None;
@@ -715,9 +716,10 @@ pub(crate) fn parse_connection_string(
         }
     }
 
-    // Resolve the `server`/`addr`/`address` group: a non-empty Address/Addr wins
-    // over Server regardless of position (SNAC ODBC spec); an empty or absent
-    // Address falls back to Server.
+    // Resolve the `server`/`addr`/`address` group to match msodbcsql `sqlcconn.cpp`
+    // (login target = KEY_ADDR when Address has a value, else KEY_SERVER): a
+    // non-empty Address/Addr wins over Server regardless of position; an empty or
+    // absent Address falls back to Server.
     params.server = match address_kw {
         Some(addr) if !addr.is_empty() => addr,
         _ => server_kw.unwrap_or_default(),
@@ -1319,9 +1321,9 @@ mod tests {
 
     #[test]
     fn address_takes_precedence_over_server() {
-        // SNAC ODBC spec: a non-empty Address/Addr wins over Server regardless of
-        // position. (mssql-python never sends both — it collapses the synonym group
-        // first — so this only affects direct ODBC callers.)
+        // msodbcsql parity (sqlcconn.cpp): a non-empty Address/Addr wins over Server
+        // regardless of position. (mssql-python never sends both — it collapses the
+        // synonym group first — so this only affects direct ODBC callers.)
         for s in [
             "Server=srv;Address=addr;UID=u",
             "Address=addr;Server=srv;UID=u",

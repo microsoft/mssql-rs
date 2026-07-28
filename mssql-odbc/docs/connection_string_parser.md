@@ -140,7 +140,8 @@ Several spellings can share one slot, giving first-wins semantics across the who
 synonym group (e.g. `Server` / `Addr` / `Address`). The `Server` group is the one
 exception to plain first-wins: a non-empty `Address` / `Addr` takes precedence over
 `Server` regardless of position, and an empty `Address` falls back to `Server`,
-matching the SQL Server Native Client ODBC spec. (This only affects callers that
+matching the msodbcsql driver (`sqlcconn.cpp` builds its login target from `KEY_ADDR`
+when Address has a value, otherwise `KEY_SERVER`). (This only affects callers that
 pass both keys directly; mssql-python collapses the group to a single canonical
 `Server` before it reaches the driver.)
 
