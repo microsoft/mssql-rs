@@ -310,6 +310,19 @@ mod tests {
     }
 
     #[test]
+    fn exported_wrapper_forwards_to_impl() {
+        // Exercise the extern "C" entrypoint (init_tracing + delegation) rather
+        // than the inner impl the other tests call directly.
+        let null = unsafe { crate::api::exports::SQLGetTypeInfoW(SQL_NULL_HANDLE, SQL_ALL_TYPES) };
+        assert_eq!(null, SQL_INVALID_HANDLE);
+
+        // An invalid type is rejected before any I/O, so no connection is needed.
+        let h = TestHandles::with_env_dbc_stmt();
+        let invalid = unsafe { crate::api::exports::SQLGetTypeInfoW(h.stmt, 999) };
+        assert_eq!(invalid, SQL_ERROR);
+    }
+
+    #[test]
     fn type_info_column_names_are_version_aware() {
         // ODBC 3.x names (the mssql-python swap target).
         assert_eq!(
