@@ -245,7 +245,7 @@ mod tests {
         assert_eq!(stmt_state.diag_records[0].sql_state, SQLSTATE_HY000);
         assert_eq!(
             stmt_state.diag_records[0].message,
-            "Connection is busy with results for another command"
+            "[Microsoft][ODBC Driver 18 for SQL Server]Connection is busy with results for another command"
         );
         drop(stmt_state);
 
