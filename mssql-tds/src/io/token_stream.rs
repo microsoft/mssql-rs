@@ -491,6 +491,14 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
     match token_type {
         TokenType::Row => {
             let (columns, decryptor) = extract_row_context(context)?;
+            if writer.pause_before_first_column() {
+                return Ok(RowReadResult::RowPaused(RowPauseState {
+                    next_column_index: 0,
+                    columns: columns.to_vec(),
+                    nbc_null_bitmap: None,
+                    decryptor: decryptor.cloned(),
+                }));
+            }
             decode_row_columns(reader, columns, decryptor, 0, writer).await
         }
         TokenType::NbcRow => {
@@ -498,6 +506,14 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
             let bitmap_len = columns.len().div_ceil(8);
             let mut bitmap = vec![0u8; bitmap_len];
             reader.read_bytes(&mut bitmap).await?;
+            if writer.pause_before_first_column() {
+                return Ok(RowReadResult::RowPaused(RowPauseState {
+                    next_column_index: 0,
+                    columns: columns.to_vec(),
+                    nbc_null_bitmap: Some(bitmap),
+                    decryptor: decryptor.cloned(),
+                }));
+            }
             decode_nbcrow_columns(reader, columns, decryptor, &bitmap, 0, writer).await
         }
         _ => {

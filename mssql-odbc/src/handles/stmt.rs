@@ -4,11 +4,11 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use mssql_tds::datatypes::column_values::ColumnValues;
-use mssql_tds::query::metadata::ColumnMetadata;
 use super::{DbcHandle, HandleType, HasObjectType};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
+use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::query::metadata::ColumnMetadata;
 
 pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
 pub(crate) const STMT_STATE_PREPARED: u32 = 0x0000_0200;
@@ -61,6 +61,8 @@ pub(crate) struct StmtState {
     /// The C target type used for the active PLP stream (`SQL_C_CHAR` or
     /// `SQL_C_WCHAR`). Mixed target-type chunking on one stream is rejected.
     pub(crate) active_plp_target_type: Option<i16>,
+    /// Whether the active PLP column contains UTF-16LE data (NVARCHAR/XML).
+    pub(crate) active_plp_is_unicode: bool,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
 }
@@ -125,6 +127,7 @@ impl StmtHandle {
                 current_row_complete: false,
                 active_plp_column: None,
                 active_plp_target_type: None,
+                active_plp_is_unicode: false,
                 state_flags: 0,
             }),
         }

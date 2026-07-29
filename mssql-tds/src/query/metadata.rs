@@ -82,6 +82,15 @@ impl ColumnMetadata {
             TypeInfoVariant::PartialLen(_, _, _, _, _)
         )
     }
+
+    /// Returns `true` for Unicode character columns (`nvarchar`, `nchar`, `xml`).
+    /// The wire encoding for these types is UTF-16LE.
+    pub fn is_unicode_text(&self) -> bool {
+        matches!(
+            self.data_type,
+            TdsDataType::NVarChar | TdsDataType::NChar | TdsDataType::Xml
+        )
+    }
     /// Returns the scale for decimal/numeric/time types.
     ///
     /// Returns `Some(scale)` for types that include scale information (e.g., `decimal(18,4)`, `time(7)`),

@@ -402,6 +402,7 @@ fn resume_row_to_column(
 ///
 /// This never buffers the full PLP payload in ODBC-layer memory. The TDS
 /// client remains the owner of stream state between repeated calls.
+#[allow(clippy::too_many_arguments)]
 fn stream_active_plp_chunk(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
@@ -428,6 +429,10 @@ fn stream_active_plp_chunk(
         if starting_new_stream {
             stmt_state.active_plp_column = Some(col_index);
             stmt_state.active_plp_target_type = None;
+            stmt_state.active_plp_is_unicode = stmt_state
+                .column_metadata
+                .get(col_index - 1)
+                .is_some_and(|m| m.is_unicode_text());
         }
 
         if stmt_state.active_plp_column != Some(col_index) {
@@ -465,6 +470,13 @@ fn stream_active_plp_chunk(
     };
     let mut payload = vec![0u8; max_read];
 
+    let is_unicode_plp = {
+        let Ok(ss) = stmt.inner.lock() else {
+            return SQL_ERROR;
+        };
+        ss.active_plp_is_unicode
+    };
+
     let dbc = stmt.parent_dbc();
     let mut client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
@@ -493,7 +505,9 @@ fn stream_active_plp_chunk(
         client
     };
 
-    let read_result = dbc.runtime.block_on(client.read_active_plp_bytes(&mut payload));
+    let read_result = dbc
+        .runtime
+        .block_on(client.read_active_plp_bytes(&mut payload));
     let reached_end = client.active_plp_reached_end();
 
     if let Ok(mut dbc_state) = dbc.inner.lock() {
@@ -522,6 +536,23 @@ fn stream_active_plp_chunk(
         unsafe {
             copy_with_nul(target_value_ptr as *mut SqlWChar, buf_elements, &units);
             write_if_some(strlen_or_ind_ptr, usable as SqlLen);
+        }
+    } else if is_unicode_plp {
+        // NVARCHAR PLP wire bytes are UTF-16LE; convert to UTF-8 for SQL_C_CHAR.
+        let usable = read & !1;
+        let units: Vec<u16> = payload[..usable]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        let utf8 = String::from_utf16_lossy(&units);
+        let utf8_bytes = utf8.as_bytes();
+        unsafe {
+            copy_with_nul(
+                target_value_ptr as *mut u8,
+                buffer_length as usize,
+                utf8_bytes,
+            );
+            write_if_some(strlen_or_ind_ptr, utf8_bytes.len() as SqlLen);
         }
     } else {
         unsafe {

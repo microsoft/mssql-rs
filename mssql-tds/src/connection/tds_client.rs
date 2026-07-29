@@ -2695,10 +2695,23 @@ impl TdsClient {
             ));
         }
 
+        // When the writer requests pause-before-first-column it is acting as an
+        // "advance to next row" consumer (ODBC SQLFetch). Any currently-paused
+        // row must be drained first so the next receive_row_into reads a fresh
+        // ROW/NBCROW token rather than resuming the old one.
+        let advance_to_next_row = writer.pause_before_first_column();
+
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
             ActiveRowReadState::Idle => {}
             ActiveRowReadState::RowPaused(pause_state) => {
-                return self.resume_row_loop(*pause_state, writer).await;
+                if advance_to_next_row {
+                    let col_count = pause_state.columns.len();
+                    let mut drain = DefaultRowWriter::new(col_count);
+                    self.resume_row_loop(*pause_state, &mut drain).await?;
+                    // State is now Idle; fall through to read the next row.
+                } else {
+                    return self.resume_row_loop(*pause_state, writer).await;
+                }
             }
             ActiveRowReadState::PlpPaused(mut plp_state) => {
                 let mut buffer = [0u8; 8192];
@@ -2721,9 +2734,17 @@ impl TdsClient {
                         ));
                     }
                 }
-                return self
-                    .resume_row_loop(plp_state.row_pause_state, writer)
-                    .await;
+                if advance_to_next_row {
+                    let col_count = plp_state.row_pause_state.columns.len();
+                    let mut drain = DefaultRowWriter::new(col_count);
+                    self.resume_row_loop(plp_state.row_pause_state, &mut drain)
+                        .await?;
+                    // State is now Idle; fall through to read the next row.
+                } else {
+                    return self
+                        .resume_row_loop(plp_state.row_pause_state, writer)
+                        .await;
+                }
             }
         }
 
