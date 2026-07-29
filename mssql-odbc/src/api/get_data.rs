@@ -160,11 +160,11 @@ fn sql_get_data_safe(
         strlen_or_ind_ptr,
     };
 
-    // ---- PLP continuation / already-consumed short-circuit ----
+    // ---- PLP continuation / backward-column rejection ----
     // Checked before taking the client so a repeat call on a scalar column can
-    // short-circuit to SQL_NO_DATA without I/O.
+    // short-circuit without I/O.
     {
-        let Ok(stmt_state) = stmt.inner.lock() else {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLGetData: stmt mutex poisoned");
             return SQL_ERROR;
         };
@@ -179,9 +179,19 @@ fn sql_get_data_safe(
         }
         let col0 = usize::from(column_number) - 1;
         if col0 < stmt_state.getdata_next_col {
-            // Column already fully retrieved on this row.
-            debug!(column_number, "SQLGetData: column already consumed");
-            return SQL_NO_DATA;
+            // This driver does not advertise SQL_GD_ANY_ORDER, so columns must be
+            // retrieved in non-decreasing order. `getdata_next_col` holds the
+            // 1-based ordinal of the most recently consumed column.
+            if usize::from(column_number) == stmt_state.getdata_next_col {
+                // Re-requesting the column just retrieved: the value is already
+                // exhausted, so report end-of-data per the SQLGetData contract.
+                debug!(column_number, "SQLGetData: column already exhausted");
+                return SQL_NO_DATA;
+            }
+            // A strictly earlier column: backward retrieval is not supported.
+            debug!(column_number, "SQLGetData: backward column access rejected");
+            post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
+            return SQL_ERROR;
         }
     }
 
@@ -675,9 +685,9 @@ mod tests {
     }
 
     #[test]
-    fn get_data_already_consumed_column_returns_no_data() {
-        // A column earlier than the get-data cursor was already retrieved on this
-        // row; re-requesting it returns SQL_NO_DATA without touching the wire.
+    fn get_data_backward_column_is_rejected() {
+        // Columns 1..=3 were consumed (cursor at 3). Requesting an earlier column
+        // (2) is backward retrieval, which this driver rejects with 07009.
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = h.stmt;
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
@@ -685,7 +695,7 @@ mod tests {
             let mut s = stmt_handle.inner.lock().unwrap();
             s.set_state(STMT_STATE_CURSOR_OPEN);
             s.row_active = true;
-            s.getdata_next_col = 3; // columns 1..=3 (0-based 0..3) already consumed
+            s.getdata_next_col = 3; // columns 1..=3 already consumed
         }
 
         let mut buf = [0u8; 8];
@@ -694,6 +704,35 @@ mod tests {
             sql_get_data(
                 stmt,
                 2,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn get_data_reread_just_consumed_column_returns_no_data() {
+        // Re-requesting the column that was most recently retrieved (cursor == its
+        // ordinal) reports end-of-data, matching the SQLGetData streaming contract.
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.row_active = true;
+            s.getdata_next_col = 3; // column 3 was the last consumed
+        }
+
+        let mut buf = [0u8; 8];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                3,
                 SQL_C_CHAR,
                 buf.as_mut_ptr() as SqlPointer,
                 buf.len() as SqlLen,

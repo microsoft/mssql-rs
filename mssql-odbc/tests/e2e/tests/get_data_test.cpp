@@ -102,9 +102,10 @@ TEST_F(GetDataLiveTest, ColumnWiseAscending) {
     SQLCloseCursor(stmt_);
 }
 
-// Re-requesting a column already consumed on the current row returns
-// SQL_NO_DATA (forward-only SQLGetData semantics).
-TEST_F(GetDataLiveTest, ReReadConsumedColumnReturnsNoData) {
+// Re-requesting a column strictly earlier than the last one retrieved is
+// backward retrieval, which this driver rejects (SQLSTATE 07009). Re-requesting
+// the column just retrieved reports end-of-data (SQL_NO_DATA).
+TEST_F(GetDataLiveTest, BackwardColumnRejectedRereadIsNoData) {
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT CAST(10 AS INT) AS c1, "
                       "CAST(20 AS INT) AS c2, "
@@ -117,13 +118,15 @@ TEST_F(GetDataLiveTest, ReReadConsumedColumnReturnsNoData) {
     EXPECT_EQ("20", GetChar(2, &rc));
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 
-    // Column 1 was drained while reaching column 2; re-request is SQL_NO_DATA.
+    // Column 1 was drained while reaching column 2; requesting it now is a
+    // backward access and returns SQL_ERROR with SQLSTATE 07009.
     SQLCHAR buf[16] = {0};
     SQLLEN ind = 0;
     rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind);
-    EXPECT_EQ(SQL_NO_DATA, rc);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07009");
 
-    // Re-requesting the just-read column 2 is also SQL_NO_DATA.
+    // Re-requesting the just-retrieved column 2 returns SQL_NO_DATA.
     rc = SQLGetData(stmt_, 2, SQL_C_CHAR, buf, sizeof(buf), &ind);
     EXPECT_EQ(SQL_NO_DATA, rc);
 
