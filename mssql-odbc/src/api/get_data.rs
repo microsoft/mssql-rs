@@ -7,9 +7,9 @@ use tracing::{debug, error};
 
 use super::odbc_row_writer::OdbcRowWriter;
 use super::odbc_types::{
-    SQL_C_CHAR, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_TOTAL, SQL_NULL_DATA,
-    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
-    SqlUSmallInt,
+    SQL_C_CHAR, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_TOTAL,
+    SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer, SqlReturn,
+    SqlSmallInt, SqlUSmallInt,
 };
 use super::sqlstate::*;
 use crate::api::odbc_types::SqlWChar;
@@ -154,6 +154,18 @@ fn sql_get_data_safe(
         stmt_state.active_plp_target_type = None;
     }
 
+    // Enforce forward-only column access within a row.
+    let last_col = stmt_state.current_row_last_col;
+    if last_col > 0 {
+        if col_index < last_col {
+            post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
+            return SQL_ERROR;
+        }
+        if col_index == last_col {
+            return SQL_NO_DATA;
+        }
+    }
+
     let Some(row) = stmt_state.current_row.as_ref() else {
         post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "No current row");
         return SQL_ERROR;
@@ -255,8 +267,6 @@ fn write_column_as_text(
     let value = &row[col_index - 1];
     if matches!(value, ColumnValues::Null) {
         unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
-        // Write a NUL terminator into the caller buffer when there's room. The
-        // helper handles null `dst` and zero-length uniformly.
         if target_type == SQL_C_WCHAR {
             unsafe {
                 copy_with_nul(target_value_ptr as *mut SqlWChar, buf_elements, &[]);
@@ -266,6 +276,7 @@ fn write_column_as_text(
                 copy_with_nul(target_value_ptr as *mut u8, buf_elements, &[]);
             }
         }
+        stmt_state.current_row_last_col = col_index;
         return SQL_SUCCESS;
     }
 
@@ -279,7 +290,7 @@ fn write_column_as_text(
         return SQL_ERROR;
     };
 
-    if target_type == SQL_C_WCHAR {
+    let rc = if target_type == SQL_C_WCHAR {
         let utf16: Vec<u16> = as_text.encode_utf16().collect();
         write_string_result(
             stmt_state,
@@ -296,7 +307,11 @@ fn write_column_as_text(
             buf_elements,
             strlen_or_ind_ptr,
         )
+    };
+    if rc != SQL_ERROR {
+        stmt_state.current_row_last_col = col_index;
     }
+    rc
 }
 
 fn resume_row_to_column(
@@ -429,10 +444,25 @@ fn stream_active_plp_chunk(
         if starting_new_stream {
             stmt_state.active_plp_column = Some(col_index);
             stmt_state.active_plp_target_type = None;
-            stmt_state.active_plp_is_unicode = stmt_state
+            let (is_unicode, is_binary) = stmt_state
                 .column_metadata
                 .get(col_index - 1)
-                .is_some_and(|m| m.is_unicode_text());
+                .map(|m| (m.is_unicode_text(), m.is_binary_type()))
+                .unwrap_or((false, false));
+            stmt_state.active_plp_is_unicode = is_unicode;
+            stmt_state.active_plp_is_binary = is_binary;
+            stmt_state.current_row_last_col = col_index;
+        }
+
+        // Binary PLP columns (VARBINARY) cannot be delivered as character data.
+        if stmt_state.active_plp_is_binary {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HYC00,
+                0,
+                "Target type not yet implemented for binary columns",
+            );
+            return SQL_ERROR;
         }
 
         if stmt_state.active_plp_column != Some(col_index) {

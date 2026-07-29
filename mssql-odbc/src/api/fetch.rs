@@ -132,6 +132,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             stmt_state.current_row_complete = row_complete;
             stmt_state.active_plp_column = None;
             stmt_state.active_plp_target_type = None;
+            stmt_state.current_row_last_col = 0;
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();
@@ -191,6 +192,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             stmt_state.current_row_complete = false;
             stmt_state.active_plp_column = None;
             stmt_state.active_plp_target_type = None;
+            stmt_state.current_row_last_col = 0;
             // Don't clear CURSOR_OPEN here: the cursor stays open until
             // SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE).
             drop(stmt_state);
@@ -208,6 +210,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 stmt_state.current_row_complete = false;
                 stmt_state.active_plp_column = None;
                 stmt_state.active_plp_target_type = None;
+                stmt_state.current_row_last_col = 0;
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
                 let info_messages = client.take_info_messages();

@@ -58,12 +58,10 @@ impl OdbcRowWriter {
             self.row[col] = value;
             return;
         }
-
-        debug_assert_eq!(
-            col,
-            self.row.len(),
-            "RowWriter emitted non-sequential column index"
-        );
+        // PLP columns are streamed out-of-band and leave gaps; fill with Null.
+        while self.row.len() < col {
+            self.row.push(ColumnValues::Null);
+        }
         self.row.push(value);
     }
 }

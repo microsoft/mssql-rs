@@ -91,6 +91,18 @@ impl ColumnMetadata {
             TdsDataType::NVarChar | TdsDataType::NChar | TdsDataType::Xml
         )
     }
+
+    /// Returns `true` for binary columns (`varbinary`, `binary`, `image`, etc.).
+    pub fn is_binary_type(&self) -> bool {
+        matches!(
+            self.data_type,
+            TdsDataType::BigVarBinary
+                | TdsDataType::BigBinary
+                | TdsDataType::VarBinary
+                | TdsDataType::Binary
+                | TdsDataType::Image
+        )
+    }
     /// Returns the scale for decimal/numeric/time types.
     ///
     /// Returns `Some(scale)` for types that include scale information (e.g., `decimal(18,4)`, `time(7)`),

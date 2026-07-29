@@ -63,6 +63,11 @@ pub(crate) struct StmtState {
     pub(crate) active_plp_target_type: Option<i16>,
     /// Whether the active PLP column contains UTF-16LE data (NVARCHAR/XML).
     pub(crate) active_plp_is_unicode: bool,
+    /// Whether the active PLP column is a binary type (VARBINARY/BINARY/IMAGE).
+    pub(crate) active_plp_is_binary: bool,
+    /// 1-based column number of the last successful SQLGetData call on this row.
+    /// Used to enforce forward-only column access (07009) and SQL_NO_DATA on re-read.
+    pub(crate) current_row_last_col: usize,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
 }
@@ -128,6 +133,8 @@ impl StmtHandle {
                 active_plp_column: None,
                 active_plp_target_type: None,
                 active_plp_is_unicode: false,
+                active_plp_is_binary: false,
+                current_row_last_col: 0,
                 state_flags: 0,
             }),
         }
