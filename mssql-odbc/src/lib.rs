@@ -7,6 +7,7 @@ pub mod api;
 mod auth;
 mod connection;
 mod error;
+mod fetch_engine;
 mod handles;
 mod params;
 #[cfg(test)]

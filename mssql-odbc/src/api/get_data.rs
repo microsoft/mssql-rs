@@ -4,12 +4,12 @@
 //! `SQLGetData` — msodbcsql-style column-wise retrieval.
 //!
 //! `SQLFetch` positions the cursor on a row without decoding any column (see
-//! [`OdbcRowWriter`](crate::api::row_writer::OdbcRowWriter)). Each `SQLGetData`
+//! [`OdbcRowWriter`](crate::fetch_engine::row_writer::OdbcRowWriter)). Each `SQLGetData`
 //! then decodes exactly the requested column, draining any intervening columns
 //! off the wire. Columns must be requested in non-decreasing order; a column
 //! already consumed reports `SQL_NO_DATA`. PLP (`*(MAX)` / `xml`) values are
 //! streamed chunk-by-chunk across repeated `SQLGetData` calls for the same
-//! column (see [`plp_stream`](crate::api::plp_stream)).
+//! column (see [`plp_stream`](crate::fetch_engine::plp_stream)).
 
 use tracing::{debug, error};
 
@@ -20,8 +20,8 @@ use super::odbc_types::{
 };
 use super::sqlstate::*;
 use crate::api::odbc_types::SqlWChar;
-use crate::api::plp_stream::{PlpStream, PlpTarget, pump_wire};
-use crate::api::row_writer::OdbcRowWriter;
+use crate::fetch_engine::plp_stream::{PlpStream, PlpTarget, pump_wire};
+use crate::fetch_engine::row_writer::OdbcRowWriter;
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;

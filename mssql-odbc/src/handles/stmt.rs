@@ -63,7 +63,7 @@ pub(crate) struct StmtState {
     /// Active chunk-by-chunk PLP (`*(MAX)` / `xml`) stream for the column
     /// currently being retrieved through repeated `SQLGetData` calls; `None`
     /// when no PLP stream is in progress.
-    pub(crate) plp_stream: Option<crate::api::plp_stream::PlpStream>,
+    pub(crate) plp_stream: Option<crate::fetch_engine::plp_stream::PlpStream>,
     /// Rowset size for block fetches (`SQL_ATTR_ROW_ARRAY_SIZE`). Defaults to 1
     /// (single-row). Consumed by the columnar `SQLFetchScroll` path.
     pub(crate) row_array_size: SqlULen,

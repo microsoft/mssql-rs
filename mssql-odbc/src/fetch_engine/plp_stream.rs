@@ -4,7 +4,7 @@
 //! Chunked PLP (`*(MAX)` / `xml`) streaming state for `SQLGetData`.
 //!
 //! When `SQLGetData` targets a PLP column, the TDS decoder pauses at the PLP
-//! boundary (see [`OdbcRowWriter`](crate::api::row_writer::OdbcRowWriter)) and
+//! boundary (see [`OdbcRowWriter`](crate::fetch_engine::row_writer::OdbcRowWriter)) and
 //! the bytes are pulled off the wire on demand via
 //! [`ResultSet::read_active_plp_bytes`](mssql_tds::connection::tds_client::ResultSet::read_active_plp_bytes).
 //! A single logical value is delivered across repeated `SQLGetData` calls: each
