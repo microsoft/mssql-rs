@@ -14,9 +14,19 @@
 //! 4. Exchange the `code` (with the PKCE verifier) at the `/token` endpoint.
 //!
 //! The Azure SDK (`azure_identity`) ships no interactive credential, so the flow
-//! is implemented directly here. It uses the well-known msodbcsql / `SqlClient`
-//! public-client id and an `http://localhost` loopback redirect, matching the
-//! classic driver so no app registration is required.
+//! is implemented directly here, presenting msodbcsql's application id so both
+//! drivers are one identity in Entra; see [`PUBLIC_CLIENT_ID`].
+//!
+//! Platform mechanism, and how it differs from the sibling drivers:
+//! - Linux/macOS: this loopback flow is the only option. msodbcsql has no
+//!   interactive support off Windows (its WAM path is compiled out, and
+//!   `mssql-auth` has no non-Windows build), and SqlClient uses this same
+//!   system-browser + `http://localhost` pattern there.
+//! - Windows: msodbcsql and SqlClient both broker through WAM, which additionally
+//!   satisfies device-based Conditional Access and signs in silently from the
+//!   logged-on account. Adopting `mssql-auth` here is tracked by AB#46684; this
+//!   flow then stays as the fallback for contexts WAM cannot serve, such as
+//!   Session 0 services, where its WinRT dependency rules it out.
 //!
 //! Security notes:
 //! - PKCE (`S256`) binds the authorization code to this process; the `state`
@@ -33,8 +43,10 @@
 //!   attacker-controlled authority — use `Encrypt=Strict` or a validated server
 //!   certificate for interactive auth.
 //! - The loopback listener binds IPv4 `127.0.0.1` while the redirect advertises
-//!   `http://localhost` (matching MSAL.NET); hosts that resolve `localhost` only
-//!   to IPv6 `::1` are a known gap.
+//!   `http://localhost` (matching MSAL.NET). The `localhost` form is required:
+//!   Entra accepts a registered `http://localhost` on any port, but never the
+//!   `127.0.0.1` or `[::1]` literals. Hosts that resolve `localhost` only to
+//!   IPv6 `::1` are a known gap.
 
 use std::time::Duration;
 
@@ -54,11 +66,24 @@ use mssql_tds::core::TdsResult;
 use mssql_tds::error::Error;
 use mssql_tds::security::SecurityError;
 
-/// Well-known Microsoft public-client id used by msodbcsql / `SqlClient` for
-/// ActiveDirectory Interactive. It is registered with an `http://localhost`
-/// loopback redirect for native clients, so reusing it matches the classic
-/// driver and needs no per-app registration.
-const PUBLIC_CLIENT_ID: &str = "a94f9c62-97fe-4d19-b06d-472bed8d2bcb";
+/// Public-client id used for the interactive authorization-code + PKCE flow.
+///
+/// This is msodbcsql's application id, used on every platform so the Rust driver
+/// presents the same identity to Entra as the C++ driver: one app registration,
+/// one set of tenant sign-in logs, one conditional-access target.
+///
+/// # Pending loopback registration (AB#46683)
+///
+/// msodbcsql only signs in interactively through the Windows WAM broker, so this
+/// application is registered for broker redirects only. Verified against Entra:
+/// `ms-appx-web://microsoft.aad.brokerplugin/{client_id}` and `https://sqlaad/`
+/// are accepted, while `http://localhost` (with or without a port) is not.
+///
+/// Until `http://localhost` is added, this flow fails — and it fails late, since
+/// Entra defers redirect validation until after authentication, so the user
+/// completes sign-in and only then receives `AADSTS50011`. The Windows broker
+/// redirect needs no change, so AB#46684 is unblocked by comparison.
+const PUBLIC_CLIENT_ID: &str = "2c1229aa-16c5-4ff5-b46b-4f7fe2a2a9c8";
 
 /// Fallback browser-wait timeout, used by [`wait_for_redirect_bounded`] only
 /// when no effective login timeout is available. In normal operation the
@@ -220,6 +245,15 @@ fn token_endpoint(authority: &str, tenant: &str) -> String {
     format!("{authority}/{tenant}/oauth2/v2.0/token")
 }
 
+/// Builds the loopback redirect advertised to Entra. Must use the `localhost`
+/// host: Entra matches a registered `http://localhost` on any port, but rejects
+/// the `127.0.0.1` and `[::1]` literals even though the listener itself binds
+/// `127.0.0.1`. See [`PUBLIC_CLIENT_ID`] for the pending registration of this
+/// redirect.
+fn loopback_redirect_uri(port: u16) -> String {
+    format!("http://localhost:{port}")
+}
+
 /// Runs the full interactive flow and returns the raw access token.
 async fn acquire_interactive_token(
     authority: &str,
@@ -239,8 +273,9 @@ async fn acquire_interactive_token(
         .local_addr()
         .map_err(|e| Error::ConnectionError(format!("failed to read listener address: {e}")))?
         .port();
-    // Loopback redirect per RFC 8252; the well-known client allows any port.
-    let redirect_uri = format!("http://localhost:{port}");
+    // Loopback redirect per RFC 8252; see `loopback_redirect_uri` for why the
+    // advertised host differs from the bound address.
+    let redirect_uri = loopback_redirect_uri(port);
 
     let authorize_url = build_authorize_url(&AuthorizeRequest {
         authority,
@@ -309,7 +344,17 @@ async fn wait_for_redirect_bounded(
         Some(dur) => tokio::time::timeout(dur, wait_for_redirect(listener, expected_state))
             .await
             .map_err(|_| {
-                Error::ConnectionError("timed out waiting for interactive sign-in".into())
+                // A silent expiry is ambiguous: the sign-in page can fail without
+                // ever redirecting here, so the listener just waits. Point at the
+                // browser, where Entra reports the real cause -- most likely
+                // AADSTS50011 until the loopback redirect is registered (AB#46683).
+                Error::ConnectionError(
+                    "timed out waiting for interactive sign-in: the browser never \
+                     returned to the loopback redirect. Check the browser window for \
+                     an Entra error such as AADSTS50011 (redirect URI not registered \
+                     for the application)"
+                        .into(),
+                )
             })?,
         None => wait_for_redirect(listener, expected_state).await,
     }
@@ -692,6 +737,18 @@ mod tests {
     }
 
     #[test]
+    fn loopback_redirect_uses_localhost_host_not_ip_literal() {
+        // Entra accepts `http://localhost` on any port for this app registration
+        // but rejects the `127.0.0.1` / `[::1]` literals, so the advertised
+        // redirect must keep the `localhost` host even though the listener binds
+        // `127.0.0.1`.
+        let uri = loopback_redirect_uri(54321);
+        assert_eq!(uri, "http://localhost:54321");
+        assert!(!uri.contains("127.0.0.1"));
+        assert!(!uri.contains("::1"));
+    }
+
+    #[test]
     fn token_endpoint_is_v2() {
         assert_eq!(
             token_endpoint("https://login.microsoftonline.com", "my-tenant"),
@@ -796,6 +853,24 @@ mod tests {
         assert_eq!(redirect_wait_cap(None), Some(REDIRECT_TIMEOUT));
     }
 
+    #[test]
+    fn redirect_wait_timeout_points_at_the_browser() {
+        // The sign-in page can fail without ever redirecting back, so a bare
+        // expiry says nothing useful; the message has to send the user to the
+        // browser. One second is the smallest expressible cap.
+        block_on_io(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let err = wait_for_redirect_bounded(&listener, "the-state", Some(1))
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("timed out") && msg.contains("AADSTS50011"),
+                "timeout must name the browser-side cause, got: {msg}"
+            );
+        });
+    }
+
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -834,6 +909,172 @@ mod tests {
                 "expected the overall deadline to fire quickly, took {elapsed:?}"
             );
             drop(client);
+        });
+    }
+
+    /// Spawns a one-shot loopback HTTP server that captures the request body and
+    /// replies with `status` and `body`. Returns the base authority to pass to
+    /// [`exchange_code_for_token`] plus a handle yielding the captured body.
+    async fn spawn_token_endpoint(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Read the headers, then exactly the advertised Content-Length so the
+            // captured form body is complete before replying.
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(headers_end) = text.find("\r\n\r\n") {
+                    let len: usize = text
+                        .to_ascii_lowercase()
+                        .split("\r\n")
+                        .find_map(|line| {
+                            line.strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= headers_end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&buf).to_string();
+            let response = format!(
+                "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            request
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    async fn exchange_against(authority: &str) -> TdsResult<String> {
+        exchange_code_for_token(
+            authority,
+            "my-tenant",
+            "client-123",
+            "https://database.windows.net/.default",
+            "http://localhost:54321",
+            "the-auth-code",
+            "the-verifier",
+        )
+        .await
+    }
+
+    fn block_on_io<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    #[test]
+    fn token_exchange_posts_expected_form_and_returns_token() {
+        block_on_io(async {
+            let (authority, server) = spawn_token_endpoint(
+                "HTTP/1.1 200 OK",
+                r#"{"token_type":"Bearer","expires_in":3599,"access_token":"the.jwt.token"}"#,
+            )
+            .await;
+
+            let token = exchange_against(&authority).await.unwrap();
+            assert_eq!(token, "the.jwt.token");
+
+            let request = server.await.unwrap();
+            assert!(
+                request.starts_with("POST /my-tenant/oauth2/v2.0/token "),
+                "unexpected request line: {request}"
+            );
+            let body = request.rsplit("\r\n\r\n").next().unwrap_or_default();
+            let pairs: std::collections::HashMap<_, _> =
+                url::form_urlencoded::parse(body.as_bytes())
+                    .into_owned()
+                    .collect();
+            assert_eq!(pairs["client_id"], "client-123");
+            assert_eq!(pairs["grant_type"], "authorization_code");
+            assert_eq!(pairs["code"], "the-auth-code");
+            assert_eq!(pairs["redirect_uri"], "http://localhost:54321");
+            assert_eq!(pairs["code_verifier"], "the-verifier");
+            assert_eq!(pairs["scope"], "https://database.windows.net/.default");
+            // Public client: no secret may ever be sent.
+            assert!(!pairs.contains_key("client_secret"));
+        });
+    }
+
+    #[test]
+    fn token_exchange_maps_oauth_error_to_non_transient_denial() {
+        block_on_io(async {
+            let (authority, server) = spawn_token_endpoint(
+                "HTTP/1.1 400 Bad Request",
+                r#"{"error":"invalid_grant","error_description":"AADSTS70008: expired"}"#,
+            )
+            .await;
+
+            let err = exchange_against(&authority).await.unwrap_err();
+            let _ = server.await;
+
+            assert!(
+                matches!(
+                    err,
+                    Error::Security(SecurityError::AuthenticationDenied(ref d))
+                        if d.contains("invalid_grant") && d.contains("AADSTS70008")
+                ),
+                "expected a non-transient AuthenticationDenied, got: {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn token_exchange_maps_malformed_success_body_to_protocol_error() {
+        block_on_io(async {
+            let (authority, server) = spawn_token_endpoint("HTTP/1.1 200 OK", "not json").await;
+            let err = exchange_against(&authority).await.unwrap_err();
+            let _ = server.await;
+            assert!(
+                matches!(err, Error::ProtocolError(_)),
+                "expected ProtocolError, got: {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn token_exchange_maps_empty_token_to_protocol_error() {
+        block_on_io(async {
+            let (authority, server) =
+                spawn_token_endpoint("HTTP/1.1 200 OK", r#"{"access_token":""}"#).await;
+            let err = exchange_against(&authority).await.unwrap_err();
+            let _ = server.await;
+            assert!(
+                matches!(err, Error::ProtocolError(_)),
+                "expected ProtocolError, got: {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn token_exchange_rejects_unreachable_endpoint_as_transient() {
+        block_on_io(async {
+            // Port 1 on loopback refuses connections: a transport failure, which
+            // must stay transient so the connect retry can recover.
+            let err = exchange_against("http://127.0.0.1:1").await.unwrap_err();
+            assert!(
+                matches!(err, Error::ConnectionError(_)),
+                "expected ConnectionError, got: {err:?}"
+            );
         });
     }
 }

@@ -245,8 +245,8 @@ pub(crate) fn configure_auth(
             );
         }
         TdsAuthenticationMethod::ActiveDirectoryInteractive => {
-            // A non-empty UID becomes the `login_hint`; the browser flow uses the
-            // well-known public-client id and stores no secret in the context.
+            // A non-empty UID becomes the `login_hint`; the browser flow presents
+            // msodbcsql's public-client id and stores no secret in the context.
             let login_hint = (!resolved.user_name.is_empty()).then_some(resolved.user_name);
             // The browser sign-in (with MFA) can take minutes, far longer than
             // the default 15s login deadline. Raise the overall login timeout
