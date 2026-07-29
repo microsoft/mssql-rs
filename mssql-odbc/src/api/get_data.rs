@@ -305,19 +305,21 @@ fn read_new_column(
             SQL_ERROR
         }
         Ok(true) => {
-            if writer.end_row_fired() {
-                // The requested column index is past the last column of the row.
+            if let Some(value) = writer.take_captured() {
+                // Non-PLP scalar (or NULL): fully materialized, one-shot delivery.
+                // This holds even when the requested column is the row's last
+                // column (decoding it also fires `end_row`).
+                let ret = deliver_scalar(stmt, col0, &value, req);
+                return_client(&dbc, client);
+                ret
+            } else if writer.end_row_fired() {
+                // The row completed without capturing the requested column: the
+                // requested index is past the last column of the row.
                 if let Ok(mut ss) = stmt.inner.lock() {
                     post_diag(&mut ss, ERR_INVALID_DESCRIPTOR_INDEX);
                 }
                 return_client(&dbc, client);
-                return SQL_ERROR;
-            }
-            if let Some(value) = writer.take_captured() {
-                // Non-PLP scalar (or NULL): fully materialized, one-shot delivery.
-                let ret = deliver_scalar(stmt, col0, &value, req);
-                return_client(&dbc, client);
-                ret
+                SQL_ERROR
             } else {
                 // The requested column is a non-null PLP value: begin streaming.
                 let ret = begin_plp_stream(&dbc, stmt, column_number, &mut client, req);
