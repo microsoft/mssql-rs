@@ -281,6 +281,33 @@ TEST_F(GetDataLiveTest, SkipsPlpMiddleColumn) {
     SQLCloseCursor(stmt_);
 }
 
+// Two PLP columns in the same row, both streamed: read column 2 (VARCHAR(MAX))
+// to completion, skip the PLP column 3, then stream column 4 (VARCHAR(MAX)).
+// Verifies PLP stream state is fully reset between columns and that a skipped
+// PLP column is drained while advancing forward.
+TEST_F(GetDataLiveTest, TwoPlpColumnsStreamedWithSkippedPlpBetween) {
+    const std::string expected_c2 = RepeatToken("ab", 500);   // 1000 bytes
+    const std::string expected_c4 = RepeatToken("wxyz", 300);  // 1200 bytes
+    ASSERT_SQL_OK(ExecDirect(
+                      "SELECT CAST(1 AS INT) AS c1, "
+                      "REPLICATE(CAST('ab' AS VARCHAR(MAX)), 500) AS c2, "
+                      "REPLICATE(CAST('q' AS VARCHAR(MAX)), 128) AS c3, "
+                      "REPLICATE(CAST('wxyz' AS VARCHAR(MAX)), 300) AS c4"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Column 2: stream the whole VARCHAR(MAX) across many small-buffer calls.
+    EXPECT_EQ(expected_c2, ReadCharDataInChunks(stmt_, 2, 16));
+
+    // Column 3 (also PLP) is never read; requesting column 4 must drain it and
+    // then stream column 4 from a clean state.
+    EXPECT_EQ(expected_c4, ReadCharDataInChunks(stmt_, 4, 16));
+
+    SQLCloseCursor(stmt_);
+}
+
+
 // Requesting a column past the end of the row returns SQLSTATE 07009.
 TEST_F(GetDataLiveTest, ColumnBeyondEndReturns07009) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(123 AS INT) AS c1"), SQL_HANDLE_STMT, stmt_);
