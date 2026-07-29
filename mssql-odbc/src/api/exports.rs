@@ -304,6 +304,20 @@ pub unsafe extern "C" fn SQLExecDirectW(
     unsafe { super::exec_direct::sql_exec_direct_w(statement_handle, statement_text, text_length) }
 }
 
+/// Returns information about the data types supported by the data source as an
+/// open result set (fetchable via `SQLFetch` / `SQLGetData`).
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetTypeInfoW(
+    statement_handle: SqlHandle,
+    data_type: SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe { super::get_type_info::sql_get_type_info_w(statement_handle, data_type) }
+}
+
 /// Executes a prepared statement using the current bound parameter values.
 ///
 /// # Safety

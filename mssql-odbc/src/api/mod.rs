@@ -14,6 +14,7 @@ pub(crate) mod fetch;
 pub(crate) mod free_handle;
 mod get_data;
 mod get_diag;
+mod get_type_info;
 mod more_results;
 mod num_result_cols;
 pub(crate) mod odbc_types;

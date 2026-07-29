@@ -76,6 +76,10 @@ pub(crate) const ERR_INVALID_SQL_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY004,
     text: "Invalid SQL data type",
 };
+pub(crate) const ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HYC00,
+    text: "Optional feature not implemented",
+};
 pub(crate) const ERR_INVALID_C_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY003,
     text: "Invalid application buffer type",
