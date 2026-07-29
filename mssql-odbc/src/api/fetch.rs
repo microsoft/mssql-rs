@@ -10,6 +10,7 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
     SqlReturn,
 };
+use crate::api::row_writer::OdbcRowWriter;
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -54,7 +55,12 @@ fn sql_fetch_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     fetch_rows_next(statement_handle, stmt)
 }
 
-/// Row materialization step for one forward fetch operation.
+/// Positions the cursor on the next row for column-wise `SQLGetData`.
+///
+/// In the msodbcsql model, `SQLFetch` advances to a row boundary but reads no
+/// columns: decoding pauses before the first column via
+/// [`OdbcRowWriter::pause_before_first_column`]. Any columns left unread on the
+/// previously positioned row are drained here before advancing.
 fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
@@ -98,12 +104,12 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         client
     };
 
-    let fetch_result = dbc.runtime.block_on(client.next_row());
+    let position_result = dbc.runtime.block_on(position_next_row(&mut client));
 
-    match fetch_result {
-        Ok(Some(row)) => {
+    match position_result {
+        Ok(true) => {
             let Ok(mut stmt_state) = stmt.inner.lock() else {
-                error!("SQLFetch: stmt mutex poisoned storing row");
+                error!("SQLFetch: stmt mutex poisoned positioning row");
                 if let Ok(mut ds) = dbc.inner.lock() {
                     ds.client = Some(client);
                     if ds.active_stmt == Some(statement_handle) {
@@ -112,7 +118,10 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 }
                 return SQL_ERROR;
             };
-            stmt_state.current_row = Some(row);
+            // Row positioned: columns are streamed on demand by SQLGetData.
+            stmt_state.row_active = true;
+            stmt_state.getdata_next_col = 0;
+            stmt_state.plp_stream = None;
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();
@@ -124,14 +133,14 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 dbc_state.active_stmt = Some(statement_handle);
             }
 
-            debug!("SQLFetch: row fetched");
+            debug!("SQLFetch: row positioned");
             if has_server_info {
                 SQL_SUCCESS_WITH_INFO
             } else {
                 SQL_SUCCESS
             }
         }
-        Ok(None) => {
+        Ok(false) => {
             // End of current rowset. SQLFetch must return SQL_NO_DATA here per the
             // cursor contract, and SQL_NO_DATA cannot be upgraded to
             // SQL_SUCCESS_WITH_INFO — so this call has no way to signal "there are
@@ -152,11 +161,6 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             // messages are simply attributed to the call that reports on the
             // batch boundary, mirroring msodbcsql's between-result surfacing.
             //
-            // (If the batch has no further result set and the application calls
-            // SQLMoreResults rather than closing the cursor, that call also
-            // returns SQL_NO_DATA — an unavoidable consequence of the ODBC
-            // contract, not message loss: the records are still posted there.)
-            //
             // Do NOT drain the rest of the batch here either: the application may
             // call SQLMoreResults to advance to a subsequent result set. Cursor
             // stays open; active_stmt stays set so the connection remains "busy"
@@ -168,7 +172,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 }
                 return SQL_ERROR;
             };
-            stmt_state.current_row = None;
+            stmt_state.reset_row_stream();
             // Don't clear CURSOR_OPEN here: the cursor stays open until
             // SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE).
             drop(stmt_state);
@@ -180,9 +184,9 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             SQL_NO_DATA
         }
         Err(e) => {
-            error!(%e, "SQLFetch: row fetch failed");
+            error!(%e, "SQLFetch: row positioning failed");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.current_row = None;
+                stmt_state.reset_row_stream();
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
                 let info_messages = client.take_info_messages();
@@ -196,6 +200,29 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             }
             SQL_ERROR
         }
+    }
+}
+
+/// Advances the client to the start of the next row, pausing before its first
+/// column. Any columns left unread on a previously positioned row are drained
+/// first (each `next_row_into` with a position-mode writer completes at most one
+/// paused row). Returns `Ok(true)` when positioned on a fresh row, `Ok(false)`
+/// when the result set is exhausted.
+async fn position_next_row(
+    client: &mut mssql_tds::connection::tds_client::TdsClient,
+) -> mssql_tds::core::TdsResult<bool> {
+    loop {
+        let mut writer = OdbcRowWriter::new();
+        if !client.next_row_into(&mut writer).await? {
+            return Ok(false);
+        }
+        if writer.end_row_fired() {
+            // Finished draining the previously positioned row; keep going to
+            // reach the next row's start boundary.
+            continue;
+        }
+        // Paused before the first column of a fresh row.
+        return Ok(true);
     }
 }
 

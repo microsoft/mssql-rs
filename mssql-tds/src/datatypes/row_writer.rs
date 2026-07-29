@@ -19,6 +19,18 @@ use uuid::Uuid;
 /// enabling consumers (Arrow writers, N-API binary encoders, etc.) to
 /// receive values without going through the intermediate `ColumnValues` enum.
 pub trait RowWriter {
+    /// Returns `true` to pause row decoding *before* the first column is read.
+    ///
+    /// The default is `false`. ODBC-oriented writers override this and return
+    /// `true` so that a fetch can position on a row without consuming any
+    /// column; the columns are then decoded on demand (for example, one per
+    /// `SQLGetData`). It is honored only on the initial read of a ROW/NBCROW
+    /// token — the resume path never re-consults it, so resuming from a
+    /// column-0 pause proceeds normally.
+    fn pause_before_first_column(&self) -> bool {
+        false
+    }
+
     /// Returns `true` to pause row decoding after reading column `col`.
     ///
     /// Writers that need incremental column fetch behavior (for example,

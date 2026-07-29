@@ -4,7 +4,6 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
 
 use super::{DbcHandle, HandleType, HasObjectType};
@@ -54,8 +53,17 @@ pub(crate) struct StmtState {
     /// `prepared_handle` is `Some` (a new handle can only be acquired by an
     /// execute, which flushes any pending drop first).
     pub(crate) pending_unprepare: Option<i32>,
-    /// Current fetched row, populated by SQLFetch for later SQLGetData support.
-    pub(crate) current_row: Option<Vec<ColumnValues>>,
+    /// Whether `SQLFetch` has positioned the cursor on a row that is available
+    /// for column-wise `SQLGetData`. The row's columns are streamed off the wire
+    /// on demand — no full-row `Vec<ColumnValues>` is materialized.
+    pub(crate) row_active: bool,
+    /// 0-based index of the next column not yet consumed by `SQLGetData` on the
+    /// current row. Reset to 0 by each `SQLFetch`.
+    pub(crate) getdata_next_col: usize,
+    /// Active chunk-by-chunk PLP (`*(MAX)` / `xml`) stream for the column
+    /// currently being retrieved through repeated `SQLGetData` calls; `None`
+    /// when no PLP stream is in progress.
+    pub(crate) plp_stream: Option<crate::api::plp_stream::PlpStream>,
     /// Rowset size for block fetches (`SQL_ATTR_ROW_ARRAY_SIZE`). Defaults to 1
     /// (single-row). Consumed by the columnar `SQLFetchScroll` path.
     pub(crate) row_array_size: SqlULen,
@@ -84,6 +92,15 @@ impl StmtState {
 
     pub(crate) fn clear_state(&mut self, mask: u32) {
         self.state_flags &= !mask;
+    }
+
+    /// Clears the column-wise fetch cursor state (no row positioned, get-data
+    /// cursor at the first column, no PLP stream in progress). Called wherever a
+    /// new execution or a cursor close invalidates the current row.
+    pub(crate) fn reset_row_stream(&mut self) {
+        self.row_active = false;
+        self.getdata_next_col = 0;
+        self.plp_stream = None;
     }
 
     /// Moves the cached `prepared_handle` (if any) into `pending_unprepare` so
@@ -129,7 +146,9 @@ impl StmtHandle {
                 bound_params: Vec::new(),
                 prepared_handle: None,
                 pending_unprepare: None,
-                current_row: None,
+                row_active: false,
+                getdata_next_col: 0,
+                plp_stream: None,
                 row_array_size: 1,
                 rows_fetched_ptr: std::ptr::null_mut(),
                 row_status_ptr: std::ptr::null_mut(),

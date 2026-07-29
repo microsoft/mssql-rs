@@ -491,6 +491,15 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
     match token_type {
         TokenType::Row => {
             let (columns, decryptor) = extract_row_context(context)?;
+            // ODBC-style writers position on the row without reading any column.
+            if writer.pause_before_first_column() {
+                return Ok(RowReadResult::RowPaused(RowPauseState {
+                    next_column_index: 0,
+                    columns: columns.to_vec(),
+                    nbc_null_bitmap: None,
+                    decryptor: decryptor.cloned(),
+                }));
+            }
             decode_row_columns(reader, columns, decryptor, 0, writer).await
         }
         TokenType::NbcRow => {
@@ -498,6 +507,16 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
             let bitmap_len = columns.len().div_ceil(8);
             let mut bitmap = vec![0u8; bitmap_len];
             reader.read_bytes(&mut bitmap).await?;
+            // ODBC-style writers position on the row without reading any column;
+            // the null bitmap has already been consumed and is carried over.
+            if writer.pause_before_first_column() {
+                return Ok(RowReadResult::RowPaused(RowPauseState {
+                    next_column_index: 0,
+                    columns: columns.to_vec(),
+                    nbc_null_bitmap: Some(bitmap),
+                    decryptor: decryptor.cloned(),
+                }));
+            }
             decode_nbcrow_columns(reader, columns, decryptor, &bitmap, 0, writer).await
         }
         _ => {
@@ -1285,6 +1304,185 @@ mod tests {
             Err(err) => panic!("expected UnimplementedFeature, got: {err:?}"),
             Ok(_) => panic!("expected AE paused PLP streaming to fail"),
         }
+    }
+
+    /// Writer that opts into pausing before the first column, mirroring the
+    /// ODBC positioning model. Records every typed write so tests can assert
+    /// that no column was decoded while positioning.
+    #[derive(Default)]
+    struct PauseBeforeFirstWriter {
+        writes: usize,
+        end_row_calls: usize,
+    }
+
+    impl RowWriter for PauseBeforeFirstWriter {
+        fn pause_before_first_column(&self) -> bool {
+            true
+        }
+
+        fn write_null(&mut self, _col: usize) {
+            self.writes += 1;
+        }
+        fn write_bool(&mut self, _col: usize, _val: bool) {
+            self.writes += 1;
+        }
+        fn write_u8(&mut self, _col: usize, _val: u8) {
+            self.writes += 1;
+        }
+        fn write_i16(&mut self, _col: usize, _val: i16) {
+            self.writes += 1;
+        }
+        fn write_i32(&mut self, _col: usize, _val: i32) {
+            self.writes += 1;
+        }
+        fn write_i64(&mut self, _col: usize, _val: i64) {
+            self.writes += 1;
+        }
+        fn write_f32(&mut self, _col: usize, _val: f32) {
+            self.writes += 1;
+        }
+        fn write_f64(&mut self, _col: usize, _val: f64) {
+            self.writes += 1;
+        }
+        fn write_string(&mut self, _col: usize, _val: SqlString) {
+            self.writes += 1;
+        }
+        fn write_bytes(&mut self, _col: usize, _val: Vec<u8>) {
+            self.writes += 1;
+        }
+        fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {
+            self.writes += 1;
+        }
+        fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {
+            self.writes += 1;
+        }
+        fn write_date(&mut self, _col: usize, _val: SqlDate) {
+            self.writes += 1;
+        }
+        fn write_time(&mut self, _col: usize, _val: SqlTime) {
+            self.writes += 1;
+        }
+        fn write_datetime(&mut self, _col: usize, _val: SqlDateTime) {
+            self.writes += 1;
+        }
+        fn write_smalldatetime(&mut self, _col: usize, _val: SqlSmallDateTime) {
+            self.writes += 1;
+        }
+        fn write_datetime2(&mut self, _col: usize, _val: SqlDateTime2) {
+            self.writes += 1;
+        }
+        fn write_datetimeoffset(&mut self, _col: usize, _val: SqlDateTimeOffset) {
+            self.writes += 1;
+        }
+        fn write_money(&mut self, _col: usize, _val: SqlMoney) {
+            self.writes += 1;
+        }
+        fn write_smallmoney(&mut self, _col: usize, _val: SqlSmallMoney) {
+            self.writes += 1;
+        }
+        fn write_uuid(&mut self, _col: usize, _val: uuid::Uuid) {
+            self.writes += 1;
+        }
+        fn write_xml(&mut self, _col: usize, _val: SqlXml) {
+            self.writes += 1;
+        }
+        fn write_json(&mut self, _col: usize, _val: SqlJson) {
+            self.writes += 1;
+        }
+        fn write_vector(&mut self, _col: usize, _val: SqlVector) {
+            self.writes += 1;
+        }
+        fn end_row(&mut self) {
+            self.end_row_calls += 1;
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_before_first_column_positions_row_without_decoding() {
+        let context = ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: 2,
+                columns: vec![
+                    ColumnMetadata {
+                        user_type: 0,
+                        flags: 0,
+                        data_type: TdsDataType::Int4,
+                        type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                        column_name: "c1".to_string(),
+                        multi_part_name: None,
+                        crypto_metadata: None,
+                    },
+                    plp_varbinary_metadata("c2", None),
+                ],
+                cek_table: vec![],
+            }),
+            None,
+        );
+
+        // Only the ROW token byte is present: pausing before column 0 must not
+        // read any column payload, so no further bytes are required.
+        let mut reader = TestByteReader::new(vec![TokenType::Row as u8]);
+        let registry = GenericTokenParserRegistry::default();
+        let mut writer = PauseBeforeFirstWriter::default();
+
+        let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+            .await
+            .unwrap();
+
+        match result {
+            RowReadResult::RowPaused(pause_state) => {
+                assert_eq!(pause_state.next_column_index, 0);
+                assert!(pause_state.nbc_null_bitmap.is_none());
+                assert_eq!(pause_state.columns.len(), 2);
+            }
+            _ => panic!("expected RowPaused before first column"),
+        }
+        assert_eq!(writer.writes, 0, "no column should have been decoded");
+        assert_eq!(writer.end_row_calls, 0, "row is not complete yet");
+    }
+
+    #[tokio::test]
+    async fn pause_before_first_column_positions_nbcrow_without_decoding() {
+        let context = ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: 2,
+                columns: vec![
+                    ColumnMetadata {
+                        user_type: 0,
+                        flags: 0,
+                        data_type: TdsDataType::Int4,
+                        type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                        column_name: "c1".to_string(),
+                        multi_part_name: None,
+                        crypto_metadata: None,
+                    },
+                    plp_varbinary_metadata("c2", None),
+                ],
+                cek_table: vec![],
+            }),
+            None,
+        );
+
+        // NBCROW token byte + one null-bitmap byte (c1 null). The bitmap is
+        // consumed, then decoding pauses before column 0 with the bitmap carried
+        // over in the pause state.
+        let mut reader = TestByteReader::new(vec![TokenType::NbcRow as u8, 0b0000_0001]);
+        let registry = GenericTokenParserRegistry::default();
+        let mut writer = PauseBeforeFirstWriter::default();
+
+        let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+            .await
+            .unwrap();
+
+        match result {
+            RowReadResult::RowPaused(pause_state) => {
+                assert_eq!(pause_state.next_column_index, 0);
+                assert_eq!(pause_state.nbc_null_bitmap.as_deref(), Some(&[0b0000_0001][..]));
+                assert_eq!(pause_state.columns.len(), 2);
+            }
+            _ => panic!("expected RowPaused before first column"),
+        }
+        assert_eq!(writer.writes, 0, "no column should have been decoded");
     }
 
     struct MockTokenParserRegistry {

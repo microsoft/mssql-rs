@@ -78,6 +78,18 @@ enum ActiveRowReadState {
     PlpPaused(Box<PlpPauseState>),
 }
 
+/// Wire encoding of a PLP (`*(MAX)` / `xml`) column, used by column-wise
+/// consumers to transcode streamed chunks into the requested target type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlpEncoding {
+    /// `nvarchar(max)`, `ntext`, `xml` — UTF-16LE on the wire.
+    Utf16Text,
+    /// `varchar(max)`, `text`, `json` — single-byte / UTF-8 codepage on the wire.
+    SingleByteText,
+    /// `varbinary(max)`, `image`, UDT — opaque bytes.
+    Binary,
+}
+
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -2647,6 +2659,28 @@ impl TdsClient {
         }
     }
 
+    /// Classifies the wire encoding of the column whose PLP stream is currently
+    /// paused, so column-wise consumers (ODBC `SQLGetData`) can transcode chunks
+    /// to the requested C type. Returns `None` when no PLP stream is active.
+    pub(crate) fn active_plp_encoding(&self) -> Option<PlpEncoding> {
+        use crate::datatypes::sqldatatypes::{PartialLengthType, TypeInfoVariant};
+        let ActiveRowReadState::PlpPaused(plp_state) = &self.active_row_read_state else {
+            return None;
+        };
+        // The paused column is the one just before the resume index.
+        let rp = &plp_state.row_pause_state;
+        let col = rp.next_column_index.checked_sub(1)?;
+        let meta = rp.columns.get(col)?;
+        match meta.type_info.type_info_variant {
+            TypeInfoVariant::PartialLen(pt, _, _, _, _) => Some(match pt {
+                PartialLengthType::NVarChar | PartialLengthType::Xml => PlpEncoding::Utf16Text,
+                PartialLengthType::BigVarChar | PartialLengthType::Json => PlpEncoding::SingleByteText,
+                PartialLengthType::BigVarBinary | PartialLengthType::Udt => PlpEncoding::Binary,
+            }),
+            _ => None,
+        }
+    }
+
     pub(crate) fn active_plp_reached_end(&self) -> bool {
         match &self.active_row_read_state {
             ActiveRowReadState::PlpPaused(plp_state) => plp_state.reached_end(),
@@ -3328,6 +3362,10 @@ impl ResultSet for TdsClient {
         TdsClient::active_plp_collation(self)
     }
 
+    fn active_plp_encoding(&self) -> Option<PlpEncoding> {
+        TdsClient::active_plp_encoding(self)
+    }
+
     fn maybe_has_unread_rows(&self) -> bool {
         !self.current_result_set_has_been_read_till_end
     }
@@ -3422,6 +3460,12 @@ pub trait ResultSet {
     /// Returns the TDS collation for the active PLP string stream, or `None` for
     /// binary types or when there is no active PLP stream.
     fn active_plp_collation(&self) -> Option<SqlCollation> {
+        None
+    }
+
+    /// Classifies the wire encoding of the active PLP stream's source column, or
+    /// `None` when there is no active PLP stream.
+    fn active_plp_encoding(&self) -> Option<PlpEncoding> {
         None
     }
 
