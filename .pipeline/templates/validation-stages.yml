@@ -498,17 +498,17 @@ stages:
     - template: test-matrix-template-alpine.yml
       parameters:
         artifactName: 'Build_Linux'
-        matrix:
-          Alpine3_18:
+        targets: &alpine_targets
+          - name: Alpine3_18
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
             entry: alpine.sh
-          Alpine3_19:
+          - name: Alpine3_19
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
             entry: alpine.sh
-          Alpine3_20:
+          - name: Alpine3_20
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
             entry: alpine.sh
-          Alpine3_21:
+          - name: Alpine3_21
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
             entry: alpine.sh
 
@@ -525,19 +525,7 @@ stages:
         poolImageOverride: imageOverride -equals RUST-UBUNTU-ARM64
         sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
         sqlImageTag: ${{ parameters.sqlImageTag }}
-        targets:
-          - name: Alpine3_18
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-            entry: alpine.sh
-          - name: Alpine3_19
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-            entry: alpine.sh
-          - name: Alpine3_20
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
-            entry: alpine.sh
-          - name: Alpine3_21
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
-            entry: alpine.sh
+        targets: *alpine_targets
 
 - stage: Test_amd64
   dependsOn: 
@@ -547,41 +535,7 @@ stages:
   jobs:
     - template: test-matrix-template.yml
       parameters:
-        matrix:
-          DebianBookworm:
-            container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
-            entry: deb-bookworm.sh
-          AzLinux3:
-            container: mcr.microsoft.com/azurelinux/base/core:3.0
-            entry: azlinux3.sh
-          RHEL9:
-            container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi9:latest
-            entry: rhel.sh
-          OracleLinux9:
-            container: ghcr.io/microsoft/mssql-rs/import/oraclelinux:9
-            entry: rhel.sh
-          SLES15:
-            container: registry.suse.com/suse/sle15
-            entry: sles.sh
-          Ubuntu22:
-            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
-            entry: deb-bookworm.sh
-          Ubuntu24:
-            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
-            entry: deb-bookworm.sh
-
-
-- stage: Test_arm64
-  dependsOn: 
-    - Build
-  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
-  displayName: Test Linux arm64
-  jobs:
-    - template: test-matrix-template-arm64.yml
-      parameters:
-        sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
-        sqlImageTag: ${{ parameters.sqlImageTag }}
-        targets:
+        targets: &deb_rhel_targets
           - name: DebianBookworm
             container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
             entry: deb-bookworm.sh
@@ -603,6 +557,18 @@ stages:
           - name: Ubuntu24
             container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
             entry: deb-bookworm.sh
+
+- stage: Test_arm64
+  dependsOn: 
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test Linux arm64
+  jobs:
+    - template: test-matrix-template-arm64.yml
+      parameters:
+        sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+        sqlImageTag: ${{ parameters.sqlImageTag }}
+        targets: *deb_rhel_targets
 
 # Merge the mssql-tds Rust coverage from every OS that runs the tests
 # (Build_Windows, Build_Linux, Test_MacOS) and the mssql-py-core coverage from

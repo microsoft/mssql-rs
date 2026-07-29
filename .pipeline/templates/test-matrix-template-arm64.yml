@@ -46,6 +46,13 @@ parameters:
 jobs:
   # ------------------------------------------------------------------
   # SHARED MODE: one SQL host + one matrix test job.
+  # NOTE: the steps block below is structurally identical to the
+  # per-job mode block further down. They differ only in how
+  # container/entry/sentinel names are sourced: runtime matrix
+  # variables $(container)/$(entry)/$(sentinelName) here vs.
+  # compile-time expressions ${{ target.* }} in per-job mode.
+  # ADO template constraints prevent further factoring. Keep both
+  # paths in sync when editing steps.
   # ------------------------------------------------------------------
   - ${{ if eq(parameters.sqlInstanceMode, 'shared') }}:
     - template: sql-host-template.yml
@@ -169,6 +176,7 @@ jobs:
 
   # ------------------------------------------------------------------
   # PER-JOB MODE: one SQL host + one test job per matrix entry.
+  # NOTE: keep in sync with the shared-mode steps block above.
   # ------------------------------------------------------------------
   - ${{ if eq(parameters.sqlInstanceMode, 'per-job') }}:
     - ${{ each target in parameters.targets }}:
