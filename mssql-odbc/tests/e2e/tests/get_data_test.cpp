@@ -307,6 +307,90 @@ TEST_F(GetDataLiveTest, TwoPlpColumnsStreamedWithSkippedPlpBetween) {
     SQLCloseCursor(stmt_);
 }
 
+// Multiple rows: loop SQLFetch and read scalar columns on each row. Verifies
+// the get-data cursor resets on every fetch so column order restarts per row.
+TEST_F(GetDataLiveTest, MultiRowScalarColumns) {
+    ASSERT_SQL_OK(ExecDirect(
+                      "SELECT n, CAST(n * 10 AS INT) AS m FROM (VALUES (1), (2), (3)) AS v(n) "
+                      "ORDER BY n"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    for (int row = 1; row <= 3; ++row) {
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLRETURN rc;
+        EXPECT_EQ(std::to_string(row), GetChar(1, &rc)) << "row " << row << " col 1";
+        EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+        EXPECT_EQ(std::to_string(row * 10), GetChar(2, &rc)) << "row " << row << " col 2";
+        EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    }
+
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    SQLCloseCursor(stmt_);
+}
+
+// Multiple rows each carrying a PLP column, streamed to completion on every
+// row. Verifies PLP stream state is fully reset across SQLFetch boundaries so a
+// fresh row streams cleanly after the previous row's stream was exhausted.
+TEST_F(GetDataLiveTest, MultiRowPlpStreamedPerRow) {
+    const std::string expected_r1 = RepeatToken("row1", 250);  // 1000 bytes
+    const std::string expected_r2 = RepeatToken("row2", 300);  // 1200 bytes
+    ASSERT_SQL_OK(ExecDirect(
+                      "SELECT 1 AS n, REPLICATE(CAST('row1' AS VARCHAR(MAX)), 250) AS c "
+                      "UNION ALL "
+                      "SELECT 2 AS n, REPLICATE(CAST('row2' AS VARCHAR(MAX)), 300) AS c "
+                      "ORDER BY n"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // Row 1: read the scalar, then stream the PLP column to completion.
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLRETURN rc;
+    EXPECT_EQ("1", GetChar(1, &rc));
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(expected_r1, ReadCharDataInChunks(stmt_, 2, 16));
+
+    // Row 2: a fresh fetch must reset per-row stream state; stream again.
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2", GetChar(1, &rc));
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(expected_r2, ReadCharDataInChunks(stmt_, 2, 16));
+
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    SQLCloseCursor(stmt_);
+}
+
+// Advancing to the next row while the current row still has an in-progress PLP
+// stream: SQLFetch must drain the unfinished PLP value and position on row 2.
+TEST_F(GetDataLiveTest, FetchDrainsPartiallyReadPlpFromPriorRow) {
+    ASSERT_SQL_OK(ExecDirect(
+                      "SELECT 1 AS n, REPLICATE(CAST('aaaa' AS VARCHAR(MAX)), 500) AS c "
+                      "UNION ALL "
+                      "SELECT 2 AS n, CAST('second' AS VARCHAR(MAX)) AS c "
+                      "ORDER BY n"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // Row 1: begin the PLP stream but read only one small chunk, leaving the
+    // rest of the value on the wire.
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLCHAR buf[8] = {0};
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLGetData(stmt_, 2, SQL_C_CHAR, buf, sizeof(buf), &ind);
+    ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) << "rc=" << rc;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc) << "partial read of a 2000-byte value";
+
+    // Advance to row 2: the driver drains the unread remainder of row 1's PLP
+    // column, then positions on the next row.
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2", GetChar(1, &rc));
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("second", GetChar(2, &rc));
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    SQLCloseCursor(stmt_);
+}
+
 
 // Requesting a column past the end of the row returns SQLSTATE 07009.
 TEST_F(GetDataLiveTest, ColumnBeyondEndReturns07009) {
