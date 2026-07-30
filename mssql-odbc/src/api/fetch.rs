@@ -116,7 +116,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 return SQL_ERROR;
             };
             stmt_state.reset_row_stream();
-            stmt_state.current_row = Some(Vec::new()); // row positioned, columns streamed on demand
+            stmt_state.row_positioned = true; // row positioned, columns streamed on demand
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();

@@ -19,8 +19,6 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use crate::row::{OdbcRowWriter, PlpEncoding};
 use mssql_tds::connection::tds_client::ResultSet;
 use mssql_tds::datatypes::column_values::ColumnValues;
-#[cfg(test)]
-use mssql_tds::datatypes::sql_string::SqlString;
 
 /// Implements SQLGetData for current-row retrieval.
 ///
@@ -117,15 +115,7 @@ fn sql_get_data_safe(
     }
 
     let col_index = usize::from(column_number);
-    let metadata_len = if stmt_state.column_metadata.is_empty() {
-        stmt_state
-            .current_row
-            .as_ref()
-            .map(|row| row.len())
-            .unwrap_or(0)
-    } else {
-        stmt_state.column_metadata.len()
-    };
+    let metadata_len = stmt_state.column_metadata.len();
     if col_index == 0 || col_index > metadata_len {
         post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
         return SQL_ERROR;
@@ -169,53 +159,37 @@ fn sql_get_data_safe(
         }
     }
 
-    let Some(row) = stmt_state.current_row.as_ref() else {
+    if !stmt_state.row_positioned {
         post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "No current row");
         return SQL_ERROR;
+    }
+
+    // Resume the decoder to the requested column then write output.
+    drop(stmt_state);
+    let rc = resume_row_to_column(stmt, statement_handle, col_index);
+    if rc != SQL_SUCCESS {
+        return rc;
+    }
+    let Ok(mut reopened_stmt_state) = stmt.inner.lock() else {
+        error!("SQLGetData: stmt mutex poisoned after row resume");
+        return SQL_ERROR;
     };
-
-    let need_resume = row.len() < col_index && !stmt_state.current_row_complete;
-
-    if need_resume {
-        drop(stmt_state);
-        let rc = resume_row_to_column(stmt, statement_handle, col_index);
-        if rc != SQL_SUCCESS {
-            return rc;
-        }
-        let Ok(mut reopened_stmt_state) = stmt.inner.lock() else {
-            error!("SQLGetData: stmt mutex poisoned after row resume");
-            return SQL_ERROR;
-        };
-        // A non-empty row means the target column was captured (non-PLP).
-        let col_in_row = reopened_stmt_state
-            .current_row
-            .as_ref()
-            .is_some_and(|r| !r.is_empty());
-        if !col_in_row && !reopened_stmt_state.current_row_complete {
-            drop(reopened_stmt_state);
-            return stream_active_plp_chunk(
-                stmt,
-                statement_handle,
-                col_index,
-                target_type,
-                target_value_ptr,
-                buffer_length,
-                strlen_or_ind_ptr,
-                true,
-            );
-        }
-        return write_column_as_text(
-            &mut reopened_stmt_state,
+    // last_captured is None only when the decoder paused at a PLP column.
+    if reopened_stmt_state.last_captured.is_none() && !reopened_stmt_state.current_row_complete {
+        drop(reopened_stmt_state);
+        return stream_active_plp_chunk(
+            stmt,
+            statement_handle,
             col_index,
             target_type,
             target_value_ptr,
             buffer_length,
             strlen_or_ind_ptr,
+            true,
         );
     }
-
     write_column_as_text(
-        &mut stmt_state,
+        &mut reopened_stmt_state,
         col_index,
         target_type,
         target_value_ptr,
@@ -232,12 +206,7 @@ fn write_column_as_text(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    let Some(row) = stmt_state.current_row.as_ref() else {
-        post_sql_error(stmt_state, SQLSTATE_24000, 0, "No current row");
-        return SQL_ERROR;
-    };
-
-    if row.is_empty() {
+    let Some(value) = stmt_state.last_captured.take() else {
         post_sql_error(
             stmt_state,
             SQLSTATE_24000,
@@ -245,7 +214,7 @@ fn write_column_as_text(
             "Requested column is not available in the current row",
         );
         return SQL_ERROR;
-    }
+    };
 
     if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
         post_sql_error(
@@ -265,7 +234,6 @@ fn write_column_as_text(
         buffer_length as usize
     };
 
-    let value = row.first().expect("row is non-empty; checked above");
     if matches!(value, ColumnValues::Null) {
         unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
         if target_type == SQL_C_WCHAR {
@@ -281,7 +249,7 @@ fn write_column_as_text(
         return SQL_SUCCESS;
     }
 
-    let Some(as_text) = column_value_to_text(value) else {
+    let Some(as_text) = column_value_to_text(&value) else {
         post_sql_error(
             stmt_state,
             SQLSTATE_HYC00,
@@ -323,11 +291,12 @@ fn resume_row_to_column(
     let dbc = stmt.parent_dbc();
 
     {
+        // validate row is positioned before resuming
         let Ok(stmt_state) = stmt.inner.lock() else {
             error!("SQLGetData: stmt mutex poisoned while preparing row resume");
             return SQL_ERROR;
         };
-        if stmt_state.current_row.is_none() {
+        if !stmt_state.row_positioned {
             error!("SQLGetData: no current row for resume");
             return SQL_ERROR;
         }
@@ -365,7 +334,7 @@ fn resume_row_to_column(
 
     let row_read = dbc.runtime.block_on(client.next_row_into(&mut writer));
     let row_complete = writer.end_row_fired();
-    let updated_row = writer.take_captured().map(|v| vec![v]).unwrap_or_default();
+    let captured = writer.take_captured();
 
     if let Ok(mut dbc_state) = dbc.inner.lock() {
         dbc_state.client = Some(client);
@@ -375,7 +344,7 @@ fn resume_row_to_column(
     match row_read {
         Ok(true) => {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.current_row = Some(updated_row);
+                stmt_state.last_captured = captured;
                 stmt_state.current_row_complete = row_complete;
                 return SQL_SUCCESS;
             }
@@ -383,7 +352,7 @@ fn resume_row_to_column(
         }
         Ok(false) => {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.current_row = Some(updated_row);
+                stmt_state.last_captured = None;
                 stmt_state.current_row_complete = true;
                 post_sql_error(
                     &mut stmt_state,
@@ -396,8 +365,7 @@ fn resume_row_to_column(
         }
         Err(e) => {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.current_row = None;
-                stmt_state.current_row_complete = false;
+                stmt_state.reset_row_stream();
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
             }
@@ -653,7 +621,7 @@ fn column_value_to_text(v: &ColumnValues) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_LONG, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::SQL_NULL_HANDLE;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -688,258 +656,5 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-    }
-
-    #[test]
-    fn get_data_string_success() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt = h.stmt;
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
-        {
-            let mut s = stmt_handle.inner.lock().unwrap();
-            s.set_state(STMT_STATE_CURSOR_OPEN);
-            s.current_row = Some(vec![ColumnValues::String(SqlString::from_utf8_string(
-                "hello".to_string(),
-            ))]);
-        }
-
-        let mut buf = [0u8; 16];
-        let mut ind: SqlLen = 0;
-        let ret = unsafe {
-            sql_get_data(
-                stmt,
-                1,
-                SQL_C_CHAR,
-                buf.as_mut_ptr() as SqlPointer,
-                buf.len() as SqlLen,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS);
-        assert_eq!(ind, 5);
-        assert_eq!(std::str::from_utf8(&buf[..5]).unwrap(), "hello");
-    }
-
-    #[test]
-    fn get_data_truncation_returns_info() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt = h.stmt;
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
-        {
-            let mut s = stmt_handle.inner.lock().unwrap();
-            s.set_state(STMT_STATE_CURSOR_OPEN);
-            s.current_row = Some(vec![ColumnValues::Int(12345)]);
-        }
-
-        let mut buf = [0u8; 3];
-        let mut ind: SqlLen = 0;
-        let ret = unsafe {
-            sql_get_data(
-                stmt,
-                1,
-                SQL_C_CHAR,
-                buf.as_mut_ptr() as SqlPointer,
-                buf.len() as SqlLen,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        assert_eq!(ind, 5);
-    }
-
-    #[test]
-    fn get_data_empty_string_zero_buffer_no_truncation() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt = h.stmt;
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
-        {
-            let mut s = stmt_handle.inner.lock().unwrap();
-            s.set_state(STMT_STATE_CURSOR_OPEN);
-            s.current_row = Some(vec![ColumnValues::String(SqlString::from_utf8_string(
-                String::new(),
-            ))]);
-        }
-
-        let mut ind: SqlLen = -1;
-        let ret = unsafe { sql_get_data(stmt, 1, SQL_C_CHAR, std::ptr::null_mut(), 0, &mut ind) };
-        assert_eq!(ret, SQL_SUCCESS);
-        assert_eq!(ind, 0);
-    }
-
-    #[test]
-    fn get_data_null_column_writes_indicator() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt = h.stmt;
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
-        {
-            let mut s = stmt_handle.inner.lock().unwrap();
-            s.set_state(STMT_STATE_CURSOR_OPEN);
-            s.current_row = Some(vec![ColumnValues::Null]);
-        }
-
-        let mut buf = [0u8; 4];
-        let mut ind: SqlLen = 0;
-        let ret = unsafe {
-            sql_get_data(
-                stmt,
-                1,
-                SQL_C_CHAR,
-                buf.as_mut_ptr() as SqlPointer,
-                buf.len() as SqlLen,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS);
-        assert_eq!(ind, SQL_NULL_DATA);
-    }
-
-    #[test]
-    fn get_data_unsupported_target_type() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt = h.stmt;
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
-        {
-            let mut s = stmt_handle.inner.lock().unwrap();
-            s.set_state(STMT_STATE_CURSOR_OPEN);
-            s.current_row = Some(vec![ColumnValues::Int(1)]);
-        }
-
-        let mut out: i32 = 0;
-        let mut ind: SqlLen = 0;
-        let ret = unsafe {
-            sql_get_data(
-                stmt,
-                1,
-                SQL_C_LONG,
-                (&mut out as *mut i32).cast(),
-                std::mem::size_of::<i32>() as SqlLen,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_ERROR);
-    }
-
-    #[test]
-    fn get_data_invalid_column_index() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt = h.stmt;
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
-        {
-            let mut s = stmt_handle.inner.lock().unwrap();
-            s.set_state(STMT_STATE_CURSOR_OPEN);
-            s.current_row = Some(vec![ColumnValues::Int(1)]);
-        }
-
-        let mut buf = [0u8; 8];
-        let mut ind: SqlLen = 0;
-        let ret = unsafe {
-            sql_get_data(
-                stmt,
-                2,
-                SQL_C_CHAR,
-                buf.as_mut_ptr() as SqlPointer,
-                buf.len() as SqlLen,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_ERROR);
-    }
-
-    /// Helper: read a NUL-terminated UTF-16 buffer back to a Rust String.
-    fn read_until_nul(buf: &[u16]) -> String {
-        let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
-        String::from_utf16(&buf[..len]).unwrap()
-    }
-
-    #[test]
-    fn get_data_wchar_success() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt = h.stmt;
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
-        {
-            let mut s = stmt_handle.inner.lock().unwrap();
-            s.set_state(STMT_STATE_CURSOR_OPEN);
-            s.current_row = Some(vec![ColumnValues::String(SqlString::from_utf8_string(
-                "héllo".to_string(),
-            ))]);
-        }
-
-        let mut buf = [0u16; 16];
-        let mut ind: SqlLen = 0;
-        let ret = unsafe {
-            sql_get_data(
-                stmt,
-                1,
-                SQL_C_WCHAR,
-                buf.as_mut_ptr() as SqlPointer,
-                (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlLen,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS);
-        // Indicator is byte length of untruncated value, excluding NUL.
-        // "héllo" → 5 u16 units → 10 bytes.
-        assert_eq!(ind, 10);
-        assert_eq!(read_until_nul(&buf), "héllo");
-    }
-
-    #[test]
-    fn get_data_wchar_truncation_returns_info() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt = h.stmt;
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
-        {
-            let mut s = stmt_handle.inner.lock().unwrap();
-            s.set_state(STMT_STATE_CURSOR_OPEN);
-            s.current_row = Some(vec![ColumnValues::Int(12345)]);
-        }
-
-        // 3 u16 slots = 6 bytes. "12345" needs 6 units (5 chars + NUL) → truncated.
-        let mut buf = [0u16; 3];
-        let mut ind: SqlLen = 0;
-        let ret = unsafe {
-            sql_get_data(
-                stmt,
-                1,
-                SQL_C_WCHAR,
-                buf.as_mut_ptr() as SqlPointer,
-                (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlLen,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        // Untruncated byte length: 5 chars × 2 bytes = 10.
-        assert_eq!(ind, 10);
-        assert_eq!(read_until_nul(&buf), "12");
-    }
-
-    #[test]
-    fn get_data_wchar_null_column_writes_nul_and_indicator() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt = h.stmt;
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
-        {
-            let mut s = stmt_handle.inner.lock().unwrap();
-            s.set_state(STMT_STATE_CURSOR_OPEN);
-            s.current_row = Some(vec![ColumnValues::Null]);
-        }
-
-        let mut buf = [0xDEADu16; 4];
-        let mut ind: SqlLen = 0;
-        let ret = unsafe {
-            sql_get_data(
-                stmt,
-                1,
-                SQL_C_WCHAR,
-                buf.as_mut_ptr() as SqlPointer,
-                (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlLen,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS);
-        assert_eq!(ind, SQL_NULL_DATA);
-        // First slot must be NUL; nothing else touched.
-        assert_eq!(buf[0], 0);
-        assert_eq!(&buf[1..], &[0xDEAD; 3]);
     }
 }

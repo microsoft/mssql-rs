@@ -62,8 +62,11 @@ pub(crate) struct StmtState {
     /// `prepared_handle` is `Some` (a new handle can only be acquired by an
     /// execute, which flushes any pending drop first).
     pub(crate) pending_unprepare: Option<i32>,
-    /// Current fetched row, populated by SQLFetch for later SQLGetData support.
-    pub(crate) current_row: Option<Vec<ColumnValues>>,
+    /// `true` when SQLFetch has positioned the cursor on a row ready for SQLGetData.
+    pub(crate) row_positioned: bool,
+    /// The column value captured by the most recent resume_row_to_column call.
+    pub(crate) last_captured: Option<ColumnValues>,
+    /// `true` when the entire row has been decoded to completion (RowWritten).
     pub(crate) current_row_complete: bool,
     /// Active PLP stream state; `None` when no PLP stream is in progress.
     pub(crate) active_plp: Option<ActivePlpStream>,
@@ -89,7 +92,8 @@ impl StmtState {
 
     /// Clears all row-stream state (cursor invalidated, no PLP in progress).
     pub(crate) fn reset_row_stream(&mut self) {
-        self.current_row = None;
+        self.row_positioned = false;
+        self.last_captured = None;
         self.current_row_complete = false;
         self.active_plp = None;
         self.current_row_last_col = 0;
@@ -138,7 +142,8 @@ impl StmtHandle {
                 bound_params: Vec::new(),
                 prepared_handle: None,
                 pending_unprepare: None,
-                current_row: None,
+                row_positioned: false,
+                last_captured: None,
                 current_row_complete: false,
                 active_plp: None,
                 current_row_last_col: 0,
