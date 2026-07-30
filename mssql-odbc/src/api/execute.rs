@@ -152,6 +152,8 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.column_metadata.clear();
     stmt_state.reset_row_stream();
+    stmt_state.row_count = -1;
+    stmt_state.pending_row_counts.clear();
     stmt_state.set_state(STMT_STATE_EXEC_STARTED);
 
     Ok(Execution {

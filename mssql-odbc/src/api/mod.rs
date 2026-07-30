@@ -14,12 +14,15 @@ pub(crate) mod fetch;
 pub(crate) mod free_handle;
 mod get_data;
 mod get_diag;
+mod get_type_info;
 mod more_results;
 mod num_result_cols;
 pub(crate) mod odbc_types;
 mod prepare;
+mod row_count;
 pub(crate) mod set_connect_attr;
 pub(crate) mod set_env_attr;
+pub(crate) mod set_stmt_attr;
 pub(crate) mod sqlstate;
 pub(crate) mod util;
 
