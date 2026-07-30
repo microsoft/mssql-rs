@@ -11,6 +11,15 @@ use crate::row::PlpEncoding;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
 
+/// State for a PLP column being streamed across repeated SQLGetData calls.
+#[derive(Debug)]
+pub(crate) struct ActivePlpStream {
+    /// 1-based column ordinal being streamed.
+    pub(crate) column: usize,
+    /// Wire encoding of the PLP column.
+    pub(crate) encoding: PlpEncoding,
+}
+
 pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
 pub(crate) const STMT_STATE_PREPARED: u32 = 0x0000_0200;
 pub(crate) const STMT_STATE_CURSOR_OPEN: u32 = 0x0000_0800;
@@ -56,14 +65,8 @@ pub(crate) struct StmtState {
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
     pub(crate) current_row_complete: bool,
-    /// 1-based column number of the PLP text stream currently being delivered
-    /// to the application in chunks. `None` when no PLP stream is in progress.
-    pub(crate) active_plp_column: Option<usize>,
-    /// The C target type used for the active PLP stream (`SQL_C_CHAR` or
-    /// `SQL_C_WCHAR`). Mixed target-type chunking on one stream is rejected.
-    pub(crate) active_plp_target_type: Option<i16>,
-    /// Wire encoding of the active PLP column.
-    pub(crate) active_plp_encoding: Option<PlpEncoding>,
+    /// Active PLP stream state; `None` when no PLP stream is in progress.
+    pub(crate) active_plp: Option<ActivePlpStream>,
     /// 1-based column number of the last successful SQLGetData call on this row.
     /// Used to enforce forward-only column access (07009) and SQL_NO_DATA on re-read.
     pub(crate) current_row_last_col: usize,
@@ -88,9 +91,7 @@ impl StmtState {
     pub(crate) fn reset_row_stream(&mut self) {
         self.current_row = None;
         self.current_row_complete = false;
-        self.active_plp_column = None;
-        self.active_plp_target_type = None;
-        self.active_plp_encoding = None;
+        self.active_plp = None;
         self.current_row_last_col = 0;
     }
 
@@ -139,9 +140,7 @@ impl StmtHandle {
                 pending_unprepare: None,
                 current_row: None,
                 current_row_complete: false,
-                active_plp_column: None,
-                active_plp_target_type: None,
-                active_plp_encoding: None,
+                active_plp: None,
                 current_row_last_col: 0,
                 state_flags: 0,
             }),

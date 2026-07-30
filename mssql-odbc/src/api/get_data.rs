@@ -14,7 +14,7 @@ use super::sqlstate::*;
 use crate::api::odbc_types::SqlWChar;
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
+use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use crate::row::{OdbcRowWriter, PlpEncoding};
 use mssql_tds::connection::tds_client::ResultSet;
@@ -133,7 +133,11 @@ fn sql_get_data_safe(
 
     // Continuation: app is calling SQLGetData again on the same PLP column to
     // get the next chunk from the active wire stream.
-    if stmt_state.active_plp_column == Some(col_index) {
+    if stmt_state
+        .active_plp
+        .as_ref()
+        .is_some_and(|s| s.column == col_index)
+    {
         drop(stmt_state);
         return stream_active_plp_chunk(
             stmt,
@@ -149,9 +153,8 @@ fn sql_get_data_safe(
 
     // If the app jumps to a different column while a PLP stream was open —
     // incorrect usage per the ODBC spec — clear the stale stream state.
-    if stmt_state.active_plp_column.is_some() {
-        stmt_state.active_plp_column = None;
-        stmt_state.active_plp_target_type = None;
+    if stmt_state.active_plp.is_some() {
+        stmt_state.active_plp = None;
     }
 
     // Enforce forward-only column access within a row.
@@ -432,25 +435,30 @@ fn stream_active_plp_chunk(
         };
 
         if starting_new_stream {
-            stmt_state.active_plp_column = Some(col_index);
-            stmt_state.active_plp_target_type = None;
             let (enc_unicode, enc_binary) = stmt_state
                 .column_metadata
                 .get(col_index - 1)
                 .map(|m| (m.is_unicode_text(), m.is_binary_type()))
                 .unwrap_or((false, false));
-            stmt_state.active_plp_encoding = Some(if enc_binary {
-                PlpEncoding::Binary
-            } else if enc_unicode {
-                PlpEncoding::Utf16Text
-            } else {
-                PlpEncoding::SingleByteText
+            stmt_state.active_plp = Some(ActivePlpStream {
+                column: col_index,
+                encoding: if enc_binary {
+                    PlpEncoding::Binary
+                } else if enc_unicode {
+                    PlpEncoding::Utf16Text
+                } else {
+                    PlpEncoding::SingleByteText
+                },
             });
             stmt_state.current_row_last_col = col_index;
         }
 
         // Binary PLP columns (VARBINARY) cannot be delivered as character data.
-        if matches!(stmt_state.active_plp_encoding, Some(PlpEncoding::Binary)) {
+        if stmt_state
+            .active_plp
+            .as_ref()
+            .is_some_and(|s| matches!(s.encoding, PlpEncoding::Binary))
+        {
             post_sql_error(
                 &mut stmt_state,
                 SQLSTATE_HYC00,
@@ -460,24 +468,16 @@ fn stream_active_plp_chunk(
             return SQL_ERROR;
         }
 
-        if stmt_state.active_plp_column != Some(col_index) {
+        if stmt_state
+            .active_plp
+            .as_ref()
+            .is_none_or(|s| s.column != col_index)
+        {
             post_sql_error(
                 &mut stmt_state,
                 SQLSTATE_24000,
                 0,
                 "No active PLP stream for this column",
-            );
-            return SQL_ERROR;
-        }
-
-        if let Some(existing_target) = stmt_state.active_plp_target_type
-            && existing_target != target_type
-        {
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_HYC00,
-                0,
-                "Switching SQLGetData target type during PLP streaming is not supported",
             );
             return SQL_ERROR;
         }
@@ -499,7 +499,10 @@ fn stream_active_plp_chunk(
         let Ok(ss) = stmt.inner.lock() else {
             return SQL_ERROR;
         };
-        matches!(ss.active_plp_encoding, Some(PlpEncoding::Utf16Text))
+        matches!(
+            ss.active_plp.as_ref().map(|s| &s.encoding),
+            Some(PlpEncoding::Utf16Text)
+        )
     };
 
     let dbc = stmt.parent_dbc();
@@ -596,13 +599,18 @@ fn stream_active_plp_chunk(
     };
 
     if reached_end {
-        stmt_state.active_plp_column = None;
-        stmt_state.active_plp_target_type = None;
+        stmt_state.active_plp = None;
         return SQL_SUCCESS;
     }
 
-    stmt_state.active_plp_column = Some(col_index);
-    stmt_state.active_plp_target_type = Some(target_type);
+    stmt_state.active_plp = Some(ActivePlpStream {
+        column: col_index,
+        encoding: if is_unicode_plp {
+            PlpEncoding::Utf16Text
+        } else {
+            PlpEncoding::SingleByteText
+        },
+    });
     unsafe { write_if_some(strlen_or_ind_ptr, SQL_NO_TOTAL) };
     post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
 
