@@ -168,14 +168,14 @@ fn sql_get_data_safe(
             error!("SQLGetData: stmt mutex poisoned");
             return SQL_ERROR;
         };
-        if let Some(stream) = stmt_state.plp_stream.as_ref() {
-            if stream.column == column_number {
-                drop(stmt_state);
-                return continue_plp_stream(statement_handle, stmt, column_number, &req);
-            }
-            // A different column than the in-progress PLP stream: that streamed
-            // column is abandoned. Fall through to new-column handling, which
-            // drains it while advancing.
+        // A different column than the in-progress PLP stream abandons that
+        // streamed column and falls through to new-column handling, which drains
+        // it while advancing.
+        if let Some(stream) = stmt_state.plp_stream.as_ref()
+            && stream.column == column_number
+        {
+            drop(stmt_state);
+            return continue_plp_stream(statement_handle, stmt, column_number, &req);
         }
         let col0 = usize::from(column_number) - 1;
         if col0 < stmt_state.getdata_next_col {
@@ -214,13 +214,17 @@ fn continue_plp_stream(
     // Pump wire bytes until something is deliverable or the value ends.
     let pump_result: Result<Result<(), mssql_tds::error::Error>, bool> =
         dbc.runtime.block_on(async {
-            let Ok(mut stmt_state) = stmt.inner.lock() else {
-                return Err(true); // poisoned
+            // Take the stream out under the lock, then release the guard before
+            // any await so no MutexGuard is held across the wire pump.
+            let mut stream = {
+                let Ok(mut stmt_state) = stmt.inner.lock() else {
+                    return Err(true); // poisoned
+                };
+                match stmt_state.plp_stream.take() {
+                    Some(stream) => stream,
+                    None => return Err(false), // vanished; treat as no-data
+                }
             };
-            let Some(mut stream) = stmt_state.plp_stream.take() else {
-                return Err(false); // vanished; treat as no-data
-            };
-            drop(stmt_state);
             let mut io_err = None;
             while stream.needs_pump() {
                 if let Err(e) = pump_wire(&mut stream, &mut client).await {
@@ -240,11 +244,11 @@ fn continue_plp_stream(
     match pump_result {
         Err(true) => {
             error!("SQLGetData: stmt mutex poisoned during PLP pump");
-            return_client(&dbc, client);
+            return_client(dbc, client);
             SQL_ERROR
         }
         Err(false) => {
-            return_client(&dbc, client);
+            return_client(dbc, client);
             SQL_NO_DATA
         }
         Ok(Err(e)) => {
@@ -253,12 +257,12 @@ fn continue_plp_stream(
                 ss.plp_stream = None;
                 post_tds_error(&mut ss, &e, SQLSTATE_HY000);
             }
-            return_client(&dbc, client);
+            return_client(dbc, client);
             SQL_ERROR
         }
         Ok(Ok(())) => {
             let ret = deliver_plp(stmt, column_number, req);
-            return_client(&dbc, client);
+            return_client(dbc, client);
             ret
         }
     }
@@ -293,7 +297,7 @@ fn read_new_column(
                 ss.reset_row_stream();
                 post_tds_error(&mut ss, &e, SQLSTATE_HY000);
             }
-            return_client(&dbc, client);
+            return_client(dbc, client);
             SQL_ERROR
         }
         Ok(false) => {
@@ -301,7 +305,7 @@ fn read_new_column(
             if let Ok(mut ss) = stmt.inner.lock() {
                 post_diag(&mut ss, ERR_INVALID_DESCRIPTOR_INDEX);
             }
-            return_client(&dbc, client);
+            return_client(dbc, client);
             SQL_ERROR
         }
         Ok(true) => {
@@ -310,7 +314,7 @@ fn read_new_column(
                 // This holds even when the requested column is the row's last
                 // column (decoding it also fires `end_row`).
                 let ret = deliver_scalar(stmt, col0, &value, req);
-                return_client(&dbc, client);
+                return_client(dbc, client);
                 ret
             } else if writer.end_row_fired() {
                 // The row completed without capturing the requested column: the
@@ -318,12 +322,12 @@ fn read_new_column(
                 if let Ok(mut ss) = stmt.inner.lock() {
                     post_diag(&mut ss, ERR_INVALID_DESCRIPTOR_INDEX);
                 }
-                return_client(&dbc, client);
+                return_client(dbc, client);
                 SQL_ERROR
             } else {
                 // The requested column is a non-null PLP value: begin streaming.
-                let ret = begin_plp_stream(&dbc, stmt, column_number, &mut client, req);
-                return_client(&dbc, client);
+                let ret = begin_plp_stream(dbc, stmt, column_number, &mut client, req);
+                return_client(dbc, client);
                 ret
             }
         }
