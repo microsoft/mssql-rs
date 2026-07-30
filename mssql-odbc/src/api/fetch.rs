@@ -5,7 +5,7 @@
 
 use tracing::{debug, error};
 
-use super::odbc_row_writer::OdbcRowWriter;
+use crate::row::OdbcRowWriter;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,

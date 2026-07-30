@@ -16,7 +16,6 @@ mod get_data;
 mod get_diag;
 mod more_results;
 mod num_result_cols;
-mod odbc_row_writer;
 pub(crate) mod odbc_types;
 mod prepare;
 pub(crate) mod set_connect_attr;
