@@ -22,23 +22,18 @@ pub(crate) struct OdbcRowWriter {
 }
 
 impl OdbcRowWriter {
-    pub(crate) fn new(col_count: usize) -> Self {
+    pub(crate) fn new(_col_count: usize) -> Self {
         Self {
-            row: Vec::with_capacity(col_count),
+            row: Vec::with_capacity(1),
             pause_before_first_column: false,
             pause_after_column: None,
             row_complete: false,
         }
     }
 
-    pub(crate) fn from_row(row: Vec<ColumnValues>, col_count: usize) -> Self {
-        let mut writer = Self::new(col_count);
-        writer.row = row;
-        writer
-    }
-
     pub(crate) fn request_pause_after_column(&mut self, column_number: usize) {
         self.pause_after_column = Some(column_number);
+        self.row.clear();
     }
 
     pub(crate) fn request_pause_before_first_column(&mut self) {
@@ -54,15 +49,11 @@ impl OdbcRowWriter {
     }
 
     fn set_column(&mut self, col: usize, value: ColumnValues) {
-        if col < self.row.len() {
-            self.row[col] = value;
-            return;
+        // Only capture the single column the caller requested; discard the rest.
+        if self.pause_after_column == Some(col + 1) {
+            self.row.clear();
+            self.row.push(value);
         }
-        // PLP columns are streamed out-of-band and leave gaps; fill with Null.
-        while self.row.len() < col {
-            self.row.push(ColumnValues::Null);
-        }
-        self.row.push(value);
     }
 }
 

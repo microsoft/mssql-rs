@@ -183,13 +183,11 @@ fn sql_get_data_safe(
             error!("SQLGetData: stmt mutex poisoned after row resume");
             return SQL_ERROR;
         };
-        // Column still missing from row -> decoder paused on a PLP column.
-        // Stream this column directly from the active PLP reader.
+        // A non-empty row means the target column was captured (non-PLP).
         let col_in_row = reopened_stmt_state
             .current_row
             .as_ref()
-            .map(|r| r.len() >= col_index)
-            .unwrap_or(false);
+            .is_some_and(|r| !r.is_empty());
         if !col_in_row && !reopened_stmt_state.current_row_complete {
             drop(reopened_stmt_state);
             return stream_active_plp_chunk(
@@ -236,7 +234,7 @@ fn write_column_as_text(
         return SQL_ERROR;
     };
 
-    if row.len() < col_index {
+    if row.is_empty() {
         post_sql_error(
             stmt_state,
             SQLSTATE_24000,
@@ -264,7 +262,7 @@ fn write_column_as_text(
         buffer_length as usize
     };
 
-    let value = &row[col_index - 1];
+    let value = row.first().expect("row is non-empty; checked above");
     if matches!(value, ColumnValues::Null) {
         unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
         if target_type == SQL_C_WCHAR {
@@ -321,26 +319,20 @@ fn resume_row_to_column(
 ) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
-    let (col_count, current_row) = {
-        let Ok(mut stmt_state) = stmt.inner.lock() else {
+    {
+        let Ok(stmt_state) = stmt.inner.lock() else {
             error!("SQLGetData: stmt mutex poisoned while preparing row resume");
             return SQL_ERROR;
         };
-
-        let Some(row) = stmt_state.current_row.take() else {
-            post_sql_error(&mut stmt_state, SQLSTATE_24000, 0, "No current row");
+        if stmt_state.current_row.is_none() {
+            error!("SQLGetData: no current row for resume");
             return SQL_ERROR;
-        };
-
-        (stmt_state.column_metadata.len(), row)
+        }
     };
 
     let mut client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLGetData: dbc mutex poisoned while resuming row");
-            if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.current_row = Some(current_row);
-            }
             return SQL_ERROR;
         };
 
@@ -349,7 +341,6 @@ fn resume_row_to_column(
         {
             drop(dbc_state);
             if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.current_row = Some(current_row);
                 post_diag(&mut stmt_state, ERR_CONNECTION_BUSY);
             }
             return SQL_ERROR;
@@ -358,7 +349,6 @@ fn resume_row_to_column(
         let Some(client) = dbc_state.client.take() else {
             drop(dbc_state);
             if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.current_row = Some(current_row);
                 post_diag(&mut stmt_state, ERR_NO_ACTIVE_TDS_CLIENT);
             }
             return SQL_ERROR;
@@ -367,7 +357,7 @@ fn resume_row_to_column(
         client
     };
 
-    let mut writer = OdbcRowWriter::from_row(current_row, col_count);
+    let mut writer = OdbcRowWriter::new(0);
     writer.request_pause_after_column(column_number);
 
     let row_read = dbc.runtime.block_on(client.next_row_into(&mut writer));
