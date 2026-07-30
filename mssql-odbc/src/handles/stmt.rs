@@ -64,8 +64,8 @@ pub(crate) struct StmtState {
     pub(crate) pending_unprepare: Option<i32>,
     /// `true` when SQLFetch has positioned the cursor on a row ready for SQLGetData.
     pub(crate) row_positioned: bool,
-    /// The column value captured by the most recent resume_row_to_column call.
-    pub(crate) last_captured: Option<ColumnValues>,
+    /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
+    pub(crate) last_captured: Option<(usize, ColumnValues)>,
     /// `true` when the entire row has been decoded to completion (RowWritten).
     pub(crate) current_row_complete: bool,
     /// Active PLP stream state; `None` when no PLP stream is in progress.

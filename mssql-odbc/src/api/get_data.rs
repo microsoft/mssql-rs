@@ -164,6 +164,23 @@ fn sql_get_data_safe(
         return SQL_ERROR;
     }
 
+    // If we already captured this column (e.g., prior HYC00 on same column), skip the resume.
+    let already_captured = stmt_state
+        .last_captured
+        .as_ref()
+        .is_some_and(|(c, _)| *c == col_index);
+
+    if already_captured {
+        return write_column_as_text(
+            &mut stmt_state,
+            col_index,
+            target_type,
+            target_value_ptr,
+            buffer_length,
+            strlen_or_ind_ptr,
+        );
+    }
+
     // Resume the decoder to the requested column then write output.
     drop(stmt_state);
     let rc = resume_row_to_column(stmt, statement_handle, col_index);
@@ -206,16 +223,7 @@ fn write_column_as_text(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    let Some(value) = stmt_state.last_captured.take() else {
-        post_sql_error(
-            stmt_state,
-            SQLSTATE_24000,
-            0,
-            "Requested column is not available in the current row",
-        );
-        return SQL_ERROR;
-    };
-
+    // Check target type first — an unsupported type must not consume last_captured so the app can retry.
     if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
         post_sql_error(
             stmt_state,
@@ -225,6 +233,16 @@ fn write_column_as_text(
         );
         return SQL_ERROR;
     }
+
+    let Some((_, value)) = stmt_state.last_captured.take() else {
+        post_sql_error(
+            stmt_state,
+            SQLSTATE_24000,
+            0,
+            "Requested column is not available in the current row",
+        );
+        return SQL_ERROR;
+    };
 
     // Output buffer capacity in element units (u8 for SQL_C_CHAR, SqlWChar for
     // SQL_C_WCHAR). buffer_length is always in bytes per the ODBC spec.
@@ -334,7 +352,7 @@ fn resume_row_to_column(
 
     let row_read = dbc.runtime.block_on(client.next_row_into(&mut writer));
     let row_complete = writer.end_row_fired();
-    let captured = writer.take_captured();
+    let captured = writer.take_captured().map(|v| (column_number, v));
 
     if let Ok(mut dbc_state) = dbc.inner.lock() {
         dbc_state.client = Some(client);
