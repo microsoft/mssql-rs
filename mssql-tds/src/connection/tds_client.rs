@@ -2674,7 +2674,9 @@ impl TdsClient {
         match meta.type_info.type_info_variant {
             TypeInfoVariant::PartialLen(pt, _, _, _, _) => Some(match pt {
                 PartialLengthType::NVarChar | PartialLengthType::Xml => PlpEncoding::Utf16Text,
-                PartialLengthType::BigVarChar | PartialLengthType::Json => PlpEncoding::SingleByteText,
+                PartialLengthType::BigVarChar | PartialLengthType::Json => {
+                    PlpEncoding::SingleByteText
+                }
                 PartialLengthType::BigVarBinary | PartialLengthType::Udt => PlpEncoding::Binary,
             }),
             _ => None,

@@ -179,11 +179,7 @@ impl PlpStream {
     /// indicator is the untruncated byte length still available *before* this
     /// copy when the total is known, or `SQL_NO_TOTAL` semantics are signaled by
     /// the caller via `remaining_after_call` when the wire is not yet drained.
-    pub(crate) fn deliver_char(
-        &mut self,
-        dst: *mut u8,
-        cap_bytes: usize,
-    ) -> PlpDelivery {
+    pub(crate) fn deliver_char(&mut self, dst: *mut u8, cap_bytes: usize) -> PlpDelivery {
         let Pending::Bytes(pending) = &mut self.pending else {
             unreachable!("deliver_char on non-char stream");
         };
@@ -198,11 +194,7 @@ impl PlpStream {
 
     /// Delivers the next slice of the value into a `SQL_C_WCHAR` caller buffer.
     /// `cap_units` is the buffer capacity in `u16` code units.
-    pub(crate) fn deliver_wchar(
-        &mut self,
-        dst: *mut u16,
-        cap_units: usize,
-    ) -> PlpDelivery {
+    pub(crate) fn deliver_wchar(&mut self, dst: *mut u16, cap_units: usize) -> PlpDelivery {
         let Pending::Units(pending) = &mut self.pending else {
             unreachable!("deliver_wchar on non-wchar stream");
         };
@@ -264,7 +256,10 @@ fn deliver_generic<T: Copy + Default>(
 ///
 /// Pulls at most one 8 KiB chunk so control returns to the caller promptly; the
 /// caller loops across `SQLGetData` invocations to drain the whole value.
-pub(crate) async fn pump_wire<R>(stream: &mut PlpStream, rs: &mut R) -> mssql_tds::core::TdsResult<()>
+pub(crate) async fn pump_wire<R>(
+    stream: &mut PlpStream,
+    rs: &mut R,
+) -> mssql_tds::core::TdsResult<()>
 where
     R: mssql_tds::connection::tds_client::ResultSet + Send + ?Sized,
 {

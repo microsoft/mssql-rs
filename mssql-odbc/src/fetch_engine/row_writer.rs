@@ -227,6 +227,9 @@ mod tests {
         w.request(0);
         w.write_i32(0, 7);
         w.request(1);
-        assert!(w.take_captured().is_none(), "capture should reset on request");
+        assert!(
+            w.take_captured().is_none(),
+            "capture should reset on request"
+        );
     }
 }

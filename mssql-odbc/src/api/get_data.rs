@@ -20,10 +20,10 @@ use super::odbc_types::{
 };
 use super::sqlstate::*;
 use crate::api::odbc_types::SqlWChar;
-use crate::fetch_engine::plp_stream::{PlpStream, PlpTarget, pump_wire};
-use crate::fetch_engine::row_writer::OdbcRowWriter;
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
+use crate::fetch_engine::plp_stream::{PlpStream, PlpTarget, pump_wire};
+use crate::fetch_engine::row_writer::OdbcRowWriter;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{PlpEncoding, ResultSet};
@@ -340,7 +340,12 @@ fn begin_plp_stream(
 ) -> SqlReturn {
     let Some(encoding) = client.active_plp_encoding() else {
         if let Ok(mut ss) = stmt.inner.lock() {
-            post_sql_error(&mut ss, SQLSTATE_HYC00, 0, "Unsupported PLP column encoding");
+            post_sql_error(
+                &mut ss,
+                SQLSTATE_HYC00,
+                0,
+                "Unsupported PLP column encoding",
+            );
         }
         return SQL_ERROR;
     };
@@ -408,7 +413,9 @@ fn deliver_plp(stmt: &StmtHandle, column_number: SqlUSmallInt, req: &OutReq) -> 
     unsafe { write_if_some(req.strlen_or_ind_ptr, indicator) };
 
     let delivery = match req.target_type {
-        SQL_C_WCHAR => stream.deliver_wchar(req.target_value_ptr as *mut SqlWChar, req.buf_elements),
+        SQL_C_WCHAR => {
+            stream.deliver_wchar(req.target_value_ptr as *mut SqlWChar, req.buf_elements)
+        }
         _ => stream.deliver_char(req.target_value_ptr as *mut u8, req.buf_elements),
     };
 
