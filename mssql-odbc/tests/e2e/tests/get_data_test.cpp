@@ -514,7 +514,10 @@ TEST_F(GetDataLiveTest, NvarcharMaxWideRoundTrip) {
 
 // An unsupported C target type is rejected with HYC00 and does not consume the
 // column, so a follow-up call with a supported type still returns the value.
+// The reference msodbcsql driver implements SQL_C_SSHORT conversion, so the
+// HYC00 assertion is mssql-odbc-specific — skip it on the msodbcsql leg.
 TEST_F(GetDataLiveTest, UnsupportedCTypeReturnsHyc00ThenValueReadable) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -535,8 +538,11 @@ TEST_F(GetDataLiveTest, UnsupportedCTypeReturnsHyc00ThenValueReadable) {
 }
 
 // VARBINARY(MAX) to a character target is not yet implemented; it must report
-// HYC00 rather than corrupt the stream.
+// HYC00 rather than corrupt the stream. The reference msodbcsql driver supports
+// binary-to-char (hex) conversion, so this is mssql-odbc-specific — skip it on
+// the msodbcsql comparison leg.
 TEST_F(GetDataLiveTest, VarbinaryMaxToCharReturnsHyc00) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0x41424344 AS VARBINARY(MAX)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
 

@@ -354,10 +354,13 @@ fn resume_row_to_column(
     let row_complete = writer.end_row_fired();
     let captured = writer.take_captured().map(|v| (column_number, v));
 
-    if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
-        dbc_state.active_stmt = Some(statement_handle);
-    }
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        error!("SQLGetData: dbc mutex poisoned after row resume");
+        return SQL_ERROR;
+    };
+    dbc_state.client = Some(client);
+    dbc_state.active_stmt = Some(statement_handle);
+    drop(dbc_state);
 
     match row_read {
         Ok(true) => {
@@ -531,10 +534,13 @@ fn stream_active_plp_chunk(
         .block_on(client.read_active_plp_bytes(&mut payload));
     let reached_end = client.active_plp_reached_end();
 
-    if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
-        dbc_state.active_stmt = Some(statement_handle);
-    }
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        error!("SQLGetData: dbc mutex poisoned after PLP read");
+        return SQL_ERROR;
+    };
+    dbc_state.client = Some(client);
+    dbc_state.active_stmt = Some(statement_handle);
+    drop(dbc_state);
 
     let read = match read_result {
         Ok(n) => n,

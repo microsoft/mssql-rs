@@ -92,7 +92,7 @@ impl ColumnMetadata {
         )
     }
 
-    /// Returns `true` for binary columns (`varbinary`, `binary`, `image`, etc.).
+    /// Returns `true` for binary columns (`varbinary`, `binary`, `image`, `udt`, etc.).
     pub fn is_binary_type(&self) -> bool {
         matches!(
             self.data_type,
@@ -101,6 +101,7 @@ impl ColumnMetadata {
                 | TdsDataType::VarBinary
                 | TdsDataType::Binary
                 | TdsDataType::Image
+                | TdsDataType::Udt
         )
     }
     /// Returns the scale for decimal/numeric/time types.
