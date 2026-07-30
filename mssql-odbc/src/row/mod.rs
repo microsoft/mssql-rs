@@ -82,30 +82,78 @@ impl RowWriter for OdbcRowWriter {
         self.requested_col == Some(col)
     }
 
-    fn write_null(&mut self, col: usize) { self.capture(col, ColumnValues::Null); }
-    fn write_bool(&mut self, col: usize, val: bool) { self.capture(col, ColumnValues::Bit(val)); }
-    fn write_u8(&mut self, col: usize, val: u8) { self.capture(col, ColumnValues::TinyInt(val)); }
-    fn write_i16(&mut self, col: usize, val: i16) { self.capture(col, ColumnValues::SmallInt(val)); }
-    fn write_i32(&mut self, col: usize, val: i32) { self.capture(col, ColumnValues::Int(val)); }
-    fn write_i64(&mut self, col: usize, val: i64) { self.capture(col, ColumnValues::BigInt(val)); }
-    fn write_f32(&mut self, col: usize, val: f32) { self.capture(col, ColumnValues::Real(val)); }
-    fn write_f64(&mut self, col: usize, val: f64) { self.capture(col, ColumnValues::Float(val)); }
-    fn write_string(&mut self, col: usize, val: SqlString) { self.capture(col, ColumnValues::String(val)); }
-    fn write_bytes(&mut self, col: usize, val: Vec<u8>) { self.capture(col, ColumnValues::Bytes(val)); }
-    fn write_decimal(&mut self, col: usize, val: DecimalParts) { self.capture(col, ColumnValues::Decimal(val)); }
-    fn write_numeric(&mut self, col: usize, val: DecimalParts) { self.capture(col, ColumnValues::Numeric(val)); }
-    fn write_date(&mut self, col: usize, val: SqlDate) { self.capture(col, ColumnValues::Date(val)); }
-    fn write_time(&mut self, col: usize, val: SqlTime) { self.capture(col, ColumnValues::Time(val)); }
-    fn write_datetime(&mut self, col: usize, val: SqlDateTime) { self.capture(col, ColumnValues::DateTime(val)); }
-    fn write_smalldatetime(&mut self, col: usize, val: SqlSmallDateTime) { self.capture(col, ColumnValues::SmallDateTime(val)); }
-    fn write_datetime2(&mut self, col: usize, val: SqlDateTime2) { self.capture(col, ColumnValues::DateTime2(val)); }
-    fn write_datetimeoffset(&mut self, col: usize, val: SqlDateTimeOffset) { self.capture(col, ColumnValues::DateTimeOffset(val)); }
-    fn write_money(&mut self, col: usize, val: SqlMoney) { self.capture(col, ColumnValues::Money(val)); }
-    fn write_smallmoney(&mut self, col: usize, val: SqlSmallMoney) { self.capture(col, ColumnValues::SmallMoney(val)); }
-    fn write_uuid(&mut self, col: usize, val: Uuid) { self.capture(col, ColumnValues::Uuid(val)); }
-    fn write_xml(&mut self, col: usize, val: SqlXml) { self.capture(col, ColumnValues::Xml(val)); }
-    fn write_json(&mut self, col: usize, val: SqlJson) { self.capture(col, ColumnValues::Json(val)); }
-    fn write_vector(&mut self, col: usize, val: SqlVector) { self.capture(col, ColumnValues::Vector(val)); }
+    fn write_null(&mut self, col: usize) {
+        self.capture(col, ColumnValues::Null);
+    }
+    fn write_bool(&mut self, col: usize, val: bool) {
+        self.capture(col, ColumnValues::Bit(val));
+    }
+    fn write_u8(&mut self, col: usize, val: u8) {
+        self.capture(col, ColumnValues::TinyInt(val));
+    }
+    fn write_i16(&mut self, col: usize, val: i16) {
+        self.capture(col, ColumnValues::SmallInt(val));
+    }
+    fn write_i32(&mut self, col: usize, val: i32) {
+        self.capture(col, ColumnValues::Int(val));
+    }
+    fn write_i64(&mut self, col: usize, val: i64) {
+        self.capture(col, ColumnValues::BigInt(val));
+    }
+    fn write_f32(&mut self, col: usize, val: f32) {
+        self.capture(col, ColumnValues::Real(val));
+    }
+    fn write_f64(&mut self, col: usize, val: f64) {
+        self.capture(col, ColumnValues::Float(val));
+    }
+    fn write_string(&mut self, col: usize, val: SqlString) {
+        self.capture(col, ColumnValues::String(val));
+    }
+    fn write_bytes(&mut self, col: usize, val: Vec<u8>) {
+        self.capture(col, ColumnValues::Bytes(val));
+    }
+    fn write_decimal(&mut self, col: usize, val: DecimalParts) {
+        self.capture(col, ColumnValues::Decimal(val));
+    }
+    fn write_numeric(&mut self, col: usize, val: DecimalParts) {
+        self.capture(col, ColumnValues::Numeric(val));
+    }
+    fn write_date(&mut self, col: usize, val: SqlDate) {
+        self.capture(col, ColumnValues::Date(val));
+    }
+    fn write_time(&mut self, col: usize, val: SqlTime) {
+        self.capture(col, ColumnValues::Time(val));
+    }
+    fn write_datetime(&mut self, col: usize, val: SqlDateTime) {
+        self.capture(col, ColumnValues::DateTime(val));
+    }
+    fn write_smalldatetime(&mut self, col: usize, val: SqlSmallDateTime) {
+        self.capture(col, ColumnValues::SmallDateTime(val));
+    }
+    fn write_datetime2(&mut self, col: usize, val: SqlDateTime2) {
+        self.capture(col, ColumnValues::DateTime2(val));
+    }
+    fn write_datetimeoffset(&mut self, col: usize, val: SqlDateTimeOffset) {
+        self.capture(col, ColumnValues::DateTimeOffset(val));
+    }
+    fn write_money(&mut self, col: usize, val: SqlMoney) {
+        self.capture(col, ColumnValues::Money(val));
+    }
+    fn write_smallmoney(&mut self, col: usize, val: SqlSmallMoney) {
+        self.capture(col, ColumnValues::SmallMoney(val));
+    }
+    fn write_uuid(&mut self, col: usize, val: Uuid) {
+        self.capture(col, ColumnValues::Uuid(val));
+    }
+    fn write_xml(&mut self, col: usize, val: SqlXml) {
+        self.capture(col, ColumnValues::Xml(val));
+    }
+    fn write_json(&mut self, col: usize, val: SqlJson) {
+        self.capture(col, ColumnValues::Json(val));
+    }
+    fn write_vector(&mut self, col: usize, val: SqlVector) {
+        self.capture(col, ColumnValues::Vector(val));
+    }
 
     fn end_row(&mut self) {
         self.end_row_fired = true;
@@ -181,4 +229,3 @@ mod tests {
         assert!(w.take_captured().is_none());
     }
 }
-

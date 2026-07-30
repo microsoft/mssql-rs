@@ -5,7 +5,6 @@
 
 use tracing::{debug, error};
 
-use crate::row::OdbcRowWriter;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
@@ -14,6 +13,7 @@ use crate::api::odbc_types::{
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::row::OdbcRowWriter;
 use mssql_tds::connection::tds_client::ResultSet;
 
 /// Implements SQLFetch for the current forward-only result set.

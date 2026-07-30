@@ -5,7 +5,6 @@
 
 use tracing::{debug, error};
 
-use crate::row::{OdbcRowWriter, PlpEncoding};
 use super::odbc_types::{
     SQL_C_CHAR, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_TOTAL,
     SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer, SqlReturn,
@@ -17,6 +16,7 @@ use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::row::{OdbcRowWriter, PlpEncoding};
 use mssql_tds::connection::tds_client::ResultSet;
 use mssql_tds::datatypes::column_values::ColumnValues;
 #[cfg(test)]
