@@ -73,7 +73,9 @@ impl OdbcRowWriter {
 
 impl RowWriter for OdbcRowWriter {
     fn pause_before_first_column(&self) -> bool {
-        true
+        // True when in position/drain mode (SQLFetch, no column requested).
+        // False when resuming to a specific column (SQLGetData).
+        self.requested_col.is_none()
     }
 
     fn pause_after_column(&self, col: usize) -> bool {
@@ -116,9 +118,14 @@ mod tests {
     use mssql_tds::datatypes::sql_string::SqlString;
 
     #[test]
-    fn pauses_before_first_column_always() {
+    fn pauses_before_first_column_only_in_position_mode() {
+        // Position/drain mode (no column requested) → true.
         let w = OdbcRowWriter::new();
         assert!(w.pause_before_first_column());
+        // Resume mode (column requested) → false.
+        let mut w2 = OdbcRowWriter::new();
+        w2.request(0);
+        assert!(!w2.pause_before_first_column());
     }
 
     #[test]
