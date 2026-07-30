@@ -151,10 +151,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
     let drop_handle = stmt_state.pending_unprepare.take();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.column_metadata.clear();
-    stmt_state.current_row = None;
-    stmt_state.current_row_complete = false;
-    stmt_state.active_plp_column = None;
-    stmt_state.active_plp_target_type = None;
+    stmt_state.reset_row_stream();
     stmt_state.set_state(STMT_STATE_EXEC_STARTED);
 
     Ok(Execution {

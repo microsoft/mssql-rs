@@ -105,10 +105,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 return SQL_ERROR;
             };
             stmt_state.column_metadata = metadata;
-            stmt_state.current_row = None;
-            stmt_state.current_row_complete = false;
-            stmt_state.active_plp_column = None;
-            stmt_state.active_plp_target_type = None;
+            stmt_state.reset_row_stream();
             // Drain INFO only after the lock is held.
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);

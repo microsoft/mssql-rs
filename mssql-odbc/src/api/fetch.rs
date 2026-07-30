@@ -59,14 +59,6 @@ fn sql_fetch_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
 fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
-    let col_count = {
-        let Ok(stmt_state) = stmt.inner.lock() else {
-            error!("SQLFetch: stmt mutex poisoned while reading metadata");
-            return SQL_ERROR;
-        };
-        stmt_state.column_metadata.len()
-    };
-
     let mut client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetch: dbc mutex poisoned");
@@ -107,14 +99,9 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         client
     };
 
-    let mut writer = OdbcRowWriter::new(col_count);
-    if col_count > 0 {
-        writer.request_pause_before_first_column();
-    }
+    let mut writer = OdbcRowWriter::new();
 
     let fetch_result = dbc.runtime.block_on(client.next_row_into(&mut writer));
-    let row_complete = writer.row_complete();
-    let fetched_row = writer.into_row();
 
     match fetch_result {
         Ok(true) => {
@@ -128,11 +115,8 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 }
                 return SQL_ERROR;
             };
-            stmt_state.current_row = Some(fetched_row);
-            stmt_state.current_row_complete = row_complete;
-            stmt_state.active_plp_column = None;
-            stmt_state.active_plp_target_type = None;
-            stmt_state.current_row_last_col = 0;
+            stmt_state.reset_row_stream();
+            stmt_state.current_row = Some(Vec::new()); // row positioned, columns streamed on demand
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();
@@ -188,11 +172,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 }
                 return SQL_ERROR;
             };
-            stmt_state.current_row = None;
-            stmt_state.current_row_complete = false;
-            stmt_state.active_plp_column = None;
-            stmt_state.active_plp_target_type = None;
-            stmt_state.current_row_last_col = 0;
+            stmt_state.reset_row_stream();
             // Don't clear CURSOR_OPEN here: the cursor stays open until
             // SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE).
             drop(stmt_state);
@@ -206,11 +186,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         Err(e) => {
             error!(%e, "SQLFetch: row fetch failed");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.current_row = None;
-                stmt_state.current_row_complete = false;
-                stmt_state.active_plp_column = None;
-                stmt_state.active_plp_target_type = None;
-                stmt_state.current_row_last_col = 0;
+                stmt_state.reset_row_stream();
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
                 let info_messages = client.take_info_messages();

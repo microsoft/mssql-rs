@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use super::{DbcHandle, HandleType, HasObjectType};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
+use crate::row::PlpEncoding;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
 
@@ -61,10 +62,8 @@ pub(crate) struct StmtState {
     /// The C target type used for the active PLP stream (`SQL_C_CHAR` or
     /// `SQL_C_WCHAR`). Mixed target-type chunking on one stream is rejected.
     pub(crate) active_plp_target_type: Option<i16>,
-    /// Whether the active PLP column contains UTF-16LE data (NVARCHAR/XML).
-    pub(crate) active_plp_is_unicode: bool,
-    /// Whether the active PLP column is a binary type (VARBINARY/BINARY/IMAGE).
-    pub(crate) active_plp_is_binary: bool,
+    /// Wire encoding of the active PLP column.
+    pub(crate) active_plp_encoding: Option<PlpEncoding>,
     /// 1-based column number of the last successful SQLGetData call on this row.
     /// Used to enforce forward-only column access (07009) and SQL_NO_DATA on re-read.
     pub(crate) current_row_last_col: usize,
@@ -83,6 +82,16 @@ impl StmtState {
 
     pub(crate) fn clear_state(&mut self, mask: u32) {
         self.state_flags &= !mask;
+    }
+
+    /// Clears all row-stream state (cursor invalidated, no PLP in progress).
+    pub(crate) fn reset_row_stream(&mut self) {
+        self.current_row = None;
+        self.current_row_complete = false;
+        self.active_plp_column = None;
+        self.active_plp_target_type = None;
+        self.active_plp_encoding = None;
+        self.current_row_last_col = 0;
     }
 
     /// Moves the cached `prepared_handle` (if any) into `pending_unprepare` so
@@ -132,8 +141,7 @@ impl StmtHandle {
                 current_row_complete: false,
                 active_plp_column: None,
                 active_plp_target_type: None,
-                active_plp_is_unicode: false,
-                active_plp_is_binary: false,
+                active_plp_encoding: None,
                 current_row_last_col: 0,
                 state_flags: 0,
             }),

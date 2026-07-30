@@ -5,7 +5,7 @@
 
 use tracing::{debug, error};
 
-use crate::row::OdbcRowWriter;
+use crate::row::{OdbcRowWriter, PlpEncoding};
 use super::odbc_types::{
     SQL_C_CHAR, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_TOTAL,
     SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer, SqlReturn,
@@ -357,12 +357,12 @@ fn resume_row_to_column(
         client
     };
 
-    let mut writer = OdbcRowWriter::new(0);
-    writer.request_pause_after_column(column_number);
+    let mut writer = OdbcRowWriter::new();
+    writer.request(column_number - 1); // 0-based
 
     let row_read = dbc.runtime.block_on(client.next_row_into(&mut writer));
-    let row_complete = writer.row_complete();
-    let updated_row = writer.into_row();
+    let row_complete = writer.end_row_fired();
+    let updated_row = writer.take_captured().map(|v| vec![v]).unwrap_or_default();
 
     if let Ok(mut dbc_state) = dbc.inner.lock() {
         dbc_state.client = Some(client);
@@ -434,18 +434,23 @@ fn stream_active_plp_chunk(
         if starting_new_stream {
             stmt_state.active_plp_column = Some(col_index);
             stmt_state.active_plp_target_type = None;
-            let (is_unicode, is_binary) = stmt_state
+            let (enc_unicode, enc_binary) = stmt_state
                 .column_metadata
                 .get(col_index - 1)
                 .map(|m| (m.is_unicode_text(), m.is_binary_type()))
                 .unwrap_or((false, false));
-            stmt_state.active_plp_is_unicode = is_unicode;
-            stmt_state.active_plp_is_binary = is_binary;
+            stmt_state.active_plp_encoding = Some(if enc_binary {
+                PlpEncoding::Binary
+            } else if enc_unicode {
+                PlpEncoding::Utf16Text
+            } else {
+                PlpEncoding::SingleByteText
+            });
             stmt_state.current_row_last_col = col_index;
         }
 
         // Binary PLP columns (VARBINARY) cannot be delivered as character data.
-        if stmt_state.active_plp_is_binary {
+        if matches!(stmt_state.active_plp_encoding, Some(PlpEncoding::Binary)) {
             post_sql_error(
                 &mut stmt_state,
                 SQLSTATE_HYC00,
@@ -494,7 +499,7 @@ fn stream_active_plp_chunk(
         let Ok(ss) = stmt.inner.lock() else {
             return SQL_ERROR;
         };
-        ss.active_plp_is_unicode
+        matches!(ss.active_plp_encoding, Some(PlpEncoding::Utf16Text))
     };
 
     let dbc = stmt.parent_dbc();
