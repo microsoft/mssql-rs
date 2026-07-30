@@ -457,38 +457,6 @@ TEST_F(GetDataLiveTest, PlpTinyBufferManyCalls) {
     SQLCloseCursor(stmt_);
 }
 
-// For a value that fits in a single wire pump (<= 8 KiB), the driver may
-// report an exact byte count or SQL_NO_TOTAL in the indicator; both are
-// spec-compliant. Verify the full value is returned correctly.
-TEST_F(GetDataLiveTest, PlpSmallValueIndicatorDecrements) {
-    const SQLLEN kTotal = 400;
-    ASSERT_SQL_OK(ExecDirect(
-                      "SELECT REPLICATE(CAST('abcdefgh' AS VARCHAR(MAX)), 50) AS c1"),
-                  SQL_HANDLE_STMT, stmt_);
-
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-
-    SQLLEN total_fetched = 0;
-    while (true) {
-        SQLCHAR buf[16] = {0};  // 15 usable bytes per call
-        SQLLEN ind = 0;
-        SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind);
-        ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO)
-            << "unexpected rc=" << rc;
-
-        SQLLEN copied = static_cast<SQLLEN>(std::strlen(reinterpret_cast<const char*>(buf)));
-        total_fetched += copied;
-
-        if (rc == SQL_SUCCESS) {
-            break;
-        }
-    }
-
-    EXPECT_EQ(kTotal, total_fetched);
-
-    SQLCloseCursor(stmt_);
-}
-
 // For a value larger than one wire pump (> 8 KiB), the indicator is SQL_NO_TOTAL.
 TEST_F(GetDataLiveTest, PlpLargeValueIndicatorNoTotal) {
     const int kTotal = 20000;

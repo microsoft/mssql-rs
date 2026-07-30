@@ -27,6 +27,5 @@ azure_core = { version = "1.1", default-features = false, features = [
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream"] }
 url = "2"
 uuid = "1"
-encoding_rs = "0.8"
 
 [build-dependencies]
