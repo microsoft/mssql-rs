@@ -145,10 +145,10 @@ pub const SQL_DIAG_MESSAGE_TEXT: SqlSmallInt = 6;
 
 // Special length/indicator constants.
 pub const SQL_NULL_DATA: SqlLen = -1;
+pub const SQL_DATA_AT_EXEC: SqlLen = -2;
 /// Indicator: total length of long data is unknown — driver will set this when
 /// the full value cannot be determined without consuming the entire PLP stream.
 pub const SQL_NO_TOTAL: SqlLen = -4;
-pub const SQL_DATA_AT_EXEC: SqlLen = -2;
 
 // SQLBindParameter extensions
 pub const SQL_DEFAULT_PARAM: SqlLen = -5;

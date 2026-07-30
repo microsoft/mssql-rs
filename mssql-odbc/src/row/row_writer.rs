@@ -12,8 +12,10 @@ use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::datatypes::sql_vector::SqlVector;
 use uuid::Uuid;
 
-/// Wire encoding of a PLP column; used to transcode streamed chunks to the
-/// requested C type.
+/// Wire encoding of a PLP column; used to select and transcode the delivered
+/// SQL C type. UTF-16 text can be delivered as SQL_C_WCHAR or transcoded to
+/// SQL_C_CHAR; single-byte text as SQL_C_CHAR. Binary delivery and
+/// varchar->SQL_C_WCHAR widening are not yet supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlpEncoding {
     /// nvarchar(max), nchar(max), xml — UTF-16LE on the wire.

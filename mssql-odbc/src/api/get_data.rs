@@ -439,21 +439,6 @@ fn stream_active_plp_chunk(
             stmt_state.current_row_last_col = col_index;
         }
 
-        // Binary PLP columns (VARBINARY) cannot be delivered as character data.
-        if stmt_state
-            .active_plp
-            .as_ref()
-            .is_some_and(|s| matches!(s.encoding, PlpEncoding::Binary))
-        {
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_HYC00,
-                0,
-                "Target type not yet implemented for binary columns",
-            );
-            return SQL_ERROR;
-        }
-
         if stmt_state
             .active_plp
             .as_ref()
@@ -464,6 +449,28 @@ fn stream_active_plp_chunk(
                 SQLSTATE_24000,
                 0,
                 "No active PLP stream for this column",
+            );
+            return SQL_ERROR;
+        }
+
+        // Supported text deliveries: SQL_C_WCHAR for nvarchar(max)/xml
+        // (UTF-16LE) and SQL_C_CHAR for either varchar(max) (single byte) or
+        // nvarchar(max) (UTF-16LE transcoded to UTF-8). Binary columns and the
+        // varchar->SQL_C_WCHAR widening are not yet implemented; they return
+        // HYC00 and are deferred to a follow-up change.
+        let encoding = stmt_state.active_plp.as_ref().map(|s| s.encoding);
+        let compatible = matches!(
+            (target_type, encoding),
+            (SQL_C_WCHAR, Some(PlpEncoding::Utf16Text))
+                | (SQL_C_CHAR, Some(PlpEncoding::SingleByteText))
+                | (SQL_C_CHAR, Some(PlpEncoding::Utf16Text))
+        );
+        if !compatible {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HYC00,
+                0,
+                "Target type not yet implemented for this column",
             );
             return SQL_ERROR;
         }
@@ -589,14 +596,8 @@ fn stream_active_plp_chunk(
         return SQL_SUCCESS;
     }
 
-    stmt_state.active_plp = Some(ActivePlpStream {
-        column: col_index,
-        encoding: if is_unicode_plp {
-            PlpEncoding::Utf16Text
-        } else {
-            PlpEncoding::SingleByteText
-        },
-    });
+    // active_plp already holds this column's stream state; leave it in place so
+    // the next SQLGetData call continues from where this one stopped.
     unsafe { write_if_some(strlen_or_ind_ptr, SQL_NO_TOTAL) };
     post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
 
