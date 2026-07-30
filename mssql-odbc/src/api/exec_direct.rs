@@ -107,6 +107,8 @@ fn sql_exec_direct_w_safe(
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.column_metadata.clear();
         stmt_state.current_row = None;
+        stmt_state.row_count = -1;
+        stmt_state.pending_row_counts.clear();
         stmt_state.prepared_sql = None;
         // Superseding a prepared plan orphans its server handle; release it
         // (deferred) once we hold the client below.
@@ -176,6 +178,33 @@ mod tests {
         let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
         // DBC is not connected
         assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn exec_direct_clears_stale_pending_row_counts_even_on_failure() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        // Simulate a prior pure-DML batch that left per-statement counts queued.
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.row_count = 3;
+            state.pending_row_counts = std::collections::VecDeque::from(vec![2, 1]);
+        }
+
+        let sql: Vec<u16> = "SELECT 1"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // Fails (not connected), but the stale row-count state must be cleared
+        // at execute start so a later SQLMoreResults can't surface it.
+        assert_eq!(
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_ERROR
+        );
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.row_count, -1);
+        assert!(state.pending_row_counts.is_empty());
     }
 
     #[test]
