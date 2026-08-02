@@ -104,16 +104,22 @@ TEST_F(RowCountLiveTest, NoCountSuppressesRowCount) {
     EXPECT_EQ(-1, RowCount());
 }
 
-// A DML statement followed by a SELECT in the same batch: the forward-only
-// SELECT the cursor lands on must report -1, not the DML's count. Guards the
-// review fix that clears the count when positioning on COLMETADATA.
+// A DML statement followed by a SELECT in the same batch surfaces the DML's
+// count first (statement-wise navigation, msodbcsql parity); SQLMoreResults
+// then advances to the forward-only SELECT, which must report -1 — not the
+// leaked DML count. Guards the fix that clears the count when positioning on
+// COLMETADATA.
 TEST_F(RowCountLiveTest, DmlThenSelectBatchReportsMinusOneForSelect) {
     Exec("CREATE TABLE #rc_mix(i int)");
     Exec("INSERT INTO #rc_mix VALUES (1), (2), (3)");
     Exec("UPDATE #rc_mix SET i = i + 1; SELECT * FROM #rc_mix;");
+    EXPECT_EQ(3, RowCount());
+
+    SQLRETURN rc = SQLMoreResults(stmt_);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(-1, RowCount());
 
-    SQLRETURN rc = SQLCloseCursor(stmt_);
+    rc = SQLCloseCursor(stmt_);
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
 
