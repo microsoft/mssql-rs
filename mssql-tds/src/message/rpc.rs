@@ -97,6 +97,28 @@ impl<'a> SqlRpc<'a> {
         Ok(())
     }
 
+    /// Serializes the RPC up to and including all fully-materialized
+    /// parameters, but does **not** send the terminating `finalize` packet.
+    ///
+    /// Used by the incremental (streamed) PLP write path: the caller writes the
+    /// header, proc, positional and materialized named parameters here, then
+    /// appends one or more streamed parameters chunk-by-chunk before calling
+    /// `finalize` itself. For the normal atomic send, use [`serialize`], which
+    /// wraps this and then finalizes.
+    pub(crate) async fn serialize_prefix<'s, 'b>(
+        &'s self,
+        packet_writer: &'s mut PacketWriter<'b>,
+    ) -> TdsResult<()>
+    where
+        'b: 's,
+    {
+        write_headers(&self.headers, packet_writer).await?;
+        self.write_proc(packet_writer).await?;
+        self.write_positional_parameters(packet_writer).await?;
+        self.write_named_parameters(packet_writer).await?;
+        Ok(())
+    }
+
     async fn write_proc(&self, packet_writer: &mut PacketWriter<'_>) -> TdsResult<()> {
         match &self.rpc_type {
             RpcType::Named(stored_proc_name) => {
@@ -175,10 +197,7 @@ impl Request for SqlRpc<'_> {
     where
         'b: 'a,
     {
-        write_headers(&self.headers, packet_writer).await?;
-        self.write_proc(packet_writer).await?;
-        self.write_positional_parameters(packet_writer).await?;
-        self.write_named_parameters(packet_writer).await?;
+        self.serialize_prefix(packet_writer).await?;
         packet_writer.finalize().await?;
         Ok(())
     }

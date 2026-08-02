@@ -5,7 +5,7 @@ use crate::core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult};
 use crate::io::{packet_writer::PacketWriter, reader_writer::NetworkWriter};
 use async_trait::async_trait;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 #[allow(dead_code, clippy::upper_case_acronyms)]
 pub enum PacketType {
     Unknown = 0x00,

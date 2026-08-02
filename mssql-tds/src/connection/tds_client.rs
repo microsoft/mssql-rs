@@ -6,12 +6,14 @@ use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{ClientContext, ExecutionColumnEncryptionSetting};
 use crate::connection::session_recovery::RecoveryContext;
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
+use crate::datatypes::encoder::GenericEncoder;
 use crate::datatypes::row_writer::{DefaultRowWriter, DiscardRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sqltypes::SqlType;
+use crate::datatypes::tds_value_serializer::PLP_TERMINATOR;
 use crate::error::Error::UsageError;
 use crate::error::{SqlErrorInfo, SqlInfoMessage};
-use crate::io::packet_writer::PacketWriter;
+use crate::io::packet_writer::{PacketWriter, SuspendedMessage, TdsPacketWriter};
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
 use crate::message::messages::{PacketType, ResetConnectionMode};
 use crate::message::parameters::rpc_parameters::{
@@ -184,6 +186,47 @@ pub enum CursorColumn {
     RowEnded,
 }
 
+/// Result of closing the current streamed PLP parameter via
+/// [`TdsClient::end_streamed_param`].
+#[derive(Debug)]
+pub enum StreamedParamStatus {
+    /// The server still expects another streamed parameter. Stream its value
+    /// chunks next via [`TdsClient::write_streamed_chunk`], then call
+    /// [`TdsClient::end_streamed_param`] again. Carries the name of the
+    /// parameter now open for data.
+    NeedData {
+        /// Name of the streamed parameter now awaiting its value chunks.
+        param_name: String,
+    },
+    /// All streamed parameters have been written; the RPC message has been sent
+    /// and its response consumed. Any result set is now available exactly as
+    /// after a normal `execute_*` call.
+    Done,
+}
+
+/// State machine for an in-progress incremental (streamed) PLP parameter write,
+/// parked as owned state on the client between calls (mirrors the read side's
+/// [`ActiveRowReadState`]). `Active` holds the suspended RPC message plus the
+/// streamed parameters whose headers have not yet been emitted.
+#[derive(Debug)]
+enum StreamedWriteState {
+    Idle,
+    Active(Box<StreamedWriteContext>),
+}
+
+/// Owned context for a suspended, partially-written streamed RPC.
+#[derive(Debug)]
+struct StreamedWriteContext {
+    /// The parked outgoing RPC message. The parameter currently open for data
+    /// has already had its header + `PLP_UNKNOWN_LEN` written; the next bytes
+    /// appended are its value chunks.
+    message: SuspendedMessage,
+    /// Streamed parameters whose headers have not yet been written, in order.
+    pending: std::collections::VecDeque<RpcParameter>,
+    /// Collation used to write `TYPE_INFO` for subsequent streamed parameters.
+    db_collation: SqlCollation,
+}
+
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -295,6 +338,10 @@ pub struct TdsClient {
     /// budget-exhaustion paths are exercised without live reconnect timing.
     #[cfg(test)]
     reconnect_elapsed_for_test: Option<Duration>,
+
+    // Active incremental (streamed) PLP parameter-write state, if a streamed
+    // RPC is mid-flight. Idle for the normal atomic send path.
+    streamed_write_state: StreamedWriteState,
 }
 
 impl TdsClient {
@@ -345,6 +392,7 @@ impl TdsClient {
             active_row_read_state: ActiveRowReadState::Idle,
             #[cfg(test)]
             reconnect_elapsed_for_test: None,
+            streamed_write_state: StreamedWriteState::Idle,
         }
     }
 
@@ -954,6 +1002,294 @@ impl TdsClient {
         rpc.serialize(&mut packet_writer).await?;
 
         self.position_on_first_result().await
+    }
+
+    /// Executes a parameterized `sp_executesql` where one or more MAX-type
+    /// parameter values are supplied later, in chunks (data-at-execution).
+    ///
+    /// This is the streamed counterpart of
+    /// [`execute_sp_executesql`](Self::execute_sp_executesql): it takes the same
+    /// single `named_params` list, but any entry marked with
+    /// [`RpcParameter::data_at_exec`] has its value streamed afterwards instead
+    /// of materialized up front. Such a parameter's `SqlType` acts purely as a
+    /// type template (any inner value is ignored, so `SqlType::NVarcharMax(None)`
+    /// is the intended form) and it must be named and be a MAX type
+    /// (`nvarchar(max)`, `varchar(max)` or `varbinary(max)`).
+    ///
+    /// If no parameter is marked data-at-execution this simply delegates to the
+    /// atomic path and returns [`StreamedParamStatus::Done`]. Otherwise the RPC
+    /// header, positional `@statement`/`@params` arguments (whose declaration
+    /// covers every parameter) and all materialized parameters are written
+    /// eagerly through the normal serialize path; the header +
+    /// `PLP_UNKNOWN_LEN` of the first data-at-execution parameter is written via
+    /// the same [`RpcParameter::serialize`], which stops at the value; and the
+    /// in-progress message is parked as owned state on the client. Drive each
+    /// value with [`write_streamed_chunk`](Self::write_streamed_chunk) and close
+    /// it with [`end_streamed_param`](Self::end_streamed_param).
+    ///
+    /// Value chunk bytes are raw wire bytes and their lengths are byte counts:
+    /// UTF-16LE for `nvarchar(max)`, the server's single-byte encoding for
+    /// `varchar(max)`, and raw bytes for `varbinary(max)`. Encoding is the
+    /// caller's responsibility, mirroring the read side which yields raw PLP
+    /// bytes.
+    ///
+    /// Returns [`StreamedParamStatus::NeedData`] naming the first data-at-execution
+    /// parameter now awaiting its value.
+    ///
+    /// # Errors
+    /// Returns a usage error if a batch is already open, a streamed write is
+    /// already in progress, a data-at-execution parameter is a non-MAX type or
+    /// unnamed, or Always Encrypted is active (streamed values cannot be
+    /// encrypted).
+    pub async fn begin_sp_executesql(
+        &mut self,
+        sql: String,
+        named_params: Vec<RpcParameter>,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<StreamedParamStatus> {
+        if self.execution_context.has_open_batch()
+            || !matches!(self.streamed_write_state, StreamedWriteState::Idle)
+        {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        // Split the bound parameters into materialized values (sent now, via the
+        // existing serialize path) and data-at-execution values (streamed later),
+        // preserving order. Mirrors ODBC, where every parameter is bound and some
+        // are flagged SQL_DATA_AT_EXEC.
+        let (streamed_params, materialized_params): (Vec<_>, Vec<_>) =
+            named_params.into_iter().partition(RpcParameter::is_data_at_exec);
+
+        // No data-at-execution parameters: this is just an ordinary execution.
+        if streamed_params.is_empty() {
+            self.execute_sp_executesql(
+                sql,
+                materialized_params,
+                ExecuteOptions {
+                    timeout: timeout_sec,
+                    cancel: cancel_handle,
+                    column_encryption: ExecutionColumnEncryptionSetting::UseConnectionSetting,
+                },
+            )
+            .await?;
+            return Ok(StreamedParamStatus::Done);
+        }
+
+        for param in &streamed_params {
+            if !param.is_streamable_plp() {
+                return Err(UsageError(
+                    "Streamed parameters must be nvarchar(max), varchar(max) or varbinary(max)."
+                        .to_string(),
+                ));
+            }
+            if param.name.is_none() {
+                return Err(UsageError(
+                    "Streamed parameters must be named.".to_string(),
+                ));
+            }
+        }
+
+        self.current_command_ce_setting =
+            ExecutionColumnEncryptionSetting::UseConnectionSetting;
+
+        self.begin_command();
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
+
+        self.remaining_request_timeout = request_timeout;
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+
+        // Always Encrypted is not supported when streaming parameter values.
+        if self.should_encrypt_parameters() {
+            return Err(UsageError(
+                "Streamed PLP parameter writes are not supported with Always Encrypted.".to_string(),
+            ));
+        }
+
+        self.transport.reset_reader();
+        let database_collation = self.negotiated_settings.database_collation;
+
+        let statement_parameter = RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql))),
+        );
+
+        // The @params declaration must cover BOTH the materialized and the
+        // streamed parameters so the server knows every parameter's type.
+        let mut params_list_as_string = String::new();
+        let mut all_declarations = materialized_params.clone();
+        all_declarations.extend(streamed_params.iter().cloned());
+        build_parameter_list_string(&all_declarations, &mut params_list_as_string)?;
+
+        let params_parameter = RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string))),
+        );
+
+        let positional_parameters = Some(vec![statement_parameter, params_parameter]);
+
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::ExecuteSql),
+            positional_parameters,
+            Some(materialized_params),
+            &database_collation,
+            &self.execution_context,
+        );
+
+        let mut pending: std::collections::VecDeque<RpcParameter> =
+            streamed_params.into_iter().collect();
+        let first = pending
+            .pop_front()
+            .expect("streamed_params checked non-empty above");
+        let first_name = first
+            .name
+            .clone()
+            .expect("streamed parameter names validated above");
+
+        let mut packet_writer =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        // Write the RPC prefix (headers, proc, positional + materialized named
+        // params) then the first streamed parameter's header. The data-at-exec
+        // branch of `serialize` writes name + status + TYPE_INFO + PLP_UNKNOWN_LEN
+        // and stops at the value — the same method that serialized the
+        // materialized params, parked partway through.
+        rpc.serialize_prefix(&mut packet_writer).await?;
+        first
+            .serialize(&mut packet_writer, &database_collation, false, &GenericEncoder::new())
+            .await?;
+        let message = packet_writer.suspend();
+
+        self.streamed_write_state = StreamedWriteState::Active(Box::new(StreamedWriteContext {
+            message,
+            pending,
+            db_collation: database_collation,
+        }));
+
+        Ok(StreamedParamStatus::NeedData {
+            param_name: first_name,
+        })
+    }
+
+    /// Appends one value chunk to the streamed parameter currently open for
+    /// data. Call zero or more times between
+    /// [`begin_sp_executesql`](Self::begin_sp_executesql) (or
+    /// a [`StreamedParamStatus::NeedData`] from
+    /// [`end_streamed_param`](Self::end_streamed_param)) and the matching
+    /// [`end_streamed_param`](Self::end_streamed_param).
+    ///
+    /// Empty chunks are ignored: a zero-length PLP chunk header is the value
+    /// terminator, so it must never be emitted mid-value.
+    ///
+    /// # Errors
+    /// Returns a usage error if no streamed parameter is currently open, or if
+    /// `chunk` is longer than [`u32::MAX`] bytes (the PLP chunk-length field is
+    /// 32-bit).
+    pub async fn write_streamed_chunk(&mut self, chunk: &[u8]) -> TdsResult<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if chunk.len() > u32::MAX as usize {
+            return Err(UsageError(format!(
+                "Streamed PLP chunk length {} exceeds the maximum chunk size of {} bytes.",
+                chunk.len(),
+                u32::MAX
+            )));
+        }
+
+        let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle) {
+            StreamedWriteState::Active(ctx) => ctx,
+            StreamedWriteState::Idle => {
+                return Err(UsageError(
+                    "write_streamed_chunk called with no active streamed parameter.".to_string(),
+                ));
+            }
+        };
+        let StreamedWriteContext {
+            message,
+            pending,
+            db_collation,
+        } = *ctx;
+
+        let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
+        let result = async {
+            packet_writer.write_u32_async(chunk.len() as u32).await?;
+            packet_writer.write_async(chunk).await
+        }
+        .await;
+        let message = packet_writer.suspend();
+
+        // Re-park the message regardless of outcome so the state machine stays
+        // consistent; a write error fails the whole streamed operation.
+        self.streamed_write_state = StreamedWriteState::Active(Box::new(StreamedWriteContext {
+            message,
+            pending,
+            db_collation,
+        }));
+        result
+    }
+
+    /// Closes the streamed parameter currently open for data by writing its PLP
+    /// terminator.
+    ///
+    /// If more streamed parameters remain, the next one's header is written and
+    /// [`StreamedParamStatus::NeedData`] is returned (stream its chunks next).
+    /// When the last streamed parameter closes, the RPC message is finalized and
+    /// sent, the response is advanced to the first column metadata, and
+    /// [`StreamedParamStatus::Done`] is returned — the result set is then
+    /// available exactly as after a normal `execute_*` call.
+    ///
+    /// # Errors
+    /// Returns a usage error if no streamed parameter is currently open, or an
+    /// I/O error if sending fails.
+    pub async fn end_streamed_param(&mut self) -> TdsResult<StreamedParamStatus> {
+        let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle) {
+            StreamedWriteState::Active(ctx) => ctx,
+            StreamedWriteState::Idle => {
+                return Err(UsageError(
+                    "end_streamed_param called with no active streamed parameter.".to_string(),
+                ));
+            }
+        };
+        let StreamedWriteContext {
+            message,
+            mut pending,
+            db_collation,
+        } = *ctx;
+
+        let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
+        packet_writer.write_u32_async(PLP_TERMINATOR).await?;
+
+        if let Some(next) = pending.pop_front() {
+            let next_name = next
+                .name
+                .clone()
+                .expect("streamed parameter names validated at begin");
+            next.serialize(&mut packet_writer, &db_collation, false, &GenericEncoder::new())
+                .await?;
+            let message = packet_writer.suspend();
+            self.streamed_write_state = StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                message,
+                pending,
+                db_collation,
+            }));
+            return Ok(StreamedParamStatus::NeedData {
+                param_name: next_name,
+            });
+        }
+
+        // Last streamed parameter closed: send the message and consume the
+        // response exactly like execute_sp_executesql does.
+        packet_writer.finalize().await?;
+        drop(packet_writer);
+
+        self.position_on_first_result().await?;
+        Ok(StreamedParamStatus::Done)
     }
 
     /// Executes a bulk load operation using zero-copy streaming.

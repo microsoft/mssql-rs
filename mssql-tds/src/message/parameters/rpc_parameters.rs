@@ -7,6 +7,7 @@ use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
 use crate::datatypes::encoder::SqlValueEncoder;
 use crate::datatypes::sql_tvp::TvpTypeName;
 use crate::datatypes::sqltypes::SqlType;
+use crate::datatypes::tds_value_serializer::PLP_UNKNOWN_LEN;
 use crate::{
     core::TdsResult,
     datatypes::sqldatatypes::TdsDataType,
@@ -113,6 +114,15 @@ pub struct RpcParameter {
     /// `SqlParameter.ForceColumnEncryption`; a client-side directive that is
     /// never sent on the wire.
     force_column_encryption: bool,
+
+    /// When `true`, this parameter's value is supplied later, in chunks, via the
+    /// data-at-execution path (ODBC `SQL_DATA_AT_EXEC`). During serialization the
+    /// `value` is treated purely as a type template: [`serialize`](Self::serialize)
+    /// writes the parameter header and opens an unknown-length PLP value, then
+    /// stops. The value chunks and PLP terminator are written afterwards by the
+    /// streaming driver. Only the MAX (PLP) types are eligible. Never sent on the
+    /// wire as a flag.
+    data_at_exec: bool,
 }
 
 impl RpcParameter {
@@ -124,7 +134,26 @@ impl RpcParameter {
             value,
             encrypted: None,
             force_column_encryption: false,
+            data_at_exec: false,
         }
+    }
+
+    /// Marks this parameter as data-at-execution: its value is streamed later in
+    /// chunks rather than materialized up front. The `value` supplied to
+    /// [`new`](Self::new) is used only as a type template (a `None`-valued MAX
+    /// type such as `SqlType::NVarcharMax(None)` is the intended form).
+    ///
+    /// Only `nvarchar(max)`, `varchar(max)` and `varbinary(max)` may be streamed;
+    /// see [`is_streamable_plp`](Self::is_streamable_plp).
+    pub fn data_at_exec(mut self) -> Self {
+        self.data_at_exec = true;
+        self
+    }
+
+    /// Returns `true` if this parameter's value is supplied via the
+    /// data-at-execution (streamed) path.
+    pub(crate) fn is_data_at_exec(&self) -> bool {
+        self.data_at_exec
     }
 
     /// Requires this parameter to be encrypted under Always Encrypted.
@@ -297,6 +326,33 @@ impl RpcParameter {
             }
         }
 
+        // Data-at-execution: the value is streamed later in chunks. Reuse the
+        // exact opening the atomic PLP path emits — status byte, TYPE_INFO, then
+        // the unknown-total-length sentinel — and stop. The value chunks and PLP
+        // terminator are written afterwards by the streaming driver. This is the
+        // write analogue of the incremental read's pause point: the same
+        // serialize method, parked partway through the value.
+        if self.data_at_exec {
+            if !self.is_streamable_plp() {
+                return Err(Error::UsageError(format!(
+                    "Parameter '{}' is not a streamable PLP (MAX) type; only \
+                     nvarchar(max), varchar(max) and varbinary(max) may be streamed.",
+                    self.name.as_deref().unwrap_or("<positional>")
+                )));
+            }
+            if self.encrypted.is_some() {
+                return Err(Error::UsageError(
+                    "Encrypted parameters cannot be streamed incrementally.".to_string(),
+                ));
+            }
+            packet_writer.write_byte_async(self.options.bits()).await?;
+            self.value
+                .write_type_info(packet_writer, db_collation, None, None)
+                .await?;
+            packet_writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
+            return Ok(());
+        }
+
         // Encrypted parameters bypass the normal value encoder: the ciphertext
         // is sent as a BIGVARBINARY with the ENCRYPTED status flag and a
         // trailing CryptoMetaData block (Always Encrypted).
@@ -313,6 +369,16 @@ impl RpcParameter {
             .encode_sqlvalue(packet_writer, &self.value, db_collation)
             .await?;
         Ok(())
+    }
+
+    /// Returns `true` when this parameter's declared type is a MAX (PLP) type
+    /// eligible for incremental streaming: `nvarchar(max)`, `varchar(max)`, or
+    /// `varbinary(max)`.
+    pub(crate) fn is_streamable_plp(&self) -> bool {
+        matches!(
+            self.value,
+            SqlType::NVarcharMax(_) | SqlType::VarcharMax(_) | SqlType::VarBinaryMax(_)
+        )
     }
 
     /// Marks this parameter as encrypted, supplying the ciphertext (or `None`
@@ -850,5 +916,94 @@ mod tests {
             SqlType::Int(Some(42)),
         );
         assert_eq!(param.value(), &SqlType::Int(Some(42)));
+    }
+
+    /// Serializes a data-at-execution PLP parameter via the normal `serialize`
+    /// path (which, for a `data_at_exec` param, writes only the header and opens
+    /// the value), returning the payload bytes.
+    fn streamed_header_bytes(param: &RpcParameter, is_positional: bool) -> Vec<u8> {
+        let mut mock = MockNetworkWriter::new(16384);
+        let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let encoder = GenericEncoder {};
+        block_on(param.serialize(&mut w, &collation, is_positional, &encoder)).unwrap();
+        payload(&w)
+    }
+
+    /// A named data-at-execution `nvarchar(max)` param serializes to: name
+    /// prefix, status-flags byte, the value's TYPE_INFO, then the 8-byte
+    /// `PLP_UNKNOWN_LEN` sentinel that opens the value. No value bytes or
+    /// terminator are written — those are streamed later.
+    #[test]
+    fn serialize_data_at_exec_named() {
+        let param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(None),
+        )
+        .data_at_exec();
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
+        expected.push(StatusFlags::NONE.bits()); // status flags
+        expected.extend_from_slice(&type_info_bytes(&SqlType::NVarcharMax(None))); // TYPE_INFO
+        expected.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFEu64.to_le_bytes()); // PLP_UNKNOWN_LEN
+
+        assert_eq!(streamed_header_bytes(&param, false), expected);
+    }
+
+    /// A positional data-at-execution param writes a zero-length name byte in
+    /// place of the name, then the same status/TYPE_INFO/PLP_UNKNOWN_LEN sequence.
+    #[test]
+    fn serialize_data_at_exec_positional() {
+        let param = RpcParameter::new(None, StatusFlags::NONE, SqlType::VarBinaryMax(None))
+            .data_at_exec();
+
+        let mut expected = vec![0x00]; // zero-length name (positional)
+        expected.push(StatusFlags::NONE.bits());
+        expected.extend_from_slice(&type_info_bytes(&SqlType::VarBinaryMax(None)));
+        expected.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFEu64.to_le_bytes());
+
+        assert_eq!(streamed_header_bytes(&param, true), expected);
+    }
+
+    /// Non-MAX types are rejected on the data-at-execution path: only
+    /// nvarchar(max)/varchar(max)/varbinary(max) may be streamed.
+    #[test]
+    fn serialize_data_at_exec_rejects_non_max_type() {
+        let param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(1)),
+        )
+        .data_at_exec();
+        assert!(!param.is_streamable_plp());
+
+        let mut mock = MockNetworkWriter::new(16384);
+        let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let encoder = GenericEncoder {};
+        let err = block_on(param.serialize(&mut w, &collation, false, &encoder))
+            .expect_err("non-max type must be rejected");
+        assert!(matches!(err, Error::UsageError(_)));
+    }
+
+    /// Encrypted parameters cannot be streamed incrementally.
+    #[test]
+    fn serialize_data_at_exec_rejects_encrypted() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::VarBinaryMax(None),
+        )
+        .data_at_exec();
+        param.set_encrypted(Some(vec![0x01, 0x02]), sample_metadata());
+
+        let mut mock = MockNetworkWriter::new(16384);
+        let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let encoder = GenericEncoder {};
+        let err = block_on(param.serialize(&mut w, &collation, false, &encoder))
+            .expect_err("encrypted parameter must be rejected");
+        assert!(matches!(err, Error::UsageError(_)));
     }
 }
