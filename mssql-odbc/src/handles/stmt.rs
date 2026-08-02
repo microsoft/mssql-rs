@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -56,6 +57,17 @@ pub(crate) struct StmtState {
     pub(crate) pending_unprepare: Option<i32>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
+    /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
+    /// means "not available" (no statement executed yet, a result-returning
+    /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
+    /// `SQL_NO_ROWCOUNT_TOTAL` default.
+    pub(crate) row_count: i64,
+    /// Remaining per-statement row counts from a pure-DML batch
+    /// (`UPDATE; DELETE; INSERT`). `finish_execute` reports the first via
+    /// `row_count` and queues the rest here; each `SQLMoreResults` pops the next
+    /// (in memory — no cursor or connection), mirroring msodbcsql's one
+    /// result set per DML statement.
+    pub(crate) pending_row_counts: VecDeque<i64>,
     /// Rowset size for block fetches (`SQL_ATTR_ROW_ARRAY_SIZE`). Defaults to 1
     /// (single-row). Consumed by the columnar `SQLFetchScroll` path.
     pub(crate) row_array_size: SqlULen,
@@ -130,6 +142,8 @@ impl StmtHandle {
                 prepared_handle: None,
                 pending_unprepare: None,
                 current_row: None,
+                row_count: -1,
+                pending_row_counts: VecDeque::new(),
                 row_array_size: 1,
                 rows_fetched_ptr: std::ptr::null_mut(),
                 row_status_ptr: std::ptr::null_mut(),

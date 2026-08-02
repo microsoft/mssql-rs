@@ -732,6 +732,28 @@ stages:
           parameters:
             durationSeconds: 1800  # 30 minutes
             batchSize: 1000
+            testSelector: '-m "longhaul" -k "not arrow"'
+            resultsFile: 'pytest-longhaul-results.xml'
+            testRunTitle: 'LongHaul-BCP-Test'
+
+    # Arrow long-haul runs as its own job so it executes in parallel with the
+    # tuple long-haul; total stage wall-clock stays ~30 min instead of doubling.
+    - job: LongHaul_BCP_Arrow_Test
+      displayName: Long-Haul BCP Arrow Test Ubuntu
+      pool:
+        name: RUST-1ES-POOL-WUS3
+        demands:
+          - imageOverride -equals RUST-1ES-UBUSLIM
+      variables:
+        CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      steps:
+        - template: test-longhaul-template.yml
+          parameters:
+            durationSeconds: 1800  # 30 minutes
+            batchSize: 1000
+            testSelector: '-m "longhaul" -k "arrow"'
+            resultsFile: 'pytest-longhaul-arrow-results.xml'
+            testRunTitle: 'LongHaul-BCP-Arrow-Test'
 
   # Private-link smoke test for mssql-py-core (non-PR only)
   # Deploys wheel into ACI on trusted VNet, runs pytest suite via managed identity

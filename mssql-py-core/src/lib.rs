@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 use mssql_tds::connection::client_context::DriverVersion;
 
+mod arrow_bulkcopy;
 mod bulkcopy;
 mod connection;
 mod cursor;
