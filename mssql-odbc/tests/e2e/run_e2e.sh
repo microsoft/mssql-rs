@@ -367,7 +367,10 @@ generate_coverage_report() {
             echo "WARNING: no .profraw produced; the driver ctest loaded may not be instrumented" >&2
         fi
     fi
-    mkdir -p "$(dirname "$COVERAGE_OUTPUT")"
+    if ! mkdir -p "$(dirname "$COVERAGE_OUTPUT")"; then
+        echo "WARNING: failed to create ODBC e2e coverage output directory" >&2
+        return 0
+    fi
     if cargo llvm-cov report --package mssql-tds --package mssql-odbc \
         --cobertura --output-path "$COVERAGE_OUTPUT"; then
         echo "Coverage report written to $COVERAGE_OUTPUT"
