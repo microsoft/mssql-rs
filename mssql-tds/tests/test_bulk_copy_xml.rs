@@ -8,7 +8,7 @@ mod bulk_copy_xml_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::ColumnValues;
 
@@ -75,8 +75,7 @@ mod bulk_copy_xml_tests {
         client
             .execute(
                 "CREATE TABLE #BulkCopyXmlTest (id INT NOT NULL, xml_col XML NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -152,15 +151,14 @@ mod bulk_copy_xml_tests {
         client
             .execute(
                 "SELECT id, xml_col FROM #BulkCopyXmlTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -224,8 +222,7 @@ mod bulk_copy_xml_tests {
         client
             .execute(
                 "CREATE TABLE #BulkCopyXmlBomTest (id INT NOT NULL, xml_col XML NULL)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -260,15 +257,14 @@ mod bulk_copy_xml_tests {
         client
             .execute(
                 "SELECT id, xml_col FROM #BulkCopyXmlBomTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -301,8 +297,7 @@ mod bulk_copy_xml_tests {
             .execute(
                 "CREATE TABLE #BulkCopyXmlMalformedTest (id INT NOT NULL, xml_col XML NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -341,8 +336,7 @@ mod bulk_copy_xml_tests {
             .execute(
                 "CREATE TABLE #BulkCopyXmlLargeTest (id INT NOT NULL, xml_col XML NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -372,17 +366,13 @@ mod bulk_copy_xml_tests {
 
         // Verify it was inserted
         client
-            .execute(
-                "SELECT id FROM #BulkCopyXmlLargeTest".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT id FROM #BulkCopyXmlLargeTest".to_string(), ())
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while resultset
+        if client.on_rows() {
+            while client
                 .next_row()
                 .await
                 .expect("Failed to read row")

@@ -187,11 +187,23 @@ fn sql_get_type_info_w_safe(
         DATATYPE_INFO_PROC.to_string(),
         Some(positional),
         named,
-        None,
-        None,
+        (),
     ));
     if let Err(e) = exec_result {
         error!(%e, "SQLGetTypeInfoW: execution failed");
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
+
+    // The catalog proc builds its output through internal statements, so in
+    // statement-wise navigation the type-info SELECT can be preceded by no-row
+    // results (e.g. an internal DML count). Collapse them to the first
+    // row-returning result so `SQLGetTypeInfo` exposes the single type-info
+    // result set, matching msodbcsql.
+    if !client.on_rows()
+        && client.has_open_batch()
+        && let Err(e) = dbc.runtime.block_on(client.advance_to_rows())
+    {
+        error!(%e, "SQLGetTypeInfoW: advancing to type-info rows failed");
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 

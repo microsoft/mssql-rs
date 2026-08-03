@@ -33,7 +33,7 @@ use criterion::Criterion;
 use mssql_tds::{
     connection::{
         client_context::ClientContext,
-        tds_client::{ResultSet, ResultSetClient, TdsClient},
+        tds_client::{ResultSet, TdsClient},
     },
     connection_provider::tds_connection_provider::TdsConnectionProvider,
     core::{EncryptionOptions, EncryptionSetting},
@@ -195,7 +195,11 @@ pub async fn drain(client: &mut TdsClient) -> u64 {
         while client.next_row().await.expect("next_row failed").is_some() {
             rows += 1;
         }
-        if !client.move_to_next().await.expect("move_to_next failed") {
+        if !client
+            .advance_to_rows()
+            .await
+            .expect("advance_to_rows failed")
+        {
             break;
         }
     }
@@ -213,7 +217,11 @@ pub async fn drain(client: &mut TdsClient) -> u64 {
 pub async fn drain_capture_handle(client: &mut TdsClient) -> i32 {
     loop {
         while client.next_row().await.expect("next_row failed").is_some() {}
-        if !client.move_to_next().await.expect("move_to_next failed") {
+        if !client
+            .advance_to_rows()
+            .await
+            .expect("advance_to_rows failed")
+        {
             break;
         }
     }
@@ -253,7 +261,7 @@ pub async fn create_mixed_rows_table(client: &mut TdsClient, table: &str, rows: 
             c_datetime2 DATETIME2 NOT NULL)"
     );
     client
-        .execute(ddl, None, None)
+        .execute(ddl, ())
         .await
         .expect("create rows table failed");
     client.close_query().await.expect("close_query failed");
@@ -272,7 +280,7 @@ pub async fn create_mixed_rows_table(client: &mut TdsClient, table: &str, rows: 
          FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
     );
     client
-        .execute(fill, None, None)
+        .execute(fill, ())
         .await
         .expect("fill rows table failed");
     client.close_query().await.expect("close_query failed");

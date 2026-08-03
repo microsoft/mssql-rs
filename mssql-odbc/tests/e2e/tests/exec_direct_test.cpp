@@ -155,27 +155,32 @@ TEST_F(ExecDirectLiveTest, DmlDoesNotOpenCursor) {
 }
 
 TEST_F(ExecDirectLiveTest, InfoMessagesSurfaceAsDiagnostics) {
+    // Statement-wise navigation (msodbcsql parity): each no-row statement is its
+    // own result. The PRINT surfaces on SQLExecDirect; the low-severity
+    // RAISERROR surfaces on the next SQLMoreResults; then the batch ends.
     SqlTString sql = ODBCTestUtils::ToSqlTStr(
         "PRINT N'odbc info one'; RAISERROR(N'odbc info two', 10, 1) WITH NOWAIT;");
 
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
 
-    SQLINTEGER diagCount = 0;
-    rc = SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 0, SQL_DIAG_NUMBER,
-                         &diagCount, 0, nullptr);
-    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
-    ASSERT_GE(diagCount, 2);
-
     SQLINTEGER native1 = 0;
-    SQLINTEGER native2 = 0;
     std::string message1 = GetDiagMessageForRecord(stmt_, 1, &native1);
-    std::string message2 = GetDiagMessageForRecord(stmt_, 2, &native2);
-
     EXPECT_EQ(0, native1);
-    EXPECT_EQ(50000, native2);
     EXPECT_NE(std::string::npos, message1.find("odbc info one"));
+
+    // Advance to the RAISERROR statement's result; its message surfaces here.
+    rc = SQLMoreResults(stmt_);
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+
+    SQLINTEGER native2 = 0;
+    std::string message2 = GetDiagMessageForRecord(stmt_, 1, &native2);
+    EXPECT_EQ(50000, native2);
     EXPECT_NE(std::string::npos, message2.find("odbc info two"));
+
+    // No more statements.
+    rc = SQLMoreResults(stmt_);
+    EXPECT_EQ(SQL_NO_DATA, rc);
 }
 
 TEST_F(ExecDirectLiveTest, FetchOnFreshStatementReturnsHy010) {
