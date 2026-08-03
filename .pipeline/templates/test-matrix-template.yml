@@ -1,12 +1,17 @@
 # filepath: .pipeline/templates/test-matrix-template.yml
 parameters:
-  matrix: {}
+  # Each entry: { name, container, entry }
+  targets: []
 
 jobs:
   - job: Test_Matrix
     displayName: Linux amd64 
     strategy:
-      matrix: ${{ parameters.matrix }}
+      matrix:
+        ${{ each target in parameters.targets }}:
+          ${{ target.name }}:
+            container: ${{ target.container }}
+            entry: ${{ target.entry }}
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:
