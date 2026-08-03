@@ -76,6 +76,10 @@ the two drivers.
 ./run_e2e.sh --compare-with-msodbcsql --msodbcsql-ini=/opt/msodbcsql/odbcinst.ini
 ```
 
+Both INIs must register the driver under the same section name
+(`[ODBC Driver 18 for SQL Server]`). The script exits `0` only if **both**
+runs pass.
+
 ### Collecting coverage
 
 `run_e2e.sh --coverage` builds the Rust driver with LLVM source-based
@@ -98,10 +102,6 @@ the report), so the LLVM version that reads the `.profraw` always matches the
 rustc that produced the instrumented `.so`. In CI, the Linux x64 PR build sets
 `ODBC_E2E_COVERAGE=1`, publishes the report as `CoberturaCoverageOdbcE2E_Linux`,
 and the Merge Coverage stage unions it into the diff-coverage report.
-
-Both INIs must register the driver under the same section name
-(`[ODBC Driver 18 for SQL Server]`). The script exits `0` only if **both**
-runs pass.
 
 ### Windows (requires Administrator)
 
