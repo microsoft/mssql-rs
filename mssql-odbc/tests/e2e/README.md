@@ -76,6 +76,29 @@ the two drivers.
 ./run_e2e.sh --compare-with-msodbcsql --msodbcsql-ini=/opt/msodbcsql/odbcinst.ini
 ```
 
+### Collecting coverage
+
+`run_e2e.sh --coverage` builds the Rust driver with LLVM source-based
+instrumentation so the driver code exercised by the C++ tests — which load the
+`.so` through the unixODBC Driver Manager as separate processes — is measured.
+It writes a Cobertura report for `mssql-tds` + `mssql-odbc` (the cdylib
+statically links `mssql-tds`, so both are covered).
+
+```bash
+# Report to the default path: <repo>/target/cobertura-odbc-e2e.xml
+./run_e2e.sh --coverage
+
+# Custom output path
+./run_e2e.sh --coverage=/tmp/odbc-e2e.xml
+```
+
+This uses the same mechanism as `dev/test-python.sh --coverage`: everything runs
+through `cargo llvm-cov` (`show-env` to instrument the build, `report` to emit
+the report), so the LLVM version that reads the `.profraw` always matches the
+rustc that produced the instrumented `.so`. In CI, the Linux x64 PR build sets
+`ODBC_E2E_COVERAGE=1`, publishes the report as `CoberturaCoverageOdbcE2E_Linux`,
+and the Merge Coverage stage unions it into the diff-coverage report.
+
 Both INIs must register the driver under the same section name
 (`[ODBC Driver 18 for SQL Server]`). The script exits `0` only if **both**
 runs pass.
