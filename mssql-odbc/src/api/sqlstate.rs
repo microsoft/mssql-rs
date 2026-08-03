@@ -10,6 +10,7 @@ use mssql_tds::error::SqlInfoMessage;
 pub(crate) const SQLSTATE_01000: [u8; 5] = *b"01000";
 pub(crate) const SQLSTATE_01004: [u8; 5] = *b"01004";
 pub(crate) const SQLSTATE_01S00: [u8; 5] = *b"01S00";
+pub(crate) const SQLSTATE_01S02: [u8; 5] = *b"01S02";
 pub(crate) const SQLSTATE_07002: [u8; 5] = *b"07002";
 pub(crate) const SQLSTATE_07006: [u8; 5] = *b"07006";
 pub(crate) const SQLSTATE_07009: [u8; 5] = *b"07009";
@@ -76,6 +77,10 @@ pub(crate) const ERR_INVALID_SQL_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY004,
     text: "Invalid SQL data type",
 };
+pub(crate) const ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HYC00,
+    text: "Optional feature not implemented",
+};
 pub(crate) const ERR_INVALID_C_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY003,
     text: "Invalid application buffer type",
@@ -118,6 +123,13 @@ pub(crate) const ERR_INVALID_INFO_TYPE: DiagMsg = DiagMsg {
 pub(crate) fn post_diag(state: &mut impl HasDiagnostics, msg: DiagMsg) {
     post_sql_error(state, msg.state, 0, msg.text);
 }
+
+/// Sub-source tag msodbcsql inserts after the driver prefix for diagnostics
+/// that originate inside the SQL Server engine (errors and info/PRINT
+/// messages), yielding the full
+/// `[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]<message>`. The
+/// driver prefix itself is added by [`post_sql_error`].
+const SERVER_DIAG_SUBSOURCE: &str = "[SQL Server]";
 
 /// SQL Server engine error number → ODBC 3.x SQLSTATE.
 ///
@@ -290,7 +302,12 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
             for e in &diagnostics.errors {
                 let sqlstate = sqlstate_for_sql_error(e.number).unwrap_or(default);
                 let native = i32::try_from(e.number).unwrap_or(i32::MAX);
-                post_sql_error(state, sqlstate, native, e.message.clone());
+                post_sql_error(
+                    state,
+                    sqlstate,
+                    native,
+                    format!("{SERVER_DIAG_SUBSOURCE}{}", e.message),
+                );
             }
         }
         // Informational/warning records follow the primary error record(s).
@@ -312,7 +329,12 @@ pub(crate) fn post_tds_info_messages(
     for message in messages {
         let sqlstate = sqlstate_for_sql_error(message.number).unwrap_or(SQLSTATE_01000);
         let native = i32::try_from(message.number).unwrap_or(i32::MAX);
-        post_sql_error(state, sqlstate, native, message.message.clone());
+        post_sql_error(
+            state,
+            sqlstate,
+            native,
+            format!("{SERVER_DIAG_SUBSOURCE}{}", message.message),
+        );
     }
 
     !messages.is_empty()
@@ -403,7 +425,13 @@ mod tests {
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, *b"28000");
         assert_eq!(s.records[0].native_error, 18456);
-        assert_eq!(s.records[0].message, "Login failed for user 'x'.");
+        assert_eq!(
+            s.records[0].message,
+            format!(
+                "{}{SERVER_DIAG_SUBSOURCE}Login failed for user 'x'.",
+                crate::error::diag::DRIVER_DIAG_PREFIX
+            )
+        );
     }
 
     #[test]
@@ -529,11 +557,20 @@ mod tests {
         assert_eq!(s.records[0].native_error, 5701);
         assert_eq!(
             s.records[0].message,
-            "Changed database context to 'master'."
+            format!(
+                "{}{SERVER_DIAG_SUBSOURCE}Changed database context to 'master'.",
+                crate::error::diag::DRIVER_DIAG_PREFIX
+            )
         );
         assert_eq!(s.records[1].sql_state, SQLSTATE_01000);
         assert_eq!(s.records[1].native_error, 0);
-        assert_eq!(s.records[1].message, "hello from PRINT");
+        assert_eq!(
+            s.records[1].message,
+            format!(
+                "{}{SERVER_DIAG_SUBSOURCE}hello from PRINT",
+                crate::error::diag::DRIVER_DIAG_PREFIX
+            )
+        );
     }
 
     #[test]
@@ -550,6 +587,33 @@ mod tests {
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_08003);
         assert_eq!(s.records[0].native_error, 0);
-        assert_eq!(s.records[0].message, "Connection does not exist");
+        assert_eq!(
+            s.records[0].message,
+            format!(
+                "{}Connection does not exist",
+                crate::error::diag::DRIVER_DIAG_PREFIX
+            )
+        );
+    }
+
+    #[test]
+    fn driver_raised_error_carries_only_driver_prefix() {
+        let mut s = FakeState::default();
+        post_sql_error(&mut s, SQLSTATE_HY000, 0, "Something broke");
+        assert_eq!(
+            s.records[0].message,
+            "[Microsoft][ODBC Driver 18 for SQL Server]Something broke"
+        );
+    }
+
+    #[test]
+    fn server_error_carries_driver_and_sql_server_prefix() {
+        let mut s = FakeState::default();
+        let err = TdsError::from_sql_errors(vec![sql_error(18456, "Login failed for user 'x'.")]);
+        post_tds_error(&mut s, &err, SQLSTATE_08001);
+        assert_eq!(
+            s.records[0].message,
+            "[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Login failed for user 'x'."
+        );
     }
 }

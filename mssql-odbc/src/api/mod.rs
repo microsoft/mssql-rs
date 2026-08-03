@@ -18,13 +18,15 @@ mod get_diag;
 mod get_env_attr;
 mod get_functions;
 mod get_info;
-mod get_stmt_attr;
+mod get_type_info;
 mod more_results;
 mod num_result_cols;
 pub(crate) mod odbc_types;
 mod prepare;
+mod row_count;
 pub(crate) mod set_connect_attr;
 pub(crate) mod set_env_attr;
+pub(crate) mod set_stmt_attr;
 pub(crate) mod sqlstate;
 pub(crate) mod util;
 

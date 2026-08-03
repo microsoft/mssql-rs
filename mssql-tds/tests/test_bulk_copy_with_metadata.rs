@@ -8,7 +8,7 @@ mod bulk_copy_integration_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::bulk_copy_metadata::SqlDbType;
     use mssql_tds::datatypes::column_values::ColumnValues;
@@ -95,8 +95,7 @@ mod bulk_copy_integration_tests {
                     value3 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -145,14 +144,13 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT COUNT(*) as cnt FROM #BulkCopyMetadataTest".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read count")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read count")
         {
             println!("DEBUG: Actual rows in database: {:?}", row[0]);
         }
@@ -175,7 +173,7 @@ mod bulk_copy_integration_tests {
             "IF OBJECT_ID('tempdb..{}') IS NOT NULL DROP TABLE {}",
             table_name, table_name
         );
-        client.execute(drop_sql, None, None).await.ok();
+        client.execute(drop_sql, ()).await.ok();
         client.close_query().await.ok();
 
         // Create temp table with various data types
@@ -191,7 +189,7 @@ mod bulk_copy_integration_tests {
         );
 
         client
-            .execute(create_sql, None, None)
+            .execute(create_sql, ())
             .await
             .expect("Failed to create test table");
 
@@ -247,8 +245,7 @@ mod bulk_copy_integration_tests {
                     value NVARCHAR(50) NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -290,8 +287,7 @@ mod bulk_copy_integration_tests {
                     total AS (value1 + value2)
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -329,8 +325,7 @@ mod bulk_copy_integration_tests {
                     name NVARCHAR(100) NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -373,8 +368,7 @@ mod bulk_copy_integration_tests {
                     col_nvarchar_max NVARCHAR(MAX)
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -439,8 +433,7 @@ mod bulk_copy_integration_tests {
                     col_float FLOAT
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -567,8 +560,7 @@ mod bulk_copy_integration_tests {
                         "CREATE TABLE {} (id INT NOT NULL, val NVARCHAR({}) NOT NULL)",
                         table_name, n
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("Failed to create table");
@@ -604,19 +596,18 @@ mod bulk_copy_integration_tests {
             client
                 .execute(
                     format!("SELECT id, val FROM {} ORDER BY id", table_name),
-                    None,
-                    None,
+                    (),
                 )
                 .await
                 .expect("Failed to query");
 
-            let resultset = client.get_current_resultset().expect("No resultset");
-            let row1 = resultset
+            assert!(client.on_rows(), "No resultset");
+            let row1 = client
                 .next_row()
                 .await
                 .expect("Failed to read")
                 .expect("No row");
-            let row2 = resultset
+            let row2 = client
                 .next_row()
                 .await
                 .expect("Failed to read")
@@ -653,8 +644,7 @@ mod bulk_copy_integration_tests {
                     col50 NVARCHAR(50)
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create table");

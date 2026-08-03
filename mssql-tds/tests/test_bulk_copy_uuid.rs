@@ -8,7 +8,7 @@ mod bulk_copy_uuid_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use uuid::Uuid;
@@ -75,8 +75,7 @@ mod bulk_copy_uuid_tests {
             .execute(
                 "CREATE TABLE #BulkCopyUuidTest (id INT NOT NULL, uuid_col UNIQUEIDENTIFIER NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -124,15 +123,14 @@ mod bulk_copy_uuid_tests {
         client
             .execute(
                 "SELECT id, uuid_col FROM #BulkCopyUuidTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -168,12 +166,8 @@ mod bulk_copy_uuid_tests {
 
         // Create temp table with multiple UUID columns
         client
-            .execute(
-                "CREATE TABLE #BulkCopyMultiUuidTest (id INT NOT NULL, uuid1 UNIQUEIDENTIFIER, uuid2 UNIQUEIDENTIFIER, uuid3 UNIQUEIDENTIFIER NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
+            .execute("CREATE TABLE #BulkCopyMultiUuidTest (id INT NOT NULL, uuid1 UNIQUEIDENTIFIER, uuid2 UNIQUEIDENTIFIER, uuid3 UNIQUEIDENTIFIER NULL)"
+                    .to_string(), ())
             .await
             .unwrap();
 
@@ -278,15 +272,14 @@ mod bulk_copy_uuid_tests {
             .execute(
                 "SELECT id, uuid1, uuid2, uuid3 FROM #BulkCopyMultiUuidTest ORDER BY id"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {

@@ -107,6 +107,8 @@ fn sql_exec_direct_w_safe(
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.column_metadata.clear();
         stmt_state.current_row = None;
+        stmt_state.row_count = -1;
+        stmt_state.pending_row_counts.clear();
         stmt_state.prepared_sql = None;
         // Superseding a prepared plan orphans its server handle; release it
         // (deferred) once we hold the client below.
@@ -129,9 +131,14 @@ fn sql_exec_direct_w_safe(
     // STMT lock is held during I/O.
     let exec_result: Result<(), mssql_tds::error::Error> = if marker_count > 0 {
         dbc.runtime
-            .block_on(client.execute_sp_executesql(rewritten_sql, named_params, None, None))
+            .block_on(client.execute_sp_executesql(rewritten_sql, named_params, ()))
+            .map(|_| ())
     } else {
-        dbc.runtime.block_on(client.execute(sql, None, None))
+        // Statement-wise navigation: position on the batch's first statement
+        // (msodbcsql parity) so no-row statements (PRINT / RAISERROR / DML) are
+        // individually navigable via SQLMoreResults. finish_execute inspects the
+        // resulting client state.
+        dbc.runtime.block_on(client.execute(sql, ())).map(|_| ())
     };
     if let Err(e) = exec_result {
         error!(%e, "SQLExecDirectW: execution failed");
@@ -176,6 +183,33 @@ mod tests {
         let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
         // DBC is not connected
         assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn exec_direct_clears_stale_pending_row_counts_even_on_failure() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        // Simulate a prior pure-DML batch that left per-statement counts queued.
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.row_count = 3;
+            state.pending_row_counts = std::collections::VecDeque::from(vec![2, 1]);
+        }
+
+        let sql: Vec<u16> = "SELECT 1"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // Fails (not connected), but the stale row-count state must be cleared
+        // at execute start so a later SQLMoreResults can't surface it.
+        assert_eq!(
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_ERROR
+        );
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.row_count, -1);
+        assert!(state.pending_row_counts.is_empty());
     }
 
     #[test]
@@ -224,5 +258,83 @@ mod tests {
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
         // A binding error must leave the statement unchanged — no EXEC_STARTED.
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    /// A plain batch whose first statement is a no-row result (DML row count)
+    /// followed by more statements leaves the cursor open with zero columns and
+    /// the connection busy, so SQLMoreResults can advance past it (msodbcsql
+    /// statement-wise parity). Exercises the `finish_execute` no-row branch.
+    #[test]
+    fn exec_direct_norow_statement_keeps_cursor_open_and_busy() {
+        use crate::api::odbc_types::SQL_SUCCESS;
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_more_with_count, done_no_more, tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // Batch response: a DML statement (row count + MORE) then a trailing
+        // SELECT. The first statement surfaces as a no-row result with the batch
+        // still open.
+        let client = tds_client_from_tokens(vec![
+            done_more_with_count(5),
+            col_metadata_empty(),
+            done_no_more(),
+        ]);
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            // active_stmt stays None => connection idle and claimable.
+        }
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "UPDATE t SET x = 1; SELECT 1".to_string());
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let ss = stmt.inner.lock().unwrap();
+        assert!(ss.has_state(STMT_STATE_CURSOR_OPEN));
+        assert!(ss.column_metadata.is_empty());
+        drop(ss);
+
+        // Connection stays busy on this statement with the client returned.
+        let ds = dbc.inner.lock().unwrap();
+        assert_eq!(ds.active_stmt, Some(h.stmt));
+        assert!(ds.client.is_some());
+    }
+
+    /// A no-row statement that also produced a message surfaces its diagnostics
+    /// with SQL_SUCCESS_WITH_INFO from the `finish_execute` no-row branch.
+    #[test]
+    fn exec_direct_norow_statement_with_message_returns_success_with_info() {
+        use crate::api::odbc_types::SQL_SUCCESS_WITH_INFO;
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_more_with_count, done_no_more, info, tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = tds_client_from_tokens(vec![
+            info(0, 0, "print in batch"),
+            done_more_with_count(1),
+            col_metadata_empty(),
+            done_no_more(),
+        ]);
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+        }
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ret = sql_exec_direct_w_safe(
+            h.stmt,
+            stmt,
+            "PRINT 'x'; UPDATE t SET x = 1; SELECT 1".to_string(),
+        );
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert!(stmt.inner.lock().unwrap().has_state(STMT_STATE_CURSOR_OPEN));
     }
 }

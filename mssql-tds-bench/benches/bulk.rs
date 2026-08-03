@@ -82,8 +82,7 @@ fn bulk_insert(c: &mut Criterion) {
         let mut conn = client.borrow_mut();
         conn.execute(
             "CREATE TABLE #bulk_target (id BIGINT NOT NULL, value INT NOT NULL)".to_string(),
-            None,
-            None,
+            (),
         )
         .await
         .expect("create temp table failed");
@@ -110,7 +109,7 @@ fn bulk_insert(c: &mut Criterion) {
                         // Un-measured: reset the target so it doesn't grow.
                         rt.block_on(async {
                             let mut conn = client.borrow_mut();
-                            conn.execute("TRUNCATE TABLE #bulk_target".to_string(), None, None)
+                            conn.execute("TRUNCATE TABLE #bulk_target".to_string(), ())
                                 .await
                                 .expect("truncate failed");
                             conn.close_query().await.expect("close_query failed");

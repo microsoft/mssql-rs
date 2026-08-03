@@ -16,7 +16,7 @@ mod common;
 mod no_protocol_resolution {
     use dotenv::dotenv;
     use mssql_tds::connection::client_context::ClientContext;
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
     use std::env;
@@ -118,20 +118,20 @@ mod no_protocol_resolution {
     /// Execute a simple query and verify we get results
     async fn test_simple_query(client: &mut TdsClient) -> TdsResult<()> {
         let query = "SELECT @@VERSION AS version, @@SERVERNAME AS servername";
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         let mut has_results = false;
         let mut row_count = 0;
 
         loop {
-            if let Some(resultset) = client.get_current_resultset() {
+            if client.on_rows() {
                 has_results = true;
-                while let Some(_row) = resultset.next_row().await? {
+                while let Some(_row) = client.next_row().await? {
                     row_count += 1;
                 }
             }
 
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -605,17 +605,17 @@ mod no_protocol_resolution {
             create_client_with_trust_cert(&datasource, EncryptionSetting::On, true).await?;
 
         let query = "SELECT @@SERVICENAME AS svc";
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         let mut service_name = String::new();
         loop {
-            if let Some(rs) = client.get_current_resultset()
-                && let Some(row) = rs.next_row().await?
+            if client.on_rows()
+                && let Some(row) = client.next_row().await?
                 && let mssql_tds::datatypes::column_values::ColumnValues::String(s) = &row[0]
             {
                 service_name = s.to_utf8_string();
             }
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
