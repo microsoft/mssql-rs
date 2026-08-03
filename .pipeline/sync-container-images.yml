@@ -1035,6 +1035,12 @@ stages:
         import/redhat/ubi9:latest
         import/redhat/ubi8:latest
         import/oraclelinux:9
+        import/python-build/manylinux_2_34_x86_64:latest
+        import/python-build/manylinux_2_34_aarch64:latest
+        import/python-build/manylinux_2_28_x86_64:latest
+        import/python-build/manylinux_2_28_aarch64:latest
+        import/python-build/musllinux_1_2_x86_64:latest
+        import/python-build/musllinux_1_2_aarch64:latest
         EOF
         echo "Images to mirror to GHCR:"
         sed 's/^/  /' "$(Pipeline.Workspace)/ghcr/images.txt"
