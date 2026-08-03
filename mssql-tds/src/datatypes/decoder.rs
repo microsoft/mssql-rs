@@ -2129,10 +2129,14 @@ async fn decode_seven_propbyte_variant<T>(
 where
     T: TdsPacketReader + Send + Sync,
 {
-    assert!(matches!(
+    if !matches!(
         tds_type,
         TdsDataType::BigVarChar | TdsDataType::BigChar | TdsDataType::NVarChar | TdsDataType::NChar
-    ));
+    ) {
+        return Err(crate::error::Error::ProtocolError(format!(
+            "Unexpected SQL variant base type for len(7) prop bytes: {tds_type:?}. Expected a character type."
+        )));
+    }
     let mut collation_bytes = vec![0u8; 5];
     reader.read_bytes(&mut collation_bytes).await?;
     let _max_length = reader.read_uint16().await? as usize;
@@ -4181,6 +4185,21 @@ mod test {
             buf.push(TdsDataType::IntN as u8); // not binary/decimal → error
             buf.push(2); // prop_bytes=2
             buf.extend_from_slice(&[0; 4]); // prop data + value data
+            assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn ssvariant_seven_prop_unexpected_type() {
+            // Regression for fuzz crash-80c55599: a SQL_VARIANT advertising 7
+            // property bytes with a non-character base type used to trip a
+            // debug assertion in decode_seven_propbyte_variant. It must now
+            // return a ProtocolError instead of panicking.
+            let md = ssvariant_metadata();
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&20u32.to_le_bytes()); // length
+            buf.push(TdsDataType::IntN as u8); // not a character type → error
+            buf.push(7); // prop_bytes=7 selects the character-type decoder
+            buf.extend_from_slice(&[0; 11]); // padding, never read
             assert_decode_err(buf, &md).await;
         }
 
