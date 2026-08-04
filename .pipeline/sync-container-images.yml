@@ -733,6 +733,7 @@ stages:
   jobs:
   - job: BuildX64Images
     displayName: Build x64 Images
+    condition: or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true'))
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:
@@ -921,6 +922,10 @@ stages:
   - job: BuildARM64Images
     displayName: Build ARM64 Images
     dependsOn: BuildX64Images
+    # succeeded() must stay explicit: supplying a condition replaces the
+    # implicit succeeded(), which would otherwise let ARM64 start after an
+    # x64 failure.
+    condition: and(succeeded(), or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true')))
     pool:
       name: RUST-1ES-POOL-ARM-WUS3
       demands:
