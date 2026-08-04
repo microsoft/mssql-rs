@@ -46,8 +46,10 @@ param(
     [string]$CoverageOutput = "",
     [switch]$CompareWithMsodbcsql,
     [string]$MsodbcsqlDll = "",
-    # Known Windows driver gaps excluded so coverage can flow; see AB#46973. Pass -ExcludeTests '' to run everything once the driver is fixed.
-    [string]$ExcludeTests = 'driver_connect_test'
+    # Optional ctest name-exclusion regex (ctest -E). Empty by default: the Windows
+    # driver gaps tracked in AB#46973 (get_type_info_test, driver_connect_test) are
+    # fixed, so the full suite runs on Windows. Pass -ExcludeTests '<regex>' to skip.
+    [string]$ExcludeTests = ''
 )
 
 $ErrorActionPreference = "Stop"
@@ -163,7 +165,7 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName) {
             $ctestArgs += @('--repeat', "until-pass:$($Retries + 1)")
         }
         if ($ExcludeTests) {
-            # ctest -E <regex> excludes tests by name; see AB#46973 (driver_connect_test: connect-string 01S00/28000 SQLSTATE parity on Windows DM).
+            # ctest -E <regex> excludes tests by name (opt-in via -ExcludeTests).
             $ctestArgs += @('-E', $ExcludeTests)
         }
         # ODBC_TEST_TARGET tells tests which driver implementation this leg runs

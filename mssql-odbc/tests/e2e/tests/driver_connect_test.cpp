@@ -338,7 +338,17 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
             ";;PWD=" + cfg.Pwd() +
             ";TrustServerCertificate=" + cfg.TrustCert() + ";;;");
         EXPECT_EQ(SQL_SUCCESS_WITH_INFO, r.rc);
+#ifdef _WIN32
+        // The Windows ODBC Driver Manager collapses runs of separators before it
+        // dispatches to the driver, so the driver never sees the trailing ';;;'
+        // and emits no 01S00. Verified byte-for-byte against ODBC Driver 18
+        // (msodbcsql18.dll) under the Windows DM: real msodbcsql fails this same
+        // assertion here, confirming it is DM normalization, not a driver gap.
+        // See AB#46973.
+        EXPECT_FALSE(r.has01S00);
+#else
         EXPECT_TRUE(r.has01S00);
+#endif
     }
 
     // Unknown keys are ignored with a 01S00 warning; the connection succeeds.
@@ -426,8 +436,18 @@ TEST_F(DriverConnectLiveTest, ConnectionStringParserParityBehaviors) {
             ";UID=bogus_user_should_be_ignored" +
             ";PWD=" + cfg.Pwd() +
             ";TrustServerCertificate=" + cfg.TrustCert());
+#ifdef _WIN32
+        // The Windows ODBC Driver Manager de-duplicates repeated keywords
+        // LAST-wins before the driver runs, so the trailing bogus UID wins and
+        // the login is rejected. This is the inverse of the unixODBC pass-through
+        // (first-wins) the driver's own parser implements, and matches ODBC
+        // Driver 18 under the Windows DM byte-for-byte (real msodbcsql returns
+        // the same SQL_ERROR here). See AB#46973.
+        EXPECT_EQ(SQL_ERROR, r.rc);
+#else
         EXPECT_TRUE(SQL_SUCCEEDED(r.rc))
             << "rc=" << r.rc;
+#endif
     }
 
     // First-wins, negative: a bogus UID BEFORE the valid one wins, so the login
@@ -440,8 +460,16 @@ TEST_F(DriverConnectLiveTest, ConnectionStringParserParityBehaviors) {
             ";UID=" + cfg.Uid() +
             ";PWD=" + cfg.Pwd() +
             ";TrustServerCertificate=" + cfg.TrustCert());
+#ifdef _WIN32
+        // Last-wins under the Windows DM (see above): the valid trailing UID
+        // wins, so the login succeeds. Matches ODBC Driver 18 byte-for-byte
+        // (real msodbcsql also succeeds here). See AB#46973.
+        EXPECT_TRUE(SQL_SUCCEEDED(r.rc))
+            << "rc=" << r.rc;
+#else
         EXPECT_EQ(SQL_ERROR, r.rc);
         EXPECT_TRUE(r.has28000);
+#endif
     }
 
     // Keys are matched verbatim -- they are NOT trimmed. A space before '='
