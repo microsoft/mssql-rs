@@ -109,6 +109,7 @@ stages:
           osType: Windows
           buildType: ${{ parameters.buildType }}
           testFilter: -E "not (test(connectivity))"
+          enableOdbcE2E: true
       # Extended Protection (EPA) channel-binding test.
       # Runs AFTER the main test pass. Runs the same integrated-auth encrypted
       # login test under two server configurations, expecting success in both:
@@ -606,10 +607,11 @@ stages:
 
 # Merge the mssql-tds Rust coverage from every OS that runs the tests
 # (Build_Windows, Build_Linux, Test_MacOS), the ODBC C++ e2e coverage
-# (Build_Linux x64), and the mssql-py-core coverage from the Python tests
-# (Build_Linux) into one Cobertura report. ADO does not merge coverage across
-# stages/jobs, so it is combined here and published as CoberturaCoverage (the
-# artifact the GitHub diff-cover workflow consumes) and to the ADO coverage tab.
+# (Build_Linux x64 and Build_Windows), and the mssql-py-core coverage from the
+# Python tests (Build_Linux) into one Cobertura report. ADO does not merge
+# coverage across stages/jobs, so it is combined here and published as
+# CoberturaCoverage (the artifact the GitHub diff-cover workflow consumes) and
+# to the ADO coverage tab.
 - stage: Coverage
   displayName: Merge Coverage
   dependsOn:
@@ -646,6 +648,13 @@ stages:
           artifactName: 'CoberturaCoverageOdbcE2E_Linux'
           targetPath: '$(Pipeline.Workspace)/cov-odbc-e2e-linux'
       - task: DownloadPipelineArtifact@2
+        displayName: Download ODBC e2e Windows coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoverageOdbcE2E_Windows'
+          targetPath: '$(Pipeline.Workspace)/cov-odbc-e2e-windows'
+      - task: DownloadPipelineArtifact@2
         displayName: Download Rust (mssql-tds) macOS coverage
         continueOnError: true
         inputs:
@@ -673,13 +682,14 @@ stages:
           # Each OS emits its mssql-tds + mssql-odbc report with repo-root-relative
           # paths, so the same source file lines up across reports and coverage is
           # unioned: a line covered on any OS counts as covered in the merged result.
-          # The ODBC e2e report (Linux x64) is also repo-root-relative and adds
-          # coverage for lines reachable only through the ODBC Driver Manager.
+          # The ODBC e2e reports (Linux x64 and Windows) are also repo-root-relative
+          # and add coverage for lines reachable only through the ODBC Driver Manager.
           for report in \
             "$(Pipeline.Workspace)/cov-rust-windows/cobertura.xml" \
             "$(Pipeline.Workspace)/cov-rust-linux/cobertura.xml" \
             "$(Pipeline.Workspace)/cov-rust-macos/cobertura.xml" \
-            "$(Pipeline.Workspace)/cov-odbc-e2e-linux/cobertura-odbc-e2e.xml"; do
+            "$(Pipeline.Workspace)/cov-odbc-e2e-linux/cobertura-odbc-e2e.xml" \
+            "$(Pipeline.Workspace)/cov-odbc-e2e-windows/cobertura-odbc-e2e.xml"; do
             [ -f "$report" ] && inputs+=("$report")
           done
           # mssql-py-core coverage is measured from within its own crate

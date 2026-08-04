@@ -46,6 +46,11 @@ parameters:
   type: boolean
   default: true
 
+- name: enableOdbcE2E
+  displayName: Enable ODBC C++ e2e suite (Windows, PR only) with coverage
+  type: boolean
+  default: false
+
 steps:
 - template: generate-sql-password-template.yml
   parameters:
@@ -180,6 +185,47 @@ steps:
     inputs:
       targetPath: "$(Build.SourcesDirectory)/target/cobertura.xml"
       artifactName: "CoberturaCoverageRust_${{ parameters.osType }}"
+
+# ODBC C++ e2e suite (Windows only). The gtest suite loads the Rust ODBC driver
+# DLL through the Windows Driver Manager as separate processes, so its execution
+# was contributing zero coverage. run_e2e.ps1 -Coverage instruments the driver
+# via cargo llvm-cov, lets the gtest processes emit .profraw, and produces a
+# repo-root-relative Cobertura report for mssql-odbc (and statically-linked
+# mssql-tds). The report is unioned into the Merge Coverage stage so lines
+# reachable only via the ODBC surface count toward PR diff coverage.
+- ${{ if and(eq(parameters.osType, 'Windows'), eq(parameters.enableOdbcE2E, true)) }}:
+  - pwsh: |
+      $env:ODBC_TEST_SERVER   = 'localhost'
+      $env:ODBC_TEST_UID      = 'sa'
+      $env:ODBC_TEST_PWD      = $env:SQL_PASSWORD
+      $env:ODBC_TEST_TRUST_CERT = 'Yes'
+      # Explicit -CoverageOutput under $(Build.SourcesDirectory)/target keeps the
+      # publish path deterministic regardless of the job's CARGO_TARGET_DIR.
+      ./mssql-odbc/tests/e2e/run_e2e.ps1 -Retries 3 -Coverage `
+        -CoverageOutput "$(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml"
+    displayName: Run ODBC C++ e2e tests (Windows) with coverage
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+      RUST_BACKTRACE: full
+
+  - task: PublishTestResults@2
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: "Publish ODBC e2e test results (Windows)"
+    inputs:
+      testResultsFormat: "JUnit"
+      testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
+      testRunTitle: $(System.PhaseName)-OdbcE2E
+
+  # Best-effort (continueOnError) so a coverage hiccup never fails the build; the
+  # Merge Coverage stage skips it if absent.
+  - task: PublishPipelineArtifact@1
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: "Publish ODBC e2e Windows Cobertura coverage artifact"
+    continueOnError: true
+    inputs:
+      targetPath: "$(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml"
+      artifactName: "CoberturaCoverageOdbcE2E_Windows"
 
 - ${{ if eq(parameters.enableRustBuild, true) }}:
   - task: CopyFiles@2

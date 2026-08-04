@@ -8,12 +8,20 @@
 # (or manual registry edits) is required. See run_e2e.sh for Linux/macOS.
 #
 # Requires: Administrator privileges (writes to HKLM).
-# Usage: .\run_e2e.ps1 [-Release] [-Retries N]
+# Usage: .\run_e2e.ps1 [-Release] [-Retries N] [-Coverage] [-CoverageOutput PATH]
 #                      [-CompareWithMsodbcsql] [-MsodbcsqlDll PATH]
 #
 # -Retries N reruns each failing test up to N extra times (ctest
 # --repeat until-pass:N+1). A test that passes on any attempt counts as a
 # pass; the suite only fails if a test still fails after all retries.
+#
+# -Coverage builds the Rust driver with LLVM source-based coverage
+# instrumentation so the driver code exercised by the C++ tests (which load the
+# DLL through the Driver Manager as separate processes) is measured. A Cobertura
+# report for mssql-tds + mssql-odbc is written to -CoverageOutput (default
+# <repo>\target\cobertura-odbc-e2e.xml). Same mechanism as run_e2e.sh
+# --coverage; everything runs through cargo-llvm-cov so the LLVM version that
+# reads the .profraw matches the rustc that produced the instrumented DLL.
 #
 # With -CompareWithMsodbcsql, the script reruns the same suite against the
 # Microsoft C++ driver and prints a parity table. Unlike Linux (which uses
@@ -34,6 +42,8 @@
 param(
     [switch]$Release,
     [int]$Retries = 0,
+    [switch]$Coverage,
+    [string]$CoverageOutput = "",
     [switch]$CompareWithMsodbcsql,
     [string]$MsodbcsqlDll = ""
 )
@@ -44,6 +54,13 @@ $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $OdbcCrateDir = Resolve-Path (Join-Path $ScriptDir "..\..")
 $WorkspaceDir = Resolve-Path (Join-Path $OdbcCrateDir "..")
 $BuildType   = if ($Release) { "release" } else { "debug" }
+
+# Default the Cobertura output into the workspace target/ dir so CI can publish
+# it as an artifact. Resolved here (not as a param default) because it depends
+# on $WorkspaceDir.
+if ($Coverage -and -not $CoverageOutput) {
+    $CoverageOutput = Join-Path $WorkspaceDir "target\cobertura-odbc-e2e.xml"
+}
 
 $DriverRegKey  = "HKLM:\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server"
 $DriversRegKey = "HKLM:\Software\ODBC\ODBCINST.INI\ODBC Drivers"
@@ -224,9 +241,84 @@ function Write-ParityReport([string]$RustXml, [string]$MsXml) {
     Write-Host ("Summary: {0} parity, {1} divergence(s), {2} shared failure(s), {3} skipped" -f $counts.parity, $counts.divergence, $counts.shared, $counts.skip)
 }
 
+# Enable LLVM source-based instrumentation for the driver build.
+# `cargo llvm-cov show-env` prints the env (RUSTFLAGS with -C instrument-coverage,
+# the llvm-cov target dir, and an LLVM_PROFILE_FILE pattern keyed by %p/%m so
+# distinct gtest processes and ctest retries never clobber each other's .profraw).
+# PowerShell has no `eval`, so parse each KEY=VALUE line (stripping surrounding
+# quotes) into the process env. The subsequent `cargo build` then produces an
+# instrumented msodbcsql18.dll, and every ctest child process inherits
+# LLVM_PROFILE_FILE from this environment. The llvm-cov target dir is also
+# exported so the later `cargo metadata` resolves the INSTRUMENTED DLL.
+function Enable-CoverageInstrumentation {
+    Write-Host "=== Enabling coverage instrumentation for the Rust driver ==="
+    cargo llvm-cov clean --workspace
+    # stderr carries rustup/info chatter (e.g. "info: cargo-llvm-cov ...") — drop it.
+    $envLines = & cargo llvm-cov show-env 2>$null
+    foreach ($line in $envLines) {
+        if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
+            $key = $Matches[1]
+            $val = $Matches[2].Trim()
+            if ($val.Length -ge 2 -and $val.StartsWith('"') -and $val.EndsWith('"')) {
+                $val = $val.Substring(1, $val.Length - 2)
+            }
+            Set-Item -Path "env:$key" -Value $val
+        }
+    }
+    Write-Host "Coverage: LLVM_PROFILE_FILE=$($env:LLVM_PROFILE_FILE)"
+}
+
+# Turn the .profraw written by the ctest processes into a Cobertura report.
+# `cargo llvm-cov report` wraps llvm-profdata merge + llvm-cov export, so the
+# LLVM tooling matches the rustc that produced the instrumented DLL. Includes
+# both mssql-tds and mssql-odbc because the cdylib statically links mssql-tds.
+# Best-effort: the suite has already run, so a coverage tooling hiccup must not
+# change the pass/fail result. Runs from the repo root so Cobertura filenames
+# are repo-root-relative and union with the per-OS reports in the merge.
+function New-CoverageReport([string]$OutputPath) {
+    Write-Host ""
+    Write-Host "=== Generating ODBC e2e coverage report ==="
+    # Prove the instrumented driver actually ran under the Driver Manager: each
+    # gtest process writes a .profraw keyed by LLVM_PROFILE_FILE. Zero .profraw
+    # means coverage captured nothing (e.g. an uninstrumented DLL was loaded), so
+    # warn loudly. Non-fatal: the functional result already stands.
+    if ($env:LLVM_PROFILE_FILE) {
+        $profrawDir = Split-Path -Parent $env:LLVM_PROFILE_FILE
+        if ($profrawDir -and (Test-Path $profrawDir)) {
+            $n = @(Get-ChildItem -Path $profrawDir -Filter '*.profraw' -ErrorAction SilentlyContinue).Count
+            Write-Host "Coverage: found $n .profraw file(s) under $profrawDir"
+            if ($n -eq 0) {
+                Write-Warning "no .profraw produced; the driver ctest loaded may not be instrumented"
+            }
+        }
+    }
+    $outDir = Split-Path -Parent $OutputPath
+    if ($outDir -and -not (Test-Path $outDir)) {
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    }
+    Push-Location $WorkspaceDir
+    try {
+        cargo llvm-cov report --package mssql-tds --package mssql-odbc `
+            --cobertura --output-path $OutputPath
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Coverage report written to $OutputPath"
+        } else {
+            Write-Warning "failed to generate ODBC e2e coverage report (exit $LASTEXITCODE)"
+        }
+    } catch {
+        Write-Warning "failed to generate ODBC e2e coverage report: $_"
+    } finally {
+        Pop-Location
+    }
+}
+
 try {
     if ($Retries -gt 0) {
         Write-Host "Retries enabled: each failing test reruns up to $Retries time(s)."
+    }
+
+    if ($Coverage) {
+        Enable-CoverageInstrumentation
     }
 
     Write-Host "=== Building mssql-odbc ($BuildType) ==="
@@ -256,6 +348,14 @@ try {
     }
     $DriverPath = (Resolve-Path $DriverPath).Path
     Write-Host "Rust driver: $DriverPath"
+
+    if ($Coverage) {
+        # RUSTFLAGS=-C instrument-coverage was exported before the build, so this
+        # DLL is the instrumented one ctest will load; the post-run .profraw check
+        # in New-CoverageReport proves it fired.
+        Write-Host "Coverage: instrumented driver=$DriverPath"
+        Write-Host "Coverage: LLVM_PROFILE_FILE=$($env:LLVM_PROFILE_FILE)"
+    }
 
     # Capture the existing registration before we overwrite it. In comparison
     # mode this is also the default reference (msodbcsql) driver.
@@ -302,6 +402,12 @@ try {
     # Run 1: the Rust driver.
     Set-DriverRegistration $DriverPath
     $RustExit = Invoke-CtestRun "mssql-odbc" "junit-mssql-odbc.xml"
+
+    # Report on the instrumented mssql-odbc leg before the (uninstrumented)
+    # msodbcsql reference leg runs, so the profraw reflects our driver only.
+    if ($Coverage) {
+        New-CoverageReport $CoverageOutput
+    }
 
     if (-not $CompareWithMsodbcsql) {
         if ($RustExit -ne 0) {
