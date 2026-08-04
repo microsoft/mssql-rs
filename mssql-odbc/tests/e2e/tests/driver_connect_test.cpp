@@ -74,7 +74,7 @@ protected:
     void SetUp() override {
         ODBCTest::SetUp();
         if (!ODBCTestConfig::Instance().HasConnection()) {
-            GTEST_SKIP() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+            FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
         }
     }
 };
@@ -207,9 +207,12 @@ TEST_F(DriverConnectLiveTest, OutputBufferTruncation) {
                           static_cast<SQLSMALLINT>(connstr.size()),
                           outStr, 8, &outLen,
                           SQL_DRIVER_NOPROMPT);
-    // Truncation must return SQL_SUCCESS_WITH_INFO (SQLSTATE 01004)
+    // Truncation must return SQL_SUCCESS_WITH_INFO (SQLSTATE 01004).
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
-    EXPECT_SQLSTATE(SQL_HANDLE_DBC, hdbc, "01004");
+    // Scan every record: a live login interleaves the server's own 01000
+    // ENVCHANGE info messages (database/language context) ahead of the DM's
+    // 01004 truncation warning, so reading only record #1 would miss it.
+    EXPECT_TRUE(ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "01004"));
     // outLen reports the FULL length (not truncated)
     EXPECT_GT(outLen, 7);
 

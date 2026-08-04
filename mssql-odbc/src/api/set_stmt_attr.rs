@@ -22,11 +22,12 @@ use tracing::{debug, error};
 
 use crate::api::odbc_types::{
     SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_ATTR_CONCURRENCY, SQL_ATTR_CURSOR_TYPE,
-    SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_STATUS_PTR, SQL_ATTR_PARAMS_PROCESSED_PTR,
-    SQL_ATTR_PARAMSET_SIZE, SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR,
-    SQL_ATTR_ROW_BIND_TYPE, SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR,
-    SQL_CONCUR_READ_ONLY, SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
+    SQL_ATTR_IMP_PARAM_DESC, SQL_ATTR_IMP_ROW_DESC, SQL_ATTR_PARAM_BIND_TYPE,
+    SQL_ATTR_PARAM_STATUS_PTR, SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_ATTR_PARAMSET_SIZE,
+    SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR, SQL_ATTR_ROW_BIND_TYPE,
+    SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR, SQL_CONCUR_READ_ONLY,
+    SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{
     ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE, SQLSTATE_01S02, SQLSTATE_HYC00,
@@ -293,6 +294,22 @@ fn sql_get_stmt_attr_w_safe(
         },
         SQL_ATTR_PARAMSET_SIZE => unsafe {
             write_if_some(value_ptr as *mut SqlULen, 1);
+        },
+        // The four implicit descriptors (ARD/APD/IRD/IPD). The Driver Manager
+        // queries these while allocating a statement to obtain the driver's
+        // descriptor handles; returning them avoids a null descriptor
+        // dereference inside the DM's `SQLExecDirectW`.
+        SQL_ATTR_APP_ROW_DESC => unsafe {
+            write_if_some(value_ptr as *mut SqlHandle, stmt.ard);
+        },
+        SQL_ATTR_APP_PARAM_DESC => unsafe {
+            write_if_some(value_ptr as *mut SqlHandle, stmt.apd);
+        },
+        SQL_ATTR_IMP_ROW_DESC => unsafe {
+            write_if_some(value_ptr as *mut SqlHandle, stmt.ird);
+        },
+        SQL_ATTR_IMP_PARAM_DESC => unsafe {
+            write_if_some(value_ptr as *mut SqlHandle, stmt.ipd);
         },
         _ => {
             error!(
@@ -622,5 +639,53 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
+    }
+
+    fn read_desc(stmt: SqlHandle, attribute: SqlInteger) -> (SqlReturn, SqlHandle) {
+        let mut out: SqlHandle = SQL_NULL_HANDLE;
+        let rc = unsafe {
+            sql_get_stmt_attr_w(
+                stmt,
+                attribute,
+                &mut out as *mut SqlHandle as SqlPointer,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        (rc, out)
+    }
+
+    #[test]
+    fn get_returns_the_four_implicit_descriptors() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_ref = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        for (attr, expected) in [
+            (SQL_ATTR_APP_ROW_DESC, stmt_ref.ard),
+            (SQL_ATTR_APP_PARAM_DESC, stmt_ref.apd),
+            (SQL_ATTR_IMP_ROW_DESC, stmt_ref.ird),
+            (SQL_ATTR_IMP_PARAM_DESC, stmt_ref.ipd),
+        ] {
+            let (rc, out) = read_desc(h.stmt, attr);
+            assert_eq!(rc, SQL_SUCCESS);
+            assert!(!out.is_null());
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn get_implicit_descriptors_are_distinct() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let all = [
+            read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC).1,
+            read_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC).1,
+            read_desc(h.stmt, SQL_ATTR_IMP_ROW_DESC).1,
+            read_desc(h.stmt, SQL_ATTR_IMP_PARAM_DESC).1,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "descriptors {i} and {j} alias");
+            }
+        }
     }
 }

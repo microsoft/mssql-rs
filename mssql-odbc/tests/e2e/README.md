@@ -111,6 +111,16 @@ and the Merge Coverage stage unions it into the diff-coverage report.
 .\run_e2e.ps1
 ```
 
+Like `run_e2e.sh`, it can rerun the suite against msodbcsql 18 and print a
+parity table.
+```powershell
+# Use the currently registered msodbcsql18.dll as the reference
+.\run_e2e.ps1 -CompareWithMsodbcsql
+
+# Point at a specific reference driver
+.\run_e2e.ps1 -CompareWithMsodbcsql -MsodbcsqlDll 'C:\path\to\msodbcsql18.dll'
+```
+
 Both scripts:
 1. Build the Rust cdylib (`cargo build` from `mssql-odbc/`)
 2. Register the driver with the platform's ODBC Driver Manager
@@ -177,15 +187,16 @@ then:
 ```cmd
 cd mssql-odbc && cargo build
 cd tests\e2e
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DODBC_E2E_FORCE_UNICODE=ON
 cmake --build build --config Debug
 cd build && ctest --output-on-failure -C Debug
 ```
 
 ## Running Connected Tests
 
-Tests that require a live SQL Server are automatically **skipped** when no
-connection is configured. Set environment variables to enable them:
+Tests that require a live SQL Server **fail** when no connection is configured,
+so an unconfigured environment is surfaced instead of silently passing. Set
+environment variables to enable them:
 
 ### Auto-detection
 

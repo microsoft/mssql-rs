@@ -12,7 +12,7 @@ use tracing::{debug, error};
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_ATTR_ACCESS_MODE, SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT,
+    SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT,
     SQL_ATTR_PACKET_SIZE, SQL_COPT_SS_ACCESS_TOKEN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
     SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
@@ -130,7 +130,10 @@ unsafe fn sql_set_connect_attr_w_impl(
         // Standard attributes the Driver Manager sets before connecting that we
         // accept (and currently ignore) so the connect handshake is not broken.
         // TODO: honor these (connection timeout, packet size, access mode) once wired.
-        SQL_ATTR_ACCESS_MODE | SQL_ATTR_CONNECTION_TIMEOUT | SQL_ATTR_PACKET_SIZE => SQL_SUCCESS,
+        SQL_ATTR_ACCESS_MODE
+        | SQL_ATTR_CONNECTION_TIMEOUT
+        | SQL_ATTR_PACKET_SIZE
+        | SQL_ATTR_ANSI_APP => SQL_SUCCESS,
         // Any other attribute is genuinely unsupported: surface a clear error
         // (HYC00) instead of silently pretending it took effect.
         _ => {

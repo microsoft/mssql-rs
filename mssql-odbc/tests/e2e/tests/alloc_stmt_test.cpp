@@ -89,7 +89,7 @@ protected:
         ODBCTest::SetUp();
         auto& cfg = ODBCTestConfig::Instance();
         if (!cfg.HasConnection()) {
-            GTEST_SKIP()
+            FAIL()
                 << "No connection configured – set ODBC_TEST_DSN, "
                    "ODBC_TEST_SERVER, or ODBC_TEST_CONNSTR";
         }
