@@ -41,8 +41,23 @@ parameters:
   type: boolean
   default: true
 
+- name: syncAlpine3
+  displayName: 'Import: Alpine 3.22-3.23 (docker.io)'
+  type: boolean
+  default: true
+
 - name: syncDebianRHEL
   displayName: 'Import: Debian & RHEL (docker.io)'
+  type: boolean
+  default: true
+
+- name: syncCentOS
+  displayName: 'Import: CentOS Stream (quay.io)'
+  type: boolean
+  default: true
+
+- name: syncSUSE
+  displayName: 'Import: openSUSE Leap (docker.io)'
   type: boolean
   default: true
 
@@ -399,9 +414,68 @@ stages:
         DOCKER_PAT: $(DOCKERHUB_PAT)
       retryCountOnTaskFailure: 3
 
+  # Alpine 3.22 & 3.23 (Docker Hub - rate limited)
+  - job: Alpine3
+    displayName: 'Import Alpine 3.22 & 3.23'
+    condition: eq('${{ parameters.syncAlpine3 }}', 'true')
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - checkout: none
+    - task: AzureCLI@2
+      displayName: 'Import Alpine 3.22'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          AUTH_ARGS=""
+          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
+            echo "Using authenticated Docker Hub access"
+            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+          else
+            echo "Using anonymous Docker Hub access"
+          fi
+          az acr import \
+            --name $(ACR_NAME) \
+            --source docker.io/library/alpine:3.22 \
+            --image import/alpine:3.22 \
+            $AUTH_ARGS \
+            --force
+      env:
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
+      retryCountOnTaskFailure: 3
+    - task: AzureCLI@2
+      displayName: 'Import Alpine 3.23'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          AUTH_ARGS=""
+          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
+            echo "Using authenticated Docker Hub access"
+            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+          else
+            echo "Using anonymous Docker Hub access"
+          fi
+          az acr import \
+            --name $(ACR_NAME) \
+            --source docker.io/library/alpine:3.23 \
+            --image import/alpine:3.23 \
+            $AUTH_ARGS \
+            --force
+      env:
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
+      retryCountOnTaskFailure: 3
+
   # Debian & RHEL (Docker Hub - rate limited)
   - job: DebianRHEL
-    displayName: 'Import Debian & RHEL UBI9'
+    displayName: 'Import Debian & RHEL UBI'
     condition: eq('${{ parameters.syncDebianRHEL }}', 'true')
     pool:
       name: RUST-1ES-POOL-WUS3
@@ -427,6 +501,54 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/debian:bookworm \
             --image import/debian:bookworm \
+            $AUTH_ARGS \
+            --force
+      env:
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
+      retryCountOnTaskFailure: 3
+    - task: AzureCLI@2
+      displayName: 'Import Debian Bullseye'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          AUTH_ARGS=""
+          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
+            echo "Using authenticated Docker Hub access"
+            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+          else
+            echo "Using anonymous Docker Hub access"
+          fi
+          az acr import \
+            --name $(ACR_NAME) \
+            --source docker.io/library/debian:bullseye \
+            --image import/debian:bullseye \
+            $AUTH_ARGS \
+            --force
+      env:
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
+      retryCountOnTaskFailure: 3
+    - task: AzureCLI@2
+      displayName: 'Import Debian Trixie'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          AUTH_ARGS=""
+          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
+            echo "Using authenticated Docker Hub access"
+            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+          else
+            echo "Using anonymous Docker Hub access"
+          fi
+          az acr import \
+            --name $(ACR_NAME) \
+            --source docker.io/library/debian:trixie \
+            --image import/debian:trixie \
             $AUTH_ARGS \
             --force
       env:
@@ -481,6 +603,21 @@ stages:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
         DOCKER_PAT: $(DOCKERHUB_PAT)
       retryCountOnTaskFailure: 3
+    # UBI10 is not published on Docker Hub, so it comes straight from the
+    # Red Hat public registry (anonymous, no Docker Hub credentials).
+    - task: AzureCLI@2
+      displayName: 'Import Red Hat UBI10'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az acr import \
+            --name $(ACR_NAME) \
+            --source registry.access.redhat.com/ubi10/ubi:latest \
+            --image import/redhat/ubi10:latest \
+            --force
+      retryCountOnTaskFailure: 3
 
   # Oracle Linux (Docker Hub - rate limited)
   - job: Oracle
@@ -510,6 +647,65 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/oraclelinux:9 \
             --image import/oraclelinux:9 \
+            $AUTH_ARGS \
+            --force
+      env:
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
+      retryCountOnTaskFailure: 3
+
+  # CentOS Stream (quay.io - no Docker Hub rate limit)
+  - job: CentOS
+    displayName: 'Import CentOS Stream 9'
+    condition: eq('${{ parameters.syncCentOS }}', 'true')
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - checkout: none
+    - task: AzureCLI@2
+      displayName: 'Import CentOS Stream 9'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az acr import \
+            --name $(ACR_NAME) \
+            --source quay.io/centos/centos:stream9 \
+            --image import/centos:stream9 \
+            --force
+      retryCountOnTaskFailure: 3
+
+  # openSUSE Leap (Docker Hub - rate limited)
+  - job: SUSE
+    displayName: 'Import openSUSE Leap 15.6'
+    condition: eq('${{ parameters.syncSUSE }}', 'true')
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - checkout: none
+    - task: AzureCLI@2
+      displayName: 'Import openSUSE Leap 15.6'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          AUTH_ARGS=""
+          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
+            echo "Using authenticated Docker Hub access"
+            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+          else
+            echo "Using anonymous Docker Hub access"
+          fi
+          az acr import \
+            --name $(ACR_NAME) \
+            --source docker.io/opensuse/leap:15.6 \
+            --image import/opensuse/leap:15.6 \
             $AUTH_ARGS \
             --force
       env:
@@ -1026,15 +1222,22 @@ stages:
         build/ubuntu:22.04
         build/alpine:3.18
         import/debian:bookworm
+        import/debian:bullseye
+        import/debian:trixie
         import/alpine:3.18
         import/alpine:3.19
         import/alpine:3.20
         import/alpine:3.21
+        import/alpine:3.22
+        import/alpine:3.23
         import/ubuntu:22.04
         import/ubuntu:24.04
         import/redhat/ubi9:latest
         import/redhat/ubi8:latest
+        import/redhat/ubi10:latest
         import/oraclelinux:9
+        import/centos:stream9
+        import/opensuse/leap:15.6
         import/python-build/manylinux_2_34_x86_64:latest
         import/python-build/manylinux_2_34_aarch64:latest
         import/python-build/manylinux_2_28_x86_64:latest
