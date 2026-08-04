@@ -158,11 +158,12 @@ unsafe fn sql_set_connect_attr_w_impl(
         }
         SQL_ATTR_CONNECTION_TIMEOUT => {
             // Shares msodbcsql's clamp with SQL_ATTR_LOGIN_TIMEOUT
-            // (`sqlcmisc.cpp:1733-1741`).
+            // (`sqlcmisc.cpp:1733-1741`), but names this attribute in the
+            // warning rather than reusing msodbcsql's "Login timeout changed".
             let requested = value_ptr as usize as u64;
             state.connection_timeout = requested.min(MAX_LOGIN_TIMEOUT_SECS) as u32;
             if requested > MAX_LOGIN_TIMEOUT_SECS {
-                post_diag(&mut state, WARN_LOGIN_TIMEOUT_CHANGED);
+                post_diag(&mut state, WARN_CONNECTION_TIMEOUT_CHANGED);
                 SQL_SUCCESS_WITH_INFO
             } else {
                 SQL_SUCCESS
@@ -393,6 +394,42 @@ mod tests {
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.login_timeout, Some(MAX_LOGIN_TIMEOUT_SECS as u32));
         assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_01S02);
+    }
+
+    #[test]
+    fn connection_timeout_above_maximum_warns_about_the_connection_timeout() {
+        // Same clamp and same SQLSTATE as the login timeout, but the message
+        // names the attribute the application actually set. msodbcsql reuses
+        // "Login timeout changed" here (`sqlcmisc.cpp:1739`); this is a
+        // deliberate divergence, so pin it.
+        let h = TestHandles::with_env_dbc();
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_CONNECTION_TIMEOUT,
+                (MAX_LOGIN_TIMEOUT_SECS + 1) as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.connection_timeout, MAX_LOGIN_TIMEOUT_SECS as u32);
+
+        let record = &state.diag_records()[0];
+        assert_eq!(record.sql_state, SQLSTATE_01S02);
+        assert!(
+            record
+                .message
+                .ends_with(WARN_CONNECTION_TIMEOUT_CHANGED.text),
+            "got: {}",
+            record.message
+        );
+        assert!(
+            !record.message.contains(WARN_LOGIN_TIMEOUT_CHANGED.text),
+            "must not reuse msodbcsql's login-timeout wording: {}",
+            record.message
+        );
     }
 
     #[cfg(target_pointer_width = "64")]
