@@ -2,13 +2,15 @@
 # Runs Kerberos/GSSAPI tests using Samba AD DC as the domain controller
 #
 # ARCHITECTURE (Efficient single-agent approach):
-#   1. Start DC + SQL Server once (shared infrastructure)
-#   2. Configure Kerberos once
-#   3. Loop through client profiles sequentially:
-#      - Build & start client
+#   1. Pull pre-built DC / SQL / client images (built by sync-container-images.yml).
+#      This stage never builds images; a pull failure fails the stage.
+#   2. Start DC + SQL Server once (shared infrastructure)
+#   3. Configure Kerberos once
+#   4. Loop through client profiles sequentially:
+#      - Start client
 #      - Run tests
 #      - Stop client
-#   4. Clean up at end
+#   5. Clean up at end
 #
 # This is much faster than spinning up separate DC+SQL for each distro.
 #
@@ -41,6 +43,12 @@ parameters:
   - name: useArchive
     type: boolean
     default: true  # Use pre-built nextest archive for faster tests
+  - name: imageRegistry
+    type: string
+    default: 'ghcr.io/microsoft/mssql-rs'
+  - name: imageTag
+    type: string
+    default: 'latest'
 
 jobs:
   - job: Kerberos_Test
@@ -55,6 +63,8 @@ jobs:
     variables:
       profileList: ${{ join(',', parameters.profiles) }}
       useArchive: ${{ parameters.useArchive }}
+      KERBEROS_IMAGE_REGISTRY: ${{ parameters.imageRegistry }}
+      KERBEROS_IMAGE_TAG: ${{ parameters.imageTag }}
     
     steps:
       - task: DockerInstaller@0
@@ -75,12 +85,6 @@ jobs:
           installAzCli: false
           installDocker: true
       
-      - script: |
-          set -euo pipefail
-          # Pull base images needed for Kerberos tests
-          docker pull ghcr.io/microsoft/mssql-rs/import/debian:bookworm
-        displayName: 'Pull base images'
-
       # Download nextest archives (for --archive mode)
       # Both glibc and musl archives are in Build_Linux artifact
       - ${{ if eq(parameters.useArchive, true) }}:
@@ -122,43 +126,36 @@ jobs:
         workingDirectory: '$(Build.SourcesDirectory)'
 
       - script: |
+          set -euo pipefail
           echo "=============================================="
-          echo "Building infrastructure containers"
-          echo "=============================================="
-          
-          cd kerberos-test
-          
-          # Source credentials
-          set -a && source .env && set +a
-          
-          # Build DC and SQL Server (shared by all clients)
-          docker compose -f docker-compose-matrix.yml build dc mssql
-          
-          echo "✓ Infrastructure images built"
-        displayName: 'Build infrastructure'
-        workingDirectory: '$(Build.SourcesDirectory)'
-
-      - script: |
-          echo "=============================================="
-          echo "Pre-building all client images"
+          echo "Pulling pre-built Kerberos images"
+          echo "Registry: ${{ parameters.imageRegistry }}"
+          echo "Tag:      ${{ parameters.imageTag }}"
           echo "Profiles: $(profileList)"
           echo "=============================================="
-          
+
           cd kerberos-test
           set -a && source .env && set +a
-          
-          # Build all client images in parallel (they share layers)
+
+          PROFILE_ARGS=()
           IFS=',' read -ra PROFILES <<< "$(profileList)"
           for profile in "${PROFILES[@]}"; do
-            echo "Building client: $profile"
-            docker compose -f docker-compose-matrix.yml --profile "$profile" build &
+            PROFILE_ARGS+=(--profile "$profile")
           done
-          
-          # Wait for all builds to complete
-          wait
-          
-          echo "✓ All client images built"
-        displayName: 'Build all client images'
+
+          # Images are published by the sync-container-images pipeline. This
+          # stage never builds them: a pull failure means the image is missing,
+          # private or unpublished, and must be fixed at the source rather than
+          # masked by a slow local rebuild.
+          if ! docker compose -f docker-compose-matrix.yml "${PROFILE_ARGS[@]}" pull --quiet; then
+            echo "ERROR: Failed to pull one or more pre-built Kerberos images."
+            echo "  Registry: ${{ parameters.imageRegistry }}, tag: ${{ parameters.imageTag }}"
+            echo "  Confirm the sync-container-images pipeline has published them"
+            echo "  and that the GHCR packages are public."
+            exit 1
+          fi
+          echo "✓ Pulled pre-built images"
+        displayName: 'Pull pre-built images'
         workingDirectory: '$(Build.SourcesDirectory)'
 
       - script: |
