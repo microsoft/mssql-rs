@@ -30,6 +30,45 @@ parameters:
     default: 3
 
 steps:
+  # Preflight: the ODBC e2e suite needs CMake and an ARM64 C++ toolchain, neither
+  # of which this job otherwise uses. Resolving them before we claim the shared SQL
+  # host turns a missing-toolchain image into an immediate, legible failure instead
+  # of a confusing error deep inside run_e2e.ps1 — and avoids occupying a SQL host
+  # this job could never have used.
+  - pwsh: |
+      $ErrorActionPreference = 'Continue'
+      Write-Host "PSVersion: $($PSVersionTable.PSVersion)  OSArchitecture: $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+      $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+      Write-Host "Elevated (required to register the driver in HKLM): $admin"
+
+      $cmake = Get-Command cmake -ErrorAction SilentlyContinue
+      if ($cmake) { Write-Host "cmake on PATH: $($cmake.Source)" } else { Write-Host 'cmake NOT on PATH' }
+
+      $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+      if (Test-Path $vswhere) {
+        $vsRoot = & $vswhere -latest -products '*' -property installationPath 2>$null | Select-Object -First 1
+        Write-Host "Visual Studio: $vsRoot"
+        if ($vsRoot) {
+          $vsCMake = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+          Write-Host "VS-bundled cmake present: $(Test-Path $vsCMake) ($vsCMake)"
+          Get-ChildItem (Join-Path $vsRoot 'VC\Tools\MSVC') -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              $arm64 = Join-Path $_.FullName 'bin\Hostarm64\arm64\cl.exe'
+              $x64 = Join-Path $_.FullName 'bin\Hostx64\arm64\cl.exe'
+              Write-Host "MSVC $($_.Name): Hostarm64/arm64 cl=$(Test-Path $arm64) Hostx64/arm64 cl=$(Test-Path $x64)"
+            }
+        }
+      } else {
+        Write-Host "vswhere NOT found at $vswhere"
+      }
+
+      if (-not $cmake -and -not (Test-Path $vswhere)) {
+        Write-Host '##vso[task.logissue type=error]Neither cmake nor Visual Studio was found on this agent; the ODBC e2e suite cannot be built.'
+        exit 1
+      }
+    displayName: 'Preflight: CMake and C++ toolchain'
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
   - pwsh: ./.pipeline/scripts/sql-host/New-SqlPassword.ps1
     displayName: 'Derive shared SQL_PASSWORD from build context'
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
