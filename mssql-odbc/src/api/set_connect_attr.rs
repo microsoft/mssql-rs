@@ -14,11 +14,17 @@ use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT,
     SQL_ATTR_PACKET_SIZE, SQL_COPT_SS_ACCESS_TOKEN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
-    SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
+
+/// Largest login timeout the driver accepts, in seconds.
+///
+/// Matches msodbcsql's `MAX_QUERY_TIMEOUT` (`0xfffe`, `tds/TdsParser.h:99`),
+/// which it applies to `SQL_ATTR_LOGIN_TIMEOUT` in `sqlcmisc.cpp:1735`.
+const MAX_LOGIN_TIMEOUT_SECS: u64 = 0xfffe;
 
 /// Sets a connection attribute.
 ///
@@ -122,10 +128,20 @@ unsafe fn sql_set_connect_attr_w_impl(
             // pointer slot (not a pointer to it). Store it so SQLDriverConnect
             // can apply it to the TDS login deadline. `0` means "wait
             // indefinitely" (mapped to no deadline at connect time).
-            let secs = value_ptr as usize as u32;
-            state.login_timeout = Some(secs);
+            //
+            // Read at pointer width and clamp before narrowing: a direct `as
+            // u32` would wrap, turning a value like 2^32 into `0` and silently
+            // granting an infinite deadline instead of a long one.
+            let requested = value_ptr as usize as u64;
+            let secs = requested.min(MAX_LOGIN_TIMEOUT_SECS);
+            state.login_timeout = Some(secs as u32);
             debug!(secs, "SQLSetConnectAttrW: login timeout stored");
-            SQL_SUCCESS
+            if requested > MAX_LOGIN_TIMEOUT_SECS {
+                post_diag(&mut state, WARN_LOGIN_TIMEOUT_CHANGED);
+                SQL_SUCCESS_WITH_INFO
+            } else {
+                SQL_SUCCESS
+            }
         }
         // Standard attributes the Driver Manager sets before connecting that we
         // accept (and currently ignore) so the connect handshake is not broken.
@@ -192,6 +208,7 @@ unsafe fn decode_access_token(value_ptr: SqlPointer) -> Option<String> {
 mod tests {
     use super::*;
     use crate::api::odbc_types::SQL_IS_POINTER;
+    use crate::error::HasDiagnostics;
     use crate::test_support::TestHandles;
 
     /// Build a `SQL_COPT_SS_ACCESS_TOKEN` struct the way msodbcsql apps do:
@@ -298,5 +315,62 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.login_timeout, Some(0));
+    }
+
+    #[test]
+    fn login_timeout_at_maximum_is_not_clamped() {
+        let h = TestHandles::with_env_dbc();
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_LOGIN_TIMEOUT,
+                MAX_LOGIN_TIMEOUT_SECS as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.login_timeout, Some(MAX_LOGIN_TIMEOUT_SECS as u32));
+    }
+
+    #[test]
+    fn login_timeout_above_maximum_is_clamped_with_warning() {
+        let h = TestHandles::with_env_dbc();
+        // msodbcsql clamps to MAX_QUERY_TIMEOUT and reports 01S02 rather than
+        // failing or honoring the oversized value (`sqlcmisc.cpp:1735-1741`).
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_LOGIN_TIMEOUT,
+                (MAX_LOGIN_TIMEOUT_SECS + 1) as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.login_timeout, Some(MAX_LOGIN_TIMEOUT_SECS as u32));
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_01S02);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn login_timeout_beyond_u32_does_not_wrap_to_infinite() {
+        let h = TestHandles::with_env_dbc();
+        // A raw `as u32` would turn 2^32 into 0, which this driver reads as
+        // "wait indefinitely" - the opposite of what the caller asked for.
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_LOGIN_TIMEOUT,
+                0x1_0000_0000usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.login_timeout, Some(MAX_LOGIN_TIMEOUT_SECS as u32));
     }
 }

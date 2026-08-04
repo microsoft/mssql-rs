@@ -117,6 +117,13 @@ pub(crate) const ERR_INVALID_INFO_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY096,
     text: "Information type out of range",
 };
+/// Reported when a requested login timeout is larger than the driver accepts
+/// and is clamped. Mirrors msodbcsql's `IDS_01_S02_05` (`dll/res/local.rc:45`),
+/// which it posts from the same situation.
+pub(crate) const WARN_LOGIN_TIMEOUT_CHANGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S02,
+    text: "Login timeout changed",
+};
 
 /// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with
 /// native error 0. For server-originated errors use [`post_tds_error`].
