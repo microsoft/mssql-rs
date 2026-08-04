@@ -29,7 +29,7 @@ use crate::datatypes::row_writer::RowWriter;
 use crate::handler::handler_factory::create_test_negotiated_settings_internal;
 use crate::io::reader_writer::{NetworkReader, NetworkWriter};
 use crate::io::token_stream::{
-    ParserContext, PlpPauseState, RowPauseState, RowReadResult, TdsTokenStreamReader,
+    ParserContext, PlpPauseState, RowPauseState, RowPlan, RowReadResult, TdsTokenStreamReader,
 };
 use crate::message::messages::ResetConnectionMode;
 use crate::token::tokens::{
@@ -78,6 +78,7 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         _context: &ParserContext,
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
+        _plan: RowPlan,
         _writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         if let Some(tok) = self.pending_tokens.pop_front() {
@@ -94,6 +95,7 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         _pause_state: RowPauseState,
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
+        _plan: RowPlan,
         _writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         Err(crate::error::Error::ConnectionClosed("test".to_string()))

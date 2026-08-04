@@ -7,17 +7,9 @@ mod common;
 mod client_based_iterators {
     use crate::common::{build_tcp_datasource, create_context, init_tracing};
     use futures::lock::Mutex;
-    use mssql_tds::connection::tds_client::ResultSet;
+    use mssql_tds::connection::tds_client::{CursorColumn, ResultSet};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-    use mssql_tds::datatypes::column_values::{
-        ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
-        SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
-    };
-    use mssql_tds::datatypes::decoder::DecimalParts;
-    use mssql_tds::datatypes::row_writer::RowWriter;
-    use mssql_tds::datatypes::sql_json::SqlJson;
-    use mssql_tds::datatypes::sql_string::SqlString;
-    use mssql_tds::datatypes::sql_vector::SqlVector;
+    use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::datatypes::sqltypes::SqlType;
     use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
     use std::sync::Arc;
@@ -25,87 +17,6 @@ mod client_based_iterators {
     #[ctor::ctor]
     fn init() {
         init_tracing();
-    }
-
-    #[derive(Default)]
-    struct SparseCaptureWriter {
-        // ODBC-style request uses 1-based column ordinals.
-        requested_column: Option<usize>,
-        captured: Vec<ColumnValues>,
-    }
-
-    impl SparseCaptureWriter {
-        fn new(col_count: usize) -> Self {
-            Self {
-                requested_column: None,
-                captured: Vec::with_capacity(col_count),
-            }
-        }
-
-        fn request_column(&mut self, requested_column: usize) {
-            self.requested_column = Some(requested_column);
-        }
-
-        fn clear_request(&mut self) {
-            self.requested_column = None;
-        }
-    }
-
-    impl RowWriter for SparseCaptureWriter {
-        fn pause_after_column(&self, col: usize) -> bool {
-            self.requested_column == Some(col + 1)
-        }
-
-        fn write_null(&mut self, col: usize) {
-            if self.requested_column == Some(col + 1) {
-                self.captured.push(ColumnValues::Null);
-            }
-        }
-
-        fn write_bool(&mut self, _col: usize, _val: bool) {}
-        fn write_u8(&mut self, _col: usize, _val: u8) {}
-        fn write_i16(&mut self, _col: usize, _val: i16) {}
-
-        fn write_i32(&mut self, col: usize, val: i32) {
-            if self.requested_column == Some(col + 1) {
-                self.captured.push(ColumnValues::Int(val));
-            }
-        }
-
-        fn write_i64(&mut self, _col: usize, _val: i64) {}
-        fn write_f32(&mut self, _col: usize, _val: f32) {}
-        fn write_f64(&mut self, _col: usize, _val: f64) {}
-
-        fn write_string(&mut self, col: usize, val: SqlString) {
-            if self.requested_column == Some(col + 1) {
-                self.captured.push(ColumnValues::String(val));
-            }
-        }
-
-        fn write_bytes(&mut self, col: usize, val: Vec<u8>) {
-            if self.requested_column == Some(col + 1) {
-                self.captured.push(ColumnValues::Bytes(val));
-            }
-        }
-
-        fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
-        fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
-        fn write_date(&mut self, _col: usize, _val: SqlDate) {}
-        fn write_time(&mut self, _col: usize, _val: SqlTime) {}
-        fn write_datetime(&mut self, _col: usize, _val: SqlDateTime) {}
-        fn write_smalldatetime(&mut self, _col: usize, _val: SqlSmallDateTime) {}
-        fn write_datetime2(&mut self, _col: usize, _val: SqlDateTime2) {}
-        fn write_datetimeoffset(&mut self, _col: usize, _val: SqlDateTimeOffset) {}
-        fn write_money(&mut self, _col: usize, _val: SqlMoney) {}
-        fn write_smallmoney(&mut self, _col: usize, _val: SqlSmallMoney) {}
-        fn write_uuid(&mut self, _col: usize, _val: uuid::Uuid) {}
-        fn write_xml(&mut self, _col: usize, _val: SqlXml) {}
-        fn write_json(&mut self, _col: usize, _val: SqlJson) {}
-        fn write_vector(&mut self, _col: usize, _val: SqlVector) {}
-
-        fn end_row(&mut self) {
-            self.requested_column = None;
-        }
     }
 
     #[tokio::test]
@@ -957,12 +868,15 @@ mod client_based_iterators {
         .to_string();
         client.execute(query, ()).await?;
 
-        let mut row1 = SparseCaptureWriter::new(5);
         if client.on_rows() {
-            row1.request_column(2);
-            assert!(client.next_row_into(&mut row1).await?);
-            row1.request_column(4);
-            assert!(client.next_row_into(&mut row1).await?);
+            // Row 1: position, then pull c2 (0-based 1) and c4 (0-based 3, PLP).
+            assert!(client.next_row_cursor().await?);
+            let c2 = client.read_row_column(1).await?;
+            assert!(matches!(
+                &c2,
+                CursorColumn::Value(ColumnValues::String(s)) if s.to_utf8_string() == "row1-c2"
+            ));
+            assert!(matches!(client.read_row_column(3).await?, CursorColumn::PlpStreaming));
 
             let mut buf = [0u8; 2048];
             let mut first_row_c4 = Vec::new();
@@ -976,15 +890,14 @@ mod client_based_iterators {
             }
             assert_eq!(first_row_c4.len(), 9000);
 
-            // Drain remaining col 5 before advancing to row2.
-            row1.clear_request();
-            assert!(client.next_row_into(&mut row1).await?);
-
-            let mut row2 = SparseCaptureWriter::new(5);
-            row2.request_column(2);
-            assert!(client.next_row_into(&mut row2).await?);
-            row2.request_column(4);
-            assert!(client.next_row_into(&mut row2).await?);
+            // Row 2: advancing drains row1's remaining columns automatically.
+            assert!(client.next_row_cursor().await?);
+            let c2b = client.read_row_column(1).await?;
+            assert!(matches!(
+                &c2b,
+                CursorColumn::Value(ColumnValues::String(s)) if s.to_utf8_string() == "row2-c2"
+            ));
+            assert!(matches!(client.read_row_column(3).await?, CursorColumn::PlpStreaming));
 
             let mut second_row_c4 = Vec::new();
             loop {
@@ -997,23 +910,8 @@ mod client_based_iterators {
             }
             assert_eq!(second_row_c4.len(), 9000);
 
-            // Drain remaining col 5 before checking exhaustion.
-            row2.clear_request();
-            assert!(client.next_row_into(&mut row2).await?);
-
-            assert!(!client.next_row_into(&mut row2).await?);
-
-            assert_eq!(row1.captured.len(), 1);
-            assert!(matches!(
-                &row1.captured[0],
-                ColumnValues::String(s) if s.to_utf8_string() == "row1-c2"
-            ));
-
-            assert_eq!(row2.captured.len(), 1);
-            assert!(matches!(
-                &row2.captured[0],
-                ColumnValues::String(s) if s.to_utf8_string() == "row2-c2"
-            ));
+            // No third row: advancing drains row2's tail and reaches end-of-set.
+            assert!(!client.next_row_cursor().await?);
         }
 
         client.close_query().await?;
@@ -1044,13 +942,14 @@ mod client_based_iterators {
         .to_string();
         client.execute(query, ()).await?;
 
-        let mut row1 = SparseCaptureWriter::new(3);
         if client.on_rows() {
-            row1.request_column(1);
-            assert!(client.next_row_into(&mut row1).await?);
-
-            row1.request_column(2);
-            assert!(client.next_row_into(&mut row1).await?);
+            // Row 1: c1 (0-based 0) is NULL (NBCROW), c2 (0-based 1) is PLP.
+            assert!(client.next_row_cursor().await?);
+            assert!(matches!(
+                client.read_row_column(0).await?,
+                CursorColumn::Value(ColumnValues::Null)
+            ));
+            assert!(matches!(client.read_row_column(1).await?, CursorColumn::PlpStreaming));
             assert!(client.active_plp_collation().is_none());
 
             let mut buf = [0u8; 2048];
@@ -1066,15 +965,13 @@ mod client_based_iterators {
             assert_eq!(first_row_c2.len(), 9000);
             assert!(first_row_c2.iter().all(|b| *b == b'A'));
 
-            row1.clear_request();
-            assert!(client.next_row_into(&mut row1).await?);
-
-            let mut row2 = SparseCaptureWriter::new(3);
-            row2.request_column(1);
-            assert!(client.next_row_into(&mut row2).await?);
-
-            row2.request_column(2);
-            assert!(client.next_row_into(&mut row2).await?);
+            // Row 2.
+            assert!(client.next_row_cursor().await?);
+            assert!(matches!(
+                client.read_row_column(0).await?,
+                CursorColumn::Value(ColumnValues::Null)
+            ));
+            assert!(matches!(client.read_row_column(1).await?, CursorColumn::PlpStreaming));
 
             let mut second_row_c2 = Vec::new();
             loop {
@@ -1088,18 +985,7 @@ mod client_based_iterators {
             assert_eq!(second_row_c2.len(), 9000);
             assert!(second_row_c2.iter().all(|b| *b == b'B'));
 
-            row2.clear_request();
-            assert!(client.next_row_into(&mut row2).await?);
-
-            assert!(!client.next_row_into(&mut row1).await?);
-
-            // With paused PLP reads, column 2 is exposed via read_active_plp_bytes
-            // and is not materialized into the sparse row capture.
-            assert_eq!(row1.captured.len(), 1);
-            assert!(matches!(&row1.captured[0], ColumnValues::Null));
-
-            assert_eq!(row2.captured.len(), 1);
-            assert!(matches!(&row2.captured[0], ColumnValues::Null));
+            assert!(!client.next_row_cursor().await?);
         }
 
         client.close_query().await?;
@@ -1131,10 +1017,10 @@ mod client_based_iterators {
         .to_string();
         client.execute(query, ()).await?;
 
-        let mut row1 = SparseCaptureWriter::new(5);
         if client.on_rows() {
-            row1.request_column(2);
-            assert!(client.next_row_into(&mut row1).await?);
+            // Row 1: c2 (0-based 1) is PLP nvarchar(max), then c4 (0-based 3) INT.
+            assert!(client.next_row_cursor().await?);
+            assert!(matches!(client.read_row_column(1).await?, CursorColumn::PlpStreaming));
 
             let mut buf = [0u8; 2048];
             let mut first_row_c2 = Vec::new();
@@ -1148,16 +1034,12 @@ mod client_based_iterators {
             }
             assert_eq!(first_row_c2.len(), 18_000);
 
-            row1.request_column(4);
-            assert!(client.next_row_into(&mut row1).await?);
+            let c4 = client.read_row_column(3).await?;
+            assert!(matches!(&c4, CursorColumn::Value(ColumnValues::Int(v)) if *v == 24));
 
-            // Drain remaining col 5 before advancing to row2.
-            row1.clear_request();
-            assert!(client.next_row_into(&mut row1).await?);
-
-            let mut row2 = SparseCaptureWriter::new(5);
-            row2.request_column(2);
-            assert!(client.next_row_into(&mut row2).await?);
+            // Row 2.
+            assert!(client.next_row_cursor().await?);
+            assert!(matches!(client.read_row_column(1).await?, CursorColumn::PlpStreaming));
 
             let mut second_row_c2 = Vec::new();
             loop {
@@ -1170,26 +1052,10 @@ mod client_based_iterators {
             }
             assert_eq!(second_row_c2.len(), 18_000);
 
-            row2.request_column(4);
-            assert!(client.next_row_into(&mut row2).await?);
+            let c4b = client.read_row_column(3).await?;
+            assert!(matches!(&c4b, CursorColumn::Value(ColumnValues::Int(v)) if *v == 34));
 
-            // Drain remaining col 5 before checking exhaustion.
-            row2.clear_request();
-            assert!(client.next_row_into(&mut row2).await?);
-
-            assert!(!client.next_row_into(&mut row2).await?);
-
-            assert_eq!(row1.captured.len(), 1);
-            assert!(matches!(
-                &row1.captured[0],
-                ColumnValues::Int(v) if *v == 24
-            ));
-
-            assert_eq!(row2.captured.len(), 1);
-            assert!(matches!(
-                &row2.captured[0],
-                ColumnValues::Int(v) if *v == 34
-            ));
+            assert!(!client.next_row_cursor().await?);
         }
 
         client.close_query().await?;

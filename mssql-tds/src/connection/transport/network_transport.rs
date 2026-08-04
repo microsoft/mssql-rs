@@ -18,7 +18,7 @@ use crate::io::packet_reader::{PacketReader, TdsPacketReader};
 use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
 use crate::io::token_stream::{
-    ParserContext, PlpPauseState, RowPauseState, RowReadResult, TdsTokenStreamReader,
+    ParserContext, PlpPauseState, RowPauseState, RowPlan, RowReadResult, TdsTokenStreamReader,
     read_active_plp_bytes_internal, receive_row_into_internal, receive_token_internal,
     resume_row_into_internal,
 };
@@ -1408,11 +1408,12 @@ impl TdsTokenStreamReader for NetworkTransport {
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
+        plan: RowPlan,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         let cancellable = CancelHandle::run_until_cancelled(
             cancel_handle,
-            receive_row_into_internal(self, &*PARSER_REGISTRY, context, writer),
+            receive_row_into_internal(self, &*PARSER_REGISTRY, context, plan, writer),
         );
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {
@@ -1439,11 +1440,12 @@ impl TdsTokenStreamReader for NetworkTransport {
         pause_state: RowPauseState,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
+        plan: RowPlan,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         let cancellable = CancelHandle::run_until_cancelled(
             cancel_handle,
-            resume_row_into_internal(self, pause_state, writer),
+            resume_row_into_internal(self, pause_state, plan, writer),
         );
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {

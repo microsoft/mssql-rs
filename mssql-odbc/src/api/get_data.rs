@@ -16,8 +16,8 @@ use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
-use crate::row::{OdbcRowWriter, PlpEncoding};
-use mssql_tds::connection::tds_client::ResultSet;
+use crate::row::PlpEncoding;
+use mssql_tds::connection::tds_client::{CursorColumn, ResultSet};
 use mssql_tds::datatypes::column_values::ColumnValues;
 
 /// Implements SQLGetData for current-row retrieval.
@@ -347,12 +347,8 @@ fn resume_row_to_column(
         client
     };
 
-    let mut writer = OdbcRowWriter::new();
-    writer.request(column_number - 1); // 0-based
-
-    let row_read = dbc.runtime.block_on(client.next_row_into(&mut writer));
-    let row_complete = writer.end_row_fired();
-    let captured = writer.take_captured().map(|v| (column_number, v));
+    let target = column_number - 1; // 0-based
+    let cursor_result = dbc.runtime.block_on(client.read_row_column(target));
 
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("SQLGetData: dbc mutex poisoned after row resume");
@@ -362,16 +358,35 @@ fn resume_row_to_column(
     dbc_state.active_stmt = Some(statement_handle);
     drop(dbc_state);
 
-    match row_read {
-        Ok(true) => {
+    match cursor_result {
+        Ok(CursorColumn::Value(value)) => {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.last_captured = captured;
-                stmt_state.current_row_complete = row_complete;
+                stmt_state.last_captured = Some((column_number, value));
+                stmt_state.current_row_complete = false;
                 return SQL_SUCCESS;
             }
             SQL_ERROR
         }
-        Ok(false) => {
+        Ok(CursorColumn::PlpStreaming) => {
+            // Target is a PLP column: leave last_captured empty so the caller
+            // switches to chunked streaming via stream_active_plp_chunk.
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                stmt_state.last_captured = None;
+                stmt_state.current_row_complete = false;
+                return SQL_SUCCESS;
+            }
+            SQL_ERROR
+        }
+        Ok(CursorColumn::AlreadyConsumed) => {
+            // Forward-only violation. The caller's own last-column guard should
+            // catch this first; treat any residual case as no-data.
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                stmt_state.last_captured = None;
+                post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
+            }
+            SQL_ERROR
+        }
+        Ok(CursorColumn::RowEnded) => {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.last_captured = None;
                 stmt_state.current_row_complete = true;

@@ -7,8 +7,8 @@ pub use crate::connection::tds_client::TdsClient;
 pub use crate::connection_provider::tds_connection_provider::TdsConnectionProvider;
 pub use crate::io::packet_reader::TdsPacketReader;
 pub use crate::io::token_stream::{
-    GenericTokenParserRegistry, ParserContext, PlpPauseState, RowPauseState, RowReadResult,
-    TdsTokenStreamReader, TokenParserRegistry, TokenStreamReader,
+    GenericTokenParserRegistry, ParserContext, PlpPauseState, RowPauseState, RowPlan,
+    RowReadResult, TdsTokenStreamReader, TokenParserRegistry, TokenStreamReader,
 };
 pub use crate::token::parsers::common::TokenParser;
 pub use crate::token::parsers::{
@@ -533,10 +533,11 @@ impl TdsTokenStreamReader for MockTransport {
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
+        plan: RowPlan,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         self.token_stream_reader
-            .receive_row_into(context, remaining_request_timeout, cancel_handle, writer)
+            .receive_row_into(context, remaining_request_timeout, cancel_handle, plan, writer)
             .await
     }
 
@@ -545,6 +546,7 @@ impl TdsTokenStreamReader for MockTransport {
         pause_state: RowPauseState,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
+        plan: RowPlan,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         self.token_stream_reader
@@ -552,6 +554,7 @@ impl TdsTokenStreamReader for MockTransport {
                 pause_state,
                 remaining_request_timeout,
                 cancel_handle,
+                plan,
                 writer,
             )
             .await

@@ -13,8 +13,6 @@ use crate::api::odbc_types::{
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
-use crate::row::OdbcRowWriter;
-use mssql_tds::connection::tds_client::ResultSet;
 
 /// Implements SQLFetch for the current forward-only result set.
 ///
@@ -131,13 +129,10 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         }
     }
 
-    // Use OdbcRowWriter in drain mode (no column requested) so the TDS decoder
-    // pauses before the first column. This positions the cursor on the row
-    // without materializing any column data; columns are streamed lazily by
-    // subsequent SQLGetData calls via next_row_into with a requested column.
-    let mut writer = OdbcRowWriter::new();
-
-    let fetch_result = dbc.runtime.block_on(client.next_row_into(&mut writer));
+    // Position the pull cursor on the next row without decoding any column
+    // (SQLFetch semantics). Columns are pulled lazily by subsequent SQLGetData
+    // calls via `read_row_column`.
+    let fetch_result = dbc.runtime.block_on(client.next_row_cursor());
 
     match fetch_result {
         Ok(true) => {
