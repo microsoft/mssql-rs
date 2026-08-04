@@ -13,8 +13,9 @@ use crate::api::odbc_types::{
     SQL_API_SQLFREESTMT, SQL_API_SQLGETDATA, SQL_API_SQLGETDIAGFIELD, SQL_API_SQLGETDIAGREC,
     SQL_API_SQLGETENVATTR, SQL_API_SQLGETFUNCTIONS, SQL_API_SQLGETINFO, SQL_API_SQLGETSTMTATTR,
     SQL_API_SQLGETTYPEINFO, SQL_API_SQLMORERESULTS, SQL_API_SQLNUMRESULTCOLS, SQL_API_SQLPREPARE,
-    SQL_API_SQLROWCOUNT, SQL_API_SQLSETCONNECTATTR, SQL_API_SQLSETENVATTR, SQL_ERROR, SQL_FALSE,
-    SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_TRUE, SqlHandle, SqlReturn, SqlUSmallInt,
+    SQL_API_SQLROWCOUNT, SQL_API_SQLSETCONNECTATTR, SQL_API_SQLSETENVATTR, SQL_API_SQLSETSTMTATTR,
+    SQL_ERROR, SQL_FALSE, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_TRUE, SqlHandle, SqlReturn,
+    SqlUSmallInt,
 };
 use crate::error::free_errors;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
@@ -160,6 +161,7 @@ fn supported_function_ids() -> &'static [SqlUSmallInt] {
         SQL_API_SQLGETENVATTR,
         SQL_API_SQLGETSTMTATTR,
         SQL_API_SQLSETCONNECTATTR,
+        SQL_API_SQLSETSTMTATTR,
         SQL_API_SQLSETENVATTR,
         SQL_API_SQLPREPARE,
         SQL_API_SQLBINDPARAMETER,
@@ -169,7 +171,9 @@ fn supported_function_ids() -> &'static [SqlUSmallInt] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_API_ODBC3_ALL_FUNCTIONS_SIZE, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::{
+        SQL_API_ODBC3_ALL_FUNCTIONS_SIZE, SQL_API_SQLSETSTMTATTR, SQL_NULL_HANDLE,
+    };
     use crate::test_support::TestHandles;
 
     // A function id the driver does not implement (not in `supported_function_ids`).
@@ -206,6 +210,18 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         let mut supported: SqlUSmallInt = SQL_FALSE;
         let ret = unsafe { sql_get_functions(h.dbc, SQL_API_SQLGETTYPEINFO, &mut supported) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(supported, SQL_TRUE);
+    }
+
+    // AB#46973 (scope follow-up): SQLSetStmtAttrW is exported and fully
+    // implemented (shares set_stmt_attr.rs with the already-advertised
+    // SQLGetStmtAttr), so the Windows DM must not short-circuit it with IM001.
+    #[test]
+    fn set_stmt_attr_reports_true() {
+        let h = TestHandles::with_env_dbc();
+        let mut supported: SqlUSmallInt = SQL_FALSE;
+        let ret = unsafe { sql_get_functions(h.dbc, SQL_API_SQLSETSTMTATTR, &mut supported) };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(supported, SQL_TRUE);
     }
@@ -252,6 +268,8 @@ mod tests {
         assert!(bit_set(SQL_API_SQLALLOCHANDLE));
         // AB#46973: SQLGetTypeInfo (47) bit must be set in the ODBC3 bitmap.
         assert!(bit_set(SQL_API_SQLGETTYPEINFO));
+        // AB#46973 (scope follow-up): SQLSetStmtAttr (1020) bit must be set too.
+        assert!(bit_set(SQL_API_SQLSETSTMTATTR));
         // An in-range unsupported id (2) keeps its bit clear.
         assert!(!bit_set(2));
     }

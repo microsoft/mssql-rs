@@ -128,6 +128,7 @@ pub const SQL_API_SQLGETENVATTR: SqlUSmallInt = 1012;
 pub const SQL_API_SQLGETSTMTATTR: SqlUSmallInt = 1014;
 pub const SQL_API_SQLSETCONNECTATTR: SqlUSmallInt = 1016;
 pub const SQL_API_SQLSETENVATTR: SqlUSmallInt = 1019;
+pub const SQL_API_SQLSETSTMTATTR: SqlUSmallInt = 1020;
 
 // SQLGetInfo info-type identifiers.
 pub const SQL_MAX_DRIVER_CONNECTIONS: SqlUSmallInt = 0;
