@@ -298,9 +298,14 @@ function New-CoverageReport([string]$OutputPath) {
             }
         }
     }
-    $outDir = Split-Path -Parent $OutputPath
-    if ($outDir -and -not (Test-Path $outDir)) {
-        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    try {
+        $outDir = Split-Path -Parent $OutputPath
+        if ($outDir -and -not (Test-Path $outDir)) {
+            New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+        }
+    } catch {
+        Write-Warning "failed to create ODBC e2e coverage output directory: $_"
+        return
     }
     Push-Location $WorkspaceDir
     try {
