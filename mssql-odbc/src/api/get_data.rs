@@ -880,7 +880,45 @@ mod tests {
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         let mut s = stmt_handle.inner.lock().unwrap();
         s.set_state(STMT_STATE_CURSOR_OPEN);
-        s.current_row = Some(vec![value]);
+        s.set_current_row(Some(vec![value]));
+    }
+
+    #[test]
+    fn get_data_offset_resets_on_new_row() {
+        let h = TestHandles::with_env_dbc_stmt();
+        open_row(h.stmt, ColumnValues::Bytes(vec![1, 2, 3, 4]));
+
+        // Partially read column 1, leaving a streaming offset behind.
+        let mut buf = [0u8; 2];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_BINARY,
+                buf.as_mut_ptr() as SqlPointer,
+                2,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(buf, [1, 2]);
+
+        // Moving to a new row must restart the column from its first byte.
+        open_row(h.stmt, ColumnValues::Bytes(vec![9, 8, 7, 6]));
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_BINARY,
+                buf.as_mut_ptr() as SqlPointer,
+                2,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(ind, 4);
+        assert_eq!(buf, [9, 8]);
     }
 
     #[test]

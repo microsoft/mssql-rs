@@ -119,9 +119,11 @@ impl StmtState {
         self.state_flags &= !mask;
     }
 
-    /// Clears the `SQLGetData` streaming cursor. Called whenever the current
-    /// row changes so a new row's columns are read from the start.
-    pub(crate) fn reset_getdata(&mut self) {
+    /// Sets the current row, resetting the `SQLGetData` streaming cursor with
+    /// it. Row changes must go through here so a stale per-column offset can
+    /// never be applied to a different row.
+    pub(crate) fn set_current_row(&mut self, row: Option<Vec<ColumnValues>>) {
+        self.current_row = row;
         self.getdata_col = 0;
         self.getdata_offset = 0;
     }
