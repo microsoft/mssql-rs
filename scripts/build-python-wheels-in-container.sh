@@ -7,9 +7,14 @@ set -e
 PYTHON_VERSIONS=("3.10" "3.11" "3.12" "3.13" "3.14")
 WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 OUTPUT_DIR="${OUTPUT_DIR:-$WORKSPACE_DIR/target/wheels}"
-# Optional: when set, per-Python-version .dwp + .so symbol files are copied
-# into "$SYMBOLS_OUTPUT_DIR/<pytag>/" immediately after each maturin build.
+# Optional: when set, a separate .debug file plus the stripped .so it belongs
+# to are written to "$SYMBOLS_OUTPUT_DIR/<pytag>/" after each maturin build.
 SYMBOLS_OUTPUT_DIR="${SYMBOLS_OUTPUT_DIR:-}"
+
+# Split DWARF (.dwp) cannot be consumed once the skeleton units are stripped
+# out of the shipped .so, so Linux links with debug info in the binary and the
+# split happens below via objcopy. macOS/Windows keep the Cargo.toml default.
+export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=off
 
 echo "==> Building Python wheels in container"
 echo "Workspace: $WORKSPACE_DIR"
@@ -86,37 +91,69 @@ for PY_VERSION in "${PYTHON_VERSIONS[@]}"; do
     echo "✅ Wheel built successfully for Python $PY_VERSION"
 
     # -----------------------------------------------------------------------
-    # Collect split debug info (.dwp) emitted by
-    # split-debuginfo="packed" in mssql-py-core/Cargo.toml.
-    # The .dwp lives next to the built cdylib in the deps directory and is
-    # linked back to the shipped .so by GNU build-id, so publishing just the
-    # .dwp plus the (stripped) .so is enough for the symbol server to index.
-    # We copy immediately after each maturin build because building the next
-    # Python version reuses target/release/deps and overwrites artifacts.
+    # Split debug info out of the freshly built wheel.
+    #
+    # Operating on the .so *inside* the wheel (rather than on a copy under
+    # target/) guarantees the published debug file belongs to exactly the
+    # binary we ship, and sidesteps the fact that target/release/deps is
+    # overwritten by the next interpreter's build.
+    #
+    #   objcopy --only-keep-debug  -> standalone .debug (carries the build-id)
+    #   objcopy --strip-debug      -> shipped .so keeps .symtab + build-id
+    #   objcopy --add-gnu-debuglink-> local debuggers can find the .debug file
     # -----------------------------------------------------------------------
     if [ -n "$SYMBOLS_OUTPUT_DIR" ]; then
         PY_TAG="cp${PY_VERSION//./}"
         SYM_DEST="$SYMBOLS_OUTPUT_DIR/$PY_TAG"
         mkdir -p "$SYM_DEST"
 
-        TARGET_ROOT="$WORKSPACE_DIR/mssql-py-core/target"
-        # Look under both the default target dir and any triple-specific subdir
-        # (musllinux builds usually land under a x86_64-unknown-linux-musl subdir).
-        for candidate_dir in \
-            "$TARGET_ROOT/release/deps" \
-            "$TARGET_ROOT"/*/release/deps ; do
-            [ -d "$candidate_dir" ] || continue
-            find "$candidate_dir" -maxdepth 1 -name 'libmssql_py_core*.dwp' -exec cp -v {} "$SYM_DEST/" \;
-            find "$candidate_dir" -maxdepth 1 -name 'libmssql_py_core*.so'  -exec cp -v {} "$SYM_DEST/" \;
-        done
-
-        DWP_COUNT=$(find "$SYM_DEST" -maxdepth 1 -name '*.dwp' | wc -l)
-        if [ "$DWP_COUNT" -eq 0 ]; then
-            echo "⚠️  WARNING: no .dwp emitted for Python $PY_VERSION under $TARGET_ROOT"
-            echo "     Verify [profile.release] has split-debuginfo=\"packed\" and debug=\"full\"."
-        else
-            echo "📦 Captured $DWP_COUNT .dwp + matching .so into $SYM_DEST"
+        if ! command -v objcopy &> /dev/null; then
+            echo "❌ ERROR: objcopy (binutils) not found; cannot split debug info."
+            exit 1
         fi
+        $FIRST_PYTHON -m pip show wheel &> /dev/null || $FIRST_PYTHON -m pip install --quiet wheel
+
+        WHEEL_PATH=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*-${PY_TAG}-*.whl" | head -n1)
+        if [ -z "$WHEEL_PATH" ]; then
+            echo "❌ ERROR: no wheel matching *-${PY_TAG}-*.whl found in $OUTPUT_DIR"
+            exit 1
+        fi
+
+        UNPACK_DIR=$(mktemp -d)
+        $FIRST_PYTHON -m wheel unpack "$WHEEL_PATH" --dest "$UNPACK_DIR"
+
+        SO_PATH=$(find "$UNPACK_DIR" -name 'mssql_py_core*.so' | head -n1)
+        if [ -z "$SO_PATH" ]; then
+            echo "❌ ERROR: no mssql_py_core*.so found inside $(basename "$WHEEL_PATH")"
+            exit 1
+        fi
+
+        DEBUG_NAME="$(basename "$SO_PATH").debug"
+        objcopy --only-keep-debug "$SO_PATH" "$SYM_DEST/$DEBUG_NAME"
+        objcopy --strip-debug "$SO_PATH"
+        objcopy --add-gnu-debuglink="$SYM_DEST/$DEBUG_NAME" "$SO_PATH"
+        cp "$SO_PATH" "$SYM_DEST/"
+
+        if ! readelf -n "$SYM_DEST/$DEBUG_NAME" | grep -qi 'Build ID'; then
+            echo "❌ ERROR: $DEBUG_NAME has no GNU build-id; symbol server cannot index it."
+            exit 1
+        fi
+
+        # Repack over the original so the shipped wheel carries the stripped .so
+        # with a correct RECORD.
+        REPACK_DIR=$(mktemp -d)
+        $FIRST_PYTHON -m wheel pack "$(find "$UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -n1)" --dest-dir "$REPACK_DIR"
+        REPACKED=$(find "$REPACK_DIR" -maxdepth 1 -name '*.whl' | head -n1)
+        if [ -z "$REPACKED" ]; then
+            echo "❌ ERROR: failed to repack $(basename "$WHEEL_PATH") after stripping."
+            exit 1
+        fi
+        rm -f "$WHEEL_PATH"
+        mv "$REPACKED" "$OUTPUT_DIR/"
+        rm -rf "$UNPACK_DIR" "$REPACK_DIR"
+
+        echo "📦 Split debug info for Python $PY_VERSION -> $SYM_DEST"
+        ls -lh "$SYM_DEST"
     fi
 done
 

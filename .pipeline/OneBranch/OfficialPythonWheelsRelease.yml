@@ -250,40 +250,14 @@ extends:
     # InternalSymbolServer stage always runs (Microsoft Internal Symbol Server).
     # PublicSymbolServer stage is gated by publishSymbolsPublic (default false)
     # and forces ExpirationDays=0 (public symbols cannot expire).
+    #
+    # Both consume the version the Release stage resolved at the Official
+    # Build's source commit, so symbols, NuGet and tag always agree.
     ###########################################################################
-    - ${{ if or(eq(parameters.publishSymbolsInternal, true), eq(parameters.publishSymbolsPublic, true)) }}:
-      - stage: GetSymbolsVersion
-        displayName: 'Resolve Release Version'
-        dependsOn: Release
-        jobs:
-        - job: ResolveVersion
-          displayName: 'Resolve version from build source commit'
-          pool:
-            type: windows
-          variables:
-            ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-          steps:
-          - checkout: self
-          - pwsh: |
-              $ErrorActionPreference = 'Stop'
-              $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
-              Write-Host "Reading Cargo.toml at build source commit: $commitSha"
-              $cargoTomlAtCommit = git -C "$(Build.SourcesDirectory)" show "${commitSha}:mssql-py-core/Cargo.toml"
-              if ($LASTEXITCODE -ne 0) {
-                $cargoTomlAtCommit = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/Cargo.toml" -Raw
-              }
-              $cargoToml = ($cargoTomlAtCommit -join "`n")
-              if ($cargoToml -match 'version\s*=\s*"([^"]+)"') { $version = $Matches[1] }
-              else { Write-Error "Could not extract version from Cargo.toml"; exit 1 }
-              Write-Host "Release version: $version"
-              Write-Host "##vso[task.setvariable variable=releaseVersion;isOutput=true]$version"
-            name: v
-            displayName: 'Read release version'
-
     - ${{ if eq(parameters.publishSymbolsInternal, true) }}:
       - stage: InternalSymbolServer
         displayName: 'Publish Symbols → Microsoft Internal'
-        dependsOn: GetSymbolsVersion
+        dependsOn: Release
         jobs:
         - job: InternalSymbols
           displayName: 'Publish to Microsoft Internal Symbol Server'
@@ -292,7 +266,7 @@ extends:
           variables:
             ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
             ob_git_checkout: false
-            releaseVersion: $[ stageDependencies.GetSymbolsVersion.ResolveVersion.outputs['v.releaseVersion'] ]
+            releaseVersion: $[ stageDependencies.Release.PublishRelease.outputs['ReleaseVersion.releaseVersion'] ]
           steps:
           - download: officialBuild
             displayName: 'Download build artifacts (wheels + symbols)'
@@ -322,7 +296,7 @@ extends:
     - ${{ if eq(parameters.publishSymbolsPublic, true) }}:
       - stage: PublicSymbolServer
         displayName: 'Publish Symbols → Microsoft Public'
-        dependsOn: GetSymbolsVersion
+        dependsOn: Release
         jobs:
         - job: PublicSymbols
           displayName: 'Publish to Microsoft Public Symbol Server (msdl.microsoft.com)'
@@ -331,7 +305,7 @@ extends:
           variables:
             ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
             ob_git_checkout: false
-            releaseVersion: $[ stageDependencies.GetSymbolsVersion.ResolveVersion.outputs['v.releaseVersion'] ]
+            releaseVersion: $[ stageDependencies.Release.PublishRelease.outputs['ReleaseVersion.releaseVersion'] ]
           steps:
           - pwsh: |
               Write-Host "##[warning]Publishing to Microsoft Public Symbol Server."
@@ -372,6 +346,12 @@ extends:
             type: windows
           variables:
             ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+            # Use the version the Release stage actually packaged (read at the
+            # build's source commit), not this run's working-tree Cargo.toml —
+            # otherwise a version bump on stable after the Official Build would
+            # tag the old commit with the new version.
+            releaseVersion: $[ stageDependencies.Release.PublishRelease.outputs['ReleaseVersion.releaseVersion'] ]
+            releaseCommit: $[ stageDependencies.Release.PublishRelease.outputs['ReleaseVersion.sourceCommit'] ]
           steps:
           - checkout: self
             persistCredentials: true
@@ -379,15 +359,13 @@ extends:
           - pwsh: |
               $ErrorActionPreference = 'Stop'
 
-              $cargoToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/Cargo.toml" -Raw
-              if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
-                $version = $Matches[1]
-              } else {
-                Write-Error "Could not extract version from Cargo.toml"
+              $version = "$(releaseVersion)"
+              $commitSha = "$(releaseCommit)"
+              if ([string]::IsNullOrWhiteSpace($version) -or [string]::IsNullOrWhiteSpace($commitSha)) {
+                Write-Error "Release stage did not publish releaseVersion/sourceCommit outputs"
                 exit 1
               }
 
-              $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
               $tagName = "v$version"
               $branchName = "release/$version"
 

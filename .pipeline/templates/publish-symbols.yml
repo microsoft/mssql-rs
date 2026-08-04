@@ -35,13 +35,18 @@ parameters:
   type: string
 - name: SearchPattern
   type: string
-  # PDB (Windows), .dwp DWARF package (Linux), .so (build-id carrier for Linux).
+  # PDB (Windows), separate .debug file (Linux), and the stripped .so it
+  # belongs to (build-id carrier, lets the server resolve binary -> debug).
   # .dSYM.tgz macOS bundles are excluded — dSYM indexing on ADO/MS symbol
   # servers is not proven; macOS symbols are shipped as pipeline artifacts only.
+  #
+  # NOTE (WI 45990 follow-up): a green run here only proves upload succeeded.
+  # End-to-end retrieval (WinDbg for PDBs, gdb/debuginfod-find by build-id for
+  # Linux) must be validated before this flow is treated as production-ready.
   default: |
     **/*.pdb
-    **/*.dwp
-    **/libmssql_py_core*.so
+    **/*.debug
+    **/mssql_py_core*.so
 - name: SymbolsVersion
   type: string
 - name: SymbolsProduct
@@ -69,7 +74,11 @@ steps:
     SymbolsProduct: ${{ parameters.SymbolsProduct }}
     SymbolsVersion: ${{ parameters.SymbolsVersion }}
     SymbolsArtifactName: mssql_rs_${{ parameters.SymbolServer }}Symbols_${{ parameters.SymbolsVersion }}_$(System.TimelineId)
-    # Required for DWARF/ELF indexing (Linux .dwp + .so). Legacy client is
+    # Retention on the ADO org symbol server. Omitted when 0 so the symbols
+    # never expire (the release flow's default).
+    ${{ if gt(parameters.ExpirationDays, 0) }}:
+      SymbolExpirationInDays: ${{ parameters.ExpirationDays }}
+    # Required for DWARF/ELF indexing (Linux .debug + .so). Legacy client is
     # Windows-PDB only.
     UseNetCoreClientTool: true
     IndexableFileFormats: All
@@ -89,7 +98,10 @@ steps:
       azureSubscription: SymbolsPublishing-mssql-rs
       scriptType: 'pscore'
       scriptLocation: 'inlineScript'
-      failOnStandardError: true
+      # az CLI writes experimental/deprecation notices to stderr; failing on
+      # those would abort promotion for reasons unrelated to publishing.
+      # Failures are surfaced explicitly by Test-Result below.
+      failOnStandardError: false
       inlineScript: |
         function Test-Completed([object] $publishingStatus)
         {

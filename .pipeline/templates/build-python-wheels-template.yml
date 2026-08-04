@@ -114,17 +114,36 @@ steps:
 
         # Collect .dSYM bundles emitted by split-debuginfo="packed" immediately
         # after this interpreter's build — the next Python version's build reuses
-        # target/release/deps and would overwrite them.
+        # the deps directory and would overwrite them.
         PY_TAG="cp$(echo ${{ pythonVersion }} | tr -d .)"
-        SYM_DEST="$(ob_outputDirectory)/symbols/MacOS_universal2/$PY_TAG"
+        SYM_DEST="$(ob_outputDirectory)/symbols/${{ parameters.osType }}_${{ parameters.architecture }}/$PY_TAG"
         mkdir -p "$SYM_DEST"
+
+        # This step has already cd'd into mssql-py-core, and CARGO_TARGET_DIR is
+        # set to the sources directory by the macOS job, so relative target/
+        # paths are wrong. Search the real target root instead. A universal2
+        # build emits per-architecture dSYMs under the x86_64/aarch64 target
+        # directories, so keep every bundle we find.
+        TARGET_ROOT="${CARGO_TARGET_DIR:-$(pwd)/target}"
+        echo "Searching for dSYM bundles under $TARGET_ROOT"
+        DSYM_COUNT=0
         # dSYM is a directory; tar it so it survives artifact publish.
-        for dsym in target/universal2-apple-darwin/release/deps/libmssql_py_core*.dSYM \
-                    target/release/deps/libmssql_py_core*.dSYM ; do
+        while IFS= read -r dsym; do
           [ -d "$dsym" ] || continue
-          tar -czf "$SYM_DEST/$(basename "$dsym").tgz" -C "$(dirname "$dsym")" "$(basename "$dsym")"
-          echo "Captured dSYM: $dsym -> $SYM_DEST/$(basename "$dsym").tgz"
-        done
+          # Disambiguate same-named bundles coming from different target triples.
+          TRIPLE=$(echo "$dsym" | sed -n 's#.*/\([^/]*-apple-darwin\)/.*#\1#p')
+          ARCHIVE="$SYM_DEST/${TRIPLE:+$TRIPLE.}$(basename "$dsym").tgz"
+          tar -czf "$ARCHIVE" -C "$(dirname "$dsym")" "$(basename "$dsym")"
+          echo "Captured dSYM: $dsym -> $ARCHIVE"
+          DSYM_COUNT=$((DSYM_COUNT + 1))
+        done < <(find "$TARGET_ROOT" -type d -name 'libmssql_py_core*.dSYM' -o -type d -name 'mssql_py_core*.dSYM')
+
+        if [ "$DSYM_COUNT" -eq 0 ]; then
+          echo "ERROR: no .dSYM bundles found under $TARGET_ROOT for Python ${{ pythonVersion }}."
+          echo "       Verify [profile.release] keeps debug=\"full\" and split-debuginfo=\"packed\"."
+          exit 1
+        fi
+        echo "Captured $DSYM_COUNT dSYM bundle(s) into $SYM_DEST"
       displayName: 'Build universal2 wheel for Python ${{ pythonVersion }} (MacOS)'
   
   - script: |
@@ -239,12 +258,11 @@ steps:
           }
         }
         if ($pdbs.Count -eq 0) {
-          Write-Warning "No .pdb files found for Python ${{ pythonVersion }} under: $($targetRoots -join '; ')"
-        } else {
-          foreach ($pdb in $pdbs) {
-            Copy-Item -Path $pdb.FullName -Destination $symDest -Force
-            Write-Host "Captured PDB: $($pdb.FullName) -> $symDest"
-          }
+          throw "No .pdb files found for Python ${{ pythonVersion }} under: $($targetRoots -join '; '). Symbol publishing would silently ship this target without debug info."
+        }
+        foreach ($pdb in $pdbs) {
+          Copy-Item -Path $pdb.FullName -Destination $symDest -Force
+          Write-Host "Captured PDB: $($pdb.FullName) -> $symDest"
         }
       displayName: 'Build wheel for Python ${{ pythonVersion }} (Windows ${{ parameters.architecture }})'
 
