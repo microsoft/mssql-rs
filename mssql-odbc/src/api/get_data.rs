@@ -16,9 +16,22 @@ use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
-use crate::row::PlpEncoding;
 use mssql_tds::connection::tds_client::{CursorColumn, ResultSet};
 use mssql_tds::datatypes::column_values::ColumnValues;
+
+/// Wire encoding of a PLP column; used to select and transcode the delivered
+/// SQL C type. UTF-16 text can be delivered as SQL_C_WCHAR or transcoded to
+/// SQL_C_CHAR; single-byte text as SQL_C_CHAR. Binary delivery and
+/// varchar->SQL_C_WCHAR widening are not yet supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlpEncoding {
+    /// nvarchar(max), nchar(max), xml — UTF-16LE on the wire.
+    Utf16Text,
+    /// varchar(max), text, json — single-byte / UTF-8 on the wire.
+    SingleByteText,
+    /// varbinary(max), image, UDT — opaque bytes.
+    Binary,
+}
 
 /// Implements SQLGetData for current-row retrieval.
 ///

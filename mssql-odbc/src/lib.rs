@@ -9,7 +9,6 @@ mod connection;
 mod error;
 mod handles;
 mod params;
-pub(crate) mod row;
 #[cfg(test)]
 pub(crate) mod test_support;
 

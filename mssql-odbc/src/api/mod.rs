@@ -13,6 +13,7 @@ mod execute;
 pub(crate) mod fetch;
 pub(crate) mod free_handle;
 mod get_data;
+pub(crate) use get_data::PlpEncoding;
 mod get_diag;
 mod get_type_info;
 mod more_results;
