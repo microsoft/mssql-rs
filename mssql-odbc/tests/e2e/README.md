@@ -121,6 +121,27 @@ parity table.
 .\run_e2e.ps1 -CompareWithMsodbcsql -MsodbcsqlDll 'C:\path\to\msodbcsql18.dll'
 ```
 
+`run_e2e.ps1 -Coverage` builds the Rust driver with LLVM source-based
+instrumentation so the driver code exercised by the C++ tests — which load the
+DLL through the Windows Driver Manager as separate processes — is measured. It
+writes a Cobertura report for `mssql-tds` + `mssql-odbc` (the cdylib statically
+links `mssql-tds`, so both are covered).
+
+```powershell
+# Report to the default path: <repo>\target\cobertura-odbc-e2e.xml
+.\run_e2e.ps1 -Coverage
+
+# Custom output path
+.\run_e2e.ps1 -Coverage -CoverageOutput 'C:\tmp\odbc-e2e.xml'
+```
+
+This uses the same mechanism as `run_e2e.sh --coverage`: everything runs through
+`cargo llvm-cov` (`show-env` to instrument the build, `report` to emit the
+report), so the LLVM version that reads the `.profraw` always matches the rustc
+that produced the instrumented DLL. In CI, the Windows x64 PR build runs the
+suite with `-Coverage`, publishes the report as `CoberturaCoverageOdbcE2E_Windows`,
+and the Merge Coverage stage unions it into the diff-coverage report.
+
 Both scripts:
 1. Build the Rust cdylib (`cargo build` from `mssql-odbc/`)
 2. Register the driver with the platform's ODBC Driver Manager
