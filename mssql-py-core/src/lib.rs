@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use mssql_tds::connection::client_context::DriverVersion;
 
 mod arrow_bulkcopy;
+mod async_runtime;
 mod bulkcopy;
 mod connection;
 mod cursor;
@@ -48,6 +49,10 @@ pub(crate) fn get_raw_driver_version() -> Option<String> {
 fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize tracing on module load (via MSSQL_TDS_TRACE env var)
     tracing_init::init_tracing();
+
+    // Bring up the shared Tokio runtime used by every connection, cursor, and
+    // `asyncio`-facing coroutine. Must run before any code that touches Tokio.
+    async_runtime::init();
 
     // Statically capture the Python version once during module initialization
     let py_version = pyo3::Python::version_str();
