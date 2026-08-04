@@ -16,7 +16,7 @@
 //! You can implement the [`MetadataRetriever`] trait to provide custom metadata
 //! retrieval strategies, such as caching or alternative sources.
 
-use crate::connection::tds_client::{ResultSetClient, TdsClient};
+use crate::connection::tds_client::{ExecuteOptions, TdsClient};
 use crate::core::{CancelHandle, TdsResult};
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::error::Error;
@@ -350,7 +350,16 @@ EXEC {catalog_for_sproc}sp_tablecollations_100 N'{schema_name}.{table_name_escap
     debug!("Fetching table metadata with FMTONLY and collations");
 
     // Execute the query
-    client.execute(query, timeout_sec, cancel_handle).await?;
+    client
+        .execute(
+            query,
+            ExecuteOptions {
+                timeout: timeout_sec,
+                cancel: cancel_handle,
+                ..Default::default()
+            },
+        )
+        .await?;
 
     // Result set 1: @@TRANCOUNT - execute() positions us at the first ColMetadata
     // Consume this result set (should have exactly 1 row)
@@ -363,7 +372,7 @@ EXEC {catalog_for_sproc}sp_tablecollations_100 N'{schema_name}.{table_name_escap
     // This will navigate through multiple DONE tokens from the variable declarations
     // and SET FMTONLY statements until it finds the COLMETADATA for the EXEC() result
     trace!("Moving to FMTONLY metadata result set");
-    if !client.move_to_next().await? {
+    if !client.advance_to_rows().await? {
         return Err(Error::UsageError(format!(
             "Failed to move to FMTONLY metadata for table {}",
             table_name
@@ -403,7 +412,7 @@ EXEC {catalog_for_sproc}sp_tablecollations_100 N'{schema_name}.{table_name_escap
     // This will navigate through SET FMTONLY OFF, EXEC sp_tablecollations_100,
     // ReturnStatus, and DoneProc tokens until it finds the COLMETADATA
     trace!("Moving to sp_tablecollations_100 result set");
-    if !client.move_to_next().await? {
+    if !client.advance_to_rows().await? {
         return Err(Error::UsageError(format!(
             "Failed to move to collation metadata for table {}",
             table_name

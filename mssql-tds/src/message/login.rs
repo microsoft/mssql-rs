@@ -9,8 +9,9 @@ use crate::message::features::jsonfeature::JsonFeature;
 use crate::message::login_options::{
     OptionFlags1, OptionFlags2, OptionFlags3, OptionsValue, TdsVersion, TypeFlags,
 };
-use crate::message::messages::{PacketType, Request, TdsError};
+use crate::message::messages::{PacketType, Request};
 
+use crate::error::{SqlErrorInfo, SqlInfoMessage};
 use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
 use crate::token::fed_auth_info::{FedAuthInfoToken, SspiToken};
 use crate::token::login_ack::LoginAckToken;
@@ -425,13 +426,15 @@ impl LoginRequestModel<'_> {
 pub(crate) struct LoginResponseModel {
     pub change_properties: EnvChangeProperties,
     pub features: FeaturesRequest,
-    pub tds_error: Option<TdsError>,
+    pub errors: Vec<SqlErrorInfo>,
     pub success_token: Option<LoginAckToken>,
     pub fed_auth_info: Option<FedAuthInfoToken>,
     /// SSPI challenge token from server for integrated authentication
     pub sspi_token: Option<SspiToken>,
     /// Session state tokens received during login, for transfer to RecoveryContext.
     pub session_state_tokens: Vec<SessionStateToken>,
+    /// Informational messages received during login.
+    pub info_messages: Vec<SqlInfoMessage>,
 }
 
 #[repr(u8)]
@@ -453,11 +456,12 @@ impl LoginResponseModel {
         LoginResponseModel {
             change_properties: EnvChangeProperties::default(),
             features,
-            tds_error: None,
+            errors: Vec::new(),
             success_token: None,
             fed_auth_info: None,
             sspi_token: None,
             session_state_tokens: Vec::new(),
+            info_messages: Vec::new(),
         }
     }
 
@@ -561,7 +565,7 @@ impl LoginResponseModel {
             return LoginResponseStatus::Success;
         }
 
-        if self.tds_error.is_some() {
+        if !self.errors.is_empty() {
             return LoginResponseStatus::Error;
         }
 
@@ -706,8 +710,9 @@ impl LoginResponse {
                                 Level::ERROR,
                                 "Received Error token during login response parsing."
                             );
-                            response_model.tds_error = Some(TdsError::new(error_token));
-                            // Decide if you want to break here, or keep looping.
+                            response_model.errors.push(SqlErrorInfo::from(&error_token));
+                            // Keep looping so every ERROR/INFO token in the login
+                            // response is captured, not just the first.
                         }
                         Tokens::FeatureExtAck(_t) => {
                             for f in _t.acknowledged_features().iter() {
@@ -720,12 +725,13 @@ impl LoginResponse {
                             response_model.fed_auth_info = Some(fed_auth_info_token);
                             break;
                         }
-                        Tokens::Info(_t) => {
+                        Tokens::Info(t) => {
                             event!(
                                 Level::INFO,
                                 "Received {:?} during login response parsing.",
                                 token_type
                             );
+                            response_model.info_messages.push(SqlInfoMessage::from(&t));
                         }
                         Tokens::SessionState(session_state) => {
                             event!(
@@ -1657,7 +1663,7 @@ mod tests {
     #[test]
     fn get_status_error() {
         let mut model = make_response_model();
-        model.tds_error = Some(TdsError::new(ErrorToken {
+        model.errors.push(SqlErrorInfo::from(&ErrorToken {
             number: 1,
             state: 0,
             severity: 16,

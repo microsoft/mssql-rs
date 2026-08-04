@@ -12,7 +12,7 @@ use crate::api::odbc_types::{
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE, ERR_INVALID_NULL_POINTER,
     ERR_STRING_RIGHT_TRUNCATION, SQLSTATE_08001, SQLSTATE_HY024, SQLSTATE_HY110, SQLSTATE_HYC00,
-    post_diag, post_tds_error,
+    post_diag, post_tds_error, post_tds_info_messages,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
@@ -20,14 +20,17 @@ use crate::handles::DbcHandle;
 use crate::handles::dbc::{ConnectionState, DbcState};
 use crate::handles::{HandleType, handle_from_raw};
 
-use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
+use mssql_tds::connection::client_context::{ClientContext, IPAddressPreference};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+use mssql_tds::message::login_options::ApplicationIntent;
+use std::path::PathBuf;
 
 use super::util::read_utf16;
+use crate::auth::configure_auth;
 use crate::connection::odbc_authentication_transformer::transform_auth;
 use crate::connection::odbc_authentication_validator::validate_auth;
-use crate::connection::parse_connection_string;
+use crate::connection::{ConnectionParams, parse_connection_string};
 
 /// Implementation of `SQLDriverConnectW`.
 ///
@@ -242,34 +245,29 @@ fn do_connect(
         state.access_token.as_deref(),
     );
 
-    // T1 wires SQL password, integrated (SSPI/GSSAPI), and pre-acquired access
-    // tokens. Entra methods that require token acquisition are not yet available.
-    match &resolved.method {
-        TdsAuthenticationMethod::Password
-        | TdsAuthenticationMethod::SSPI
-        | TdsAuthenticationMethod::AccessToken => {}
-        other => {
-            error!(
-                ?other,
-                "SQLDriverConnectW: authentication method not implemented"
-            );
-            post_sql_error(
-                state,
-                SQLSTATE_HYC00,
-                0,
-                format!("Authentication method {other:?} is not yet supported"),
-            );
-            return SQL_ERROR;
-        }
+    // Build ClientContext. T1 wired SQL password, integrated (SSPI/GSSAPI), and
+    // pre-acquired access tokens; T2 adds Entra service principal (secret) and
+    // managed identity via an Azure-SDK token factory. Methods that still need
+    // token acquisition (AD password, interactive, device code, workload
+    // identity, default credential, AD integrated) are rejected with HYC00
+    // until a later tier.
+    let mut context = ClientContext::default();
+    context.database = params.database.clone();
+
+    if let Err(method) = configure_auth(&mut context, resolved) {
+        error!(
+            ?method,
+            "SQLDriverConnectW: authentication method not implemented"
+        );
+        post_sql_error(
+            state,
+            SQLSTATE_HYC00,
+            0,
+            format!("Authentication method {method:?} is not yet supported"),
+        );
+        return SQL_ERROR;
     }
 
-    // Build ClientContext
-    let mut context = ClientContext::default();
-    context.user_name = resolved.user_name;
-    context.password = resolved.password;
-    context.access_token = resolved.access_token;
-    context.database = params.database.clone();
-    context.tds_authentication_method = resolved.method;
     context.encryption_options = EncryptionOptions {
         trust_server_certificate: params.trust_server_certificate,
         mode: match params.encrypt.as_deref() {
@@ -286,13 +284,15 @@ fn do_connect(
         server_certificate: None,
     };
 
+    apply_connection_params(&mut context, &params);
+
     // Connect via mssql-tds (lock is NOT held - the 'Connecting' state prevents races)
     let provider = TdsConnectionProvider::new();
     let client = dbc
         .runtime
         .block_on(provider.create_client(context, &params.server, None));
 
-    let client = match client {
+    let mut client = match client {
         Ok(c) => c,
         Err(e) => {
             error!(%e, "SQLDriverConnectW: connection failed");
@@ -300,6 +300,7 @@ fn do_connect(
             return SQL_ERROR;
         }
     };
+    let info_messages = client.take_info_messages();
 
     // Write output connection string
     // TODO: build completed output connection string from resolved attributes and negotiated
@@ -315,13 +316,13 @@ fn do_connect(
     truncated |=
         unsafe { copy_with_nul(out_connection_string, buffer_length as usize, &out_utf16) };
 
+    let has_server_info = post_tds_info_messages(state, &info_messages);
+
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
-    // TODO: This print is for demo purposes only. Remove before release.
-    println!("**** Connected via mssql-odbc Driver ****");
     debug!("SQLDriverConnectW: connected successfully");
 
-    if has_warnings || truncated {
+    if has_warnings || truncated || has_server_info {
         if has_warnings {
             post_diag(state, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE);
         }
@@ -331,6 +332,66 @@ fn do_connect(
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
+    }
+}
+
+/// TDS packet-size range accepted by `mssql-tds` (`DefaultClientContextValidator`).
+/// Unlike `ConnectRetryCount` / `ConnectRetryInterval` (which the parser rejects
+/// out-of-range to match msodbcsql), `PacketSize` is clamped to this range.
+const MIN_PACKET_SIZE: u32 = 512;
+const MAX_PACKET_SIZE: u32 = 32768;
+
+/// Maps parsed [`ConnectionParams`] onto a [`ClientContext`]. `ConnectRetryCount`
+/// and `ConnectRetryInterval` are already range-validated during parsing;
+/// `PacketSize` is clamped here to the range `mssql-tds` accepts. Enum strings are
+/// mapped to their variant with a default fallback — validated during parsing,
+/// except `IpAddressPreference`, whose unknown values fall back to `IPv4First`
+/// (matching msodbcsql). Kept separate from `do_connect` so the mapping is
+/// unit-testable without a live server.
+fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParams) {
+    context.encryption_options.host_name_in_cert = params.host_name_in_certificate.clone();
+    context.encryption_options.server_certificate =
+        params.server_certificate.as_deref().map(PathBuf::from);
+
+    if let Some(server_spn) = &params.server_spn {
+        context.server_spn = Some(server_spn.clone());
+    }
+    if let Some(intent) = &params.application_intent {
+        context.application_intent = if intent.eq_ignore_ascii_case("readonly") {
+            ApplicationIntent::ReadOnly
+        } else {
+            ApplicationIntent::ReadWrite
+        };
+    }
+    if let Some(multi_subnet_failover) = params.multi_subnet_failover {
+        context.multi_subnet_failover = multi_subnet_failover;
+    }
+    if let Some(count) = params.connect_retry_count {
+        context.connect_retry_count = count;
+    }
+    if let Some(interval) = params.connect_retry_interval {
+        context.connect_retry_interval = interval;
+    }
+    // ODBC expresses KeepAlive/KeepAliveInterval in seconds; mssql-tds stores
+    // milliseconds. Saturate so a large value can't overflow.
+    if let Some(secs) = params.keep_alive {
+        context.keep_alive_in_ms = secs.saturating_mul(1000);
+    }
+    if let Some(secs) = params.keep_alive_interval {
+        context.keep_alive_interval_in_ms = secs.saturating_mul(1000);
+    }
+    if let Some(pref) = &params.ip_address_preference {
+        context.ipaddress_preference = if pref.eq_ignore_ascii_case("ipv6first") {
+            IPAddressPreference::IPv6First
+        } else if pref.eq_ignore_ascii_case("useplatformdefault") {
+            IPAddressPreference::UsePlatformDefault
+        } else {
+            IPAddressPreference::IPv4First
+        };
+    }
+    if let Some(size) = params.packet_size {
+        context.packet_size =
+            u16::try_from(size.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE)).unwrap_or(u16::MAX);
     }
 }
 
@@ -441,12 +502,14 @@ mod tests {
     }
 
     #[test]
-    fn entra_method_not_implemented_returns_hyc00() {
-        // ActiveDirectoryMSI validates fine but needs token acquisition (T2);
+    fn interactive_method_not_implemented_returns_hyc00() {
+        // ActiveDirectoryInteractive is recognized but not yet implemented (T3);
         // the gate must reject it with HYC00 before any network activity.
+        // (T2 now implements ServicePrincipal and ManagedIdentity, so those no
+        // longer hit this gate.)
         let h = TestHandles::with_env_dbc();
         let dbc = h.dbc;
-        let conn_str: Vec<u16> = cs("Server=s;Authentication=ActiveDirectoryMSI")
+        let conn_str: Vec<u16> = cs("Server=s;Authentication=ActiveDirectoryInteractive")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -576,5 +639,129 @@ mod tests {
                 "mode {mode} should post HY110"
             );
         }
+    }
+
+    #[test]
+    fn apply_params_maps_tls_identity_fields() {
+        let mut ctx = ClientContext::default();
+        let params = ConnectionParams {
+            host_name_in_certificate: Some("cn.contoso.com".to_string()),
+            server_certificate: Some("/etc/ssl/server.pem".to_string()),
+            ..Default::default()
+        };
+        apply_connection_params(&mut ctx, &params);
+        assert_eq!(
+            ctx.encryption_options.host_name_in_cert.as_deref(),
+            Some("cn.contoso.com")
+        );
+        assert_eq!(
+            ctx.encryption_options.server_certificate,
+            Some(PathBuf::from("/etc/ssl/server.pem"))
+        );
+    }
+
+    #[test]
+    fn apply_params_passes_through_connect_retry_values() {
+        // The parser range-validates these, so the mapping stores them verbatim.
+        let mut ctx = ClientContext::default();
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                connect_retry_count: Some(255),
+                connect_retry_interval: Some(60),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.connect_retry_count, 255);
+        assert_eq!(ctx.connect_retry_interval, 60);
+    }
+
+    #[test]
+    fn apply_params_falls_back_unknown_ip_preference_to_ipv4first() {
+        let mut ctx = ClientContext::default();
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                ip_address_preference: Some("IPv7".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            ctx.ipaddress_preference,
+            IPAddressPreference::IPv4First
+        ));
+    }
+
+    #[test]
+    fn apply_params_clamps_packet_size_to_tds_range() {
+        let mut ctx = ClientContext::default();
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                packet_size: Some(100),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.packet_size, 512);
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                packet_size: Some(70_000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.packet_size, 32768);
+    }
+
+    #[test]
+    fn apply_params_maps_keepalive_seconds_to_millis() {
+        let mut ctx = ClientContext::default();
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                keep_alive: Some(30),
+                keep_alive_interval: Some(5),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.keep_alive_in_ms, 30_000);
+        assert_eq!(ctx.keep_alive_interval_in_ms, 5_000);
+    }
+
+    #[test]
+    fn apply_params_maps_validated_enums() {
+        let mut ctx = ClientContext::default();
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                application_intent: Some("ReadOnly".to_string()),
+                ip_address_preference: Some("IPv6First".to_string()),
+                multi_subnet_failover: Some(true),
+                server_spn: Some("MSSQLSvc/host:1433".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            ctx.application_intent,
+            ApplicationIntent::ReadOnly
+        ));
+        assert!(matches!(
+            ctx.ipaddress_preference,
+            IPAddressPreference::IPv6First
+        ));
+        assert!(ctx.multi_subnet_failover);
+        assert_eq!(ctx.server_spn.as_deref(), Some("MSSQLSvc/host:1433"));
+    }
+
+    #[test]
+    fn apply_params_leaves_unset_fields_at_defaults() {
+        let mut ctx = ClientContext::default();
+        let before_packet = ctx.packet_size;
+        let before_retry = ctx.connect_retry_count;
+        apply_connection_params(&mut ctx, &ConnectionParams::default());
+        assert_eq!(ctx.packet_size, before_packet);
+        assert_eq!(ctx.connect_retry_count, before_retry);
+        assert_eq!(ctx.encryption_options.host_name_in_cert, None);
+        assert_eq!(ctx.encryption_options.server_certificate, None);
     }
 }

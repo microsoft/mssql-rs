@@ -9,6 +9,7 @@ mod transactions {
         ExpectedQueryResultType, begin_connection, build_tcp_datasource,
         run_query_and_check_results, validate_results,
     };
+    use mssql_tds::connection::tds_client::StatementResult;
     use mssql_tds::message::transaction_management::{CreateTxnParams, TransactionIsolationLevel};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -121,7 +122,16 @@ mod transactions {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
         connection.get_dtc_address().await.unwrap();
-        validate_results(&mut connection, &expected).await.unwrap();
+        // `get_dtc_address` positions on its result set exactly like `execute`;
+        // reconstruct the first `StatementResult` for statement-wise validation.
+        let first = if connection.on_rows() {
+            StatementResult::Rows
+        } else {
+            StatementResult::End
+        };
+        validate_results(&mut connection, first, &expected)
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

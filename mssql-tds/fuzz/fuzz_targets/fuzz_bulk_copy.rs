@@ -181,6 +181,7 @@ impl FuzzBulkCopyOptions {
             table_lock: self.table_lock,
             use_internal_transaction: self.use_internal_transaction,
             notification_interval: 0,
+            allow_encrypted_value_modifications: false,
         }
     }
 }

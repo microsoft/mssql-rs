@@ -5,9 +5,8 @@
 //! [`CursorClient`](crate::connection::cursor_ops::CursorClient) trait
 //! implemented for [`TdsClient`](crate::connection::tds_client::TdsClient).
 //!
-//! Defining the cursor surface as a trait (mirroring
-//! [`ResultSetClient`](crate::connection::tds_client::ResultSetClient)) keeps it
-//! a distinct, swappable abstraction rather than inherent methods. Bring
+//! Defining the cursor surface as a trait keeps it a distinct, swappable
+//! abstraction rather than inherent methods. Bring
 //! [`CursorClient`](crate::connection::cursor_ops::CursorClient) into scope to
 //! call these methods on a [`TdsClient`](crate::connection::tds_client::TdsClient).
 
@@ -39,10 +38,8 @@ use tracing::instrument;
 /// The server-cursor RPC surface (`sp_cursor*`) for a TDS client.
 ///
 /// Implemented for [`TdsClient`]; bring this trait into scope to open, fetch
-/// from, mutate, prepare, and close server cursors. Modeled on
-/// [`ResultSetClient`](crate::connection::tds_client::ResultSetClient) so the
-/// cursor behavior is a distinct, swappable abstraction rather than inherent
-/// methods on the client.
+/// from, mutate, prepare, and close server cursors. Kept as a distinct,
+/// swappable abstraction rather than inherent methods on the client.
 #[async_trait]
 pub trait CursorClient {
     /// Opens a server cursor with a SQL statement (`sp_cursoropen`, RPC ID 2).
@@ -465,7 +462,7 @@ impl CursorClient for TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         rpc.serialize(&mut pw).await?;
 
-        let metadata = self.move_to_column_metadata().await?;
+        let metadata = self.next_rowset().await?;
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
             self.current_result_set_has_been_read_till_end = true;
@@ -1103,7 +1100,7 @@ impl TdsClient {
         // Clear any stale return status so a missing ReturnStatus token surfaces
         // as Succeeded rather than the previous RPC's status.
         self.last_return_status = ReturnStatus::NotReceived;
-        let metadata = self.move_to_column_metadata().await?;
+        let metadata = self.next_rowset().await?;
         self.current_metadata = metadata;
         let server_errors = self.drain_stream().await?;
         self.execution_context.set_has_open_batch(false);

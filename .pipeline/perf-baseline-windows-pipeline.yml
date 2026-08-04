@@ -1,0 +1,67 @@
+# Fixed-baseline performance pipeline — WINDOWS (dedicated perf lab)
+#
+# Windows counterpart to perf-baseline-linux-pipeline.yml. Both wrappers extend
+# the same shared PerfTest lab template; the ONLY difference is the hard-coded
+# `platform` (and the .ps1 vs .sh testScript). They are registered as two
+# separate ADO pipeline definitions so each has its own schedule, artifacts, and
+# regression gate — Windows and Linux numbers are not comparable and are tuned
+# independently.
+#
+# Compares the current commit against a fixed baseline pinned by a commit SHA in
+# mssql-tds-bench/perf-lab/baseline-commit.txt (advanced via PR), using the
+# mssql-tds-bench harness whose ONLY swapped input is the mssql-tds source. The
+# harness code, Criterion version, and toolchain are identical across both runs,
+# so any significant delta is attributable to mssql-tds itself.
+#
+# The build happens ON the VM (the lab's documented model): the testScript
+# bootstraps the toolchain, builds the candidate from the working tree and the
+# baseline from a local `git worktree` of the commit in baseline-commit.txt, then
+# compares with critcmp. On Windows the template auto-selects run-benchmarks.ps1.
+#
+# The weekly cron is staggered two hours after the Linux pipeline's so the two
+# scheduled runs do not contend for the lab's limited VM slots. ADO scheduled
+# triggers always use default parameter values, which is exactly why each
+# platform needs its own definition with the platform hard-coded.
+
+trigger: none
+pr: none
+
+schedules:
+  - cron: '0 10 * * 1'
+    displayName: Weekly baseline comparison (Windows)
+    branches:
+      include:
+        - main
+    always: true
+
+resources:
+  repositories:
+    - repository: PerfTemplates
+      type: git
+      name: InternalDriverTools/PerfTest
+      ref: refs/heads/main
+
+extends:
+  template: v1/Perf.Test.Job.yml@PerfTemplates
+  parameters:
+    platform: windows
+    # Ship the whole repo (including .git) so the testScript can create a local
+    # worktree of the baseline commit with no VM-side ADO authentication. The
+    # baseline commit must be present in the shipped history (full checkout).
+    testRootDir: $(Build.SourcesDirectory)/mssql-rs
+    # Relative to testRootDir. The Windows harness is the PowerShell port.
+    testScript: mssql-tds-bench/perf-lab/run-benchmarks.ps1
+    testScriptArgs: none
+    testResultsSubDir: results
+    testTimeoutMinutes: 120
+    steps:
+      - bash: |
+          set -euo pipefail
+          report="$(Build.ArtifactStagingDirectory)/results/comparison.txt"
+          echo "=== Benchmark comparison (base -> candidate) ==="
+          if [ -f "$report" ]; then
+            cat "$report"
+          else
+            echo "comparison.txt not found"
+          fi
+        displayName: 'Show benchmark comparison'

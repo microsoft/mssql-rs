@@ -12,7 +12,7 @@ mod common;
 #[cfg(test)]
 mod encryption_tests {
     use mssql_tds::connection::client_context::ClientContext;
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
 
@@ -56,18 +56,16 @@ mod encryption_tests {
 
     /// Execute SELECT 1 and verify we get a result
     async fn test_simple_query(client: &mut TdsClient) -> TdsResult<()> {
-        client
-            .execute("SELECT 1 AS value".to_string(), None, None)
-            .await?;
+        client.execute("SELECT 1 AS value".to_string(), ()).await?;
 
         let mut has_result = false;
         loop {
-            if let Some(resultset) = client.get_current_resultset() {
-                while let Some(_row) = resultset.next_row().await? {
+            if client.on_rows() {
+                while let Some(_row) = client.next_row().await? {
                     has_result = true;
                 }
             }
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }

@@ -84,6 +84,12 @@ pub struct StreamingBulkLoadWriter<'a> {
     /// before `begin()` when column encryption is enabled; used to encrypt cell
     /// values on the write path.
     plaintext_ceks: Vec<Option<std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>>>,
+
+    /// When set, encrypted destination columns receive their values verbatim as
+    /// varbinary ciphertext instead of being encrypted with the column's key
+    /// (the .NET `AllowEncryptedValueModifications` behavior). No plaintext CEK
+    /// is required for the encrypted columns in this mode.
+    allow_encrypted_value_modifications: bool,
 }
 
 impl<'a> StreamingBulkLoadWriter<'a> {
@@ -113,6 +119,7 @@ impl<'a> StreamingBulkLoadWriter<'a> {
             column_encryption_enabled: false,
             emitted_cek_table: Vec::new(),
             plaintext_ceks: Vec::new(),
+            allow_encrypted_value_modifications: false,
         }
     }
 
@@ -136,6 +143,17 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         ceks: Vec<Option<std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>>>,
     ) {
         self.plaintext_ceks = ceks;
+    }
+
+    /// Enable ciphertext passthrough for encrypted columns (the
+    /// `AllowEncryptedValueModifications` behavior). When set, values for
+    /// encrypted columns are emitted verbatim as varbinary ciphertext rather
+    /// than encrypted, so the caller need not supply plaintext CEKs for those
+    /// columns. Requires
+    /// [`set_column_encryption_enabled`](Self::set_column_encryption_enabled) so
+    /// the encrypted COLMETADATA is still emitted.
+    pub(crate) fn set_allow_encrypted_value_modifications(&mut self, enabled: bool) {
+        self.allow_encrypted_value_modifications = enabled;
     }
 
     /// Begin streaming - write COLMETADATA token.
@@ -237,6 +255,36 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         column_index: usize,
         value: &ColumnValues,
     ) -> TdsResult<()> {
+        // Ciphertext passthrough (AllowEncryptedValueModifications): for an
+        // encrypted column, serialize the caller-supplied ciphertext verbatim —
+        // no plaintext CEK, no re-encryption, and no clone of the (potentially
+        // large) ciphertext buffer. The value must already be varbinary
+        // ciphertext (or NULL); anything else is a usage error rather than
+        // silently storing an un-decryptable value.
+        if self.allow_encrypted_value_modifications
+            && self
+                .column_metadata
+                .get(column_index)
+                .is_some_and(|col| col.encryption.is_some())
+        {
+            if !matches!(value, ColumnValues::Bytes(_) | ColumnValues::Null) {
+                return Err(Error::UsageError(format!(
+                    "allow_encrypted_value_modifications requires already-encrypted varbinary \
+                     ciphertext for encrypted column '{}', but got {value:?}",
+                    self.column_metadata[column_index].column_name
+                )));
+            }
+            let ctx = self.column_contexts.get(column_index).cloned().ok_or_else(|| {
+                Error::UsageError(format!(
+                    "Column index {} out of bounds, expected {} columns based on table metadata.",
+                    column_index,
+                    self.column_contexts.len()
+                ))
+            })?;
+            TdsValueSerializer::serialize_value(self.packet_writer, value, &ctx).await?;
+            return Ok(());
+        }
+
         // Always Encrypted: encrypt the plaintext cell value and emit the
         // ciphertext as a varbinary, matching the encrypted COLMETADATA wire
         // type. NULL values stay NULL (no ciphertext).
@@ -1339,5 +1387,130 @@ mod ae_colmetadata_tests {
         // A NULL varbinary is the 0xFFFF length sentinel.
         let len = reader.read_uint16().await.unwrap();
         assert_eq!(len, 0xFFFF);
+    }
+
+    #[tokio::test]
+    async fn passthrough_emits_ciphertext_verbatim_without_cek() {
+        // With AllowEncryptedValueModifications the caller-supplied ciphertext is
+        // written verbatim as a varbinary, and no plaintext CEK is required.
+        let ciphertext = vec![0x10u8, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90];
+
+        let mut net = CapturingWriter { buffer: Vec::new() };
+        {
+            let mut packet_writer = PacketWriter::new(PacketType::BulkLoad, &mut net, None, None);
+            let mut writer = StreamingBulkLoadWriter::new(
+                &mut packet_writer,
+                "T".to_string(),
+                vec![deterministic_int_column()],
+                SqlCollation::default(),
+            );
+            writer.set_column_encryption_enabled(true);
+            writer.set_allow_encrypted_value_modifications(true);
+            // Intentionally no set_plaintext_ceks: passthrough must not need it.
+            writer.begin().await.unwrap();
+            writer
+                .write_column_value(0, &ColumnValues::Bytes(ciphertext.clone()))
+                .await
+                .unwrap();
+            let _ = writer.end().await.unwrap();
+        }
+
+        let body = net.buffer[9..].to_vec();
+        let mut reader = MockReader::new(body);
+        let parser = ColMetadataTokenParser;
+        let context = ParserContext::ColumnEncryption(true);
+        let _ = parser.parse(&mut reader, &context).await.unwrap();
+
+        let len = reader.read_uint16().await.unwrap() as usize;
+        assert_eq!(len, ciphertext.len(), "verbatim ciphertext length");
+        let mut blob = vec![0u8; len];
+        reader.read_bytes(&mut blob).await.unwrap();
+        assert_eq!(blob, ciphertext, "ciphertext must be sent unchanged");
+    }
+
+    #[tokio::test]
+    async fn passthrough_null_serializes_as_null() {
+        let mut net = CapturingWriter { buffer: Vec::new() };
+        {
+            let mut packet_writer = PacketWriter::new(PacketType::BulkLoad, &mut net, None, None);
+            let mut writer = StreamingBulkLoadWriter::new(
+                &mut packet_writer,
+                "T".to_string(),
+                vec![deterministic_int_column()],
+                SqlCollation::default(),
+            );
+            writer.set_column_encryption_enabled(true);
+            writer.set_allow_encrypted_value_modifications(true);
+            writer.begin().await.unwrap();
+            writer
+                .write_column_value(0, &ColumnValues::Null)
+                .await
+                .unwrap();
+            let _ = writer.end().await.unwrap();
+        }
+
+        let body = net.buffer[9..].to_vec();
+        let mut reader = MockReader::new(body);
+        let parser = ColMetadataTokenParser;
+        let context = ParserContext::ColumnEncryption(true);
+        let _ = parser.parse(&mut reader, &context).await.unwrap();
+
+        // A NULL varbinary is the 0xFFFF length sentinel.
+        let len = reader.read_uint16().await.unwrap();
+        assert_eq!(len, 0xFFFF);
+    }
+
+    #[tokio::test]
+    async fn passthrough_rejects_non_ciphertext_value() {
+        // A plaintext typed value under passthrough is a usage error rather than
+        // silently storing an un-decryptable value in the encrypted column.
+        let mut net = CapturingWriter { buffer: Vec::new() };
+        let mut packet_writer = PacketWriter::new(PacketType::BulkLoad, &mut net, None, None);
+        let mut writer = StreamingBulkLoadWriter::new(
+            &mut packet_writer,
+            "T".to_string(),
+            vec![deterministic_int_column()],
+            SqlCollation::default(),
+        );
+        writer.set_column_encryption_enabled(true);
+        writer.set_allow_encrypted_value_modifications(true);
+        writer.begin().await.unwrap();
+
+        let err = writer
+            .write_column_value(0, &ColumnValues::Int(42))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("ciphertext"),
+            "expected a ciphertext usage error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_out_of_bounds_column_errors() {
+        // Passthrough for an encrypted column whose context is missing (because
+        // begin() has not populated column_contexts) surfaces a clear
+        // out-of-bounds error instead of panicking.
+        let mut net = CapturingWriter { buffer: Vec::new() };
+        let mut packet_writer = PacketWriter::new(PacketType::BulkLoad, &mut net, None, None);
+        let mut writer = StreamingBulkLoadWriter::new(
+            &mut packet_writer,
+            "T".to_string(),
+            vec![deterministic_int_column()],
+            SqlCollation::default(),
+        );
+        writer.set_column_encryption_enabled(true);
+        writer.set_allow_encrypted_value_modifications(true);
+        // begin() intentionally not called: column_contexts stays empty even
+        // though column_metadata has the encrypted column.
+
+        let err = writer
+            .write_column_value(0, &ColumnValues::Bytes(vec![1, 2, 3, 4]))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("out of bounds"),
+            "expected an out-of-bounds error, got: {err}"
+        );
     }
 }

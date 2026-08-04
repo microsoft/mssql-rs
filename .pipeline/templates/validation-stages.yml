@@ -869,11 +869,11 @@ stages:
               entry: odbc-e2e-rhel.sh
 
 # Merge the mssql-tds Rust coverage from every OS that runs the tests
-# (Build_Windows, Build_Linux, Test_MacOS) and the mssql-py-core coverage from
-# the Python tests (Build_Linux) into one Cobertura report. ADO does not merge
-# coverage across stages/jobs, so it is combined here and published as
-# CoberturaCoverage (the artifact the GitHub diff-cover workflow consumes) and
-# to the ADO coverage tab.
+# (Build_Windows, Build_Linux, Test_MacOS), the ODBC C++ e2e coverage
+# (Build_Linux x64), and the mssql-py-core coverage from the Python tests
+# (Build_Linux) into one Cobertura report. ADO does not merge coverage across
+# stages/jobs, so it is combined here and published as CoberturaCoverage (the
+# artifact the GitHub diff-cover workflow consumes) and to the ADO coverage tab.
 - stage: Coverage
   displayName: Merge Coverage
   dependsOn:
@@ -903,6 +903,13 @@ stages:
           artifactName: 'CoberturaCoverageRust_Linux'
           targetPath: '$(Pipeline.Workspace)/cov-rust-linux'
       - task: DownloadPipelineArtifact@2
+        displayName: Download ODBC e2e Linux coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoverageOdbcE2E_Linux'
+          targetPath: '$(Pipeline.Workspace)/cov-odbc-e2e-linux'
+      - task: DownloadPipelineArtifact@2
         displayName: Download Rust (mssql-tds) macOS coverage
         continueOnError: true
         inputs:
@@ -916,24 +923,37 @@ stages:
           buildType: 'current'
           artifactName: 'CoberturaCoveragePython'
           targetPath: '$(Pipeline.Workspace)/cov-python'
+      - task: DownloadPipelineArtifact@2
+        displayName: Download Rust (mssql-py-core) coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoveragePyCoreRust'
+          targetPath: '$(Pipeline.Workspace)/cov-pycore-rust'
       - bash: |
           set -euo pipefail
           mkdir -p "$(Build.SourcesDirectory)/target"
           inputs=()
-          # Each OS emits its mssql-tds report with repo-root-relative paths, so
-          # the same source file lines up across reports and coverage is unioned:
-          # a line covered on any OS counts as covered in the merged result.
+          # Each OS emits its mssql-tds + mssql-odbc report with repo-root-relative
+          # paths, so the same source file lines up across reports and coverage is
+          # unioned: a line covered on any OS counts as covered in the merged result.
+          # The ODBC e2e report (Linux x64) is also repo-root-relative and adds
+          # coverage for lines reachable only through the ODBC Driver Manager.
           for report in \
             "$(Pipeline.Workspace)/cov-rust-windows/cobertura.xml" \
             "$(Pipeline.Workspace)/cov-rust-linux/cobertura.xml" \
-            "$(Pipeline.Workspace)/cov-rust-macos/cobertura.xml"; do
+            "$(Pipeline.Workspace)/cov-rust-macos/cobertura.xml" \
+            "$(Pipeline.Workspace)/cov-odbc-e2e-linux/cobertura-odbc-e2e.xml"; do
             [ -f "$report" ] && inputs+=("$report")
           done
           # mssql-py-core coverage is measured from within its own crate
           # directory, so prefix its relative filenames to make them repo-root
-          # relative in the merged report.
+          # relative in the merged report. Both the Python bindings coverage and
+          # the Rust unit test coverage use the same crate prefix so they union.
           py="$(Pipeline.Workspace)/cov-python/pycore-cobertura.xml"
           [ -f "$py" ] && inputs+=("$py::mssql-py-core")
+          pyrust="$(Pipeline.Workspace)/cov-pycore-rust/pycore-rust-cobertura.xml"
+          [ -f "$pyrust" ] && inputs+=("$pyrust::mssql-py-core")
           if [ ${#inputs[@]} -eq 0 ]; then
             echo "##vso[task.logissue type=warning]No coverage inputs found to merge"
             exit 0
@@ -986,6 +1006,28 @@ stages:
           parameters:
             durationSeconds: 1800  # 30 minutes
             batchSize: 1000
+            testSelector: '-m "longhaul" -k "not arrow"'
+            resultsFile: 'pytest-longhaul-results.xml'
+            testRunTitle: 'LongHaul-BCP-Test'
+
+    # Arrow long-haul runs as its own job so it executes in parallel with the
+    # tuple long-haul; total stage wall-clock stays ~30 min instead of doubling.
+    - job: LongHaul_BCP_Arrow_Test
+      displayName: Long-Haul BCP Arrow Test Ubuntu
+      pool:
+        name: RUST-1ES-POOL-WUS3
+        demands:
+          - imageOverride -equals RUST-1ES-UBUSLIM
+      variables:
+        CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      steps:
+        - template: test-longhaul-template.yml
+          parameters:
+            durationSeconds: 1800  # 30 minutes
+            batchSize: 1000
+            testSelector: '-m "longhaul" -k "arrow"'
+            resultsFile: 'pytest-longhaul-arrow-results.xml'
+            testRunTitle: 'LongHaul-BCP-Arrow-Test'
 
   # Private-link smoke test for mssql-py-core (non-PR only)
   # Deploys wheel into ACI on trusted VNet, runs pytest suite via managed identity

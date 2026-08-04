@@ -8,7 +8,7 @@ mod bulk_copy_integration_tests {
     use crate::common::{begin_connection, build_tcp_datasource, get_scalar_value, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::{
         ColumnValues, SqlDateTime2, SqlDateTimeOffset, SqlMoney, SqlTime,
@@ -97,8 +97,7 @@ mod bulk_copy_integration_tests {
                     value3 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -142,16 +141,12 @@ mod bulk_copy_integration_tests {
 
         // Check actual row count in database before assertion
         client
-            .execute(
-                "SELECT COUNT(*) as cnt FROM #BulkCopyTest".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) as cnt FROM #BulkCopyTest".to_string(), ())
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read count")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read count")
         {
             println!("DEBUG: Actual rows in database: {:?}", row[0]);
         }
@@ -166,15 +161,14 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT id, value1, value2, value3 FROM #BulkCopyTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -205,6 +199,249 @@ mod bulk_copy_integration_tests {
         // Temp table will be automatically dropped when connection closes
     }
 
+    /// Bulk copy is a composite operation (metadata retrieval + optional internal
+    /// transaction + one or more bulk-load batches). INFO tokens emitted while the
+    /// bulk load runs — here via an AFTER INSERT trigger's `PRINT`, which surfaces
+    /// because `fire_triggers` is enabled — must be captured and remain retrievable
+    /// via `info_messages()` once the whole operation completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bulk_copy_captures_info_messages_from_fired_trigger() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        // Unique permanent-table names: SQL Server does not allow triggers on
+        // temporary tables, so we create (and clean up) real tables.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dest_table = format!("BulkCopyInfoTrigger_{}", timestamp);
+        let trigger_name = format!("TR_BulkCopyInfo_{}", timestamp);
+
+        async fn cleanup(
+            client: &mut mssql_tds::connection::tds_client::TdsClient,
+            trigger_name: &str,
+            dest_table: &str,
+        ) {
+            let _ = client
+                .execute(
+                    format!(
+                        "IF OBJECT_ID('{}', 'TR') IS NOT NULL DROP TRIGGER {}",
+                        trigger_name, trigger_name
+                    ),
+                    (),
+                )
+                .await;
+            let _ = client.close_query().await;
+            let _ = client
+                .execute(
+                    format!(
+                        "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
+                        dest_table, dest_table
+                    ),
+                    (),
+                )
+                .await;
+            let _ = client.close_query().await;
+        }
+
+        // Initial cleanup in case a previous run left objects behind.
+        cleanup(&mut client, &trigger_name, &dest_table).await;
+
+        client
+            .execute(
+                format!(
+                    "CREATE TABLE {} (
+                    id INT NOT NULL,
+                    value1 INT NOT NULL,
+                    value2 INT NOT NULL,
+                    value3 INT NOT NULL
+                )",
+                    dest_table
+                ),
+                (),
+            )
+            .await
+            .expect("Failed to create test table");
+        client.close_query().await.expect("Failed to close query");
+
+        // AFTER INSERT trigger emitting an informational (PRINT) message. It only
+        // fires during the bulk load because the bulk copy enables FIRE_TRIGGERS.
+        client
+            .execute(
+                format!(
+                    "CREATE TRIGGER {} ON {} AFTER INSERT AS PRINT N'bulk copy trigger info';",
+                    trigger_name, dest_table
+                ),
+                (),
+            )
+            .await
+            .expect("Failed to create trigger");
+        client.close_query().await.expect("Failed to close query");
+
+        let test_data = vec![
+            TestUser {
+                id: 1,
+                value1: 100,
+                value2: 200,
+                value3: 300,
+            },
+            TestUser {
+                id: 2,
+                value1: 101,
+                value2: 201,
+                value3: 301,
+            },
+        ];
+
+        let result = {
+            let bulk_copy = BulkCopy::new(&mut client, dest_table.as_str());
+            bulk_copy
+                .batch_size(1000)
+                .fire_triggers(true)
+                .write_to_server_zerocopy(&test_data)
+                .await
+                .expect("Bulk copy failed")
+        };
+
+        assert_eq!(result.rows_affected, 2, "Expected 2 rows to be inserted");
+
+        let surfaced = client
+            .info_messages()
+            .iter()
+            .any(|message| message.message.contains("bulk copy trigger info"));
+
+        cleanup(&mut client, &trigger_name, &dest_table).await;
+
+        assert!(
+            surfaced,
+            "bulk copy should surface INFO tokens emitted during the bulk load"
+        );
+    }
+
+    /// On a mid-stream bulk-copy failure, INFO captured for the batches that
+    /// completed before the failure must remain retrievable via `info_messages()`
+    /// alongside the returned error — INFO and ERROR are separate, complementary
+    /// channels. Here batch 1 (id = 1) fires an AFTER INSERT trigger `PRINT` and
+    /// commits, then batch 2 (id = 2) violates a CHECK constraint and fails;
+    /// `batch_size(1)` forces the two rows into separate batches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bulk_copy_retains_prior_batch_info_after_midstream_failure() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dest_table = format!("BulkCopyMidFail_{}", timestamp);
+        let trigger_name = format!("TR_BulkCopyMidFail_{}", timestamp);
+
+        async fn cleanup(
+            client: &mut mssql_tds::connection::tds_client::TdsClient,
+            trigger_name: &str,
+            dest_table: &str,
+        ) {
+            let _ = client
+                .execute(
+                    format!(
+                        "IF OBJECT_ID('{}', 'TR') IS NOT NULL DROP TRIGGER {}",
+                        trigger_name, trigger_name
+                    ),
+                    (),
+                )
+                .await;
+            let _ = client.close_query().await;
+            let _ = client
+                .execute(
+                    format!(
+                        "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
+                        dest_table, dest_table
+                    ),
+                    (),
+                )
+                .await;
+            let _ = client.close_query().await;
+        }
+
+        cleanup(&mut client, &trigger_name, &dest_table).await;
+
+        client
+            .execute(
+                format!(
+                    "CREATE TABLE {} (
+                    id INT NOT NULL,
+                    value1 INT NOT NULL CONSTRAINT CK_BulkCopyMidFail_{} CHECK (value1 < 500),
+                    value2 INT NOT NULL,
+                    value3 INT NOT NULL
+                )",
+                    dest_table, timestamp
+                ),
+                (),
+            )
+            .await
+            .expect("Failed to create test table");
+        client.close_query().await.expect("Failed to close query");
+
+        client
+            .execute(
+                format!(
+                    "CREATE TRIGGER {} ON {} AFTER INSERT AS PRINT N'midfail trigger info';",
+                    trigger_name, dest_table
+                ),
+                (),
+            )
+            .await
+            .expect("Failed to create trigger");
+        client.close_query().await.expect("Failed to close query");
+
+        let test_data = vec![
+            TestUser {
+                id: 1,
+                value1: 100, // valid: 100 < 500
+                value2: 200,
+                value3: 300,
+            },
+            TestUser {
+                id: 2,
+                value1: 500, // invalid: 500 is NOT < 500, violates CHECK
+                value2: 201,
+                value3: 301,
+            },
+        ];
+
+        let result = {
+            let bulk_copy = BulkCopy::new(&mut client, dest_table.as_str());
+            bulk_copy
+                .batch_size(1) // one row per batch: batch 1 commits, batch 2 fails
+                .fire_triggers(true)
+                .check_constraints(true)
+                .write_to_server_zerocopy(&test_data)
+                .await
+        };
+
+        assert!(
+            result.is_err(),
+            "batch 2 should fail the CHECK constraint (error 547)"
+        );
+
+        // The trigger PRINT from the batch that completed before the failure must
+        // still be retrievable after the error.
+        let retained = client
+            .info_messages()
+            .iter()
+            .any(|message| message.message.contains("midfail trigger info"));
+
+        cleanup(&mut client, &trigger_name, &dest_table).await;
+
+        assert!(
+            retained,
+            "INFO from the batch that completed before the failure must remain retrievable"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_bulk_copy_large_batch() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
@@ -219,8 +456,7 @@ mod bulk_copy_integration_tests {
                     value3 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -255,16 +491,12 @@ mod bulk_copy_integration_tests {
 
         // Verify count
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkCopyLarge".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkCopyLarge".to_string(), ())
             .await
             .expect("Failed to select count");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(100));
         }
@@ -283,8 +515,7 @@ mod bulk_copy_integration_tests {
                     value2 INT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -390,15 +621,14 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT id, value1, value2 FROM #BulkCopyNulls ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -440,8 +670,7 @@ mod bulk_copy_integration_tests {
                     value1 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -474,8 +703,7 @@ mod bulk_copy_integration_tests {
                     value2 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -649,8 +877,7 @@ mod bulk_copy_integration_tests {
                     large_value VARCHAR(MAX)
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -687,15 +914,14 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT id, LEN(large_value) as len FROM #BulkCopyLargeString".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select from table");
 
         let mut rows_returned = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 let id = match &row[0] {
                     ColumnValues::Int(v) => *v,
                     _ => panic!("Expected Int for id"),
@@ -731,8 +957,7 @@ mod bulk_copy_integration_tests {
                     value3 INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -779,14 +1004,13 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT COUNT(*) as cnt FROM #BulkCopyTableLock".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read count")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read count")
         {
             assert_eq!(
                 row[0],
@@ -804,15 +1028,14 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT id, value1, value2, value3 FROM #BulkCopyTableLock ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -856,7 +1079,7 @@ mod bulk_copy_integration_tests {
             table_name, table_name
         );
         client
-            .execute(drop_sql, None, None)
+            .execute(drop_sql, ())
             .await
             .expect("Failed to drop test table");
         client.close_query().await.ok();
@@ -873,7 +1096,7 @@ mod bulk_copy_integration_tests {
         );
 
         client
-            .execute(create_sql, None, None)
+            .execute(create_sql, ())
             .await
             .expect("Failed to create test table");
         client.close_query().await.expect("Failed to close query");
@@ -894,15 +1117,12 @@ mod bulk_copy_integration_tests {
 
         // Get the session ID of the bulk copy connection
         client
-            .execute("SELECT @@SPID as session_id".to_string(), None, None)
+            .execute("SELECT @@SPID as session_id".to_string(), ())
             .await
             .expect("Failed to get session ID");
 
-        let session_id: i32 = if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset
-                .next_row()
-                .await
-                .expect("Failed to read session ID")
+        let session_id: i32 = if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read session ID")
         {
             match row[0] {
                 ColumnValues::SmallInt(id) => id as i32,
@@ -961,12 +1181,16 @@ mod bulk_copy_integration_tests {
 
         while attempts < max_attempts {
             lock_monitor_client
-                .execute(lock_query.clone(), None, None)
+                .execute(lock_query.clone(), ())
                 .await
                 .expect("Failed to query locks");
 
-            if let Some(resultset) = lock_monitor_client.get_current_resultset() {
-                while let Some(row) = resultset.next_row().await.expect("Failed to read lock row") {
+            if lock_monitor_client.on_rows() {
+                while let Some(row) = lock_monitor_client
+                    .next_row()
+                    .await
+                    .expect("Failed to read lock row")
+                {
                     println!("Lock detected:");
                     println!("  Session ID: {:?}", row[0]);
                     println!("  Resource Type: {:?}", row[1]);
@@ -1015,12 +1239,15 @@ mod bulk_copy_integration_tests {
 
         // Verify data was inserted
         lock_monitor_client
-            .execute(format!("SELECT COUNT(*) FROM {}", table_name), None, None)
+            .execute(format!("SELECT COUNT(*) FROM {}", table_name), ())
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = lock_monitor_client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read count")
+        if lock_monitor_client.on_rows()
+            && let Some(row) = lock_monitor_client
+                .next_row()
+                .await
+                .expect("Failed to read count")
         {
             assert_eq!(
                 row[0],
@@ -1032,7 +1259,7 @@ mod bulk_copy_integration_tests {
 
         // Cleanup - drop the persistent table
         lock_monitor_client
-            .execute(format!("DROP TABLE {}", table_name), None, None)
+            .execute(format!("DROP TABLE {}", table_name), ())
             .await
             .expect("Failed to drop test table");
         lock_monitor_client.close_query().await.ok();
@@ -1114,7 +1341,7 @@ mod bulk_copy_integration_tests {
             table_name, table_name
         );
         client
-            .execute(drop_sql, None, None)
+            .execute(drop_sql, ())
             .await
             .expect("Failed to drop test table");
         client.close_query().await.ok();
@@ -1131,7 +1358,7 @@ mod bulk_copy_integration_tests {
         );
 
         client
-            .execute(create_sql, None, None)
+            .execute(create_sql, ())
             .await
             .expect("Failed to create test table");
         client.close_query().await.expect("Failed to close query");
@@ -1175,15 +1402,14 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 format!("SELECT id, name, value FROM {} ORDER BY id", table_name),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -1223,7 +1449,7 @@ mod bulk_copy_integration_tests {
 
         // Cleanup - drop the table
         client
-            .execute(format!("DROP TABLE {}", table_name), None, None)
+            .execute(format!("DROP TABLE {}", table_name), ())
             .await
             .expect("Failed to drop test table");
         client.close_query().await.ok();
@@ -1246,7 +1472,7 @@ mod bulk_copy_integration_tests {
             table_name, table_name
         );
         client
-            .execute(drop_sql, None, None)
+            .execute(drop_sql, ())
             .await
             .expect("Failed to drop test table");
         client.close_query().await.ok();
@@ -1262,7 +1488,7 @@ mod bulk_copy_integration_tests {
         );
 
         client
-            .execute(create_sql, None, None)
+            .execute(create_sql, ())
             .await
             .expect("Failed to create test table");
         client.close_query().await.expect("Failed to close query");
@@ -1350,15 +1576,14 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 format!("SELECT id, name, value FROM {} ORDER BY id", table_name),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -1398,7 +1623,7 @@ mod bulk_copy_integration_tests {
 
         // Cleanup - drop the table
         client
-            .execute(format!("DROP TABLE {}", table_name), None, None)
+            .execute(format!("DROP TABLE {}", table_name), ())
             .await
             .expect("Failed to drop test table");
         client.close_query().await.ok();
@@ -1486,8 +1711,7 @@ mod bulk_copy_integration_tests {
                     col3 NVARCHAR(100)
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table with CHECK constraint");
@@ -1563,8 +1787,7 @@ mod bulk_copy_integration_tests {
                     col3 NVARCHAR(100)
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table with CHECK constraint");
@@ -1616,15 +1839,14 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT col1, col2 FROM #BulkCopyNoCheckConstraint WHERE col2 >= 500".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to query invalid data");
 
         let mut found_invalid = false;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 if row[0] == ColumnValues::Int(65) && row[1] == ColumnValues::Int(500) {
                     found_invalid = true;
                     println!(
@@ -1742,8 +1964,7 @@ mod bulk_copy_integration_tests {
                     value INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table with DEFAULT constraint");
@@ -1794,15 +2015,14 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT id, name FROM #BulkCopyKeepNulls WHERE id = 2".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to query data");
 
         let mut found_null = false;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 if row[0] == ColumnValues::Int(2) {
                     // Check that name is NULL (preserved), not 'DefaultName'
                     match &row[1] {
@@ -1849,8 +2069,7 @@ mod bulk_copy_integration_tests {
                     value INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table with DEFAULT constraint");
@@ -1901,15 +2120,14 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 "SELECT id, name FROM #BulkCopyNoKeepNulls WHERE id = 2".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to query data");
 
         let mut found_default = false;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 if row[0] == ColumnValues::Int(2) {
                     // Check that name is 'DefaultName' (replaced), not NULL
                     match &row[1] {
@@ -2049,8 +2267,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'TR') IS NOT NULL DROP TRIGGER {}",
                         trigger_name, trigger_name
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -2062,8 +2279,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
                         dest_table, dest_table
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -2075,8 +2291,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
                         marker_table, marker_table
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -2096,8 +2311,7 @@ mod bulk_copy_integration_tests {
                 )",
                     dest_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create destination table");
@@ -2113,8 +2327,7 @@ mod bulk_copy_integration_tests {
                 )",
                     marker_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create marker table");
@@ -2132,8 +2345,7 @@ mod bulk_copy_integration_tests {
                 INSERT INTO {} VALUES (333)",
                     trigger_name, dest_table, marker_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create trigger");
@@ -2172,17 +2384,13 @@ mod bulk_copy_integration_tests {
         // Verify the trigger fired by checking the marker table
         // The trigger inserts value 333 when rows are inserted
         client
-            .execute(
-                format!("SELECT marker_value FROM {}", marker_table),
-                None,
-                None,
-            )
+            .execute(format!("SELECT marker_value FROM {}", marker_table), ())
             .await
             .expect("Failed to query marker table");
 
         let mut trigger_fired = false;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 if let ColumnValues::Int(333) = row[0] {
                     trigger_fired = true;
                     println!("Confirmed: Trigger fired and inserted marker value 333");
@@ -2231,8 +2439,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'TR') IS NOT NULL DROP TRIGGER {}",
                         trigger_name, trigger_name
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -2242,8 +2449,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
                         dest_table, dest_table
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -2253,8 +2459,7 @@ mod bulk_copy_integration_tests {
                         "IF OBJECT_ID('{}', 'U') IS NOT NULL DROP TABLE {}",
                         marker_table, marker_table
                     ),
-                    None,
-                    None,
+                    (),
                 )
                 .await;
             let _ = client.close_query().await;
@@ -2274,8 +2479,7 @@ mod bulk_copy_integration_tests {
                 )",
                     dest_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create destination table");
@@ -2286,8 +2490,7 @@ mod bulk_copy_integration_tests {
         client
             .execute(
                 format!("CREATE TABLE {} (marker_value INT)", marker_table),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create marker table");
@@ -2303,8 +2506,7 @@ mod bulk_copy_integration_tests {
                 INSERT INTO {} VALUES (333)",
                     trigger_name, dest_table, marker_table
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create trigger");
@@ -2333,12 +2535,12 @@ mod bulk_copy_integration_tests {
 
         // Check marker table - should be EMPTY because trigger didn't fire
         client
-            .execute(format!("SELECT COUNT(*) FROM {}", marker_table), None, None)
+            .execute(format!("SELECT COUNT(*) FROM {}", marker_table), ())
             .await
             .expect("Failed to query marker table");
 
-        let marker_count = if let Some(resultset) = client.get_current_resultset() {
-            if let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        let marker_count = if client.on_rows() {
+            if let Some(row) = client.next_row().await.expect("Failed to read row") {
                 match row[0] {
                     ColumnValues::Int(count) => count,
                     _ => -1,
@@ -2434,10 +2636,7 @@ mod bulk_copy_integration_tests {
     async fn test_bulk_copy_diverse_types() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
-        client.execute(
-            "CREATE TABLE #BulkDiverse (id INT NOT NULL, nvarchar_val NVARCHAR(200), int_val INT, datetime2_val DATETIME2(3), varbinary_val VARBINARY(100))".to_string(),
-            None, None,
-        ).await.unwrap();
+        client.execute("CREATE TABLE #BulkDiverse (id INT NOT NULL, nvarchar_val NVARCHAR(200), int_val INT, datetime2_val DATETIME2(3), varbinary_val VARBINARY(100))".to_string(), ()).await.unwrap();
         client.close_query().await.unwrap();
 
         let rows: Vec<DiverseRow> = (0..5)
@@ -2462,7 +2661,7 @@ mod bulk_copy_integration_tests {
         }
 
         client
-            .execute("SELECT COUNT(*) FROM #BulkDiverse".to_string(), None, None)
+            .execute("SELECT COUNT(*) FROM #BulkDiverse".to_string(), ())
             .await
             .unwrap();
         let count = get_scalar_value(&mut client).await.unwrap();
@@ -2523,10 +2722,7 @@ mod bulk_copy_integration_tests {
     async fn test_bulk_copy_nullable_max_types() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
-        client.execute(
-            "CREATE TABLE #BulkNullable (id INT NOT NULL, nvarchar_max_val NVARCHAR(MAX), varbinary_max_val VARBINARY(MAX))".to_string(),
-            None, None,
-        ).await.unwrap();
+        client.execute("CREATE TABLE #BulkNullable (id INT NOT NULL, nvarchar_max_val NVARCHAR(MAX), varbinary_max_val VARBINARY(MAX))".to_string(), ()).await.unwrap();
         client.close_query().await.unwrap();
 
         let rows = vec![
@@ -2553,7 +2749,7 @@ mod bulk_copy_integration_tests {
         }
 
         client
-            .execute("SELECT COUNT(*) FROM #BulkNullable".to_string(), None, None)
+            .execute("SELECT COUNT(*) FROM #BulkNullable".to_string(), ())
             .await
             .unwrap();
         let count = get_scalar_value(&mut client).await.unwrap();
@@ -2614,10 +2810,7 @@ mod bulk_copy_integration_tests {
     async fn test_bulk_copy_time_and_datetimeoffset() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
-        client.execute(
-            "CREATE TABLE #BulkTime (id INT NOT NULL, time_val TIME(4), dto_val DATETIMEOFFSET(2))".to_string(),
-            None, None,
-        ).await.unwrap();
+        client.execute("CREATE TABLE #BulkTime (id INT NOT NULL, time_val TIME(4), dto_val DATETIMEOFFSET(2))".to_string(), ()).await.unwrap();
         client.close_query().await.unwrap();
 
         let rows = vec![
@@ -2663,7 +2856,7 @@ mod bulk_copy_integration_tests {
         }
 
         client
-            .execute("SELECT COUNT(*) FROM #BulkTime".to_string(), None, None)
+            .execute("SELECT COUNT(*) FROM #BulkTime".to_string(), ())
             .await
             .unwrap();
         let count = get_scalar_value(&mut client).await.unwrap();
@@ -2724,8 +2917,7 @@ mod bulk_copy_integration_tests {
             .execute(
                 "CREATE TABLE #BulkMoney (id INT NOT NULL, bigint_val BIGINT, money_val MONEY)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -2756,7 +2948,7 @@ mod bulk_copy_integration_tests {
         }
 
         client
-            .execute("SELECT COUNT(*) FROM #BulkMoney".to_string(), None, None)
+            .execute("SELECT COUNT(*) FROM #BulkMoney".to_string(), ())
             .await
             .unwrap();
         let count = get_scalar_value(&mut client).await.unwrap();

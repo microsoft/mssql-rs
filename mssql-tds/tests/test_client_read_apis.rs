@@ -7,8 +7,17 @@ mod common;
 mod client_based_iterators {
     use crate::common::{build_tcp_datasource, create_context, init_tracing};
     use futures::lock::Mutex;
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+    use mssql_tds::datatypes::column_values::{
+        ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
+        SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
+    };
+    use mssql_tds::datatypes::decoder::DecimalParts;
+    use mssql_tds::datatypes::row_writer::RowWriter;
+    use mssql_tds::datatypes::sql_json::SqlJson;
+    use mssql_tds::datatypes::sql_string::SqlString;
+    use mssql_tds::datatypes::sql_vector::SqlVector;
     use mssql_tds::datatypes::sqltypes::SqlType;
     use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
     use std::sync::Arc;
@@ -16,6 +25,87 @@ mod client_based_iterators {
     #[ctor::ctor]
     fn init() {
         init_tracing();
+    }
+
+    #[derive(Default)]
+    struct SparseCaptureWriter {
+        // ODBC-style request uses 1-based column ordinals.
+        requested_column: Option<usize>,
+        captured: Vec<ColumnValues>,
+    }
+
+    impl SparseCaptureWriter {
+        fn new(col_count: usize) -> Self {
+            Self {
+                requested_column: None,
+                captured: Vec::with_capacity(col_count),
+            }
+        }
+
+        fn request_column(&mut self, requested_column: usize) {
+            self.requested_column = Some(requested_column);
+        }
+
+        fn clear_request(&mut self) {
+            self.requested_column = None;
+        }
+    }
+
+    impl RowWriter for SparseCaptureWriter {
+        fn pause_after_column(&self, col: usize) -> bool {
+            self.requested_column == Some(col + 1)
+        }
+
+        fn write_null(&mut self, col: usize) {
+            if self.requested_column == Some(col + 1) {
+                self.captured.push(ColumnValues::Null);
+            }
+        }
+
+        fn write_bool(&mut self, _col: usize, _val: bool) {}
+        fn write_u8(&mut self, _col: usize, _val: u8) {}
+        fn write_i16(&mut self, _col: usize, _val: i16) {}
+
+        fn write_i32(&mut self, col: usize, val: i32) {
+            if self.requested_column == Some(col + 1) {
+                self.captured.push(ColumnValues::Int(val));
+            }
+        }
+
+        fn write_i64(&mut self, _col: usize, _val: i64) {}
+        fn write_f32(&mut self, _col: usize, _val: f32) {}
+        fn write_f64(&mut self, _col: usize, _val: f64) {}
+
+        fn write_string(&mut self, col: usize, val: SqlString) {
+            if self.requested_column == Some(col + 1) {
+                self.captured.push(ColumnValues::String(val));
+            }
+        }
+
+        fn write_bytes(&mut self, col: usize, val: Vec<u8>) {
+            if self.requested_column == Some(col + 1) {
+                self.captured.push(ColumnValues::Bytes(val));
+            }
+        }
+
+        fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
+        fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
+        fn write_date(&mut self, _col: usize, _val: SqlDate) {}
+        fn write_time(&mut self, _col: usize, _val: SqlTime) {}
+        fn write_datetime(&mut self, _col: usize, _val: SqlDateTime) {}
+        fn write_smalldatetime(&mut self, _col: usize, _val: SqlSmallDateTime) {}
+        fn write_datetime2(&mut self, _col: usize, _val: SqlDateTime2) {}
+        fn write_datetimeoffset(&mut self, _col: usize, _val: SqlDateTimeOffset) {}
+        fn write_money(&mut self, _col: usize, _val: SqlMoney) {}
+        fn write_smallmoney(&mut self, _col: usize, _val: SqlSmallMoney) {}
+        fn write_uuid(&mut self, _col: usize, _val: uuid::Uuid) {}
+        fn write_xml(&mut self, _col: usize, _val: SqlXml) {}
+        fn write_json(&mut self, _col: usize, _val: SqlJson) {}
+        fn write_vector(&mut self, _col: usize, _val: SqlVector) {}
+
+        fn end_row(&mut self) {
+            self.requested_column = None;
+        }
     }
 
     #[tokio::test]
@@ -28,14 +118,14 @@ mod client_based_iterators {
             .await?;
         let query = "SELECT TOP(2) * FROM sys.databases; SELECT 1";
 
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
         let mut row_count = 0;
         loop {
             while client.next_row().await?.is_some() {
                 row_count += 1;
             }
 
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -62,14 +152,14 @@ mod client_based_iterators {
             FROM sys.databases 
             ORDER BY name;";
 
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
         let mut row_count = 0;
         loop {
             while client.next_row().await?.is_some() {
                 row_count += 1;
             }
 
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -91,7 +181,7 @@ mod client_based_iterators {
             .await?;
         let query = "SELECT TOP(2) * FROM sys.databases; SELECT 1";
 
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
         let mut row_count = 0;
 
         if client.next_row().await?.is_some() {
@@ -104,12 +194,12 @@ mod client_based_iterators {
             "Expected 1 row from the incomplete result set execution"
         );
         let mut row_count = 0;
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
         loop {
             while client.next_row().await?.is_some() {
                 row_count += 1;
             }
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -134,17 +224,17 @@ mod client_based_iterators {
             .await?;
         let query = "bad bad query";
 
-        let err = client.execute(query.to_string(), None, None).await;
+        let err = client.execute(query.to_string(), ()).await;
         assert!(err.is_err(), "Expected error for bad query");
 
         let query = "SELECT TOP(2) * FROM sys.databases; SELECT 1";
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
         let mut row_count = 0;
         loop {
             while client.next_row().await?.is_some() {
                 row_count += 1;
             }
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -167,12 +257,10 @@ mod client_based_iterators {
         let create_database_query = "IF DB_ID('TestDB') IS NULL CREATE DATABASE TestDB";
 
         client
-            .execute(create_database_query.to_string(), None, None)
+            .execute(create_database_query.to_string(), ())
             .await?;
         let use_database_query = "USE TestDB";
-        client
-            .execute(use_database_query.to_string(), None, None)
-            .await?;
+        client.execute(use_database_query.to_string(), ()).await?;
 
         Ok(())
     }
@@ -199,7 +287,7 @@ mod client_based_iterators {
         client
             .lock()
             .await
-            .execute(create_proc.to_string(), None, None)
+            .execute(create_proc.to_string(), ())
             .await?;
         client.lock().await.close_query().await?;
 
@@ -219,15 +307,14 @@ mod client_based_iterators {
         client
             .lock()
             .await
-            .execute_stored_procedure(proc_name, None, Some(named_parameters), None, None)
+            .execute_stored_procedure(proc_name, None, Some(named_parameters), ())
             .await?;
         let mut binding = client.lock().await;
-        let result_set = binding.get_current_resultset();
-        if let Some(result_set) = result_set {
-            let _ = result_set.get_metadata();
+        if binding.on_rows() {
+            let _ = binding.get_metadata();
             let mut row_count = 0;
 
-            while (result_set.next_row().await?).is_some() {
+            while (binding.next_row().await?).is_some() {
                 row_count += 1;
             }
             assert_eq!(
@@ -239,7 +326,7 @@ mod client_based_iterators {
         }
 
         // Move once more till we read the return values.
-        while binding.move_to_next().await? {
+        while binding.advance_to_rows().await? {
             // Continue to next result set if available
         }
 
@@ -270,13 +357,11 @@ mod client_based_iterators {
                 CAST('2024-03-15 14:30:45.1234567 +05:30' AS DATETIMEOFFSET(7)) AS datetimeoffset_col
         "#;
 
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         // Get metadata and verify it was parsed correctly
-        let resultset = client
-            .get_current_resultset()
-            .expect("Expected a resultset");
-        let metadata = resultset.get_metadata();
+        assert!(client.on_rows(), "Expected a resultset");
+        let metadata = client.get_metadata();
 
         // Verify we have 6 columns
         assert_eq!(metadata.len(), 6, "Expected 6 date/time columns");
@@ -334,7 +419,7 @@ mod client_based_iterators {
         );
 
         // Also verify we can read the actual values
-        let row = resultset.next_row().await?.expect("Expected a row");
+        let row = client.next_row().await?.expect("Expected a row");
 
         // Just verify we got values of the right types
         match &row[0] {
@@ -398,7 +483,7 @@ mod client_based_iterators {
                             REPLICATE('Y', 5000) AS AnotherLargeColumn,
                             1 AS SmallColumn";
 
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         let mut row_count = 0;
         while let Some(row) = client.next_row().await? {
@@ -447,7 +532,7 @@ mod client_based_iterators {
 
         // First query: large data
         let query1 = "SELECT REPLICATE('A', 6000) AS Col1";
-        client.execute(query1.to_string(), None, None).await?;
+        client.execute(query1.to_string(), ()).await?;
 
         let mut count = 0;
         while let Some(row) = client.next_row().await? {
@@ -464,7 +549,7 @@ mod client_based_iterators {
 
         // Second query: even larger data
         let query2 = "SELECT REPLICATE('B', 7000) AS Col1, REPLICATE('C', 7000) AS Col2";
-        client.execute(query2.to_string(), None, None).await?;
+        client.execute(query2.to_string(), ()).await?;
 
         count = 0;
         while let Some(row) = client.next_row().await? {
@@ -487,7 +572,7 @@ mod client_based_iterators {
 
         // Third query: small data (verifies buffer works correctly after large data)
         let query3 = "SELECT 42 AS SmallValue";
-        client.execute(query3.to_string(), None, None).await?;
+        client.execute(query3.to_string(), ()).await?;
 
         count = 0;
         while let Some(row) = client.next_row().await? {
@@ -525,7 +610,7 @@ mod client_based_iterators {
         //   ERROR("First error") → DONE(ERROR,MORE) → ERROR("Second error") → DONE(ERROR)
         let query = "RAISERROR('First error', 16, 1); RAISERROR('Second error', 16, 1)";
 
-        let result = client.execute(query.to_string(), None, None).await;
+        let result = client.execute(query.to_string(), ()).await;
         assert!(
             result.is_err(),
             "Expected error from batch with multiple RAISERRORs"
@@ -542,7 +627,8 @@ mod client_based_iterators {
         );
 
         // Verify multiple errors are collected in the error variant
-        if let mssql_tds::error::Error::SqlServerError { errors } = &err {
+        if let mssql_tds::error::Error::SqlServerError { diagnostics } = &err {
+            let errors = &diagnostics.errors;
             assert_eq!(
                 errors.len(),
                 2,
@@ -556,7 +642,7 @@ mod client_based_iterators {
         }
 
         // Connection must remain usable after multiple errors
-        client.execute("SELECT 1".to_string(), None, None).await?;
+        client.execute("SELECT 1".to_string(), ()).await?;
         let mut row_count = 0;
         while client.next_row().await?.is_some() {
             row_count += 1;
@@ -583,7 +669,7 @@ mod client_based_iterators {
 
         let query = "SELECT * FROM nonexistent_table_abc_1; SELECT * FROM nonexistent_table_abc_2";
 
-        let result = client.execute(query.to_string(), None, None).await;
+        let result = client.execute(query.to_string(), ()).await;
         assert!(
             result.is_err(),
             "Expected error from referencing nonexistent tables"
@@ -591,7 +677,8 @@ mod client_based_iterators {
 
         // SQL Server may abort batch after first object-resolution failure,
         // so we may get 1 or 2 errors depending on server behavior.
-        if let mssql_tds::error::Error::SqlServerError { errors } = result.unwrap_err() {
+        if let mssql_tds::error::Error::SqlServerError { diagnostics } = result.unwrap_err() {
+            let errors = &diagnostics.errors;
             assert!(!errors.is_empty(), "Expected at least one error");
             assert!(
                 errors[0].message.contains("nonexistent_table_abc_1"),
@@ -603,9 +690,7 @@ mod client_based_iterators {
         }
 
         // Connection must remain usable
-        client
-            .execute("SELECT 42 AS val".to_string(), None, None)
-            .await?;
+        client.execute("SELECT 42 AS val".to_string(), ()).await?;
         let mut row_count = 0;
         while let Some(row) = client.next_row().await? {
             row_count += 1;
@@ -641,7 +726,7 @@ mod client_based_iterators {
         // second statement fails with an error
         let query = "SELECT 1; RAISERROR('Batch error after success', 16, 1)";
 
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         // Consume the first result set
         let mut row_count = 0;
@@ -651,16 +736,14 @@ mod client_based_iterators {
         assert_eq!(row_count, 1, "Expected 1 row from SELECT 1");
 
         // Advancing to the next result should hit the error
-        let next_result = client.move_to_next().await;
+        let next_result = client.advance_to_rows().await;
         assert!(
             next_result.is_err(),
             "Expected error from RAISERROR after SELECT"
         );
 
         // Connection must remain usable
-        client
-            .execute("SELECT 99 AS val".to_string(), None, None)
-            .await?;
+        client.execute("SELECT 99 AS val".to_string(), ()).await?;
         let mut row_count2 = 0;
         while client.next_row().await?.is_some() {
             row_count2 += 1;
@@ -701,9 +784,9 @@ mod client_based_iterators {
             CAST(NEWID() AS UNIQUEIDENTIFIER) AS uid"
             .to_string();
 
-        client.execute(query, None, None).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        client.execute(query, ()).await?;
+        if client.on_rows() {
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 15);
 
             use mssql_tds::datatypes::column_values::ColumnValues;
@@ -754,10 +837,10 @@ mod client_based_iterators {
             CAST(N'fixed' AS NCHAR(10)) AS nc"
             .to_string();
 
-        client.execute(query, None, None).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let meta = resultset.get_metadata().clone();
-            let row = resultset.next_row().await?.expect("expected a row");
+        client.execute(query, ()).await?;
+        if client.on_rows() {
+            let meta = client.get_metadata().clone();
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 4);
             for col in &row {
                 assert!(matches!(
@@ -794,9 +877,9 @@ mod client_based_iterators {
             CAST(0.000001 AS DECIMAL(38,6)) AS d2"
             .to_string();
 
-        client.execute(query, None, None).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        client.execute(query, ()).await?;
+        if client.on_rows() {
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 3);
             for col in &row {
                 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -828,9 +911,9 @@ mod client_based_iterators {
             CAST('<r>1</r>' AS XML) AS x"
         );
 
-        client.execute(query, None, None).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        client.execute(query, ()).await?;
+        if client.on_rows() {
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 4);
             use mssql_tds::datatypes::column_values::ColumnValues;
             match &row[0] {
@@ -844,6 +927,271 @@ mod client_based_iterators {
             assert!(matches!(row[2], ColumnValues::Bytes(_)));
             assert!(matches!(row[3], ColumnValues::Xml(_)));
         }
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_two_rows_column_2_then_4_non_plp_then_plp() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "
+            SELECT
+                CAST(1 AS INT) AS c1,
+                CAST(N'row1-c2' AS NVARCHAR(100)) AS c2,
+                CAST(3 AS INT) AS c3,
+                CAST(REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)) AS c4,
+                CAST(5 AS INT) AS c5
+            UNION ALL
+            SELECT
+                CAST(11 AS INT) AS c1,
+                CAST(N'row2-c2' AS NVARCHAR(100)) AS c2,
+                CAST(13 AS INT) AS c3,
+                CAST(REPLICATE(CAST('B' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)) AS c4,
+                CAST(15 AS INT) AS c5
+        "
+        .to_string();
+        client.execute(query, ()).await?;
+
+        let mut row1 = SparseCaptureWriter::new(5);
+        if client.on_rows() {
+            row1.request_column(2);
+            assert!(client.next_row_into(&mut row1).await?);
+            row1.request_column(4);
+            assert!(client.next_row_into(&mut row1).await?);
+
+            let mut buf = [0u8; 2048];
+            let mut first_row_c4 = Vec::new();
+            loop {
+                let n = client.read_active_plp_bytes(&mut buf).await?;
+                first_row_c4.extend_from_slice(&buf[..n]);
+                if client.active_plp_reached_end() {
+                    break;
+                }
+                assert!(n > 0, "Expected progress while draining first-row c4");
+            }
+            assert_eq!(first_row_c4.len(), 9000);
+
+            // Drain remaining col 5 before advancing to row2.
+            row1.clear_request();
+            assert!(client.next_row_into(&mut row1).await?);
+
+            let mut row2 = SparseCaptureWriter::new(5);
+            row2.request_column(2);
+            assert!(client.next_row_into(&mut row2).await?);
+            row2.request_column(4);
+            assert!(client.next_row_into(&mut row2).await?);
+
+            let mut second_row_c4 = Vec::new();
+            loop {
+                let n = client.read_active_plp_bytes(&mut buf).await?;
+                second_row_c4.extend_from_slice(&buf[..n]);
+                if client.active_plp_reached_end() {
+                    break;
+                }
+                assert!(n > 0, "Expected progress while draining second-row c4");
+            }
+            assert_eq!(second_row_c4.len(), 9000);
+
+            // Drain remaining col 5 before checking exhaustion.
+            row2.clear_request();
+            assert!(client.next_row_into(&mut row2).await?);
+
+            assert!(!client.next_row_into(&mut row2).await?);
+
+            assert_eq!(row1.captured.len(), 1);
+            assert!(matches!(
+                &row1.captured[0],
+                ColumnValues::String(s) if s.to_utf8_string() == "row1-c2"
+            ));
+
+            assert_eq!(row2.captured.len(), 1);
+            assert!(matches!(
+                &row2.captured[0],
+                ColumnValues::String(s) if s.to_utf8_string() == "row2-c2"
+            ));
+        }
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_two_rows_nbcrow_column_1_then_2_plp_pause_and_resume()
+    -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        // Nullable c1 forces NBCROW token emission; c2 is PLP payload.
+        let query = "
+            SELECT
+                CAST(NULL AS INT) AS c1,
+                CAST(REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)) AS c2,
+                CAST(103 AS INT) AS c3
+            UNION ALL
+            SELECT
+                CAST(NULL AS INT) AS c1,
+                CAST(REPLICATE(CAST('B' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)) AS c2,
+                CAST(203 AS INT) AS c3
+        "
+        .to_string();
+        client.execute(query, ()).await?;
+
+        let mut row1 = SparseCaptureWriter::new(3);
+        if client.on_rows() {
+            row1.request_column(1);
+            assert!(client.next_row_into(&mut row1).await?);
+
+            row1.request_column(2);
+            assert!(client.next_row_into(&mut row1).await?);
+            assert!(client.active_plp_collation().is_none());
+
+            let mut buf = [0u8; 2048];
+            let mut first_row_c2 = Vec::new();
+            loop {
+                let n = client.read_active_plp_bytes(&mut buf).await?;
+                first_row_c2.extend_from_slice(&buf[..n]);
+                if client.active_plp_reached_end() {
+                    break;
+                }
+                assert!(n > 0, "Expected progress while draining first-row c2");
+            }
+            assert_eq!(first_row_c2.len(), 9000);
+            assert!(first_row_c2.iter().all(|b| *b == b'A'));
+
+            row1.clear_request();
+            assert!(client.next_row_into(&mut row1).await?);
+
+            let mut row2 = SparseCaptureWriter::new(3);
+            row2.request_column(1);
+            assert!(client.next_row_into(&mut row2).await?);
+
+            row2.request_column(2);
+            assert!(client.next_row_into(&mut row2).await?);
+
+            let mut second_row_c2 = Vec::new();
+            loop {
+                let n = client.read_active_plp_bytes(&mut buf).await?;
+                second_row_c2.extend_from_slice(&buf[..n]);
+                if client.active_plp_reached_end() {
+                    break;
+                }
+                assert!(n > 0, "Expected progress while draining second-row c2");
+            }
+            assert_eq!(second_row_c2.len(), 9000);
+            assert!(second_row_c2.iter().all(|b| *b == b'B'));
+
+            row2.clear_request();
+            assert!(client.next_row_into(&mut row2).await?);
+
+            assert!(!client.next_row_into(&mut row1).await?);
+
+            // With paused PLP reads, column 2 is exposed via read_active_plp_bytes
+            // and is not materialized into the sparse row capture.
+            assert_eq!(row1.captured.len(), 1);
+            assert!(matches!(&row1.captured[0], ColumnValues::Null));
+
+            assert_eq!(row2.captured.len(), 1);
+            assert!(matches!(&row2.captured[0], ColumnValues::Null));
+        }
+
+        client.close_query().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn sparse_two_rows_column_2_then_4_plp_then_non_plp() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "
+            SELECT
+                CAST(21 AS INT) AS c1,
+                CAST(REPLICATE(CAST(N'X' AS NVARCHAR(MAX)), 9000) AS NVARCHAR(MAX)) AS c2,
+                CAST(23 AS INT) AS c3,
+                CAST(24 AS INT) AS c4,
+                CAST(25 AS INT) AS c5
+            UNION ALL
+            SELECT
+                CAST(31 AS INT) AS c1,
+                CAST(REPLICATE(CAST(N'Y' AS NVARCHAR(MAX)), 9000) AS NVARCHAR(MAX)) AS c2,
+                CAST(33 AS INT) AS c3,
+                CAST(34 AS INT) AS c4,
+                CAST(35 AS INT) AS c5
+        "
+        .to_string();
+        client.execute(query, ()).await?;
+
+        let mut row1 = SparseCaptureWriter::new(5);
+        if client.on_rows() {
+            row1.request_column(2);
+            assert!(client.next_row_into(&mut row1).await?);
+
+            let mut buf = [0u8; 2048];
+            let mut first_row_c2 = Vec::new();
+            loop {
+                let n = client.read_active_plp_bytes(&mut buf).await?;
+                first_row_c2.extend_from_slice(&buf[..n]);
+                if client.active_plp_reached_end() {
+                    break;
+                }
+                assert!(n > 0, "Expected progress while draining first-row c2");
+            }
+            assert_eq!(first_row_c2.len(), 18_000);
+
+            row1.request_column(4);
+            assert!(client.next_row_into(&mut row1).await?);
+
+            // Drain remaining col 5 before advancing to row2.
+            row1.clear_request();
+            assert!(client.next_row_into(&mut row1).await?);
+
+            let mut row2 = SparseCaptureWriter::new(5);
+            row2.request_column(2);
+            assert!(client.next_row_into(&mut row2).await?);
+
+            let mut second_row_c2 = Vec::new();
+            loop {
+                let n = client.read_active_plp_bytes(&mut buf).await?;
+                second_row_c2.extend_from_slice(&buf[..n]);
+                if client.active_plp_reached_end() {
+                    break;
+                }
+                assert!(n > 0, "Expected progress while draining second-row c2");
+            }
+            assert_eq!(second_row_c2.len(), 18_000);
+
+            row2.request_column(4);
+            assert!(client.next_row_into(&mut row2).await?);
+
+            // Drain remaining col 5 before checking exhaustion.
+            row2.clear_request();
+            assert!(client.next_row_into(&mut row2).await?);
+
+            assert!(!client.next_row_into(&mut row2).await?);
+
+            assert_eq!(row1.captured.len(), 1);
+            assert!(matches!(
+                &row1.captured[0],
+                ColumnValues::Int(v) if *v == 24
+            ));
+
+            assert_eq!(row2.captured.len(), 1);
+            assert!(matches!(
+                &row2.captured[0],
+                ColumnValues::Int(v) if *v == 34
+            ));
+        }
+
         client.close_query().await?;
         Ok(())
     }

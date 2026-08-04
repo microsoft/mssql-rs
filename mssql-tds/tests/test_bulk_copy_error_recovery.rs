@@ -13,7 +13,7 @@ mod bulk_copy_error_recovery_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::error::Error;
@@ -103,8 +103,7 @@ mod bulk_copy_error_recovery_tests {
                     value INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create temp table");
@@ -141,7 +140,7 @@ mod bulk_copy_error_recovery_tests {
         // If attention packet was not sent, this query would fail with
         // "Connection closed by server while reading TDS packet header"
         let select_result = client
-            .execute("SELECT 1 AS test_value".to_string(), None, None)
+            .execute("SELECT 1 AS test_value".to_string(), ())
             .await;
 
         assert!(
@@ -151,8 +150,8 @@ mod bulk_copy_error_recovery_tests {
         );
 
         // Verify we can read the result and consume the entire result set
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset
+        if client.on_rows() {
+            let row = client
                 .next_row()
                 .await
                 .expect("Failed to read row")
@@ -160,20 +159,14 @@ mod bulk_copy_error_recovery_tests {
             assert_eq!(row[0], ColumnValues::Int(1));
 
             // Consume remaining rows to close the result set
-            while resultset
-                .next_row()
-                .await
-                .expect("Failed reading")
-                .is_some()
-            {}
+            while client.next_row().await.expect("Failed reading").is_some() {}
         }
 
         // Also verify we can do another operation (insert)
         client
             .execute(
                 "INSERT INTO #BulkCopyErrorRecoveryTest (id, value) VALUES (100, 1000)".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Should be able to insert after failed bulk copy");
@@ -182,14 +175,13 @@ mod bulk_copy_error_recovery_tests {
         client
             .execute(
                 "SELECT COUNT(*) FROM #BulkCopyErrorRecoveryTest WHERE id = 100".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset
+        if client.on_rows() {
+            let row = client
                 .next_row()
                 .await
                 .expect("Failed to read count")
@@ -211,8 +203,7 @@ mod bulk_copy_error_recovery_tests {
                     value INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create temp table");
@@ -240,7 +231,7 @@ mod bulk_copy_error_recovery_tests {
 
         // Verify the connection is still usable
         let select_result = client
-            .execute("SELECT 'connection ok' AS status".to_string(), None, None)
+            .execute("SELECT 'connection ok' AS status".to_string(), ())
             .await;
 
         assert!(
@@ -262,8 +253,7 @@ mod bulk_copy_error_recovery_tests {
                     value INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create temp table");
@@ -315,14 +305,13 @@ mod bulk_copy_error_recovery_tests {
         client
             .execute(
                 "SELECT COUNT(*) FROM #BulkCopySuccessAfterFailTest".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset
+        if client.on_rows() {
+            let row = client
                 .next_row()
                 .await
                 .expect("Failed to read count")

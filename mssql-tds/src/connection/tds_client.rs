@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::collections::HashMap;
-
 use crate::connection::bulk_copy::{BulkCopyOptions, BulkLoadRow, ResolvedColumnMapping};
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{ClientContext, ExecutionColumnEncryptionSetting};
@@ -12,7 +10,7 @@ use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sqltypes::SqlType;
 use crate::error::Error::UsageError;
-use crate::error::SqlErrorInfo;
+use crate::error::{SqlErrorInfo, SqlInfoMessage};
 use crate::io::packet_writer::PacketWriter;
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
 use crate::message::messages::{PacketType, ResetConnectionMode};
@@ -33,11 +31,12 @@ use crate::{
     },
     datatypes::column_values::ColumnValues,
     handler::handler_factory::NegotiatedSettings,
-    io::token_stream::{ParserContext, RowReadResult},
+    io::token_stream::{ParserContext, PlpPauseState, RowPauseState, RowReadResult},
     message::{batch::SqlBatch, messages::Request},
-    token::tokens::{ColMetadataToken, CurrentCommand, EnvChangeTokenSubType, Tokens},
+    token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, EnvChangeTokenSubType, Tokens},
 };
 use async_trait::async_trait;
+use std::collections::HashMap;
 use tracing::{debug, error, info, instrument};
 
 use crate::{
@@ -46,6 +45,13 @@ use crate::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Prefix for the synthetic parameter names given to positional stored-procedure
+/// parameters when building the `sp_describe_parameter_encryption` request.
+/// Positional arguments have no caller-supplied name, so they are declared as
+/// `@ce_pos_0`, `@ce_pos_1`, ... in the describe `EXEC`. These names exist only
+/// in the describe request; the real RPC still sends the parameters unnamed.
+const SYNTHETIC_POSITIONAL_PARAM_PREFIX: &str = "ce_pos_";
 
 /// State of the `ReturnStatus` token observed while draining the most recent
 /// cursor RPC response. Distinguishes "no token was sent" from an actual raw
@@ -65,6 +71,13 @@ type MemoizedCellDecryptor = (
     Option<Arc<dyn crate::security::cell_decryptor::CellDecryptor>>,
 );
 
+#[derive(Debug)]
+enum ActiveRowReadState {
+    Idle,
+    RowPaused(Box<RowPauseState>),
+    PlpPaused(Box<PlpPauseState>),
+}
+
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -83,8 +96,17 @@ pub struct TdsClient {
     /// changes. `None` until the first encrypted result set is seen.
     current_decryptor: Option<MemoizedCellDecryptor>,
     count_map: HashMap<CurrentCommand, u64>,
+    /// Rows affected by the most recent statement; see [`last_rows_affected`](Self::last_rows_affected).
+    last_rows_affected: i64,
+    /// Per-statement affected-row counts captured (in order) from every counted
+    /// DONE token seen since the last COLMETADATA or command start. For a
+    /// pure-DML batch (`UPDATE; DELETE; INSERT`) this holds one entry per
+    /// statement so the ODBC layer can surface each as its own result set via
+    /// [`take_dml_result_counts`](Self::take_dml_result_counts).
+    dml_result_counts: Vec<i64>,
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
+    info_messages: Vec<SqlInfoMessage>,
     /// Per-prepared-handle Always Encrypted parameter metadata, captured by
     /// `execute_sp_prepare` from `sp_describe_parameter_encryption` and reused by
     /// `execute_sp_execute` to encrypt parameter values without describing again.
@@ -124,6 +146,15 @@ pub struct TdsClient {
     /// result-decryption paths to honor per-command overrides.
     current_command_ce_setting: crate::connection::client_context::ExecutionColumnEncryptionSetting,
 
+    /// Set while an `sp_prepexec` is in flight, cleared once its `@handle`
+    /// output parameter (RETURNVALUE ordinal 0) has been captured.
+    expecting_prepare_handle: bool,
+    /// Prepared-statement handle from the most recent `sp_prepexec`, surfaced
+    /// via [`take_prepared_statement_handle`](Self::take_prepared_statement_handle).
+    /// Kept separately because [`close_query`](Self::close_query) clears
+    /// `return_values` once the batch has been drained.
+    prepared_statement_handle: Option<i32>,
+
     /// The remaining request timeout for operations. This is updated after each token read.
     pub(in crate::connection) remaining_request_timeout: Option<Duration>,
 
@@ -132,6 +163,9 @@ pub struct TdsClient {
 
     /// Empty metadata vector for returning when no metadata is available
     empty_metadata: Vec<ColumnMetadata>,
+
+    // Active PLP stream state when row decoding paused at a PLP target column.
+    active_row_read_state: ActiveRowReadState,
 }
 
 impl TdsClient {
@@ -160,7 +194,10 @@ impl TdsClient {
             current_metadata: None,
             current_decryptor: None,
             count_map: HashMap::new(),
+            last_rows_affected: -1,
+            dml_result_counts: Vec::new(),
             return_values: Vec::new(),
+            info_messages: Vec::new(),
             prepared_param_encryption: HashMap::new(),
             query_metadata_cache: crate::security::query_metadata_cache::QueryMetadataCache::new(),
             describe_round_trips: 0,
@@ -169,9 +206,12 @@ impl TdsClient {
             current_result_set_has_been_read_till_end: false,
             current_command_ce_setting:
                 crate::connection::client_context::ExecutionColumnEncryptionSetting::default(),
+            expecting_prepare_handle: false,
+            prepared_statement_handle: None,
             remaining_request_timeout: None,
             cancel_handle: None,
             empty_metadata: Vec::new(),
+            active_row_read_state: ActiveRowReadState::Idle,
         }
     }
 
@@ -272,7 +312,7 @@ impl TdsClient {
             )
             .await;
             match connect_result {
-                Ok((new_transport, new_settings, new_exec_ctx)) => {
+                Ok((new_transport, new_settings, new_exec_ctx, info_messages)) => {
                     // Validate reconnection properties match original
                     if let Err(validation_err) =
                         self.recovery_context.validate_reconnection(&new_settings)
@@ -293,10 +333,14 @@ impl TdsClient {
                     self.current_metadata = None;
                     self.count_map.clear();
                     self.return_values.clear();
+                    self.info_messages.clear();
+                    self.info_messages.extend(info_messages);
                     // Prepared-statement handles do not survive a reconnect, so
                     // drop their cached Always Encrypted metadata to avoid
                     // encrypting a later sp_execute with a stale describe result.
                     self.prepared_param_encryption.clear();
+                    self.expecting_prepare_handle = false;
+                    self.prepared_statement_handle = None;
                     self.current_result_set_has_been_read_till_end = false;
                     self.remaining_request_timeout = None;
                     self.cancel_handle = None;
@@ -388,6 +432,26 @@ impl TdsClient {
 
     pub(crate) fn get_current_metadata(&self) -> Option<&ColMetadataToken> {
         self.current_metadata.as_deref()
+    }
+
+    /// Rows affected by the most recently executed statement.
+    ///
+    /// Returns the row count from the last DONE token that carried the
+    /// `DONE_COUNT` flag, or `-1` when no count is available (DDL,
+    /// `SET NOCOUNT ON`, a forward-only SELECT whose trailing DONE has not been
+    /// read, or before any statement has executed). This maps directly to the
+    /// value ODBC `SQLRowCount` reports.
+    pub fn last_rows_affected(&self) -> i64 {
+        self.last_rows_affected
+    }
+
+    /// Drains the per-statement affected-row counts captured since the last
+    /// COLMETADATA (or command start), in statement order. Used by the ODBC
+    /// layer to surface each DML statement in a pure-DML batch as its own
+    /// result set. Returns an empty vec when the batch produced no counted DONE
+    /// (e.g. DDL, `SET NOCOUNT ON`).
+    pub fn take_dml_result_counts(&mut self) -> Vec<i64> {
+        std::mem::take(&mut self.dml_result_counts)
     }
 
     /// Converts an `Option<u32>` timeout (where `Some(0)` means infinite) to `Option<Duration>`.
@@ -534,31 +598,51 @@ impl TdsClient {
         self.transport.as_writer().set_reset_mode(mode);
     }
 
-    /// Sends a SQL batch to the server for execution.
+    /// Executes a SQL batch and positions on its **first navigable result**,
+    /// returning that result's [`StatementResult`].
     ///
-    /// Wraps the SQL text in a TDS `SQL_BATCH` message. After this call returns,
-    /// use [`read_row()`](Self::read_row) to consume result rows, then
-    /// [`close_query()`](Self::close_query) to finalize.
+    /// Navigation is statement-wise (lossless): a no-row statement that carries
+    /// a row count or produced a message is surfaced as its own
+    /// [`StatementResult::NoRows`]; a pure no-op statement (e.g. a bare
+    /// `CREATE TABLE`) is collapsed. Advance through the rest of the batch with
+    /// [`advance()`](Self::advance), or skip straight to row-returning result
+    /// sets with [`advance_to_rows()`](Self::advance_to_rows).
     ///
     /// # Parameters
     /// - `sql_command` — raw T-SQL text to execute.
-    /// - `timeout_sec` — per-request timeout in seconds. `None` means no timeout.
-    /// - `cancel_handle` — optional [`CancelHandle`] for cooperative cancellation.
-    ///   A child token is derived so cancelling the handle aborts this request
-    ///   without tearing down the connection.
+    /// - `options` — per-command [`ExecuteOptions`] (timeout, cancellation,
+    ///   Always Encrypted override). Pass `()` for defaults.
     ///
     /// # Errors
     /// Returns [`UsageError`](crate::error::Error::UsageError) if a previous
     /// batch is still open.
-    #[instrument(skip(self), level = "info")]
-    pub async fn execute(
+    #[instrument(skip(self, options), level = "info")]
+    pub async fn execute<'a>(
         &mut self,
         sql_command: String,
-        timeout_sec: Option<u32>,
-        cancel_handle: Option<&CancelHandle>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StatementResult> {
+        self.send_query_batch(sql_command, options.into()).await?;
+        let boundary = self.advance_to_result_boundary().await?;
+        Ok(self.apply_result_boundary(boundary))
+    }
+
+    /// Runs the batch-execution prologue and sends a SQL batch to the wire:
+    /// sets the per-command Always Encrypted setting, rejects a re-entrant call,
+    /// reconnects if needed, stores the timeout / cancel handle, and serializes
+    /// the batch. The caller then consumes the response via
+    /// [`advance_to_result_boundary`](Self::advance_to_result_boundary).
+    async fn send_query_batch(
+        &mut self,
+        sql_command: String,
+        options: ExecuteOptions<'_>,
     ) -> TdsResult<()> {
-        // Batch execution always uses the connection's Always Encrypted setting.
-        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
+        let ExecuteOptions {
+            timeout,
+            cancel,
+            column_encryption,
+        } = options;
+        self.current_command_ce_setting = column_encryption;
 
         if self.execution_context.has_open_batch() {
             return Err(crate::error::Error::UsageError(
@@ -566,33 +650,24 @@ impl TdsClient {
             ));
         };
 
-        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        self.begin_command();
+        let reconnect_elapsed = self.check_and_reconnect(timeout, cancel).await?;
+        let timeout = Self::deduct_timeout(timeout, reconnect_elapsed);
 
         // Store timeout and cancel handle for this operation
-        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
-        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.remaining_request_timeout = Self::timeout_to_duration(timeout);
+        self.cancel_handle = cancel.map(|handle| handle.child_handle());
 
         self.transport.reset_reader();
         let batch = SqlBatch::new(sql_command, &self.execution_context);
         let mut packet_writer =
-            batch.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+            batch.create_packet_writer(self.transport.as_writer(), timeout, cancel);
         batch.serialize(&mut packet_writer).await?;
-
-        let metadata = self.move_to_column_metadata().await?;
-        // No metadata means no rows were returned, so we set has_open_batch to false.
-        if metadata.is_none() {
-            self.execution_context.set_has_open_batch(false);
-            self.current_metadata = None;
-        } else {
-            self.current_metadata = metadata;
-
-            self.execution_context.set_has_open_batch(true);
-        }
         Ok(())
     }
 
-    /// Executes a parameterized query via `sp_executesql`.
+    /// Executes a parameterized query via `sp_executesql`, positioning on its
+    /// first navigable result.
     ///
     /// The SQL text and parameter declarations are sent as positional RPC
     /// arguments. Caller-supplied `named_params` are appended as named
@@ -606,64 +681,28 @@ impl TdsClient {
     /// # Parameters
     /// - `sql` — parameterized T-SQL statement.
     /// - `named_params` — parameter values. Build with [`RpcParameter::new`].
-    /// - `timeout_sec` / `cancel_handle` — see [`execute()`](Self::execute).
-    #[instrument(skip(self, named_params), level = "info")]
-    pub async fn execute_sp_executesql(
-        &mut self,
-        sql: String,
-        named_params: Vec<RpcParameter>,
-        timeout_sec: Option<u32>,
-        cancel_handle: Option<&CancelHandle>,
-    ) -> TdsResult<()> {
-        self.execute_sp_executesql_core(
-            sql,
-            named_params,
-            ExecutionColumnEncryptionSetting::UseConnectionSetting,
-            timeout_sec,
-            cancel_handle,
-        )
-        .await
-    }
-
-    /// Executes a parameterized statement via `sp_executesql` with a per-command
-    /// [`ExecutionColumnEncryptionSetting`] that overrides the connection's
-    /// Always Encrypted behavior for this execution only.
-    ///
-    /// See [`execute_sp_executesql`](Self::execute_sp_executesql) for the common
-    /// path that inherits the connection setting.
-    #[instrument(skip(self, named_params), level = "info")]
-    pub async fn execute_sp_executesql_with_encryption_setting(
-        &mut self,
-        sql: String,
-        named_params: Vec<RpcParameter>,
-        encryption_setting: ExecutionColumnEncryptionSetting,
-        timeout_sec: Option<u32>,
-        cancel_handle: Option<&CancelHandle>,
-    ) -> TdsResult<()> {
-        self.execute_sp_executesql_core(
-            sql,
-            named_params,
-            encryption_setting,
-            timeout_sec,
-            cancel_handle,
-        )
-        .await
-    }
-
-    async fn execute_sp_executesql_core(
+    /// - `options` — per-command [`ExecuteOptions`]; set
+    ///   [`column_encryption`](ExecuteOptions::column_encryption) to override
+    ///   Always Encrypted for this call. Pass `()` for defaults.
+    #[instrument(skip(self, named_params, options), level = "info")]
+    pub async fn execute_sp_executesql<'a>(
         &mut self,
         sql: String,
         mut named_params: Vec<RpcParameter>,
-        encryption_setting: ExecutionColumnEncryptionSetting,
-        timeout_sec: Option<u32>,
-        cancel_handle: Option<&CancelHandle>,
-    ) -> TdsResult<()> {
-        self.current_command_ce_setting = encryption_setting;
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StatementResult> {
+        let ExecuteOptions {
+            timeout: timeout_sec,
+            cancel: cancel_handle,
+            column_encryption,
+        } = options.into();
+        self.current_command_ce_setting = column_encryption;
 
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -688,6 +727,7 @@ impl TdsClient {
         // Always Encrypted: when the connection enabled column encryption and the
         // server acknowledged the feature, ask the server which parameters need
         // encryption and encrypt them in place before sending the real RPC.
+        self.ensure_force_column_encryption_supported(named_params.iter())?;
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
                 &sql,
@@ -728,18 +768,7 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         rpc.serialize(&mut packet_writer).await?;
 
-        let metadata = self.move_to_column_metadata().await?;
-        // No metadata means no rows were returned, so we set has_open_batch to false.
-        if metadata.is_none() {
-            self.execution_context.set_has_open_batch(false);
-            self.current_result_set_has_been_read_till_end = true;
-            self.current_metadata = None;
-        } else {
-            self.current_metadata = metadata;
-            self.current_result_set_has_been_read_till_end = false;
-            self.execution_context.set_has_open_batch(true);
-        }
-        Ok(())
+        self.position_on_first_result().await
     }
 
     /// Executes a bulk load operation using zero-copy streaming.
@@ -789,6 +818,7 @@ impl TdsClient {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
 
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -825,43 +855,59 @@ impl TdsClient {
         // Always Encrypted: when column encryption is negotiated and enabled,
         // resolve the plaintext CEK for each encrypted destination column so the
         // writer can encrypt row values and emit the encrypted COLMETADATA.
-        let plaintext_ceks: Vec<Option<std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>>> = if self
-            .should_encrypt_bulk_copy()
-            && mapped_column_metadata.iter().any(|c| c.is_encrypted)
-        {
-            use crate::security::keystore::decrypt_cek;
+        //
+        // With `allow_encrypted_value_modifications`, the caller supplies
+        // ciphertext directly, so we skip CEK resolution entirely and let the
+        // writer pass those values through verbatim.
+        let has_encrypted_columns = mapped_column_metadata.iter().any(|c| c.is_encrypted);
+        let encrypt_bulk_copy = self.should_encrypt_bulk_copy() && has_encrypted_columns;
+        let passthrough_ciphertext =
+            encrypt_bulk_copy && options.allow_encrypted_value_modifications;
 
-            let (providers, cek_cache) = {
-                let client_context =
-                    self.recovery_context
-                        .client_context
-                        .as_ref()
-                        .ok_or_else(|| {
-                            crate::error::Error::ColumnEncryptionError(
-                                "Cannot encrypt bulk copy values without a client context"
-                                    .to_string(),
+        let plaintext_ceks: Vec<Option<std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>>> =
+            if encrypt_bulk_copy && !passthrough_ciphertext {
+                use crate::security::keystore::decrypt_cek;
+
+                let (providers, cek_cache, trusted_key_paths) = {
+                    let client_context =
+                        self.recovery_context
+                            .client_context
+                            .as_ref()
+                            .ok_or_else(|| {
+                                crate::error::Error::ColumnEncryptionError(
+                                    "Cannot encrypt bulk copy values without a client context"
+                                        .to_string(),
+                                )
+                            })?;
+                    (
+                        client_context.column_encryption_key_store_providers.clone(),
+                        client_context.cek_cache.clone(),
+                        client_context
+                            .trusted_key_paths_for_current_server()
+                            .to_vec(),
+                    )
+                };
+
+                let mut ceks = Vec::with_capacity(mapped_column_metadata.len());
+                for col in &mapped_column_metadata {
+                    match &col.encryption {
+                        Some(enc) => {
+                            let cek = decrypt_cek(
+                                &providers,
+                                &cek_cache,
+                                &enc.cek_entry,
+                                &trusted_key_paths,
                             )
-                        })?;
-                (
-                    client_context.column_encryption_key_store_providers.clone(),
-                    client_context.cek_cache.clone(),
-                )
-            };
-
-            let mut ceks = Vec::with_capacity(mapped_column_metadata.len());
-            for col in &mapped_column_metadata {
-                match &col.encryption {
-                    Some(enc) => {
-                        let cek = decrypt_cek(&providers, &cek_cache, &enc.cek_entry).await?;
-                        ceks.push(Some(cek));
+                            .await?;
+                            ceks.push(Some(cek));
+                        }
+                        None => ceks.push(None),
                     }
-                    None => ceks.push(None),
                 }
-            }
-            ceks
-        } else {
-            Vec::new()
-        };
+                ceks
+            } else {
+                Vec::new()
+            };
 
         let mut packet_writer = PacketWriter::new(
             PacketType::BulkLoad,
@@ -878,8 +924,13 @@ impl TdsClient {
         );
 
         // Enable Always Encrypted serialization before writing metadata so the
-        // COLMETADATA carries the CEK table and per-column crypto metadata.
-        if !plaintext_ceks.is_empty() {
+        // COLMETADATA carries the CEK table and per-column crypto metadata. Under
+        // ciphertext passthrough the metadata is still emitted, but values are
+        // sent verbatim rather than encrypted, so no plaintext CEKs are attached.
+        if passthrough_ciphertext {
+            writer.set_column_encryption_enabled(true);
+            writer.set_allow_encrypted_value_modifications(true);
+        } else if !plaintext_ceks.is_empty() {
             writer.set_column_encryption_enabled(true);
             writer.set_plaintext_ceks(plaintext_ceks);
         }
@@ -970,6 +1021,7 @@ impl TdsClient {
                 }
                 Tokens::Info(info_token) => {
                     info!(?info_token);
+                    self.capture_info_message(&info_token);
                     continue;
                 }
                 Tokens::EnvChange(env_change) => {
@@ -1025,10 +1077,9 @@ impl TdsClient {
     ///
     /// Sends an `sp_executesql`-style RPC request for the named procedure.
     /// Parameters can be supplied positionally, by name, or both. If the
-    /// procedure returns result sets, iterate rows with
-    /// [`move_to_next()`](Self::move_to_next) and
-    /// [`column_value()`](Self::column_value). After all result sets are
-    /// consumed, retrieve output parameters with
+    /// procedure returns result sets, read the rows of each and move between
+    /// result sets with [`advance_to_rows()`](Self::advance_to_rows). After all
+    /// result sets are consumed, retrieve output parameters with
     /// [`get_return_values()`](Self::get_return_values).
     ///
     /// Only one batch may be active at a time — calling this while a previous
@@ -1039,19 +1090,25 @@ impl TdsClient {
     /// Pass `timeout_sec` to cap server-side execution time, or supply a
     /// [`CancelHandle`] to cancel the operation cooperatively from another
     /// task.
-    #[instrument(skip(self, positional_parameters, named_parameters), level = "info")]
-    pub async fn execute_stored_procedure(
+    #[instrument(
+        skip(self, positional_parameters, named_parameters, options),
+        level = "info"
+    )]
+    pub async fn execute_stored_procedure<'a>(
         &mut self,
         stored_procedure_name: String,
         positional_parameters: Option<Vec<RpcParameter>>,
         named_parameters: Option<Vec<RpcParameter>>,
-        timeout_sec: Option<u32>,
-        cancel_handle: Option<&CancelHandle>,
-    ) -> TdsResult<()> {
-        // Stored-procedure execution uses the connection's Always Encrypted
-        // setting; there is no per-command override on this path.
-        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StatementResult> {
+        let ExecuteOptions {
+            timeout: timeout_sec,
+            cancel: cancel_handle,
+            column_encryption,
+        } = options.into();
+        self.current_command_ce_setting = column_encryption;
 
+        let mut positional_parameters = positional_parameters;
         let mut named_parameters = named_parameters;
 
         if self.execution_context.has_open_batch() {
@@ -1060,20 +1117,7 @@ impl TdsClient {
             ));
         };
 
-        // Positional stored-procedure parameters cannot be referenced by name in
-        // the `sp_describe_parameter_encryption` request, so they cannot be
-        // transparently encrypted. Fail fast rather than silently sending them
-        // as plaintext on an Always Encrypted connection.
-        if self.column_encryption_enabled_on_connection()
-            && positional_parameters
-                .as_ref()
-                .is_some_and(|p| !p.is_empty())
-        {
-            return Err(Self::ae_params_unsupported(
-                "positional stored-procedure parameters",
-            ));
-        }
-
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -1081,23 +1125,53 @@ impl TdsClient {
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
-        self.return_values.clear();
         self.transport.reset_reader();
 
         // Always Encrypted: when the connection enabled column encryption and the
-        // server acknowledged the feature, ask the server which named parameters
-        // need encryption (via `sp_describe_parameter_encryption` against an
-        // `EXEC` form of the call) and encrypt them in place before sending the
-        // real stored-procedure RPC. Positional parameters cannot be referenced
-        // by name in the describe request and are sent unchanged.
-        if self.should_encrypt_parameters()
-            && let Some(named) = named_parameters.as_mut()
-            && named.iter().any(|p| p.name.is_some())
-        {
-            let (tsql, params_decl) =
-                Self::build_stored_procedure_describe_request(&stored_procedure_name, named)?;
-            self.encrypt_parameters(&tsql, &params_decl, named, timeout_sec, cancel_handle)
-                .await?;
+        // server acknowledged the feature, ask the server which parameters need
+        // encryption (via `sp_describe_parameter_encryption` against an `EXEC`
+        // form of the call) and encrypt them in place before sending the real
+        // stored-procedure RPC. Positional parameters are described under
+        // synthetic names bound by position; named parameters bind by name.
+        self.ensure_force_column_encryption_supported(
+            positional_parameters
+                .iter()
+                .flatten()
+                .chain(named_parameters.iter().flatten()),
+        )?;
+        let has_positional = positional_parameters
+            .as_ref()
+            .is_some_and(|p| !p.is_empty());
+        let has_named = named_parameters
+            .as_ref()
+            .is_some_and(|p| p.iter().any(|param| param.name.is_some()));
+        if self.should_encrypt_parameters() && (has_positional || has_named) {
+            let (tsql, params_decl) = Self::build_stored_procedure_describe_request(
+                &stored_procedure_name,
+                positional_parameters.as_deref().unwrap_or(&[]),
+                named_parameters.as_deref().unwrap_or(&[]),
+            )?;
+
+            // Assemble one slice of mutable references in declaration order
+            // (positional first, then named) so the describe result maps back by
+            // ordinal (positional) or name (named).
+            let mut combined: Vec<&mut RpcParameter> = Vec::new();
+            if let Some(positional) = positional_parameters.as_mut() {
+                combined.extend(positional.iter_mut());
+            }
+            if let Some(named) = named_parameters.as_mut() {
+                combined.extend(named.iter_mut());
+            }
+
+            self.encrypt_combined_parameters(
+                &tsql,
+                &params_decl,
+                &mut combined,
+                timeout_sec,
+                cancel_handle,
+            )
+            .await?;
+
             // The describe round-trip closes its own batch, which clears
             // the per-operation timeout/cancel state; restore it for the
             // real RPC.
@@ -1120,18 +1194,7 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         rpc.serialize(&mut packet_writer).await?;
 
-        let metadata = self.move_to_column_metadata().await?;
-        // No metadata means no rows were returned, so we set has_open_batch to false.
-        if metadata.is_none() {
-            self.execution_context.set_has_open_batch(false);
-            self.current_result_set_has_been_read_till_end = true;
-            self.current_metadata = None;
-        } else {
-            self.current_metadata = metadata;
-            self.current_result_set_has_been_read_till_end = false;
-            self.execution_context.set_has_open_batch(true);
-        }
-        Ok(())
+        self.position_on_first_result().await
     }
 
     /// Prepares a parameterized statement via `sp_prepare` and returns the
@@ -1160,22 +1223,25 @@ impl TdsClient {
     ///   means no timeout beyond the connection default.
     /// * `cancel_handle` — optional handle to cooperatively cancel the
     ///   request.
-    #[instrument(skip(self, named_params), level = "info")]
-    pub async fn execute_sp_prepare(
+    #[instrument(skip(self, named_params, options), level = "info")]
+    pub async fn execute_sp_prepare<'a>(
         &mut self,
         sql: String,
         named_params: Vec<RpcParameter>,
-        timeout_sec: Option<u32>,
-        cancel_handle: Option<&CancelHandle>,
+        options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<i32> {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
-        // Prepared-statement execution uses the connection's Always Encrypted
-        // setting; there is no per-command override on this path.
-        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
+        let ExecuteOptions {
+            timeout: timeout_sec,
+            cancel: cancel_handle,
+            column_encryption,
+        } = options.into();
+        self.current_command_ce_setting = column_encryption;
 
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -1183,7 +1249,6 @@ impl TdsClient {
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
-        self.return_values.clear();
         self.transport.reset_reader();
 
         let database_collation = self.negotiated_settings.database_collation;
@@ -1304,17 +1369,23 @@ impl TdsClient {
     /// Frees server-side resources associated with the handle returned by
     /// [`execute_sp_prepare()`](Self::execute_sp_prepare) or
     /// [`execute_sp_prepexec()`](Self::execute_sp_prepexec).
-    #[instrument(skip(self), level = "info")]
-    pub async fn execute_sp_unprepare(
+    #[instrument(skip(self, options), level = "info")]
+    pub async fn execute_sp_unprepare<'a>(
         &mut self,
         handle: i32,
-        timeout_sec: Option<u32>,
-        cancel_handle: Option<&CancelHandle>,
+        options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<()> {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
+        let ExecuteOptions {
+            timeout: timeout_sec,
+            cancel: cancel_handle,
+            ..
+        } = options.into();
+
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -1368,24 +1439,37 @@ impl TdsClient {
     /// is stored internally and can be retrieved with
     /// [`get_return_values()`](Self::get_return_values).
     ///
+    /// `drop_handle` piggybacks a prepared-handle release onto this call: when
+    /// `Some(h)`, `h` is sent as the input value of the by-reference `@handle`
+    /// parameter, so the server drops that prior prepared statement before
+    /// preparing the new one - replacing a separate `sp_unprepare` round trip.
+    /// `None` prepares fresh (the `@handle` input is NULL). Either way the new
+    /// handle is returned in the `@handle` RETURNVALUE (ordinal 0). This mirrors
+    /// the reference ODBC/`SqlClient` drivers, which send the retained handle as
+    /// the `sp_prepexec` in/out `@handle` argument.
+    ///
     /// Result rows are available through [`read_row()`](Self::read_row) after
     /// this call returns.
-    #[instrument(skip(self, named_params), level = "info")]
-    pub async fn execute_sp_prepexec(
+    #[instrument(skip(self, named_params, options), level = "info")]
+    pub async fn execute_sp_prepexec<'a>(
         &mut self,
         sql: String,
         mut named_params: Vec<RpcParameter>,
-        timeout_sec: Option<u32>,
-        cancel_handle: Option<&CancelHandle>,
-    ) -> TdsResult<()> {
+        drop_handle: Option<i32>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StatementResult> {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
-        // Prepared-statement execution uses the connection's Always Encrypted
-        // setting; there is no per-command override on this path.
-        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
+        let ExecuteOptions {
+            timeout: timeout_sec,
+            cancel: cancel_handle,
+            column_encryption,
+        } = options.into();
+        self.current_command_ce_setting = column_encryption;
 
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -1393,13 +1477,17 @@ impl TdsClient {
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
-        self.return_values.clear();
         self.transport.reset_reader();
 
         let database_collation = self.negotiated_settings.database_collation;
 
         let sql_statement_value =
             SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql.clone())));
+
+        // Reset any prepared handle from a prior operation. The capture flag is
+        // armed just before the send below so a failure while building the RPC
+        // cannot leave it set.
+        self.prepared_statement_handle = None;
 
         // Create the parameter list for sp_prepexec
         let statement_parameter = RpcParameter::new(None, StatusFlags::NONE, sql_statement_value);
@@ -1415,6 +1503,7 @@ impl TdsClient {
         // sending the real RPC. The `@params` declaration keeps each parameter's
         // original type; only the value is replaced with ciphertext plus cipher
         // metadata.
+        self.ensure_force_column_encryption_supported(named_params.iter())?;
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
                 &sql,
@@ -1436,7 +1525,10 @@ impl TdsClient {
 
         let params_parameter = RpcParameter::new(None, StatusFlags::NONE, params_as_sql_string);
 
-        let handle_value = SqlType::Int(None);
+        // The by-reference `@handle`: NULL input prepares fresh; a `Some(h)`
+        // input tells the server to drop prepared statement `h` before
+        // preparing. The new handle comes back as the `@handle` RETURNVALUE captured during drain.
+        let handle_value = SqlType::Int(drop_handle);
 
         let handle_parameter = RpcParameter::new(None, StatusFlags::BY_REF_VALUE, handle_value);
 
@@ -1454,22 +1546,28 @@ impl TdsClient {
             &self.execution_context,
         );
 
+        // Clear the flag on any send/read failure so a leaked
+        // `true` cannot miscapture the first Int RETURNVALUE of a later
+        // operation as a prepared handle.
+        self.expecting_prepare_handle = true;
+
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut packet_writer).await?;
-
-        let metadata = self.move_to_column_metadata().await?;
-        // No metadata means no rows were returned, so we set has_open_batch to false.
-        if metadata.is_none() {
-            self.execution_context.set_has_open_batch(false);
-            self.current_result_set_has_been_read_till_end = true;
-            self.current_metadata = None;
-        } else {
-            self.current_metadata = metadata;
-            self.current_result_set_has_been_read_till_end = false;
-            self.execution_context.set_has_open_batch(true);
+        let serialize_result = rpc.serialize(&mut packet_writer).await;
+        drop(packet_writer);
+        if let Err(e) = serialize_result {
+            self.expecting_prepare_handle = false;
+            return Err(e);
         }
-        Ok(())
+
+        let boundary = match self.advance_to_result_boundary().await {
+            Ok(boundary) => boundary,
+            Err(e) => {
+                self.expecting_prepare_handle = false;
+                return Err(e);
+            }
+        };
+        Ok(self.apply_result_boundary(boundary))
     }
 
     /// Executes a previously prepared statement by handle via `sp_execute`.
@@ -1479,23 +1577,29 @@ impl TdsClient {
     /// [`execute_sp_prepexec()`](Self::execute_sp_prepexec) call.
     /// Supply fresh parameter values through `positional_parameters` and/or
     /// `named_parameters`.
-    #[instrument(skip(self, positional_parameters, named_parameters), level = "info")]
-    pub async fn execute_sp_execute(
+    #[instrument(
+        skip(self, positional_parameters, named_parameters, options),
+        level = "info"
+    )]
+    pub async fn execute_sp_execute<'a>(
         &mut self,
         handle: i32,
         mut positional_parameters: Option<Vec<RpcParameter>>,
         mut named_parameters: Option<Vec<RpcParameter>>,
-        timeout_sec: Option<u32>,
-        cancel_handle: Option<&CancelHandle>,
-    ) -> TdsResult<()> {
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StatementResult> {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
-        // Prepared-statement execution uses the connection's Always Encrypted
-        // setting; there is no per-command override on this path.
-        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
+        let ExecuteOptions {
+            timeout: timeout_sec,
+            cancel: cancel_handle,
+            column_encryption,
+        } = options.into();
+        self.current_command_ce_setting = column_encryption;
 
+        self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
@@ -1503,20 +1607,25 @@ impl TdsClient {
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
-        self.return_values.clear();
         self.transport.reset_reader();
 
         // Always Encrypted: encrypt the supplied parameter values in place using
         // the metadata captured when the statement was prepared, then send the
         // real RPC. sp_execute never describes — the metadata must already have
         // been cached by execute_sp_prepare on this connection.
+        self.ensure_force_column_encryption_supported(
+            positional_parameters
+                .iter()
+                .flatten()
+                .chain(named_parameters.iter().flatten()),
+        )?;
         if self.should_encrypt_parameters()
             && (positional_parameters
                 .as_ref()
                 .is_some_and(|p| !p.is_empty())
                 || named_parameters.as_ref().is_some_and(|p| !p.is_empty()))
         {
-            let (providers, cek_cache) = self.cloned_ce_key_material()?;
+            let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
             let describe = self
                 .prepared_param_encryption
                 .get(&handle)
@@ -1544,6 +1653,7 @@ impl TdsClient {
                 &cek_cache,
                 &mut param_refs,
                 &mut self.output_param_ceks,
+                &trusted_key_paths,
             )
             .await?;
         }
@@ -1574,18 +1684,23 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         rpc.serialize(&mut packet_writer).await?;
 
-        let metadata = self.move_to_column_metadata().await?;
-        // No metadata means no rows were returned, so we set has_open_batch to false.
-        if metadata.is_none() {
-            self.execution_context.set_has_open_batch(false);
-            self.current_result_set_has_been_read_till_end = true;
-            self.current_metadata = None;
-        } else {
-            self.current_metadata = metadata;
-            self.current_result_set_has_been_read_till_end = false;
-            self.execution_context.set_has_open_batch(true);
+        self.position_on_first_result().await
+    }
+
+    /// Collects a return value, capturing the `sp_prepexec` `@handle`
+    /// (RETURNVALUE ordinal 0) the first time one arrives while a prepare is in
+    /// flight. Every `Tokens::ReturnValue` is funnelled through here so capture
+    /// works regardless of which drain path reads the stream.
+    fn push_return_value(&mut self, return_value: ReturnValue) {
+        if self.expecting_prepare_handle
+            && return_value.param_ordinal == 0
+            && let ColumnValues::Int(handle) = &return_value.value
+        {
+            self.prepared_statement_handle = Some(*handle);
+            self.expecting_prepare_handle = false;
+            return;
         }
-        Ok(())
+        self.return_values.push(return_value);
     }
 
     #[instrument(skip(self), level = "info")]
@@ -1627,6 +1742,10 @@ impl TdsClient {
                     info!(?error_token, "Draining ERROR token from stream");
                     collected_errors.push(SqlErrorInfo::from(&error_token));
                 }
+                Tokens::Info(info_token) => {
+                    info!(?info_token, "Draining INFO token from stream");
+                    self.capture_info_message(&info_token);
+                }
                 Tokens::EnvChange(t1) => {
                     if t1.sub_type == EnvChangeTokenSubType::ResetConnection {
                         self.recovery_context.session_state_table.reset();
@@ -1640,7 +1759,7 @@ impl TdsClient {
                 }
                 Tokens::ReturnValue(return_value_token) => {
                     let return_value = self.finalize_return_value(return_value_token)?;
-                    self.return_values.push(return_value);
+                    self.push_return_value(return_value);
                 }
                 Tokens::ReturnStatus(return_status) => {
                     self.last_return_status = ReturnStatus::Received(return_status.value);
@@ -1654,17 +1773,40 @@ impl TdsClient {
         Ok(collected_errors)
     }
 
-    #[instrument(skip(self), level = "debug", name = "move_to_column_metadata")]
-    pub(crate) async fn move_to_column_metadata(
-        &mut self,
-    ) -> TdsResult<Option<Arc<ColMetadataToken>>> {
+    /// Reads tokens up to the next result boundary in the response stream.
+    ///
+    /// With `expose_norow_statements = false` (result-set navigation used by
+    /// batch execution and the JS/Python consumers), a no-row statement's DONE
+    /// token carrying the MORE flag is skipped so the method advances to the
+    /// next COLMETADATA — consecutive no-row statements collapse into the
+    /// following row-returning result set.
+    ///
+    /// With `true` (ODBC statement-wise navigation, matching msodbcsql), a
+    /// no-row statement's DONE token can be its own result boundary, returned
+    /// as [`ResultBoundaryKind::NoRows`] instead of always being skipped. It is
+    /// surfaced only when the statement carries a row count (DONE `COUNT` flag)
+    /// or produced an informational message (PRINT / low-severity RAISERROR);
+    /// a pure no-op statement with neither — e.g. a bare `CREATE TABLE` — is
+    /// still collapsed into the following result, exactly as in result-set
+    /// navigation. This mirrors msodbcsql, which exposes a statement as its own
+    /// result iff it returns rows, carries a count, or produced a message. A
+    /// DONE reached in this method (without a COLMETADATA earlier in the same
+    /// call) always belongs to a no-row statement, because a row-returning
+    /// statement's DONE is consumed while its rows are read/drained.
+    async fn advance_to_result_boundary(&mut self) -> TdsResult<ResultBoundaryKind> {
         // Tell the COLMETADATA parser whether Always Encrypted was negotiated so
         // it can parse the CEK table and per-column crypto metadata.
         let parser_context = ParserContext::ColumnEncryption(
             self.negotiated_settings.is_column_encryption_supported(),
         );
-        let mut col_metadata: Option<Arc<ColMetadataToken>> = None;
         let mut loop_count = 0u32;
+        // Whether the statement whose DONE we are about to reach produced any
+        // informational message. In statement-wise navigation, msodbcsql exposes
+        // a statement as its own result when it returns rows, carries a row count
+        // (DONE COUNT flag), or produced messages; pure DDL / no-op statements
+        // with none of these are collapsed. Tracks messages since the last
+        // boundary so a PRINT / low-severity RAISERROR is surfaced individually.
+        let mut saw_message = false;
 
         loop {
             loop_count += 1;
@@ -1673,7 +1815,7 @@ impl TdsClient {
             if loop_count.is_multiple_of(1000) {
                 debug!(
                     loop_count,
-                    "High iteration count in move_to_column_metadata"
+                    "High iteration count in advance_to_result_boundary"
                 );
             }
 
@@ -1690,9 +1832,14 @@ impl TdsClient {
             match token {
                 Tokens::ColMetadata(md) => {
                     info!(?md);
-                    col_metadata = Some(Arc::new(md));
                     self.current_result_set_has_been_read_till_end = false;
-                    break;
+                    // Positioning on a row-returning result: its count is
+                    // unavailable on a forward-only cursor. Clear any count
+                    // captured from a preceding DONE-only (DML) result in the
+                    // same batch so it is not misreported for this SELECT.
+                    self.last_rows_affected = -1;
+                    self.dml_result_counts.clear();
+                    return Ok(ResultBoundaryKind::RowSet(Arc::new(md)));
                 }
                 Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
                     info!(
@@ -1713,17 +1860,51 @@ impl TdsClient {
                     *count = count.saturating_add(done.row_count);
                     self.current_result_set_has_been_read_till_end = true;
 
-                    if !done.has_more() {
-                        // No more result sets - end of batch
-                        info!("No more result sets (has_more=false), ending batch");
-                        self.execution_context.set_has_open_batch(false);
-                        break;
+                    let is_last = !done.has_more();
+
+                    // Capture the affected-row count for `SQLRowCount`, but only
+                    // when the DONE_COUNT flag is set — otherwise `row_count` is
+                    // not meaningful (DDL, SET NOCOUNT ON) and must stay -1. Each
+                    // counted DONE is also appended in order so a pure-DML batch
+                    // surfaces one count per statement.
+                    let has_count = done.status.contains(DoneStatus::COUNT);
+                    if has_count {
+                        let count = i64::try_from(done.row_count).unwrap_or(i64::MAX);
+                        self.last_rows_affected = count;
+                        self.dml_result_counts.push(count);
                     }
 
-                    // has_more() is true - there are more result sets coming
-                    // For DML operations (CREATE TABLE, INSERT, UPDATE, DELETE), there's no ColMetadata.
-                    // The Done token represents the result, but we skip over it to find the next
-                    // result set with ColMetadata (SELECT). This matches SQL Server behavior.
+                    // Statement-wise navigation (msodbcsql parity): this DONE is
+                    // a navigable result only if the statement returned a row
+                    // count (COUNT flag) or produced messages. Pure DDL / no-op
+                    // statements (no count, no messages) are collapsed, exactly
+                    // like result-set navigation, so a batch such as
+                    // `CREATE; INSERT; SELECT` exposes the INSERT's row count and
+                    // the SELECT, not the bare CREATE. `rows_affected` is
+                    // `Some(n)` only when the DONE carried a COUNT.
+                    if has_count || saw_message {
+                        self.execution_context.set_has_open_batch(!is_last);
+                        return Ok(ResultBoundaryKind::NoRows {
+                            rows_affected: if has_count {
+                                Some(done.row_count)
+                            } else {
+                                None
+                            },
+                        });
+                    }
+
+                    if is_last {
+                        // No more result sets - end of batch.
+                        info!("No more result sets (has_more=false), ending batch");
+                        self.execution_context.set_has_open_batch(false);
+                        return Ok(ResultBoundaryKind::End);
+                    }
+
+                    // has_more() is true - there are more result sets coming.
+                    // For no-row statements (PRINT / RAISERROR / DDL / DML) there
+                    // is no ColMetadata; in result-set navigation (and for
+                    // collapsed no-op statements above) we skip over their DONE
+                    // token to find the next result set with ColMetadata (SELECT).
                     info!(
                         "More result sets available (has_more=true), continuing to look for ColMetadata"
                     );
@@ -1732,7 +1913,7 @@ impl TdsClient {
                     if loop_count > 10000 {
                         error!(
                             loop_count,
-                            "Excessive iterations in move_to_column_metadata - possible malicious input or protocol violation"
+                            "Excessive iterations in advance_to_result_boundary - possible malicious input or protocol violation"
                         );
                         return Err(crate::error::Error::UsageError(
                             "Too many Done tokens with has_more=true without ColMetadata"
@@ -1755,7 +1936,7 @@ impl TdsClient {
                 }
                 Tokens::ReturnValue(return_value_token) => {
                     let return_value = self.finalize_return_value(return_value_token)?;
-                    self.return_values.push(return_value);
+                    self.push_return_value(return_value);
                 }
                 Tokens::ReturnStatus(return_status) => {
                     self.last_return_status = ReturnStatus::Received(return_status.value);
@@ -1772,20 +1953,129 @@ impl TdsClient {
                 }
                 Tokens::Info(info_token) => {
                     info!(?info_token);
+                    self.capture_info_message(&info_token);
+                    // Marks the current statement as message-bearing so
+                    // statement-wise navigation surfaces it as its own result.
+                    saw_message = true;
                     continue;
                 }
                 Tokens::TabName | Tokens::ColInfo => {
                     continue;
                 }
                 _ => {
-                    info!("move_to_column_metadata: {:?}", token);
+                    info!("advance_to_result_boundary: {:?}", token);
                     return Err(UsageError(format!(
-                        "Unexpected token while moving to column metadata: {token:?}"
+                        "Unexpected token while moving to next result boundary: {token:?}"
                     )));
                 }
             }
         }
-        Ok(col_metadata)
+    }
+
+    /// Positions on the next **row-returning** result set, collapsing (skipping)
+    /// any no-row statements, and returns its column metadata — or `None` at end
+    /// of batch. Internal helper for paths that only consume row sets (e.g.
+    /// reading the result sets of `sp_describe_parameter_encryption`).
+    #[instrument(skip(self), level = "debug", name = "next_rowset")]
+    pub(crate) async fn next_rowset(&mut self) -> TdsResult<Option<Arc<ColMetadataToken>>> {
+        loop {
+            match self.advance_to_result_boundary().await? {
+                ResultBoundaryKind::RowSet(md) => return Ok(Some(md)),
+                ResultBoundaryKind::NoRows { .. } => continue,
+                ResultBoundaryKind::End => return Ok(None),
+            }
+        }
+    }
+
+    /// Applies a [`ResultBoundaryKind`] to the client's current-result state and
+    /// maps it to the public [`StatementResult`] returned by
+    /// [`execute`](Self::execute) and [`advance`](Self::advance).
+    fn apply_result_boundary(&mut self, boundary: ResultBoundaryKind) -> StatementResult {
+        match boundary {
+            ResultBoundaryKind::RowSet(md) => {
+                self.current_metadata = Some(md);
+                self.execution_context.set_has_open_batch(true);
+                self.current_result_set_has_been_read_till_end = false;
+                StatementResult::Rows
+            }
+            ResultBoundaryKind::NoRows { rows_affected } => {
+                // A no-row statement has zero columns; `has_open_batch` was set
+                // by `advance_to_result_boundary` based on the DONE MORE flag.
+                self.current_metadata = None;
+                StatementResult::NoRows { rows_affected }
+            }
+            ResultBoundaryKind::End => {
+                self.current_metadata = None;
+                self.execution_context.set_has_open_batch(false);
+                self.current_result_set_has_been_read_till_end = true;
+                StatementResult::End
+            }
+        }
+    }
+
+    /// Returns `true` while the current batch still has unconsumed results on
+    /// the wire (a positioned result set, or further statements to navigate to).
+    /// Used by the ODBC layer to decide whether the connection stays busy after
+    /// positioning on a no-row statement result.
+    pub fn has_open_batch(&self) -> bool {
+        self.execution_context.has_open_batch()
+    }
+
+    /// Returns `true` when the client is currently positioned on a row-returning
+    /// result set (the last [`execute`](Self::execute) / [`advance`](Self::advance)
+    /// returned [`StatementResult::Rows`]). Row-reading via the [`ResultSet`] API
+    /// is only meaningful in this state.
+    pub fn on_rows(&self) -> bool {
+        self.current_metadata.is_some()
+    }
+
+    /// Positions on the first navigable result after a request has been sent to
+    /// the wire. Shared tail of the `execute*` entry points.
+    async fn position_on_first_result(&mut self) -> TdsResult<StatementResult> {
+        let boundary = self.advance_to_result_boundary().await?;
+        Ok(self.apply_result_boundary(boundary))
+    }
+
+    /// Advances to the next navigable result in the current batch, draining any
+    /// unread rows of the current result set first. Returns
+    /// [`StatementResult::End`] when the batch is exhausted.
+    ///
+    /// This is the lossless, statement-wise "next": each DML count, message-only
+    /// statement, and row set is surfaced individually (matching msodbcsql's
+    /// `SQLMoreResults`). Use [`advance_to_rows()`](Self::advance_to_rows) to
+    /// skip straight to the next row-returning result set.
+    #[instrument(skip(self), level = "info")]
+    pub async fn advance(&mut self) -> TdsResult<StatementResult> {
+        if !self.execution_context.has_open_batch() {
+            return Ok(StatementResult::End);
+        }
+        if self.maybe_has_unread_rows() {
+            self.drain_rows().await?;
+        }
+        // Draining the current result set may have consumed the batch's final
+        // DONE token (has_more=false), which closes the batch. If so there is
+        // nothing left on the wire to advance to; reading again would block
+        // forever waiting for a token that never arrives.
+        if !self.execution_context.has_open_batch() {
+            return Ok(StatementResult::End);
+        }
+        self.position_on_first_result().await
+    }
+
+    /// Advances to the next **row-returning** result set, collapsing (skipping)
+    /// no-row statements (DML counts / message-only statements). Returns `true`
+    /// when positioned on rows, or `false` at end of batch. This is the
+    /// "give me the next rowset" convenience for consumers that don't care about
+    /// per-statement counts — the equivalent of ADO.NET's `NextResult`.
+    #[instrument(skip(self), level = "info")]
+    pub async fn advance_to_rows(&mut self) -> TdsResult<bool> {
+        loop {
+            match self.advance().await? {
+                StatementResult::Rows => return Ok(true),
+                StatementResult::NoRows { .. } => continue,
+                StatementResult::End => return Ok(false),
+            }
+        }
     }
 
     /// This functions returns to the next row in the result set.
@@ -1813,6 +2103,27 @@ impl TdsClient {
             && self.effective_command_ce_setting() == ExecutionColumnEncryptionSetting::Enabled
     }
 
+    /// Enforces the ForceColumnEncryption precondition: if any supplied parameter
+    /// requires encryption but Always Encrypted is not enabled for this command,
+    /// fail rather than sending it as plaintext. The per-parameter downgrade
+    /// check (server reports the column plaintext) is enforced separately in
+    /// [`apply_parameter_encryption`](Self::apply_parameter_encryption).
+    fn ensure_force_column_encryption_supported<'p>(
+        &self,
+        params: impl IntoIterator<Item = &'p RpcParameter>,
+    ) -> TdsResult<()> {
+        if !self.should_encrypt_parameters()
+            && params.into_iter().any(|p| p.force_column_encryption())
+        {
+            return Err(crate::error::Error::UsageError(
+                "A parameter has ForceColumnEncryption set, but Always Encrypted is not enabled \
+                 for this command; enable column encryption on the connection, or clear the flag."
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns `true` when the connection negotiated Always Encrypted and
     /// enabled column encryption, ignoring any per-command override. Used by
     /// paths that have no per-command setting (bulk copy, prepared statements).
@@ -1834,20 +2145,6 @@ impl TdsClient {
     /// directly against the connection setting.
     fn should_encrypt_bulk_copy(&self) -> bool {
         self.column_encryption_enabled_on_connection()
-    }
-
-    /// Error for execution paths that cannot yet transparently encrypt their
-    /// parameters under Always Encrypted. Returned instead of silently sending
-    /// plaintext parameter values on an AE-enabled connection.
-    fn ae_params_unsupported(path: &str) -> crate::error::Error {
-        crate::error::Error::UnimplementedFeature {
-            feature: format!("Always Encrypted for {path}"),
-            context: "Column encryption is enabled on this connection but this execution path \
-                      does not run sp_describe_parameter_encryption, so its parameters cannot be \
-                      transparently encrypted. Use execute_sp_executesql or named \
-                      stored-procedure parameters, or disable column encryption for this command."
-                .into(),
-        }
     }
 
     /// Normalizes a parameter name for matching across
@@ -1999,7 +2296,7 @@ impl TdsClient {
         let mut result = DescribeParameterEncryptionResult::new();
 
         // Result set 1: CEK table metadata.
-        match self.move_to_column_metadata().await? {
+        match self.next_rowset().await? {
             Some(metadata) => {
                 self.current_metadata = Some(metadata);
                 self.execution_context.set_has_open_batch(true);
@@ -2019,7 +2316,7 @@ impl TdsClient {
         }
 
         // Result set 2: per-parameter encryption info.
-        if self.move_to_next().await? {
+        if self.advance_to_rows().await? {
             while let Some(row) = self.get_next_row().await? {
                 result.parameters.push(parse_parameter_info(&row)?);
             }
@@ -2046,22 +2343,49 @@ impl TdsClient {
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<()> {
+        let mut param_refs: Vec<&mut RpcParameter> = named_params.iter_mut().collect();
+        self.encrypt_combined_parameters(
+            sql,
+            params_decl,
+            &mut param_refs,
+            timeout_sec,
+            cancel_handle,
+        )
+        .await
+    }
+
+    /// Describes and encrypts, in place, a combined set of parameter references.
+    ///
+    /// This is the shared core behind [`encrypt_parameters`](Self::encrypt_parameters)
+    /// (all-named) and the stored-procedure path (positional and/or named): the
+    /// caller assembles one slice of mutable parameter references in the same
+    /// order they were declared in `params_decl`, and
+    /// [`apply_parameter_encryption`](Self::apply_parameter_encryption) matches
+    /// each describe entry back by name (named) or ordinal (positional).
+    async fn encrypt_combined_parameters(
+        &mut self,
+        sql: &str,
+        params_decl: &str,
+        params: &mut [&mut RpcParameter],
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<()> {
         // Mirror SqlClient: don't cache metadata for statements with output
         // parameters — the client can't validate cached describe results against
         // a RETURNVALUE — but still use it for this call.
-        let has_output = named_params.iter().any(|p| p.is_output());
+        let has_output = params.iter().any(|p| p.is_output());
         let describe = self
             .describe_parameters_cached(sql, params_decl, has_output, timeout_sec, cancel_handle)
             .await?;
 
-        let (providers, cek_cache) = self.cloned_ce_key_material()?;
-        let mut param_refs: Vec<&mut RpcParameter> = named_params.iter_mut().collect();
+        let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
         Self::apply_parameter_encryption(
             &describe,
             &providers,
             &cek_cache,
-            &mut param_refs,
+            params,
             &mut self.output_param_ceks,
+            &trusted_key_paths,
         )
         .await
     }
@@ -2110,13 +2434,15 @@ impl TdsClient {
     }
 
     /// Clones the `Arc` handles to the column-master-key provider registry and
-    /// the CEK cache from the client context, so the parameter-encryption paths
+    /// the CEK cache from the client context, plus the trusted master key path
+    /// allow-list for the connected server, so the parameter-encryption paths
     /// can pass them around without holding a borrow on `self`.
     fn cloned_ce_key_material(
         &self,
     ) -> TdsResult<(
         std::sync::Arc<crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry>,
         std::sync::Arc<crate::security::keystore::CekCache>,
+        Vec<String>,
     )> {
         let client_context = self
             .recovery_context
@@ -2130,7 +2456,34 @@ impl TdsClient {
         Ok((
             client_context.column_encryption_key_store_providers.clone(),
             client_context.cek_cache.clone(),
+            client_context
+                .trusted_key_paths_for_current_server()
+                .to_vec(),
         ))
+    }
+
+    /// Matches a `sp_describe_parameter_encryption` result entry to a supplied
+    /// parameter: by name first (case-insensitively, like a T-SQL identifier),
+    /// otherwise falling back to the *unnamed* parameter at the describe's
+    /// 1-based ordinal (the positional case). Requiring the ordinal slot to be
+    /// unnamed keeps a named parameter from being matched by position.
+    fn match_describe_param_index(
+        params: &[&mut RpcParameter],
+        info: &crate::security::describe_parameter_encryption::ParameterEncryptionInfo,
+    ) -> Option<usize> {
+        params
+            .iter()
+            .position(|p| {
+                p.name
+                    .as_deref()
+                    .map(|n| n.eq_ignore_ascii_case(&info.parameter_name))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                (info.parameter_ordinal as usize)
+                    .checked_sub(1)
+                    .filter(|&i| i < params.len() && params[i].name.is_none())
+            })
     }
 
     /// Encrypts, in place, the parameters that a prior
@@ -2151,6 +2504,7 @@ impl TdsClient {
         cek_cache: &crate::security::keystore::CekCache,
         params: &mut [&mut RpcParameter],
         output_param_ceks: &mut HashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>,
+        trusted_key_paths: &[String],
     ) -> TdsResult<()> {
         use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
         use crate::security::encryption::encrypt_parameter;
@@ -2160,6 +2514,43 @@ impl TdsClient {
         // command's parameters, so a previous command's keys cannot leak into
         // this one's output-parameter decryption.
         output_param_ceks.clear();
+
+        // ForceColumnEncryption: every supplied parameter that demands
+        // encryption must be reported as encrypted by the server. Validate before
+        // any work — and before the "nothing encrypted" early return below — so a
+        // server that downgrades a forced parameter is caught rather than
+        // silently sending its value as plaintext. A downgrade takes two forms,
+        // both rejected here: the server reports the parameter's target column as
+        // plaintext, or it omits a row for the parameter entirely (which would
+        // otherwise slip past a describe-driven check and be serialized in the
+        // clear).
+        //
+        // This is a server-trust failure — the "compromised server downgrades to
+        // harvest plaintext" threat this flag defends against — so it is a
+        // `ColumnEncryptionError`, matching the "parameter not supplied" mismatch
+        // below and the trusted-master-key-path rejection in `decrypt_cek`. It is
+        // deliberately distinct from the caller-misconfiguration case (the flag
+        // set while Always Encrypted is off) that
+        // `ensure_force_column_encryption_supported` reports as a `UsageError`.
+        for index in 0..params.len() {
+            if !params[index].force_column_encryption() {
+                continue;
+            }
+            let reported_encrypted = describe.parameters.iter().any(|info| {
+                info.is_encrypted() && Self::match_describe_param_index(params, info) == Some(index)
+            });
+            if !reported_encrypted {
+                let name = params[index]
+                    .name
+                    .as_deref()
+                    .unwrap_or("<positional>")
+                    .to_string();
+                return Err(crate::error::Error::ColumnEncryptionError(format!(
+                    "Parameter {name} has ForceColumnEncryption set, but the server did not \
+                     report it as encrypted; refusing to send it as plaintext.",
+                )));
+            }
+        }
 
         // Nothing to do when the server reports no encrypted parameters.
         if !describe.parameters.iter().any(|p| p.is_encrypted()) {
@@ -2178,25 +2569,7 @@ impl TdsClient {
                 ))
             })?;
 
-            // Match by name first; otherwise fall back to the unnamed parameter at
-            // this describe ordinal (the positional case). Requiring the ordinal
-            // slot to be unnamed keeps a named parameter from being matched by
-            // position.
-            let index = params
-                .iter()
-                .position(|p| {
-                    p.name
-                        .as_deref()
-                        .map(|n| n.eq_ignore_ascii_case(&info.parameter_name))
-                        .unwrap_or(false)
-                })
-                .or_else(|| {
-                    (info.parameter_ordinal as usize)
-                        .checked_sub(1)
-                        .filter(|&i| i < params.len() && params[i].name.is_none())
-                });
-
-            let Some(index) = index else {
+            let Some(index) = Self::match_describe_param_index(params, info) else {
                 return Err(crate::error::Error::ColumnEncryptionError(format!(
                     "sp_describe_parameter_encryption returned encryption info for parameter {} \
                      that was not supplied to the call",
@@ -2204,7 +2577,25 @@ impl TdsClient {
                 )));
             };
 
-            let plaintext_cek = decrypt_cek(providers, cek_cache, cek_entry).await?;
+            // An encrypted positional (unnamed) OUTPUT parameter cannot have its
+            // returned value decrypted: the RETURNVALUE token arrives unnamed, so
+            // its ciphertext can't be matched back to the CEK, which is retained
+            // under the parameter's synthetic describe name (`@ce_pos_N`). Reject
+            // it with an actionable error instead of returning ciphertext the
+            // caller can't read. Named OUTPUT parameters are unaffected (the
+            // RETURNVALUE name matches), as are non-encrypted positional OUTPUT
+            // parameters (they never reach this encrypted-parameter branch).
+            if params[index].is_output() && params[index].name.is_none() {
+                return Err(crate::error::Error::UsageError(
+                    "Encrypted positional OUTPUT stored-procedure parameters are not supported \
+                     because their returned value cannot be matched back to a column encryption \
+                     key; pass the output parameter by name so it can be decrypted on return."
+                        .to_string(),
+                ));
+            }
+
+            let plaintext_cek =
+                decrypt_cek(providers, cek_cache, cek_entry, trusted_key_paths).await?;
 
             // An encrypted RETURNVALUE output parameter carries no CEK table and
             // reuses the CEK that encrypted the matching input parameter. Retain
@@ -2245,23 +2636,65 @@ impl TdsClient {
     /// `sp_describe_parameter_encryption` when the original call is a stored
     /// procedure (rather than an `sp_executesql` statement).
     ///
-    /// `@tsql` is an `EXEC` form that names every parameter so the server can
-    /// resolve per-parameter encryption metadata:
-    /// `EXEC <proc> @p1=@p1, @p2=@p2 OUTPUT, ...`. `@params` is the matching
-    /// declaration list (`@p1 int, @p2 nvarchar(10) OUTPUT, ...`). Only named
-    /// parameters participate; positional parameters cannot be referenced by
-    /// name and are omitted. Mirrors dotnet
-    /// `BuildStoredProcedureStatementForColumnEncryption`.
+    /// `@tsql` is an `EXEC` form of the call. Positional parameters bind by
+    /// position and are given synthetic names (`@ce_pos_0`, `@ce_pos_1`, ...) so
+    /// they can be declared in `@params` and referenced in the `EXEC`; named
+    /// parameters bind by name. Positional arguments precede named ones, as
+    /// T-SQL requires. `@params` is the matching declaration list. The synthetic
+    /// names exist only in the describe request — the real RPC still sends the
+    /// positional parameters unnamed, and the describe result is mapped back by
+    /// ordinal (positional) or name (named) in
+    /// [`apply_parameter_encryption`](Self::apply_parameter_encryption).
+    ///
+    /// Example: `EXEC dbo.p @ce_pos_0, @name1=@name1 OUTPUT` with
+    /// `@ce_pos_0 int, @name1 nvarchar(10) OUTPUT`. Mirrors dotnet
+    /// `BuildStoredProcedureStatementForColumnEncryption`, extended to cover the
+    /// positional-parameter case the Rust API exposes.
     fn build_stored_procedure_describe_request(
         stored_procedure_name: &str,
+        positional_params: &[RpcParameter],
         named_params: &[RpcParameter],
     ) -> TdsResult<(String, String)> {
         use std::fmt::Write as _;
+
+        for named in named_params
+            .iter()
+            .filter_map(|param| param.name.as_deref())
+        {
+            for ordinal in 0..positional_params.len() {
+                let synthetic = format!("@{SYNTHETIC_POSITIONAL_PARAM_PREFIX}{ordinal}");
+                if named.eq_ignore_ascii_case(&synthetic) {
+                    return Err(UsageError(format!(
+                        "Named parameter '{named}' conflicts with internally generated positional parameter name '{synthetic}'"
+                    )));
+                }
+            }
+        }
 
         let mut tsql = format!("EXEC {stored_procedure_name}");
         let mut params_decl = String::new();
         let mut first = true;
 
+        // Positional parameters: synthetic name, bound by position in the EXEC.
+        for (ordinal, param) in positional_params.iter().enumerate() {
+            let synthetic = format!("@{SYNTHETIC_POSITIONAL_PARAM_PREFIX}{ordinal}");
+            let type_name = RpcParameter::get_sql_name(param.value())?;
+            let output = if param.is_output() { " OUTPUT" } else { "" };
+
+            if first {
+                tsql.push(' ');
+                first = false;
+            } else {
+                tsql.push_str(", ");
+                params_decl.push_str(", ");
+            }
+
+            // `write!` into a String is infallible.
+            let _ = write!(tsql, "{synthetic}{output}");
+            let _ = write!(params_decl, "{synthetic} {type_name}{output}");
+        }
+
+        // Named parameters: bound by name.
         for param in named_params {
             let Some(name) = param.name.as_deref() else {
                 continue;
@@ -2343,6 +2776,7 @@ impl TdsClient {
             &client_context.column_encryption_key_store_providers,
             &client_context.cek_cache,
             &metadata.cek_table,
+            client_context.trusted_key_paths_for_current_server(),
         )
         .await;
         let decryptor: Arc<dyn CellDecryptor> = Arc::new(resolved);
@@ -2350,8 +2784,47 @@ impl TdsClient {
         Ok(Some(decryptor))
     }
 
+    pub(crate) fn active_plp_collation(&self) -> Option<SqlCollation> {
+        match &self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => plp_state.collation(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn active_plp_reached_end(&self) -> bool {
+        match &self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => plp_state.reached_end(),
+            _ => true,
+        }
+    }
+
+    pub(crate) async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        let ActiveRowReadState::PlpPaused(plp_state) = &mut self.active_row_read_state else {
+            return Ok(0);
+        };
+
+        let start = Instant::now();
+        let read = self
+            .transport
+            .read_active_plp_bytes(
+                plp_state,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+                out,
+            )
+            .await?;
+        self.update_remaining_timeout(start);
+        Ok(read)
+    }
+
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
+    ///
+    /// If a prior call paused mid-row, this method first resumes and completes
+    /// that same logical row before reading tokens for a subsequent row. If row
+    /// decoding was paused on a PLP column and the caller did not finish draining
+    /// it via `read_active_plp_bytes`, this method drains the remaining PLP bytes
+    /// before resuming the row.
     ///
     /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
     /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
@@ -2365,6 +2838,39 @@ impl TdsClient {
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
             ));
         }
+
+        match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
+            ActiveRowReadState::Idle => {}
+            ActiveRowReadState::RowPaused(pause_state) => {
+                return self.resume_row_loop(*pause_state, writer).await;
+            }
+            ActiveRowReadState::PlpPaused(mut plp_state) => {
+                let mut buffer = [0u8; 8192];
+                while !plp_state.reached_end() {
+                    let start = Instant::now();
+                    let read = self
+                        .transport
+                        .read_active_plp_bytes(
+                            &mut plp_state,
+                            self.remaining_request_timeout,
+                            self.cancel_handle.as_ref(),
+                            &mut buffer,
+                        )
+                        .await?;
+                    self.update_remaining_timeout(start);
+
+                    if read == 0 && !plp_state.reached_end() {
+                        return Err(crate::error::Error::ProtocolError(
+                            "Active PLP drain made no progress before end-of-stream".to_string(),
+                        ));
+                    }
+                }
+                return self
+                    .resume_row_loop(plp_state.row_pause_state, writer)
+                    .await;
+            }
+        }
+
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
         let decryptor = self.resolve_cell_decryptor(&metadata).await?;
         let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
@@ -2387,79 +2893,142 @@ impl TdsClient {
                     info!("Row Received");
                     return Ok(true);
                 }
-                RowReadResult::Token(token) => match token {
-                    Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
-                        info!("done while get_next_row: {:?}", done);
-
-                        if done.has_error() {
-                            return Err(crate::error::Error::ProtocolError(
-                                "Server reported error in DONE token without preceding ERROR token"
-                                    .to_string(),
-                            ));
-                        }
-
-                        let count = self.count_map.entry(done.cur_cmd).or_insert(0);
-                        *count = count.saturating_add(done.row_count);
-
-                        self.current_result_set_has_been_read_till_end = true;
-                        if !done.has_more() {
-                            info!("No more rows for current command: {:?}", done.cur_cmd);
-                            self.execution_context.set_has_open_batch(false);
-                        }
-                        return Ok(false);
+                RowReadResult::RowPaused(pause_state) => {
+                    self.active_row_read_state =
+                        ActiveRowReadState::RowPaused(Box::new(pause_state));
+                    return Ok(true);
+                }
+                RowReadResult::PlpPaused(plp_state) => {
+                    self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(plp_state));
+                    return Ok(true);
+                }
+                RowReadResult::Token(token) => {
+                    if let Some(has_row) = self.handle_row_read_token(token).await? {
+                        return Ok(has_row);
                     }
-                    Tokens::Order(order_token) => {
-                        info!(?order_token);
-                        continue;
-                    }
-                    Tokens::EnvChange(env_change) => {
-                        info!(?env_change);
-                        if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                            self.recovery_context.session_state_table.reset();
-                        }
-                        self.execution_context
-                            .capture_change_property(&env_change, &mut self.negotiated_settings)?;
-                        continue;
-                    }
-                    Tokens::SessionState(session_state) => {
-                        self.recovery_context
-                            .process_session_state(&session_state)?;
-                        continue;
-                    }
-                    Tokens::ReturnValue(return_value_token) => {
-                        let return_value = self.finalize_return_value(return_value_token)?;
-                        self.return_values.push(return_value);
-                        continue;
-                    }
-                    Tokens::Error(error_token) => {
-                        info!(?error_token);
-                        let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
-                        let drain_errors = self.drain_stream().await?;
-                        all_errors.extend(drain_errors);
-                        return Err(crate::error::Error::from_sql_errors(all_errors));
-                    }
-                    Tokens::ColMetadata(_) => {
-                        return Err(crate::error::Error::UsageError(
-                            "Unexpected ColMetadata token encountered while reading rows. \
-                             This typically indicates the API was not used correctly - \
-                             you may need to call move_to_next() to advance to the next result set."
-                                .to_string(),
-                        ));
-                    }
-                    Tokens::Info(info_token) => {
-                        info!(?info_token);
-                        continue;
-                    }
-                    Tokens::TabName | Tokens::ColInfo => {
-                        continue;
-                    }
-                    _ => {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "Unexpected token while finding the next row: {token:?}"
-                        )));
-                    }
-                },
+                }
             }
+        }
+    }
+
+    async fn resume_row_loop(
+        &mut self,
+        pause_state: RowPauseState,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<bool> {
+        let current = pause_state;
+        let start = Instant::now();
+        let result = self
+            .transport
+            .resume_row_into(
+                current,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+                writer,
+            )
+            .await?;
+        self.update_remaining_timeout(start);
+        match result {
+            RowReadResult::RowWritten => {
+                writer.end_row();
+                info!("Row Received");
+                Ok(true)
+            }
+            RowReadResult::RowPaused(next_pause) => {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(next_pause));
+                Ok(true)
+            }
+            RowReadResult::PlpPaused(plp_state) => {
+                self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(plp_state));
+                Ok(true)
+            }
+            RowReadResult::Token(token) => {
+                if let Some(has_row) = self.handle_row_read_token(token).await? {
+                    Ok(has_row)
+                } else {
+                    // This should not happen in normal resume flow; keep as a defensive guard.
+                    Err(crate::error::Error::ProtocolError(
+                        "Unexpected token during row resume".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn handle_row_read_token(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
+        match token {
+            Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
+                info!("done while get_next_row: {:?}", done);
+
+                if done.has_error() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "Server reported error in DONE token without preceding ERROR token"
+                            .to_string(),
+                    ));
+                }
+
+                let count = self.count_map.entry(done.cur_cmd).or_insert(0);
+                *count = count.saturating_add(done.row_count);
+
+                self.current_result_set_has_been_read_till_end = true;
+                if !done.has_more() {
+                    info!("No more rows for current command: {:?}", done.cur_cmd);
+                    self.execution_context.set_has_open_batch(false);
+                }
+                Ok(Some(false))
+            }
+            Tokens::Order(order_token) => {
+                info!(?order_token);
+                Ok(None)
+            }
+            Tokens::EnvChange(env_change) => {
+                info!(?env_change);
+                if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                    self.recovery_context.session_state_table.reset();
+                }
+                self.execution_context
+                    .capture_change_property(&env_change, &mut self.negotiated_settings)?;
+                Ok(None)
+            }
+            Tokens::SessionState(session_state) => {
+                self.recovery_context
+                    .process_session_state(&session_state)?;
+                Ok(None)
+            }
+            Tokens::ReturnValue(return_value_token) => {
+                let return_value = self.finalize_return_value(return_value_token)?;
+                self.push_return_value(return_value);
+                Ok(None)
+            }
+            Tokens::Error(error_token) => {
+                info!(?error_token);
+                let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
+                let drain_errors = self.drain_stream().await?;
+                all_errors.extend(drain_errors);
+                // The error drained the rest of the batch to its terminal
+                // DONE, so the connection is idle again. Clear the batch
+                // state so a subsequent `close_query` / `advance` does not
+                // block trying to read a stream that is already consumed.
+                self.execution_context.set_has_open_batch(false);
+                self.current_result_set_has_been_read_till_end = true;
+                self.current_metadata = None;
+                Err(crate::error::Error::from_sql_errors(all_errors))
+            }
+            Tokens::ColMetadata(_) => Err(crate::error::Error::UsageError(
+                "Unexpected ColMetadata token encountered while reading rows. \
+                     This typically indicates the API was not used correctly - \
+                     you may need to call advance_to_rows() to advance to the next result set."
+                    .to_string(),
+            )),
+            Tokens::Info(info_token) => {
+                info!(?info_token);
+                self.capture_info_message(&info_token);
+                Ok(None)
+            }
+            Tokens::TabName | Tokens::ColInfo => Ok(None),
+            _ => Err(crate::error::Error::ProtocolError(format!(
+                "Unexpected token while finding the next row: {token:?}"
+            ))),
         }
     }
 
@@ -2468,9 +3037,75 @@ impl TdsClient {
     ///
     /// Values accumulate as the token stream is read; call this after the
     /// result set is fully consumed (e.g. after [`close_query()`](Self::close_query)
-    /// or after [`move_to_next()`](Self::move_to_next) returns `false`).
+    /// or after [`advance_to_rows()`](Self::advance_to_rows) returns `false`).
     pub fn get_return_values(&self) -> Vec<ReturnValue> {
         self.return_values.clone()
+    }
+
+    /// Returns the informational (INFO-token) messages captured from the
+    /// current or most recent command's token stream — server `PRINT` output
+    /// and low-severity `RAISERROR`/context notices.
+    ///
+    /// The buffer is reset at the start of each command, so this reflects only
+    /// the most recent one. Messages are **retained even when that command
+    /// returned an error**: a failed statement/RPC/batch surfaces its errors in
+    /// [`Error::SqlServerError`](crate::error::Error::SqlServerError) whose
+    /// `diagnostics.info_messages` is empty on the statement path, so any INFO it
+    /// emitted must still be read from here. ([`close_query()`](Self::close_query)
+    /// deliberately preserves the buffer for the same reason.)
+    pub fn info_messages(&self) -> &[SqlInfoMessage] {
+        &self.info_messages
+    }
+
+    /// Drains and returns the captured informational messages, leaving the
+    /// buffer empty.
+    ///
+    /// Same lifecycle as [`info_messages()`](Self::info_messages): the buffer
+    /// reflects the current/most-recent command, is populated even when that
+    /// command errored (statement-path errors carry no INFO in
+    /// [`Error::SqlServerError`](crate::error::Error::SqlServerError)), and is
+    /// reset at the next command's start — so drain it before issuing the next
+    /// command if you need the messages.
+    pub fn take_info_messages(&mut self) -> Vec<SqlInfoMessage> {
+        std::mem::take(&mut self.info_messages)
+    }
+
+    pub(crate) fn extend_info_messages(&mut self, messages: Vec<SqlInfoMessage>) {
+        self.info_messages.extend(messages);
+    }
+
+    fn capture_info_message(&mut self, token: &crate::token::tokens::InfoToken) {
+        self.info_messages.push(SqlInfoMessage::from(token));
+    }
+
+    /// Resets the informational-message buffer at the start of a new command so
+    /// [`info_messages()`](Self::info_messages) reflects only that command.
+    ///
+    /// Call this at the top of every public token-consuming command, before
+    /// consuming the response (and before `check_and_reconnect` where
+    /// applicable): a transparent reconnect repopulates login messages for the
+    /// new session *after* this point, so those remain visible as part of the
+    /// command that triggered the reconnect.
+    fn begin_command(&mut self) {
+        self.info_messages.clear();
+        // Clear output parameters / return values from the previous command so a
+        // fully-navigated prior RPC does not leave `get_return_values()` /
+        // `retrieve_output_params()` reporting stale values for this new command.
+        self.return_values.clear();
+        // Every execution RPC path (plain batch, sp_executesql, sp_execute,
+        // sp_prepexec, stored proc) funnels through here, so reset the
+        // affected-row count for the new command. A prior DML count must not
+        // leak into `SQLRowCount` when this command reports none (DDL /
+        // `SET NOCOUNT ON` / SELECT).
+        self.last_rows_affected = -1;
+        self.dml_result_counts.clear();
+    }
+
+    /// Returns and clears the prepared-statement handle captured from the most
+    /// recent `sp_prepexec` (its `@handle` output parameter, RETURNVALUE
+    /// ordinal 0).
+    pub fn take_prepared_statement_handle(&mut self) -> Option<i32> {
+        self.prepared_statement_handle.take()
     }
 
     /// Retrieves a snapshot of the output parameters (including return values)
@@ -2497,14 +3132,23 @@ impl TdsClient {
             return Ok(());
         }
         // call next row to consume any remaining tokens
-        while self.move_to_next().await? {}
+        while self.advance_to_rows().await? {}
         info!("No more rows to consume.");
 
         // Reset the current metadata, return values, and timeout/cancel state.
+        // Note: `info_messages` is intentionally NOT cleared here. Draining the
+        // trailing token stream above can surface INFO/warning messages (e.g. a
+        // PRINT after the last result set), and the caller drains them via
+        // `take_info_messages()` after this returns (see the ODBC
+        // `drain_and_release` path). Clearing them here would discard them.
+        // The sp_prepexec @handle, if any, was captured during the drain above
+        // (see push_return_value) and survives this clear.
         self.current_metadata = None;
         self.return_values.clear();
+        self.expecting_prepare_handle = false;
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
+        self.active_row_read_state = ActiveRowReadState::Idle;
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
         Ok(())
@@ -2589,6 +3233,7 @@ impl TdsClient {
             ));
         }
 
+        self.begin_command();
         // begin_transaction has no command timeout — use connect_timeout as fallback.
         let _reconnect_elapsed = self.check_and_reconnect(None, None).await?;
 
@@ -2618,6 +3263,7 @@ impl TdsClient {
                 "Cannot save transaction while another batch is executing.".to_string(),
             ));
         }
+        self.begin_command();
         let transaction = TransactionManagementRequest::new(
             TransactionManagementType::Save(name),
             &self.execution_context,
@@ -2646,6 +3292,7 @@ impl TdsClient {
                 "Cannot commit transaction while another batch is executing.".to_string(),
             ));
         }
+        self.begin_command();
         let transaction = TransactionManagementRequest::new(
             TransactionManagementType::Commit {
                 name,
@@ -2677,6 +3324,7 @@ impl TdsClient {
                 "Cannot rollback transaction while another batch is executing.".to_string(),
             ));
         }
+        self.begin_command();
         let transaction = TransactionManagementRequest::new(
             TransactionManagementType::Rollback {
                 name,
@@ -2703,6 +3351,7 @@ impl TdsClient {
                 "Cannot get DTC address while another batch is executing.".to_string(),
             ));
         }
+        self.begin_command();
         let transaction = TransactionManagementRequest::new(
             TransactionManagementType::GetDtcAddress,
             &self.execution_context,
@@ -2713,7 +3362,7 @@ impl TdsClient {
 
         // GetDtcAddress returns a result set, unlike other transaction commands
         // Set up execution state for result iteration (similar to execute())
-        let metadata = self.move_to_column_metadata().await?;
+        let metadata = self.next_rowset().await?;
         if metadata.is_none() {
             self.execution_context.set_has_open_batch(false);
             self.current_metadata = None;
@@ -2766,6 +3415,11 @@ impl TdsClient {
                 Tokens::Error(error_token) => {
                     info!(?error_token);
                     collected_errors.push(SqlErrorInfo::from(&error_token));
+                    continue;
+                }
+                Tokens::Info(info_token) => {
+                    info!(?info_token);
+                    self.capture_info_message(&info_token);
                     continue;
                 }
                 Tokens::EnvChange(env_change) => {
@@ -2824,6 +3478,18 @@ impl ResultSet for TdsClient {
         }
     }
 
+    async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        TdsClient::read_active_plp_bytes(self, out).await
+    }
+
+    fn active_plp_reached_end(&self) -> bool {
+        TdsClient::active_plp_reached_end(self)
+    }
+
+    fn active_plp_collation(&self) -> Option<SqlCollation> {
+        TdsClient::active_plp_collation(self)
+    }
+
     fn maybe_has_unread_rows(&self) -> bool {
         !self.current_result_set_has_been_read_till_end
     }
@@ -2834,51 +3500,99 @@ impl ResultSet for TdsClient {
     }
 }
 
-#[async_trait]
-impl ResultSetClient for TdsClient {
-    fn get_current_resultset(&mut self) -> Option<&mut TdsClient> {
-        if self.execution_context.has_open_batch() {
-            Some(self)
-        } else {
-            None
-        }
+/// Per-execution options shared by every `execute*` entry point on
+/// [`TdsClient`].
+///
+/// All fields default to "inherit the connection's behavior", so
+/// [`ExecuteOptions::default()`] (or passing `()`, which converts via
+/// [`From`]) reproduces the implicit defaults. New per-command capabilities are
+/// added here as new defaulted fields — never as new methods or changed
+/// signatures — keeping the `execute*` surface forward-compatible.
+#[derive(Default, Clone)]
+pub struct ExecuteOptions<'a> {
+    /// Per-request timeout in seconds. `None` means no client-side timeout.
+    pub timeout: Option<u32>,
+    /// Optional [`CancelHandle`] for cooperative cancellation. A child token is
+    /// derived so cancelling aborts the request without tearing down the
+    /// connection.
+    pub cancel: Option<&'a CancelHandle>,
+    /// Per-command Always Encrypted override. Defaults to
+    /// [`ExecutionColumnEncryptionSetting::UseConnectionSetting`] (inherit the
+    /// connection). Only has effect when the server acknowledged the Column
+    /// Encryption feature during login.
+    pub column_encryption: ExecutionColumnEncryptionSetting,
+}
+
+impl<'a> ExecuteOptions<'a> {
+    /// Creates default options (inherit all connection behavior).
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    #[instrument(skip(self), level = "info")]
-    async fn move_to_next(&mut self) -> TdsResult<bool> {
-        if !self.execution_context.has_open_batch() {
-            return Ok(false);
-        }
-        // Drain the current result set.
-        if self.maybe_has_unread_rows() {
-            self.drain_rows().await?;
-        }
-
-        info!("Moving to next result set...");
-
-        let has_open_batch = self.execution_context.has_open_batch();
-        info!("Has open batch: {}", has_open_batch);
-        if !has_open_batch {
-            return Ok(false);
-        }
-        let metadata_token = self.move_to_column_metadata().await?;
-
-        match metadata_token {
-            Some(metadata) => {
-                self.current_metadata = Some(metadata);
-                self.execution_context.set_has_open_batch(true);
-                self.current_result_set_has_been_read_till_end = false;
-                Ok(true)
-            }
-            None => {
-                // No metadata means no more result sets.
-                self.execution_context.set_has_open_batch(false);
-                self.current_metadata = None;
-                self.current_result_set_has_been_read_till_end = true;
-                Ok(false)
-            }
-        }
+    /// Sets a per-request timeout, in seconds.
+    pub fn timeout_secs(mut self, seconds: u32) -> Self {
+        self.timeout = Some(seconds);
+        self
     }
+
+    /// Attaches a cancellation handle.
+    pub fn cancel(mut self, handle: &'a CancelHandle) -> Self {
+        self.cancel = Some(handle);
+        self
+    }
+
+    /// Overrides the Always Encrypted behavior for this command only.
+    pub fn column_encryption(mut self, setting: ExecutionColumnEncryptionSetting) -> Self {
+        self.column_encryption = setting;
+        self
+    }
+}
+
+impl From<()> for ExecuteOptions<'_> {
+    fn from(_: ()) -> Self {
+        Self::default()
+    }
+}
+
+/// The result the client is positioned on after an `execute*` call or an
+/// [`advance()`](TdsClient::advance).
+///
+/// This is the lossless, statement-wise view of a batch: every statement that
+/// returns rows, carries a row count, or produced a message is surfaced as its
+/// own result (matching msodbcsql's `SQLMoreResults` and JDBC's
+/// `getMoreResults`/`getUpdateCount`). Consumers that only care about
+/// row-returning result sets can collapse no-row statements with
+/// [`advance_to_rows()`](TdsClient::advance_to_rows). A pure no-op statement
+/// with neither a count nor a message (e.g. a bare `CREATE TABLE`) is collapsed
+/// and never surfaces as [`NoRows`](Self::NoRows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatementResult {
+    /// A row-returning result set (e.g. `SELECT`). Column metadata is available
+    /// via [`TdsClient::get_metadata`] and rows via the [`ResultSet`] API.
+    Rows,
+    /// A statement that produced no result set but is still individually
+    /// navigable. `rows_affected` is `Some(n)` when the statement's DONE token
+    /// carried a row count (DML), or `None` for a message-only statement
+    /// (`PRINT` / low-severity `RAISERROR`) or plain DDL. Messages are drained
+    /// separately via [`take_info_messages`](TdsClient::take_info_messages).
+    NoRows {
+        /// Rows affected, when the DONE token carried a COUNT; otherwise `None`.
+        rows_affected: Option<u64>,
+    },
+    /// No more statements remain in the batch; the connection is idle.
+    End,
+}
+
+/// Internal boundary kind produced by
+/// [`advance_to_result_boundary`](TdsClient::advance_to_result_boundary),
+/// before it is mapped to the public [`StatementResult`].
+enum ResultBoundaryKind {
+    /// A row-returning result set; carries its column metadata.
+    RowSet(Arc<ColMetadataToken>),
+    /// A no-row statement (DML count, message-only, or DDL).
+    NoRows { rows_affected: Option<u64> },
+    /// End of batch.
+    End,
 }
 
 /// Async result set iteration.
@@ -2894,7 +3608,32 @@ pub trait ResultSet {
 
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
+    ///
+    /// If the writer opts into [`RowWriter::pause_after_column`], this method
+    /// may return `Ok(true)` more than once for the same logical row: each pause
+    /// boundary yields control back to the caller, and [`RowWriter::end_row`]
+    /// runs only after the final resume completes the row.
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool>;
+
+    /// Reads bytes from the active PLP stream captured after a `PlpPaused` result from
+    /// `next_row_into`. The caller must drain the stream to completion before calling
+    /// `next_row_into` again.
+    async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        let _ = out;
+        Ok(0)
+    }
+
+    /// Returns `true` when the active PLP stream has been fully consumed or when
+    /// there is no active PLP stream.
+    fn active_plp_reached_end(&self) -> bool {
+        true
+    }
+
+    /// Returns the TDS collation for the active PLP string stream, or `None` for
+    /// binary types or when there is no active PLP stream.
+    fn active_plp_collation(&self) -> Option<SqlCollation> {
+        None
+    }
 
     /// Returns `true` if the result set may still contain unread rows.
     fn maybe_has_unread_rows(&self) -> bool;
@@ -2902,24 +3641,6 @@ pub trait ResultSet {
     /// Iterates over the result set, and marks it as closed. After calling close, the next_row method,
     /// will always return None.
     async fn close(&mut self) -> TdsResult<()>;
-}
-
-/// Navigation across multiple result sets.
-#[async_trait]
-pub trait ResultSetClient<T = TdsClient> {
-    /// Returns the current result set on the client.
-    /// Execution of query positions the client at the first result set.
-    /// If we have read all the results from the current result set,
-    /// this method will return None.
-    fn get_current_resultset(&mut self) -> Option<&mut T>;
-
-    /// Moves to the next result set, if available.
-    /// Returns true if there is a next result set, false otherwise.
-    /// The current_resultset will be closed and if the next result set is available,
-    /// it will be set as the current result set.
-    /// If there is no next result set, the current result set will be closed and
-    /// the method will return false.
-    async fn move_to_next(&mut self) -> TdsResult<bool>;
 }
 
 #[cfg(test)]
@@ -2931,8 +3652,12 @@ mod tests {
     use crate::core::{CancelHandle, TdsResult};
     use crate::datatypes::row_writer::RowWriter;
     use crate::io::reader_writer::{NetworkReader, NetworkWriter};
-    use crate::io::token_stream::{ParserContext, RowReadResult, TdsTokenStreamReader};
-    use crate::token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, Tokens};
+    use crate::io::token_stream::{
+        ParserContext, RowPauseState, RowReadResult, TdsTokenStreamReader,
+    };
+    use crate::token::tokens::{
+        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
+    };
     use async_trait::async_trait;
     use std::collections::VecDeque;
 
@@ -2943,6 +3668,11 @@ mod tests {
         closed: bool,
         pending_tokens: VecDeque<Tokens>,
         reset_mode: ResetConnectionMode,
+        /// Every byte handed to `send` (request framing + payload), so tests can
+        /// assert what was actually written to the wire.
+        sent: Arc<std::sync::Mutex<Vec<u8>>>,
+        packet_data: Vec<u8>,
+        packet_pos: usize,
     }
 
     impl TestTransport {
@@ -2951,6 +3681,9 @@ mod tests {
                 closed: false,
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                packet_data: Vec::new(),
+                packet_pos: 0,
             }
         }
 
@@ -2959,7 +3692,33 @@ mod tests {
                 closed: false,
                 pending_tokens: VecDeque::from(tokens),
                 reset_mode: ResetConnectionMode::None,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                packet_data: Vec::new(),
+                packet_pos: 0,
             }
+        }
+
+        fn with_packet_data(packet_data: Vec<u8>) -> Self {
+            Self {
+                closed: false,
+                pending_tokens: VecDeque::new(),
+                reset_mode: ResetConnectionMode::None,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                packet_data,
+                packet_pos: 0,
+            }
+        }
+
+        fn take_packet_bytes(&mut self, count: usize) -> TdsResult<&[u8]> {
+            if self.packet_pos + count > self.packet_data.len() {
+                return Err(crate::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "End of data",
+                )));
+            }
+            let slice = &self.packet_data[self.packet_pos..self.packet_pos + count];
+            self.packet_pos += count;
+            Ok(slice)
         }
     }
 
@@ -2984,6 +3743,34 @@ mod tests {
             _cancel_handle: Option<&CancelHandle>,
             _writer: &mut (dyn RowWriter + Send),
         ) -> TdsResult<RowReadResult> {
+            // The mock has no row bytes to materialize, so it replays the queued
+            // tokens as control tokens (e.g. a terminal DONE). This lets drain
+            // paths — which read rows until the result set's DONE — be exercised
+            // without a live server. Running dry is a protocol error, mirroring a
+            // closed connection.
+            if let Some(tok) = self.pending_tokens.pop_front() {
+                return Ok(RowReadResult::Token(tok));
+            }
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+
+        async fn resume_row_into(
+            &mut self,
+            _pause_state: RowPauseState,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+            _writer: &mut (dyn RowWriter + Send),
+        ) -> TdsResult<RowReadResult> {
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+
+        async fn read_active_plp_bytes(
+            &mut self,
+            _plp_state: &mut PlpPauseState,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+            _out: &mut [u8],
+        ) -> TdsResult<usize> {
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
     }
@@ -3000,7 +3787,8 @@ mod tests {
 
     #[async_trait]
     impl NetworkWriter for TestTransport {
-        async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
+        async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
+            self.sent.lock().unwrap().extend_from_slice(data);
             Ok(())
         }
         fn packet_size(&self) -> u32 {
@@ -3046,6 +3834,81 @@ mod tests {
         }
         fn is_connection_dead(&self) -> bool {
             true
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::io::packet_reader::TdsPacketReader for TestTransport {
+        async fn read_byte(&mut self) -> TdsResult<u8> {
+            Ok(self.take_packet_bytes(1)?[0])
+        }
+        async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint40(&mut self) -> TdsResult<u64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_float32(&mut self) -> TdsResult<f32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_float64(&mut self) -> TdsResult<f64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int16(&mut self) -> TdsResult<i16> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint16(&mut self) -> TdsResult<u16> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint24(&mut self) -> TdsResult<u32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int32(&mut self) -> TdsResult<i32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_uint32(&mut self) -> TdsResult<u32> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_int64(&mut self) -> TdsResult<i64> {
+            Ok(i64::from_le_bytes(
+                self.take_packet_bytes(8)?.try_into().unwrap(),
+            ))
+        }
+        async fn read_uint64(&mut self) -> TdsResult<u64> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_bytes(&mut self, _buf: &mut [u8]) -> TdsResult<usize> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_u8_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_u16_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_varchar_u16_length(&mut self) -> TdsResult<Option<String>> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_varchar_u8_length(&mut self) -> TdsResult<String> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_unicode(&mut self, _len: usize) -> TdsResult<String> {
+            unimplemented!("TestTransport")
+        }
+        async fn read_unicode_with_byte_length(&mut self, _len: usize) -> TdsResult<String> {
+            unimplemented!("TestTransport")
+        }
+        async fn skip_bytes(&mut self, _count: usize) -> TdsResult<()> {
+            unimplemented!("TestTransport")
+        }
+        async fn cancel_read_stream(&mut self) -> TdsResult<()> {
+            unimplemented!("TestTransport")
+        }
+        fn reset_reader(&mut self) {
+            self.packet_pos = 0;
         }
     }
 
@@ -3107,11 +3970,56 @@ mod tests {
         )
     }
 
+    /// Builds a client whose transport replays `tokens` and captures every byte
+    /// written to the wire, returning the shared capture buffer alongside it.
+    fn create_capturing_client(tokens: Vec<Tokens>) -> (TdsClient, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let transport = Box::new(TestTransport::with_tokens(tokens));
+        let sent = Arc::clone(&transport.sent);
+        let negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let execution_context = crate::connection::execution_context::ExecutionContext::new();
+        let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        let client = TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            client_context,
+        );
+        (client, sent)
+    }
+
     fn done_no_more() -> Tokens {
         Tokens::Done(DoneToken {
             status: DoneStatus::FINAL,
             cur_cmd: CurrentCommand::Insert,
             row_count: 0,
+        })
+    }
+
+    /// A DONE token carrying the `DONE_COUNT` flag (a DML row count). `more`
+    /// sets `DONE_MORE` so it is treated as a non-terminal result in a batch.
+    fn done_count(cmd: CurrentCommand, rows: u64, more: bool) -> Tokens {
+        let status = if more {
+            DoneStatus::COUNT | DoneStatus::MORE
+        } else {
+            DoneStatus::COUNT
+        };
+        Tokens::Done(DoneToken {
+            status,
+            cur_cmd: cmd,
+            row_count: rows,
+        })
+    }
+
+    fn info_token(number: u32, severity: u8, message: &str) -> Tokens {
+        Tokens::Info(InfoToken {
+            number,
+            state: 1,
+            severity,
+            message: message.to_string(),
+            server_name: "test-server".to_string(),
+            proc_name: String::new(),
+            line_number: 7,
         })
     }
 
@@ -3121,6 +4029,165 @@ mod tests {
 
     fn stale_metadata() -> Arc<ColMetadataToken> {
         Arc::new(ColMetadataToken::default())
+    }
+
+    fn done_more() -> Tokens {
+        Tokens::Done(DoneToken {
+            status: DoneStatus::MORE,
+            cur_cmd: CurrentCommand::Insert,
+            row_count: 0,
+        })
+    }
+
+    fn done_more_with_count(row_count: u64) -> Tokens {
+        Tokens::Done(DoneToken {
+            status: DoneStatus::MORE | DoneStatus::COUNT,
+            cur_cmd: CurrentCommand::Insert,
+            row_count,
+        })
+    }
+
+    /// Statement-wise navigation exposes each no-row statement (PRINT /
+    /// RAISERROR) as its own result, matching msodbcsql, instead of collapsing
+    /// them the way `advance_to_rows()` does.
+    #[tokio::test]
+    async fn execute_exposes_each_norow_statement() {
+        // Batch: PRINT N'one'; RAISERROR(N'two', 10, 1);
+        let mut client = create_test_client_with_tokens(vec![
+            info_token(0, 0, "print one"),
+            done_more(),
+            info_token(50000, 10, "raiserror two"),
+            done_no_more(),
+        ]);
+
+        // First statement surfaces as its own no-row result.
+        let r1 = client
+            .execute(
+                "PRINT N'one'; RAISERROR(N'two', 10, 1) WITH NOWAIT;".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r1,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
+        // Only the first statement's INFO is present when it is drained.
+        let info1 = client.take_info_messages();
+        assert!(
+            info1.iter().any(|m| m.message == "print one"),
+            "first statement's PRINT should be captured: {info1:?}"
+        );
+        assert!(
+            !info1.iter().any(|m| m.message == "raiserror two"),
+            "second statement's INFO must not leak into the first: {info1:?}"
+        );
+
+        // Second statement is a separate no-row result.
+        let r2 = client.advance().await.unwrap();
+        assert_eq!(
+            r2,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
+        let info2 = client.take_info_messages();
+        assert!(
+            info2.iter().any(|m| m.message == "raiserror two"),
+            "second statement's RAISERROR should surface on its own step: {info2:?}"
+        );
+
+        // No more statements.
+        let r3 = client.advance().await.unwrap();
+        assert_eq!(r3, StatementResult::End);
+    }
+
+    /// A single no-row statement is exposed once, then the batch ends.
+    #[tokio::test]
+    async fn execute_single_norow_then_end() {
+        let mut client =
+            create_test_client_with_tokens(vec![info_token(0, 0, "just a print"), done_no_more()]);
+
+        let r1 = client
+            .execute("PRINT N'just a print';".to_string(), ())
+            .await
+            .unwrap();
+        assert_eq!(
+            r1,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
+
+        let r2 = client.advance().await.unwrap();
+        assert_eq!(r2, StatementResult::End);
+    }
+
+    /// Statement-wise navigation collapses pure no-op statements (no row count,
+    /// no messages — e.g. `CREATE TABLE`) but surfaces a DML statement's row
+    /// count, matching msodbcsql (`CREATE; INSERT; SELECT` exposes the INSERT
+    /// count and the SELECT, not the bare CREATE).
+    #[tokio::test]
+    async fn execute_collapses_noop_surfaces_rowcount() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_more(),             // pure no-op (CREATE) - collapsed
+            done_more_with_count(5), // DML with a row count - surfaced
+            done_no_more(),          // trailing no-op - collapsed -> End
+        ]);
+
+        let r1 = client
+            .execute(
+                "CREATE TABLE #t(i int); INSERT INTO #t VALUES(1);".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r1,
+            StatementResult::NoRows {
+                rows_affected: Some(5)
+            }
+        );
+
+        let r2 = client.advance().await.unwrap();
+        assert_eq!(r2, StatementResult::End);
+    }
+
+    #[tokio::test]
+    async fn advance_end_when_no_open_batch() {
+        let mut client = create_test_client();
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+    }
+
+    /// Regression test for a hang: after positioning on the batch's final row
+    /// set, calling `advance` without reading its rows must drain
+    /// them, observe the terminal DONE (which closes the batch), and return
+    /// `End` — instead of issuing another token read that would block forever on
+    /// an already-finished batch. The whole exchange is bounded by a timeout so a
+    /// regression surfaces as a test failure rather than a hung suite.
+    #[tokio::test]
+    async fn move_to_next_statement_end_after_draining_final_rowset() {
+        // A single row-returning statement: COLMETADATA then a terminal DONE.
+        let mut client = create_test_client_with_tokens(vec![empty_col_metadata(), done_no_more()]);
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.execute("SELECT 1;".to_string(), ()),
+        )
+        .await
+        .expect("execute should not hang")
+        .unwrap();
+        assert_eq!(first, StatementResult::Rows);
+
+        // Advance without fetching any rows: the drain consumes the terminal
+        // DONE and the call must report end-of-batch rather than block.
+        let next = tokio::time::timeout(Duration::from_secs(5), client.advance())
+            .await
+            .expect("advance must not hang after draining the final row set")
+            .unwrap();
+        assert_eq!(next, StatementResult::End);
     }
 
     #[test]
@@ -3141,6 +4208,88 @@ mod tests {
         );
     }
 
+    // ── PLP streaming lifecycle contract tests ──
+
+    #[tokio::test]
+    async fn plp_read_bytes_no_active_stream_returns_zero() {
+        let mut client = create_test_client();
+        let mut buf = [0u8; 4];
+
+        let read = client.read_active_plp_bytes(&mut buf).await.unwrap();
+
+        assert_eq!(read, 0);
+    }
+
+    #[test]
+    fn plp_reached_end_returns_true_when_no_stream_active() {
+        let client = create_test_client();
+
+        assert!(client.active_plp_reached_end());
+    }
+
+    #[test]
+    fn plp_collation_returns_none_when_no_stream_active() {
+        let client = create_test_client();
+        assert!(client.active_plp_collation().is_none());
+    }
+
+    #[tokio::test]
+    async fn active_plp_collation_reports_stream_collation_when_paused() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let metadata = crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::partial_len(
+                crate::datatypes::sqldatatypes::TdsDataType::BigVarChar,
+                0xFFFF,
+                Some(collation),
+            )
+            .unwrap(),
+            data_type: crate::datatypes::sqldatatypes::TdsDataType::BigVarChar,
+            column_name: "c1".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+        let mut reader = TestTransport::with_packet_data((-2_i64).to_le_bytes().to_vec());
+        let plp_stream = crate::datatypes::decoder::PlpColumnStream::begin(&metadata, &mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        let row_pause_state = RowPauseState {
+            next_column_index: 1,
+            columns: vec![metadata],
+            nbc_null_bitmap: None,
+            decryptor: None,
+        };
+
+        let mut client = create_test_client();
+        client.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(PlpPauseState {
+            row_pause_state,
+            plp_stream,
+        }));
+
+        assert_eq!(client.active_plp_collation(), Some(collation));
+    }
+
+    #[test]
+    fn plp_helpers_treat_non_plp_row_pause_as_no_active_stream() {
+        let mut client = create_test_client();
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 1,
+            columns: Vec::new(),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+
+        assert!(client.active_plp_reached_end());
+        assert!(client.active_plp_collation().is_none());
+    }
+
     #[test]
     fn normalize_param_name_strips_at_and_uppercases() {
         // A single leading '@' is stripped and the name is ASCII-uppercased, so a
@@ -3152,6 +4301,89 @@ mod tests {
         // Only one leading '@' is stripped.
         assert_eq!(TdsClient::normalize_param_name("@@version"), "@VERSION");
         assert_eq!(TdsClient::normalize_param_name(""), "");
+    }
+
+    #[tokio::test]
+    async fn consume_done_token_captures_all_info_tokens() {
+        let mut client = create_test_client_with_tokens(vec![
+            info_token(5701, 10, "Changed database context to 'master'."),
+            info_token(0, 0, "hello from PRINT"),
+            done_no_more(),
+        ]);
+
+        let rows_affected = client.consume_done_token().await.unwrap();
+
+        assert_eq!(rows_affected, 0);
+        assert_eq!(client.info_messages().len(), 2);
+        assert_eq!(client.info_messages()[0].number, 5701);
+        assert_eq!(client.info_messages()[0].class, 10);
+        assert_eq!(client.info_messages()[1].message, "hello from PRINT");
+
+        let messages = client.take_info_messages();
+        assert_eq!(messages.len(), 2);
+        assert!(client.info_messages().is_empty());
+    }
+
+    #[test]
+    fn begin_command_clears_stale_info_messages() {
+        // Simulates login/connect messages left on the client before a new
+        // command starts. `begin_command` (called at the top of every execute*
+        // entry point) must clear them so `info_messages()` reflects only the
+        // current command.
+        let mut client = create_test_client();
+        client.extend_info_messages(vec![SqlInfoMessage::from(
+            &crate::token::tokens::InfoToken {
+                number: 5701,
+                state: 1,
+                severity: 10,
+                message: "Changed database context to 'master'.".to_string(),
+                server_name: "srv".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            },
+        )]);
+        assert_eq!(client.info_messages().len(), 1);
+
+        client.begin_command();
+        assert!(
+            client.info_messages().is_empty(),
+            "begin_command must clear stale info messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sp_unprepare_clears_stale_info_messages() {
+        // Regression: token-consuming commands beyond the execute*/query family
+        // (here sp_unprepare, which drains via drain_stream) must also reset the
+        // info buffer so a prior command's messages don't leak into this one.
+        let mut client = create_test_client_with_tokens(vec![
+            info_token(0, 0, "unprepare info"),
+            done_no_more(),
+        ]);
+
+        // Stale message left over from an earlier command / login.
+        client.extend_info_messages(vec![SqlInfoMessage {
+            message: "stale from previous command".to_string(),
+            state: 1,
+            class: 10,
+            number: 5701,
+            server_name: None,
+            proc_name: None,
+            line_number: None,
+        }]);
+
+        client.execute_sp_unprepare(1, ()).await.unwrap();
+
+        let msgs = client.info_messages();
+        assert!(
+            msgs.iter()
+                .all(|m| m.message != "stale from previous command"),
+            "stale info from a prior command must be cleared: {msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| m.message == "unprepare info"),
+            "the current command's info should be captured: {msgs:?}"
+        );
     }
 
     // ── finalize_return_value (encrypted RETURNVALUE decryption) tests ──
@@ -3549,9 +4781,9 @@ mod tests {
     /// Seeds a client with stale metadata + a single DONE token, runs `invoke`,
     /// and asserts the no-result-set post-conditions. Failure attribution comes
     /// from the calling test's name.
-    async fn assert_no_result_set_clears_metadata<F>(invoke: F)
+    async fn assert_no_result_set_clears_metadata<F, T>(invoke: F)
     where
-        F: AsyncFnOnce(&mut TdsClient) -> TdsResult<()>,
+        F: AsyncFnOnce(&mut TdsClient) -> TdsResult<T>,
     {
         let mut client = create_test_client_with_tokens(vec![done_no_more()]);
         client.current_metadata = Some(stale_metadata());
@@ -3574,8 +4806,7 @@ mod tests {
     #[tokio::test]
     async fn execute_clears_stale_metadata_when_no_result_set() {
         assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
-            c.execute("INSERT INTO t VALUES (1)".to_string(), None, None)
-                .await
+            c.execute("INSERT INTO t VALUES (1)".to_string(), ()).await
         })
         .await;
     }
@@ -3587,7 +4818,7 @@ mod tests {
         client.current_metadata = Some(Arc::clone(&stale));
 
         client
-            .execute("SELECT 1".to_string(), None, None)
+            .execute("SELECT 1".to_string(), ())
             .await
             .expect("execute should consume COLMETADATA and return Ok");
 
@@ -3605,10 +4836,128 @@ mod tests {
         );
     }
 
+    // ── SQLRowCount plumbing: last_rows_affected capture / reset ──
+
+    #[tokio::test]
+    async fn execute_captures_dml_affected_row_count() {
+        let mut client =
+            create_test_client_with_tokens(vec![done_count(CurrentCommand::Update, 5, false)]);
+        client
+            .execute("UPDATE t SET x = 1".to_string(), ())
+            .await
+            .unwrap();
+        assert_eq!(client.last_rows_affected(), 5);
+    }
+
+    #[tokio::test]
+    async fn execute_reports_no_row_count_for_ddl() {
+        // A DONE without the COUNT flag (DDL / SET NOCOUNT ON) leaves it at -1.
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client
+            .execute("CREATE TABLE t(i int)".to_string(), ())
+            .await
+            .unwrap();
+        assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    #[tokio::test]
+    async fn execute_reports_no_row_count_for_select() {
+        // Landing on COLMETADATA (a forward-only result set) reports -1.
+        let mut client = create_test_client_with_tokens(vec![empty_col_metadata(), done_no_more()]);
+        client.execute("SELECT 1".to_string(), ()).await.unwrap();
+        assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    #[tokio::test]
+    async fn dml_then_select_batch_reports_no_row_count_for_select() {
+        // UPDATE (counted, has_more) then SELECT. Statement-wise, `execute`
+        // lands on the UPDATE (count 7); advancing onto the SELECT's COLMETADATA
+        // must clear that count so SQLRowCount reports -1 for the forward-only
+        // SELECT, not the DML count. (Copilot review AB thread.)
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Update, 7, true),
+            empty_col_metadata(),
+            done_no_more(),
+        ]);
+        client
+            .execute("UPDATE t SET x = 1; SELECT * FROM t".to_string(), ())
+            .await
+            .unwrap();
+        assert_eq!(client.last_rows_affected(), 7);
+        // Advance onto the SELECT: COLMETADATA clears the DML count.
+        client.advance().await.unwrap();
+        assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    #[tokio::test]
+    async fn row_count_resets_between_commands() {
+        // A DML count from one command must not leak into the next command that
+        // reports none. begin_command (on every execute* path) resets it.
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Delete, 4, false),
+            done_no_more(),
+        ]);
+        client
+            .execute("DELETE FROM t".to_string(), ())
+            .await
+            .unwrap();
+        assert_eq!(client.last_rows_affected(), 4);
+        // The second command is a DDL (no count) and must start fresh at -1.
+        client
+            .execute("CREATE TABLE u(i int)".to_string(), ())
+            .await
+            .unwrap();
+        assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    #[tokio::test]
+    async fn multi_dml_batch_captures_each_statement_count() {
+        // A pure-DML batch surfaces one count per statement, in order. Statement-
+        // wise, each count is captured as `execute`/`advance` positions on the
+        // next DML boundary.
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Update, 3, true),
+            done_count(CurrentCommand::Delete, 2, true),
+            done_count(CurrentCommand::Insert, 1, false),
+        ]);
+        client
+            .execute(
+                "UPDATE t SET x=1; DELETE FROM t; INSERT INTO t VALUES (1)".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.last_rows_affected(), 3);
+        client.advance().await.unwrap();
+        assert_eq!(client.last_rows_affected(), 2);
+        client.advance().await.unwrap();
+        assert_eq!(client.last_rows_affected(), 1);
+        assert_eq!(client.take_dml_result_counts(), vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn select_clears_preceding_dml_counts() {
+        // UPDATE (counted, has_more) then SELECT: advancing onto COLMETADATA
+        // clears the buffered DML counts so they are not surfaced for the SELECT.
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Update, 7, true),
+            empty_col_metadata(),
+            done_no_more(),
+        ]);
+        client
+            .execute("UPDATE t SET x=1; SELECT * FROM t".to_string(), ())
+            .await
+            .unwrap();
+        // Statement-wise: execute stops on the UPDATE; advancing onto the
+        // SELECT's COLMETADATA clears the buffered DML counts.
+        client.advance().await.unwrap();
+        assert!(client.take_dml_result_counts().is_empty());
+    }
+
     #[tokio::test]
     async fn execute_stored_procedure_clears_stale_metadata_when_no_result_set() {
         assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
-            c.execute_stored_procedure("dbo.do_work".to_string(), None, None, None, None)
+            c.execute_stored_procedure("dbo.do_work".to_string(), None, None, ())
                 .await
         })
         .await;
@@ -3617,7 +4966,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sp_executesql_clears_stale_metadata_when_no_result_set() {
         assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
-            c.execute_sp_executesql("UPDATE t SET v = 1".to_string(), Vec::new(), None, None)
+            c.execute_sp_executesql("UPDATE t SET v = 1".to_string(), Vec::new(), ())
                 .await
         })
         .await;
@@ -3626,16 +4975,125 @@ mod tests {
     #[tokio::test]
     async fn execute_sp_prepexec_clears_stale_metadata_when_no_result_set() {
         assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
-            c.execute_sp_prepexec("UPDATE t SET v = 1".to_string(), Vec::new(), None, None)
+            c.execute_sp_prepexec("UPDATE t SET v = 1".to_string(), Vec::new(), None, ())
                 .await
         })
         .await;
     }
 
+    // The `@handle` positional parameter of sp_prepexec serializes as:
+    //   0x00  positional name length
+    //   0x01  status flags = BY_REF_VALUE
+    //   0x26  TYPE_INFO type byte = INTN
+    //   0x04  TYPE_INFO max size = 4
+    //   value: length byte then little-endian bytes (length 0x00 for NULL).
+    // These tests pin the byte the current selection controls: `drop_handle`
+    // becomes the input value of that by-reference `@handle`.
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_sends_drop_handle_as_byref_handle_input() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .execute_sp_prepexec(
+                "UPDATE t SET v = 1".to_string(),
+                Vec::new(),
+                Some(0x5152_5354),
+                (),
+            )
+            .await
+            .expect("sp_prepexec should succeed against the queued DONE token");
+
+        let bytes = sent.lock().unwrap().clone();
+        let expected = [0x00, 0x01, 0x26, 0x04, 0x04, 0x54, 0x53, 0x52, 0x51];
+        assert!(
+            bytes.windows(expected.len()).any(|w| w == expected),
+            "Some(handle) must be sent as the by-reference @handle input so the server \
+             drops the prior prepared statement"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_sends_null_handle_when_no_drop_handle() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .execute_sp_prepexec("UPDATE t SET v = 1".to_string(), Vec::new(), None, ())
+            .await
+            .expect("sp_prepexec should succeed against the queued DONE token");
+
+        let bytes = sent.lock().unwrap().clone();
+        let expected_null = [0x00, 0x01, 0x26, 0x04, 0x00];
+        assert!(
+            bytes
+                .windows(expected_null.len())
+                .any(|w| w == expected_null),
+            "None must send a NULL @handle input so the server prepares fresh"
+        );
+    }
+
+    /// Builds an `Int` RETURNVALUE for exercising `push_return_value` directly.
+    /// The column metadata is irrelevant to the capture logic (which only
+    /// inspects the value), so a minimal INT4 descriptor is used.
+    fn int_return_value(ordinal: u16, value: i32) -> ReturnValue {
+        use crate::datatypes::sqldatatypes::{
+            FixedLengthTypes, TdsDataType, TypeInfo, TypeInfoVariant,
+        };
+        use crate::token::tokenitems::ReturnValueStatus;
+
+        ReturnValue {
+            param_ordinal: ordinal,
+            param_name: String::new(),
+            value: ColumnValues::Int(value),
+            column_metadata: Box::new(ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::IntN,
+                type_info: TypeInfo {
+                    tds_type: TdsDataType::IntN,
+                    length: 4,
+                    type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+                },
+                column_name: String::new(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            }),
+            status: ReturnValueStatus::OutputParam,
+        }
+    }
+
+    #[test]
+    fn push_return_value_captures_handle_then_surfaces_following_output_params() {
+        let mut client = create_test_client();
+        client.expecting_prepare_handle = true;
+
+        // First value = the sp_prepexec @handle: captured into the dedicated
+        // field and NOT surfaced as a user output parameter — mirroring
+        // msodbcsql, which routes it to hPrepCurrent, not the output-param path.
+        client.push_return_value(int_return_value(0, 0x0102_0304));
+
+        assert_eq!(client.prepared_statement_handle, Some(0x0102_0304));
+        assert!(!client.expecting_prepare_handle, "flag must be one-shot");
+        assert!(
+            client.return_values.is_empty(),
+            "the internal handle must not appear in return_values"
+        );
+        assert!(client.get_return_values().is_empty());
+
+        // Subsequent values are genuine output params and must be surfaced.
+        client.push_return_value(int_return_value(1, 7));
+        assert_eq!(client.return_values.len(), 1);
+        assert!(matches!(
+            client.return_values[0].value,
+            ColumnValues::Int(7)
+        ));
+
+        // The captured handle stays retrievable independently of return_values.
+        assert_eq!(client.take_prepared_statement_handle(), Some(0x0102_0304));
+    }
+
     #[tokio::test]
     async fn execute_sp_execute_clears_stale_metadata_when_no_result_set() {
         assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
-            c.execute_sp_execute(42, None, None, None, None).await
+            c.execute_sp_execute(42, None, None, ()).await
         })
         .await;
     }
@@ -3707,7 +5165,7 @@ mod tests {
         ];
 
         let (tsql, params_decl) =
-            TdsClient::build_stored_procedure_describe_request("dbo.my_proc", &params)
+            TdsClient::build_stored_procedure_describe_request("dbo.my_proc", &[], &params)
                 .expect("building the describe request should succeed");
 
         assert_eq!(tsql, "EXEC dbo.my_proc @id=@id, @count=@count OUTPUT");
@@ -3715,31 +5173,93 @@ mod tests {
     }
 
     #[test]
-    fn build_sp_describe_request_skips_positional_params() {
+    fn build_sp_describe_request_positional_and_named() {
         use crate::datatypes::sqltypes::SqlType;
         use crate::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 
-        // A positional (unnamed) parameter cannot be referenced by name in the
-        // describe request and must be omitted without disturbing the commas.
-        let params = vec![
-            RpcParameter::new(
-                Some("@a".to_string()),
-                StatusFlags::NONE,
-                SqlType::Int(Some(1)),
-            ),
-            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(2))),
-            RpcParameter::new(
-                Some("@b".to_string()),
-                StatusFlags::NONE,
-                SqlType::BigInt(Some(3)),
-            ),
+        // Positional (unnamed) parameters get synthetic names bound by position
+        // and precede the named parameters, which bind by name.
+        let positional = vec![
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(1))),
+            RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::BigInt(None)),
         ];
+        let named = vec![RpcParameter::new(
+            Some("@b".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(3)),
+        )];
 
         let (tsql, params_decl) =
-            TdsClient::build_stored_procedure_describe_request("proc", &params)
+            TdsClient::build_stored_procedure_describe_request("proc", &positional, &named)
                 .expect("building the describe request should succeed");
 
-        assert_eq!(tsql, "EXEC proc @a=@a, @b=@b");
-        assert_eq!(params_decl, "@a int, @b bigint");
+        assert_eq!(tsql, "EXEC proc @ce_pos_0, @ce_pos_1 OUTPUT, @b=@b");
+        assert_eq!(
+            params_decl,
+            "@ce_pos_0 int, @ce_pos_1 bigint OUTPUT, @b int"
+        );
+    }
+
+    #[test]
+    fn build_sp_describe_request_rejects_synthetic_named_collision() {
+        use crate::datatypes::sqltypes::SqlType;
+        use crate::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let positional = vec![RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::Int(Some(1)),
+        )];
+        let named = vec![RpcParameter::new(
+            Some("@CE_POS_0".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(2)),
+        )];
+
+        let err = TdsClient::build_stored_procedure_describe_request("proc", &positional, &named)
+            .expect_err("synthetic positional name collision should be rejected");
+
+        assert!(matches!(err, UsageError(message) if message.contains("@CE_POS_0")));
+    }
+
+    /// A forced parameter whose row the server omits entirely from the describe
+    /// result must be rejected — not silently sent as plaintext. This is the
+    /// downgrade a describe-driven check (iterating only the server's rows) would
+    /// miss, so the validation iterates the supplied forced parameters instead.
+    #[tokio::test]
+    async fn apply_parameter_encryption_rejects_forced_param_omitted_from_describe() {
+        use crate::datatypes::sqltypes::SqlType;
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+        use crate::security::keystore::{CekCache, ColumnEncryptionKeyStoreProviderRegistry};
+
+        // Server returns an empty describe result: no row for the forced param.
+        let describe = DescribeParameterEncryptionResult::new();
+        let providers = ColumnEncryptionKeyStoreProviderRegistry::new();
+        let cek_cache = CekCache::new();
+        let mut output_param_ceks = HashMap::new();
+
+        let mut forced = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(42)),
+        )
+        .with_force_column_encryption(true);
+        let mut params: Vec<&mut RpcParameter> = vec![&mut forced];
+
+        let err = TdsClient::apply_parameter_encryption(
+            &describe,
+            &providers,
+            &cek_cache,
+            &mut params,
+            &mut output_param_ceks,
+            &[],
+        )
+        .await
+        .expect_err("a forced parameter omitted from the describe result must be rejected");
+
+        assert!(
+            matches!(&err, crate::error::Error::ColumnEncryptionError(message) if message.contains("ForceColumnEncryption")),
+            "expected a ForceColumnEncryption column-encryption error, got: {err}"
+        );
     }
 }

@@ -14,7 +14,7 @@ mod common;
 #[cfg(test)]
 mod vector_integration_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 
@@ -31,18 +31,18 @@ mod vector_integration_tests {
         // Query a simple 3-dimensional vector
         let query = "SELECT CAST('[1.0, 2.0, 3.0]' AS VECTOR(3)) AS VectorColumn";
 
-        client.execute(query.to_string(), None, None).await.unwrap();
+        client.execute(query.to_string(), ()).await.unwrap();
 
         // Get the result set
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             // Verify metadata
-            let columns = resultset.get_metadata();
+            let columns = client.get_metadata();
             assert_eq!(columns.len(), 1);
             assert_eq!(columns[0].column_name, "VectorColumn");
 
             // Read the row
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 assert_eq!(row.len(), 1);
 
@@ -75,31 +75,30 @@ mod vector_integration_tests {
         // Enable preview features before testing
         // TODO: disable once v16 is available in sql server
         client
-            .execute("USE UserDatabase;".to_string(), None, None)
+            .execute("USE UserDatabase;".to_string(), ())
             .await
             .unwrap();
         client
             .execute(
                 "ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
 
         // Query a simple 3-dimensional float16 vector
         let query = "SELECT CAST('[1.0, 2.0, 3.0]' AS VECTOR(3, float16)) AS VectorColumn";
-        client.execute(query.to_string(), None, None).await.unwrap();
+        client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             // Verify metadata
-            let columns = resultset.get_metadata();
+            let columns = client.get_metadata();
             assert_eq!(columns.len(), 1);
             assert_eq!(columns[0].column_name, "VectorColumn");
 
             // Read the row
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 assert_eq!(row.len(), 1);
 
@@ -134,13 +133,11 @@ mod vector_integration_tests {
             CAST('[1.0, 2.0, 3.0]' AS VECTOR(3)) AS NonNullVec,
             CAST(NULL AS VECTOR(3)) AS NullVec";
 
-        client.execute(query.to_string(), None, None).await.unwrap();
+        client.execute(query.to_string(), ()).await.unwrap();
 
-        let resultset = client
-            .get_current_resultset()
-            .expect("Expected a result set");
+        assert!(client.on_rows(), "Expected a result set");
 
-        let metadata = resultset.get_metadata();
+        let metadata = client.get_metadata();
         assert_eq!(metadata.len(), 2);
 
         // Expected metadata values for VECTOR(3), Float32 base type
@@ -177,14 +174,13 @@ mod vector_integration_tests {
 
         // TODO: disable once v16 is available in sql server
         client
-            .execute("USE UserDatabase;".to_string(), None, None)
+            .execute("USE UserDatabase;".to_string(), ())
             .await
             .unwrap();
         client
             .execute(
                 "ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -193,13 +189,11 @@ mod vector_integration_tests {
             CAST('[1.0, 2.0, 3.0]' AS VECTOR(3, float16)) AS NonNullVec,
             CAST(NULL AS VECTOR(3, float16)) AS NullVec";
 
-        client.execute(query.to_string(), None, None).await.unwrap();
+        client.execute(query.to_string(), ()).await.unwrap();
 
-        let resultset = client
-            .get_current_resultset()
-            .expect("Expected a result set");
+        assert!(client.on_rows(), "Expected a result set");
 
-        let metadata = resultset.get_metadata();
+        let metadata = client.get_metadata();
         assert_eq!(metadata.len(), 2);
 
         // Expected metadata values for VECTOR(3, float16), Float16 base type
@@ -233,11 +227,11 @@ mod vector_integration_tests {
 
         let query = "SELECT CAST('[42.5]' AS VECTOR(1)) AS SingleVector";
 
-        client.execute(query.to_string(), None, None).await.unwrap();
+        client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
@@ -266,11 +260,11 @@ mod vector_integration_tests {
             vector_literal
         );
 
-        client.execute(query, None, None).await.unwrap();
+        client.execute(query, ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
@@ -299,14 +293,13 @@ mod vector_integration_tests {
 
         // TODO: disable once v16 is available in sql server
         client
-            .execute("USE UserDatabase;".to_string(), None, None)
+            .execute("USE UserDatabase;".to_string(), ())
             .await
             .unwrap();
         client
             .execute(
                 "ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -319,11 +312,11 @@ mod vector_integration_tests {
             vector_literal
         );
 
-        client.execute(query, None, None).await.unwrap();
+        client.execute(query, ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
@@ -352,11 +345,11 @@ mod vector_integration_tests {
 
         let query = "SELECT CAST(NULL AS VECTOR(3)) AS NullVector";
 
-        client.execute(query.to_string(), None, None).await.unwrap();
+        client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Null => {
@@ -376,11 +369,11 @@ mod vector_integration_tests {
 
         let query = "SELECT CAST('[0.0, -1.0, 1.0, -100.5, 100.5]' AS VECTOR(5)) AS MixedVector";
 
-        client.execute(query.to_string(), None, None).await.unwrap();
+        client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
@@ -410,14 +403,14 @@ mod vector_integration_tests {
             CAST('[3.0, 4.0, 5.0]' AS VECTOR(3)) AS Vec2,
             42 AS IntCol";
 
-        client.execute(query.to_string(), None, None).await.unwrap();
+        client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
-            let columns = resultset.get_metadata();
+        if client.on_rows() {
+            let columns = client.get_metadata();
             assert_eq!(columns.len(), 3);
 
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 assert_eq!(row.len(), 3);
 
@@ -474,17 +467,16 @@ mod vector_integration_tests {
             INSERT INTO #VectorTest VALUES (3, NULL);
         ";
 
-        client.execute(setup.to_string(), None, None).await.unwrap();
+        client.execute(setup.to_string(), ()).await.unwrap();
 
         // Consume setup results
-        while client.move_to_next().await.unwrap() {}
+        while client.advance_to_rows().await.unwrap() {}
 
         // Query the data
         client
             .execute(
                 "SELECT Id, Embedding FROM #VectorTest ORDER BY Id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -492,8 +484,8 @@ mod vector_integration_tests {
         let expected_values = [Some(vec![1.0, 2.0, 3.0]), Some(vec![4.0, 5.0, 6.0]), None];
 
         let mut row_index = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 assert_eq!(row.len(), 2);
 
                 // Check Id
@@ -539,25 +531,24 @@ mod vector_integration_tests {
 
         // TODO: disable once v16 is available in sql server
         client
-            .execute("USE UserDatabase;".to_string(), None, None)
+            .execute("USE UserDatabase;".to_string(), ())
             .await
             .unwrap();
         client
             .execute(
                 "ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
 
         let query = "SELECT CAST(NULL AS VECTOR(3, float16)) AS NullVector";
 
-        client.execute(query.to_string(), None, None).await.unwrap();
+        client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Null => {
@@ -578,14 +569,13 @@ mod vector_integration_tests {
 
         // TODO: disable once v16 is available in sql server
         client
-            .execute("USE UserDatabase;".to_string(), None, None)
+            .execute("USE UserDatabase;".to_string(), ())
             .await
             .unwrap();
         client
             .execute(
                 "ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -602,17 +592,16 @@ mod vector_integration_tests {
             INSERT INTO #MixedVectorTest VALUES (3, NULL, CAST('[3.0, 4.0]' AS VECTOR(2, float16)));
         ";
 
-        client.execute(setup.to_string(), None, None).await.unwrap();
+        client.execute(setup.to_string(), ()).await.unwrap();
 
         // Consume setup results
-        while client.move_to_next().await.unwrap() {}
+        while client.advance_to_rows().await.unwrap() {}
 
         // Query the data
         client
             .execute(
                 "SELECT Id, Vec32, Vec16 FROM #MixedVectorTest ORDER BY Id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -621,8 +610,8 @@ mod vector_integration_tests {
         let expected_v16 = [Some(vec![1.0, 2.0]), None, Some(vec![3.0, 4.0])];
 
         let mut row_index = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 assert_eq!(row.len(), 3);
 
                 // Check Id
@@ -680,11 +669,11 @@ mod vector_integration_tests {
 
         let query = "SELECT CAST('[0.0001, 0.0002, 0.0003]' AS VECTOR(3)) AS SmallVector";
 
-        client.execute(query.to_string(), None, None).await.unwrap();
+        client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
@@ -709,11 +698,11 @@ mod vector_integration_tests {
 
         let query = "SELECT CAST('[123456.79, -987654.3, 0.0]' AS VECTOR(3)) AS LargeVector";
 
-        client.execute(query.to_string(), None, None).await.unwrap();
+        client.execute(query.to_string(), ()).await.unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
@@ -754,13 +743,13 @@ mod vector_integration_tests {
         let params = vec![param];
 
         client
-            .execute_sp_executesql(query.to_string(), params, None, None)
+            .execute_sp_executesql(query.to_string(), params, ())
             .await
             .unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(returned_vector) => {
@@ -799,13 +788,13 @@ mod vector_integration_tests {
         let params = vec![param];
 
         client
-            .execute_sp_executesql(query.to_string(), params, None, None)
+            .execute_sp_executesql(query.to_string(), params, ())
             .await
             .unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 assert_eq!(row.len(), 2);
 
@@ -849,15 +838,10 @@ mod vector_integration_tests {
             INSERT INTO #VectorTest VALUES (3, CAST('[1.0, 2.0, 3.0]' AS VECTOR(3)));
         ";
 
-        client
-            .execute(create_table.to_string(), None, None)
-            .await
-            .unwrap();
+        client.execute(create_table.to_string(), ()).await.unwrap();
 
-        // Consume any result sets from the setup
-        while client.get_current_resultset().is_some() {
-            client.move_to_next().await.unwrap();
-        }
+        // Drain the setup batch to the end (no-row statements included).
+        while client.advance_to_rows().await.unwrap() {}
 
         // Now query with Vector parameter
         let values = vec![1.0f32, 2.0f32, 3.0f32];
@@ -873,15 +857,15 @@ mod vector_integration_tests {
         let params = vec![param];
 
         client
-            .execute_sp_executesql(query.to_string(), params, None, None)
+            .execute_sp_executesql(query.to_string(), params, ())
             .await
             .unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
             let mut found_ids = vec![];
 
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Int(id) => {
@@ -925,13 +909,13 @@ mod vector_integration_tests {
         let params = vec![param];
 
         client
-            .execute_sp_executesql(query.to_string(), params, None, None)
+            .execute_sp_executesql(query.to_string(), params, ())
             .await
             .unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 match &row[0] {
                     ColumnValues::Vector(returned_vector) => {
@@ -980,13 +964,13 @@ mod vector_integration_tests {
         let query = "SELECT @p1 AS Vec1, @p2 AS Vec2";
 
         client
-            .execute_sp_executesql(query.to_string(), params, None, None)
+            .execute_sp_executesql(query.to_string(), params, ())
             .await
             .unwrap();
 
-        if let Some(resultset) = client.get_current_resultset() {
+        if client.on_rows() {
             let mut row_count = 0;
-            while let Some(row) = resultset.next_row().await.unwrap() {
+            while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 assert_eq!(row.len(), 2);
 
@@ -1036,15 +1020,10 @@ mod vector_integration_tests {
             END
         ";
 
-        client
-            .execute(create_proc.to_string(), None, None)
-            .await
-            .unwrap();
+        client.execute(create_proc.to_string(), ()).await.unwrap();
 
-        // Consume result sets from CREATE PROCEDURE
-        while client.get_current_resultset().is_some() {
-            client.move_to_next().await.unwrap();
-        }
+        // Drain the setup batch to the end (no-row statements included).
+        while client.advance_to_rows().await.unwrap() {}
 
         // Call the procedure with output parameter
         let output_param = RpcParameter::new(
@@ -1058,13 +1037,15 @@ mod vector_integration_tests {
                 "#TestVectorOutput".to_string(),
                 None,
                 Some(vec![output_param]),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
 
         // Get output parameter value
+        // Drain to the end of the batch so the output-parameter RETURNVALUE
+        // tokens are collected (they arrive after the proc body's statements).
+        client.advance_to_rows().await.unwrap();
         let output_params = client.retrieve_output_params().unwrap().unwrap();
         assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
 
@@ -1104,15 +1085,10 @@ mod vector_integration_tests {
             END
         ";
 
-        client
-            .execute(create_proc.to_string(), None, None)
-            .await
-            .unwrap();
+        client.execute(create_proc.to_string(), ()).await.unwrap();
 
-        // Consume result sets from CREATE PROCEDURE
-        while client.get_current_resultset().is_some() {
-            client.move_to_next().await.unwrap();
-        }
+        // Drain the setup batch to the end (no-row statements included).
+        while client.advance_to_rows().await.unwrap() {}
 
         // Prepare input and output parameters
         let input_vector = SqlVector::try_from_f32(vec![10.5f32, 20.5f32, 30.5f32]).unwrap();
@@ -1130,17 +1106,14 @@ mod vector_integration_tests {
         ];
 
         client
-            .execute_stored_procedure(
-                "#TestVectorInOut".to_string(),
-                None,
-                Some(params),
-                None,
-                None,
-            )
+            .execute_stored_procedure("#TestVectorInOut".to_string(), None, Some(params), ())
             .await
             .unwrap();
 
         // Get output parameter value
+        // Drain to the end of the batch so the output-parameter RETURNVALUE
+        // tokens are collected (they arrive after the proc body's statements).
+        client.advance_to_rows().await.unwrap();
         let output_params = client.retrieve_output_params().unwrap().unwrap();
         assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
 
@@ -1177,15 +1150,10 @@ mod vector_integration_tests {
             END
         ";
 
-        client
-            .execute(create_proc.to_string(), None, None)
-            .await
-            .unwrap();
+        client.execute(create_proc.to_string(), ()).await.unwrap();
 
-        // Consume result sets from CREATE PROCEDURE
-        while client.get_current_resultset().is_some() {
-            client.move_to_next().await.unwrap();
-        }
+        // Drain the setup batch to the end (no-row statements included).
+        while client.advance_to_rows().await.unwrap() {}
 
         // Call the procedure with output parameter
         let output_param = RpcParameter::new(
@@ -1199,13 +1167,15 @@ mod vector_integration_tests {
                 "#TestVectorOutputNull".to_string(),
                 None,
                 Some(vec![output_param]),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
 
         // Get output parameter value - should be NULL
+        // Drain to the end of the batch so the output-parameter RETURNVALUE
+        // tokens are collected (they arrive after the proc body's statements).
+        client.advance_to_rows().await.unwrap();
         let output_params = client.retrieve_output_params().unwrap().unwrap();
         assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
 
@@ -1245,12 +1215,10 @@ mod vector_integration_tests {
             vector_literal
         );
 
-        client.execute(create_proc, None, None).await.unwrap();
+        client.execute(create_proc, ()).await.unwrap();
 
-        // Consume result sets from CREATE PROCEDURE
-        while client.get_current_resultset().is_some() {
-            client.move_to_next().await.unwrap();
-        }
+        // Drain the setup batch to the end (no-row statements included).
+        while client.advance_to_rows().await.unwrap() {}
 
         // Call the procedure with output parameter
         let output_param = RpcParameter::new(
@@ -1264,13 +1232,15 @@ mod vector_integration_tests {
                 "#TestVectorOutputLarge".to_string(),
                 None,
                 Some(vec![output_param]),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
 
         // Get output parameter value
+        // Drain to the end of the batch so the output-parameter RETURNVALUE
+        // tokens are collected (they arrive after the proc body's statements).
+        client.advance_to_rows().await.unwrap();
         let output_params = client.retrieve_output_params().unwrap().unwrap();
         assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
 

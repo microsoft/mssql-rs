@@ -6,18 +6,19 @@ mod common;
 
 mod connectivity {
 
-    use std::{collections::HashMap, env};
+    use std::{collections::HashMap, env, sync::Arc};
 
+    use azure_core::cloud::{CloudConfiguration, CustomConfiguration};
     use azure_core::credentials::TokenCredential;
+    use azure_core::http::ClientOptions;
     use mssql_tds::connection::client_context::CloneableEntraIdTokenFactory;
 
     use crate::common::{create_context, get_scalar_value, init_tracing};
     use azure_identity::{
-        DefaultAzureCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
-        TokenCredentialOptions,
+        DeveloperToolsCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
     };
     use dotenv::dotenv;
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::EncryptionOptions;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::{
@@ -32,14 +33,7 @@ mod connectivity {
     const SCOPE: &str = "https://database.windows.net/.default";
 
     async fn generate_access_token() -> String {
-        // let azclicred = AzureCliCredential::new();
-
-        let mut credential_options = TokenCredentialOptions::default();
-        credential_options.set_authority_host(
-            "https://login.windows.net/E8F4741A-817A-403A-B28F-200D2B07D656".to_string(),
-        );
-
-        let credential = DefaultAzureCredential::new();
+        let credential = DeveloperToolsCredential::new(None);
 
         let token_response = credential.unwrap().get_token(&[SCOPE], None).await;
 
@@ -53,10 +47,15 @@ mod connectivity {
         sts: String,
         auth_method: &TdsAuthenticationMethod,
     ) -> String {
-        // let azclicred = AzureCliCredential::new();
         let scopes = &[spn.as_ref()];
-        let mut credential_options = TokenCredentialOptions::default();
-        credential_options.set_authority_host(sts);
+        // `CustomConfiguration` is `#[non_exhaustive]`, so it must be built by
+        // mutating a default; the field-reassign lint does not fire on it.
+        let mut custom = CustomConfiguration::default();
+        custom.authority_host = sts;
+        let client_options = ClientOptions {
+            cloud: Some(Arc::new(CloudConfiguration::Custom(custom))),
+            ..Default::default()
+        };
         let token_response = match auth_method {
             TdsAuthenticationMethod::Password => todo!(),
             TdsAuthenticationMethod::SSPI => todo!(),
@@ -66,14 +65,14 @@ mod connectivity {
             TdsAuthenticationMethod::ActiveDirectoryServicePrincipal => todo!(),
             TdsAuthenticationMethod::ActiveDirectoryManagedIdentity => {
                 let options = ManagedIdentityCredentialOptions {
-                    credential_options,
+                    client_options,
                     user_assigned_id: None,
                 };
                 let vm_credential = ManagedIdentityCredential::new(Some(options)).unwrap();
                 vm_credential.get_token(scopes, None).await
             }
             TdsAuthenticationMethod::ActiveDirectoryDefault => {
-                let credential = DefaultAzureCredential::new();
+                let credential = DeveloperToolsCredential::new(None);
                 credential.unwrap().get_token(scopes, None).await
             }
             TdsAuthenticationMethod::ActiveDirectoryMSI => todo!(),
@@ -149,10 +148,10 @@ mod connectivity {
         let connection_result = provider.create_client(context, &datasource, None).await;
         let mut connection = connection_result.unwrap();
         let command = "select 1".to_string();
-        connection.execute(command, None, None).await.unwrap();
+        connection.execute(command, ()).await.unwrap();
 
-        if let Some(resultset) = connection.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if connection.on_rows() {
+            while let Some(row) = connection.next_row().await.unwrap() {
                 for cell in row {
                     print!("{cell:?},");
                 }
@@ -171,10 +170,10 @@ mod connectivity {
         let connection_result = provider.create_client(context, &datasource, None).await;
         let mut connection = connection_result.unwrap();
         let command = "select 1".to_string();
-        connection.execute(command, None, None).await.unwrap();
+        connection.execute(command, ()).await.unwrap();
 
-        if let Some(resultset) = connection.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if connection.on_rows() {
+            while let Some(row) = connection.next_row().await.unwrap() {
                 for cell in row {
                     print!("{cell:?},");
                 }
@@ -222,10 +221,10 @@ mod connectivity {
         let connection_result = provider.create_client(context, &datasource, None).await;
         let mut connection = connection_result.unwrap();
         let command = "select 1".to_string();
-        connection.execute(command, None, None).await.unwrap();
+        connection.execute(command, ()).await.unwrap();
 
-        if let Some(resultset) = connection.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if connection.on_rows() {
+            while let Some(row) = connection.next_row().await.unwrap() {
                 for cell in row {
                     print!("{cell:?},");
                 }
@@ -251,7 +250,7 @@ mod connectivity {
         let command =
             "select host_name from sys.dm_exec_sessions where client_interface_name = 'TdsX'"
                 .to_string();
-        client.execute(command, None, None).await.unwrap();
+        client.execute(command, ()).await.unwrap();
         let col_hostname = get_scalar_value(&mut client).await.unwrap();
         if let Some(column_value) = col_hostname {
             match column_value {
@@ -280,7 +279,7 @@ mod connectivity {
             .await
             .unwrap();
         let command = "select 1".to_string();
-        client.execute(command, None, None).await.unwrap();
+        client.execute(command, ()).await.unwrap();
         let col_hostname = get_scalar_value(&mut client).await.unwrap();
         if let Some(column_value) = col_hostname {
             match column_value {
@@ -315,9 +314,7 @@ mod connectivity {
         async fn get_spid(
             client: &mut mssql_tds::connection::tds_client::TdsClient,
         ) -> Result<i16, Box<dyn std::error::Error>> {
-            client
-                .execute("SELECT @@SPID".to_string(), None, None)
-                .await?;
+            client.execute("SELECT @@SPID".to_string(), ()).await?;
             let value = get_scalar_value(client).await?;
             match value {
                 Some(ColumnValues::SmallInt(spid)) => Ok(spid),
@@ -330,7 +327,7 @@ mod connectivity {
             client: &mut mssql_tds::connection::tds_client::TdsClient,
             query: &str,
         ) -> Result<(), Box<dyn std::error::Error>> {
-            client.execute(query.to_string(), None, None).await?;
+            client.execute(query.to_string(), ()).await?;
             while client.next_row().await?.is_some() {}
             client.close_query().await?;
             Ok(())
@@ -341,7 +338,7 @@ mod connectivity {
             client: &mut mssql_tds::connection::tds_client::TdsClient,
             query: &str,
         ) -> Result<String, Box<dyn std::error::Error>> {
-            client.execute(query.to_string(), None, None).await?;
+            client.execute(query.to_string(), ()).await?;
             let value = get_scalar_value(client).await?;
             match value {
                 Some(ColumnValues::String(s)) => Ok(s.to_string()),
@@ -534,7 +531,7 @@ mod connectivity {
             exec_and_drain(&mut killer, &format!("KILL {}", spid)).await?;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            let result = client.execute("SELECT 1".to_string(), None, None).await;
+            let result = client.execute("SELECT 1".to_string(), ()).await;
             assert!(
                 result.is_err(),
                 "Should fail when connection is dead and transaction is active"
