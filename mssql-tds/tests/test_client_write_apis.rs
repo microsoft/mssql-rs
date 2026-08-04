@@ -312,4 +312,166 @@ mod streamed_plp_write {
         client.close_query().await?;
         Ok(())
     }
+
+    /// Streams a `varchar(max)` value into several rows in sequence, each via its
+    /// own `begin`/chunks/`end` cycle on the same connection, then verifies the
+    /// row count with `SELECT COUNT(*)`. Proves the streamed-write state machine
+    /// resets cleanly between rows so many rows can be written back-to-back.
+    #[tokio::test]
+    async fn stream_varchar_max_multiple_rows_round_trips() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute(
+                "CREATE TABLE #plp_rows (id INT, val VARCHAR(MAX))".to_string(),
+                None,
+                None,
+            )
+            .await?;
+        client.close_query().await?;
+
+        const ROW_COUNT: i32 = 5;
+        for id in 1..=ROW_COUNT {
+            // varchar(max) wire bytes are single-byte encoded; ASCII payload
+            // bytes equal the value's UTF-8 bytes, so stream them directly.
+            let value = format!("row-{id}-").repeat(3_000);
+
+            let streamed = RpcParameter::new(
+                Some("@v".to_string()),
+                StatusFlags::NONE,
+                SqlType::VarcharMax(None),
+            )
+            .data_at_exec();
+
+            let status = client
+                .begin_sp_executesql(
+                    format!("INSERT INTO #plp_rows (id, val) VALUES ({id}, @v)"),
+                    vec![streamed],
+                    None,
+                    None,
+                )
+                .await?;
+            assert!(
+                matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@v")
+            );
+
+            for chunk in value.as_bytes().chunks(4_096) {
+                client.write_streamed_chunk(chunk).await?;
+            }
+            let status = client.end_streamed_param().await?;
+            assert!(matches!(status, StreamedParamStatus::Done));
+            client.close_query().await?;
+        }
+
+        // Every streamed row must be present.
+        client
+            .execute(
+                "SELECT COUNT(*) FROM #plp_rows".to_string(),
+                None,
+                None,
+            )
+            .await?;
+        if let Some(resultset) = client.get_current_resultset() {
+            let row = resultset.next_row().await?.expect("expected a count row");
+            match &row[0] {
+                ColumnValues::Int(count) => assert_eq!(*count, ROW_COUNT),
+                other => panic!("Expected Int for COUNT(*), got {other:?}"),
+            }
+        } else {
+            panic!("expected a result set");
+        }
+        client.close_query().await?;
+
+        // Spot-check the last row's value survived the multi-row stream intact.
+        client
+            .execute(
+                format!("SELECT val FROM #plp_rows WHERE id = {ROW_COUNT}"),
+                None,
+                None,
+            )
+            .await?;
+        if let Some(resultset) = client.get_current_resultset() {
+            let row = resultset.next_row().await?.expect("expected the last row");
+            match &row[0] {
+                ColumnValues::String(s) => {
+                    assert_eq!(s.to_utf8_string(), format!("row-{ROW_COUNT}-").repeat(3_000));
+                }
+                other => panic!("Expected String for varchar(max), got {other:?}"),
+            }
+        } else {
+            panic!("expected a result set");
+        }
+        client.close_query().await?;
+        Ok(())
+    }
+
+    /// A NULL value for a `nvarchar(max)` column round-trips as SQL NULL. NULL is
+    /// never streamed: it is bound directly as a materialized `NVarcharMax(None)`
+    /// value (which serializes to `PLP_NULL`), mirroring how a NULL data-at-exec
+    /// indicator is sent inline without ever requesting streamed data.
+    #[tokio::test]
+    async fn write_null_max_round_trips() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute(
+                "CREATE TABLE #plp_null (id INT, val NVARCHAR(MAX))".to_string(),
+                None,
+                None,
+            )
+            .await?;
+        client.close_query().await?;
+
+        // A NULL max parameter is materialized (value None -> PLP_NULL), so
+        // begin_sp_executesql completes atomically with no NeedData.
+        let null_param = RpcParameter::new(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(None),
+        );
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO #plp_null (id, val) VALUES (1, @v)".to_string(),
+                vec![null_param],
+                None,
+                None,
+            )
+            .await?;
+        assert!(
+            matches!(status, StreamedParamStatus::Done),
+            "a materialized NULL parameter must not request streamed data"
+        );
+        client.close_query().await?;
+
+        client
+            .execute(
+                "SELECT val FROM #plp_null WHERE id = 1".to_string(),
+                None,
+                None,
+            )
+            .await?;
+        if let Some(resultset) = client.get_current_resultset() {
+            let row = resultset.next_row().await?.expect("expected a row");
+            assert!(
+                matches!(&row[0], ColumnValues::Null),
+                "expected SQL NULL, got {:?}",
+                &row[0]
+            );
+        } else {
+            panic!("expected a result set");
+        }
+        client.close_query().await?;
+        Ok(())
+    }
 }

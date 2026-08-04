@@ -951,6 +951,26 @@ mod tests {
         assert_eq!(streamed_header_bytes(&param, false), expected);
     }
 
+    /// A named data-at-execution `varchar(max)` param serializes with the same
+    /// header shape as the other MAX types, using the varchar TYPE_INFO. Covers
+    /// the third streamable type (nvarchar/varchar/varbinary all supported).
+    #[test]
+    fn serialize_data_at_exec_varchar_max_named() {
+        let param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::VarcharMax(None),
+        )
+        .data_at_exec();
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
+        expected.push(StatusFlags::NONE.bits()); // status flags
+        expected.extend_from_slice(&type_info_bytes(&SqlType::VarcharMax(None))); // TYPE_INFO
+        expected.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFEu64.to_le_bytes()); // PLP_UNKNOWN_LEN
+
+        assert_eq!(streamed_header_bytes(&param, false), expected);
+    }
+
     /// A positional data-at-execution param writes a zero-length name byte in
     /// place of the name, then the same status/TYPE_INFO/PLP_UNKNOWN_LEN sequence.
     #[test]

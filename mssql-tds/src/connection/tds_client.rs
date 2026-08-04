@@ -7622,6 +7622,7 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD
     // ── Raw TDS token byte builders (little-endian, matching the real parsers) ──
 
     fn message_token_bytes(
@@ -8096,5 +8097,467 @@ mod tests {
             1,
             "the RETURNVALUE must be surfaced as an output parameter"
         );
+=======
+    // ── Streamed (data-at-execution) PLP parameter write ──
+
+    /// Reassembles the TDS packet stream captured by the mock transport into the
+    /// original contiguous request payload, stripping each 8-byte packet header.
+    fn reassemble_sent(sent: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off < sent.len() {
+            let packet_len = u16::from_be_bytes([sent[off + 2], sent[off + 3]]) as usize;
+            out.extend_from_slice(&sent[off + 8..off + packet_len]);
+            off += packet_len;
+        }
+        out
+    }
+
+    /// The 8-byte little-endian `PLP_UNKNOWN_LEN` sentinel that opens every
+    /// unknown-length PLP value on the wire.
+    const PLP_UNKNOWN_LEN_BYTES: [u8; 8] = [0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+    /// The 4-byte PLP terminator (a zero-length chunk header) that closes a value.
+    const PLP_TERMINATOR_BYTES: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+
+    /// Index of the last occurrence of `needle` in `haystack`, if any.
+    fn find_last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return None;
+        }
+        (0..=haystack.len() - needle.len())
+            .rev()
+            .find(|&i| &haystack[i..i + needle.len()] == needle)
+    }
+
+    /// A data-at-execution `varbinary(max)` parameter template named `name`.
+    /// varbinary keeps chunk bytes raw (no encoding), so tests can assert the
+    /// exact wire bytes they streamed.
+    fn streamed_varbinary(name: &str) -> RpcParameter {
+        RpcParameter::new(
+            Some(name.to_string()),
+            StatusFlags::NONE,
+            SqlType::VarBinaryMax(None),
+        )
+        .data_at_exec()
+    }
+
+    /// A single streamed chunk is framed as `[u32 len][bytes]` and the value is
+    /// then closed with the PLP terminator.
+    #[tokio::test]
+    async fn streamed_write_single_chunk_frames_value_and_terminator() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@v")
+        );
+
+        let chunk = [0xAAu8; 6];
+        client.write_streamed_chunk(&chunk).await.unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(matches!(status, StreamedParamStatus::Done));
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).expect("value opener present");
+        let after = &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..];
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&chunk);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(after, expected.as_slice());
+
+        // The lifecycle is complete: no streamed write remains parked.
+        assert!(matches!(client.streamed_write_state, StreamedWriteState::Idle));
+    }
+
+    /// Multiple chunks are each length-prefixed independently and the value is
+    /// closed by exactly one terminator — the incremental multi-chunk case.
+    #[tokio::test]
+    async fn streamed_write_multiple_chunks_each_length_prefixed_single_terminator() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let chunks: [&[u8]; 3] = [&[0x01, 0x02], &[0x03, 0x04, 0x05], &[0x06]];
+        for c in chunks {
+            client.write_streamed_chunk(c).await.unwrap();
+        }
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let after = &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..];
+
+        let mut expected = Vec::new();
+        for c in chunks {
+            expected.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            expected.extend_from_slice(c);
+        }
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(after, expected.as_slice());
+    }
+
+    /// An empty chunk must be ignored, not written: a zero-length chunk header
+    /// IS the terminator, so emitting one mid-value would truncate the value on
+    /// the server. Protocol-safety analogue of the read-side early-terminator
+    /// test.
+    #[tokio::test]
+    async fn streamed_write_empty_chunk_is_skipped_not_terminator() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        client.write_streamed_chunk(&[0x11, 0x22]).await.unwrap();
+        client.write_streamed_chunk(&[]).await.unwrap(); // must be a no-op
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let after = &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..];
+
+        // Exactly one framed chunk followed by exactly one terminator; the empty
+        // chunk contributed nothing.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[0x11, 0x22]);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(after, expected.as_slice());
+    }
+
+    /// Two data-at-execution parameters advance NeedData(@a) -> NeedData(@b) ->
+    /// Done, and both values are framed in order on the wire.
+    #[tokio::test]
+    async fn streamed_write_two_params_advances_need_data_then_done() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO t(a, b) VALUES (@a, @b)".to_string(),
+                vec![streamed_varbinary("@a"), streamed_varbinary("@b")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@a")
+        );
+
+        let a_value = [0xA1u8; 4];
+        client.write_streamed_chunk(&a_value).await.unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(
+            matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@b")
+        );
+
+        let b_value = [0xB2u8; 5];
+        client.write_streamed_chunk(&b_value).await.unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(matches!(status, StreamedParamStatus::Done));
+
+        // @b is the last streamed param: its opener is the last sentinel, and the
+        // bytes after it are exactly @b's framed value + terminator.
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let b_pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected_b = Vec::new();
+        expected_b.extend_from_slice(&(b_value.len() as u32).to_le_bytes());
+        expected_b.extend_from_slice(&b_value);
+        expected_b.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[b_pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected_b.as_slice()
+        );
+
+        // @a's opener precedes @b's, and its framed value + terminator sits right
+        // after it (followed by @b's parameter header).
+        let a_pos = find_last(&payload[..b_pos], &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected_a = Vec::new();
+        expected_a.extend_from_slice(&(a_value.len() as u32).to_le_bytes());
+        expected_a.extend_from_slice(&a_value);
+        expected_a.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert!(
+            payload[a_pos + PLP_UNKNOWN_LEN_BYTES.len()..].starts_with(&expected_a),
+            "@a's framed value + terminator must immediately follow its opener"
+        );
+        assert!(a_pos < b_pos, "@a must be serialized before @b");
+    }
+
+    /// With no data-at-execution parameter, `begin_sp_executesql` behaves like
+    /// the atomic path: it sends the RPC, consumes the response, and returns
+    /// Done without parking any streamed state.
+    #[tokio::test]
+    async fn begin_without_data_at_exec_delegates_and_returns_done() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO t(id) VALUES (@id)".to_string(),
+                vec![RpcParameter::new(
+                    Some("@id".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(7)),
+                )],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(status, StreamedParamStatus::Done));
+        assert!(matches!(client.streamed_write_state, StreamedWriteState::Idle));
+        assert!(
+            !sent.lock().unwrap().is_empty(),
+            "the atomic RPC should have been sent"
+        );
+    }
+
+    /// Beginning a streamed execution while one is already active is rejected.
+    #[tokio::test]
+    async fn begin_while_stream_active_errors() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .expect_err("cannot begin a second streamed execution while one is active");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// A non-MAX data-at-execution parameter is rejected before any wire I/O, and
+    /// the client is left in the Idle state.
+    #[tokio::test]
+    async fn begin_rejects_non_max_data_at_exec_param() {
+        let mut client = create_test_client_with_tokens(vec![]);
+
+        let bad = RpcParameter::new(
+            Some("@n".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(1)),
+        )
+        .data_at_exec();
+
+        let err = client
+            .begin_sp_executesql("SELECT @n".to_string(), vec![bad], None, None)
+            .await
+            .expect_err("non-max data-at-exec parameter must be rejected");
+        assert!(matches!(err, UsageError(_)));
+        assert!(matches!(client.streamed_write_state, StreamedWriteState::Idle));
+    }
+
+    /// An unnamed data-at-execution parameter is rejected: streamed values must
+    /// be named so `sp_executesql` can match them by name.
+    #[tokio::test]
+    async fn begin_rejects_unnamed_data_at_exec_param() {
+        let mut client = create_test_client_with_tokens(vec![]);
+
+        let bad = RpcParameter::new(None, StatusFlags::NONE, SqlType::VarBinaryMax(None))
+            .data_at_exec();
+
+        let err = client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![bad],
+                None,
+                None,
+            )
+            .await
+            .expect_err("unnamed data-at-exec parameter must be rejected");
+        assert!(matches!(err, UsageError(_)));
+        assert!(matches!(client.streamed_write_state, StreamedWriteState::Idle));
+    }
+
+    /// `write_streamed_chunk` with no active streamed parameter is a usage error.
+    #[tokio::test]
+    async fn write_streamed_chunk_without_active_stream_errors() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let err = client
+            .write_streamed_chunk(&[0x01])
+            .await
+            .expect_err("no active streamed parameter");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// `end_streamed_param` with no active streamed parameter is a usage error.
+    #[tokio::test]
+    async fn end_streamed_param_without_active_stream_errors() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let err = client
+            .end_streamed_param()
+            .await
+            .expect_err("no active streamed parameter");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// Little-endian UTF-16 encoding of `s`, matching how parameter names are
+    /// written on the wire (length-prefixed unicode).
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    /// A materialized (send-now) named parameter and a data-at-execution one may
+    /// be mixed: the materialized value is sent atomically in the RPC prefix and
+    /// the streamed value follows. Offline analogue of the sparse non-PLP + PLP
+    /// e2e test. The materialized name precedes the streamed value opener, and
+    /// the streamed value frames correctly.
+    #[tokio::test]
+    async fn streamed_write_mixes_materialized_and_data_at_exec() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let materialized = RpcParameter::new(
+            Some("@id".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(7)),
+        );
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO t(id, v) VALUES (@id, @v)".to_string(),
+                vec![materialized, streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@v")
+        );
+
+        let value = [0xCDu8; 8];
+        client.write_streamed_chunk(&value).await.unwrap();
+        assert!(matches!(
+            client.end_streamed_param().await.unwrap(),
+            StreamedParamStatus::Done
+        ));
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+
+        // The streamed value opener is the last unknown-length sentinel, and the
+        // materialized parameter's name is serialized before it.
+        let v_pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let id_name = utf16le("@id");
+        let id_pos = find_last(&payload[..v_pos], &id_name)
+            .expect("materialized parameter name must be serialized before the streamed value");
+        assert!(id_pos < v_pos, "@id must precede the streamed @v value");
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&value);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(&payload[v_pos + PLP_UNKNOWN_LEN_BYTES.len()..], expected.as_slice());
+    }
+
+    /// After `begin_sp_executesql` parks the message, the streamed state must
+    /// retain the un-emitted parameters and the collation used to write their
+    /// TYPE_INFO. Analogue of the read side's pause-state-preserves-collation
+    /// test.
+    #[tokio::test]
+    async fn streamed_write_pause_state_preserves_pending_and_collation() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+        let expected_collation = client.negotiated_settings.database_collation;
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(a, b, c) VALUES (@a, @b, @c)".to_string(),
+                vec![
+                    streamed_varbinary("@a"),
+                    streamed_varbinary("@b"),
+                    streamed_varbinary("@c"),
+                ],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        match &client.streamed_write_state {
+            StreamedWriteState::Active(ctx) => {
+                // @a is open for data; @b and @c remain pending, in order.
+                assert_eq!(ctx.pending.len(), 2);
+                assert_eq!(ctx.pending[0].name.as_deref(), Some("@b"));
+                assert_eq!(ctx.pending[1].name.as_deref(), Some("@c"));
+                assert_eq!(ctx.db_collation, expected_collation);
+            }
+            StreamedWriteState::Idle => panic!("streamed write should be Active after begin"),
+        }
+    }
+
+    /// A single chunk larger than the TDS packet payload is split across multiple
+    /// packets on the wire yet reassembles into one contiguous length-prefixed
+    /// value. Analogue of multi-packet incremental reads.
+    #[tokio::test]
+    async fn streamed_write_large_chunk_spans_multiple_packets() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Larger than the mock transport's 4096-byte packet so the value must
+        // span several TDS packets.
+        let big: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        client.write_streamed_chunk(&big).await.unwrap();
+        client.end_streamed_param().await.unwrap();
+
+        // The captured stream is more than one packet.
+        assert!(
+            sent.lock().unwrap().len() > 4096,
+            "a 10 KB value must produce multiple TDS packets"
+        );
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(big.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&big);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(&payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..], expected.as_slice());
+>>>>>>> 7e8c9eb0 (Add streamed PLP write test coverage)
     }
 }
