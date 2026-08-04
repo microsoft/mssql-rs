@@ -474,7 +474,24 @@ unsafe fn pump_sign_in_window(
         let _ = unsafe { ReleaseCapture() };
 
         let mut message = MSG::default();
-        while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
+        // GetMessageW returns >0 for a message, 0 for WM_QUIT, and -1 on error.
+        // `BOOL::as_bool()` is `!= 0`, so it would take the error for a message
+        // and dispatch an uninitialized MSG, spinning here forever while the
+        // caller blocks on this thread's join. msodbcsql tests `> 0`
+        // (`SNI_FedAuth.cpp:474`).
+        loop {
+            let pumped = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
+            if pumped < 0 {
+                let code = unsafe { GetLastError() }.0;
+                error!(
+                    windows_error = code,
+                    "interactive: GetMessageW failed, ending the message pump"
+                );
+                break;
+            }
+            if pumped == 0 {
+                break;
+            }
             let _ = unsafe { TranslateMessage(&message) };
             unsafe { DispatchMessageW(&message) };
         }
