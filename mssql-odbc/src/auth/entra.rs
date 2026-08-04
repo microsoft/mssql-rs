@@ -35,6 +35,7 @@ use azure_identity::{
 use tokio::sync::OnceCell;
 use url::{Position, Url};
 
+#[cfg(windows)]
 use super::interactive::{InteractiveTokenFactory, LOGIN_TIMEOUT_SECS};
 use crate::connection::odbc_authentication_transformer::TransformedAuth;
 use mssql_tds::connection::client_context::{
@@ -204,15 +205,19 @@ pub(super) fn encode_utf16le(s: &str) -> Vec<u8> {
 
 /// Applies the resolved authentication to `context`: sets credentials for
 /// SQL/SSPI, the pre-acquired token for `AccessToken`, or builds and registers
-/// an Entra token factory for service principal / managed identity. For the
-/// factory methods the credentials are captured by the factory and left out of
-/// `context`, so they are never serialized in LOGIN7.
+/// an Entra token factory for service principal / managed identity /
+/// interactive. For the factory methods the credentials are captured by the
+/// factory and left out of `context`, so they are never serialized in LOGIN7.
+///
+/// `server` labels the interactive sign-in window, so it is only read on
+/// Windows, the sole platform with an interactive path.
 ///
 /// Network-free: no token is acquired here. Returns the unsupported method as
 /// `Err` so the caller can surface `HYC00`.
 pub(crate) fn configure_auth(
     context: &mut ClientContext,
     resolved: TransformedAuth,
+    #[cfg_attr(not(windows), allow(unused_variables))] server: &str,
 ) -> Result<(), TdsAuthenticationMethod> {
     // Resolve the method first and only commit it to the context on a supported
     // path, so the context is left untouched when we return `Err`.
@@ -244,27 +249,37 @@ pub(crate) fn configure_auth(
                 Box::new(factory),
             );
         }
+        #[cfg(windows)]
         TdsAuthenticationMethod::ActiveDirectoryInteractive => {
-            // A non-empty UID becomes the `login_hint`; the browser flow presents
-            // msodbcsql's public-client id and stores no secret in the context.
+            // A non-empty UID becomes the sign-in hint and the token-cache key;
+            // no secret is stored in the context.
             let login_hint = (!resolved.user_name.is_empty()).then_some(resolved.user_name);
-            // The browser sign-in (with MFA) can take minutes, far longer than
-            // the default 15s login deadline. Raise the overall login timeout
-            // while leaving `connect_timeout` (the per-TCP-connect cap) at its
-            // default, so an unreachable server still fails fast. An app-set
-            // SQL_ATTR_LOGIN_TIMEOUT (already applied to the context) takes
-            // precedence. Mirrors msodbcsql's separate login vs. connection
-            // timeouts. See AB#46067.
+            // Sign-in involves a human and can take minutes, far longer than the
+            // default 15s login deadline. Raise the overall login timeout while
+            // leaving `connect_timeout` (the per-TCP-connect cap) at its default,
+            // so an unreachable server still fails fast. An app-set
+            // SQL_ATTR_LOGIN_TIMEOUT (already applied to the context) wins.
+            // Mirrors msodbcsql's separate login vs. connection timeouts.
             if context.login_timeout.is_none() {
                 context.login_timeout = Some(LOGIN_TIMEOUT_SECS);
             }
-            // Build the factory with the effective login timeout so the browser
-            // wait is bounded by the same budget as the provider login deadline.
-            let factory = InteractiveTokenFactory::new(login_hint, context.login_timeout);
+            let factory = InteractiveTokenFactory::new(login_hint, server.to_string());
             context.auth_method_map.insert(
                 TdsAuthenticationMethod::ActiveDirectoryInteractive,
                 Box::new(factory),
             );
+        }
+        // msodbcsql has no interactive path off Windows: `SNI_FedAuth` is not
+        // compiled at all (its Makefile omits the translation unit) and the
+        // dispatch site is removed by `#if !defined(XPLAT_ODBC_TODO)`
+        // (`Parse.cpp:3597`). The request lands in the generic `AzureADAuth`
+        // block, whose `authMode` ternary (`:3657-3660`) has no Interactive arm
+        // and so resolves to `AKVCFG_AUTHMODE_INTEGRATED` — a Kerberos attempt
+        // against the STS. Report it as Integrated for the same reason; once
+        // that method is implemented this becomes msodbcsql's behaviour exactly.
+        #[cfg(not(windows))]
+        TdsAuthenticationMethod::ActiveDirectoryInteractive => {
+            return Err(TdsAuthenticationMethod::ActiveDirectoryIntegrated);
         }
         other => return Err(other),
     }
@@ -394,6 +409,15 @@ mod tests {
         }
     }
 
+    /// Applies `resolved` against a stand-in server name; only interactive
+    /// sign-in reads it (for the window title).
+    fn configure(
+        ctx: &mut ClientContext,
+        resolved: TransformedAuth,
+    ) -> Result<(), TdsAuthenticationMethod> {
+        configure_auth(ctx, resolved, "testserver.database.windows.net")
+    }
+
     #[test]
     fn configure_auth_service_principal_hides_credentials() {
         let mut ctx = ClientContext::default();
@@ -402,7 +426,7 @@ mod tests {
             "client-id",
             "top-secret",
         );
-        assert!(configure_auth(&mut ctx, r).is_ok());
+        assert!(configure(&mut ctx, r).is_ok());
         // Neither the client id nor the secret may be serialized in LOGIN7.
         assert!(ctx.user_name.is_empty());
         assert!(ctx.password.is_empty());
@@ -420,7 +444,7 @@ mod tests {
             "",
             "",
         );
-        assert!(configure_auth(&mut ctx, r).is_ok());
+        assert!(configure(&mut ctx, r).is_ok());
         assert!(ctx.user_name.is_empty());
         assert!(
             ctx.auth_method_map
@@ -432,12 +456,13 @@ mod tests {
     fn configure_auth_password_keeps_credentials() {
         let mut ctx = ClientContext::default();
         let r = transformed(TdsAuthenticationMethod::Password, "sa", "pw");
-        assert!(configure_auth(&mut ctx, r).is_ok());
+        assert!(configure(&mut ctx, r).is_ok());
         assert_eq!(ctx.user_name, "sa");
         assert_eq!(ctx.password, "pw");
         assert!(ctx.auth_method_map.is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn configure_auth_interactive_registers_factory() {
         let mut ctx = ClientContext::default();
@@ -447,7 +472,7 @@ mod tests {
             "user@contoso.com",
             "",
         );
-        assert!(configure_auth(&mut ctx, r).is_ok());
+        assert!(configure(&mut ctx, r).is_ok());
         assert!(ctx.user_name.is_empty());
         assert!(ctx.password.is_empty());
         assert!(
@@ -458,14 +483,15 @@ mod tests {
             ctx.tds_authentication_method,
             TdsAuthenticationMethod::ActiveDirectoryInteractive
         );
-        // Interactive raises the overall login deadline so the browser/MFA flow
-        // has time to complete, while leaving the per-TCP-connect cap
-        // (`connect_timeout`) at its default so an unreachable server fails fast.
+        // Interactive raises the overall login deadline so a human has time to
+        // sign in, while leaving the per-TCP-connect cap (`connect_timeout`) at
+        // its default so an unreachable server still fails fast.
         assert_eq!(ctx.login_timeout, Some(LOGIN_TIMEOUT_SECS));
         const { assert!(LOGIN_TIMEOUT_SECS > 15) };
         assert_eq!(ctx.connect_timeout, 15);
     }
 
+    #[cfg(windows)]
     #[test]
     fn configure_auth_interactive_preserves_app_login_timeout() {
         // An app-set SQL_ATTR_LOGIN_TIMEOUT (applied to the context before auth
@@ -477,8 +503,36 @@ mod tests {
             "user@contoso.com",
             "",
         );
-        assert!(configure_auth(&mut ctx, r).is_ok());
+        assert!(configure(&mut ctx, r).is_ok());
         assert_eq!(ctx.login_timeout, Some(60));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn configure_auth_interactive_reports_integrated_off_windows() {
+        // msodbcsql does not compile an interactive path off Windows; the
+        // request falls through its `authMode` ternary (`Parse.cpp:3657-3660`)
+        // to AKVCFG_AUTHMODE_INTEGRATED. Reporting Integrated keeps that
+        // behaviour, and becomes a real Kerberos attempt once that method
+        // lands.
+        let mut ctx = ClientContext::default();
+        let r = transformed(
+            TdsAuthenticationMethod::ActiveDirectoryInteractive,
+            "user@contoso.com",
+            "",
+        );
+        assert_eq!(
+            configure(&mut ctx, r),
+            Err(TdsAuthenticationMethod::ActiveDirectoryIntegrated)
+        );
+        // Nothing is written to the context, and no factory is registered, so
+        // the connection cannot proceed.
+        assert!(ctx.auth_method_map.is_empty());
+        assert!(ctx.login_timeout.is_none());
+        assert_ne!(
+            ctx.tds_authentication_method,
+            TdsAuthenticationMethod::ActiveDirectoryInteractive
+        );
     }
 
     #[test]
@@ -490,7 +544,7 @@ mod tests {
             "",
         );
         assert_eq!(
-            configure_auth(&mut ctx, r),
+            configure(&mut ctx, r),
             Err(TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow)
         );
     }

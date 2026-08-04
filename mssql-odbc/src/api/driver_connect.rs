@@ -245,21 +245,23 @@ fn do_connect(
 
     // Build ClientContext. T1 wired SQL password, integrated (SSPI/GSSAPI), and
     // pre-acquired access tokens; T2 added Entra service principal (secret) and
-    // managed identity; T3 adds interactive (browser) sign-in — all via a token
-    // factory. Methods that still need token acquisition (AD password, device
-    // code, workload identity, default credential, AD integrated) are rejected
-    // with HYC00 until a later tier.
+    // managed identity; T3 adds interactive sign-in (Windows only, matching
+    // msodbcsql) — all via a token factory. Methods that still need token
+    // acquisition (AD password, device code, workload identity, default
+    // credential, AD integrated) are rejected with HYC00 until a later tier.
+    // Off Windows an interactive request is reported as AD integrated, the same
+    // method msodbcsql falls through to there.
     let mut context = ClientContext::default();
     context.database = params.database.clone();
 
     // Apply an app-set SQL_ATTR_LOGIN_TIMEOUT before configuring auth so an
     // explicit login timeout takes precedence over any method-specific default
-    // (e.g. the larger default the interactive browser flow installs).
+    // (e.g. the larger default interactive sign-in installs).
     if let Some(secs) = state.login_timeout {
         context.login_timeout = Some(secs);
     }
 
-    if let Err(method) = configure_auth(&mut context, resolved) {
+    if let Err(method) = configure_auth(&mut context, resolved, &params.server) {
         error!(
             ?method,
             "SQLDriverConnectW: authentication method not implemented"
