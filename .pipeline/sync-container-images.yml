@@ -94,6 +94,11 @@ parameters:
   type: boolean
   default: true
 
+- name: buildKerberosImages
+  displayName: 'Build Kerberos test images (DC, SQL+AD, per-distro clients)'
+  type: boolean
+  default: true
+
 # GitHub Container Registry (GHCR) mirror.
 # To also publish images to GHCR, define a SECRET pipeline variable named
 # GHCR_TOKEN (a GitHub PAT with write:packages), settable at queue time. If
@@ -724,7 +729,7 @@ stages:
 - stage: BuildAndPushImages
   displayName: Build and Push Custom Images
   dependsOn: []
-  condition: or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true'))
+  condition: or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true'), eq('${{ parameters.buildKerberosImages }}', 'true'))
   jobs:
   - job: BuildX64Images
     displayName: Build x64 Images
@@ -842,6 +847,76 @@ stages:
             docker push tdslibrs.azurecr.io/build/ubuntu:latest-x64
             docker push tdslibrs.azurecr.io/build/alpine:3.18-amd64
           fi
+
+  - job: BuildKerberosImages
+    displayName: Build Kerberos Test Images
+    timeoutInMinutes: 120
+    condition: eq('${{ parameters.buildKerberosImages }}', 'true')
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - checkout: self
+      displayName: Checkout repository
+
+    - task: AzureCLI@2
+      displayName: 'Build and push Kerberos infrastructure images'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -euo pipefail
+          cd $(Build.SourcesDirectory)/kerberos-test
+          az acr login --name $(ACR_NAME)
+
+          echo "==> Building Samba AD DC image..."
+          docker build -f Dockerfile.samba-dc \
+            -t $(ACR_REGISTRY)/kerberos/samba-dc:latest .
+          docker push $(ACR_REGISTRY)/kerberos/samba-dc:latest
+
+          echo "==> Building SQL Server + AD image..."
+          docker build -f Dockerfile.mssql-ad \
+            -t $(ACR_REGISTRY)/kerberos/mssql-ad:latest .
+          docker push $(ACR_REGISTRY)/kerberos/mssql-ad:latest
+
+    - task: AzureCLI@2
+      displayName: 'Build and push Kerberos client images (all distros)'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -euo pipefail
+          cd $(Build.SourcesDirectory)/kerberos-test
+          az acr login --name $(ACR_NAME)
+
+          # profile|base image|entry script - must stay in sync with
+          # kerberos-test/docker-compose-matrix.yml
+          PROFILES="
+          alpine318|$(ACR_REGISTRY)/import/alpine:3.18|alpine.sh
+          alpine319|$(ACR_REGISTRY)/import/alpine:3.19|alpine.sh
+          alpine320|$(ACR_REGISTRY)/import/alpine:3.20|alpine.sh
+          alpine321|$(ACR_REGISTRY)/import/alpine:3.21|alpine.sh
+          debian|$(ACR_REGISTRY)/import/debian:bookworm|deb-bookworm.sh
+          ubuntu22|$(ACR_REGISTRY)/import/ubuntu:22.04|deb-bookworm.sh
+          ubuntu24|$(ACR_REGISTRY)/import/ubuntu:24.04|deb-bookworm.sh
+          rhel9|$(ACR_REGISTRY)/import/redhat/ubi9:latest|rhel.sh
+          oracle9|$(ACR_REGISTRY)/import/oraclelinux:9|rhel.sh
+          "
+
+          echo "$PROFILES" | while IFS='|' read -r profile base entry; do
+            [ -z "$profile" ] && continue
+            tag="$(ACR_REGISTRY)/kerberos/client:${profile}-latest"
+            echo "==> Building $profile from $base"
+            docker build -f Dockerfile.client.matrix \
+              --build-arg BASE_IMAGE="$base" \
+              --build-arg ENTRY_SCRIPT="$entry" \
+              -t "$tag" .
+            docker push "$tag"
+            echo "✅ $tag"
+          done
 
   - job: BuildARM64Images
     displayName: Build ARM64 Images
@@ -1033,6 +1108,7 @@ stages:
     dependsOn:
     - BuildX64Images
     - BuildARM64Images
+    - BuildKerberosImages
     - CreateMultiArchManifests
     condition: always()
     pool:
@@ -1221,6 +1297,17 @@ stages:
         python-build/manylinux_2_28_aarch64_rust:latest
         build/ubuntu:22.04
         build/alpine:3.18
+        kerberos/samba-dc:latest
+        kerberos/mssql-ad:latest
+        kerberos/client:alpine318-latest
+        kerberos/client:alpine319-latest
+        kerberos/client:alpine320-latest
+        kerberos/client:alpine321-latest
+        kerberos/client:debian-latest
+        kerberos/client:ubuntu22-latest
+        kerberos/client:ubuntu24-latest
+        kerberos/client:rhel9-latest
+        kerberos/client:oracle9-latest
         import/debian:bookworm
         import/debian:bullseye
         import/debian:trixie

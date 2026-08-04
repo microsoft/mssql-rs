@@ -1,4 +1,6 @@
 # Parameterized Kerberos test client
+# Pre-built per profile by .pipeline/sync-container-images.yml and published as
+# kerberos/client:<profile>-latest.
 # Usage: docker build --build-arg BASE_IMAGE=tdslibrs.azurecr.io/import/alpine:3.18 \
 #                     --build-arg ENTRY_SCRIPT=alpine.sh \
 #                     -f Dockerfile.client.matrix .
@@ -42,6 +44,14 @@ RUN if [ -f /etc/alpine-release ]; then \
 # Install Rust
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Pre-install cargo-nextest. Without this, run-kerberos-tests.sh compiles it
+# from source inside every client container on every CI run.
+ARG NEXTEST_VERSION=0.9.99
+RUN if [ -f /etc/alpine-release ]; then NEXTEST_PLATFORM=linux-musl; else NEXTEST_PLATFORM=linux; fi \
+    && curl -LsSf "https://get.nexte.st/${NEXTEST_VERSION}/${NEXTEST_PLATFORM}" \
+        | tar zxf - -C /root/.cargo/bin \
+    && cargo nextest --version
 
 # Install go-sqlcmd for debugging (optional, skip if it fails on some platforms)
 RUN curl -sSL -o /tmp/sqlcmd.tar.bz2 "https://github.com/microsoft/go-sqlcmd/releases/download/v1.8.0/sqlcmd-linux-amd64.tar.bz2" 2>/dev/null \

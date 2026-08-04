@@ -21,6 +21,7 @@ services:
       - KERBEROS_ADMIN_PASSWORD=${KERBEROS_ADMIN_PASSWORD}
     volumes:
       - samba-data:/var/lib/samba
+      - ./scripts:/scripts:ro
     networks:
       kerberos-net:
         ipv4_address: 172.20.0.10
