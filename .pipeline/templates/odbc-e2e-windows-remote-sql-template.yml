@@ -1,0 +1,96 @@
+# Template: odbc-e2e-windows-remote-sql-template.yml
+#
+# Runs the mssql-odbc C++ gtest e2e suite on a Windows agent that has no local
+# SQL Server, against the cross-pool x64 SQL host booted by sql-host-template.yml.
+#
+# The Windows ARM agent image ships no SQL Server (unlike RUST-Win22-Sql25-1P used
+# by Build_Windows), so the ARM job joins the same artifact-sentinel rendezvous the
+# Linux ARM jobs use: derive the shared SA password, poll for the sql-ready
+# endpoint sentinel, run the suite, then publish a teardown sentinel to release
+# the host. See sql-host-template.yml for the full contract.
+#
+# Caller contract:
+#   * The consuming job must NOT add `dependsOn` on the SQL host job.
+#   * `sentinelName` must be listed in that host's `expectedSentinels`.
+#   * The host is PR-only (jobCondition), so these steps are PR-only too.
+
+parameters:
+  - name: sqlReadyInstanceId
+    # instanceId of the sql-ready sentinel to consume.
+    type: string
+    default: 'build_arm'
+  - name: sentinelName
+    # Teardown sentinel this job publishes to release the SQL host.
+    type: string
+  - name: testRunTitle
+    type: string
+    default: 'ODBC e2e (Windows ARM)'
+  - name: retries
+    type: number
+    default: 3
+
+steps:
+  - pwsh: ./.pipeline/scripts/sql-host/New-SqlPassword.ps1
+    displayName: 'Derive shared SQL_PASSWORD from build context'
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      BUILD_BUILDID: $(Build.BuildId)
+      SYSTEM_COLLECTIONID: $(System.CollectionId)
+
+  - pwsh: ./.pipeline/scripts/sql-host/Wait-ForSqlEndpoint.ps1
+    displayName: 'Wait for SQL host endpoint sentinel'
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      ARTIFACT_NAME: 'sql-ready-${{ parameters.sqlReadyInstanceId }}-$(System.StageAttempt)'
+      BUILD_BUILDID: $(Build.BuildId)
+      SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+      SYSTEM_TEAMPROJECT: $(System.TeamProject)
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      SYSTEM_STAGEATTEMPT: $(System.StageAttempt)
+      AGENT_TEMPDIRECTORY: $(Agent.TempDirectory)
+
+  # No -Coverage here: the x64 Windows leg already publishes
+  # CoberturaCoverageOdbcE2E_Windows, and a second artifact under the same name
+  # would collide. This leg exists to prove the ARM64 driver binary works through
+  # the Windows Driver Manager.
+  - pwsh: |
+      $env:ODBC_TEST_SERVER     = "$($env:DB_HOST),$($env:DB_PORT)"
+      $env:ODBC_TEST_UID        = 'sa'
+      $env:ODBC_TEST_PWD        = $env:SQL_PASSWORD
+      $env:ODBC_TEST_TRUST_CERT = 'Yes'
+      ./mssql-odbc/tests/e2e/run_e2e.ps1 -Retries ${{ parameters.retries }}
+    displayName: 'Run ODBC C++ e2e tests'
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      DB_HOST: $(DB_HOST)
+      DB_PORT: $(DB_PORT)
+      SQL_PASSWORD: $(SQL_PASSWORD)
+      RUST_BACKTRACE: full
+
+  - task: PublishTestResults@2
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: 'Publish ODBC e2e test results'
+    inputs:
+      testResultsFormat: 'JUnit'
+      testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
+      testRunTitle: ${{ parameters.testRunTitle }}
+
+  # always() so a failure or cancellation still releases the SQL host instead of
+  # leaving it to burn its MAX_LIFETIME_MINUTES cap.
+  - pwsh: |
+      $dir = Join-Path $env:AGENT_TEMPDIRECTORY 'teardown-${{ parameters.sentinelName }}'
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+      "${{ parameters.sentinelName }} done at $([DateTime]::UtcNow.ToString('o'))" |
+        Set-Content -Path (Join-Path $dir 'done.txt')
+    displayName: 'Stage teardown sentinel'
+    condition: and(always(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      AGENT_TEMPDIRECTORY: $(Agent.TempDirectory)
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish teardown sentinel (release SQL host)'
+    condition: and(always(), eq(variables['Build.Reason'], 'PullRequest'))
+    inputs:
+      targetPath: '$(Agent.TempDirectory)/teardown-${{ parameters.sentinelName }}'
+      artifact: '${{ parameters.sentinelName }}-$(System.StageAttempt)'
+      publishLocation: 'pipeline'
