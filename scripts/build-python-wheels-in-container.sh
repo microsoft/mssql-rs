@@ -107,8 +107,8 @@ for PY_VERSION in "${PYTHON_VERSIONS[@]}"; do
         SYM_DEST="$SYMBOLS_OUTPUT_DIR/$PY_TAG"
         mkdir -p "$SYM_DEST"
 
-        if ! command -v objcopy &> /dev/null; then
-            echo "❌ ERROR: objcopy (binutils) not found; cannot split debug info."
+        if ! command -v objcopy &> /dev/null || ! command -v readelf &> /dev/null; then
+            echo "❌ ERROR: binutils (objcopy/readelf) not found; cannot split debug info."
             exit 1
         fi
         $FIRST_PYTHON -m pip show wheel &> /dev/null || $FIRST_PYTHON -m pip install --quiet wheel
