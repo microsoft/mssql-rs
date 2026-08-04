@@ -114,7 +114,7 @@ impl InteractiveTokenFactory {
 
         let ui_thread_id = Arc::new(super::msqa::UiThreadId::default());
         let cancel_on_drop = CancelUiOnDrop {
-            ui_thread_id: Arc::clone(&ui_thread_id),
+            ui_thread_id: Some(Arc::clone(&ui_thread_id)),
         };
 
         let result = spawn_acquisition(move || {
@@ -165,25 +165,30 @@ impl EntraIdTokenFactory for InteractiveTokenFactory {
 /// Closes an in-flight sign-in window if the acquisition future is dropped —
 /// which is what happens when the connection's login deadline expires.
 struct CancelUiOnDrop {
-    ui_thread_id: Arc<super::msqa::UiThreadId>,
+    /// Cleared by [`Self::disarm`]. An `Option` rather than `mem::forget`, so
+    /// suppressing cancellation still releases the `Arc`.
+    ui_thread_id: Option<Arc<super::msqa::UiThreadId>>,
 }
 
 impl CancelUiOnDrop {
     /// Suppresses cancellation after the acquisition has already returned.
-    fn disarm(self) {
-        std::mem::forget(self);
+    fn disarm(mut self) {
+        self.ui_thread_id = None;
     }
 }
 
 impl Drop for CancelUiOnDrop {
     fn drop(&mut self) {
-        super::msqa::cancel_ui(&self.ui_thread_id);
+        if let Some(ui_thread_id) = &self.ui_thread_id {
+            super::msqa::cancel_ui(ui_thread_id);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::msqa::UiThreadId;
 
     #[test]
     fn client_id_matches_msodbcsql() {
@@ -242,5 +247,33 @@ mod tests {
             .block_on(spawn_acquisition(|| Ok("token".to_string())))
             .expect("the step succeeded");
         assert_eq!(token, "token");
+    }
+
+    #[test]
+    fn disarming_releases_the_thread_id_instead_of_leaking_it() {
+        let ui_thread_id = Arc::new(UiThreadId::default());
+        let canceller = CancelUiOnDrop {
+            ui_thread_id: Some(Arc::clone(&ui_thread_id)),
+        };
+        assert_eq!(Arc::strong_count(&ui_thread_id), 2);
+
+        canceller.disarm();
+
+        assert_eq!(
+            Arc::strong_count(&ui_thread_id),
+            1,
+            "disarming must drop the Arc, not forget it"
+        );
+    }
+
+    #[test]
+    fn dropping_an_armed_canceller_releases_the_thread_id() {
+        // No window is open, so `cancel_ui` is a no-op; this covers the arm that
+        // does run cancellation still tidying up after itself.
+        let ui_thread_id = Arc::new(UiThreadId::default());
+        drop(CancelUiOnDrop {
+            ui_thread_id: Some(Arc::clone(&ui_thread_id)),
+        });
+        assert_eq!(Arc::strong_count(&ui_thread_id), 1);
     }
 }
