@@ -10,7 +10,7 @@ mod transport_protocols {
     use mssql_tds::connection::client_context::ClientContext;
     #[cfg(windows)]
     use mssql_tds::connection::client_context::TdsAuthenticationMethod;
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
     use std::env;
@@ -102,18 +102,18 @@ mod transport_protocols {
     /// Execute a simple query and verify we get results
     async fn test_simple_query(client: &mut TdsClient) -> TdsResult<()> {
         let query = "SELECT @@VERSION AS version";
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         let mut has_results = false;
         loop {
-            if let Some(resultset) = client.get_current_resultset() {
+            if client.on_rows() {
                 has_results = true;
-                while let Some(_row) = resultset.next_row().await? {
+                while let Some(_row) = client.next_row().await? {
                     // We got at least one row, which is what we expect
                 }
             }
 
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -479,14 +479,15 @@ mod transport_protocols {
 
         for query in queries {
             println!("Executing: {query}");
-            client.execute(query.to_string(), None, None).await?;
+            client.execute(query.to_string(), ()).await?;
 
-            while let Some(resultset) = client.get_current_resultset() {
-                while let Some(_row) = resultset.next_row().await? {}
+            if client.on_rows() {
+                while let Some(_row) = client.next_row().await? {}
             }
 
-            if client.move_to_next().await? {
-                // Process any additional result sets
+            while client.advance_to_rows().await? {
+                // Drain any additional result sets
+                while let Some(_row) = client.next_row().await? {}
             }
 
             client.close_query().await?;

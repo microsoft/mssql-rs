@@ -304,6 +304,20 @@ pub unsafe extern "C" fn SQLExecDirectW(
     unsafe { super::exec_direct::sql_exec_direct_w(statement_handle, statement_text, text_length) }
 }
 
+/// Returns information about the data types supported by the data source as an
+/// open result set (fetchable via `SQLFetch` / `SQLGetData`).
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetTypeInfoW(
+    statement_handle: SqlHandle,
+    data_type: SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe { super::get_type_info::sql_get_type_info_w(statement_handle, data_type) }
+}
+
 /// Executes a prepared statement using the current bound parameter values.
 ///
 /// # Safety
@@ -418,23 +432,20 @@ pub unsafe extern "C" fn SQLMoreResults(statement_handle: SqlHandle) -> SqlRetur
     unsafe { super::more_results::sql_more_results(statement_handle) }
 }
 
-// ---- Result set processing (TO-BE-IMPLEMENTED) --------------------------------
+// ---- Result set processing --------------------------------------------------
 
 /// Returns the row count from the last INSERT, UPDATE, or DELETE statement.
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle.
-/// - `row_count_ptr` must be a valid, writable pointer to [`i64`].
+/// - `row_count_ptr` must be a valid, writable pointer to [`SqlLen`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLRowCount(
-    _statement_handle: SqlHandle,
-    row_count_ptr: *mut i64,
+    statement_handle: SqlHandle,
+    row_count_ptr: *mut SqlLen,
 ) -> SqlReturn {
     crate::init_tracing();
-    if !row_count_ptr.is_null() {
-        unsafe { *row_count_ptr = 0 };
-    }
-    SQL_SUCCESS
+    unsafe { super::row_count::sql_row_count(statement_handle, row_count_ptr) }
 }
 
 // ---- Attribute management (TO-BE-IMPLEMENTED) --------------------------------
@@ -499,13 +510,20 @@ pub unsafe extern "C" fn SQLGetConnectAttrW(
 /// - `string_length` is used only for string-type attributes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLSetStmtAttrW(
-    _statement_handle: SqlHandle,
-    _attribute: SqlInteger,
-    _value_ptr: SqlPointer,
-    _string_length: SqlInteger,
+    statement_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    string_length: SqlInteger,
 ) -> SqlReturn {
     crate::init_tracing();
-    SQL_SUCCESS
+    unsafe {
+        super::set_stmt_attr::sql_set_stmt_attr_w(
+            statement_handle,
+            attribute,
+            value_ptr,
+            string_length,
+        )
+    }
 }
 
 /// Retrieves a statement attribute.
@@ -516,14 +534,22 @@ pub unsafe extern "C" fn SQLSetStmtAttrW(
 /// - Output pointers must be valid and writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLGetStmtAttrW(
-    _statement_handle: SqlHandle,
-    _attribute: SqlInteger,
-    _value_ptr: SqlPointer,
-    _buffer_length: SqlInteger,
-    _string_length_ptr: *mut SqlInteger,
+    statement_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
     crate::init_tracing();
-    SQL_SUCCESS
+    unsafe {
+        super::set_stmt_attr::sql_get_stmt_attr_w(
+            statement_handle,
+            attribute,
+            value_ptr,
+            buffer_length,
+            string_length_ptr,
+        )
+    }
 }
 
 // ---- Descriptor and parameter management (TO-BE-IMPLEMENTED) -----------------

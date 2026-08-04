@@ -41,4 +41,10 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+# Enable the `test-util` feature on mssql-tds so unit tests can build a
+# `TdsClient` driven by scripted TDS tokens (see `mssql_tds::test_client_support`)
+# to cover client-driven ODBC paths without a live server.
+mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
+
 [build-dependencies]

@@ -323,7 +323,8 @@ impl PyMockTdsServer {
 
 /// Python module for mock TDS server bindings
 #[pymodule]
-fn mssql_mock_tds_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pyo3(name = "mssql_mock_tds")]
+fn mssql_mock_tds_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMockTdsServer>()?;
     m.add_class::<PyConnectionInfo>()?;
     Ok(())

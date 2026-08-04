@@ -1,0 +1,42 @@
+# filepath: .pipeline/templates/build-odbc-alpine-template.yml
+#
+# Build the mssql-odbc driver + C++ gtest e2e binaries once inside the Alpine
+# (musl) build container and publish them as a pipeline artifact, so downstream
+# Test_odbc_alpine* stages can download and rerun the prebuilt binaries in many
+# Alpine versions (run_e2e.sh --skip-build) instead of rebuilding per container.
+#
+# CI (non-PR) only, mirroring build-odbc-template.yml (the glibc variant).
+
+parameters:
+  # 'x64' or 'ARM64' - selects the build pool the surrounding job runs on.
+  - name: architecture
+    type: string
+  # Pipeline artifact name, e.g. 'Odbc_Musl_x64' / 'Odbc_Musl_arm64'.
+  - name: artifactName
+    type: string
+  # Alpine (musl) build container image (multi-arch).
+  - name: buildImage
+    type: string
+    default: 'ghcr.io/microsoft/mssql-rs/build/alpine:3.18'
+
+steps:
+  - script: |
+      set -e
+      bash .pipeline/scripts/docker-cargo-run.sh --rm \
+        -v "$PWD:/workspace" \
+        -e ODBC_DROP_DIR=/workspace/odbc-drop \
+        -w /workspace \
+        ${{ parameters.buildImage }} \
+        /workspace/scripts/dockerentry/alpine-odbc-build.sh
+    displayName: 'Build ODBC driver + e2e binaries musl (${{ parameters.architecture }})'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    env:
+      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish ${{ parameters.artifactName }}'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)/odbc-drop'
+      artifact: ${{ parameters.artifactName }}

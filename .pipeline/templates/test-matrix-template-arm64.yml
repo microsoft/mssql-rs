@@ -42,18 +42,25 @@ parameters:
   - name: maxLifetimeMinutes
     type: number
     default: 120
+  - name: manageSqlHost
+    # When false, the caller (stage) owns the shared SQL host so it can be
+    # shared with another matrix (e.g. the ODBC arm64 matrix in the same stage);
+    # this template then only emits the test job, which consumes sql-ready-shared.
+    type: boolean
+    default: true
 
 jobs:
   # ------------------------------------------------------------------
   # SHARED MODE: one SQL host + one matrix test job.
   # ------------------------------------------------------------------
   - ${{ if eq(parameters.sqlInstanceMode, 'shared') }}:
-    - template: sql-host-template.yml
-      parameters:
-        instanceId: shared
-        sqlImageTag: ${{ parameters.sqlImageTag }}
-        maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
-        expectedSentinels: ${{ join(',', parameters.targets.*.name) }}
+    - ${{ if parameters.manageSqlHost }}:
+      - template: sql-host-template.yml
+        parameters:
+          instanceId: shared
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
+          expectedSentinels: ${{ join(',', parameters.targets.*.name) }}
 
     - job: Test_Matrix_arm64
       displayName: Linux arm64

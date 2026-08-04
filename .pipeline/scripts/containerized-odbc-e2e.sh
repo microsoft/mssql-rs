@@ -11,6 +11,8 @@
 #
 # Connection details are passed via ODBC_TEST_* env vars by the caller.
 # ODBC_E2E_RETRIES controls the ctest until-pass retry count (default 3).
+# ODBC_E2E_COVERAGE=1 builds the driver instrumented and emits a Cobertura
+# report (x64 Linux PR builds only).
 
 set -euo pipefail
 
@@ -21,4 +23,15 @@ apt-get update
 apt-get install -y --no-install-recommends cmake unixodbc-dev
 rm -rf /var/lib/apt/lists/*
 
-exec /workspace/mssql-odbc/tests/e2e/run_e2e.sh --retries="${ODBC_E2E_RETRIES:-3}"
+# When ODBC_E2E_COVERAGE=1 (x64 Linux PR builds), build the driver with LLVM
+# instrumentation and emit a Cobertura report to the mounted workspace target/
+# dir so the host agent can publish it as CoberturaCoverageOdbcE2E_Linux. The
+# cargo-llvm-cov + llvm-tools this needs already ship in the build image.
+coverage_args=()
+case "$(printf '%s' "${ODBC_E2E_COVERAGE:-0}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes)
+        coverage_args+=(--coverage=/workspace/target/cobertura-odbc-e2e.xml)
+        ;;
+esac
+
+exec /workspace/mssql-odbc/tests/e2e/run_e2e.sh --retries="${ODBC_E2E_RETRIES:-3}" "${coverage_args[@]}"

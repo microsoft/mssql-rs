@@ -235,7 +235,7 @@ fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &Dbc
     for handle in handles {
         if let Err(e) = dbc
             .runtime
-            .block_on(client.execute_sp_unprepare(handle, None, None))
+            .block_on(client.execute_sp_unprepare(handle, ()))
         {
             error!(%e, handle, "SQLFreeHandle(STMT): sp_unprepare failed — handle leaked until disconnect");
         }

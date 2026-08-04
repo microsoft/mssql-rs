@@ -24,7 +24,7 @@ mod ssrp_local {
     use std::env;
 
     use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
     use mssql_tds::datatypes::column_values::ColumnValues;
@@ -64,17 +64,17 @@ mod ssrp_local {
 
         // Validate the connection works and we reached the right instance
         let query = "SELECT @@SERVICENAME AS instance_name";
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         let mut instance_name = String::new();
         loop {
-            if let Some(rs) = client.get_current_resultset()
-                && let Some(row) = rs.next_row().await?
+            if client.on_rows()
+                && let Some(row) = client.next_row().await?
                 && let ColumnValues::String(s) = &row[0]
             {
                 instance_name = s.to_utf8_string();
             }
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -106,17 +106,17 @@ mod ssrp_local {
         let mut client = connect_ssrp_integrated(&datasource).await?;
 
         let query = "SELECT @@SERVICENAME AS instance_name";
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         let mut instance_name = String::new();
         loop {
-            if let Some(rs) = client.get_current_resultset()
-                && let Some(row) = rs.next_row().await?
+            if client.on_rows()
+                && let Some(row) = client.next_row().await?
                 && let ColumnValues::String(s) = &row[0]
             {
                 instance_name = s.to_utf8_string();
             }
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
