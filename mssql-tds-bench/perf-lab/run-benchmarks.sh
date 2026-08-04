@@ -353,6 +353,28 @@ offender_hits() { awk -v id="$1" '$1 == id { c++ } END { print c + 0 }' "$TALLY_
 # Per-offender worst candidate ratio among the re-runs it tripped ("" if none).
 offender_worst() { awk -v id="$1" '$1 == id && $2 + 0 > w { w = $2 + 0 } END { if (w > 0) print w }' "$TALLY_FILE"; }
 
+# Candidate/base ratio for a benchmark id in a critcmp file ("" if absent).
+ratio_in_file() { awk -v id="$1" '$1 == id && $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ { print $6 / $2; exit }' "$2"; }
+# Median of the numbers read on stdin.
+median_stdin() { sort -n | awk '{ v[NR] = $1 } END { if (NR == 0) exit; if (NR % 2) print v[(NR + 1) / 2]; else print (v[NR / 2] + v[NR / 2 + 1]) / 2 }'; }
+
+# Reconcile each offender's headline number with the gate: replace its
+# (possibly anomalous) first-pass ratio with the MEDIAN of {main run + all
+# re-runs}, so the chart matches the majority decision instead of the one-off
+# spike. Only offenders are re-measured, so only they are reconciled; the raw
+# critcmp block in the summary keeps the untouched first-pass data.
+MEDIANS_FILE="$RESULTS_DIR/offender-medians.txt"
+: > "$MEDIANS_FILE"
+for id in $OFFENDERS; do
+    med=$(
+        {
+            ratio_in_file "$id" "$RESULTS_DIR/comparison.txt"
+            for run in $(seq 1 "$CONFIRM_RUNS"); do ratio_in_file "$id" "$RESULTS_DIR/confirm-run${run}.txt"; done
+        } | grep -E '^[0-9.]+$' | median_stdin
+    ) || med=""
+    if [ -n "$med" ]; then printf '%s %s\n' "$id" "$med" >> "$MEDIANS_FILE"; fi
+done
+
 # --- Verdict (based on the majority-confirmed regressions) ---
 THR="${BENCH_REGRESSION_RATIO:-1.10}"
 PCT=$(awk -v t="$THR" 'BEGIN { printf "%d", (t - 1) * 100 + 0.5 }')
@@ -373,10 +395,17 @@ fi
 # unlike the fixed-width critcmp block). Green = faster, red = slower, one square
 # per ~1%, drawn only outside ±1% so the noise rows stay clean. Reads the critcmp
 # table ($2 = base ratio, $6 = candidate ratio; % change = candidate/base - 1).
+# $2 = optional "id ratio" overrides file: re-measured offenders use that median
+# ratio (marked ⟳) instead of their first-pass value.
 emoji_bar_table() {
-    awk -v g="🟩" -v r="🟥" '
+    awk -v g="🟩" -v r="🟥" -v ov="${2:-}" '
+        BEGIN {
+            if (ov != "") while ((getline line < ov) > 0) { split(line, kv, " "); over[kv[1]] = kv[2]; }
+        }
         $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ {
-            m++; id[m] = $1; pct[m] = ($6 / $2 - 1) * 100;
+            m++; id[m] = $1;
+            if (id[m] in over) { pct[m] = (over[id[m]] - 1) * 100; rem[m] = 1; }
+            else               { pct[m] = ($6 / $2 - 1) * 100; }
         }
         END {
             # sort indices ascending by % change (fastest first)
@@ -385,6 +414,7 @@ emoji_bar_table() {
                     if (pct[j] < pct[i]) {
                         t = pct[i]; pct[i] = pct[j]; pct[j] = t;
                         s = id[i];  id[i] = id[j];  id[j] = s;
+                        u = rem[i]; rem[i] = rem[j]; rem[j] = u;
                     }
             print "| Benchmark | faster \342\227\204 | \316\224% | \342\226\272 slower |";
             print "|---|--:|:--:|:--|";
@@ -397,7 +427,8 @@ emoji_bar_table() {
                 if (p <= -0.05)      lbl = sprintf("%.1f", p);
                 else if (p >= 0.05)  lbl = sprintf("+%.1f", p);
                 else                 lbl = "\302\2610.0";
-                printf "| `%s` | %s | %s | %s |\n", id[i], gs, lbl, rs;
+                mark = rem[i] ? " \342\237\263" : "";
+                printf "| `%s`%s | %s | %s | %s |\n", id[i], mark, gs, lbl, rs;
             }
         }
     ' "$1"
@@ -418,11 +449,15 @@ emoji_bar_table() {
     fi
     echo "### Change vs baseline"
     echo ""
-    echo "_🟩 faster · 🟥 slower · 1 square ≈ 1% (drawn only for |Δ| ≥ 1%)_"
+    echo "_🟩 faster · 🟥 slower · 1 square ≈ 1% (drawn only for |Δ| ≥ 1%) · ⟳ re-measured (median of re-runs)_"
     echo ""
-    emoji_bar_table "$RESULTS_DIR/comparison.txt"
+    emoji_bar_table "$RESULTS_DIR/comparison.txt" "$MEDIANS_FILE"
     echo ""
     echo "Baseline commit: \`${BASELINE_COMMIT}\`"
+    echo ""
+    echo "### Raw first-pass measurements"
+    echo ""
+    echo "_Full critcmp table from the initial run. Benchmarks marked ⟳ above were re-measured; the chart shows the median and the re-runs are detailed below._"
     echo ""
     echo '```'
     cat "$RESULTS_DIR/comparison.txt"

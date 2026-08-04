@@ -475,6 +475,38 @@ if ($regressions.Count -gt 0) {
 }
 Remove-Item -Recurse -Force (Join-Path $RepoRoot 'target-base') -ErrorAction SilentlyContinue
 
+# Reconcile each offender's headline number with the gate: replace its
+# (possibly anomalous) first-pass ratio with the MEDIAN of {main run + all
+# re-runs}, so the chart matches the majority decision instead of the one-off
+# spike. Only offenders are re-measured, so only they are reconciled.
+function Get-RatioFor {
+    param([string]$Comparison, [string]$Name)
+    foreach ($line in ($Comparison -split "\r?\n")) {
+        $f = @($line -split '\s+' | Where-Object { $_ -ne '' })
+        if ($f.Count -ge 6 -and $f[0] -eq $Name -and $f[1] -match '^[0-9]+\.[0-9]+$' -and $f[5] -match '^[0-9]+\.[0-9]+$') {
+            return [double]$f[5] / [double]$f[1]
+        }
+    }
+    return $null
+}
+function Get-Median {
+    param([double[]]$Values)
+    if (-not $Values -or $Values.Count -eq 0) { return $null }
+    $s = @($Values | Sort-Object); $n = $s.Count
+    if ($n % 2) { return $s[[int](($n - 1) / 2)] } else { return ($s[[int]($n / 2 - 1)] + $s[[int]($n / 2)]) / 2 }
+}
+$overrides = @{}
+foreach ($o in $regressions) {
+    $vals = @()
+    $mr = Get-RatioFor $comparison $o.Name
+    if ($null -ne $mr) { $vals += $mr }
+    foreach ($cc in $confirmRunComparisons) {
+        $rr = Get-RatioFor $cc $o.Name
+        if ($null -ne $rr) { $vals += $rr }
+    }
+    if ($vals.Count -gt 0) { $overrides[$o.Name] = Get-Median $vals }
+}
+
 # --- Verdict (based on the majority-confirmed regressions) ---
 $pct = [int][math]::Round(($thr - 1) * 100)
 $warn = [char]::ConvertFromUtf32(0x26A0) + [char]::ConvertFromUtf32(0xFE0F)
@@ -491,15 +523,22 @@ if ($confirmed.Count -gt 0) {
 # Emit each benchmark's % change as a compact, colored "diverging bar" markdown
 # table (renders with color on the run Summary tab, unlike the fixed-width critcmp
 # block). Green = faster, red = slower, one square per ~1%, drawn only outside ±1%.
+# $Overrides maps a re-measured offender to its median ratio (marked ⟳).
 function Get-EmojiBarTable {
-    param([string]$Comparison)
+    param([string]$Comparison, [hashtable]$Overrides)
     $g = [char]::ConvertFromUtf32(0x1F7E9)  # green square
     $r = [char]::ConvertFromUtf32(0x1F7E5)  # red square
+    if (-not $Overrides) { $Overrides = @{} }
     $rows = @()
     foreach ($line in ($Comparison -split "\r?\n")) {
         $f = @($line -split '\s+' | Where-Object { $_ -ne '' })
         if ($f.Count -ge 6 -and $f[1] -match '^[0-9]+\.[0-9]+$' -and $f[5] -match '^[0-9]+\.[0-9]+$') {
-            $rows += [pscustomobject]@{ Name = $f[0]; Pct = ([double]$f[5] / [double]$f[1] - 1) * 100 }
+            $name = $f[0]
+            if ($Overrides.ContainsKey($name)) {
+                $rows += [pscustomobject]@{ Name = $name; Pct = ($Overrides[$name] - 1) * 100; Rem = $true }
+            } else {
+                $rows += [pscustomobject]@{ Name = $name; Pct = ([double]$f[5] / [double]$f[1] - 1) * 100; Rem = $false }
+            }
         }
     }
     $lines = @(
@@ -513,7 +552,8 @@ function Get-EmojiBarTable {
         if ($p -le -0.05) { $lbl = ('{0:0.0}' -f $p) }
         elseif ($p -ge 0.05) { $lbl = ('+{0:0.0}' -f $p) }
         else { $lbl = [char]0x00B1 + '0.0' }
-        $lines += "| ``$($row.Name)`` | $gs | $lbl | $rs |"
+        $mark = if ($row.Rem) { ' ' + [char]0x27F3 } else { '' }
+        $lines += "| ``$($row.Name)``$mark | $gs | $lbl | $rs |"
     }
     return $lines
 }
@@ -533,13 +573,17 @@ if ($regressions.Count -gt 0) {
 $summaryLines += @(
     '### Change vs baseline'
     ''
-    "_$gsq faster, $rsq slower; 1 square ~ 1% (drawn only for changes of at least 1%)_"
+    "_$gsq faster, $rsq slower; 1 square ~ 1% (drawn only for changes of at least 1%); $([char]0x27F3) re-measured (median of re-runs)_"
     ''
 )
-$summaryLines += (Get-EmojiBarTable $comparison)
+$summaryLines += (Get-EmojiBarTable $comparison $overrides)
 $summaryLines += ''
 $summaryLines += @(
     "Baseline commit: ``$BaselineCommit``"
+    ''
+    '### Raw first-pass measurements'
+    ''
+    "_Full critcmp table from the initial run. Benchmarks marked $([char]0x27F3) above were re-measured; the chart shows the median and the re-runs are detailed below._"
     ''
     '```'
     $comparison
