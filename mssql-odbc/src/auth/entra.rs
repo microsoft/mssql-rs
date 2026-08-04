@@ -203,6 +203,28 @@ pub(super) fn encode_utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
 }
 
+/// An authentication method the driver cannot honour.
+///
+/// `requested` is what the connection string asked for and `resolved` is what
+/// platform resolution turned it into. They differ only where a keyword maps to
+/// a different method on this platform, and both are reported so the diagnostic
+/// never names a keyword the user did not write.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct UnsupportedAuth {
+    pub(crate) requested: TdsAuthenticationMethod,
+    pub(crate) resolved: TdsAuthenticationMethod,
+}
+
+impl UnsupportedAuth {
+    /// The method was not resolved to anything else; it is simply unimplemented.
+    fn plain(method: TdsAuthenticationMethod) -> Self {
+        Self {
+            requested: method.clone(),
+            resolved: method,
+        }
+    }
+}
+
 /// Applies the resolved authentication to `context`: sets credentials for
 /// SQL/SSPI, the pre-acquired token for `AccessToken`, or builds and registers
 /// an Entra token factory for service principal / managed identity /
@@ -218,7 +240,7 @@ pub(crate) fn configure_auth(
     context: &mut ClientContext,
     resolved: TransformedAuth,
     #[cfg_attr(not(windows), allow(unused_variables))] server: &str,
-) -> Result<(), TdsAuthenticationMethod> {
+) -> Result<(), UnsupportedAuth> {
     // Resolve the method first and only commit it to the context on a supported
     // path, so the context is left untouched when we return `Err`.
     let method = resolved.method.clone();
@@ -275,13 +297,18 @@ pub(crate) fn configure_auth(
         // (`Parse.cpp:3597`). The request lands in the generic `AzureADAuth`
         // block, whose `authMode` ternary (`:3657-3660`) has no Interactive arm
         // and so resolves to `AKVCFG_AUTHMODE_INTEGRATED` — a Kerberos attempt
-        // against the STS. Report it as Integrated for the same reason; once
-        // that method is implemented this becomes msodbcsql's behaviour exactly.
+        // against the STS. Resolve it the same way; once Integrated is
+        // implemented this becomes msodbcsql's behaviour exactly. The caller
+        // still names the requested method, because parity justifies the
+        // resolution, not a diagnostic about a keyword nobody typed.
         #[cfg(not(windows))]
         TdsAuthenticationMethod::ActiveDirectoryInteractive => {
-            return Err(TdsAuthenticationMethod::ActiveDirectoryIntegrated);
+            return Err(UnsupportedAuth {
+                requested: TdsAuthenticationMethod::ActiveDirectoryInteractive,
+                resolved: TdsAuthenticationMethod::ActiveDirectoryIntegrated,
+            });
         }
-        other => return Err(other),
+        other => return Err(UnsupportedAuth::plain(other)),
     }
     context.tds_authentication_method = method;
     Ok(())
@@ -414,7 +441,7 @@ mod tests {
     fn configure(
         ctx: &mut ClientContext,
         resolved: TransformedAuth,
-    ) -> Result<(), TdsAuthenticationMethod> {
+    ) -> Result<(), UnsupportedAuth> {
         configure_auth(ctx, resolved, "testserver.database.windows.net")
     }
 
@@ -523,7 +550,11 @@ mod tests {
         );
         assert_eq!(
             configure(&mut ctx, r),
-            Err(TdsAuthenticationMethod::ActiveDirectoryIntegrated)
+            Err(UnsupportedAuth {
+                requested: TdsAuthenticationMethod::ActiveDirectoryInteractive,
+                resolved: TdsAuthenticationMethod::ActiveDirectoryIntegrated,
+            }),
+            "the error must still name the keyword the user wrote"
         );
         // Nothing is written to the context, and no factory is registered, so
         // the connection cannot proceed.
@@ -545,7 +576,10 @@ mod tests {
         );
         assert_eq!(
             configure(&mut ctx, r),
-            Err(TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow)
+            Err(UnsupportedAuth::plain(
+                TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow
+            )),
+            "a method that resolves to itself reports itself"
         );
     }
 }

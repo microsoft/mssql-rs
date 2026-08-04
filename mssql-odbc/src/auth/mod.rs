@@ -15,4 +15,4 @@ mod interactive;
 #[cfg(windows)]
 mod msqa;
 
-pub(crate) use entra::configure_auth;
+pub(crate) use entra::{UnsupportedAuth, configure_auth};

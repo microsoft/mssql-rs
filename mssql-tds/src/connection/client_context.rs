@@ -145,6 +145,10 @@ where
     }
 }
 
+/// Default connection timeout in seconds, and the value the ODBC layer reports
+/// for `SQL_ATTR_LOGIN_TIMEOUT` when the application has not set one.
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u32 = 15;
+
 /// Authentication method for the TDS connection.
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub enum TdsAuthenticationMethod {
@@ -228,6 +232,7 @@ pub struct ClientContext {
     ///
     /// Bounds each individual TCP-connect attempt (the network reach), not the
     /// whole login. See [`Self::login_timeout`] for the overall login deadline.
+    /// Defaults to [`DEFAULT_CONNECT_TIMEOUT_SECS`].
     pub connect_timeout: u32,
     /// Overall login deadline in seconds, covering the network connect, the TDS
     /// handshake, and any auth token acquisition (e.g. the interactive browser
@@ -472,7 +477,7 @@ impl ClientContext {
             change_password: "".to_string(),
             connect_retry_count: 1,
             connect_retry_interval: 10,
-            connect_timeout: 15,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT_SECS,
             login_timeout: None,
             database: "".to_string(),
             data_source: data_source.to_string(),
@@ -535,7 +540,7 @@ impl ClientContext {
             change_password: "".to_string(),
             connect_retry_count: 1,
             connect_retry_interval: 10,
-            connect_timeout: 15,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT_SECS,
             login_timeout: None,
             database: "".to_string(),
             data_source: "".to_string(),

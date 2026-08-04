@@ -27,7 +27,7 @@ use mssql_tds::message::login_options::ApplicationIntent;
 use std::path::PathBuf;
 
 use super::util::read_utf16;
-use crate::auth::configure_auth;
+use crate::auth::{UnsupportedAuth, configure_auth};
 use crate::connection::odbc_authentication_transformer::transform_auth;
 use crate::connection::odbc_authentication_validator::validate_auth;
 use crate::connection::{ConnectionParams, parse_connection_string};
@@ -263,17 +263,28 @@ fn do_connect(
         context.login_timeout = Some(secs);
     }
 
-    if let Err(method) = configure_auth(&mut context, resolved, &params.server) {
+    if let Err(unsupported) = configure_auth(&mut context, resolved, &params.server) {
+        let UnsupportedAuth {
+            requested,
+            resolved,
+        } = &unsupported;
         error!(
-            ?method,
+            ?requested,
+            ?resolved,
             "SQLDriverConnectW: authentication method not implemented"
         );
-        post_sql_error(
-            state,
-            SQLSTATE_HYC00,
-            0,
-            format!("Authentication method {method:?} is not yet supported"),
-        );
+        // Name the keyword the application actually supplied. Where the
+        // platform maps it to another method, say so rather than reporting a
+        // method the connection string never mentioned.
+        let message = if requested == resolved {
+            format!("Authentication method {requested:?} is not yet supported")
+        } else {
+            format!(
+                "Authentication method {requested:?} resolves to {resolved:?} on this platform, \
+                 which is not yet supported"
+            )
+        };
+        post_sql_error(state, SQLSTATE_HYC00, 0, message);
         return SQL_ERROR;
     }
 

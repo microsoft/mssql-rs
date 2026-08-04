@@ -24,10 +24,22 @@
 //! (:231) loads the library, `MSQAAuthContextCache::getOrCreate` (:113) caches
 //! contexts, `MSQAThread` (:417) pumps the UI, and `SNISecMSQAGetAccessToken`
 //! (:553) sequences the whole acquisition.
+//!
+//! # Known limitation: account reuse when no UID is supplied
+//!
+//! Contexts are cached by `(UID, STS URL)` and `ForcePrompt` is cleared after
+//! the first successful sign-in, both matching msodbcsql (whose key is
+//! `username + "\0" + stsUrl`). A connection string with no `UID` therefore
+//! keys on `("", sts_url)`: the first connection prompts, and every later
+//! connection to the same authority silently reuses whoever signed in, with no
+//! way to switch accounts for the life of the process.
+//!
+//! This matters when one process serves more than one user, so supply `UID` to
+//! pin a connection to a specific account.
 
 use std::collections::HashMap;
 use std::ffi::{CString, c_void};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use mssql_tds::core::TdsResult;
 use mssql_tds::error::Error;
@@ -188,44 +200,54 @@ impl Drop for RequestGuard {
 /// Contexts cached by `(login hint, STS URL)`, matching msodbcsql's cache key.
 type ContextCache = Mutex<HashMap<(String, String), Arc<CachedContext>>>;
 
-static MSQA_API: OnceLock<Result<MsqaApi, String>> = OnceLock::new();
+static MSQA_API: OnceLock<MsqaApi> = OnceLock::new();
 static CONTEXT_CACHE: OnceLock<ContextCache> = OnceLock::new();
 
 /// Loads `mssql-auth.dll` and resolves the entry points, once per process.
+///
+/// Only a *successful* load is cached. Caching the failure too would mean a
+/// process that ran once without the Microsoft SQL Server authentication
+/// library installed could never use interactive auth again, even after the
+/// user installs msodbcsql 18 and retries — the retry would replay the
+/// remembered error without touching the filesystem.
+fn api() -> TdsResult<&'static MsqaApi> {
+    if let Some(api) = MSQA_API.get() {
+        return Ok(api);
+    }
+    match load_api() {
+        // A concurrent caller may have won the race; its table is equivalent,
+        // and the extra `LoadLibraryExA` reference is deliberately never freed.
+        Ok(api) => Ok(MSQA_API.get_or_init(|| api)),
+        Err(message) => Err(Error::Security(SecurityError::LoadLibraryFailed(message))),
+    }
+}
+
+/// Loads the library and binds its entry points.
 ///
 /// The search is restricted to System32 (as msodbcsql does at
 /// `SNI_FedAuth.cpp:249`) so a DLL dropped next to the application cannot
 /// hijack authentication. The module is never freed: OneAuth spins up
 /// background state that must outlive individual connections.
-fn api() -> TdsResult<&'static MsqaApi> {
-    let loaded = MSQA_API.get_or_init(|| {
-        let name = CString::new(MSQA_LIBRARY).expect("library name has no interior NUL");
-        let module = unsafe {
-            LoadLibraryExA(
-                PCSTR(name.as_ptr().cast()),
-                None,
-                LOAD_LIBRARY_SEARCH_SYSTEM32,
-            )
-        };
-        let module = match module {
-            Ok(m) => m,
-            Err(e) => {
-                return Err(format!(
-                    "{MSQA_LIBRARY} could not be loaded from the system directory ({e}). \
-                     Entra interactive authentication requires the Microsoft SQL Server \
-                     authentication library to be installed."
-                ));
-            }
-        };
-        resolve(module)
-    });
-
-    match loaded {
-        Ok(api) => Ok(api),
-        Err(message) => Err(Error::Security(SecurityError::LoadLibraryFailed(
-            message.clone(),
-        ))),
-    }
+fn load_api() -> Result<MsqaApi, String> {
+    let name = CString::new(MSQA_LIBRARY).expect("library name has no interior NUL");
+    let module = unsafe {
+        LoadLibraryExA(
+            PCSTR(name.as_ptr().cast()),
+            None,
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    let module = match module {
+        Ok(m) => m,
+        Err(e) => {
+            return Err(format!(
+                "{MSQA_LIBRARY} could not be loaded from the system directory ({e}). \
+                 Entra interactive authentication requires the Microsoft SQL Server \
+                 authentication library to be installed."
+            ));
+        }
+    };
+    resolve(module)
 }
 
 /// Resolves every entry point the interactive flow needs, failing if any is
@@ -268,6 +290,9 @@ fn resolve(module: HMODULE) -> Result<MsqaApi, String> {
 /// prompting again. `ForcePrompt` starts enabled so the first sign-in of a
 /// process is always explicit; [`acquire_token`] clears it once a token has
 /// been obtained. Mirrors `MSQAAuthContextCache::getOrCreate`.
+///
+/// An empty `login_hint` keys every account-less connection to the same entry;
+/// see the module-level "Known limitation" note.
 fn get_or_create_context(
     api: &'static MsqaApi,
     sts_url: &str,
@@ -368,7 +393,7 @@ pub(super) fn acquire_token(
     let status = unsafe { (api.get_request_status)(request) };
     let status = if status == MSQA_INTERACTION_REQUIRED {
         debug!("interactive: OneAuth requires sign-in, opening the host window");
-        run_interactive_ui(api, request, window_title, ui_thread_id)
+        run_interactive_ui(api, request, window_title, ui_thread_id)?
     } else {
         debug!(status, "interactive: OneAuth answered without a prompt");
         status
@@ -396,7 +421,7 @@ fn run_interactive_ui(
     request: HMsqaRequest,
     window_title: &str,
     ui_thread_id: &Arc<UiThreadId>,
-) -> i32 {
+) -> TdsResult<i32> {
     let moved = RequestHandle(request);
     let title: Vec<u16> = window_title
         .encode_utf16()
@@ -418,7 +443,7 @@ fn run_interactive_ui(
         Ok(worker) => worker,
         Err(e) => {
             error!(error = %e, "interactive: could not start the sign-in UI thread");
-            return unsafe { (api.get_request_status)(request) };
+            return Ok(unsafe { (api.get_request_status)(request) });
         }
     };
 
@@ -426,7 +451,7 @@ fn run_interactive_ui(
         Ok(status) => status,
         Err(_) => {
             error!("interactive: the sign-in UI thread panicked");
-            unsafe { (api.get_request_status)(request) }
+            Ok(unsafe { (api.get_request_status)(request) })
         }
     }
 }
@@ -443,12 +468,20 @@ unsafe fn pump_sign_in_window(
     request: HMsqaRequest,
     title: &[u16],
     ui_thread_id: &UiThreadId,
-) -> i32 {
+) -> TdsResult<i32> {
     // OneAuth's window is a COM single-threaded apartment object.
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     if com.is_err() {
         error!(hresult = com.0, "interactive: CoInitializeEx failed");
-        return com.0;
+        // Not a request status: OneAuth never saw this request, so it has no
+        // description for it. Returning the HRESULT here would send it through
+        // `describe_failure`, which would query `MSQAGetErrorDescription` about
+        // a request that never failed and render the HRESULT as a OneAuth
+        // status code.
+        return Err(Error::Security(SecurityError::InternalError(format!(
+            "the interactive sign-in thread could not initialize COM (HRESULT {:#010x})",
+            com.0
+        ))));
     }
 
     let thread_id = unsafe { GetCurrentThreadId() };
@@ -458,7 +491,7 @@ unsafe fn pump_sign_in_window(
         (api.ui_create_host_window)(
             request,
             ui_complete,
-            thread_id as usize as *mut c_void,
+            std::ptr::from_ref(ui_thread_id).cast_mut().cast(),
             GetDesktopWindow(),
             std::ptr::null(),
             title.as_ptr(),
@@ -507,23 +540,37 @@ unsafe fn pump_sign_in_window(
     ui_thread_id.clear();
     let status = unsafe { (api.get_request_status)(request) };
     unsafe { CoUninitialize() };
-    status
+    Ok(status)
 }
 
-/// OneAuth's completion callback. Ends the message pump on the thread whose id
-/// was passed as `data` when the window was created.
+/// OneAuth's completion callback. Ends the message pump for the window whose
+/// [`UiThreadId`] was passed as `data` when the window was created.
+///
+/// msodbcsql passes the bare thread id here (`SNI_FedAuth.cpp:430`), which is
+/// safe for it because its pump only ever ends on this callback. This driver
+/// also ends the pump when the login deadline expires, and OneAuth gives no
+/// guarantee that a callback cannot still arrive afterwards, so the post goes
+/// through the same guarded path as [`cancel_ui`]: once the pump has cleared
+/// its id, this becomes a no-op instead of targeting a recycled thread.
 ///
 /// # Safety
 ///
 /// Called by OneAuth with the `callback_data` supplied to
-/// `MSQAUICreateHostWindow`, which is always a thread id cast to a pointer.
+/// `MSQAUICreateHostWindow`, which is always a `&UiThreadId` borrowed from an
+/// `Arc` the caller keeps alive past `MSQADeleteRequest`.
 unsafe extern "system" fn ui_complete(_request: HMsqaRequest, data: *mut c_void) {
-    let thread_id = data as usize as u32;
-    let _ = unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+    let ui_thread_id = unsafe { &*data.cast::<UiThreadId>() };
+    post_quit(ui_thread_id, "OneAuth signalled completion");
 }
 
 /// Reads the acquired token with the two-pass length-then-buffer protocol
 /// `MSQAGetAccessToken` uses.
+///
+/// The reported length is a character count that *excludes* the terminating
+/// NUL, which is why the second call allocates `length + 1` while still passing
+/// `length` as the buffer size, and why truncating to `length` yields the token
+/// alone. Were it ever to include the terminator, the truncation would leave an
+/// embedded NUL inside the bearer token and the server would reject the login.
 fn read_access_token(api: &'static MsqaApi, request: HMsqaRequest) -> TdsResult<String> {
     let mut length: u32 = 0;
     unsafe { (api.get_access_token)(request, std::ptr::null_mut(), &mut length) };
@@ -601,35 +648,51 @@ fn is_transient(status: u8) -> bool {
 /// The id of the running sign-in message pump, or zero when none is running.
 ///
 /// Zero is never a valid thread id, so it doubles as "nothing to cancel".
+///
+/// A mutex rather than an atomic: the id is only meaningful while the pump
+/// thread is alive, and an atomic only makes the individual load atomic, not
+/// the load-then-post. A reader that copied the id out could be overtaken by
+/// the pump clearing it, returning, and the thread exiting, leaving the reader
+/// to post at whichever unrelated thread the OS handed the id to next. Holding
+/// the lock across the post keeps the pump from reaching
+/// [`UiThreadId::clear`] — and so from returning — until the post is done.
 #[derive(Default)]
-pub(super) struct UiThreadId(std::sync::atomic::AtomicU32);
+pub(super) struct UiThreadId(Mutex<u32>);
 
 impl UiThreadId {
     fn set(&self, id: u32) {
-        self.0.store(id, std::sync::atomic::Ordering::SeqCst);
+        *self.lock() = id;
     }
 
     fn clear(&self) {
-        self.0.store(0, std::sync::atomic::Ordering::SeqCst);
+        *self.lock() = 0;
     }
 
-    fn get(&self) -> u32 {
-        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    fn lock(&self) -> MutexGuard<'_, u32> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// Ends the sign-in message pump, if one is still running.
+///
+/// A stray `WM_QUIT` is not a benign mistake: in a host application that runs
+/// its own message loops it reads as a request to quit, so this must never
+/// post at a thread that merely inherited a recycled id.
+fn post_quit(ui_thread_id: &UiThreadId, reason: &str) {
+    let thread_id = ui_thread_id.lock();
+    if *thread_id == 0 {
+        return;
+    }
+    debug!(reason, "interactive: ending the sign-in message pump");
+    let _ = unsafe { PostThreadMessageW(*thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
 }
 
 /// Closes a sign-in window that is still open, used when the caller's login
 /// deadline expires.
-///
-/// The pump clears its id before it returns, so this cannot post to a thread id
-/// that has already been recycled by another thread.
 pub(super) fn cancel_ui(ui_thread_id: &UiThreadId) {
-    let thread_id = ui_thread_id.get();
-    if thread_id == 0 {
-        return;
-    }
-    debug!("interactive: login deadline expired, closing the sign-in window");
-    let _ = unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+    post_quit(ui_thread_id, "login deadline expired");
 }
 
 /// Converts a connection-derived string into the narrow C string the MSQA ABI
@@ -665,17 +728,41 @@ mod tests {
     #[test]
     fn ui_thread_id_round_trips_and_clears() {
         let id = UiThreadId::default();
-        assert_eq!(id.get(), 0, "no pump running yet");
+        assert_eq!(*id.lock(), 0, "no pump running yet");
         id.set(4242);
-        assert_eq!(id.get(), 4242);
+        assert_eq!(*id.lock(), 4242);
         id.clear();
-        assert_eq!(id.get(), 0, "a cleared id must not be posted to");
+        assert_eq!(*id.lock(), 0, "a cleared id must not be posted to");
     }
 
     #[test]
     fn cancel_ui_is_a_no_op_when_no_window_is_open() {
         // Guards against posting WM_QUIT to a recycled thread id.
         cancel_ui(&UiThreadId::default());
+    }
+
+    #[test]
+    fn a_cleared_pump_is_never_posted_to() {
+        // The window closed and the pump returned; both the deadline canceller
+        // and a late OneAuth completion callback must now do nothing rather
+        // than post WM_QUIT at whichever thread inherited the id.
+        let id = UiThreadId::default();
+        id.set(4242);
+        id.clear();
+        post_quit(&id, "late completion");
+        assert_eq!(*id.lock(), 0);
+    }
+
+    #[test]
+    fn cancelling_does_not_deadlock_against_the_pump() {
+        // `post_quit` holds the lock across PostThreadMessageW; the pump takes
+        // the same lock to clear. Releasing on every path is what keeps the
+        // pump from blocking forever once cancellation has run.
+        let id = Arc::new(UiThreadId::default());
+        id.set(unsafe { GetCurrentThreadId() });
+        cancel_ui(&id);
+        id.clear();
+        assert_eq!(*id.lock(), 0);
     }
 
     #[test]

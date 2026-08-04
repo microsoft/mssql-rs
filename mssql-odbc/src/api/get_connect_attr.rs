@@ -3,16 +3,19 @@
 
 //! Implementation of SQLGetConnectAttrW.
 //!
-//! Reports `SQL_ATTR_LOGIN_TIMEOUT` from the stored connection state so a
-//! set/get round-trip returns the configured value (matching msodbcsql). Any
-//! other attribute is unsupported and returns `HYC00` rather than claiming
-//! success without writing, mirroring the set-side (`SQLSetConnectAttrW`).
+//! Reports the attributes `SQLSetConnectAttrW` accepts, so a set/get round-trip
+//! returns the configured value (matching msodbcsql, which answers
+//! `SQL_ATTR_ACCESS_MODE`, `SQL_ATTR_PACKET_SIZE` and the two timeouts at
+//! `sqlcmisc.cpp:3038-3391`). Any other attribute is unsupported and returns
+//! `HYC00` rather than claiming success without writing.
 
+use mssql_tds::connection::client_context::DEFAULT_CONNECT_TIMEOUT_SECS;
 use tracing::{debug, error};
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_ATTR_LOGIN_TIMEOUT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
+    SQL_ATTR_ACCESS_MODE, SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT,
+    SQL_ATTR_PACKET_SIZE, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
     SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
@@ -20,10 +23,8 @@ use crate::error::{free_errors, post_sql_error};
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 
 /// Login timeout reported when the application has not set
-/// `SQL_ATTR_LOGIN_TIMEOUT`. Mirrors `ClientContext::connect_timeout`'s default,
-/// which is what the connect path falls back to when no explicit login timeout
-/// is present.
-const DEFAULT_LOGIN_TIMEOUT_SECS: u32 = 15;
+/// `SQL_ATTR_LOGIN_TIMEOUT`, which is what the connect path falls back to.
+const DEFAULT_LOGIN_TIMEOUT_SECS: u32 = DEFAULT_CONNECT_TIMEOUT_SECS;
 
 /// Retrieves a connection attribute.
 ///
@@ -108,9 +109,28 @@ fn sql_get_connect_attr_w_safe(
             debug!(secs, "SQLGetConnectAttrW: login timeout returned");
             SQL_SUCCESS
         }
+        // The remaining attributes the set-side accepts. Returning HYC00 here
+        // would make a set/get round-trip fail for a value the driver had just
+        // reported as accepted.
+        SQL_ATTR_ACCESS_MODE | SQL_ATTR_CONNECTION_TIMEOUT | SQL_ATTR_PACKET_SIZE => {
+            if value_ptr.is_null() {
+                error!(attribute, "SQLGetConnectAttrW: value pointer is null");
+                post_diag(&mut state, ERR_INVALID_NULL_POINTER);
+                return SQL_ERROR;
+            }
+            let value = match attribute {
+                SQL_ATTR_ACCESS_MODE => state.access_mode,
+                SQL_ATTR_CONNECTION_TIMEOUT => state.connection_timeout,
+                _ => state.packet_size,
+            };
+            unsafe { write_if_some(value_ptr as *mut u32, value) };
+            debug!(attribute, value, "SQLGetConnectAttrW: attribute returned");
+            SQL_SUCCESS
+        }
         // Any other attribute is genuinely unsupported: surface HYC00 instead of
-        // claiming success while leaving the caller's buffer untouched. Mirrors
-        // the set-side (`sql_set_connect_attr_w`).
+        // claiming success while leaving the caller's buffer untouched.
+        // `SQL_ATTR_ANSI_APP` lands here deliberately — the Driver Manager sets
+        // it and ODBC defines no way to read it back.
         _ => {
             error!(
                 attribute,
@@ -130,6 +150,7 @@ fn sql_get_connect_attr_w_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_ATTR_ANSI_APP, SQL_MODE_READ_WRITE};
     use crate::api::set_connect_attr::sql_set_connect_attr_w;
     use crate::test_support::TestHandles;
 
@@ -197,6 +218,70 @@ mod tests {
             sql_get_connect_attr_w(
                 h.dbc,
                 1234,
+                &mut out as *mut u32 as SqlPointer,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get, SQL_ERROR);
+    }
+
+    /// Reads an attribute back, asserting the call succeeded.
+    fn get_u32(dbc: crate::api::odbc_types::SqlHandle, attribute: SqlInteger) -> u32 {
+        let mut out: u32 = 0;
+        let rc = unsafe {
+            sql_get_connect_attr_w(
+                dbc,
+                attribute,
+                &mut out as *mut u32 as SqlPointer,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS, "attribute {attribute} should be readable");
+        out
+    }
+
+    #[test]
+    fn every_attribute_the_set_side_accepts_can_be_read_back() {
+        // The set side reported success for these, so the get side must not
+        // answer HYC00 for a value it has just accepted.
+        let h = TestHandles::with_env_dbc();
+        for (attribute, value) in [
+            (SQL_ATTR_ACCESS_MODE, 1u32),
+            (SQL_ATTR_CONNECTION_TIMEOUT, 30),
+            (SQL_ATTR_PACKET_SIZE, 16384),
+        ] {
+            let set = unsafe {
+                sql_set_connect_attr_w(h.dbc, attribute, value as usize as SqlPointer, 0)
+            };
+            assert_eq!(set, SQL_SUCCESS, "setting {attribute}");
+            assert_eq!(get_u32(h.dbc, attribute), value, "reading {attribute} back");
+        }
+    }
+
+    #[test]
+    fn accepted_attributes_report_defaults_when_unset() {
+        let h = TestHandles::with_env_dbc();
+        assert_eq!(get_u32(h.dbc, SQL_ATTR_ACCESS_MODE), SQL_MODE_READ_WRITE);
+        assert_eq!(
+            get_u32(h.dbc, SQL_ATTR_CONNECTION_TIMEOUT),
+            0,
+            "ODBC default is no timeout"
+        );
+        assert_eq!(get_u32(h.dbc, SQL_ATTR_PACKET_SIZE), DEFAULT_PACKET_SIZE);
+    }
+
+    #[test]
+    fn ansi_app_is_not_readable() {
+        // Set by the Driver Manager; ODBC defines no way to retrieve it, and
+        // msodbcsql's get switch has no arm for it either.
+        let h = TestHandles::with_env_dbc();
+        let mut out: u32 = 0;
+        let get = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_ANSI_APP,
                 &mut out as *mut u32 as SqlPointer,
                 0,
                 std::ptr::null_mut(),

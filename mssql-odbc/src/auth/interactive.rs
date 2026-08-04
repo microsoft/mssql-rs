@@ -13,9 +13,11 @@
 //! same reason msodbcsql's Unix makefile omits `SNI_FedAuth` from its source
 //! list altogether.
 //!
-//! Off Windows, [`super::entra::configure_auth`] reports the request as
+//! Off Windows, [`super::entra::configure_auth`] resolves the request to
 //! `ActiveDirectoryIntegrated`, mirroring the fall-through that msodbcsql's
-//! `authMode` ternary produces (`Parse.cpp:3657-3660`).
+//! `authMode` ternary produces (`Parse.cpp:3657-3660`). The resulting
+//! diagnostic still names `ActiveDirectoryInteractive`, since that is the
+//! keyword the application supplied.
 //!
 //! # Mechanism
 //!

@@ -703,6 +703,53 @@ mod tests {
         assert!(validate_multi_subnet_failover(true, "", false).is_ok());
     }
 
+    // ── Shared-memory fall-through policy ──
+
+    /// Both arms of the `Err` branch in the shared-memory shortcut.
+    ///
+    /// That branch is Windows-only and needs a live named instance to reach
+    /// end to end, so the policy it applies is asserted directly here: this is
+    /// the decision that determines whether *every* local named-instance
+    /// connection gets a second chance over TCP.
+    #[cfg(windows)]
+    #[test]
+    fn shared_memory_falls_through_only_on_transient_failures() {
+        use crate::security::SecurityError;
+
+        // Falls through to SSRP/TCP. The shared-memory endpoint was absent or
+        // unresponsive; TCP is a different path and may well succeed.
+        for err in [
+            Error::ConnectionError("shared memory endpoint not found".to_string()),
+            Error::TimeoutError(TimeoutErrorType::String(
+                "Timeout while connecting via Shared Memory".to_string(),
+            )),
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such pipe",
+            )),
+        ] {
+            assert!(
+                err.is_transient_connect_error(),
+                "should retry over TCP: {err}"
+            );
+        }
+
+        // Surfaced immediately. The handshake got far enough to be refused, so
+        // it would be refused identically over TCP — and retrying would raise a
+        // second interactive sign-in prompt for a user who just cancelled one.
+        for err in [
+            Error::Security(SecurityError::AuthenticationDenied(
+                "user cancelled the sign-in".to_string(),
+            )),
+            Error::ProtocolError("unexpected token in login response".to_string()),
+        ] {
+            assert!(
+                !err.is_transient_connect_error(),
+                "should not fall through: {err}"
+            );
+        }
+    }
+
     // ── Connection retry tests ──
 
     /// Helper to build a ClientContext targeting a specific host:port

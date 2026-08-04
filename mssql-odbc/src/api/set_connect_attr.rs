@@ -129,6 +129,11 @@ unsafe fn sql_set_connect_attr_w_impl(
             // can apply it to the TDS login deadline. `0` means "wait
             // indefinitely" (mapped to no deadline at connect time).
             //
+            // Accepted while connected, matching msodbcsql, which stores it
+            // unconditionally (`sqlcmisc.cpp:1733-1748`) with none of the
+            // `if (lpdbc->hConn)` guards its connect-time-only attributes carry.
+            // The handle is reusable, so the value applies to the next connect.
+            //
             // Read at pointer width and clamp before narrowing: a direct `as
             // u32` would wrap, turning a value like 2^32 into `0` and silently
             // granting an infinite deadline instead of a long one.
@@ -143,13 +148,46 @@ unsafe fn sql_set_connect_attr_w_impl(
                 SQL_SUCCESS
             }
         }
-        // Standard attributes the Driver Manager sets before connecting that we
-        // accept (and currently ignore) so the connect handshake is not broken.
-        // TODO: honor these (connection timeout, packet size, access mode) once wired.
-        SQL_ATTR_ACCESS_MODE
-        | SQL_ATTR_CONNECTION_TIMEOUT
-        | SQL_ATTR_PACKET_SIZE
-        | SQL_ATTR_ANSI_APP => SQL_SUCCESS,
+        // Standard attributes the Driver Manager sets before connecting. Stored
+        // rather than discarded so `SQLGetConnectAttrW` reports back what was
+        // set; none of them changes behaviour on the wire yet.
+        // TODO: honor these (connection timeout, packet size, access mode).
+        SQL_ATTR_ACCESS_MODE => {
+            state.access_mode = value_ptr as usize as u32;
+            SQL_SUCCESS
+        }
+        SQL_ATTR_CONNECTION_TIMEOUT => {
+            // Shares msodbcsql's clamp with SQL_ATTR_LOGIN_TIMEOUT
+            // (`sqlcmisc.cpp:1733-1741`).
+            let requested = value_ptr as usize as u64;
+            state.connection_timeout = requested.min(MAX_LOGIN_TIMEOUT_SECS) as u32;
+            if requested > MAX_LOGIN_TIMEOUT_SECS {
+                post_diag(&mut state, WARN_LOGIN_TIMEOUT_CHANGED);
+                SQL_SUCCESS_WITH_INFO
+            } else {
+                SQL_SUCCESS
+            }
+        }
+        SQL_ATTR_PACKET_SIZE => {
+            // Packet size is negotiated in the LOGIN7 handshake, so it can only
+            // be chosen before connecting. msodbcsql rejects a late set with
+            // HY011 (`sqlcmisc.cpp:1901-1906`).
+            if state.connection_state != ConnectionState::Disconnected {
+                error!("SQLSetConnectAttrW: SQL_ATTR_PACKET_SIZE set after connect");
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_HY011,
+                    0,
+                    "SQL_ATTR_PACKET_SIZE must be set before connecting",
+                );
+                return SQL_ERROR;
+            }
+            state.packet_size = value_ptr as usize as u32;
+            SQL_SUCCESS
+        }
+        // Set by the Driver Manager only, and not retrievable, so nothing to
+        // store.
+        SQL_ATTR_ANSI_APP => SQL_SUCCESS,
         // Any other attribute is genuinely unsupported: surface a clear error
         // (HYC00) instead of silently pretending it took effect.
         _ => {
@@ -207,7 +245,7 @@ unsafe fn decode_access_token(value_ptr: SqlPointer) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::SQL_IS_POINTER;
+    use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_IS_POINTER};
     use crate::error::HasDiagnostics;
     use crate::test_support::TestHandles;
 
@@ -281,13 +319,16 @@ mod tests {
     }
 
     #[test]
-    fn accepted_standard_attribute_is_noop() {
+    fn connection_timeout_null_value_is_accepted_as_zero() {
         let h = TestHandles::with_env_dbc();
-        // A standard connection attribute the DM sets pre-connect is accepted.
+        // A standard connection attribute the DM sets pre-connect is accepted;
+        // a null pointer slot carries the integer value 0.
         let ret = unsafe {
             sql_set_connect_attr_w(h.dbc, SQL_ATTR_CONNECTION_TIMEOUT, std::ptr::null_mut(), 0)
         };
         assert_eq!(ret, SQL_SUCCESS);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(dbc.inner.lock().unwrap().connection_timeout, 0);
     }
 
     #[test]
@@ -372,5 +413,60 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.login_timeout, Some(MAX_LOGIN_TIMEOUT_SECS as u32));
+    }
+
+    #[test]
+    fn login_timeout_after_connect_is_accepted() {
+        // msodbcsql stores it unconditionally (`sqlcmisc.cpp:1733-1748`) with
+        // none of the `if (lpdbc->hConn)` guards its connect-time-only
+        // attributes carry. The value is not dead: SQLDisconnect leaves it in
+        // place, so it applies to the next connect on this reusable handle.
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().connection_state = ConnectionState::Connected;
+
+        let ret = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_ATTR_LOGIN_TIMEOUT, 45usize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(dbc.inner.lock().unwrap().login_timeout, Some(45));
+    }
+
+    #[test]
+    fn packet_size_after_connect_is_rejected() {
+        // Packet size is fixed by the LOGIN7 handshake, so a late set could
+        // never apply. msodbcsql posts HY011 for it (`sqlcmisc.cpp:1901-1906`).
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().connection_state = ConnectionState::Connected;
+
+        let ret = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 16384usize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HY011);
+        assert_eq!(
+            state.packet_size, DEFAULT_PACKET_SIZE,
+            "a rejected set must not change the stored value"
+        );
+    }
+
+    #[test]
+    fn accepted_standard_attributes_are_stored() {
+        let h = TestHandles::with_env_dbc();
+        for (attribute, value) in [
+            (SQL_ATTR_ACCESS_MODE, 1usize),
+            (SQL_ATTR_CONNECTION_TIMEOUT, 30),
+            (SQL_ATTR_PACKET_SIZE, 16384),
+        ] {
+            let ret = unsafe { sql_set_connect_attr_w(h.dbc, attribute, value as SqlPointer, 0) };
+            assert_eq!(ret, SQL_SUCCESS, "setting {attribute}");
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.access_mode, 1);
+        assert_eq!(state.connection_timeout, 30);
+        assert_eq!(state.packet_size, 16384);
     }
 }
