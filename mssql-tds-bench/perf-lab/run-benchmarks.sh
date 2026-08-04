@@ -222,6 +222,18 @@ warmup_pass() {
 # per-bench filter would still re-run every bench's setup each time, so per-binary
 # keeps setup cost — and total run time — the same as the old two-pass approach.)
 
+# Compile one side's bench binaries with human-readable output so any compile
+# error is visible in the log and fails the run loudly. bench_bins() below hides
+# cargo's stderr and only extracts paths, so a compile failure there would abort
+# with no diagnostics.
+compile_benches() {
+    echo ">>> Compiling $2 bench binaries ($1)..."
+    if ! CARGO_TARGET_DIR="$1" cargo bench -p mssql-tds-bench --no-run; then
+        echo "ERROR: $2 bench compilation failed — see the cargo errors above." >&2
+        exit 1
+    fi
+}
+
 # Print "<bench-name><TAB><exe-path>" for each built bench binary. $1 = target dir.
 bench_bins() {
     CARGO_TARGET_DIR="$1" cargo bench -p mssql-tds-bench --no-run --message-format=json 2>/dev/null \
@@ -250,6 +262,7 @@ restore_candidate() {
 }
 
 echo ">>> Building candidate bench binaries (target/)..."
+compile_benches "$REPO_ROOT/target" "candidate"
 CAND_BINS="$(bench_bins "$REPO_ROOT/target")"
 [ -n "$CAND_BINS" ] || { echo "ERROR: no candidate bench binaries found"; exit 1; }
 
@@ -258,6 +271,7 @@ echo ">>> Adding baseline worktree for ${BASELINE_COMMIT} at ${BASELINE_TREE}...
 git worktree add --detach "$BASELINE_TREE" "$BASELINE_COMMIT"
 echo ">>> Building baseline bench binaries (target-base/)..."
 swap_to_baseline
+compile_benches "$REPO_ROOT/target-base" "baseline"
 BASE_BINS="$(bench_bins "$REPO_ROOT/target-base")"
 restore_candidate
 git worktree remove --force "$BASELINE_TREE" || true

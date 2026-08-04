@@ -347,6 +347,23 @@ function Get-BenchBinaries {
     $bins
 }
 
+# Compile one side's bench binaries with visible output so any compile error
+# surfaces in the log and fails the run loudly; Get-BenchBinaries above discards
+# cargo's stderr and only extracts paths.
+function Invoke-CompileBenches {
+    param([Parameter(Mandatory)][string]$TargetDir, [Parameter(Mandatory)][string]$Label)
+    Write-Host ">>> Compiling $Label bench binaries ($TargetDir)..."
+    $prev = $env:CARGO_TARGET_DIR
+    $env:CARGO_TARGET_DIR = $TargetDir
+    try {
+        Invoke-Native { cargo bench -p mssql-tds-bench --no-run }
+    } catch {
+        throw "$Label bench compilation failed - see the cargo errors above. $($_.Exception.Message)"
+    } finally {
+        if ($null -eq $prev) { Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue } else { $env:CARGO_TARGET_DIR = $prev }
+    }
+}
+
 # Run every bench binary once per side, candidate then baseline back-to-back,
 # saving to Criterion baselines $CandName / $BaseName; $Filter optionally limits
 # to a Criterion benchmark-id regex. Both binaries write to the shared
@@ -385,6 +402,7 @@ function Restore-CandidateSource {
 }
 
 Write-Host '>>> Building candidate bench binaries (target/)...'
+Invoke-CompileBenches (Join-Path $RepoRoot 'target') 'candidate'
 $script:CandBins = Get-BenchBinaries (Join-Path $RepoRoot 'target')
 if ($script:CandBins.Count -eq 0) { throw 'no candidate bench binaries found' }
 
@@ -392,6 +410,7 @@ Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree...
 Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
 Write-Host '>>> Building baseline bench binaries (target-base/)...'
 Set-BaselineSource
+Invoke-CompileBenches (Join-Path $RepoRoot 'target-base') 'baseline'
 $script:BaseBins = Get-BenchBinaries (Join-Path $RepoRoot 'target-base')
 Restore-CandidateSource
 Invoke-Native { git worktree remove --force $BaselineTree }
