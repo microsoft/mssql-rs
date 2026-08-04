@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use mssql_tds::core::TdsResult;
 use mssql_tds::error::Error;
 use mssql_tds::security::SecurityError;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, warn};
 use windows::Win32::Foundation::{GetLastError, HMODULE, LPARAM, RECT, WPARAM};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
@@ -162,7 +163,7 @@ unsafe impl Sync for MsqaApi {}
 /// A `HMSQACONTEXT` parked in the process-wide cache.
 ///
 /// The handle is an opaque OneAuth pointer. Concurrent use is serialized by
-/// [`CachedContext::acquire_lock`], and the handle outlives every borrow
+/// [`CachedContext::sign_in_lock`], and the handle outlives every borrow
 /// because cached contexts are never released.
 struct ContextHandle(HMsqaContext);
 
@@ -171,9 +172,14 @@ unsafe impl Sync for ContextHandle {}
 
 /// A cached authentication context plus the lock that keeps concurrent
 /// connections from opening two sign-in windows against it at once.
-struct CachedContext {
+pub(super) struct CachedContext {
     handle: ContextHandle,
-    acquire_lock: Mutex<()>,
+    /// Held across the whole acquisition. Async rather than blocking so that a
+    /// connection whose login deadline expires while another is signing in is
+    /// simply dropped from the waiter queue: a blocking lock would park a
+    /// `spawn_blocking` thread until the sign-in ahead of it finished, long
+    /// after the waiter had given up.
+    pub(super) sign_in_lock: Arc<AsyncMutex<()>>,
 }
 
 /// A `HMSQAREQUEST` being moved onto the UI thread.
@@ -338,41 +344,49 @@ fn get_or_create_context(
 
     let context = Arc::new(CachedContext {
         handle: ContextHandle(handle),
-        acquire_lock: Mutex::new(()),
+        sign_in_lock: Arc::new(AsyncMutex::new(())),
     });
     cache.insert(key, Arc::clone(&context));
     Ok(context)
 }
 
+/// Loads `mssql-auth.dll` if needed and resolves the cached context for an
+/// account. Blocking: run it on a thread that may block.
+///
+/// Split out from [`acquire_token`] so the caller can take
+/// [`CachedContext::sign_in_lock`] on the async side, where waiting is
+/// cancellable.
+pub(super) fn resolve_context(
+    sts_url: &str,
+    login_hint: &str,
+    client_id: &str,
+    redirect_uri: &str,
+) -> TdsResult<Arc<CachedContext>> {
+    get_or_create_context(api()?, sts_url, login_hint, client_id, redirect_uri)
+}
+
 /// Acquires an access token interactively. Blocking: run it on a thread that
 /// may block.
+///
+/// The caller must hold [`CachedContext::sign_in_lock`] for the whole call:
+/// without it, two connections sharing a context would each raise their own
+/// prompt.
 ///
 /// `ui_thread_id` receives the id of the message-pump thread as soon as it
 /// starts, so a caller whose login deadline expires can tear the sign-in window
 /// down via [`cancel_ui`] instead of leaving it orphaned on screen.
 pub(super) fn acquire_token(
-    sts_url: &str,
+    context: &CachedContext,
     resource: &str,
-    login_hint: &str,
-    client_id: &str,
-    redirect_uri: &str,
     window_title: &str,
     ui_thread_id: &Arc<UiThreadId>,
 ) -> TdsResult<String> {
     let api = api()?;
-    let context = get_or_create_context(api, sts_url, login_hint, client_id, redirect_uri)?;
     let resource_c = to_c_string(resource, "resource")?;
 
     // A fresh correlation id per acquisition, so a failed sign-in can be
     // located in the tenant's Entra sign-in logs.
     let correlation_id = GUID::new().unwrap_or(GUID::zeroed());
-
-    // Only one sign-in window per context at a time: without this, two
-    // connections opening concurrently would each raise their own prompt.
-    let _serialized = context
-        .acquire_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let request = unsafe {
         (api.acquire_token)(
@@ -776,5 +790,67 @@ mod tests {
         // OneAuth returns status in the top 8 bits, error in the rest.
         let packed: i64 = ((STATUS_TRANSIENT_ERROR as i64) << MSQA_STATUS_SHIFT) | 0x1234_5678;
         assert_eq!(((packed >> MSQA_STATUS_SHIFT) & 0xFF) as u8, 15);
+    }
+
+    /// A context whose handle is never dereferenced; only the lock is exercised.
+    fn lock_only_context() -> Arc<CachedContext> {
+        Arc::new(CachedContext {
+            handle: ContextHandle(std::ptr::null_mut()),
+            sign_in_lock: Arc::new(AsyncMutex::new(())),
+        })
+    }
+
+    /// Single-threaded on purpose: a lock that parked its waiter instead of
+    /// yielding would deadlock this runtime, which is the thread-occupancy
+    /// problem these tests are about, in miniature.
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime")
+    }
+
+    #[test]
+    fn a_second_sign_in_waits_without_stalling_the_runtime() {
+        let context = lock_only_context();
+
+        current_thread_runtime().block_on(async {
+            let held = Arc::clone(&context.sign_in_lock).lock_owned().await;
+
+            let waiter = tokio::spawn({
+                let lock = Arc::clone(&context.sign_in_lock);
+                async move { lock.lock_owned().await }
+            });
+
+            tokio::task::yield_now().await;
+            assert!(!waiter.is_finished(), "the second sign-in must wait");
+
+            drop(held);
+            waiter
+                .await
+                .expect("the waiter acquires once the lock is free");
+        });
+    }
+
+    #[test]
+    fn an_abandoned_waiter_does_not_hold_up_the_next_sign_in() {
+        // The login-deadline case: a connection gives up while another is
+        // signing in. Dropping its future has to take it out of the queue, or
+        // the lock would be handed to a caller that no longer wants it.
+        let context = lock_only_context();
+
+        current_thread_runtime().block_on(async {
+            let held = Arc::clone(&context.sign_in_lock).lock_owned().await;
+
+            let abandoned = tokio::spawn({
+                let lock = Arc::clone(&context.sign_in_lock);
+                async move { lock.lock_owned().await }
+            });
+            tokio::task::yield_now().await;
+            abandoned.abort();
+            let _ = abandoned.await;
+
+            drop(held);
+            Arc::clone(&context.sign_in_lock).lock_owned().await;
+        });
     }
 }

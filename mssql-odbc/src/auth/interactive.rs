@@ -82,6 +82,12 @@ impl InteractiveTokenFactory {
     /// caller's login deadline expires the future is dropped while the sign-in
     /// window is still up; [`CancelUiOnDrop`] closes it rather than leaving it
     /// orphaned on the user's desktop.
+    ///
+    /// Contexts are resolved in their own blocking call so the per-account
+    /// sign-in lock can be taken here, where waiting *is* cancellable. Taking it
+    /// inside the acquisition instead would park a blocking-pool thread behind
+    /// whoever is signing in, for the full length of a human sign-in, even after
+    /// this connection's deadline had passed.
     async fn acquire(&self, spn: &str, sts_url: &str) -> TdsResult<String> {
         // msodbcsql titles the window "Authenticate to database on %s" with the
         // server name (`local.rc:786`, applied at `Parse.cpp:3618-3619`).
@@ -91,39 +97,55 @@ impl InteractiveTokenFactory {
             "interactive: acquiring an Entra token via mssql-auth"
         );
 
+        let spn = spn.to_string();
+
+        let context = {
+            let (sts_url, login_hint) = (sts_url.to_string(), self.login_hint.clone());
+            spawn_acquisition(move || {
+                super::msqa::resolve_context(&sts_url, &login_hint, PUBLIC_CLIENT_ID, REDIRECT_URI)
+            })
+            .await?
+        };
+
+        // One sign-in window per account at a time. Awaited rather than blocked
+        // on, so a caller that hits its login deadline while another connection
+        // is signing in leaves the queue instead of occupying a blocking thread.
+        let serialized = Arc::clone(&context.sign_in_lock).lock_owned().await;
+
         let ui_thread_id = Arc::new(super::msqa::UiThreadId::default());
         let cancel_on_drop = CancelUiOnDrop {
             ui_thread_id: Arc::clone(&ui_thread_id),
         };
 
-        let (spn, sts_url, login_hint) = (
-            spn.to_string(),
-            sts_url.to_string(),
-            self.login_hint.clone(),
-        );
-        let worker = Arc::clone(&ui_thread_id);
-        let result = tokio::task::spawn_blocking(move || {
-            super::msqa::acquire_token(
-                &sts_url,
-                &spn,
-                &login_hint,
-                PUBLIC_CLIENT_ID,
-                REDIRECT_URI,
-                &window_title,
-                &worker,
-            )
+        let result = spawn_acquisition(move || {
+            // Held inside the blocking task rather than by the caller: a
+            // dropped future would otherwise release the lock while this
+            // acquisition was still tearing its window down, letting the next
+            // waiter open a second prompt on top of it.
+            let _serialized = serialized;
+            super::msqa::acquire_token(&context, &spn, &window_title, &ui_thread_id)
         })
         .await;
 
         // The sign-in finished on its own, so there is no window to close.
         cancel_on_drop.disarm();
 
-        match result {
-            Ok(token) => token,
-            Err(e) => Err(Error::ConnectionError(format!(
-                "Entra interactive sign-in did not run to completion: {e}"
-            ))),
-        }
+        result
+    }
+}
+
+/// Runs one step of the acquisition on a blocking thread, flattening a join
+/// failure into a connection error.
+async fn spawn_acquisition<T, F>(step: F) -> TdsResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> TdsResult<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(step).await {
+        Ok(result) => result,
+        Err(e) => Err(Error::ConnectionError(format!(
+            "Entra interactive sign-in did not run to completion: {e}"
+        ))),
     }
 }
 
@@ -191,5 +213,34 @@ mod tests {
         let factory =
             InteractiveTokenFactory::new(Some("user@contoso.com".to_string()), "s".to_string());
         assert_eq!(factory.login_hint, "user@contoso.com");
+    }
+
+    #[test]
+    fn a_panicking_acquisition_becomes_a_connection_error() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+
+        let result: TdsResult<()> =
+            runtime.block_on(spawn_acquisition(|| panic!("OneAuth fell over")));
+
+        match result {
+            Err(Error::ConnectionError(message)) => {
+                assert!(message.contains("did not run to completion"), "{message}");
+            }
+            other => panic!("expected a connection error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_successful_acquisition_passes_its_value_through() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+
+        let token = runtime
+            .block_on(spawn_acquisition(|| Ok("token".to_string())))
+            .expect("the step succeeded");
+        assert_eq!(token, "token");
     }
 }
