@@ -312,6 +312,38 @@ function New-CoverageReport([string]$OutputPath) {
     }
 }
 
+# Ensure cmake is resolvable. CI Windows agents have Visual Studio (used to link
+# the Rust MSVC build) which bundles CMake, but it isn't on PATH by default.
+# Locate it via vswhere and prepend it, falling back to a standalone install.
+function Initialize-CMake {
+    if (Get-Command cmake -ErrorAction SilentlyContinue) {
+        Write-Host "Using cmake: $((Get-Command cmake).Source)"
+        return
+    }
+
+    $candidates = @('C:\Program Files\CMake\bin', (Join-Path ${env:ProgramFiles(x86)} 'CMake\bin'))
+
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $vsRoot = & $vswhere -latest -products '*' -property installationPath 2>$null | Select-Object -First 1
+        if ($vsRoot) {
+            $candidates = @(Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin') + $candidates
+        }
+    }
+
+    foreach ($dir in $candidates) {
+        if ($dir -and (Test-Path (Join-Path $dir 'cmake.exe'))) {
+            $env:PATH = "$dir;$env:PATH"
+            Write-Host "Added CMake to PATH from: $dir"
+            break
+        }
+    }
+
+    if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+        Write-Error "cmake not found. Install CMake 3.15+ or the 'C++ CMake tools for Windows' Visual Studio component."
+    }
+}
+
 try {
     if ($Retries -gt 0) {
         Write-Host "Retries enabled: each failing test reruns up to $Retries time(s)."
@@ -383,6 +415,7 @@ try {
 
     Write-Host ""
     Write-Host "=== Configuring e2e tests (CMake) ==="
+    Initialize-CMake
     Push-Location $ScriptDir
     cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DODBC_E2E_FORCE_UNICODE=ON
 
