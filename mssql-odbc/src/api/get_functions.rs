@@ -171,9 +171,7 @@ fn supported_function_ids() -> &'static [SqlUSmallInt] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{
-        SQL_API_ODBC3_ALL_FUNCTIONS_SIZE, SQL_API_SQLSETSTMTATTR, SQL_NULL_HANDLE,
-    };
+    use crate::api::odbc_types::{SQL_API_ODBC3_ALL_FUNCTIONS_SIZE, SQL_NULL_HANDLE};
     use crate::test_support::TestHandles;
 
     // A function id the driver does not implement (not in `supported_function_ids`).
