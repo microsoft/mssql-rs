@@ -193,8 +193,9 @@ cd build && ctest --output-on-failure -C Debug
 
 ## Running Connected Tests
 
-Tests that require a live SQL Server are automatically **skipped** when no
-connection is configured. Set environment variables to enable them:
+Tests that require a live SQL Server **fail** when no connection is configured,
+so an unconfigured environment is surfaced instead of silently passing. Set
+environment variables to enable them:
 
 ### Auto-detection
 

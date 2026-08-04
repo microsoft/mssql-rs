@@ -141,13 +141,24 @@ fn sql_get_info_w_safe(
             string_length_ptr,
             "Microsoft SQL Server",
         ),
-        SQL_DBMS_VER => write_wide_str(
-            &mut state,
-            info_value_ptr,
-            buffer_length,
-            string_length_ptr,
-            "16.00.0000",
-        ),
+        SQL_DBMS_VER => {
+            // ODBC reports SQL_DBMS_VER as "##.##.####" (major.minor.build).
+            // Use the version negotiated at login; fall back to a neutral
+            // placeholder when the connection has no reported version yet.
+            let version = state
+                .client
+                .as_ref()
+                .and_then(|c| c.server_version())
+                .map(|v| format!("{:02}.{:02}.{:04}", v.major, v.minor, v.build))
+                .unwrap_or_else(|| "00.00.0000".to_string());
+            write_wide_str(
+                &mut state,
+                info_value_ptr,
+                buffer_length,
+                string_length_ptr,
+                &version,
+            )
+        }
         SQL_IDENTIFIER_QUOTE_CHAR => write_wide_str(
             &mut state,
             info_value_ptr,

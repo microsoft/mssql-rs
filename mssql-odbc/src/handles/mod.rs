@@ -7,6 +7,7 @@ mod env;
 pub(crate) mod stmt;
 
 pub(crate) use dbc::DbcHandle;
+pub(crate) use desc::DescHandle;
 pub(crate) use env::EnvHandle;
 pub(crate) use env::OdbcVersion;
 pub(crate) use stmt::StmtHandle;

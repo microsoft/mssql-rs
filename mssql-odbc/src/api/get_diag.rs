@@ -18,13 +18,13 @@ use crate::api::odbc_types::{
     SQL_DIAG_CLASS_ORIGIN, SQL_DIAG_CONNECTION_NAME, SQL_DIAG_DYNAMIC_FUNCTION_CODE,
     SQL_DIAG_MESSAGE_TEXT, SQL_DIAG_NATIVE, SQL_DIAG_NUMBER, SQL_DIAG_SERVER_NAME,
     SQL_DIAG_SQLSTATE, SQL_DIAG_SUBCLASS_ORIGIN, SQL_DIAG_UNKNOWN_STATEMENT, SQL_ERROR,
-    SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_NO_DATA,
-    SQL_SQLSTATE_SIZE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer,
-    SqlReturn, SqlSmallInt, SqlWChar,
+    SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_INVALID_HANDLE,
+    SQL_NO_DATA, SQL_SQLSTATE_SIZE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger,
+    SqlPointer, SqlReturn, SqlSmallInt, SqlWChar,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{DiagRecord, HasDiagnostics};
-use crate::handles::{DbcHandle, EnvHandle, HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{DbcHandle, DescHandle, EnvHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Implementation of [`SQLGetDiagRecW`](super::exports::SQLGetDiagRecW).
 ///
@@ -422,6 +422,19 @@ unsafe fn with_locked_diag_records<T>(
             })?;
             Ok(f(guard.diag_records()))
         }
+        SQL_HANDLE_DESC => {
+            let h = unsafe { handle_from_raw::<DescHandle>(handle) };
+            debug_assert_eq!(
+                h.object_type,
+                HandleType::Desc,
+                "with_locked_diag_records: handle is not DESC"
+            );
+            let guard = h.inner.lock().map_err(|_| {
+                error!("with_locked_diag_records: DESC mutex poisoned");
+                SQL_ERROR
+            })?;
+            Ok(f(guard.diag_records()))
+        }
         _ => {
             error!(
                 handle_type,
@@ -704,13 +717,14 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_handle_type_returns_invalid_handle() {
+    fn unknown_handle_type_returns_invalid_handle() {
         let env = alloc_env();
-        // DESC handles are not yet implemented; passing SQL_HANDLE_DESC on a
-        // non-DESC pointer must be rejected before we dereference.
+        // A handle type outside the ODBC set (ENV/DBC/STMT/DESC) must be
+        // rejected before the pointer is dereferenced.
+        let bogus_handle_type: SqlSmallInt = 99;
         let ret = unsafe {
             sql_get_diag_rec_w(
-                SQL_HANDLE_DESC,
+                bogus_handle_type,
                 env,
                 1,
                 ptr::null_mut(),
@@ -722,6 +736,33 @@ mod tests {
         };
         assert_eq!(ret, SQL_INVALID_HANDLE);
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn desc_handle_without_diagnostics_returns_no_data() {
+        use crate::handles::StmtHandle;
+        use crate::test_support::TestHandles;
+
+        // A statement's implicit descriptors are the DESC handles returned by
+        // SQLGetStmtAttrW, so SQLGetDiagRecW must accept them. With no records
+        // posted, record 1 yields SQL_NO_DATA (not SQL_INVALID_HANDLE).
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let desc: SqlHandle = stmt.ard;
+
+        let ret = unsafe {
+            sql_get_diag_rec_w(
+                SQL_HANDLE_DESC,
+                desc,
+                1,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_NO_DATA);
     }
 
     #[test]
