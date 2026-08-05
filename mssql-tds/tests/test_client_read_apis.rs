@@ -876,7 +876,10 @@ mod client_based_iterators {
                 &c2,
                 CursorColumn::Value(ColumnValues::String(s)) if s.to_utf8_string() == "row1-c2"
             ));
-            assert!(matches!(client.read_row_column(3).await?, CursorColumn::PlpStreaming));
+            assert!(matches!(
+                client.read_row_column(3).await?,
+                CursorColumn::PlpStreaming
+            ));
 
             let mut buf = [0u8; 2048];
             let mut first_row_c4 = Vec::new();
@@ -898,7 +901,10 @@ mod client_based_iterators {
                 &c2b,
                 CursorColumn::Value(ColumnValues::String(s)) if s.to_utf8_string() == "row2-c2"
             ));
-            assert!(matches!(client.read_row_column(3).await?, CursorColumn::PlpStreaming));
+            assert!(matches!(
+                client.read_row_column(3).await?,
+                CursorColumn::PlpStreaming
+            ));
 
             let mut second_row_c4 = Vec::new();
             loop {
@@ -951,7 +957,10 @@ mod client_based_iterators {
                 client.read_row_column(0).await?,
                 CursorColumn::Value(ColumnValues::Null)
             ));
-            assert!(matches!(client.read_row_column(1).await?, CursorColumn::PlpStreaming));
+            assert!(matches!(
+                client.read_row_column(1).await?,
+                CursorColumn::PlpStreaming
+            ));
             assert!(client.active_plp_collation().is_none());
 
             let mut buf = [0u8; 2048];
@@ -973,7 +982,10 @@ mod client_based_iterators {
                 client.read_row_column(0).await?,
                 CursorColumn::Value(ColumnValues::Null)
             ));
-            assert!(matches!(client.read_row_column(1).await?, CursorColumn::PlpStreaming));
+            assert!(matches!(
+                client.read_row_column(1).await?,
+                CursorColumn::PlpStreaming
+            ));
 
             let mut second_row_c2 = Vec::new();
             loop {
@@ -1022,7 +1034,10 @@ mod client_based_iterators {
         if client.on_rows() {
             // Row 1: c2 (0-based 1) is PLP nvarchar(max), then c4 (0-based 3) INT.
             assert!(client.next_row_cursor().await?);
-            assert!(matches!(client.read_row_column(1).await?, CursorColumn::PlpStreaming));
+            assert!(matches!(
+                client.read_row_column(1).await?,
+                CursorColumn::PlpStreaming
+            ));
 
             let mut buf = [0u8; 2048];
             let mut first_row_c2 = Vec::new();
@@ -1042,7 +1057,10 @@ mod client_based_iterators {
 
             // Row 2.
             assert!(client.next_row_cursor().await?);
-            assert!(matches!(client.read_row_column(1).await?, CursorColumn::PlpStreaming));
+            assert!(matches!(
+                client.read_row_column(1).await?,
+                CursorColumn::PlpStreaming
+            ));
 
             let mut second_row_c2 = Vec::new();
             loop {

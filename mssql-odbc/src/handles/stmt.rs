@@ -6,10 +6,10 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use super::{DbcHandle, HandleType, HasObjectType};
+use crate::api::PlpEncoding;
 use crate::api::odbc_types::{SqlULen, SqlUSmallInt};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
-use crate::api::PlpEncoding;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
 

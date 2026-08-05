@@ -537,7 +537,13 @@ impl TdsTokenStreamReader for MockTransport {
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         self.token_stream_reader
-            .receive_row_into(context, remaining_request_timeout, cancel_handle, plan, writer)
+            .receive_row_into(
+                context,
+                remaining_request_timeout,
+                cancel_handle,
+                plan,
+                writer,
+            )
             .await
     }
 

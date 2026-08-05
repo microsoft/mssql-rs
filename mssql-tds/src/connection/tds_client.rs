@@ -2990,7 +2990,8 @@ impl TdsClient {
             }
             ActiveRowReadState::PlpPaused(mut plp_state) => {
                 self.drain_active_plp(&mut plp_state).await?;
-                self.resume_to_column(plp_state.row_pause_state, target).await
+                self.resume_to_column(plp_state.row_pause_state, target)
+                    .await
             }
         }
     }
@@ -3023,15 +3024,22 @@ impl TdsClient {
 
         match result {
             RowReadResult::RowPaused(next_pause) => {
-                self.active_row_read_state =
-                    ActiveRowReadState::RowPaused(Box::new(next_pause));
-                let value = capture.take_row().into_iter().next().unwrap_or(ColumnValues::Null);
+                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(next_pause));
+                let value = capture
+                    .take_row()
+                    .into_iter()
+                    .next()
+                    .unwrap_or(ColumnValues::Null);
                 Ok(CursorColumn::Value(value))
             }
             RowReadResult::RowWritten => {
                 // `target` was the last column; the row is now fully consumed.
                 self.active_row_read_state = ActiveRowReadState::Idle;
-                let value = capture.take_row().into_iter().next().unwrap_or(ColumnValues::Null);
+                let value = capture
+                    .take_row()
+                    .into_iter()
+                    .next()
+                    .unwrap_or(ColumnValues::Null);
                 Ok(CursorColumn::Value(value))
             }
             RowReadResult::PlpPaused(plp_state) => {

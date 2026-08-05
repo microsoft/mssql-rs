@@ -27,13 +27,13 @@ use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult};
 use crate::datatypes::row_writer::RowWriter;
 use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
-use crate::query::metadata::ColumnMetadata;
 use crate::handler::handler_factory::create_test_negotiated_settings_internal;
 use crate::io::reader_writer::{NetworkReader, NetworkWriter};
 use crate::io::token_stream::{
     ParserContext, PlpPauseState, RowPauseState, RowPlan, RowReadResult, TdsTokenStreamReader,
 };
 use crate::message::messages::ResetConnectionMode;
+use crate::query::metadata::ColumnMetadata;
 use crate::token::tokens::{
     ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
 };
@@ -209,8 +209,7 @@ pub fn int_columns(n: usize) -> Vec<ColumnMetadata> {
         .map(|i| ColumnMetadata {
             user_type: 0,
             flags: 0x01, // nullable
-            type_info: TypeInfo::fixed_len(TdsDataType::Int4)
-                .expect("Int4 is a fixed-length type"),
+            type_info: TypeInfo::fixed_len(TdsDataType::Int4).expect("Int4 is a fixed-length type"),
             data_type: TdsDataType::Int4,
             column_name: format!("c{i}"),
             multi_part_name: None,

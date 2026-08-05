@@ -1208,10 +1208,15 @@ mod tests {
         let registry = GenericTokenParserRegistry::default();
         let mut writer = DiscardRowWriter;
 
-        let result =
-            receive_row_into_internal(&mut reader, &registry, &context, RowPlan::Column(0), &mut writer)
-                .await
-                .unwrap();
+        let result = receive_row_into_internal(
+            &mut reader,
+            &registry,
+            &context,
+            RowPlan::Column(0),
+            &mut writer,
+        )
+        .await
+        .unwrap();
 
         match result {
             RowReadResult::PlpPaused(plp_state) => {
@@ -1250,10 +1255,15 @@ mod tests {
         let registry = GenericTokenParserRegistry::default();
         let mut writer = DiscardRowWriter;
 
-        let result =
-            receive_row_into_internal(&mut reader, &registry, &context, RowPlan::Column(1), &mut writer)
-                .await
-                .unwrap();
+        let result = receive_row_into_internal(
+            &mut reader,
+            &registry,
+            &context,
+            RowPlan::Column(1),
+            &mut writer,
+        )
+        .await
+        .unwrap();
 
         match result {
             RowReadResult::PlpPaused(plp_state) => {
@@ -1279,9 +1289,14 @@ mod tests {
         let registry = GenericTokenParserRegistry::default();
         let mut writer = DiscardRowWriter;
 
-        let result =
-            receive_row_into_internal(&mut reader, &registry, &context, RowPlan::Column(0), &mut writer)
-                .await;
+        let result = receive_row_into_internal(
+            &mut reader,
+            &registry,
+            &context,
+            RowPlan::Column(0),
+            &mut writer,
+        )
+        .await;
 
         match result {
             Err(crate::error::Error::UnimplementedFeature { feature, context }) => {
