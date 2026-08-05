@@ -636,6 +636,15 @@ if ($regressions.Count -gt 0) {
 $summary = $summaryLines -join "`n"
 [System.IO.File]::WriteAllText((Join-Path $ResultsDir 'summary.md'), $summary + "`n", $Utf8NoBom)
 
+# Also echo the summary into the log: task.uploadsummary only surfaces it on the
+# run's Summary tab, so without this the verdict is invisible when triaging from
+# the log alone.
+Write-Host ''
+Write-Host '===== summary.md ====='
+Write-Host $summary
+Write-Host '===== end summary.md ====='
+Write-Host ''
+
 Copy-Item -Recurse -Force 'target/criterion' (Join-Path $ResultsDir 'criterion') -ErrorAction SilentlyContinue
 
 Write-Host ">>> Done. Results in $ResultsDir"

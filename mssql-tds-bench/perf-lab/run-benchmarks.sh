@@ -508,6 +508,15 @@ emoji_bar_table() {
     fi
 } > "$RESULTS_DIR/summary.md"
 
+# Also echo the summary into the log: task.uploadsummary only surfaces it on the
+# run's Summary tab, so without this the verdict is invisible when triaging from
+# the log alone.
+echo ""
+echo "===== summary.md ====="
+cat "$RESULTS_DIR/summary.md"
+echo "===== end summary.md ====="
+echo ""
+
 # Archive the raw Criterion data for offline analysis.
 cp -r target/criterion "$RESULTS_DIR/criterion" 2>/dev/null || true
 

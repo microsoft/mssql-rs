@@ -168,7 +168,22 @@ trips is re-measured by **auto-confirm** `BENCH_CONFIRM_RUNS` times (default 4) 
 fails the run if it regresses in a **majority** of those re-runs (default 3 of 4). The
 verdict and the full `critcmp` table are written to `results/summary.md`, which the lab
 attaches to the run's **Summary** tab (`task.uploadsummary`) so the comparison renders
-inline on the pipeline run page.
+inline on the pipeline run page. The summary is also echoed into the log, since the
+Summary tab is not visible when triaging from the log alone.
+
+`summary.md` leads with a **diverging bar table** (🟩 faster / 🟥 slower, one square ≈ 1%,
+drawn only for |Δ| ≥ 1%) so a run's shape is readable at a glance; the raw `critcmp`
+output follows it. A benchmark that auto-confirm re-measured is shown as the **median** of
+its first pass plus all re-runs and marked `⟳` — otherwise the chart would keep rendering
+the first-pass spike for a benchmark the gate had already cleared as noise, and the
+summary would appear to contradict the verdict. The median (rather than the best passing
+re-run) keeps the displayed number from being cherry-picked.
+
+**Compilation failures fail loudly.** Both runners compile the candidate and baseline
+bench binaries in an explicit `cargo bench --no-run` step with human-readable output
+before enumerating them. The enumeration itself parses cargo's JSON and discards stderr,
+so without a separate compile step a build error surfaced only as a generic "no bench
+binaries found" with no diagnostics in the log.
 
 ---
 
@@ -267,6 +282,19 @@ binaries keep the per-binary interleaving effective (see §2).
 - Baseline commit is stored in **`mssql-tds-bench/perf-lab/baseline-commit.txt`, read by the
   testScript**. The baseline is advanced via a **pull request that edits that file**, so the
   change is reviewed and recorded in git history (no untracked tag move or pipeline variable).
+- **A breaking `mssql-tds` API change forces the baseline forward.** The harness compiles
+  *one* bench source — the candidate's — against *both* libraries, which is what makes a
+  measured delta attributable to `mssql-tds` alone. The corollary is that the benches must
+  compile against both revisions, so once they are updated for a new API they no longer
+  build against a baseline that predates it, and the baseline compile fails. Advance
+  `baseline-commit.txt` to the commit that **introduced** the API — the earliest library
+  that compiles the current benches — which preserves the longest comparison window.
+  (`cfg`-gating the changed call sites so one source compiles both ways is possible but
+  costs dual code paths; reserve it for when a pre-break baseline is specifically needed.
+  Building each side from its own bench source is *not* an option: it reintroduces the
+  variable the harness exists to eliminate.) Bumping the baseline can also surface
+  *runtime* breaks that still compile — e.g. a value that moved from the generic
+  return-value buffer to a dedicated accessor.
 - Perf-lab pipeline runs on a **dedicated host VM** via the shared `PerfTest` lab
   `extends` template; the build happens on the VM (the lab's documented model).
 - Comparison is **interleaved per bench binary** (not two full passes), and the run
