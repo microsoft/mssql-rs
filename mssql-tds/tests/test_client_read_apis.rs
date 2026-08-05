@@ -1083,4 +1083,94 @@ mod client_based_iterators {
         client.close_query().await?;
         Ok(())
     }
+
+    // Positions on each row without pulling any column, so advancing drains the
+    // whole row through `DiscardRowWriter`. The drain path decodes every
+    // non-PLP column into the discard sink, exercising its `write_*` methods
+    // across a broad spread of fixed- and variable-length types.
+    #[tokio::test]
+    async fn drain_row_with_diverse_types_via_discard_writer() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let row = "
+            SELECT
+                CAST(NULL AS INT)                         AS c_null,
+                CAST(1 AS BIT)                            AS c_bit,
+                CAST(2 AS TINYINT)                        AS c_tinyint,
+                CAST(3 AS SMALLINT)                       AS c_smallint,
+                CAST(4 AS INT)                            AS c_int,
+                CAST(5 AS BIGINT)                         AS c_bigint,
+                CAST(1.5 AS REAL)                         AS c_real,
+                CAST(2.5 AS FLOAT)                        AS c_float,
+                CAST(N'txt' AS NVARCHAR(50))              AS c_nvarchar,
+                CAST(0x0102 AS VARBINARY(50))             AS c_varbinary,
+                CAST(12.34 AS DECIMAL(10,2))              AS c_decimal,
+                CAST(56.78 AS NUMERIC(18,4))              AS c_numeric,
+                CAST('2020-01-02' AS DATE)                AS c_date,
+                CAST('12:34:56' AS TIME)                  AS c_time,
+                CAST('2020-01-02 12:34:56' AS DATETIME)   AS c_datetime,
+                CAST('2020-01-02 12:34' AS SMALLDATETIME) AS c_smalldatetime,
+                CAST('2020-01-02 12:34:56.123' AS DATETIME2)       AS c_datetime2,
+                CAST('2020-01-02 12:34:56 +05:30' AS DATETIMEOFFSET) AS c_dto,
+                CAST(123.45 AS MONEY)                     AS c_money,
+                CAST(6.78 AS SMALLMONEY)                  AS c_smallmoney,
+                CAST('6F9619FF-8B86-D011-B42D-00C04FC964FF' AS UNIQUEIDENTIFIER) AS c_uuid";
+        let query = format!("{row} UNION ALL {row}");
+        client.execute(query, ()).await?;
+
+        if client.on_rows() {
+            // Position both rows and advance without pulling any column, forcing
+            // each row's columns to drain through the discard sink.
+            assert!(client.next_row_cursor().await?);
+            assert!(client.next_row_cursor().await?);
+            assert!(!client.next_row_cursor().await?);
+        }
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    // Pulling a column index at or beyond the row's column count must be
+    // rejected without consuming the row, and the cursor must stay usable so a
+    // subsequent in-range pull still succeeds.
+    #[tokio::test]
+    async fn read_row_column_out_of_range_is_rejected() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute(
+                "SELECT CAST(10 AS INT) AS c1, CAST(20 AS INT) AS c2".to_string(),
+                (),
+            )
+            .await?;
+
+        if client.on_rows() {
+            assert!(client.next_row_cursor().await?);
+
+            // Two columns (0, 1); index 2 is out of range.
+            assert!(
+                client.read_row_column(2).await.is_err(),
+                "Out-of-range column pull should error"
+            );
+
+            // Cursor re-parked: a valid pull still returns the column value.
+            assert!(matches!(
+                client.read_row_column(0).await?,
+                CursorColumn::Value(ColumnValues::Int(10))
+            ));
+
+            assert!(!client.next_row_cursor().await?);
+        }
+
+        client.close_query().await?;
+        Ok(())
+    }
 }
