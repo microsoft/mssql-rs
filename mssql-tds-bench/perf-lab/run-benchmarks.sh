@@ -309,10 +309,17 @@ cpu_sample "interleave-end" || true
 echo ">>> Comparing base -> candidate..."
 critcmp base candidate | tee "$RESULTS_DIR/comparison.txt"
 
+THR="${BENCH_REGRESSION_RATIO:-1.10}"
+# Improvements are verified at the SAME magnitude as regressions by default: a
+# baseline-slower anomaly pollutes the recorded numbers (and the run-over-run
+# trend they feed) exactly as much as a candidate-slower one, and both directions
+# share one re-measure set, so the extra confidence costs nothing per run.
+IMP_THR="${BENCH_IMPROVEMENT_VERIFY_RATIO:-$THR}"
+
 # Print the IDs (field 1) of benchmarks whose candidate ratio (field 6) meets or
 # exceeds the regression threshold, one per line.
 regression_ids() {
-    awk -v thr="${BENCH_REGRESSION_RATIO:-1.10}" '
+    awk -v thr="$THR" '
         $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ && ($6 + 0) >= thr { print $1 }
     ' "$1"
 }
@@ -320,7 +327,7 @@ regression_ids() {
 # Like regression_ids, but prints "id candidate_ratio" so the auto-confirm loop
 # can tally how many re-runs each benchmark tripped and track its worst ratio.
 regression_pairs() {
-    awk -v thr="${BENCH_REGRESSION_RATIO:-1.10}" '
+    awk -v thr="$THR" '
         $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ && ($6 + 0) >= thr { print $1, $6 }
     ' "$1"
 }
@@ -328,17 +335,16 @@ regression_pairs() {
 OFFENDERS=$(regression_ids "$RESULTS_DIR/comparison.txt")
 
 # The gate is one-directional, so a *baseline*-slower result is never challenged
-# and an implausible "3x faster" gets published unverified. critcmp normalizes
-# the faster side to 1.00, so field 2 carries the baseline's ratio: select IDs
-# where the baseline is slower by at least BENCH_IMPROVEMENT_VERIFY_RATIO and
-# re-measure them too. Only large deltas qualify, so normal runs pay nothing.
+# and an unverified "3x faster" gets published. critcmp normalizes the faster
+# side to 1.00, so field 2 carries the baseline's ratio: select IDs where the
+# baseline is slower by at least IMP_THR and re-measure them too.
 improvement_ids() {
-    awk -v thr="${BENCH_IMPROVEMENT_VERIFY_RATIO:-1.50}" '
+    awk -v thr="$IMP_THR" '
         $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ && ($2 + 0) >= thr { print $1 }
     ' "$1"
 }
 improvement_pairs() {
-    awk -v thr="${BENCH_IMPROVEMENT_VERIFY_RATIO:-1.50}" '
+    awk -v thr="$IMP_THR" '
         $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ && ($2 + 0) >= thr { print $1, $2 }
     ' "$1"
 }
@@ -421,8 +427,6 @@ for id in $VERIFY_IDS; do
 done
 
 # --- Verdict (based on the majority-confirmed regressions) ---
-THR="${BENCH_REGRESSION_RATIO:-1.10}"
-IMP_THR="${BENCH_IMPROVEMENT_VERIFY_RATIO:-1.50}"
 PCT=$(awk -v t="$THR" 'BEGIN { printf "%d", (t - 1) * 100 + 0.5 }')
 IMP_PCT=$(awk -v t="$IMP_THR" 'BEGIN { printf "%d", (t - 1) * 100 + 0.5 }')
 NCONF=$(printf '%s\n' ${CONFIRMED_IDS:-} | grep -c . || true)

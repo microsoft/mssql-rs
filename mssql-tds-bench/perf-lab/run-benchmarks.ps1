@@ -462,7 +462,11 @@ $thr = [double]($env:BENCH_REGRESSION_RATIO)
 if (-not $thr) { $thr = 1.10 }
 $regressions = @(Get-CritcmpRegressions $comparison $thr)
 $impThr = [double]($env:BENCH_IMPROVEMENT_VERIFY_RATIO)
-if (-not $impThr) { $impThr = 1.50 }
+# Same magnitude as the regression threshold by default: a baseline-slower
+# anomaly pollutes the recorded numbers (and the run-over-run trend they feed)
+# exactly as much as a candidate-slower one, and both directions share one
+# re-measure set.
+if (-not $impThr) { $impThr = $thr }
 $improvements = @(Get-CritcmpImprovements $comparison $impThr)
 # One re-measure set covers both directions, so the re-runs cost one pass.
 $verifyNames = @(@($regressions | ForEach-Object { $_.Name }) + @($improvements | ForEach-Object { $_.Name }) | Select-Object -Unique)

@@ -180,14 +180,18 @@ summary would appear to contradict the verdict. The median (rather than the best
 re-run) keeps the displayed number from being cherry-picked.
 
 **Large improvements are verified too.** The gate is one-directional, so a *baseline*-slower
-result is never challenged and an implausible "3× faster" would be published unverified —
-a real risk, since a sustained host disturbance during one pass produces a large, tight-CI
-delta that does not look like noise. Any benchmark where the baseline is slower by
-≥ `BENCH_IMPROVEMENT_VERIFY_RATIO` (default `1.50`) joins the same re-measure set, and the
-summary reports whether the win reproduced in a majority of re-runs. This never fails the
-run: it exists so a one-off artifact is not reported as a real gain, and because a win that
-*does* reproduce is itself worth a look — an implausible speed-up can mean the candidate is
-doing less work rather than the same work faster.
+result is never challenged and an unverified "3× faster" would be published — a real risk,
+since a sustained host disturbance during one pass produces a large, tight-CI delta that
+does not look like noise. Any benchmark where the baseline is slower by
+≥ `BENCH_IMPROVEMENT_VERIFY_RATIO` (default: **the same as the regression threshold**) joins
+the same re-measure set, and the summary reports whether the win reproduced in a majority of
+re-runs. Verifying both directions at the same magnitude matters because the measurements are
+recorded for run-over-run trend comparison: an anomalously slow *baseline* pass corrupts that
+record exactly as much as an anomalously slow candidate one, and since both directions share
+one re-measure set the extra confidence costs nothing per run. This never fails the run: it
+exists so a one-off artifact is not reported as a real gain, and because a win that *does*
+reproduce is itself worth a look — an implausible speed-up can mean the candidate is doing
+less work rather than the same work faster.
 
 **Compilation failures fail loudly.** Both runners compile the candidate and baseline
 bench binaries in an explicit `cargo bench --no-run` step with human-readable output
