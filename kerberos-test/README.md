@@ -28,8 +28,8 @@ This directory contains a containerized Kerberos authentication test environment
 | `docker-compose-matrix.yml` | Docker Compose for multi-distro matrix testing |
 | `Dockerfile.client` | Default client container (based on .NET SDK) |
 | `Dockerfile.client.matrix` | Parameterized client for all distros (uses build args) |
-| `Dockerfile.samba-dc` | Samba AD Domain Controller |
-| `Dockerfile.mssql-ad` | SQL Server with AD integration |
+| `Dockerfile.samba-dc` | Samba AD Domain Controller (init script mounted from `scripts/`) |
+| `Dockerfile.mssql-ad` | SQL Server with AD integration (init script mounted from `scripts/`) |
 | `configure-kerberos.sh` | Script to configure Kerberos after containers start |
 | `run-kerberos-tests.sh` | Run tests on a specific distro |
 | `run-all-distros.sh` | Run tests on all distros in the matrix |

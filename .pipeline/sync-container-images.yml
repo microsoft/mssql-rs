@@ -41,8 +41,23 @@ parameters:
   type: boolean
   default: true
 
+- name: syncAlpine3
+  displayName: 'Import: Alpine 3.22-3.23 (docker.io)'
+  type: boolean
+  default: true
+
 - name: syncDebianRHEL
   displayName: 'Import: Debian & RHEL (docker.io)'
+  type: boolean
+  default: true
+
+- name: syncCentOS
+  displayName: 'Import: CentOS Stream (quay.io)'
+  type: boolean
+  default: true
+
+- name: syncSUSE
+  displayName: 'Import: openSUSE Leap (docker.io)'
   type: boolean
   default: true
 
@@ -76,6 +91,11 @@ parameters:
 
 - name: buildUbuntuImages
   displayName: 'Build Rust build images'
+  type: boolean
+  default: true
+
+- name: buildKerberosImages
+  displayName: 'Build Kerberos test images (DC, SQL+AD, per-distro clients)'
   type: boolean
   default: true
 
@@ -239,10 +259,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -250,7 +270,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/ubuntu:22.04 \
             --image import/ubuntu:22.04 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -263,10 +283,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -274,7 +294,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/ubuntu:24.04 \
             --image import/ubuntu:24.04 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -298,10 +318,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -309,7 +329,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/alpine:3.18 \
             --image import/alpine:3.18 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -322,10 +342,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -333,7 +353,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/alpine:3.19 \
             --image import/alpine:3.19 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -357,10 +377,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -368,7 +388,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/alpine:3.20 \
             --image import/alpine:3.20 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -381,10 +401,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -392,7 +412,66 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/alpine:3.21 \
             --image import/alpine:3.21 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
+            --force
+      env:
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
+      retryCountOnTaskFailure: 3
+
+  # Alpine 3.22 & 3.23 (Docker Hub - rate limited)
+  - job: Alpine3
+    displayName: 'Import Alpine 3.22 & 3.23'
+    condition: eq('${{ parameters.syncAlpine3 }}', 'true')
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - checkout: none
+    - task: AzureCLI@2
+      displayName: 'Import Alpine 3.22'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          AUTH_ARGS=()
+          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
+            echo "Using authenticated Docker Hub access"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
+          else
+            echo "Using anonymous Docker Hub access"
+          fi
+          az acr import \
+            --name $(ACR_NAME) \
+            --source docker.io/library/alpine:3.22 \
+            --image import/alpine:3.22 \
+            "${AUTH_ARGS[@]}" \
+            --force
+      env:
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
+      retryCountOnTaskFailure: 3
+    - task: AzureCLI@2
+      displayName: 'Import Alpine 3.23'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          AUTH_ARGS=()
+          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
+            echo "Using authenticated Docker Hub access"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
+          else
+            echo "Using anonymous Docker Hub access"
+          fi
+          az acr import \
+            --name $(ACR_NAME) \
+            --source docker.io/library/alpine:3.23 \
+            --image import/alpine:3.23 \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -401,7 +480,7 @@ stages:
 
   # Debian & RHEL (Docker Hub - rate limited)
   - job: DebianRHEL
-    displayName: 'Import Debian & RHEL UBI9'
+    displayName: 'Import Debian & RHEL UBI'
     condition: eq('${{ parameters.syncDebianRHEL }}', 'true')
     pool:
       name: RUST-1ES-POOL-WUS3
@@ -416,10 +495,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -427,7 +506,55 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/debian:bookworm \
             --image import/debian:bookworm \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
+            --force
+      env:
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
+      retryCountOnTaskFailure: 3
+    - task: AzureCLI@2
+      displayName: 'Import Debian Bullseye'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          AUTH_ARGS=()
+          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
+            echo "Using authenticated Docker Hub access"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
+          else
+            echo "Using anonymous Docker Hub access"
+          fi
+          az acr import \
+            --name $(ACR_NAME) \
+            --source docker.io/library/debian:bullseye \
+            --image import/debian:bullseye \
+            "${AUTH_ARGS[@]}" \
+            --force
+      env:
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
+      retryCountOnTaskFailure: 3
+    - task: AzureCLI@2
+      displayName: 'Import Debian Trixie'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          AUTH_ARGS=()
+          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
+            echo "Using authenticated Docker Hub access"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
+          else
+            echo "Using anonymous Docker Hub access"
+          fi
+          az acr import \
+            --name $(ACR_NAME) \
+            --source docker.io/library/debian:trixie \
+            --image import/debian:trixie \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -440,10 +567,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -451,7 +578,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/redhat/ubi9:latest \
             --image import/redhat/ubi9:latest \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -464,10 +591,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -475,11 +602,26 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/redhat/ubi8:latest \
             --image import/redhat/ubi8:latest \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
         DOCKER_PAT: $(DOCKERHUB_PAT)
+      retryCountOnTaskFailure: 3
+    # UBI10 is not published on Docker Hub, so it comes straight from the
+    # Red Hat public registry (anonymous, no Docker Hub credentials).
+    - task: AzureCLI@2
+      displayName: 'Import Red Hat UBI10'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az acr import \
+            --name $(ACR_NAME) \
+            --source registry.access.redhat.com/ubi10/ubi:latest \
+            --image import/redhat/ubi10:latest \
+            --force
       retryCountOnTaskFailure: 3
 
   # Oracle Linux (Docker Hub - rate limited)
@@ -499,10 +641,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -510,7 +652,66 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/oraclelinux:9 \
             --image import/oraclelinux:9 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
+            --force
+      env:
+        DOCKER_USER: $(DOCKERHUB_USERNAME)
+        DOCKER_PAT: $(DOCKERHUB_PAT)
+      retryCountOnTaskFailure: 3
+
+  # CentOS Stream (quay.io - no Docker Hub rate limit)
+  - job: CentOS
+    displayName: 'Import CentOS Stream 9'
+    condition: eq('${{ parameters.syncCentOS }}', 'true')
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - checkout: none
+    - task: AzureCLI@2
+      displayName: 'Import CentOS Stream 9'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az acr import \
+            --name $(ACR_NAME) \
+            --source quay.io/centos/centos:stream9 \
+            --image import/centos:stream9 \
+            --force
+      retryCountOnTaskFailure: 3
+
+  # openSUSE Leap (Docker Hub - rate limited)
+  - job: SUSE
+    displayName: 'Import openSUSE Leap 15.6'
+    condition: eq('${{ parameters.syncSUSE }}', 'true')
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - checkout: none
+    - task: AzureCLI@2
+      displayName: 'Import openSUSE Leap 15.6'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          AUTH_ARGS=()
+          if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
+            echo "Using authenticated Docker Hub access"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
+          else
+            echo "Using anonymous Docker Hub access"
+          fi
+          az acr import \
+            --name $(ACR_NAME) \
+            --source docker.io/opensuse/leap:15.6 \
+            --image import/opensuse/leap:15.6 \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -528,10 +729,11 @@ stages:
 - stage: BuildAndPushImages
   displayName: Build and Push Custom Images
   dependsOn: []
-  condition: or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true'))
+  condition: or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true'), eq('${{ parameters.buildKerberosImages }}', 'true'))
   jobs:
   - job: BuildX64Images
     displayName: Build x64 Images
+    condition: or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true'))
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:
@@ -578,6 +780,7 @@ stages:
               -t tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64_rust:latest \
               .
           echo "✅ manylinux_2_28 x64 image built successfully"
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Build Ubuntu x64 build image with Rust and tooling'
@@ -601,6 +804,7 @@ stages:
               -t tdslibrs.azurecr.io/build/ubuntu:latest-x64 \
               .
           echo "✅ Ubuntu x64 build image built successfully"
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Build Alpine x64 build image with Rust and tooling'
@@ -623,6 +827,7 @@ stages:
               -t tdslibrs.azurecr.io/build/alpine:3.18-amd64 \
               .
           echo "✅ Alpine x64 build image built successfully"
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Push x64 images to ACR'
@@ -646,10 +851,90 @@ stages:
             docker push tdslibrs.azurecr.io/build/ubuntu:latest-x64
             docker push tdslibrs.azurecr.io/build/alpine:3.18-amd64
           fi
+      retryCountOnTaskFailure: 3
+
+  - job: BuildKerberosImages
+    displayName: Build Kerberos Test Images
+    timeoutInMinutes: 120
+    condition: eq('${{ parameters.buildKerberosImages }}', 'true')
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - checkout: self
+      displayName: Checkout repository
+
+    - task: AzureCLI@2
+      displayName: 'Build and push Kerberos infrastructure images'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -euo pipefail
+          cd $(Build.SourcesDirectory)/kerberos-test
+          az acr login --name $(ACR_NAME)
+
+          echo "==> Building Samba AD DC image..."
+          docker build -f Dockerfile.samba-dc \
+            -t $(ACR_REGISTRY)/kerberos/samba-dc:latest .
+          docker push $(ACR_REGISTRY)/kerberos/samba-dc:latest
+
+          echo "==> Building SQL Server + AD image..."
+          docker build -f Dockerfile.mssql-ad \
+            -t $(ACR_REGISTRY)/kerberos/mssql-ad:latest .
+          docker push $(ACR_REGISTRY)/kerberos/mssql-ad:latest
+      retryCountOnTaskFailure: 3
+
+    - task: AzureCLI@2
+      displayName: 'Build and push Kerberos client images (all distros)'
+      inputs:
+        azureSubscription: 'Magnitude Test'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -euo pipefail
+          cd $(Build.SourcesDirectory)/kerberos-test
+          az acr login --name $(ACR_NAME)
+
+          # profile|base image|entry script - must stay in sync with
+          # kerberos-test/docker-compose-matrix.yml
+          PROFILES="
+          alpine318|$(ACR_REGISTRY)/import/alpine:3.18|alpine.sh
+          alpine319|$(ACR_REGISTRY)/import/alpine:3.19|alpine.sh
+          alpine320|$(ACR_REGISTRY)/import/alpine:3.20|alpine.sh
+          alpine321|$(ACR_REGISTRY)/import/alpine:3.21|alpine.sh
+          debian|$(ACR_REGISTRY)/import/debian:bookworm|deb-bookworm.sh
+          ubuntu22|$(ACR_REGISTRY)/import/ubuntu:22.04|deb-bookworm.sh
+          ubuntu24|$(ACR_REGISTRY)/import/ubuntu:24.04|deb-bookworm.sh
+          rhel9|$(ACR_REGISTRY)/import/redhat/ubi9:latest|rhel.sh
+          oracle9|$(ACR_REGISTRY)/import/oraclelinux:9|rhel.sh
+          "
+
+          echo "$PROFILES" | while IFS='|' read -r profile base entry; do
+            [ -z "$profile" ] && continue
+            tag="$(ACR_REGISTRY)/kerberos/client:${profile}-latest"
+            echo "==> Building $profile from $base"
+            docker build -f Dockerfile.client.matrix \
+              --build-arg BASE_IMAGE="$base" \
+              --build-arg ENTRY_SCRIPT="$entry" \
+              -t "$tag" .
+            docker push "$tag"
+            # Reclaim disk between builds: 9 client images at ~1.5-3 GB each
+            # would otherwise accumulate on the agent for the whole job.
+            docker rmi "$tag" || true
+            echo "✅ $tag"
+          done
+      retryCountOnTaskFailure: 3
 
   - job: BuildARM64Images
     displayName: Build ARM64 Images
     dependsOn: BuildX64Images
+    # succeeded() must stay explicit: supplying a condition replaces the
+    # implicit succeeded(), which would otherwise let ARM64 start after an
+    # x64 failure.
+    condition: and(succeeded(), or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true')))
     pool:
       name: RUST-1ES-POOL-ARM-WUS3
       demands:
@@ -706,6 +991,7 @@ stages:
               -t tdslibrs.azurecr.io/python-build/manylinux_2_28_aarch64_rust:latest \
               .
           echo "✅ manylinux_2_28 ARM64 image built successfully"
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Build Ubuntu ARM64 build image with Rust and tooling'
@@ -729,6 +1015,7 @@ stages:
               -t tdslibrs.azurecr.io/build/ubuntu:latest-arm64 \
               .
           echo "✅ Ubuntu ARM64 build image built successfully"
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Build Alpine ARM64 build image with Rust and tooling'
@@ -751,6 +1038,7 @@ stages:
               -t tdslibrs.azurecr.io/build/alpine:3.18-arm64 \
               .
           echo "✅ Alpine ARM64 build image built successfully"
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Push ARM64 images to ACR'
@@ -774,6 +1062,7 @@ stages:
             docker push tdslibrs.azurecr.io/build/ubuntu:latest-arm64
             docker push tdslibrs.azurecr.io/build/alpine:3.18-arm64
           fi
+      retryCountOnTaskFailure: 3
 
   - job: CreateMultiArchManifests
     displayName: Create Multi-Arch Manifests
@@ -809,6 +1098,7 @@ stages:
           
           echo "==> Verifying manifest..."
           docker manifest inspect tdslibrs.azurecr.io/build/ubuntu:22.04
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Create multi-arch manifest for Alpine build image'
@@ -831,12 +1121,14 @@ stages:
           
           echo "==> Verifying manifest..."
           docker manifest inspect tdslibrs.azurecr.io/build/alpine:3.18
+      retryCountOnTaskFailure: 3
 
   - job: VerifyAllImages
     displayName: Verify All Images in ACR
     dependsOn:
     - BuildX64Images
     - BuildARM64Images
+    - BuildKerberosImages
     - CreateMultiArchManifests
     condition: always()
     pool:
@@ -903,6 +1195,7 @@ stages:
             echo "==> $repo"
             az acr repository show-tags --name $(ACR_NAME) --repository $repo --output table --orderby time_desc --top 5 2>/dev/null || echo "  (not found)"
           done
+      retryCountOnTaskFailure: 3
 
     - script: |
         echo ""
@@ -1025,16 +1318,40 @@ stages:
         python-build/manylinux_2_28_aarch64_rust:latest
         build/ubuntu:22.04
         build/alpine:3.18
+        kerberos/samba-dc:latest
+        kerberos/mssql-ad:latest
+        kerberos/client:alpine318-latest
+        kerberos/client:alpine319-latest
+        kerberos/client:alpine320-latest
+        kerberos/client:alpine321-latest
+        kerberos/client:debian-latest
+        kerberos/client:ubuntu22-latest
+        kerberos/client:ubuntu24-latest
+        kerberos/client:rhel9-latest
+        kerberos/client:oracle9-latest
         import/debian:bookworm
+        import/debian:bullseye
+        import/debian:trixie
         import/alpine:3.18
         import/alpine:3.19
         import/alpine:3.20
         import/alpine:3.21
+        import/alpine:3.22
+        import/alpine:3.23
         import/ubuntu:22.04
         import/ubuntu:24.04
         import/redhat/ubi9:latest
         import/redhat/ubi8:latest
+        import/redhat/ubi10:latest
         import/oraclelinux:9
+        import/centos:stream9
+        import/opensuse/leap:15.6
+        import/python-build/manylinux_2_34_x86_64:latest
+        import/python-build/manylinux_2_34_aarch64:latest
+        import/python-build/manylinux_2_28_x86_64:latest
+        import/python-build/manylinux_2_28_aarch64:latest
+        import/python-build/musllinux_1_2_x86_64:latest
+        import/python-build/musllinux_1_2_aarch64:latest
         EOF
         echo "Images to mirror to GHCR:"
         sed 's/^/  /' "$(Pipeline.Workspace)/ghcr/images.txt"
@@ -1051,6 +1368,7 @@ stages:
         inlineScript: |
           set -euo pipefail
           az acr login --name $(ACR_NAME)
+      retryCountOnTaskFailure: 3
 
     - script: |
         set -euo pipefail

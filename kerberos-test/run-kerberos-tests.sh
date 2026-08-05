@@ -175,8 +175,11 @@ if [ "$ARCHIVE_MODE" = true ]; then
     echo ""
     echo "Step 4: Install cargo-nextest..."
     echo "----------------------------------------------"
+    # Pre-built client images ship cargo-nextest in /usr/local/bin. Skip the
+    # source build when it is already present; still install on images without it.
     docker exec "$CONTAINER_NAME" bash -c '
-        cargo install cargo-nextest --version 0.9.99 --locked
+        command -v cargo-nextest >/dev/null 2>&1 \
+          || cargo install cargo-nextest --version 0.9.99 --locked
     '
     echo "✓ cargo-nextest installed"
     
@@ -259,8 +262,11 @@ OUTER_EOF
         echo ""
         echo "Step 4: Install cargo-nextest (CI mode)..."
         echo "----------------------------------------------"
+        # Pre-built client images ship cargo-nextest in /usr/local/bin. Skip the
+        # source build when it is already present; still install on images without it.
         docker exec "$CONTAINER_NAME" bash -c '
-            cargo install cargo-nextest --version 0.9.99 --locked
+            command -v cargo-nextest >/dev/null 2>&1 \
+              || cargo install cargo-nextest --version 0.9.99 --locked
         '
         echo "✓ cargo-nextest installed"
     fi

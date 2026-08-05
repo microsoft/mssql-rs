@@ -1,5 +1,9 @@
 # SQL Server on Linux with AD integration (sssd/realmd)
-FROM mcr.microsoft.com/mssql/server:2022-latest
+# Pre-built and published by .pipeline/sync-container-images.yml. The init
+# script is mounted from ./scripts at runtime rather than baked in, so the
+# pre-built image stays valid when a PR edits the script.
+ARG BASE_IMAGE=mcr.microsoft.com/mssql/server:2022-latest
+FROM ${BASE_IMAGE}
 
 USER root
 
@@ -19,9 +23,5 @@ RUN apt-get update && ACCEPT_EULA=Y apt-get install -y \
     vim \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy initialization script
-COPY scripts/init-mssql-ad.sh /init-mssql-ad.sh
-RUN chmod +x /init-mssql-ad.sh
-
 # SQL Server runs as mssql user, but we need root for domain join
-ENTRYPOINT ["/init-mssql-ad.sh"]
+ENTRYPOINT ["/bin/bash", "/scripts/init-mssql-ad.sh"]
