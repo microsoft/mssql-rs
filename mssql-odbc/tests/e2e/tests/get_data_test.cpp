@@ -557,3 +557,51 @@ TEST_F(GetDataLiveTest, VarbinaryMaxToCharReturnsHyc00) {
     SQLCloseCursor(stmt_);
 }
 
+// Jumping to a later column while a PLP stream is still open is incorrect usage
+// per the ODBC spec. The driver must clear the stale stream, drain the partially
+// read column, and return the later column's value rather than corrupt the row.
+TEST_F(GetDataLiveTest, PartialPlpReadThenJumpToLaterColumnClearsStaleStream) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST('abc' AS VARCHAR(MAX)), 200) AS c1, "
+                   "CAST(42 AS INT) AS c2"),
+        SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // One tiny read of c1 opens the PLP stream but leaves it mid-value.
+    SQLCHAR buf[4] = {0};
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind);
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+
+    // Jumping to c2 must discard the stale c1 stream, drain the remaining c1
+    // bytes off the wire, and yield c2's value.
+    SQLRETURN rc2;
+    SQLLEN c2_ind = 0;
+    EXPECT_EQ("42", GetChar(2, &rc2, &c2_ind));
+    EXPECT_SQL_OK(rc2, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, c2_ind);
+
+    SQLCloseCursor(stmt_);
+}
+
+// A PLP (streamed max-type) column requested with a non-character C type is
+// rejected with HYC00 before any stream state is created. The reference
+// msodbcsql driver implements numeric conversions from character data, so the
+// HYC00 assertion is mssql-odbc-specific — skip it on the msodbcsql leg.
+TEST_F(GetDataLiveTest, PlpColumnUnsupportedCTypeReturnsHyc00) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('123' AS VARCHAR(MAX)) AS c1"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLSMALLINT sbuf = 0;
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_SSHORT, &sbuf, 0, &ind);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+
+    SQLCloseCursor(stmt_);
+}
+
