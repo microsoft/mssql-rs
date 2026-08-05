@@ -38,34 +38,61 @@ steps:
   - pwsh: |
       $ErrorActionPreference = 'Continue'
       Write-Host "PSVersion: $($PSVersionTable.PSVersion)  OSArchitecture: $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+
+      $problems = @()
+
       $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-      Write-Host "Elevated (required to register the driver in HKLM): $admin"
+      Write-Host "Elevated: $admin"
+      if (-not $admin) {
+        $problems += 'The agent is not elevated; run_e2e.ps1 registers the driver under HKLM and will fail.'
+      }
 
-      $cmake = Get-Command cmake -ErrorAction SilentlyContinue
-      if ($cmake) { Write-Host "cmake on PATH: $($cmake.Source)" } else { Write-Host 'cmake NOT on PATH' }
-
+      # Mirror Initialize-CMake in run_e2e.ps1: PATH, then the VS-bundled copy, then
+      # a standalone install. Whatever that function would resolve, we must resolve too.
+      $vsRoot = $null
       $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
       if (Test-Path $vswhere) {
         $vsRoot = & $vswhere -latest -products '*' -property installationPath 2>$null | Select-Object -First 1
-        Write-Host "Visual Studio: $vsRoot"
-        if ($vsRoot) {
-          $vsCMake = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
-          Write-Host "VS-bundled cmake present: $(Test-Path $vsCMake) ($vsCMake)"
-          Get-ChildItem (Join-Path $vsRoot 'VC\Tools\MSVC') -ErrorAction SilentlyContinue |
-            ForEach-Object {
-              $arm64 = Join-Path $_.FullName 'bin\Hostarm64\arm64\cl.exe'
-              $x64 = Join-Path $_.FullName 'bin\Hostx64\arm64\cl.exe'
-              Write-Host "MSVC $($_.Name): Hostarm64/arm64 cl=$(Test-Path $arm64) Hostx64/arm64 cl=$(Test-Path $x64)"
-            }
-        }
-      } else {
-        Write-Host "vswhere NOT found at $vswhere"
+      }
+      Write-Host "Visual Studio: $(if ($vsRoot) { $vsRoot } else { 'not found' })"
+
+      $cmakeExe = (Get-Command cmake -ErrorAction SilentlyContinue).Source
+      if (-not $cmakeExe) {
+        $cmakeCandidates = @()
+        if ($vsRoot) { $cmakeCandidates += Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe' }
+        $cmakeCandidates += 'C:\Program Files\CMake\bin\cmake.exe'
+        $cmakeCandidates += Join-Path ${env:ProgramFiles(x86)} 'CMake\bin\cmake.exe'
+        $cmakeExe = $cmakeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+      }
+      Write-Host "cmake: $(if ($cmakeExe) { $cmakeExe } else { 'not found' })"
+      if (-not $cmakeExe) {
+        $problems += 'No cmake found on PATH, in Visual Studio, or in a standalone install.'
       }
 
-      if (-not $cmake -and -not (Test-Path $vswhere)) {
-        Write-Host '##vso[task.logissue type=error]Neither cmake nor Visual Studio was found on this agent; the ODBC e2e suite cannot be built.'
+      # The gtest suite is built for arm64, so we need a compiler that targets arm64.
+      # Either a native arm64 host or an x64 host cross-compiler works.
+      $armCl = $null
+      if ($vsRoot) {
+        foreach ($ver in Get-ChildItem (Join-Path $vsRoot 'VC\Tools\MSVC') -ErrorAction SilentlyContinue) {
+          $native = Join-Path $ver.FullName 'bin\Hostarm64\arm64\cl.exe'
+          $cross = Join-Path $ver.FullName 'bin\Hostx64\arm64\cl.exe'
+          Write-Host "MSVC $($ver.Name): Hostarm64/arm64 cl=$(Test-Path $native) Hostx64/arm64 cl=$(Test-Path $cross)"
+          if (-not $armCl) {
+            $armCl = @($native, $cross) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+        }
+      }
+      Write-Host "arm64 cl.exe: $(if ($armCl) { $armCl } else { 'not found' })"
+      if (-not $armCl) {
+        $problems += 'No MSVC cl.exe targeting arm64 (Hostarm64/arm64 or Hostx64/arm64) was found.'
+      }
+
+      if ($problems) {
+        foreach ($p in $problems) { Write-Host "##vso[task.logissue type=error]$p" }
+        Write-Host '##vso[task.logissue type=error]Preflight failed; skipping the ODBC e2e suite rather than claiming the shared SQL host.'
         exit 1
       }
+      Write-Host 'Preflight OK.'
     displayName: 'Preflight: CMake and C++ toolchain'
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
