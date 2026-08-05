@@ -82,10 +82,18 @@ for PY_VERSION in "${PYTHON_VERSIONS[@]}"; do
     echo ""
     echo "==> Building wheel for Python $PY_VERSION using $PYTHON_BIN"
     $PYTHON_BIN --version
-    
+
+    # Stage into a private directory: $OUTPUT_DIR is shared across the manylinux
+    # and musllinux steps of the same job, so wheels already sitting there would
+    # otherwise be indistinguishable from the one we are about to build.
+    PY_TAG="cp${PY_VERSION//./}"
+    STAGE_DIR="$OUTPUT_DIR/.staging-$PY_TAG"
+    rm -rf "$STAGE_DIR"
+    mkdir -p "$STAGE_DIR"
+
     $FIRST_PYTHON -m maturin build --release \
         --interpreter "$PYTHON_BIN" \
-        --out "$OUTPUT_DIR" \
+        --out "$STAGE_DIR" \
         --manifest-path "$WORKSPACE_DIR/mssql-py-core/Cargo.toml"
     
     echo "✅ Wheel built successfully for Python $PY_VERSION"
@@ -100,7 +108,6 @@ for PY_VERSION in "${PYTHON_VERSIONS[@]}"; do
     # permissions, timestamps and compression) rather than repacking it.
     # -----------------------------------------------------------------------
     if [ -n "$SYMBOLS_OUTPUT_DIR" ]; then
-        PY_TAG="cp${PY_VERSION//./}"
         SYM_DEST="$SYMBOLS_OUTPUT_DIR/$PY_TAG"
         mkdir -p "$SYM_DEST"
 
@@ -109,15 +116,18 @@ for PY_VERSION in "${PYTHON_VERSIONS[@]}"; do
             exit 1
         fi
 
-        WHEEL_PATH=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*-${PY_TAG}-*.whl" | head -n1)
+        WHEEL_PATH=$(find "$STAGE_DIR" -maxdepth 1 -name '*.whl' | head -n1)
         if [ -z "$WHEEL_PATH" ]; then
-            echo "❌ ERROR: no wheel matching *-${PY_TAG}-*.whl found in $OUTPUT_DIR"
+            echo "❌ ERROR: no wheel produced for $PY_TAG in $STAGE_DIR"
             exit 1
         fi
 
         $FIRST_PYTHON "$WORKSPACE_DIR/scripts/split-wheel-debuginfo.py" "$WHEEL_PATH" "$SYM_DEST"
         ls -lh "$SYM_DEST"
     fi
+
+    mv "$STAGE_DIR"/*.whl "$OUTPUT_DIR"/
+    rmdir "$STAGE_DIR"
 done
 
 # auditwheel=skip in pyproject.toml means maturin won't vendor shared libs
