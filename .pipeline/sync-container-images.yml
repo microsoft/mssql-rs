@@ -259,10 +259,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -270,7 +270,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/ubuntu:22.04 \
             --image import/ubuntu:22.04 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -283,10 +283,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -294,7 +294,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/ubuntu:24.04 \
             --image import/ubuntu:24.04 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -318,10 +318,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -329,7 +329,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/alpine:3.18 \
             --image import/alpine:3.18 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -342,10 +342,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -353,7 +353,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/alpine:3.19 \
             --image import/alpine:3.19 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -377,10 +377,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -388,7 +388,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/alpine:3.20 \
             --image import/alpine:3.20 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -401,10 +401,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -412,7 +412,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/alpine:3.21 \
             --image import/alpine:3.21 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -436,10 +436,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -447,7 +447,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/alpine:3.22 \
             --image import/alpine:3.22 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -460,10 +460,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -471,7 +471,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/alpine:3.23 \
             --image import/alpine:3.23 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -495,10 +495,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -506,7 +506,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/debian:bookworm \
             --image import/debian:bookworm \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -519,10 +519,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -530,7 +530,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/debian:bullseye \
             --image import/debian:bullseye \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -543,10 +543,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -554,7 +554,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/debian:trixie \
             --image import/debian:trixie \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -567,10 +567,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -578,7 +578,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/redhat/ubi9:latest \
             --image import/redhat/ubi9:latest \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -591,10 +591,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -602,7 +602,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/redhat/ubi8:latest \
             --image import/redhat/ubi8:latest \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -641,10 +641,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -652,7 +652,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/library/oraclelinux:9 \
             --image import/oraclelinux:9 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -700,10 +700,10 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          AUTH_ARGS=""
+          AUTH_ARGS=()
           if [[ -n "$DOCKER_USER" && -n "$DOCKER_PAT" ]]; then
             echo "Using authenticated Docker Hub access"
-            AUTH_ARGS="--username $DOCKER_USER --password $DOCKER_PAT"
+            AUTH_ARGS=(--username "$DOCKER_USER" --password "$DOCKER_PAT")
           else
             echo "Using anonymous Docker Hub access"
           fi
@@ -711,7 +711,7 @@ stages:
             --name $(ACR_NAME) \
             --source docker.io/opensuse/leap:15.6 \
             --image import/opensuse/leap:15.6 \
-            $AUTH_ARGS \
+            "${AUTH_ARGS[@]}" \
             --force
       env:
         DOCKER_USER: $(DOCKERHUB_USERNAME)
@@ -780,6 +780,7 @@ stages:
               -t tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64_rust:latest \
               .
           echo "✅ manylinux_2_28 x64 image built successfully"
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Build Ubuntu x64 build image with Rust and tooling'
@@ -803,6 +804,7 @@ stages:
               -t tdslibrs.azurecr.io/build/ubuntu:latest-x64 \
               .
           echo "✅ Ubuntu x64 build image built successfully"
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Build Alpine x64 build image with Rust and tooling'
@@ -825,6 +827,7 @@ stages:
               -t tdslibrs.azurecr.io/build/alpine:3.18-amd64 \
               .
           echo "✅ Alpine x64 build image built successfully"
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Push x64 images to ACR'
@@ -848,6 +851,7 @@ stages:
             docker push tdslibrs.azurecr.io/build/ubuntu:latest-x64
             docker push tdslibrs.azurecr.io/build/alpine:3.18-amd64
           fi
+      retryCountOnTaskFailure: 3
 
   - job: BuildKerberosImages
     displayName: Build Kerberos Test Images
@@ -881,6 +885,7 @@ stages:
           docker build -f Dockerfile.mssql-ad \
             -t $(ACR_REGISTRY)/kerberos/mssql-ad:latest .
           docker push $(ACR_REGISTRY)/kerberos/mssql-ad:latest
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Build and push Kerberos client images (all distros)'
@@ -918,6 +923,7 @@ stages:
             docker push "$tag"
             echo "✅ $tag"
           done
+      retryCountOnTaskFailure: 3
 
   - job: BuildARM64Images
     displayName: Build ARM64 Images
@@ -982,6 +988,7 @@ stages:
               -t tdslibrs.azurecr.io/python-build/manylinux_2_28_aarch64_rust:latest \
               .
           echo "✅ manylinux_2_28 ARM64 image built successfully"
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Build Ubuntu ARM64 build image with Rust and tooling'
@@ -1005,6 +1012,7 @@ stages:
               -t tdslibrs.azurecr.io/build/ubuntu:latest-arm64 \
               .
           echo "✅ Ubuntu ARM64 build image built successfully"
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Build Alpine ARM64 build image with Rust and tooling'
@@ -1027,6 +1035,7 @@ stages:
               -t tdslibrs.azurecr.io/build/alpine:3.18-arm64 \
               .
           echo "✅ Alpine ARM64 build image built successfully"
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Push ARM64 images to ACR'
@@ -1050,6 +1059,7 @@ stages:
             docker push tdslibrs.azurecr.io/build/ubuntu:latest-arm64
             docker push tdslibrs.azurecr.io/build/alpine:3.18-arm64
           fi
+      retryCountOnTaskFailure: 3
 
   - job: CreateMultiArchManifests
     displayName: Create Multi-Arch Manifests
@@ -1085,6 +1095,7 @@ stages:
           
           echo "==> Verifying manifest..."
           docker manifest inspect tdslibrs.azurecr.io/build/ubuntu:22.04
+      retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
       displayName: 'Create multi-arch manifest for Alpine build image'
@@ -1107,6 +1118,7 @@ stages:
           
           echo "==> Verifying manifest..."
           docker manifest inspect tdslibrs.azurecr.io/build/alpine:3.18
+      retryCountOnTaskFailure: 3
 
   - job: VerifyAllImages
     displayName: Verify All Images in ACR
@@ -1180,6 +1192,7 @@ stages:
             echo "==> $repo"
             az acr repository show-tags --name $(ACR_NAME) --repository $repo --output table --orderby time_desc --top 5 2>/dev/null || echo "  (not found)"
           done
+      retryCountOnTaskFailure: 3
 
     - script: |
         echo ""
@@ -1352,6 +1365,7 @@ stages:
         inlineScript: |
           set -euo pipefail
           az acr login --name $(ACR_NAME)
+      retryCountOnTaskFailure: 3
 
     - script: |
         set -euo pipefail
