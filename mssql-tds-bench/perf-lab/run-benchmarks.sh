@@ -16,6 +16,14 @@
 #                the commit pinned in baseline-commit.txt (no ADO auth on the VM)
 # Any statistically significant delta is therefore attributable to mssql-tds.
 set -euo pipefail
+# set -e exits silently, which costs a whole lab run to diagnose. Report the
+# location and the failing command first. -E inherits the trap into functions,
+# subshells, and command substitutions, where most of the risk is. Commands in
+# if/&&/||/! conditions do not fire it, and neither does an explicit `exit`, so
+# the deliberate failure paths keep their own messages. For a failing pipeline
+# the line number is authoritative; BASH_COMMAND reports the last command in it.
+set -E
+trap 'rc=$?; echo "ERROR: ${BASH_SOURCE[0]}:${LINENO}: \`${BASH_COMMAND}\` exited ${rc}" >&2' ERR
 
 REPO_ROOT="$(pwd)"
 RESULTS_DIR="$REPO_ROOT/results"
@@ -445,7 +453,7 @@ for id in $VERIFY_IDS; do
     med=$(
         {
             for run in $(seq 1 "$CONFIRM_RUNS"); do ratio_in_file "$id" "$RESULTS_DIR/confirm-run${run}.txt"; done
-        } | grep -E '^[0-9.]+$' | median_stdin
+        } | awk '/^[0-9.]+$/' | median_stdin
     ) || med=""
     if [ -n "$med" ]; then printf '%s %s\n' "$id" "$med" >> "$MEDIANS_FILE"; fi
 done
