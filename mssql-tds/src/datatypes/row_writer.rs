@@ -16,11 +16,6 @@ use uuid::Uuid;
 /// The decoder calls these typed methods directly during wire decoding,
 /// enabling consumers (Arrow writers, N-API binary encoders, etc.) to
 /// receive values without going through the intermediate `ColumnValues` enum.
-///
-/// `RowWriter` is a pure *push* sink: it absorbs decoded values and never
-/// decides when decoding stops. Stop/resume control for the ODBC pull path
-/// lives on the client cursor (`TdsClient::next_row_cursor` /
-/// `read_row_column`), not here.
 pub trait RowWriter {
     /// Writes a SQL `NULL` for column `col`.
     fn write_null(&mut self, col: usize);

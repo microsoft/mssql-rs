@@ -889,6 +889,7 @@ mod client_based_iterators {
                 assert!(n > 0, "Expected progress while draining first-row c4");
             }
             assert_eq!(first_row_c4.len(), 9000);
+            assert!(first_row_c4.iter().all(|b| *b == b'A'));
 
             // Row 2: advancing drains row1's remaining columns automatically.
             assert!(client.next_row_cursor().await?);
@@ -909,6 +910,7 @@ mod client_based_iterators {
                 assert!(n > 0, "Expected progress while draining second-row c4");
             }
             assert_eq!(second_row_c4.len(), 9000);
+            assert!(second_row_c4.iter().all(|b| *b == b'B'));
 
             // No third row: advancing drains row2's tail and reaches end-of-set.
             assert!(!client.next_row_cursor().await?);
@@ -1033,6 +1035,7 @@ mod client_based_iterators {
                 assert!(n > 0, "Expected progress while draining first-row c2");
             }
             assert_eq!(first_row_c2.len(), 18_000);
+            assert!(first_row_c2.chunks_exact(2).all(|c| c == [b'X', 0]));
 
             let c4 = client.read_row_column(3).await?;
             assert!(matches!(&c4, CursorColumn::Value(ColumnValues::Int(v)) if *v == 24));
@@ -1051,6 +1054,7 @@ mod client_based_iterators {
                 assert!(n > 0, "Expected progress while draining second-row c2");
             }
             assert_eq!(second_row_c2.len(), 18_000);
+            assert!(second_row_c2.chunks_exact(2).all(|c| c == [b'Y', 0]));
 
             let c4b = client.read_row_column(3).await?;
             assert!(matches!(&c4b, CursorColumn::Value(ColumnValues::Int(v)) if *v == 34));
