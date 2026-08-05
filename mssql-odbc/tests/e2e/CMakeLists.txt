@@ -125,3 +125,10 @@ add_odbc_test(more_results_test  tests/more_results_test.cpp)
 add_odbc_test(execute_test       tests/execute_test.cpp)
 add_odbc_test(get_type_info_test tests/get_type_info_test.cpp)
 add_odbc_test(row_count_test     tests/row_count_test.cpp)
+
+# The mssql-python parity suite binds the driver by path instead of going
+# through the Driver Manager, mirroring how mssql-python loads it. It needs no
+# odbc_test_lib and no registered driver, only MSSQL_ODBC_DLL/MSSQL_ODBC_CONNSTR.
+add_executable(mssql_python_parity_test tests/mssql_python_parity_test.cpp)
+target_link_libraries(mssql_python_parity_test PRIVATE gtest)
+add_test(NAME mssql_python_parity_test COMMAND mssql_python_parity_test)

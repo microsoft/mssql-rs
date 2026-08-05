@@ -5,10 +5,11 @@
 
 use tracing::{debug, error};
 
+use super::fetch_scroll::{fold_row_status, write_bound_columns};
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
-    SqlReturn,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_ROW_NOROW, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SqlHandle, SqlReturn, SqlULen, SqlUSmallInt,
 };
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
@@ -44,6 +45,11 @@ fn sql_fetch_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        if let Some(pending) = stmt_state.pending_fetch_error.take() {
+            error!("SQLFetch: replaying error raised after the previous rowset");
+            stmt_state.diag_records.push(pending);
+            return SQL_ERROR;
+        }
         if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
             error!("SQLFetch: no open cursor on this statement");
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
@@ -51,12 +57,122 @@ fn sql_fetch_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
         }
     }
 
-    fetch_rows_next(statement_handle, stmt)
+    fetch_rowset(statement_handle, stmt)
+}
+
+/// Fetches up to `SQL_ATTR_ROW_ARRAY_SIZE` rows, materializing each into the
+/// buffers registered by `SQLBindCol` and reporting per-row status.
+///
+/// With the default rowset size of 1 and no bound columns this degenerates to a
+/// single `fetch_rows_next` call, which is the `SQLFetch` + `SQLGetData` path.
+pub(crate) fn fetch_rowset(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    let (array_size, rows_fetched_ptr, row_status_ptr) = match stmt.inner.lock() {
+        Ok(state) => (
+            state.row_array_size.max(1),
+            state.rows_fetched_ptr,
+            state.row_status_ptr,
+        ),
+        Err(_) => {
+            error!("SQLFetch: stmt mutex poisoned reading rowset attributes");
+            return SQL_ERROR;
+        }
+    };
+
+    let mut aggregate = SQL_SUCCESS;
+    let mut fetched = 0usize;
+
+    for slot in 0..array_size {
+        let rc = fetch_rows_next(statement_handle, stmt);
+        if rc == SQL_NO_DATA {
+            break;
+        }
+        if rc == SQL_ERROR {
+            if fetched == 0 {
+                unsafe { write_rowset_counters(rows_fetched_ptr, row_status_ptr, array_size, 0) };
+                return SQL_ERROR;
+            }
+            // Rows from this rowset are still valid and must be handed back, so
+            // the error is parked and replayed on the next fetch call.
+            if let Ok(mut ss) = stmt.inner.lock() {
+                ss.pending_fetch_error = ss.diag_records.first().cloned();
+            }
+            aggregate = SQL_SUCCESS_WITH_INFO;
+            break;
+        }
+        if rc == SQL_SUCCESS_WITH_INFO {
+            aggregate = SQL_SUCCESS_WITH_INFO;
+        }
+
+        let row_status = write_bound_columns(stmt, slot);
+        aggregate = fold_row_status(aggregate, row_status);
+        unsafe { write_row_status(row_status_ptr, slot, row_status) };
+        fetched += 1;
+
+        if aggregate == SQL_ERROR {
+            break;
+        }
+    }
+
+    unsafe { write_rowset_counters(rows_fetched_ptr, row_status_ptr, array_size, fetched) };
+
+    if fetched == 0 { SQL_NO_DATA } else { aggregate }
+}
+
+/// Writes the fetched-row count and marks unfilled rowset slots as `SQL_ROW_NOROW`.
+///
+/// # Safety
+/// Both pointers are application-owned buffers registered through
+/// `SQLSetStmtAttr`; when non-null they must have room for `array_size`
+/// elements.
+unsafe fn write_rowset_counters(
+    rows_fetched_ptr: *mut SqlULen,
+    row_status_ptr: *mut SqlUSmallInt,
+    array_size: usize,
+    fetched: usize,
+) {
+    if !rows_fetched_ptr.is_null() {
+        unsafe { std::ptr::write_unaligned(rows_fetched_ptr, fetched as SqlULen) };
+    }
+    if !row_status_ptr.is_null() {
+        for slot in fetched..array_size {
+            unsafe { std::ptr::write_unaligned(row_status_ptr.add(slot), SQL_ROW_NOROW) };
+        }
+    }
+}
+
+/// # Safety
+/// `row_status_ptr` must be null or have room for at least `slot + 1` elements.
+unsafe fn write_row_status(row_status_ptr: *mut SqlUSmallInt, slot: usize, status: SqlUSmallInt) {
+    if !row_status_ptr.is_null() {
+        unsafe { std::ptr::write_unaligned(row_status_ptr.add(slot), status) };
+    }
 }
 
 /// Row materialization step for one forward fetch operation.
 fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let dbc = stmt.parent_dbc();
+
+    // Rows read ahead to release the connection are served first: they are the
+    // cursor's next rows and require no I/O.
+    match stmt.inner.lock() {
+        Ok(mut state) => {
+            if let Some(row) = state.buffered_rows.pop_front() {
+                state.current_row = Some(row);
+                state.reset_getdata();
+                debug!("SQLFetch: row served from read-ahead buffer");
+                return SQL_SUCCESS;
+            }
+            if state.buffered_eof {
+                state.current_row = None;
+                debug!("SQLFetch: read-ahead buffer exhausted; returning SQL_NO_DATA");
+                return SQL_NO_DATA;
+            }
+        }
+        Err(_) => {
+            error!("SQLFetch: stmt mutex poisoned reading buffered rows");
+            return SQL_ERROR;
+        }
+    }
 
     let mut client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
@@ -145,6 +261,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 return SQL_ERROR;
             };
             stmt_state.current_row = Some(row);
+            stmt_state.reset_getdata();
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();
@@ -201,8 +318,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 return SQL_ERROR;
             };
             stmt_state.current_row = None;
-            // Don't clear CURSOR_OPEN here: the cursor stays open until
-            // SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE).
+            stmt_state.buffered_eof = true;
             drop(stmt_state);
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);

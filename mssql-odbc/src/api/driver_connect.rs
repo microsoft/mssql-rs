@@ -7,7 +7,8 @@ use tracing::{debug, error};
 
 use crate::api::odbc_types::{
     SQL_DRIVER_NOPROMPT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SqlHWnd, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_SUCCESS_WITH_INFO, SQL_TXN_READ_COMMITTED, SqlHWnd, SqlHandle, SqlReturn, SqlSmallInt,
+    SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE, ERR_INVALID_NULL_POINTER,
@@ -26,6 +27,8 @@ use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
 use mssql_tds::message::login_options::ApplicationIntent;
 use std::path::PathBuf;
 
+use super::conn_exec::exec_on_connection;
+use super::set_connect_attr::{apply_autocommit, isolation_level_sql};
 use super::util::read_utf16;
 use crate::auth::configure_auth;
 use crate::connection::odbc_authentication_transformer::transform_auth;
@@ -180,6 +183,30 @@ pub(crate) fn sql_driver_connect_w_safe(
     if result != SQL_SUCCESS && result != SQL_SUCCESS_WITH_INFO {
         // Reset state on failure
         state.connection_state = ConnectionState::Disconnected;
+        return result;
+    }
+
+    // Connection attributes set before connecting are session settings that
+    // only exist once the session does; apply them now. The lock must be
+    // released first because applying them runs a batch on this connection.
+    let autocommit = state.autocommit;
+    let txn_isolation = state.txn_isolation;
+    drop(state);
+    if !autocommit && apply_autocommit(dbc, false) == SQL_ERROR {
+        error!("SQLDriverConnectW: failed to apply pending SQL_ATTR_AUTOCOMMIT");
+        return SQL_ERROR;
+    }
+    if txn_isolation != SQL_TXN_READ_COMMITTED
+        && let Some(level) = isolation_level_sql(txn_isolation)
+        && exec_on_connection(
+            dbc,
+            &format!("SET TRANSACTION ISOLATION LEVEL {level}"),
+            "SQLDriverConnectW",
+        )
+        .is_err()
+    {
+        error!("SQLDriverConnectW: failed to apply pending SQL_ATTR_TXN_ISOLATION");
+        return SQL_ERROR;
     }
 
     result
@@ -349,6 +376,9 @@ const MAX_PACKET_SIZE: u32 = 32768;
 /// (matching msodbcsql). Kept separate from `do_connect` so the mapping is
 /// unit-testable without a live server.
 fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParams) {
+    if let Some(app) = &params.app {
+        context.application_name = app.clone();
+    }
     context.encryption_options.host_name_in_cert = params.host_name_in_certificate.clone();
     context.encryption_options.server_certificate =
         params.server_certificate.as_deref().map(PathBuf::from);

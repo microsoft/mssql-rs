@@ -17,6 +17,12 @@ pub(crate) const SQLSTATE_07009: [u8; 5] = *b"07009";
 pub(crate) const SQLSTATE_08001: [u8; 5] = *b"08001";
 pub(crate) const SQLSTATE_08003: [u8; 5] = *b"08003";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
+pub(crate) const SQLSTATE_42000: [u8; 5] = *b"42000";
+/// Numeric value out of range.
+pub(crate) const SQLSTATE_22002: [u8; 5] = *b"22002";
+pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
+/// Fetch type out of range.
+pub(crate) const SQLSTATE_HY106: [u8; 5] = *b"HY106";
 pub(crate) const SQLSTATE_HY000: [u8; 5] = *b"HY000";
 pub(crate) const SQLSTATE_HY003: [u8; 5] = *b"HY003";
 pub(crate) const SQLSTATE_HY004: [u8; 5] = *b"HY004";
@@ -26,6 +32,8 @@ pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
 pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
 pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
+/// Invalid descriptor field identifier.
+pub(crate) const SQLSTATE_HY091: [u8; 5] = *b"HY091";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
 pub(crate) const SQLSTATE_HY096: [u8; 5] = *b"HY096";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
@@ -88,6 +96,10 @@ pub(crate) const ERR_INVALID_C_DATA_TYPE: DiagMsg = DiagMsg {
 pub(crate) const ERR_RESTRICTED_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_07006,
     text: "Restricted data type attribute violation",
+};
+pub(crate) const ERR_INDICATOR_REQUIRED: DiagMsg = DiagMsg {
+    state: SQLSTATE_22002,
+    text: "Indicator variable required but not supplied",
 };
 pub(crate) const ERR_STRING_RIGHT_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01004,
@@ -271,6 +283,21 @@ pub(crate) fn sqlstate_for_sql_error(error_number: u32) -> Option<[u8; 5]> {
         .map(|i| SERVER_ERROR_TO_SQL_STATE_MAP[i].1)
 }
 
+/// SQLSTATE for a server error that is not in the explicit table.
+///
+/// msodbcsql falls back to the error's severity class: informational messages
+/// map to the general warning `01000`, ordinary statement-level errors to the
+/// syntax/access-rule class `42000`, and only fatal (>= 19) errors to `HY000`.
+/// Without this, every unmapped error surfaces as `HY000`, which callers treat
+/// as a driver failure rather than a SQL error.
+pub(crate) fn sqlstate_for_severity(class: i32) -> [u8; 5] {
+    match class {
+        ..=10 => SQLSTATE_01000,
+        11..=18 => SQLSTATE_42000,
+        _ => SQLSTATE_HY000,
+    }
+}
+
 /// Post one ODBC diagnostic record per server error in `err`.
 ///
 /// For [`TdsError::SqlServerError`], iterates the server-reported errors in
@@ -300,7 +327,15 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
             post_sql_error(state, default, 0, err.to_string());
         } else {
             for e in &diagnostics.errors {
-                let sqlstate = sqlstate_for_sql_error(e.number).unwrap_or(default);
+                // The caller's `default` wins when it carries real context
+                // (e.g. `08001` at connect time); the severity fallback only
+                // refines the generic `HY000`.
+                let fallback = if default == SQLSTATE_HY000 {
+                    sqlstate_for_severity(e.class)
+                } else {
+                    default
+                };
+                let sqlstate = sqlstate_for_sql_error(e.number).unwrap_or(fallback);
                 let native = i32::try_from(e.number).unwrap_or(i32::MAX);
                 post_sql_error(
                     state,

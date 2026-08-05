@@ -5,8 +5,8 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use mssql_tds::connection::tds_client::TdsClient;
-use tokio::runtime::Runtime;
 
+use super::env::OdbcRuntime;
 use super::{EnvHandle, HandleType, HasObjectType};
 use crate::error::{DiagRecord, HasDiagnostics};
 
@@ -35,7 +35,7 @@ pub(crate) struct DbcHandle {
     /// the ENV owns the DBC's lifetime, not the other way around.
     pub(crate) parent_env: *mut c_void,
     /// Shared Tokio runtime from the parent ENV.
-    pub(crate) runtime: Arc<Runtime>,
+    pub(crate) runtime: Arc<OdbcRuntime>,
     pub(crate) inner: Mutex<DbcState>,
 }
 
@@ -63,6 +63,18 @@ pub(crate) struct DbcState {
     /// Pre-connect access token set via `SQL_COPT_SS_ACCESS_TOKEN`.
     /// Consumed by `SQLDriverConnect` to select `AccessToken` authentication.
     pub(crate) access_token: Option<String>,
+    /// `SQL_ATTR_AUTOCOMMIT`. ODBC defaults to on; turning it off makes the
+    /// driver issue `SET IMPLICIT_TRANSACTIONS ON` so the server opens a
+    /// transaction on the next statement (msodbcsql parity).
+    pub(crate) autocommit: bool,
+    /// `SQL_ATTR_TXN_ISOLATION`, applied via `SET TRANSACTION ISOLATION LEVEL`.
+    pub(crate) txn_isolation: u32,
+    /// `SQL_ATTR_CURRENT_CATALOG`. Tracks the database the session is using so
+    /// `SQLGetConnectAttr` can report it without a round trip.
+    pub(crate) current_catalog: Option<String>,
+    /// Set once the connection is known to be unusable, so
+    /// `SQL_ATTR_CONNECTION_DEAD` can report it without a round trip.
+    pub(crate) dead: bool,
 }
 
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
@@ -79,6 +91,9 @@ impl std::fmt::Debug for DbcState {
                 "access_token",
                 &self.access_token.as_ref().map(|_| "<REDACTED>"),
             )
+            .field("autocommit", &self.autocommit)
+            .field("txn_isolation", &self.txn_isolation)
+            .field("dead", &self.dead)
             .finish()
     }
 }
@@ -93,7 +108,7 @@ impl HasDiagnostics for DbcState {
 }
 
 impl DbcHandle {
-    pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<OdbcRuntime>) -> Self {
         Self {
             object_type: HandleType::Dbc,
             parent_env,
@@ -105,6 +120,10 @@ impl DbcHandle {
                 active_stmt: None,
                 client: None,
                 access_token: None,
+                autocommit: true,
+                txn_isolation: crate::api::odbc_types::SQL_TXN_READ_COMMITTED,
+                current_catalog: None,
+                dead: false,
             }),
         }
     }

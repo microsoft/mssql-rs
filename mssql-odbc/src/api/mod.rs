@@ -2,17 +2,28 @@
 // Licensed under the MIT License.
 
 pub(crate) mod alloc_handle;
+pub(crate) mod ansi;
+mod bind_col;
 mod bind_param;
+mod catalog;
+mod cdata;
 mod close_cursor;
+mod col_attribute;
+mod conn_exec;
 mod connect;
+mod dae;
+pub(crate) mod desc;
 mod describe_col;
 mod disconnect;
 mod driver_connect;
+mod end_tran;
 mod exec_common;
 mod exec_direct;
 mod execute;
 pub(crate) mod fetch;
+mod fetch_scroll;
 pub(crate) mod free_handle;
+mod get_connect_attr;
 mod get_data;
 mod get_diag;
 mod get_env_attr;
@@ -27,6 +38,7 @@ mod row_count;
 pub(crate) mod set_connect_attr;
 pub(crate) mod set_env_attr;
 pub(crate) mod set_stmt_attr;
+pub(crate) mod spill;
 pub(crate) mod sqlstate;
 pub(crate) mod util;
 

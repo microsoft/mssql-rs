@@ -30,8 +30,7 @@ use crate::api::odbc_types::{
     SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{
-    ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE, SQLSTATE_01S02, SQLSTATE_HYC00,
-    post_diag,
+    ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE, SQLSTATE_01S02, post_diag,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
@@ -121,29 +120,17 @@ fn sql_set_stmt_attr_w_safe(
             SQL_SUCCESS
         }
         SQL_ATTR_PARAMSET_SIZE => {
-            // Parameter arrays are not yet consumed (executemany batch insert is
-            // tracked separately). Accept the ODBC default of 1; reject a larger
-            // batch (HYC00) instead of silently executing only the first row,
-            // and reject 0 as an invalid value (HY024).
+            // Column-wise parameter arrays are executed row-by-row against the
+            // cached prepared handle (`execute.rs`). 0 is invalid (HY024).
             match value_ptr as SqlULen {
-                1 => SQL_SUCCESS,
                 0 => {
                     error!("SQLSetStmtAttrW: SQL_ATTR_PARAMSET_SIZE of 0 is invalid");
                     post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
                     SQL_ERROR
                 }
                 n => {
-                    error!(
-                        paramset_size = n,
-                        "SQLSetStmtAttrW: SQL_ATTR_PARAMSET_SIZE > 1 not supported"
-                    );
-                    post_sql_error(
-                        &mut state,
-                        SQLSTATE_HYC00,
-                        0,
-                        "Parameter arrays (SQL_ATTR_PARAMSET_SIZE > 1) are not supported",
-                    );
-                    SQL_ERROR
+                    state.paramset_size = n;
+                    SQL_SUCCESS
                 }
             }
         }
@@ -527,11 +514,13 @@ mod tests {
     }
 
     #[test]
-    fn set_paramset_size_greater_than_one_rejected() {
+    fn set_paramset_size_greater_than_one_accepted() {
         let h = TestHandles::with_env_dbc_stmt();
         let ret =
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_PARAMSET_SIZE, 100 as SqlPointer, 0) };
-        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(ret, SQL_SUCCESS);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(stmt.inner.lock().unwrap().paramset_size, 100);
     }
 
     #[test]

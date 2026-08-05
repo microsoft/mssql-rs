@@ -1992,7 +1992,7 @@ impl DecimalParts {
 
     /// Convert DecimalParts to a string representation suitable for Python Decimal.
     /// Returns a string like "123.45", "-0.01", etc.
-    fn to_decimal_string(&self) -> String {
+    pub fn to_decimal_string(&self) -> String {
         // Convert int_parts to u128
         // int_parts[0] is the least significant, int_parts[n-1] is most significant
         let u128_value = self

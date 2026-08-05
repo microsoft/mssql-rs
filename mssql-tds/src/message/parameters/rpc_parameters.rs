@@ -113,6 +113,12 @@ pub struct RpcParameter {
     /// `SqlParameter.ForceColumnEncryption`; a client-side directive that is
     /// never sent on the wire.
     force_column_encryption: bool,
+
+    /// Precision and scale the application declared for a `decimal`/`numeric`
+    /// parameter. A NULL value carries no precision of its own, so without this
+    /// the parameter would be declared with the TDS default and a prepared plan
+    /// built from a NULL row would reject wider values on later executions.
+    numeric_meta: Option<(u8, u8)>,
 }
 
 impl RpcParameter {
@@ -124,7 +130,15 @@ impl RpcParameter {
             value,
             encrypted: None,
             force_column_encryption: false,
+            numeric_meta: None,
         }
+    }
+
+    /// Declares the precision and scale to use for a `decimal`/`numeric`
+    /// parameter, overriding whatever the value itself carries.
+    pub fn with_numeric_meta(mut self, precision: u8, scale: u8) -> Self {
+        self.numeric_meta = Some((precision, scale));
+        self
     }
 
     /// Requires this parameter to be encrypted under Always Encrypted.
@@ -499,7 +513,13 @@ fn build_parameter_list_string_impl(
         if let Some(param_name) = &param.name {
             // TODO: while persisting types with length, we need to compute the length and
             // add the length after the type name. e.g. Nvarchar(200), varchar(100) etc.
-            let param_type_name = RpcParameter::get_sql_name(&param.value)?;
+            let param_type_name = match (&param.value, param.numeric_meta) {
+                (SqlType::Decimal(_) | SqlType::Numeric(_), Some((precision, scale))) => {
+                    let tds_type = TdsDataType::from(&param.value);
+                    format!("{}({precision}, {scale})", tds_type.get_meta_type_name()?)
+                }
+                _ => RpcParameter::get_sql_name(&param.value)?,
+            };
             if first_param {
                 first_param = false;
             } else {

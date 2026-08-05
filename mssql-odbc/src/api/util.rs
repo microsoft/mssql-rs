@@ -77,6 +77,183 @@ pub(crate) unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> St
     String::from_utf16_lossy(slice)
 }
 
+/// Returns the text between `{` and its matching `}`, plus the index just past
+/// the closing brace.
+fn escape_body(chars: &[char], body_start: usize) -> (String, usize) {
+    let mut depth = 1usize;
+    let mut i = body_start;
+    let mut body = String::new();
+    while i < chars.len() {
+        match chars[i] {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (body, i + 1);
+                }
+            }
+            _ => {}
+        }
+        body.push(chars[i]);
+        i += 1;
+    }
+    (body, i)
+}
+
+/// Offset just past the leading `call` keyword of an escape body.
+fn keyword_span(body: &str) -> usize {
+    body.to_ascii_lowercase()
+        .find("call")
+        .map(|p| p + "call".len())
+        .unwrap_or(0)
+}
+
+/// Turns `proc(a, b)` into `proc a, b`, which is the only form `EXEC` accepts.
+fn strip_call_parens(call: &str) -> String {
+    let call = call.trim();
+    let Some(open) = call.find('(') else {
+        return call.to_string();
+    };
+    let Some(close) = call.rfind(')') else {
+        return call.to_string();
+    };
+    if close < open {
+        return call.to_string();
+    }
+    format!(
+        "{} {}{}",
+        call[..open].trim(),
+        call[open + 1..close].trim(),
+        &call[close + 1..]
+    )
+    .trim_end()
+    .to_string()
+}
+
+/// Translates ODBC escape sequences into T-SQL.
+///
+/// Applications write vendor-neutral escapes such as `{CALL proc(?)}`,
+/// `{ts '2024-01-01 00:00:00'}` or `{fn UCASE(x)}`; SQL Server does not accept
+/// the braces, so the driver has to unwrap them before sending the batch.
+/// Escapes inside string literals, quoted identifiers, and comments are left
+/// alone.
+///
+/// The rewrite is deliberately shallow — it strips the braces and maps `CALL`
+/// to `EXEC` — which covers what SQL Server understands natively. `{fn …}` and
+/// `{oj …}` reduce to their body, and the datetime literal escapes reduce to
+/// the quoted literal, which SQL Server converts implicitly.
+pub(crate) fn translate_odbc_escapes(sql: &str) -> String {
+    if !sql.contains('{') {
+        return sql.to_string();
+    }
+
+    let mut out = String::with_capacity(sql.len());
+    let bytes: Vec<char> = sql.chars().collect();
+    let mut i = 0usize;
+    // Depth of the escape bodies currently open, so the matching `}` is dropped.
+    let mut open_escapes: Vec<()> = Vec::new();
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            '\'' | '"' | '[' => {
+                let close = if c == '[' { ']' } else { c };
+                out.push(c);
+                i += 1;
+                while i < bytes.len() {
+                    out.push(bytes[i]);
+                    if bytes[i] == close {
+                        // A doubled delimiter is an escaped literal character.
+                        if bytes.get(i + 1) == Some(&close) {
+                            out.push(close);
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '-' if bytes.get(i + 1) == Some(&'-') => {
+                while i < bytes.len() && bytes[i] != '\n' {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            '/' if bytes.get(i + 1) == Some(&'*') => {
+                while i < bytes.len() {
+                    out.push(bytes[i]);
+                    if bytes[i] == '/' && i > 0 && bytes[i - 1] == '*' && i > 1 {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '{' => {
+                let body_start = i + 1;
+                let mut j = body_start;
+                while j < bytes.len() && bytes[j].is_whitespace() {
+                    j += 1;
+                }
+                let word_start = j;
+                while j < bytes.len() && (bytes[j].is_alphanumeric() || bytes[j] == '_') {
+                    j += 1;
+                }
+                let keyword: String = bytes[word_start..j].iter().collect();
+                match keyword.to_ascii_lowercase().as_str() {
+                    "call" => {
+                        // `{CALL proc(a, b)}` becomes `EXEC proc a, b`: SQL
+                        // Server rejects the parenthesised argument list.
+                        let (body, next) = escape_body(&bytes, body_start);
+                        out.push_str("EXEC ");
+                        out.push_str(&strip_call_parens(&body[keyword_span(&body)..]));
+                        i = next;
+                        continue;
+                    }
+                    // `{? = call proc(…)}` returns the procedure's status; SQL
+                    // Server spells that `EXEC ? = proc …`.
+                    "" if bytes.get(word_start) == Some(&'?') => {
+                        let (body, next) = escape_body(&bytes, body_start);
+                        let after_call = body
+                            .to_ascii_lowercase()
+                            .find("call")
+                            .map(|p| p + "call".len())
+                            .unwrap_or(0);
+                        out.push_str("EXEC ? = ");
+                        out.push_str(&strip_call_parens(&body[after_call..]));
+                        i = next;
+                        continue;
+                    }
+                    "fn" | "oj" | "escape" | "d" | "t" | "ts" | "guid" | "interval" | "limit" => {
+                        if keyword.eq_ignore_ascii_case("escape") {
+                            out.push_str("ESCAPE");
+                        }
+                        i = j;
+                    }
+                    _ => {
+                        // Not a recognised escape: emit the brace verbatim.
+                        out.push('{');
+                        i = body_start;
+                        continue;
+                    }
+                }
+                open_escapes.push(());
+            }
+            '}' if !open_escapes.is_empty() => {
+                open_escapes.pop();
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Rewrites ODBC `?` parameter markers to SQL Server named markers (`@P1`,
 /// `@P2`, …) and returns the rewritten SQL together with the marker count.
 ///
@@ -231,8 +408,76 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_with_nul, read_utf16, rewrite_param_markers, write_if_some};
+    use super::{
+        copy_with_nul, read_utf16, rewrite_param_markers, translate_odbc_escapes, write_if_some,
+    };
     use crate::api::odbc_types::{SQL_NTS, SqlWChar};
+
+    #[test]
+    fn escape_without_braces_is_unchanged() {
+        assert_eq!(translate_odbc_escapes("SELECT 1"), "SELECT 1");
+    }
+
+    #[test]
+    fn escape_call_becomes_exec_without_parens() {
+        assert_eq!(
+            translate_odbc_escapes("{CALL dbo.GetProjects(?)}"),
+            "EXEC dbo.GetProjects ?"
+        );
+    }
+
+    #[test]
+    fn escape_call_without_arguments() {
+        assert_eq!(
+            translate_odbc_escapes("{call dbo.Refresh}"),
+            "EXEC dbo.Refresh"
+        );
+    }
+
+    #[test]
+    fn escape_call_with_return_value() {
+        assert_eq!(
+            translate_odbc_escapes("{? = call dbo.Total(?, ?)}"),
+            "EXEC ? = dbo.Total ?, ?"
+        );
+    }
+
+    #[test]
+    fn escape_scalar_function_is_unwrapped() {
+        assert_eq!(
+            translate_odbc_escapes("SELECT {fn UCASE(name)} FROM t"),
+            "SELECT  UCASE(name) FROM t"
+        );
+    }
+
+    #[test]
+    fn escape_timestamp_literal_is_unwrapped() {
+        assert_eq!(
+            translate_odbc_escapes("SELECT {ts '2024-01-01 00:00:00'}"),
+            "SELECT  '2024-01-01 00:00:00'"
+        );
+    }
+
+    #[test]
+    fn escape_like_escape_clause_is_rewritten() {
+        assert_eq!(
+            translate_odbc_escapes("WHERE a LIKE 'x!%' {escape '!'}"),
+            "WHERE a LIKE 'x!%' ESCAPE '!'"
+        );
+    }
+
+    #[test]
+    fn escape_inside_string_literal_is_left_alone() {
+        assert_eq!(
+            translate_odbc_escapes("SELECT '{CALL nope}'"),
+            "SELECT '{CALL nope}'"
+        );
+    }
+
+    #[test]
+    fn escape_unknown_keyword_passes_through() {
+        assert_eq!(translate_odbc_escapes("SELECT {json a}"), "SELECT {json a}");
+    }
 
     #[test]
     fn rewrite_no_markers_is_unchanged() {

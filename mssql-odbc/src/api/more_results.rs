@@ -99,7 +99,18 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         client
     };
 
-    match dbc.runtime.block_on(client.advance()) {
+    let pending = match stmt.inner.lock() {
+        Ok(mut ss) => ss.pending_result.take(),
+        Err(_) => None,
+    };
+    let advanced = match pending {
+        // The boundary was already crossed while releasing the connection for
+        // another statement; the client is still positioned on that result.
+        Some(result) => Ok(result),
+        None => dbc.runtime.block_on(client.advance()),
+    };
+
+    match advanced {
         Ok(StatementResult::Rows) => {
             // Positioned on a new row-returning result set. Refresh metadata,
             // clear row state, keep CURSOR_OPEN and active_stmt set.
@@ -114,7 +125,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             stmt_state.column_metadata = metadata;
             // Refresh the count for the newly-positioned result set (-1 for a SELECT).
             stmt_state.row_count = client.last_rows_affected();
-            stmt_state.current_row = None;
+            stmt_state.reset_rows();
             // Drain INFO only after the lock is held.
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
@@ -147,7 +158,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // Surface this no-row statement's own affected-row count for
             // SQLRowCount now that we are positioned on it.
             stmt_state.row_count = client.last_rows_affected();
-            stmt_state.current_row = None;
+            stmt_state.reset_rows();
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);

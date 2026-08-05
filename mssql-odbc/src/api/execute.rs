@@ -9,13 +9,19 @@ use tracing::{debug, error};
 use mssql_tds::connection::tds_client::StatementResult;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
-use super::exec_common::{build_named_params, claim_connection, fail_with_tds, finish_execute};
+use super::close_cursor::{DrainOutcome, drain_and_release, reset_cursor_state};
+use super::exec_common::{
+    build_named_params_row, claim_connection, collect_dae_params, fail_with_tds, finish_execute,
+};
 use super::sqlstate::*;
 use super::util::rewrite_param_markers;
-use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
+use crate::api::odbc_types::{
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NEED_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
+    SqlReturn,
+};
 use crate::error::free_errors;
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+    DaeState, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -45,24 +51,112 @@ unsafe fn sql_execute_impl(statement_handle: SqlHandle) -> SqlReturn {
 }
 
 /// Values gathered under the STMT lock before any network I/O.
-struct Execution {
-    rewritten_sql: String,
-    named_params: Vec<RpcParameter>,
-    handle: Option<i32>,
+pub(super) struct Execution {
+    pub(super) rewritten_sql: String,
+    pub(super) named_params: Vec<RpcParameter>,
+    pub(super) handle: Option<i32>,
     /// A superseded prepared handle (from a prior rebind / re-prepare) to be dropped
     /// on the server
-    drop_handle: Option<i32>,
+    pub(super) drop_handle: Option<i32>,
 }
 
 fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
-    let dbc = stmt.parent_dbc();
+    let paramset_size = stmt
+        .inner
+        .lock()
+        .map(|state| state.paramset_size)
+        .unwrap_or(1);
 
-    let exec = match stage_execution(stmt) {
-        Ok(exec) => exec,
+    if paramset_size > 1 {
+        return execute_param_array(statement_handle, stmt, paramset_size);
+    }
+
+    let exec = match stage_execution(stmt, 0) {
+        Ok(Staged::Ready(exec)) => exec,
+        Ok(Staged::NeedData) => return SQL_NEED_DATA,
         Err(rc) => return rc,
     };
+    run_execution(statement_handle, stmt, exec, "SQLExecute")
+}
 
-    let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
+/// Executes a statement once per element of a column-wise parameter array
+/// (`SQL_ATTR_PARAMSET_SIZE > 1`), as used by `executemany`.
+///
+/// SQL Server has no wire-level parameter-array form for `sp_execute`, so each
+/// row is a separate RPC on the same prepared plan: the first execution
+/// prepares, and the cached handle makes the rest single-round-trip. Affected
+/// row counts are summed so `SQLRowCount` reports the total, matching msodbcsql.
+fn execute_param_array(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    paramset_size: usize,
+) -> SqlReturn {
+    let mut total_rows: i64 = 0;
+    let mut worst = SQL_SUCCESS;
+
+    for row in 0..paramset_size {
+        let exec = match stage_execution(stmt, row) {
+            Ok(Staged::Ready(exec)) => exec,
+            // A DAE parameter inside a parameter array is driven row-by-row by
+            // the application, which mssql-python does on a separate code path;
+            // arrays reaching here are always fully materialized.
+            Ok(Staged::NeedData) => return SQL_NEED_DATA,
+            Err(rc) => return rc,
+        };
+        let rc = run_execution(statement_handle, stmt, exec, "SQLExecute");
+        if rc == SQL_ERROR || rc == SQL_INVALID_HANDLE {
+            return rc;
+        }
+        if rc == SQL_SUCCESS_WITH_INFO {
+            worst = SQL_SUCCESS_WITH_INFO;
+        }
+        if let Ok(state) = stmt.inner.lock()
+            && state.row_count >= 0
+        {
+            total_rows += state.row_count;
+        }
+
+        // A row that produced a result set leaves the cursor open and the
+        // connection claimed, which would make the next row fail the
+        // invalid-cursor guard below. `executemany` never exposes intermediate
+        // result sets, so each row's cursor is closed before the next starts.
+        // The final row's cursor stays open: a statement with an `OUTPUT`
+        // clause is expected to leave its rows and metadata available.
+        let is_last = row + 1 == paramset_size;
+        let cursor_open = stmt
+            .inner
+            .lock()
+            .is_ok_and(|state| state.has_state(STMT_STATE_CURSOR_OPEN));
+        if cursor_open && !is_last {
+            if let Ok(mut state) = stmt.inner.lock() {
+                reset_cursor_state(&mut state);
+            }
+            if matches!(
+                drain_and_release(stmt, statement_handle),
+                DrainOutcome::Failed
+            ) {
+                return SQL_ERROR;
+            }
+        }
+    }
+
+    if let Ok(mut state) = stmt.inner.lock() {
+        state.row_count = total_rows;
+    }
+    worst
+}
+
+/// Runs a staged execution: claims the connection, issues `sp_execute` or
+/// `sp_prepexec`, and finalizes statement state.
+pub(super) fn run_execution(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    exec: Execution,
+    op: &'static str,
+) -> SqlReturn {
+    let dbc = stmt.parent_dbc();
+
+    let mut client = match claim_connection(dbc, stmt, statement_handle, op) {
         Ok(client) => client,
         Err(rc) => return rc,
     };
@@ -99,7 +193,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
     let stmt_result = match exec_result {
         Ok(result) => result,
         Err(e) => {
-            error!(%e, "SQLExecute: prepared execution failed");
+            error!(%e, "{op}: prepared execution failed");
             return fail_with_tds(dbc, stmt, statement_handle, client, &e);
         }
     };
@@ -114,17 +208,24 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
     if !matches!(stmt_result, StatementResult::Rows)
         && let Err(e) = dbc.runtime.block_on(client.advance_to_rows())
     {
-        error!(%e, "SQLExecute: draining no-row prepared result failed");
+        error!(%e, "{op}: draining no-row prepared result failed");
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    finish_execute(dbc, stmt, statement_handle, client, "SQLExecute")
+    finish_execute(dbc, stmt, statement_handle, client, op)
+}
+
+/// Outcome of staging: either everything needed to run, or a request for the
+/// application to stream data-at-execution parameters first.
+pub(super) enum Staged {
+    Ready(Execution),
+    NeedData,
 }
 
 /// Validates statement state and builds the parameter list under the STMT lock,
 /// setting `EXEC_STARTED` on success. Application value buffers are read here by
 /// reference (no network I/O).
-fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
+fn stage_execution(stmt: &StmtHandle, row: usize) -> Result<Staged, SqlReturn> {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLExecute: stmt mutex poisoned");
         return Err(SQL_ERROR);
@@ -152,23 +253,47 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
 
     let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
 
-    let named_params = unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
-
     let handle = stmt_state.prepared_handle;
-    let drop_handle = stmt_state.pending_unprepare.take();
-    stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
-    stmt_state.column_metadata.clear();
-    stmt_state.current_row = None;
-    stmt_state.row_count = -1;
-    stmt_state.pending_row_counts.clear();
-    stmt_state.set_state(STMT_STATE_EXEC_STARTED);
+    let dae_order = unsafe { collect_dae_params(&stmt_state, marker_count) };
+    if !dae_order.is_empty() {
+        let drop_handle = stmt_state.pending_unprepare.take();
+        reset_for_execute(&mut stmt_state);
+        stmt_state.dae = Some(DaeState {
+            rewritten_sql,
+            marker_count,
+            handle,
+            drop_handle,
+            order: dae_order,
+            next: 0,
+            current: None,
+            data: vec![None; marker_count],
+            op: "SQLExecute",
+        });
+        return Ok(Staged::NeedData);
+    }
 
-    Ok(Execution {
+    let named_params =
+        unsafe { build_named_params_row(&mut stmt_state, marker_count, "SQLExecute", None, row) }?;
+
+    let drop_handle = stmt_state.pending_unprepare.take();
+    reset_for_execute(&mut stmt_state);
+
+    Ok(Staged::Ready(Execution {
         rewritten_sql,
         named_params,
         handle,
         drop_handle,
-    })
+    }))
+}
+
+/// Clears per-execution result state and marks the statement as executing.
+pub(super) fn reset_for_execute(stmt_state: &mut crate::handles::stmt::StmtState) {
+    stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
+    stmt_state.column_metadata.clear();
+    stmt_state.reset_rows();
+    stmt_state.row_count = -1;
+    stmt_state.pending_row_counts.clear();
+    stmt_state.set_state(STMT_STATE_EXEC_STARTED);
 }
 
 #[cfg(test)]
@@ -238,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn data_at_exec_parameter_returns_hyc00() {
+    fn data_at_exec_parameter_returns_need_data() {
         use crate::api::odbc_types::{
             SQL_C_CHAR, SQL_DATA_AT_EXEC, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen,
         };
@@ -248,8 +373,6 @@ mod tests {
         set_prepared(h.stmt, "SELECT ?");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
-        // Bind passes (SQL_C_CHAR → SQL_VARCHAR), but the data-at-execution
-        // indicator is only seen at execute time and is unsupported in Phase 1.
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
         stmt.inner
             .lock()
@@ -267,10 +390,8 @@ mod tests {
             }));
 
         let ret = unsafe { sql_execute(h.stmt) };
-        assert_eq!(ret, SQL_ERROR);
-        let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
-        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+        assert_eq!(ret, SQL_NEED_DATA);
+        assert!(stmt.inner.lock().unwrap().dae.is_some());
     }
 
     #[test]
@@ -287,7 +408,9 @@ mod tests {
             state.pending_unprepare = Some(42);
         }
 
-        let exec = stage_execution(stmt).expect("staging should succeed");
+        let Staged::Ready(exec) = stage_execution(stmt, 0).expect("staging should succeed") else {
+            panic!("expected a ready execution");
+        };
         assert_eq!(exec.handle, None);
         assert_eq!(exec.drop_handle, Some(42));
 
@@ -308,7 +431,9 @@ mod tests {
             state.prepared_handle = Some(7);
         }
 
-        let exec = stage_execution(stmt).expect("staging should succeed");
+        let Staged::Ready(exec) = stage_execution(stmt, 0).expect("staging should succeed") else {
+            panic!("expected a ready execution");
+        };
         assert_eq!(exec.handle, Some(7));
         assert_eq!(exec.drop_handle, None);
     }

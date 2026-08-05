@@ -54,6 +54,11 @@ pub(crate) struct StmtState {
     /// SQL text stored by `SQLPrepare`, awaiting execution. The server-side
     /// prepare is deferred to `SQLExecute`.
     pub(crate) prepared_sql: Option<String>,
+    /// Parameter metadata from `sp_describe_undeclared_parameters`, cached for
+    /// the life of the prepared text because callers describe every parameter
+    /// in turn and each probe costs a round trip. Invalidated whenever
+    /// `prepared_sql` changes.
+    pub(crate) described_params: Option<Vec<crate::api::desc::DescribedParam>>,
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
     pub(crate) bound_params: Vec<Option<BoundParam>>,
@@ -71,6 +76,24 @@ pub(crate) struct StmtState {
     pub(crate) pending_unprepare: Option<i32>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
+    /// Rows of the open result set that were read off the wire ahead of time so
+    /// the connection could be handed to another statement. `SQLFetch` drains
+    /// this before touching the connection. Mirrors msodbcsql, which serves a
+    /// second statement as soon as the first result set is fully buffered.
+    pub(crate) buffered_rows: VecDeque<Vec<ColumnValues>>,
+    /// `true` once `buffered_rows` holds the complete remainder of the open
+    /// result set, so an empty buffer means `SQL_NO_DATA` rather than a read.
+    pub(crate) buffered_eof: bool,
+    /// Error raised by the server *after* one or more rows of the current
+    /// rowset were already delivered. The rows are still handed to the
+    /// application, so the diagnostic is held here and re-posted by the next
+    /// fetch call, which reports `SQL_ERROR`. Without this the cursor would
+    /// simply appear closed and the real SQLSTATE would be lost behind 24000.
+    pub(crate) pending_fetch_error: Option<crate::error::DiagRecord>,
+    /// Result boundary already crossed on this statement's behalf while trying
+    /// to release the connection (see `api::spill`). `SQLMoreResults` consumes
+    /// this instead of advancing the client again.
+    pub(crate) pending_result: Option<mssql_tds::connection::tds_client::StatementResult>,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
     /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
@@ -95,11 +118,96 @@ pub(crate) struct StmtState {
     /// Row binding orientation (`SQL_ATTR_ROW_BIND_TYPE`): `SQL_BIND_BY_COLUMN`
     /// (0) for column-wise arrays, otherwise a row-struct byte size.
     pub(crate) row_bind_type: SqlULen,
+    /// Result columns bound via `SQLBindCol`, indexed by `(ColumnNumber - 1)`.
+    /// `None` slots are gaps left by binding a higher ordinal first, or columns
+    /// explicitly unbound with a null buffer pointer.
+    pub(crate) bound_cols: Vec<Option<BoundCol>>,
+    /// Column currently being streamed by `SQLGetData`.
+    pub(crate) getdata_col: Option<usize>,
+    /// Units of that column already delivered.
+    pub(crate) getdata_offset: usize,
+    /// Whether the streamed column has been fully delivered.
+    pub(crate) getdata_done: bool,
+    /// Number of parameter-array elements per execution (`SQL_ATTR_PARAMSET_SIZE`).
+    pub(crate) paramset_size: SqlULen,
+    /// In-flight data-at-execution state, present between the `SQL_NEED_DATA`
+    /// return from `SQLExecute`/`SQLExecDirect` and the final `SQLParamData`
+    /// that actually runs the statement.
+    pub(crate) dae: Option<DaeState>,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
 }
 
+/// Deferred execution state for data-at-execution (DAE) parameters.
+///
+/// ODBC streams oversized parameter values *after* `SQLExecute` returns
+/// `SQL_NEED_DATA`: the application loops `SQLParamData` (which names the next
+/// hungry parameter) and `SQLPutData` (which feeds it) until every DAE
+/// parameter is satisfied, at which point `SQLParamData` performs the real
+/// execution. The statement text and prepared-handle bookkeeping captured at
+/// staging time are parked here for that final call.
+#[derive(Debug)]
+pub(crate) struct DaeState {
+    /// Rewritten SQL (`?` markers replaced with `@P<n>`).
+    pub(crate) rewritten_sql: String,
+    /// Number of parameter markers in the statement.
+    pub(crate) marker_count: usize,
+    /// Cached server-side prepared handle, if the statement was already
+    /// prepared.
+    pub(crate) handle: Option<i32>,
+    /// A superseded prepared handle to drop on the server during execution.
+    pub(crate) drop_handle: Option<i32>,
+    /// Zero-based indexes of parameters awaiting data, in ODBC order.
+    pub(crate) order: Vec<usize>,
+    /// Position within `order` of the next parameter to hand out.
+    pub(crate) next: usize,
+    /// Parameter currently being fed by `SQLPutData`.
+    pub(crate) current: Option<usize>,
+    /// Accumulated bytes per parameter index (`None` = the application sent
+    /// `SQL_NULL_DATA`).
+    pub(crate) data: Vec<Option<Vec<u8>>>,
+    /// Entry point that started the DAE sequence, for diagnostics.
+    pub(crate) op: &'static str,
+}
+
+/// A result column bound to an application buffer by `SQLBindCol`.
+///
+/// For block fetches the buffers are arrays of `row_array_size` elements, each
+/// `buffer_length` bytes wide (column-wise binding).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoundCol {
+    pub(crate) target_type: crate::api::odbc_types::SqlSmallInt,
+    pub(crate) target_value_ptr: *mut c_void,
+    pub(crate) buffer_length: crate::api::odbc_types::SqlLen,
+    pub(crate) strlen_or_ind_ptr: *mut crate::api::odbc_types::SqlLen,
+}
+
+// SAFETY: the raw pointers are application-owned buffers that the ODBC contract
+// requires to stay valid until the column is unbound; they are only written
+// while the statement mutex is held, exactly like `rows_fetched_ptr`.
+unsafe impl Send for BoundCol {}
+unsafe impl Sync for BoundCol {}
+
 impl StmtState {
+    /// Discards the current row and any rows buffered ahead of the cursor.
+    /// Called whenever the cursor is repositioned, closed, or re-executed.
+    pub(crate) fn reset_rows(&mut self) {
+        self.current_row = None;
+        self.buffered_rows.clear();
+        self.buffered_eof = false;
+        self.pending_result = None;
+        self.pending_fetch_error = None;
+        self.reset_getdata();
+    }
+
+    /// Clears `SQLGetData` streaming position; called whenever the current row
+    /// changes, since offsets are only meaningful within a single row.
+    pub(crate) fn reset_getdata(&mut self) {
+        self.getdata_col = None;
+        self.getdata_offset = 0;
+        self.getdata_done = false;
+    }
+
     pub(crate) fn has_state(&self, mask: u32) -> bool {
         (self.state_flags & mask) != 0
     }
@@ -156,16 +264,27 @@ impl StmtHandle {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
                 prepared_sql: None,
+                described_params: None,
                 bound_params: Vec::new(),
                 prepared_handle: None,
                 pending_unprepare: None,
                 current_row: None,
+                buffered_rows: VecDeque::new(),
+                buffered_eof: false,
+                pending_result: None,
+                pending_fetch_error: None,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
                 row_array_size: 1,
                 rows_fetched_ptr: std::ptr::null_mut(),
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                bound_cols: Vec::new(),
+                getdata_col: None,
+                getdata_offset: 0,
+                getdata_done: false,
+                paramset_size: 1,
+                dae: None,
                 state_flags: 0,
             }),
         }

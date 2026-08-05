@@ -9,10 +9,10 @@ use tracing::{debug, error};
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DECIMAL, SQL_DOUBLE, SQL_ERROR, SQL_GUID,
     SQL_INTEGER, SQL_INVALID_HANDLE, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NO_NULLS,
-    SQL_NULLABLE, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIMESTAMP, SQL_UNKNOWN_TYPE,
-    SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlHandle, SqlReturn,
-    SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_NULLABLE, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
+    SQL_SS_UDT, SQL_SS_VARIANT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE,
+    SQL_TYPE_TIMESTAMP, SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
+    SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_INDEX, ERR_STRING_RIGHT_TRUNCATION, post_diag,
@@ -161,7 +161,7 @@ fn sql_describe_col_w_safe(
     }
 }
 
-fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallInt {
+pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallInt {
     match meta.data_type {
         TdsDataType::Int1 => SQL_TINYINT,
         TdsDataType::Int2 => SQL_SMALLINT,
@@ -182,10 +182,11 @@ fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallI
             8 => SQL_DOUBLE,
             _ => SQL_UNKNOWN_TYPE,
         },
-        TdsDataType::Decimal
-        | TdsDataType::DecimalN
-        | TdsDataType::Numeric
-        | TdsDataType::NumericN => SQL_DECIMAL,
+        TdsDataType::Decimal | TdsDataType::DecimalN => SQL_DECIMAL,
+        // msodbcsql keeps `numeric` and `decimal` distinct so applications can
+        // register per-type output converters, even though the two share a wire
+        // representation.
+        TdsDataType::Numeric | TdsDataType::NumericN => SQL_NUMERIC,
         TdsDataType::Money | TdsDataType::Money4 | TdsDataType::MoneyN => SQL_DECIMAL,
         TdsDataType::DateN => SQL_TYPE_DATE,
         // SQL Server's `time` supports up to 7-digit fractional seconds; SQL_TYPE_TIME
@@ -210,12 +211,23 @@ fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallI
         TdsDataType::Image => SQL_LONGVARBINARY,
         TdsDataType::Guid => SQL_GUID,
         TdsDataType::Xml | TdsDataType::Json => SQL_WLONGVARCHAR,
-        TdsDataType::Vector | TdsDataType::SsVariant | TdsDataType::Udt => SQL_VARCHAR,
+        TdsDataType::Vector => SQL_VARCHAR,
+        // sql_variant and UDTs (hierarchyid, geometry, geography) carry their own
+        // SQL Server-specific type codes. Reporting them as SQL_VARCHAR would make
+        // clients ask for SQL_C_CHAR and receive a rendered string instead of the
+        // typed value / raw UDT bytes.
+        TdsDataType::SsVariant => SQL_SS_VARIANT,
+        TdsDataType::Udt => SQL_SS_UDT,
         _ => SQL_UNKNOWN_TYPE,
     }
 }
 
-fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
+pub(crate) fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
+    // UDTs are PLP on the wire but msodbcsql reports their declared max length,
+    // because clients use a non-zero ColumnSize to tell a bounded UDT from a LOB.
+    if matches!(meta.data_type, TdsDataType::Udt) {
+        return u64::try_from(meta.type_info.length).unwrap_or(0);
+    }
     // PLP / `*(max)` / xml / json: ColumnSize is "unbounded". Report 0 per ODBC spec
     if meta.is_plp() {
         return 0;
@@ -282,7 +294,7 @@ fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
     }
 }
 
-fn decimal_digits(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallInt {
+pub(crate) fn decimal_digits(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallInt {
     match meta.data_type {
         // T-SQL `money` and `smallmoney` both have a fixed scale of 4. They are stored
         // as FixedLen/VarLen variants without a scale field, so `get_scale()` returns

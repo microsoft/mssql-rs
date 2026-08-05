@@ -73,6 +73,7 @@ unsafe fn sql_prepare_w_impl(
     );
 
     let sql = unsafe { read_utf16(statement_text, text_length) };
+    let sql = super::util::translate_odbc_escapes(&sql);
     sql_prepare_w_safe(stmt, sql)
 }
 
@@ -112,9 +113,10 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     // Re-preparing discards any prior prepared text and stale result metadata.
     // A prior prepared handle is orphaned for release at the next execute.
     stmt_state.prepared_sql = Some(sql);
+    stmt_state.described_params = None;
     stmt_state.orphan_prepared_handle();
     stmt_state.column_metadata.clear();
-    stmt_state.current_row = None;
+    stmt_state.reset_rows();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.set_state(STMT_STATE_PREPARED);
 

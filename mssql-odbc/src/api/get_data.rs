@@ -3,19 +3,22 @@
 
 //! Minimal SQLGetData implementation for Phase 1.
 
+use mssql_tds::datatypes::column_values::ColumnValues;
 use tracing::{debug, error};
 
+use super::cdata::{
+    StreamPayload, WriteError, WriteOutcome, stream_payload, wchar_capacity, write_c_value,
+};
 use super::odbc_types::{
-    SQL_C_CHAR, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NULL_DATA, SQL_SUCCESS,
+    SQL_C_CHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NULL_DATA, SQL_SUCCESS,
     SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt,
+    SqlWChar,
 };
 use super::sqlstate::*;
-use crate::api::odbc_types::SqlWChar;
-use crate::api::util::{copy_with_nul, write_if_some};
+use super::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
+use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
-use mssql_tds::datatypes::column_values::ColumnValues;
 
 /// Implements SQLGetData for current-row retrieval.
 ///
@@ -121,120 +124,212 @@ fn sql_get_data_safe(
         return SQL_ERROR;
     }
 
-    if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_HYC00,
-            0,
-            "Target type not yet implemented",
-        );
+    let value = row[col_index - 1].clone();
+
+    // A NULL buffer is the "how long is this value?" probe (and, for
+    // sql_variant, the call that primes SQL_CA_SS_VARIANT_TYPE). It must report
+    // the length without consuming any of the value, and must succeed even when
+    // the requested C type could not actually render the value — clients probe
+    // with SQL_C_BINARY before they know the underlying type. `BufferLength` is
+    // ignored for fixed-width C types, so a zero length only means "probe" for
+    // the character and binary targets.
+    // A NULL value can only be reported through the indicator, so an
+    // application that supplies none gets SQLSTATE 22002 and no buffer write.
+    // Callers depend on the failure to distinguish NULL from a real value.
+    if matches!(value, ColumnValues::Null) && strlen_or_ind_ptr.is_null() {
+        post_diag(&mut stmt_state, ERR_INDICATOR_REQUIRED);
         return SQL_ERROR;
     }
 
-    // Output buffer capacity in element units (u8 for SQL_C_CHAR, SqlWChar for
-    // SQL_C_WCHAR). buffer_length is always in bytes per the ODBC spec.
-    let buf_elements = if target_type == SQL_C_WCHAR {
-        (buffer_length as usize) / std::mem::size_of::<SqlWChar>()
-    } else {
-        buffer_length as usize
-    };
-
-    let value = &row[col_index - 1];
-    if matches!(value, ColumnValues::Null) {
-        unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
-        // Write a NUL terminator into the caller buffer when there's room. The
-        // helper handles null `dst` and zero-length uniformly.
-        if target_type == SQL_C_WCHAR {
-            unsafe {
-                copy_with_nul(target_value_ptr as *mut SqlWChar, buf_elements, &[]);
-            }
+    let streamable = stream_payload(&value, target_type).is_some();
+    if target_value_ptr.is_null() || (buffer_length == 0 && streamable) {
+        let indicator = if matches!(value, ColumnValues::Null) {
+            SQL_NULL_DATA
         } else {
-            unsafe {
-                copy_with_nul(target_value_ptr as *mut u8, buf_elements, &[]);
-            }
-        }
+            probe_length(&value, target_type)
+        };
+        unsafe { write_if_some(strlen_or_ind_ptr, indicator) };
         return SQL_SUCCESS;
     }
 
-    let Some(as_text) = column_value_to_text(value) else {
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_HYC00,
-            0,
-            "Column type conversion not yet implemented",
-        );
-        return SQL_ERROR;
-    };
+    // NULL is reported the same way for every target type: indicator
+    // SQL_NULL_DATA and SQL_SUCCESS. It must not go through the streaming path,
+    // which has no payload to render and would report a bogus conversion error
+    // for binary/UDT columns that clients fetch with SQL_C_BINARY.
+    if matches!(value, ColumnValues::Null) {
+        if stmt_state.getdata_col == Some(col_index) && stmt_state.getdata_done {
+            return SQL_NO_DATA;
+        }
+        stmt_state.getdata_col = Some(col_index);
+        stmt_state.getdata_offset = 0;
+        stmt_state.getdata_done = true;
+        unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
+        return SQL_SUCCESS;
+    }
 
-    if target_type == SQL_C_WCHAR {
-        let utf16: Vec<u16> = as_text.encode_utf16().collect();
-        write_string_result(
+    if let Some(payload) = stream_payload(&value, target_type) {
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(WriteError::RestrictedConversion) => {
+                post_diag(&mut stmt_state, ERR_RESTRICTED_DATA_TYPE);
+                return SQL_ERROR;
+            }
+            Err(_) => {
+                post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
+                return SQL_ERROR;
+            }
+        };
+        return get_data_chunk(
             &mut stmt_state,
-            &utf16,
-            target_value_ptr as *mut SqlWChar,
-            buf_elements,
+            col_index,
+            &payload,
+            target_value_ptr,
+            buffer_length,
+            strlen_or_ind_ptr,
+        );
+    }
+
+    // Fixed-width targets are delivered whole; a repeat call yields SQL_NO_DATA.
+    if stmt_state.getdata_col == Some(col_index) && stmt_state.getdata_done {
+        return SQL_NO_DATA;
+    }
+    stmt_state.getdata_col = Some(col_index);
+    stmt_state.getdata_offset = 0;
+    stmt_state.getdata_done = true;
+
+    match unsafe {
+        write_c_value(
+            &value,
+            target_type,
+            target_value_ptr,
+            buffer_length,
             strlen_or_ind_ptr,
         )
-    } else {
-        write_string_result(
-            &mut stmt_state,
-            as_text.as_bytes(),
-            target_value_ptr as *mut u8,
-            buf_elements,
-            strlen_or_ind_ptr,
-        )
+    } {
+        Ok(WriteOutcome::Complete) => SQL_SUCCESS,
+        Ok(WriteOutcome::Truncated) => {
+            post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+            SQL_SUCCESS_WITH_INFO
+        }
+        Err(WriteError::InvalidCType) => {
+            post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
+            SQL_ERROR
+        }
+        Err(WriteError::RestrictedConversion) => {
+            post_diag(&mut stmt_state, ERR_RESTRICTED_DATA_TYPE);
+            SQL_ERROR
+        }
+        Err(WriteError::OutOfRange) => {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_22003,
+                0,
+                "Numeric value out of range",
+            );
+            SQL_ERROR
+        }
     }
 }
 
-/// Writes `src` to the caller's output buffer with ODBC string semantics:
-/// the indicator (when present) reports the untruncated byte length, the
-/// payload is NUL-terminated within the buffer, and truncation is reported via
-/// SQLSTATE 01004 + `SQL_SUCCESS_WITH_INFO`.
+/// Byte length reported for a zero-length `SQLGetData` probe.
 ///
-/// `buf_elements` is the buffer capacity in units of `T` (not bytes).
+/// Falls back to the narrow rendering when the requested C type cannot express
+/// the value, so that a probe never fails.
+fn probe_length(value: &ColumnValues, target_type: SqlSmallInt) -> SqlLen {
+    match stream_payload(value, target_type) {
+        Some(Ok(StreamPayload::Narrow(b))) | Some(Ok(StreamPayload::Binary(b))) => {
+            b.len() as SqlLen
+        }
+        Some(Ok(StreamPayload::Wide(w))) => (w.len() * size_of::<SqlWChar>()) as SqlLen,
+        _ => match stream_payload(value, SQL_C_CHAR) {
+            Some(Ok(StreamPayload::Narrow(b))) => b.len() as SqlLen,
+            _ => 0,
+        },
+    }
+}
+
+/// Copies the next chunk of a streamable column value into the caller's buffer,
+/// advancing the per-column offset.
 ///
-/// The caller-provided pointers are written through small `unsafe` blocks
-/// inside this function; both pointer arguments are obligations of the FFI
-/// caller (validated against the buffer length passed by the DM).
-fn write_string_result<T: Copy + Default>(
-    stmt_state: &mut crate::handles::stmt::StmtState,
-    src: &[T],
-    target_value_ptr: *mut T,
-    buf_elements: usize,
+/// Returns `SQL_SUCCESS_WITH_INFO` (01004) while data remains, `SQL_SUCCESS` on
+/// the chunk that completes the value, and `SQL_NO_DATA` on any call after that.
+/// The indicator always reports the number of bytes still available *before*
+/// this call, which is what ODBC clients use to size the next read.
+fn get_data_chunk(
+    stmt_state: &mut StmtState,
+    col_index: usize,
+    payload: &StreamPayload,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    let byte_len = std::mem::size_of_val(src) as SqlLen;
-    unsafe { write_if_some(strlen_or_ind_ptr, byte_len) };
-    let truncated = unsafe { copy_with_nul(target_value_ptr, buf_elements, src) };
-    if truncated {
+    if stmt_state.getdata_col != Some(col_index) {
+        stmt_state.getdata_col = Some(col_index);
+        stmt_state.getdata_offset = 0;
+        stmt_state.getdata_done = false;
+    }
+
+    let (total_units, unit_size) = match payload {
+        StreamPayload::Narrow(b) | StreamPayload::Binary(b) => (b.len(), 1usize),
+        StreamPayload::Wide(w) => (w.len(), size_of::<SqlWChar>()),
+    };
+
+    if stmt_state.getdata_done {
+        return SQL_NO_DATA;
+    }
+
+    let offset = stmt_state.getdata_offset;
+    let remaining = total_units.saturating_sub(offset);
+    unsafe { write_if_some(strlen_or_ind_ptr, (remaining * unit_size) as SqlLen) };
+
+    // Character targets reserve one unit for the terminator; binary does not.
+    let capacity = match payload {
+        StreamPayload::Narrow(_) => (buffer_length.max(0) as usize).saturating_sub(1),
+        StreamPayload::Wide(_) => wchar_capacity(buffer_length).saturating_sub(1),
+        StreamPayload::Binary(_) => buffer_length.max(0) as usize,
+    };
+    let copied = remaining.min(capacity);
+
+    unsafe {
+        match payload {
+            StreamPayload::Narrow(b) => {
+                let dst = target_value_ptr as *mut u8;
+                std::ptr::copy_nonoverlapping(b[offset..offset + copied].as_ptr(), dst, copied);
+                *dst.add(copied) = 0;
+            }
+            StreamPayload::Wide(w) => {
+                let dst = target_value_ptr as *mut SqlWChar;
+                std::ptr::copy_nonoverlapping(w[offset..offset + copied].as_ptr(), dst, copied);
+                *dst.add(copied) = 0;
+            }
+            StreamPayload::Binary(b) => {
+                std::ptr::copy_nonoverlapping(
+                    b[offset..offset + copied].as_ptr(),
+                    target_value_ptr as *mut u8,
+                    copied,
+                );
+            }
+        }
+    }
+
+    stmt_state.getdata_offset = offset + copied;
+    if stmt_state.getdata_offset >= total_units {
+        stmt_state.getdata_done = true;
+        SQL_SUCCESS
+    } else {
         post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION);
         SQL_SUCCESS_WITH_INFO
-    } else {
-        SQL_SUCCESS
-    }
-}
-
-fn column_value_to_text(v: &ColumnValues) -> Option<String> {
-    match v {
-        ColumnValues::TinyInt(x) => Some(x.to_string()),
-        ColumnValues::SmallInt(x) => Some(x.to_string()),
-        ColumnValues::Int(x) => Some(x.to_string()),
-        ColumnValues::BigInt(x) => Some(x.to_string()),
-        ColumnValues::Real(x) => Some(x.to_string()),
-        ColumnValues::Float(x) => Some(x.to_string()),
-        ColumnValues::Bit(x) => Some(if *x { "1".into() } else { "0".into() }),
-        ColumnValues::String(s) => Some(s.to_utf8_string()),
-        ColumnValues::Uuid(u) => Some(u.to_string()),
-        ColumnValues::Null => Some(String::new()),
-        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_LONG, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::{
+        SQL_C_CHAR, SQL_C_LONG, SQL_C_WCHAR, SQL_NULL_DATA, SQL_NULL_HANDLE, SqlWChar,
+    };
     use crate::test_support::TestHandles;
+    use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::datatypes::sql_string::SqlString;
 
     #[test]
@@ -391,13 +486,41 @@ mod tests {
             sql_get_data(
                 stmt,
                 1,
-                SQL_C_LONG,
+                12345,
                 (&mut out as *mut i32).cast(),
                 std::mem::size_of::<i32>() as SqlLen,
                 &mut ind,
             )
         };
         assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn get_data_long_target_type_succeeds() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.current_row = Some(vec![ColumnValues::Int(7)]);
+        }
+
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_LONG,
+                (&mut out as *mut i32).cast(),
+                std::mem::size_of::<i32>() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 7);
+        assert_eq!(ind, 4);
     }
 
     #[test]
@@ -519,8 +642,8 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(ind, SQL_NULL_DATA);
-        // First slot must be NUL; nothing else touched.
-        assert_eq!(buf[0], 0);
-        assert_eq!(&buf[1..], &[0xDEAD; 3]);
+        // A NULL is reported through the indicator alone; ODBC leaves the
+        // buffer contents undefined, so nothing is written.
+        assert_eq!(buf, [0xDEAD; 4]);
     }
 }

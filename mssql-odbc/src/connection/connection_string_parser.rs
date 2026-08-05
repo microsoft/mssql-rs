@@ -48,7 +48,6 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
     "description",
     "desc",
     "driver",
-    "app",
     "wsid",
     "language",
     "network",
@@ -145,6 +144,7 @@ enum ConnAttrKey {
     PacketSize,
     HostNameInCert,
     ServerCertificate,
+    App,
     Count,
 }
 
@@ -199,6 +199,8 @@ pub(crate) struct ConnectionParams {
     pub(crate) uid: String,
     pub(crate) pwd: String,
     pub(crate) trust_server_certificate: bool,
+    /// `APP=` — reported to the server as the application name.
+    pub(crate) app: Option<String>,
     pub(crate) encrypt: Option<String>,
     pub(crate) authentication: Option<String>,
     pub(crate) trusted_connection: Option<bool>,
@@ -383,6 +385,7 @@ const MAPPED_KEYS: &[(&str, ConnAttrKey)] = &[
     ("packetsize", ConnAttrKey::PacketSize),
     ("hostnameincertificate", ConnAttrKey::HostNameInCert),
     ("servercertificate", ConnAttrKey::ServerCertificate),
+    ("app", ConnAttrKey::App),
 ];
 
 fn classify_key(lower: &str) -> KeyClass {
@@ -413,6 +416,7 @@ fn assign_value(
         ConnAttrKey::Database => params.database = value.to_string(),
         ConnAttrKey::Uid => params.uid = value.to_string(),
         ConnAttrKey::Pwd => params.pwd = value.to_string(),
+        ConnAttrKey::App => params.app = Some(value.to_string()),
         ConnAttrKey::TrustServerCert => {
             validate_attr(lower, value, YES_NO)?;
             params.trust_server_certificate = is_yes(value);
@@ -1290,7 +1294,6 @@ mod tests {
         for key in [
             "Driver",
             "DSN",
-            "APP",
             "WSID",
             "Language",
             "Network",

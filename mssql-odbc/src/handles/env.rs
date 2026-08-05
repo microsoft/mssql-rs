@@ -3,6 +3,8 @@
 
 use std::ffi::c_void;
 use std::io;
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
@@ -37,6 +39,31 @@ impl TryFrom<u32> for OdbcVersion {
 
 /// Environment handle
 ///
+/// Owns the Tokio runtime and detaches its worker threads on teardown.
+///
+/// Windows terminates every other thread before running process-exit
+/// callbacks, so a plain `Runtime::drop` — which joins the workers — trips
+/// std's thread-lifecycle assertion and aborts the host process.
+/// `shutdown_background` detaches instead of joining.
+#[derive(Debug)]
+pub(crate) struct OdbcRuntime(ManuallyDrop<Runtime>);
+
+impl Deref for OdbcRuntime {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Runtime {
+        &self.0
+    }
+}
+
+impl Drop for OdbcRuntime {
+    fn drop(&mut self) {
+        // SAFETY: `Drop::drop` runs once and `self.0` is never read afterwards.
+        let runtime = unsafe { ManuallyDrop::take(&mut self.0) };
+        runtime.shutdown_background();
+    }
+}
+
 /// One ENV is typically allocated per application. It owns connection handles
 /// and stores environment-level attributes (ODBC version, connection pooling mode).
 ///
@@ -50,7 +77,7 @@ pub(crate) struct EnvHandle {
     pub(crate) inner: Mutex<EnvState>,
     /// Shared Tokio runtime for all connections on this ENV.
     /// Wrapped in `Arc` so DBCs can hold a reference without lifetime issues.
-    pub(crate) runtime: Arc<Runtime>,
+    pub(crate) runtime: Arc<OdbcRuntime>,
 }
 
 /// Mutable state within an environment handle, protected by `inner`.
@@ -90,7 +117,7 @@ impl EnvHandle {
                 output_nts: true, // SQL_ATTR_OUTPUT_NTS defaults to SQL_TRUE
                 connections: Vec::new(),
             }),
-            runtime: Arc::new(runtime),
+            runtime: Arc::new(OdbcRuntime(ManuallyDrop::new(runtime))),
         })
     }
 }

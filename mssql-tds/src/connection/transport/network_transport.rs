@@ -1301,7 +1301,7 @@ impl TdsPacketReader for NetworkTransport {
         }
 
         let string = self
-            .read_unicode_with_byte_length((length << 1) as usize)
+            .read_unicode_with_byte_length(length as usize * 2)
             .await?;
         Ok(Some(string))
     }
@@ -1309,7 +1309,7 @@ impl TdsPacketReader for NetworkTransport {
     async fn read_varchar_u8_length(&mut self) -> TdsResult<String> {
         let length: u8 = self.read_byte().await?;
         let string = self
-            .read_unicode_with_byte_length((length << 1) as usize)
+            .read_unicode_with_byte_length(length as usize * 2)
             .await?;
         Ok(string)
     }
