@@ -429,7 +429,7 @@ impl TdsPacketReader for PacketReader<'_> {
         }
 
         let string = self
-            .read_unicode_with_byte_length((length << 1) as usize)
+            .read_unicode_with_byte_length(length as usize * 2)
             .await?;
         Ok(Some(string))
     }
@@ -437,7 +437,7 @@ impl TdsPacketReader for PacketReader<'_> {
     async fn read_varchar_u8_length(&mut self) -> TdsResult<String> {
         let length: u8 = self.read_byte().await?;
         let string = self
-            .read_unicode_with_byte_length((length << 1) as usize)
+            .read_unicode_with_byte_length(length as usize * 2)
             .await?;
         Ok(string)
     }
@@ -450,8 +450,9 @@ impl TdsPacketReader for PacketReader<'_> {
     }
 
     async fn read_unicode_with_byte_length(&mut self, byte_length: usize) -> TdsResult<String> {
-        // Prevent OOM by limiting maximum string allocation to twice the u8 length.
-        const MAX_STRING_BYTE_LENGTH: usize = u8::MAX as usize * 2;
+        // A US_VARCHAR carries up to u16::MAX UTF-16 code units, so an 8000-
+        // character PRINT message is legal. Cap at that, not at u8::MAX.
+        const MAX_STRING_BYTE_LENGTH: usize = u16::MAX as usize * 2;
         if byte_length > MAX_STRING_BYTE_LENGTH {
             return Err(crate::error::Error::UsageError(format!(
                 "Unicode string byte length {byte_length} exceeds maximum allowed size of {MAX_STRING_BYTE_LENGTH} bytes"

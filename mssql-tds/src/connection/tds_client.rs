@@ -1888,7 +1888,18 @@ impl TdsClient {
                     // `CREATE; INSERT; SELECT` exposes the INSERT's row count and
                     // the SELECT, not the bare CREATE. `rows_affected` is
                     // `Some(n)` only when the DONE carried a COUNT.
-                    if has_count || saw_message {
+                    // An assignment statement (`SET @v = …`, `SELECT @v = …`)
+                    // reports DONEINPROC(COUNT, CurCmd=SELECT) with no rows and
+                    // no messages. msodbcsql does not surface those as result
+                    // sets, and stopping on one hides a following PRINT's INFO
+                    // token from the execute() return. Row-returning SELECTs
+                    // arrive with COLMETADATA and never reach this branch, and
+                    // INSERT/UPDATE/DELETE carry their own CurCmd, so their
+                    // counts still terminate navigation here.
+                    let is_assignment = has_count
+                        && !saw_message
+                        && done.cur_cmd == crate::token::tokens::CurrentCommand::Select;
+                    if (has_count || saw_message) && !is_assignment {
                         self.execution_context.set_has_open_batch(!is_last);
                         return Ok(ResultBoundaryKind::NoRows {
                             rows_affected: if has_count {
