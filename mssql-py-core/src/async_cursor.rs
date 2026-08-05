@@ -3,6 +3,13 @@
 
 //! Asynchronous cursor API for the Core TDS backend.
 //!
+//! # ⚠️ Preview API — unstable
+//!
+//! The types and methods in this module are gated behind the `async-preview`
+//! Cargo feature and are **not** part of the stable `mssql-py-core` surface.
+//! Signatures, error behavior, and internal semantics may change without
+//! notice in any release.
+//!
 //! Sibling of `cursor.rs` (the synchronous surface). A [`PyAsyncCursor`] is
 //! bound to exactly one [`crate::async_connection::PyAsyncConnection`] and
 //! shares that connection's `TdsClient` via an `Arc<tokio::sync::Mutex<_>>`.
@@ -24,6 +31,12 @@ use tokio::sync::Mutex;
 use mssql_tds::connection::tds_client::TdsClient;
 
 /// Asynchronous Python cursor backed by the Core TDS client.
+///
+/// # ⚠️ Preview API — unstable
+///
+/// This class is part of the `async-preview` surface. The API, method
+/// signatures, error behavior, and internal semantics may change without
+/// notice in minor releases. Do not depend on it from production code.
 ///
 /// Created via [`crate::async_connection::PyAsyncConnection::cursor`].
 /// Instances share the parent connection's `TdsClient` — closing the

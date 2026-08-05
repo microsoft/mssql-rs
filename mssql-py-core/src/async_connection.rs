@@ -3,6 +3,14 @@
 
 //! Asynchronous connection API for the Core TDS backend.
 //!
+//! # ⚠️ Preview API — unstable
+//!
+//! The types and methods in this module are gated behind the `async-preview`
+//! Cargo feature and are **not** part of the stable `mssql-py-core` surface.
+//! Signatures, error behavior, and internal semantics may change without
+//! notice in any release. First use in a Python process emits a
+//! [`FutureWarning`] via `warnings.warn`.
+//!
 //! Sibling of `connection.rs` (the synchronous surface). Every type defined
 //! here submits its I/O to the shared process-wide Tokio runtime via
 //! [`crate::async_runtime`] and returns Python awaitables through
@@ -11,10 +19,13 @@
 //!
 //! Invariant: one async connection maps to exactly one async cursor, one
 //! `TdsClient`, and one TDS wire session.
+//!
+//! [`FutureWarning`]: https://docs.python.org/3/library/exceptions.html#FutureWarning
 
 use std::sync::Arc;
+use std::sync::Once;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyFutureWarning, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use tokio::sync::Mutex;
@@ -25,7 +36,36 @@ use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvid
 use crate::async_cursor::PyAsyncCursor;
 use crate::connection::PyCoreConnection;
 
+/// Emit a `FutureWarning` the first time any async API is exercised in this
+/// process. Silenceable by callers via `warnings.filterwarnings(...)`.
+static PREVIEW_WARNED: Once = Once::new();
+
+fn emit_preview_warning(py: Python<'_>) {
+    PREVIEW_WARNED.call_once(|| {
+        let category = py.get_type::<PyFutureWarning>();
+        // stacklevel=2 attributes the warning to the caller's `await` site
+        // rather than to this Rust helper.
+        if let Err(e) = PyErr::warn(
+            py,
+            &category,
+            c"mssql_py_core async API is a preview and subject to breaking changes without notice; do not depend on it from production code.",
+            2,
+        ) {
+            tracing::warn!(
+                "PyAsyncConnection: failed to emit preview FutureWarning: {}",
+                e
+            );
+        }
+    });
+}
+
 /// Asynchronous Python connection backed by the Core TDS client.
+///
+/// # ⚠️ Preview API — unstable
+///
+/// This class is part of the `async-preview` surface. The API, method
+/// signatures, error behavior, and internal semantics may change without
+/// notice in minor releases. Do not depend on it from production code.
 ///
 /// Instances are created via [`PyAsyncConnection::connect`], which returns a
 /// Python awaitable. The awaitable resolves on the caller's `asyncio` loop
@@ -57,6 +97,11 @@ impl PyAsyncConnection {
         client_context_dict: &Bound<'_, PyDict>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = cls.py();
+
+        // Preview API: emit a one-shot FutureWarning so callers see the
+        // instability signal even if they somehow got a wheel built with
+        // `--features async-preview` without reading the release notes.
+        emit_preview_warning(py);
 
         tracing::info!("PyAsyncConnection::connect: extracting client context");
         let context = PyCoreConnection::dict_to_client_context(client_context_dict)?;
