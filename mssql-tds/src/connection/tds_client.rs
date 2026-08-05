@@ -3001,6 +3001,20 @@ impl TdsClient {
         pause_state: RowPauseState,
         target: usize,
     ) -> TdsResult<CursorColumn> {
+        if target >= pause_state.columns.len() {
+            // Out-of-range: decoding with RowPlan::Column(target) would skip
+            // every remaining column and report RowWritten, silently consuming
+            // the row. Reject without touching the transport and keep the
+            // cursor positioned so valid pulls still work. ODBC validates the
+            // column index first, so this guards the public API against other
+            // callers.
+            let column_count = pause_state.columns.len();
+            self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+            return Err(UsageError(format!(
+                "read_row_column target column {target} is out of range (row has {column_count} columns)"
+            )));
+        }
+
         if target < pause_state.next_column_index {
             // Forward-only: the target column's bytes are already gone. Keep the
             // cursor where it is so later (valid) pulls still work.
