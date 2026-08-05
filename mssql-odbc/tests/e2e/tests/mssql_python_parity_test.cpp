@@ -8,9 +8,23 @@
 // (ddbc_bindings.cpp). Every case below maps to a behaviour the Python suite
 // depends on, which makes this file the fast regression gate for the
 // mssql-python parity work.
+//
+// The suite is deliberately self-contained: it binds the driver by path
+// (MSSQL_ODBC_DLL, defaulting to msodbcsql18.dll next to the binary) instead of
+// linking odbc32.lib, so it exercises the same load path as mssql-python and
+// needs no Driver Manager registration.
+//
+// Configure with MSSQL_ODBC_DLL and MSSQL_ODBC_CONNSTR.
 
-#include "odbc_test_fixture.h"
+#include <gtest/gtest.h>
 
+#include <windows.h>
+
+#include <sql.h>
+#include <sqlext.h>
+#include <sqltypes.h>
+
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -21,24 +35,297 @@ namespace {
 /// set to detect sql_variant; the value is a SQL Server driver-specific field.
 constexpr SQLUSMALLINT kSqlCaSsVariantType = 1215;
 
-/// Fixture that connects once per test and exposes small helpers for the
-/// mssql-python call patterns.
-class PythonParityTest : public ODBCTest {
-protected:
-    void SetUp() override {
-        ODBCTest::SetUp();
-        if (!ODBCTestConfig::Instance().HasConnection()) {
-            GTEST_SKIP() << "No connection configured (set ODBC_TEST_* env vars)";
+using SqlTString = std::wstring;
+
+std::wstring ToWide(const std::string& s) {
+    return std::wstring(s.begin(), s.end());
+}
+
+std::string GetEnvOr(const char* name, const char* fallback) {
+    char* buf = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr) {
+        std::string value(buf);
+        free(buf);
+        if (!value.empty()) {
+            return value;
         }
-        Connect();
+    }
+    return fallback;
+}
+
+// ---------------------------------------------------------------------------
+// Driver binding
+//
+// mssql-python resolves each entrypoint by name from the loaded module. The
+// table below mirrors that, so a missing export shows up here as a load
+// failure rather than as an opaque Python traceback.
+// ---------------------------------------------------------------------------
+
+struct DriverApi {
+    HMODULE module = nullptr;
+
+    SQLRETURN(SQL_API* AllocHandle)(SQLSMALLINT, SQLHANDLE, SQLHANDLE*) = nullptr;
+    SQLRETURN(SQL_API* FreeHandle)(SQLSMALLINT, SQLHANDLE) = nullptr;
+    SQLRETURN(SQL_API* SetEnvAttr)(SQLHENV, SQLINTEGER, SQLPOINTER, SQLINTEGER) = nullptr;
+    SQLRETURN(SQL_API* DriverConnect)(SQLHDBC, SQLHWND, SQLWCHAR*, SQLSMALLINT, SQLWCHAR*,
+                                      SQLSMALLINT, SQLSMALLINT*, SQLUSMALLINT) = nullptr;
+    SQLRETURN(SQL_API* Disconnect)(SQLHDBC) = nullptr;
+    SQLRETURN(SQL_API* GetDiagRec)(SQLSMALLINT, SQLHANDLE, SQLSMALLINT, SQLWCHAR*, SQLINTEGER*,
+                                   SQLWCHAR*, SQLSMALLINT, SQLSMALLINT*) = nullptr;
+
+    SQLRETURN(SQL_API* SetConnectAttr)(SQLHDBC, SQLINTEGER, SQLPOINTER, SQLINTEGER) = nullptr;
+    SQLRETURN(SQL_API* GetConnectAttr)(SQLHDBC, SQLINTEGER, SQLPOINTER, SQLINTEGER,
+                                       SQLINTEGER*) = nullptr;
+    SQLRETURN(SQL_API* EndTran)(SQLSMALLINT, SQLHANDLE, SQLSMALLINT) = nullptr;
+
+    SQLRETURN(SQL_API* ExecDirect)(SQLHSTMT, SQLWCHAR*, SQLINTEGER) = nullptr;
+    SQLRETURN(SQL_API* Prepare)(SQLHSTMT, SQLWCHAR*, SQLINTEGER) = nullptr;
+    SQLRETURN(SQL_API* Execute)(SQLHSTMT) = nullptr;
+    SQLRETURN(SQL_API* Fetch)(SQLHSTMT) = nullptr;
+    SQLRETURN(SQL_API* FetchScroll)(SQLHSTMT, SQLSMALLINT, SQLLEN) = nullptr;
+    SQLRETURN(SQL_API* GetData)(SQLHSTMT, SQLUSMALLINT, SQLSMALLINT, SQLPOINTER, SQLLEN,
+                                SQLLEN*) = nullptr;
+    SQLRETURN(SQL_API* BindCol)(SQLHSTMT, SQLUSMALLINT, SQLSMALLINT, SQLPOINTER, SQLLEN,
+                                SQLLEN*) = nullptr;
+    SQLRETURN(SQL_API* BindParameter)(SQLHSTMT, SQLUSMALLINT, SQLSMALLINT, SQLSMALLINT, SQLSMALLINT,
+                                      SQLULEN, SQLSMALLINT, SQLPOINTER, SQLLEN, SQLLEN*) = nullptr;
+    SQLRETURN(SQL_API* NumResultCols)(SQLHSTMT, SQLSMALLINT*) = nullptr;
+    SQLRETURN(SQL_API* RowCount)(SQLHSTMT, SQLLEN*) = nullptr;
+    SQLRETURN(SQL_API* MoreResults)(SQLHSTMT) = nullptr;
+    SQLRETURN(SQL_API* FreeStmt)(SQLHSTMT, SQLUSMALLINT) = nullptr;
+    SQLRETURN(SQL_API* SetStmtAttr)(SQLHSTMT, SQLINTEGER, SQLPOINTER, SQLINTEGER) = nullptr;
+    SQLRETURN(SQL_API* GetStmtAttr)(SQLHSTMT, SQLINTEGER, SQLPOINTER, SQLINTEGER,
+                                    SQLINTEGER*) = nullptr;
+    SQLRETURN(SQL_API* SetDescField)(SQLHDESC, SQLSMALLINT, SQLSMALLINT, SQLPOINTER,
+                                     SQLINTEGER) = nullptr;
+    SQLRETURN(SQL_API* ColAttribute)(SQLHSTMT, SQLUSMALLINT, SQLUSMALLINT, SQLPOINTER, SQLSMALLINT,
+                                     SQLSMALLINT*, SQLLEN*) = nullptr;
+
+    SQLRETURN(SQL_API* Tables)(SQLHSTMT, SQLWCHAR*, SQLSMALLINT, SQLWCHAR*, SQLSMALLINT, SQLWCHAR*,
+                               SQLSMALLINT, SQLWCHAR*, SQLSMALLINT) = nullptr;
+    SQLRETURN(SQL_API* Columns)(SQLHSTMT, SQLWCHAR*, SQLSMALLINT, SQLWCHAR*, SQLSMALLINT, SQLWCHAR*,
+                                SQLSMALLINT, SQLWCHAR*, SQLSMALLINT) = nullptr;
+    SQLRETURN(SQL_API* PrimaryKeys)(SQLHSTMT, SQLWCHAR*, SQLSMALLINT, SQLWCHAR*, SQLSMALLINT,
+                                    SQLWCHAR*, SQLSMALLINT) = nullptr;
+    SQLRETURN(SQL_API* Procedures)(SQLHSTMT, SQLWCHAR*, SQLSMALLINT, SQLWCHAR*, SQLSMALLINT,
+                                   SQLWCHAR*, SQLSMALLINT) = nullptr;
+    SQLRETURN(SQL_API* Statistics)(SQLHSTMT, SQLWCHAR*, SQLSMALLINT, SQLWCHAR*, SQLSMALLINT,
+                                   SQLWCHAR*, SQLSMALLINT, SQLUSMALLINT, SQLUSMALLINT) = nullptr;
+
+    std::string load_error;
+};
+
+DriverApi& Api() {
+    static DriverApi api;
+    return api;
+}
+
+template <typename Fn>
+bool Bind(HMODULE module, const char* name, Fn& slot, std::string& error) {
+    auto proc = GetProcAddress(module, name);
+    if (proc == nullptr) {
+        if (error.empty()) {
+            error = "missing export: ";
+            error += name;
+        }
+        return false;
+    }
+    slot = reinterpret_cast<Fn>(proc);
+    return true;
+}
+
+bool LoadDriver(DriverApi& api) {
+    const std::string path = GetEnvOr("MSSQL_ODBC_DLL", "msodbcsql18.dll");
+    api.module = LoadLibraryA(path.c_str());
+    if (api.module == nullptr) {
+        api.load_error = "LoadLibrary failed for " + path + " (error " +
+                         std::to_string(static_cast<unsigned long>(GetLastError())) + ")";
+        return false;
+    }
+
+    std::string& err = api.load_error;
+    bool ok = true;
+    ok &= Bind(api.module, "SQLAllocHandle", api.AllocHandle, err);
+    ok &= Bind(api.module, "SQLFreeHandle", api.FreeHandle, err);
+    ok &= Bind(api.module, "SQLSetEnvAttr", api.SetEnvAttr, err);
+    ok &= Bind(api.module, "SQLDriverConnectW", api.DriverConnect, err);
+    ok &= Bind(api.module, "SQLDisconnect", api.Disconnect, err);
+    ok &= Bind(api.module, "SQLGetDiagRecW", api.GetDiagRec, err);
+    ok &= Bind(api.module, "SQLSetConnectAttrW", api.SetConnectAttr, err);
+    ok &= Bind(api.module, "SQLGetConnectAttrW", api.GetConnectAttr, err);
+    ok &= Bind(api.module, "SQLEndTran", api.EndTran, err);
+    ok &= Bind(api.module, "SQLExecDirectW", api.ExecDirect, err);
+    ok &= Bind(api.module, "SQLPrepareW", api.Prepare, err);
+    ok &= Bind(api.module, "SQLExecute", api.Execute, err);
+    ok &= Bind(api.module, "SQLFetch", api.Fetch, err);
+    ok &= Bind(api.module, "SQLFetchScroll", api.FetchScroll, err);
+    ok &= Bind(api.module, "SQLGetData", api.GetData, err);
+    ok &= Bind(api.module, "SQLBindCol", api.BindCol, err);
+    ok &= Bind(api.module, "SQLBindParameter", api.BindParameter, err);
+    ok &= Bind(api.module, "SQLNumResultCols", api.NumResultCols, err);
+    ok &= Bind(api.module, "SQLRowCount", api.RowCount, err);
+    ok &= Bind(api.module, "SQLMoreResults", api.MoreResults, err);
+    ok &= Bind(api.module, "SQLFreeStmt", api.FreeStmt, err);
+    ok &= Bind(api.module, "SQLSetStmtAttrW", api.SetStmtAttr, err);
+    ok &= Bind(api.module, "SQLGetStmtAttrW", api.GetStmtAttr, err);
+    ok &= Bind(api.module, "SQLSetDescFieldW", api.SetDescField, err);
+    ok &= Bind(api.module, "SQLColAttributeW", api.ColAttribute, err);
+    ok &= Bind(api.module, "SQLTablesW", api.Tables, err);
+    ok &= Bind(api.module, "SQLColumnsW", api.Columns, err);
+    ok &= Bind(api.module, "SQLPrimaryKeysW", api.PrimaryKeys, err);
+    ok &= Bind(api.module, "SQLProceduresW", api.Procedures, err);
+    ok &= Bind(api.module, "SQLStatisticsW", api.Statistics, err);
+    return ok;
+}
+
+// The tests below are written against the plain ODBC names; route them at the
+// loaded module so the file stays readable while bypassing the Driver Manager.
+#define SQLAllocHandle       Api().AllocHandle
+#define SQLFreeHandle        Api().FreeHandle
+#define SQLSetEnvAttr        Api().SetEnvAttr
+#define SQLDriverConnectW    Api().DriverConnect
+#define SQLDisconnect        Api().Disconnect
+#define SQLGetDiagRecW       Api().GetDiagRec
+#undef SQLSetConnectAttr
+#define SQLSetConnectAttr    Api().SetConnectAttr
+#define SQLGetConnectAttrW   Api().GetConnectAttr
+#define SQLEndTran           Api().EndTran
+#define SQLExecDirectW       Api().ExecDirect
+#define SQLPrepareW          Api().Prepare
+#define SQLExecute           Api().Execute
+#define SQLFetch             Api().Fetch
+#define SQLFetchScroll       Api().FetchScroll
+#define SQLGetData           Api().GetData
+#define SQLBindCol           Api().BindCol
+#define SQLBindParameter     Api().BindParameter
+#define SQLNumResultCols     Api().NumResultCols
+#define SQLRowCount          Api().RowCount
+#define SQLMoreResults       Api().MoreResults
+#define SQLFreeStmt          Api().FreeStmt
+#undef SQLSetStmtAttr
+#define SQLSetStmtAttr       Api().SetStmtAttr
+#undef SQLGetStmtAttr
+#define SQLGetStmtAttr       Api().GetStmtAttr
+#define SQLSetDescFieldW     Api().SetDescField
+#define SQLColAttributeW     Api().ColAttribute
+#define SQLTablesW           Api().Tables
+#define SQLColumnsW          Api().Columns
+#define SQLPrimaryKeysW      Api().PrimaryKeys
+#define SQLProceduresW       Api().Procedures
+#define SQLStatisticsW       Api().Statistics
+
+std::wstring DiagField(SQLSMALLINT handle_type, SQLHANDLE handle, bool want_state) {
+    SQLWCHAR state[6] = {};
+    SQLWCHAR message[1024] = {};
+    SQLINTEGER native = 0;
+    SQLSMALLINT length = 0;
+    if (!SQL_SUCCEEDED(SQLGetDiagRecW(handle_type, handle, 1, state, &native, message,
+                                      static_cast<SQLSMALLINT>(std::size(message)), &length))) {
+        return L"";
+    }
+    return want_state ? std::wstring(state) : std::wstring(message);
+}
+
+std::string Narrow(const std::wstring& value) {
+    return std::string(value.begin(), value.end());
+}
+
+std::string DiagMessage(SQLSMALLINT handle_type, SQLHANDLE handle) {
+    return "[" + Narrow(DiagField(handle_type, handle, true)) + "] " +
+           Narrow(DiagField(handle_type, handle, false));
+}
+
+std::string DiagState(SQLSMALLINT handle_type, SQLHANDLE handle) {
+    return Narrow(DiagField(handle_type, handle, true));
+}
+
+#define ASSERT_SQL_OK(rc, handle_type, handle)                                                     \
+    do {                                                                                           \
+        SQLRETURN _rc = (rc);                                                                      \
+        ASSERT_TRUE(SQL_SUCCEEDED(_rc)) << "rc=" << _rc << " " << DiagMessage(handle_type, handle); \
+    } while (0)
+
+#define EXPECT_SQL_OK(rc, handle_type, handle)                                                     \
+    do {                                                                                           \
+        SQLRETURN _rc = (rc);                                                                      \
+        EXPECT_TRUE(SQL_SUCCEEDED(_rc)) << "rc=" << _rc << " " << DiagMessage(handle_type, handle); \
+    } while (0)
+
+#define EXPECT_SQLSTATE(handle_type, handle, expected_state)                                       \
+    EXPECT_EQ(std::string(expected_state), DiagState(handle_type, handle))
+
+/// Compatibility shim so the test bodies keep the shared-fixture spelling.
+struct ODBCTestUtils {
+    static SqlTString ToSqlTStr(const std::string& s) { return ToWide(s); }
+    static std::string ToNarrow(const SqlTString& s) { return Narrow(s); }
+};
+
+/// Fixture that connects once per test and exposes helpers for the
+/// mssql-python call patterns.
+class PythonParityTest : public ::testing::Test {
+protected:
+    SQLHENV env_ = nullptr;
+    SQLHDBC dbc_ = nullptr;
+    SQLHSTMT stmt_ = nullptr;
+
+    void SetUp() override {
+        if (Api().module == nullptr) {
+            GTEST_SKIP() << "driver not loaded: " << Api().load_error;
+        }
+        const std::string conn = GetEnvOr("MSSQL_ODBC_CONNSTR", "");
+        if (conn.empty()) {
+            GTEST_SKIP() << "set MSSQL_ODBC_CONNSTR to run parity tests";
+        }
+
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_ENV, nullptr, &env_), SQL_HANDLE_ENV, env_);
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC3), 0),
+                      SQL_HANDLE_ENV, env_);
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc_), SQL_HANDLE_ENV, env_);
+
+        std::wstring wide = ToWide(conn);
+        ASSERT_SQL_OK(SQLDriverConnectW(dbc_, nullptr, wide.data(),
+                                        static_cast<SQLSMALLINT>(wide.size()), nullptr, 0, nullptr,
+                                        SQL_DRIVER_NOPROMPT),
+                      SQL_HANDLE_DBC, dbc_);
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &stmt_), SQL_HANDLE_DBC, dbc_);
+    }
+
+    void TearDown() override {
+        if (stmt_ != nullptr) {
+            SQLFreeHandle(SQL_HANDLE_STMT, stmt_);
+        }
+        if (dbc_ != nullptr) {
+            SQLDisconnect(dbc_);
+            SQLFreeHandle(SQL_HANDLE_DBC, dbc_);
+        }
+        if (env_ != nullptr) {
+            SQLFreeHandle(SQL_HANDLE_ENV, env_);
+        }
     }
 
     /// Runs |sql| on |hstmt| and asserts it succeeded.
     void Exec(SQLHSTMT hstmt, const std::string& sql) {
-        SqlTString text = ODBCTestUtils::ToSqlTStr(sql);
-        ASSERT_SQL_OK(SQLExecDirectW(hstmt, reinterpret_cast<SQLWCHAR*>(text.data()), SQL_NTS),
-                      SQL_HANDLE_STMT, hstmt);
+        std::wstring text = ToWide(sql);
+        ASSERT_SQL_OK(SQLExecDirectW(hstmt, text.data(), SQL_NTS), SQL_HANDLE_STMT, hstmt);
     }
+
+    /// Runs |sql| and swallows failures; used for best-effort cleanup.
+    void ExecDirectIgnoreError(const std::string& sql) {
+        std::wstring text = ToWide(sql);
+        SQLExecDirectW(stmt_, text.data(), SQL_NTS);
+        SQLFreeStmt(stmt_, SQL_CLOSE);
+    }
+
+    /// Allocates an extra statement on the same connection.
+    SQLHSTMT AllocStmt() {
+        SQLHSTMT handle = nullptr;
+        EXPECT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &handle), SQL_HANDLE_DBC, dbc_);
+        return handle;
+    }
+
+    void FreeStmt(SQLHSTMT handle) { SQLFreeHandle(SQL_HANDLE_STMT, handle); }
 
     /// Fetches a single SQL_C_SLONG column from a one-row query.
     SQLINTEGER ScalarLong(const std::string& sql) {
@@ -52,6 +339,7 @@ protected:
         return value;
     }
 };
+
 
 // ---------------------------------------------------------------------------
 // Connection attributes and transactions
@@ -279,8 +567,8 @@ TEST_F(PythonParityTest, GetDataReportsNullAndTruncation) {
                   stmt_);
     EXPECT_EQ(SQL_NULL_DATA, ind);
 
-    SQLCHAR small[4] = {};
-    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 2, SQL_C_CHAR, small, sizeof(small), &ind));
+    SQLCHAR tiny_buf[4] = {};
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 2, SQL_C_CHAR, tiny_buf, sizeof(tiny_buf), &ind));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 }
 
@@ -490,4 +778,13 @@ TEST_F(PythonParityTest, MoreResultsWalksMultiStatementBatch) {
     EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
 }
 
+
 }  // namespace
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    if (!LoadDriver(Api())) {
+        fprintf(stderr, "warning: %s\n", Api().load_error.c_str());
+    }
+    return RUN_ALL_TESTS();
+}
