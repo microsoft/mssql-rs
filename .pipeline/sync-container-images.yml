@@ -921,6 +921,9 @@ stages:
               --build-arg ENTRY_SCRIPT="$entry" \
               -t "$tag" .
             docker push "$tag"
+            # Reclaim disk between builds: 9 client images at ~1.5-3 GB each
+            # would otherwise accumulate on the agent for the whole job.
+            docker rmi "$tag" || true
             echo "✅ $tag"
           done
       retryCountOnTaskFailure: 3
