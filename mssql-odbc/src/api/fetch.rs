@@ -45,6 +45,11 @@ fn sql_fetch_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        if let Some(pending) = stmt_state.pending_fetch_error.take() {
+            error!("SQLFetch: replaying error raised after the previous rowset");
+            stmt_state.diag_records.push(pending);
+            return SQL_ERROR;
+        }
         if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
             error!("SQLFetch: no open cursor on this statement");
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
@@ -85,6 +90,11 @@ pub(crate) fn fetch_rowset(statement_handle: SqlHandle, stmt: &StmtHandle) -> Sq
             if fetched == 0 {
                 unsafe { write_rowset_counters(rows_fetched_ptr, row_status_ptr, array_size, 0) };
                 return SQL_ERROR;
+            }
+            // Rows from this rowset are still valid and must be handed back, so
+            // the error is parked and replayed on the next fetch call.
+            if let Ok(mut ss) = stmt.inner.lock() {
+                ss.pending_fetch_error = ss.diag_records.first().cloned();
             }
             aggregate = SQL_SUCCESS_WITH_INFO;
             break;

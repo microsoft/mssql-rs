@@ -99,7 +99,18 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         client
     };
 
-    match dbc.runtime.block_on(client.advance()) {
+    let pending = match stmt.inner.lock() {
+        Ok(mut ss) => ss.pending_result.take(),
+        Err(_) => None,
+    };
+    let advanced = match pending {
+        // The boundary was already crossed while releasing the connection for
+        // another statement; the client is still positioned on that result.
+        Some(result) => Ok(result),
+        None => dbc.runtime.block_on(client.advance()),
+    };
+
+    match advanced {
         Ok(StatementResult::Rows) => {
             // Positioned on a new row-returning result set. Refresh metadata,
             // clear row state, keep CURSOR_OPEN and active_stmt set.

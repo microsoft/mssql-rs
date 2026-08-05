@@ -23,7 +23,7 @@
 
 use std::collections::VecDeque;
 
-use mssql_tds::connection::tds_client::ResultSet;
+use mssql_tds::connection::tds_client::{ResultSet, StatementResult};
 use tracing::{debug, error};
 
 use crate::api::odbc_types::SqlHandle;
@@ -93,13 +93,31 @@ pub(crate) fn try_release_connection(dbc: &DbcHandle, busy_stmt: SqlHandle) -> b
         }
     }
 
+    // The current result set is drained, but the batch's trailing DONE (and any
+    // further result set) is still on the wire. Cross that boundary here so a
+    // single-statement batch — the overwhelmingly common case — frees the
+    // connection. If another result follows, hand it to the holder as a pending
+    // result so its `SQLMoreResults` sees it without re-advancing.
+    let mut pending = None;
+    if reached_eof && !failed && client.has_open_batch() {
+        match dbc.runtime.block_on(client.advance()) {
+            Ok(StatementResult::End) => {}
+            Ok(other) => pending = Some(other),
+            Err(e) => {
+                error!(%e, "spill: failed advancing past the current result set");
+                failed = true;
+            }
+        }
+    }
+
     // The batch is only finished when the current result set ended and no
     // further result set follows; otherwise SQLMoreResults still needs the wire.
-    let released = reached_eof && !failed && !client.has_open_batch();
+    let released = reached_eof && !failed && pending.is_none() && !client.has_open_batch();
 
     if let Ok(mut state) = other.inner.lock() {
         state.buffered_rows.extend(rows);
         state.buffered_eof = reached_eof;
+        state.pending_result = pending;
     }
 
     if let Ok(mut dbc_state) = dbc.inner.lock() {

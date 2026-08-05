@@ -9,6 +9,7 @@ use tracing::{debug, error};
 use mssql_tds::connection::tds_client::StatementResult;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
+use super::close_cursor::{DrainOutcome, drain_and_release, reset_cursor_state};
 use super::exec_common::{
     build_named_params_row, claim_connection, collect_dae_params, fail_with_tds, finish_execute,
 };
@@ -113,6 +114,29 @@ fn execute_param_array(
             && state.row_count >= 0
         {
             total_rows += state.row_count;
+        }
+
+        // A row that produced a result set leaves the cursor open and the
+        // connection claimed, which would make the next row fail the
+        // invalid-cursor guard below. `executemany` never exposes intermediate
+        // result sets, so each row's cursor is closed before the next starts.
+        // The final row's cursor stays open: a statement with an `OUTPUT`
+        // clause is expected to leave its rows and metadata available.
+        let is_last = row + 1 == paramset_size;
+        let cursor_open = stmt
+            .inner
+            .lock()
+            .is_ok_and(|state| state.has_state(STMT_STATE_CURSOR_OPEN));
+        if cursor_open && !is_last {
+            if let Ok(mut state) = stmt.inner.lock() {
+                reset_cursor_state(&mut state);
+            }
+            if matches!(
+                drain_and_release(stmt, statement_handle),
+                DrainOutcome::Failed
+            ) {
+                return SQL_ERROR;
+            }
         }
     }
 

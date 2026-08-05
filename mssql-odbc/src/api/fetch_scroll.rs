@@ -8,8 +8,8 @@ use tracing::{debug, error};
 use super::cdata::{WriteError, WriteOutcome, write_c_value};
 use super::odbc_types::{
     SQL_ERROR, SQL_FETCH_NEXT, SQL_INVALID_HANDLE, SQL_ROW_ERROR, SQL_ROW_SUCCESS,
-    SQL_ROW_SUCCESS_WITH_INFO, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
-    SqlSmallInt,
+    SQL_ROW_SUCCESS_WITH_INFO, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_UNKNOWN_TYPE, SqlHandle,
+    SqlLen, SqlReturn, SqlSmallInt,
 };
 use super::sqlstate::{
     ERR_INVALID_C_DATA_TYPE, ERR_RESTRICTED_DATA_TYPE, ERR_STRING_RIGHT_TRUNCATION, SQLSTATE_HY106,
@@ -18,6 +18,7 @@ use super::sqlstate::{
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::params::convert::c_type_stride;
 
 /// Implements `SQLFetchScroll`.
 ///
@@ -58,6 +59,11 @@ unsafe fn sql_fetch_scroll_impl(
             return SQL_ERROR;
         };
         free_errors(&mut state);
+        if let Some(pending) = state.pending_fetch_error.take() {
+            error!("SQLFetchScroll: replaying error raised after the previous rowset");
+            state.diag_records.push(pending);
+            return SQL_ERROR;
+        }
         if fetch_orientation != SQL_FETCH_NEXT {
             post_sql_error(
                 &mut state,
@@ -99,15 +105,20 @@ pub(crate) fn write_bound_columns(stmt: &StmtHandle, row_index: usize) -> u16 {
         let Some(bc) = binding else { continue };
         let Some(value) = row.get(idx) else { continue };
 
-        // Column-wise binding: each column's buffer is an array of
-        // `buffer_length`-byte elements, one per rowset slot.
+        // Column-wise binding: each column's buffer is an array of one element
+        // per rowset slot. ODBC derives the element stride from the C type for
+        // fixed-width targets and only falls back to `BufferLength` for
+        // character/binary ones — applications legitimately pass the *total*
+        // array size as `BufferLength` for fixed-width types, so using it as the
+        // stride would write past the end of the buffer.
+        let stride = c_type_stride(bc.target_type, SQL_UNKNOWN_TYPE, bc.buffer_length);
         let data_ptr = if bc.target_value_ptr.is_null() {
             std::ptr::null_mut()
         } else {
             unsafe {
                 bc.target_value_ptr
                     .cast::<u8>()
-                    .add(row_index * bc.buffer_length.max(0) as usize)
+                    .add(row_index * stride)
                     .cast()
             }
         };

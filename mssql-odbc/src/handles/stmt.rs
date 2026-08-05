@@ -54,6 +54,11 @@ pub(crate) struct StmtState {
     /// SQL text stored by `SQLPrepare`, awaiting execution. The server-side
     /// prepare is deferred to `SQLExecute`.
     pub(crate) prepared_sql: Option<String>,
+    /// Parameter metadata from `sp_describe_undeclared_parameters`, cached for
+    /// the life of the prepared text because callers describe every parameter
+    /// in turn and each probe costs a round trip. Invalidated whenever
+    /// `prepared_sql` changes.
+    pub(crate) described_params: Option<Vec<crate::api::desc::DescribedParam>>,
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
     pub(crate) bound_params: Vec<Option<BoundParam>>,
@@ -79,6 +84,16 @@ pub(crate) struct StmtState {
     /// `true` once `buffered_rows` holds the complete remainder of the open
     /// result set, so an empty buffer means `SQL_NO_DATA` rather than a read.
     pub(crate) buffered_eof: bool,
+    /// Error raised by the server *after* one or more rows of the current
+    /// rowset were already delivered. The rows are still handed to the
+    /// application, so the diagnostic is held here and re-posted by the next
+    /// fetch call, which reports `SQL_ERROR`. Without this the cursor would
+    /// simply appear closed and the real SQLSTATE would be lost behind 24000.
+    pub(crate) pending_fetch_error: Option<crate::error::DiagRecord>,
+    /// Result boundary already crossed on this statement's behalf while trying
+    /// to release the connection (see `api::spill`). `SQLMoreResults` consumes
+    /// this instead of advancing the client again.
+    pub(crate) pending_result: Option<mssql_tds::connection::tds_client::StatementResult>,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
     /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
@@ -180,6 +195,8 @@ impl StmtState {
         self.current_row = None;
         self.buffered_rows.clear();
         self.buffered_eof = false;
+        self.pending_result = None;
+        self.pending_fetch_error = None;
         self.reset_getdata();
     }
 
@@ -247,12 +264,15 @@ impl StmtHandle {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
                 prepared_sql: None,
+                described_params: None,
                 bound_params: Vec::new(),
                 prepared_handle: None,
                 pending_unprepare: None,
                 current_row: None,
                 buffered_rows: VecDeque::new(),
                 buffered_eof: false,
+                pending_result: None,
+                pending_fetch_error: None,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
                 row_array_size: 1,

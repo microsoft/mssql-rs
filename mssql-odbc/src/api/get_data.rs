@@ -133,6 +133,14 @@ fn sql_get_data_safe(
     // with SQL_C_BINARY before they know the underlying type. `BufferLength` is
     // ignored for fixed-width C types, so a zero length only means "probe" for
     // the character and binary targets.
+    // A NULL value can only be reported through the indicator, so an
+    // application that supplies none gets SQLSTATE 22002 and no buffer write.
+    // Callers depend on the failure to distinguish NULL from a real value.
+    if matches!(value, ColumnValues::Null) && strlen_or_ind_ptr.is_null() {
+        post_diag(&mut stmt_state, ERR_INDICATOR_REQUIRED);
+        return SQL_ERROR;
+    }
+
     let streamable = stream_payload(&value, target_type).is_some();
     if target_value_ptr.is_null() || (buffer_length == 0 && streamable) {
         let indicator = if matches!(value, ColumnValues::Null) {
@@ -141,6 +149,21 @@ fn sql_get_data_safe(
             probe_length(&value, target_type)
         };
         unsafe { write_if_some(strlen_or_ind_ptr, indicator) };
+        return SQL_SUCCESS;
+    }
+
+    // NULL is reported the same way for every target type: indicator
+    // SQL_NULL_DATA and SQL_SUCCESS. It must not go through the streaming path,
+    // which has no payload to render and would report a bogus conversion error
+    // for binary/UDT columns that clients fetch with SQL_C_BINARY.
+    if matches!(value, ColumnValues::Null) {
+        if stmt_state.getdata_col == Some(col_index) && stmt_state.getdata_done {
+            return SQL_NO_DATA;
+        }
+        stmt_state.getdata_col = Some(col_index);
+        stmt_state.getdata_offset = 0;
+        stmt_state.getdata_done = true;
+        unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
         return SQL_SUCCESS;
     }
 
@@ -619,8 +642,8 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(ind, SQL_NULL_DATA);
-        // First slot must be NUL; nothing else touched.
-        assert_eq!(buf[0], 0);
-        assert_eq!(&buf[1..], &[0xDEAD; 3]);
+        // A NULL is reported through the indicator alone; ODBC leaves the
+        // buffer contents undefined, so nothing is written.
+        assert_eq!(buf, [0xDEAD; 4]);
     }
 }
