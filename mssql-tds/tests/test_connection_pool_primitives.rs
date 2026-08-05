@@ -29,7 +29,7 @@ mod connection_pool_primitives {
     /// tokens (database / language / collation) are processed and reflected in
     /// the client's session-state accessors.
     async fn exec_and_drain(client: &mut TdsClient, sql: &str) {
-        client.execute(sql.to_string(), None, None).await.unwrap();
+        client.execute(sql.to_string(), ()).await.unwrap();
         let _ = get_scalar_value(client).await.unwrap();
     }
 

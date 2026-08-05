@@ -133,6 +133,7 @@ pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtStat
     stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);
     stmt_state.current_row = None;
     stmt_state.column_metadata.clear();
+    stmt_state.pending_row_counts.clear();
 }
 
 /// Outcome of draining the TDS stream and releasing the connection on cursor close.
@@ -212,6 +213,7 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
     };
 
     // Drain complete: return client and release busy claim atomically.
+    super::exec_common::capture_prepared_handle(stmt, &mut client);
     if let Ok(mut dbc_state) = dbc.inner.lock() {
         dbc_state.client = Some(client);
         if dbc_state.active_stmt == Some(statement_handle) {

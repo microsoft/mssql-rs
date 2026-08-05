@@ -8,6 +8,7 @@ mod auth;
 mod connection;
 mod error;
 mod handles;
+mod params;
 #[cfg(test)]
 pub(crate) mod test_support;
 

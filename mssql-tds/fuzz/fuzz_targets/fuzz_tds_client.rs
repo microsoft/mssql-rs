@@ -47,13 +47,13 @@ fuzz_target!(|data: &[u8]| {
         match scenario {
             0 => {
                 // Fuzz execute() - simulates sending a query and receiving response
-                let _ = client.execute("SELECT 1".to_string(), None, None).await;
+                let _ = client.execute("SELECT 1".to_string(), ()).await;
             }
             1 => {
                 // Fuzz execute() followed by close_query()
                 // This tests the full query -> response -> close flow
                 if client
-                    .execute("SELECT 1".to_string(), None, None)
+                    .execute("SELECT 1".to_string(), ())
                     .await
                     .is_ok()
                 {
@@ -64,14 +64,14 @@ fuzz_target!(|data: &[u8]| {
                 // Fuzz execute_sp_executesql()
                 // This tests parameterized query execution
                 let _ = client
-                    .execute_sp_executesql("SELECT @p1".to_string(), vec![], None, None)
+                    .execute_sp_executesql("SELECT @p1".to_string(), vec![], ())
                     .await;
             }
             3 => {
                 // Fuzz execute_stored_procedure()
                 // This tests stored procedure execution
                 let _ = client
-                    .execute_stored_procedure("sp_test".to_string(), None, None, None, None)
+                    .execute_stored_procedure("sp_test".to_string(), None, None, ())
                     .await;
             }
             _ => {}

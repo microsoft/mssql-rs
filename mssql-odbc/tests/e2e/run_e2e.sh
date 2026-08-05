@@ -9,14 +9,28 @@
 # For Windows, see run_e2e.ps1 (uses the Windows registry instead).
 #
 # Usage:
-#   ./run_e2e.sh [--release] [--verbose] [--retries=N]
+#   ./run_e2e.sh [--release] [--verbose] [--retries=N] [--coverage[=OUTPUT]]
 #                [--compare-with-msodbcsql] [--msodbcsql-ini=PATH]
+#                [--skip-build] [--driver=PATH]
 #
 # Default: runs the e2e suite against mssql-odbc only.
+#
+# --skip-build reuses a driver and CMake `build/` produced earlier by
+# build_e2e.sh (no cargo/cmake needed — only the unixODBC runtime). Combine
+# with --driver=PATH to point at the prebuilt libmsodbcsql18.so. This is how
+# CI runs prebuilt binaries across distro containers.
 #
 # --retries=N reruns each failing test up to N extra times (ctest
 # --repeat until-pass:N+1). A test that passes on any attempt counts as a
 # pass; the suite only fails if a test still fails after all retries.
+#
+# --coverage[=OUTPUT] builds the Rust driver with LLVM source-based coverage
+# instrumentation so the driver code exercised by the C++ tests (which load the
+# .so through the Driver Manager as separate processes) is measured. A Cobertura
+# report for mssql-tds + mssql-odbc is written to OUTPUT (default
+# <repo>/target/cobertura-odbc-e2e.xml). Same mechanism as dev/test-python.sh
+# --coverage; everything runs through cargo-llvm-cov so the LLVM version that
+# reads the .profraw matches the rustc that produced the instrumented .so.
 #
 # With --compare-with-msodbcsql, the script reruns the same suite against
 # the Microsoft C++ driver registered in --msodbcsql-ini (default
@@ -51,7 +65,13 @@ BUILD_TYPE="debug"
 VERBOSE=0
 COMPARE=0
 RETRIES=0
+COVERAGE=0
+# Default Cobertura output lives in the workspace target/ dir so the CI mount
+# (-v $PWD:/workspace) exposes it to the host agent for artifact publishing.
+COVERAGE_OUTPUT="${COVERAGE_OUTPUT:-$ODBC_CRATE_DIR/../target/cobertura-odbc-e2e.xml}"
 MSODBCSQL_INI="/etc/odbcinst.ini"
+SKIP_BUILD=0
+DRIVER_OVERRIDE=""
 
 CTEST_ARGS=(--output-on-failure)
 RUST_INI_DIR=""    # tempdir holding our generated odbcinst.ini
@@ -61,7 +81,9 @@ RUST_DRIVER_PATH=""
 # CLI parsing / help
 # ----------------------------------------------------------------------------
 usage() {
-    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+    # Print the leading comment block (line 2 to the first non-comment line),
+    # stripping the leading "# ".
+    awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
 }
 
 parse_args() {
@@ -74,7 +96,11 @@ parse_args() {
                 ;;
             --compare-with-msodbcsql) COMPARE=1 ;;
             --retries=*) RETRIES="${arg#--retries=}" ;;
+            --coverage) COVERAGE=1 ;;
+            --coverage=*) COVERAGE=1; COVERAGE_OUTPUT="${arg#--coverage=}" ;;
             --msodbcsql-ini=*) MSODBCSQL_INI="${arg#--msodbcsql-ini=}" ;;
+            --skip-build) SKIP_BUILD=1 ;;
+            --driver=*) DRIVER_OVERRIDE="${arg#--driver=}" ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown argument: $arg" >&2; usage >&2; exit 2 ;;
         esac
@@ -92,6 +118,25 @@ cleanup() {
 trap cleanup EXIT
 
 # ----------------------------------------------------------------------------
+# Coverage: enable LLVM source-based instrumentation for the driver build
+# ----------------------------------------------------------------------------
+# `cargo llvm-cov show-env` exports RUSTFLAGS (-C instrument-coverage), the
+# llvm-cov target dir and an LLVM_PROFILE_FILE pattern (with %p/%m so distinct
+# gtest processes and ctest retries never clobber each other's .profraw). The
+# subsequent `cargo build` then produces an instrumented libmsodbcsql18.so, and
+# every ctest child process inherits LLVM_PROFILE_FILE from this environment.
+setup_coverage_env() {
+    echo "=== Enabling coverage instrumentation for the Rust driver ==="
+    cargo llvm-cov clean --workspace
+    # Warm the tooling first so any one-time rustup component install output
+    # (e.g. downloading llvm-tools) is not sourced into the shell below.
+    cargo llvm-cov show-env --export-prefix >/dev/null 2>&1 || true
+    # Source only the export statements; discard rustup/info chatter.
+    eval "$(cargo llvm-cov show-env --export-prefix 2>/dev/null | grep '^export ')"
+    echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE:-<unset>}"
+}
+
+# ----------------------------------------------------------------------------
 # Step 1: Configure tracing for verbose mode
 # ----------------------------------------------------------------------------
 setup_tracing() {
@@ -106,34 +151,73 @@ setup_tracing() {
 # Step 2: Build the Rust driver and resolve its shared library path
 # ----------------------------------------------------------------------------
 build_rust_driver() {
-    echo "=== Building mssql-odbc ($BUILD_TYPE) ==="
-    (
-        cd "$ODBC_CRATE_DIR"
-        if [ "$BUILD_TYPE" = "release" ]; then
-            cargo build --release
-        else
-            cargo build
+    # Resolve the driver's shared-library filename for this platform.
+    local libname
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        libname="libmsodbcsql18.dylib"
+    else
+        libname="libmsodbcsql18.so"
+    fi
+
+    # Prebuilt mode: an explicit --driver=PATH wins; otherwise --skip-build
+    # resolves the path from the target dir without invoking cargo.
+    if [ -n "$DRIVER_OVERRIDE" ]; then
+        RUST_DRIVER_PATH="$DRIVER_OVERRIDE"
+        echo "=== Using prebuilt driver: $RUST_DRIVER_PATH ==="
+        if [ ! -f "$RUST_DRIVER_PATH" ]; then
+            echo "Error: Rust driver not found at $RUST_DRIVER_PATH" >&2
+            exit 1
         fi
-    )
+        return
+    fi
+
+    if [ "$SKIP_BUILD" -eq 0 ]; then
+        echo "=== Building mssql-odbc ($BUILD_TYPE) ==="
+        (
+            cd "$ODBC_CRATE_DIR"
+            if [ "$BUILD_TYPE" = "release" ]; then
+                cargo build --release
+            else
+                cargo build
+            fi
+        )
+    else
+        echo "=== Skipping driver build (--skip-build) ==="
+        # build_e2e.sh stages the driver inside the build tree, so prefer that
+        # copy when it exists before falling back to the cargo target dir.
+        if [ -f "$BUILD_DIR/$libname" ]; then
+            RUST_DRIVER_PATH="$BUILD_DIR/$libname"
+            echo "Using staged driver: $RUST_DRIVER_PATH"
+            return
+        fi
+    fi
 
     # Cargo builds into the workspace root's target/ directory, which may
-    # differ from the crate-local directory. Use `cargo metadata` to resolve.
+    # differ from the crate-local directory. Use `cargo metadata` to resolve it.
+    # Under coverage, `cargo llvm-cov show-env` may redirect the build via
+    # CARGO_TARGET_DIR; `cargo metadata` honors that env var, so target_directory
+    # always points at wherever the instrumented .so actually lands.
     local target_dir
     target_dir="$(cd "$ODBC_CRATE_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
         | python3 -c 'import sys,json; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null \
         || echo "$ODBC_CRATE_DIR/target")"
 
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        RUST_DRIVER_PATH="$target_dir/$BUILD_TYPE/libmsodbcsql18.dylib"
-    else
-        RUST_DRIVER_PATH="$target_dir/$BUILD_TYPE/libmsodbcsql18.so"
-    fi
+    RUST_DRIVER_PATH="$target_dir/$BUILD_TYPE/$libname"
 
     if [ ! -f "$RUST_DRIVER_PATH" ]; then
         echo "Error: Rust driver not found at $RUST_DRIVER_PATH" >&2
         exit 1
     fi
     echo "Rust driver: $RUST_DRIVER_PATH"
+
+    # Under coverage, surface the resolved paths so a broken instrumentation
+    # setup is obvious in the log. RUSTFLAGS=-C instrument-coverage was exported
+    # before this build, so this .so is the instrumented one ctest will load;
+    # the post-run .profraw check in generate_coverage_report proves it fired.
+    if [ "$COVERAGE" -eq 1 ]; then
+        echo "Coverage: LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE:-<unset>}"
+        echo "Coverage: instrumented driver=$RUST_DRIVER_PATH"
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -208,9 +292,26 @@ setup_dev_sql_env() {
 # Step 6: Configure + build the C++ test binaries (once, shared by both runs)
 # ----------------------------------------------------------------------------
 configure_and_build_tests() {
+    if [ "$SKIP_BUILD" -eq 1 ]; then
+        echo ""
+        echo "=== Skipping e2e test build (--skip-build); reusing $BUILD_DIR ==="
+        if [ ! -f "$BUILD_DIR/CTestTestfile.cmake" ]; then
+            echo "Error: prebuilt CMake build not found at $BUILD_DIR" >&2
+            echo "  Expected $BUILD_DIR/CTestTestfile.cmake (produced by build_e2e.sh)." >&2
+            exit 1
+        fi
+        # Publishing/downloading the build tree as a pipeline artifact drops the
+        # Unix execute bit, so the restored ctest binaries come back as 0644 and
+        # ctest fails to exec them ("permission denied"). Restore +x here.
+        find "$BUILD_DIR" -type f -name '*_test' -exec chmod +x {} +
+        return
+    fi
+
     echo ""
     echo "=== Configuring e2e tests (CMake) ==="
-    cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug
+    # Linux/macOS default to platform TCHAR mode unless explicitly overridden.
+    cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug \
+        -DODBC_E2E_FORCE_UNICODE="${ODBC_E2E_FORCE_UNICODE:-OFF}"
 
     echo ""
     echo "=== Building e2e tests ==="
@@ -234,7 +335,10 @@ run_tests() {
     local rc=0
     (
         cd "$BUILD_DIR"
-        ODBCSYSINI="$ini_dir" ctest "${CTEST_ARGS[@]}" --output-junit "$junit_out"
+        # ODBC_TEST_TARGET tells tests which driver implementation this leg runs
+        # against ("mssql-odbc" or "msodbcsql") so mssql-odbc-specific tests can
+        # SKIP_IF_COMPARING_MSODBCSQL() on the reference-driver leg.
+        ODBC_TEST_TARGET="$label" ODBCSYSINI="$ini_dir" ctest "${CTEST_ARGS[@]}" --output-junit "$junit_out"
     ) || rc=$?
     return $rc
 }
@@ -293,6 +397,45 @@ PY
 }
 
 # ----------------------------------------------------------------------------
+# Coverage: turn the .profraw written by the ctest processes into Cobertura.
+# `cargo llvm-cov report` wraps llvm-profdata merge + llvm-cov export, so the
+# LLVM tooling matches the rustc that produced the instrumented .so. Includes
+# both mssql-tds and mssql-odbc because the cdylib statically links mssql-tds,
+# so driver execution also covers mssql-tds source. Best-effort: the suite has
+# already run, so a coverage tooling hiccup must not change the pass/fail result.
+# Run from the workspace root (the script's cwd) so Cobertura filenames are
+# repo-root-relative and union with the other per-OS reports in the merge.
+# ----------------------------------------------------------------------------
+generate_coverage_report() {
+    echo ""
+    echo "=== Generating ODBC e2e coverage report ==="
+    # Prove the instrumented driver actually ran under the Driver Manager: each
+    # gtest process writes a .profraw keyed by LLVM_PROFILE_FILE. Zero .profraw
+    # means coverage silently captured nothing (e.g. an uninstrumented .so was
+    # loaded), so warn loudly. Non-fatal: the functional result already stands.
+    local profraw_dir
+    profraw_dir="$(dirname "${LLVM_PROFILE_FILE:-}")"
+    if [ -n "$profraw_dir" ] && [ -d "$profraw_dir" ]; then
+        local n
+        n="$(find "$profraw_dir" -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')"
+        echo "Coverage: found $n .profraw file(s) under $profraw_dir"
+        if [ "$n" -eq 0 ]; then
+            echo "WARNING: no .profraw produced; the driver ctest loaded may not be instrumented" >&2
+        fi
+    fi
+    if ! mkdir -p "$(dirname "$COVERAGE_OUTPUT")"; then
+        echo "WARNING: failed to create ODBC e2e coverage output directory" >&2
+        return 0
+    fi
+    if cargo llvm-cov report --package mssql-tds --package mssql-odbc \
+        --cobertura --output-path "$COVERAGE_OUTPUT"; then
+        echo "Coverage report written to $COVERAGE_OUTPUT"
+    else
+        echo "WARNING: failed to generate ODBC e2e coverage report" >&2
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 main() {
@@ -303,6 +446,9 @@ main() {
         echo "Retries enabled: each failing test reruns up to $RETRIES time(s)."
     fi
     setup_tracing
+    if [ "$COVERAGE" -eq 1 ]; then
+        setup_coverage_env
+    fi
     setup_dev_sql_env
     build_rust_driver
     register_rust_driver
@@ -316,6 +462,12 @@ main() {
     local rust_rc=0 ms_rc=0
 
     run_tests "mssql-odbc" "$RUST_INI_DIR" "$rust_junit" || rust_rc=$?
+
+    # Report on the instrumented mssql-odbc leg before the (uninstrumented)
+    # msodbcsql reference leg runs, so the profraw reflects our driver only.
+    if [ "$COVERAGE" -eq 1 ]; then
+        generate_coverage_report
+    fi
 
     if [ "$COMPARE" -eq 0 ]; then
         if [ "$rust_rc" -ne 0 ]; then

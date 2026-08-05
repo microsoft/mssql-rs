@@ -105,6 +105,14 @@ pub struct RpcParameter {
     /// ciphertext is serialized as a BIGVARBINARY with the ENCRYPTED status flag
     /// and a trailing CryptoMetaData block, bypassing the plaintext `value`.
     encrypted: Option<EncryptedRpcValue>,
+
+    /// When `true`, the caller requires this parameter to be encrypted: if
+    /// `sp_describe_parameter_encryption` reports the target column as not
+    /// encrypted (or Always Encrypted is not enabled for the command), the
+    /// driver fails rather than sending the value as plaintext. Mirrors .NET
+    /// `SqlParameter.ForceColumnEncryption`; a client-side directive that is
+    /// never sent on the wire.
+    force_column_encryption: bool,
 }
 
 impl RpcParameter {
@@ -115,7 +123,26 @@ impl RpcParameter {
             options,
             value,
             encrypted: None,
+            force_column_encryption: false,
         }
+    }
+
+    /// Requires this parameter to be encrypted under Always Encrypted.
+    ///
+    /// When set, the driver fails with a usage error if the server reports the
+    /// target column as not encrypted, or if Always Encrypted is not enabled for
+    /// the command — instead of silently sending the value as plaintext. This
+    /// defends against a compromised or misconfigured server downgrading a
+    /// parameter to harvest its plaintext. Mirrors .NET
+    /// `SqlParameter.ForceColumnEncryption`.
+    pub fn with_force_column_encryption(mut self, force: bool) -> Self {
+        self.force_column_encryption = force;
+        self
+    }
+
+    /// Returns `true` if the caller required this parameter to be encrypted.
+    pub(crate) fn force_column_encryption(&self) -> bool {
+        self.force_column_encryption
     }
 
     /// Get the SQL type name from a SqlType value for use in parameter declarations.

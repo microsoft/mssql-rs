@@ -26,7 +26,7 @@ import pytest
 # The mock TDS server Python bindings (mssql-mock-tds-py) are optional: they are
 # built by dev/test-python.sh but may be absent in other environments.
 try:
-    import mssql_mock_tds_py
+    import mssql_mock_tds
 
     MOCK_TDS_PY_AVAILABLE = True
 except ImportError:
@@ -241,7 +241,7 @@ Python callback. These
 
 @pytest.mark.skipif(
     not MOCK_TDS_PY_AVAILABLE,
-    reason="mssql_mock_tds_py not available. Build it with: cd mssql-mock-tds-py && maturin develop",
+    reason="mssql_mock_tds not available. Build it with: cd mssql-mock-tds-py && maturin develop",
 )
 class TestServicePrincipalFedAuthOverMockServer:
     """Wire-level coverage of the FedAuth challenge handshake driving the Python
@@ -260,7 +260,7 @@ class TestServicePrincipalFedAuthOverMockServer:
             callback_calls.append((spn, sts_url, auth_method))
             return raw_token.encode("utf-16-le")
 
-        server = mssql_mock_tds_py.PyMockTdsServer(port=0, tls=True)
+        server = mssql_mock_tds.PyMockTdsServer(port=0, tls=True)
 
         with server:
             client_context = {

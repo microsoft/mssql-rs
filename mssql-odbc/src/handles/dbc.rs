@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use mssql_tds::connection::tds_client::TdsClient;
 use tokio::runtime::Runtime;
 
-use super::{HandleType, HasObjectType};
+use super::{EnvHandle, HandleType, HasObjectType};
 use crate::error::{DiagRecord, HasDiagnostics};
 
 /// Connection state machine — tracks whether the DBC is connected.
@@ -107,6 +107,19 @@ impl DbcHandle {
                 access_token: None,
             }),
         }
+    }
+
+    /// Returns a reference to the parent ENV handle.
+    ///
+    /// The returned reference is bound to `&self` so it cannot outlive this
+    /// connection, and the parent ENV is guaranteed alive for at least that
+    /// long because the DM frees all DBC handles before freeing their parent
+    /// ENV.
+    pub(crate) fn parent_env(&self) -> &EnvHandle {
+        // SAFETY: `parent_env` is set at construction to a live `EnvHandle`
+        // pointer (allocated by `handle_to_raw::<EnvHandle>`), is never mutated,
+        // and the ENV outlives this DBC per the DM contract.
+        unsafe { &*(self.parent_env as *const EnvHandle) }
     }
 }
 

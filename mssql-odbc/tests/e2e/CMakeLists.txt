@@ -57,6 +57,25 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Unicode build mode (must come after googletest so the vendored gtest build
+# is not compiled with UNICODE/_UNICODE).
+# Windows defaults to ON because mssql-odbc phase-1 exports only wide (W)
+# entrypoints. Applies to odbc_test_lib and every test target defined below.
+# ---------------------------------------------------------------------------
+if(WIN32)
+    set(_odbc_e2e_unicode_default ON)
+else()
+    set(_odbc_e2e_unicode_default OFF)
+endif()
+option(ODBC_E2E_FORCE_UNICODE "Build e2e tests with UNICODE/_UNICODE" ${_odbc_e2e_unicode_default})
+if(ODBC_E2E_FORCE_UNICODE)
+    add_compile_definitions(UNICODE _UNICODE)
+    message(STATUS "ODBC e2e tests: UNICODE/_UNICODE enabled")
+else()
+    message(STATUS "ODBC e2e tests: UNICODE/_UNICODE disabled (platform default TCHAR mode)")
+endif()
+
+# ---------------------------------------------------------------------------
 # odbc_test_lib  –  shared fixture + helpers (static library)
 # ---------------------------------------------------------------------------
 add_library(odbc_test_lib STATIC
@@ -103,3 +122,6 @@ add_odbc_test(get_diag_field_test tests/get_diag_field_test.cpp)
 add_odbc_test(driver_connect_test tests/driver_connect_test.cpp)
 add_odbc_test(exec_direct_test   tests/exec_direct_test.cpp)
 add_odbc_test(more_results_test  tests/more_results_test.cpp)
+add_odbc_test(execute_test       tests/execute_test.cpp)
+add_odbc_test(get_type_info_test tests/get_type_info_test.cpp)
+add_odbc_test(row_count_test     tests/row_count_test.cpp)

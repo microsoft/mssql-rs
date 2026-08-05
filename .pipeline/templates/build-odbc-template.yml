@@ -1,0 +1,44 @@
+# filepath: .pipeline/templates/build-odbc-template.yml
+#
+# Build the mssql-odbc driver + C++ gtest e2e binaries once inside the Ubuntu
+# build container and publish them as a pipeline artifact, so downstream
+# Test_odbc_* stages can download and rerun the prebuilt binaries in many distro
+# containers (run_e2e.sh --skip-build) instead of rebuilding per container.
+#
+# CI (non-PR) only, matching how the nextest archive is published and consumed.
+
+parameters:
+  # 'x64' or 'ARM64' - selects the build pool the surrounding job runs on.
+  - name: architecture
+    type: string
+  # Pipeline artifact name, e.g. 'Odbc_Linux_x64' / 'Odbc_Linux_arm64'.
+  - name: artifactName
+    type: string
+  # Build container image (multi-arch).
+  - name: buildImage
+    type: string
+    default: 'ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04'
+
+steps:
+  - script: |
+      set -e
+      bash .pipeline/scripts/docker-cargo-run.sh --rm \
+        -v "$PWD:/workspace" \
+        -v "$HOME/.cargo/registry:/root/.cargo/registry" \
+        -v "$HOME/.cargo/git:/root/.cargo/git" \
+        -e ODBC_DROP_DIR=/workspace/odbc-drop \
+        -w /workspace \
+        ${{ parameters.buildImage }} \
+        /workspace/.pipeline/scripts/containerized-odbc-build.sh
+    displayName: 'Build ODBC driver + e2e binaries (${{ parameters.architecture }})'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    env:
+      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish ${{ parameters.artifactName }}'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)/odbc-drop'
+      artifact: ${{ parameters.artifactName }}

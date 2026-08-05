@@ -279,6 +279,7 @@ steps:
         -e ODBC_TEST_PWD="$(SQL_PASSWORD)" \
         -e ODBC_TEST_TRUST_CERT="Yes" \
         -e ODBC_E2E_RETRIES="3" \
+        -e ODBC_E2E_COVERAGE="${{ lower(parameters.collectRustCoverage) }}" \
         -e RUST_BACKTRACE=full \
         -w /workspace \
         $BUILD_IMAGE \
@@ -391,6 +392,20 @@ steps:
     inputs:
       targetPath: $(Build.SourcesDirectory)/target/cobertura.xml
       artifactName: CoberturaCoverageRust_Linux
+
+# ODBC C++ e2e coverage: the instrumented driver is exercised through the
+# unixODBC Driver Manager as a separate process, so this report adds coverage
+# for mssql-odbc (and statically-linked mssql-tds) lines reachable only via the
+# ODBC surface. Best-effort (continueOnError) so a coverage hiccup never fails
+# the build; the Merge Coverage stage skips it if absent.
+- ${{ if eq(parameters.collectRustCoverage, true) }}:
+  - task: PublishPipelineArtifact@1
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Publish ODBC e2e Linux Cobertura coverage artifact
+    continueOnError: true
+    inputs:
+      targetPath: $(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml
+      artifactName: CoberturaCoverageOdbcE2E_Linux
 
 - task: CopyFiles@2
   displayName: Copy Rust Debug Build

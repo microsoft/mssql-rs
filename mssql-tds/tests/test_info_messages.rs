@@ -6,7 +6,7 @@ mod common;
 
 mod info_message_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::error::SqlInfoMessage;
 
@@ -33,11 +33,17 @@ mod info_message_tests {
                  RAISERROR(N'tds info before result two', 10, 1) WITH NOWAIT;
                  SELECT CAST(42 AS INT) AS answer;"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
+
+        // The PRINT / RAISERROR precede the SELECT; collapse to the row set,
+        // which captures their messages while skipping the no-row statements.
+        assert!(
+            connection.advance_to_rows().await.unwrap(),
+            "should advance to the SELECT result set"
+        );
 
         let messages = connection.info_messages();
         assert!(
@@ -49,10 +55,11 @@ mod info_message_tests {
             "INFO messages should include low-severity RAISERROR output: {messages:?}"
         );
 
-        let resultset = connection
-            .get_current_resultset()
-            .expect("query should be positioned on a result set");
-        let row = resultset
+        assert!(
+            connection.on_rows(),
+            "query should be positioned on a result set"
+        );
+        let row = connection
             .next_row()
             .await
             .unwrap()
@@ -71,14 +78,19 @@ mod info_message_tests {
                 "PRINT N'tds info no result one';
                  RAISERROR(N'tds info no result two', 10, 1) WITH NOWAIT;"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
 
+        // A no-result batch: advancing drains every statement (capturing each
+        // one's messages) and reports no row set.
         assert!(
-            connection.get_current_resultset().is_none(),
+            !connection.advance_to_rows().await.unwrap(),
+            "INFO-only batch should not open a result set"
+        );
+        assert!(
+            !connection.on_rows(),
             "INFO-only batch should not open a result set"
         );
 
@@ -103,16 +115,16 @@ mod info_message_tests {
                  PRINT N'tds info after rows one';
                  RAISERROR(N'tds info after rows two', 10, 1) WITH NOWAIT;"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
 
-        let resultset = connection
-            .get_current_resultset()
-            .expect("query should be positioned on a result set");
-        let row = resultset
+        assert!(
+            connection.on_rows(),
+            "query should be positioned on a result set"
+        );
+        let row = connection
             .next_row()
             .await
             .unwrap()
@@ -141,7 +153,7 @@ mod info_message_tests {
 
         // First command emits an informational message.
         connection
-            .execute("PRINT N'tds first command info';".to_string(), None, None)
+            .execute("PRINT N'tds first command info';".to_string(), ())
             .await
             .unwrap();
         assert!(
@@ -154,7 +166,7 @@ mod info_message_tests {
         // Second command emits no informational messages; the buffer must be
         // reset so the first command's message is gone.
         connection
-            .execute("SELECT CAST(7 AS INT) AS value;".to_string(), None, None)
+            .execute("SELECT CAST(7 AS INT) AS value;".to_string(), ())
             .await
             .unwrap();
         assert!(
@@ -163,10 +175,11 @@ mod info_message_tests {
             connection.info_messages()
         );
 
-        let resultset = connection
-            .get_current_resultset()
-            .expect("query should be positioned on a result set");
-        let row = resultset
+        assert!(
+            connection.on_rows(),
+            "query should be positioned on a result set"
+        );
+        let row = connection
             .next_row()
             .await
             .unwrap()
