@@ -750,11 +750,24 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
+          set -euo pipefail
           cd $(Build.SourcesDirectory)/containers
           
           # Login to ACR
           echo "==> Logging into Azure Container Registry..."
           az acr login --name tdslibrs
+
+          # Push each image and drop it before the next build starts. The agent
+          # does not have room for every toolchain image at once, so the push
+          # cannot be deferred to a single task at the end of the job.
+          push_and_reclaim() {
+            for tag in "$@"; do
+              docker push "$tag"
+            done
+            docker rmi "$@" >/dev/null 2>&1 || true
+            docker builder prune -f >/dev/null 2>&1 || true
+            echo "    pushed and reclaimed; disk: $(df -h / | awk 'NR==2 {print $4" free of "$2}')"
+          }
           
           # Build manylinux x64 image
           echo "==> Building manylinux x64 image..."
@@ -762,7 +775,7 @@ stages:
               -f Dockerfile.PythonBuild.manylinux.x64 \
               -t tdslibrs.azurecr.io/python-build/manylinux_2_34_x86_64_rust:latest \
               .
-          echo "✅ manylinux x64 image built successfully"
+          push_and_reclaim tdslibrs.azurecr.io/python-build/manylinux_2_34_x86_64_rust:latest
           
           # Build musllinux x64 image
           echo "==> Building musllinux x64 image..."
@@ -770,7 +783,7 @@ stages:
               -f Dockerfile.PythonBuild.musllinux.x64 \
               -t tdslibrs.azurecr.io/python-build/musllinux_1_2_x86_64_rust:latest \
               .
-          echo "✅ musllinux x64 image built successfully"
+          push_and_reclaim tdslibrs.azurecr.io/python-build/musllinux_1_2_x86_64_rust:latest
 
           # Build manylinux_2_28 x64 image (glibc 2.28 / OpenSSL 1.1 for the
           # mssql-odbc RHEL 8 track; includes cmake + unixODBC-devel + rust)
@@ -779,7 +792,7 @@ stages:
               -f Dockerfile.PythonBuild.manylinux.2_28.x64 \
               -t tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64_rust:latest \
               .
-          echo "✅ manylinux_2_28 x64 image built successfully"
+          push_and_reclaim tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64_rust:latest
       retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
@@ -790,11 +803,24 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
+          set -euo pipefail
           cd $(Build.SourcesDirectory)/containers
           
           # Login to ACR
           echo "==> Logging into Azure Container Registry..."
           az acr login --name tdslibrs
+
+          # Push each image and drop it before the next build starts. The agent
+          # does not have room for every toolchain image at once, so the push
+          # cannot be deferred to a single task at the end of the job.
+          push_and_reclaim() {
+            for tag in "$@"; do
+              docker push "$tag"
+            done
+            docker rmi "$@" >/dev/null 2>&1 || true
+            docker builder prune -f >/dev/null 2>&1 || true
+            echo "    pushed and reclaimed; disk: $(df -h / | awk 'NR==2 {print $4" free of "$2}')"
+          }
           
           # Build Ubuntu x64 image
           echo "==> Building Ubuntu x64 build image..."
@@ -803,7 +829,7 @@ stages:
               -t tdslibrs.azurecr.io/build/ubuntu:22.04-x64 \
               -t tdslibrs.azurecr.io/build/ubuntu:latest-x64 \
               .
-          echo "✅ Ubuntu x64 build image built successfully"
+          push_and_reclaim tdslibrs.azurecr.io/build/ubuntu:22.04-x64 tdslibrs.azurecr.io/build/ubuntu:latest-x64
       retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
@@ -814,11 +840,24 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
+          set -euo pipefail
           cd $(Build.SourcesDirectory)/containers
           
           # Login to ACR
           echo "==> Logging into Azure Container Registry..."
           az acr login --name tdslibrs
+
+          # Push each image and drop it before the next build starts. The agent
+          # does not have room for every toolchain image at once, so the push
+          # cannot be deferred to a single task at the end of the job.
+          push_and_reclaim() {
+            for tag in "$@"; do
+              docker push "$tag"
+            done
+            docker rmi "$@" >/dev/null 2>&1 || true
+            docker builder prune -f >/dev/null 2>&1 || true
+            echo "    pushed and reclaimed; disk: $(df -h / | awk 'NR==2 {print $4" free of "$2}')"
+          }
           
           # Build Alpine x64 image
           echo "==> Building Alpine x64 build image..."
@@ -826,31 +865,7 @@ stages:
               -f Dockerfile.Alpine.Build \
               -t tdslibrs.azurecr.io/build/alpine:3.18-amd64 \
               .
-          echo "✅ Alpine x64 build image built successfully"
-      retryCountOnTaskFailure: 3
-
-    - task: AzureCLI@2
-      displayName: 'Push x64 images to ACR'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          az acr login --name tdslibrs
-          
-          # Push Python images if enabled
-          if [ "${{ parameters.buildPythonImages }}" == "True" ]; then
-            docker push tdslibrs.azurecr.io/python-build/manylinux_2_34_x86_64_rust:latest
-            docker push tdslibrs.azurecr.io/python-build/musllinux_1_2_x86_64_rust:latest
-            docker push tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64_rust:latest
-          fi
-          
-          # Push Ubuntu images if enabled
-          if [ "${{ parameters.buildUbuntuImages }}" == "True" ]; then
-            docker push tdslibrs.azurecr.io/build/ubuntu:22.04-x64
-            docker push tdslibrs.azurecr.io/build/ubuntu:latest-x64
-            docker push tdslibrs.azurecr.io/build/alpine:3.18-amd64
-          fi
+          push_and_reclaim tdslibrs.azurecr.io/build/alpine:3.18-amd64
       retryCountOnTaskFailure: 3
 
   - job: BuildKerberosImages
@@ -961,11 +976,24 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
+          set -euo pipefail
           cd $(Build.SourcesDirectory)/containers
           
           # Login to ACR
           echo "==> Logging into Azure Container Registry..."
           az acr login --name tdslibrs
+
+          # Push each image and drop it before the next build starts. The agent
+          # does not have room for every toolchain image at once, so the push
+          # cannot be deferred to a single task at the end of the job.
+          push_and_reclaim() {
+            for tag in "$@"; do
+              docker push "$tag"
+            done
+            docker rmi "$@" >/dev/null 2>&1 || true
+            docker builder prune -f >/dev/null 2>&1 || true
+            echo "    pushed and reclaimed; disk: $(df -h / | awk 'NR==2 {print $4" free of "$2}')"
+          }
           
           # Build manylinux ARM64 image
           echo "==> Building manylinux ARM64 image..."
@@ -973,7 +1001,7 @@ stages:
               -f Dockerfile.PythonBuild.manylinux.arm64 \
               -t tdslibrs.azurecr.io/python-build/manylinux_2_34_aarch64_rust:latest \
               .
-          echo "✅ manylinux ARM64 image built successfully"
+          push_and_reclaim tdslibrs.azurecr.io/python-build/manylinux_2_34_aarch64_rust:latest
           
           # Build musllinux ARM64 image
           echo "==> Building musllinux ARM64 image..."
@@ -981,7 +1009,7 @@ stages:
               -f Dockerfile.PythonBuild.musllinux.arm64 \
               -t tdslibrs.azurecr.io/python-build/musllinux_1_2_aarch64_rust:latest \
               .
-          echo "✅ musllinux ARM64 image built successfully"
+          push_and_reclaim tdslibrs.azurecr.io/python-build/musllinux_1_2_aarch64_rust:latest
 
           # Build manylinux_2_28 ARM64 image (glibc 2.28 / OpenSSL 1.1 for the
           # mssql-odbc RHEL 8 track; includes cmake + unixODBC-devel + rust)
@@ -990,7 +1018,7 @@ stages:
               -f Dockerfile.PythonBuild.manylinux.2_28.arm64 \
               -t tdslibrs.azurecr.io/python-build/manylinux_2_28_aarch64_rust:latest \
               .
-          echo "✅ manylinux_2_28 ARM64 image built successfully"
+          push_and_reclaim tdslibrs.azurecr.io/python-build/manylinux_2_28_aarch64_rust:latest
       retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
@@ -1001,11 +1029,24 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
+          set -euo pipefail
           cd $(Build.SourcesDirectory)/containers
           
           # Login to ACR
           echo "==> Logging into Azure Container Registry..."
           az acr login --name tdslibrs
+
+          # Push each image and drop it before the next build starts. The agent
+          # does not have room for every toolchain image at once, so the push
+          # cannot be deferred to a single task at the end of the job.
+          push_and_reclaim() {
+            for tag in "$@"; do
+              docker push "$tag"
+            done
+            docker rmi "$@" >/dev/null 2>&1 || true
+            docker builder prune -f >/dev/null 2>&1 || true
+            echo "    pushed and reclaimed; disk: $(df -h / | awk 'NR==2 {print $4" free of "$2}')"
+          }
           
           # Build Ubuntu ARM64 image
           echo "==> Building Ubuntu ARM64 build image..."
@@ -1014,7 +1055,7 @@ stages:
               -t tdslibrs.azurecr.io/build/ubuntu:22.04-arm64 \
               -t tdslibrs.azurecr.io/build/ubuntu:latest-arm64 \
               .
-          echo "✅ Ubuntu ARM64 build image built successfully"
+          push_and_reclaim tdslibrs.azurecr.io/build/ubuntu:22.04-arm64 tdslibrs.azurecr.io/build/ubuntu:latest-arm64
       retryCountOnTaskFailure: 3
 
     - task: AzureCLI@2
@@ -1025,11 +1066,24 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
+          set -euo pipefail
           cd $(Build.SourcesDirectory)/containers
           
           # Login to ACR
           echo "==> Logging into Azure Container Registry..."
           az acr login --name tdslibrs
+
+          # Push each image and drop it before the next build starts. The agent
+          # does not have room for every toolchain image at once, so the push
+          # cannot be deferred to a single task at the end of the job.
+          push_and_reclaim() {
+            for tag in "$@"; do
+              docker push "$tag"
+            done
+            docker rmi "$@" >/dev/null 2>&1 || true
+            docker builder prune -f >/dev/null 2>&1 || true
+            echo "    pushed and reclaimed; disk: $(df -h / | awk 'NR==2 {print $4" free of "$2}')"
+          }
           
           # Build Alpine ARM64 image
           echo "==> Building Alpine ARM64 build image..."
@@ -1037,31 +1091,7 @@ stages:
               -f Dockerfile.Alpine.Build \
               -t tdslibrs.azurecr.io/build/alpine:3.18-arm64 \
               .
-          echo "✅ Alpine ARM64 build image built successfully"
-      retryCountOnTaskFailure: 3
-
-    - task: AzureCLI@2
-      displayName: 'Push ARM64 images to ACR'
-      inputs:
-        azureSubscription: 'Magnitude Test'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          az acr login --name tdslibrs
-          
-          # Push Python images if enabled
-          if [ "${{ parameters.buildPythonImages }}" == "True" ]; then
-            docker push tdslibrs.azurecr.io/python-build/manylinux_2_34_aarch64_rust:latest
-            docker push tdslibrs.azurecr.io/python-build/musllinux_1_2_aarch64_rust:latest
-            docker push tdslibrs.azurecr.io/python-build/manylinux_2_28_aarch64_rust:latest
-          fi
-          
-          # Push Ubuntu images if enabled
-          if [ "${{ parameters.buildUbuntuImages }}" == "True" ]; then
-            docker push tdslibrs.azurecr.io/build/ubuntu:22.04-arm64
-            docker push tdslibrs.azurecr.io/build/ubuntu:latest-arm64
-            docker push tdslibrs.azurecr.io/build/alpine:3.18-arm64
-          fi
+          push_and_reclaim tdslibrs.azurecr.io/build/alpine:3.18-arm64
       retryCountOnTaskFailure: 3
 
   - job: CreateMultiArchManifests
