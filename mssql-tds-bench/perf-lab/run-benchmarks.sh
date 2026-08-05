@@ -356,7 +356,9 @@ improvement_pairs() {
 
 IMPROVEMENTS=$(improvement_ids "$RESULTS_DIR/comparison.txt")
 # One re-measure set covers both directions, so the re-runs cost one pass.
-VERIFY_IDS=$(printf '%s\n%s\n' "$OFFENDERS" "$IMPROVEMENTS" | grep -E '.' | sort -u)
+# awk 'NF' drops the blank lines rather than grep, which would exit 1 when both
+# lists are empty (a clean run) and kill the script under set -e.
+VERIFY_IDS=$(printf '%s\n%s\n' "$OFFENDERS" "$IMPROVEMENTS" | awk 'NF' | sort -u)
 
 # --- Auto-confirm regressions: re-measure the offenders N times, require a
 # --- majority to confirm ---
