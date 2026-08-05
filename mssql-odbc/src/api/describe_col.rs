@@ -223,6 +223,11 @@ pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -
 }
 
 pub(crate) fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
+    // UDTs are PLP on the wire but msodbcsql reports their declared max length,
+    // because clients use a non-zero ColumnSize to tell a bounded UDT from a LOB.
+    if matches!(meta.data_type, TdsDataType::Udt) {
+        return u64::try_from(meta.type_info.length).unwrap_or(0);
+    }
     // PLP / `*(max)` / xml / json: ColumnSize is "unbounded". Report 0 per ODBC spec
     if meta.is_plp() {
         return 0;

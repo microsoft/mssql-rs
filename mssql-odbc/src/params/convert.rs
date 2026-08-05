@@ -23,12 +23,13 @@ use crate::api::odbc_types::{
     SQL_C_SHORT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT,
     SQL_C_STINYINT, SQL_C_TIME, SQL_C_TIMESTAMP, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME,
     SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR,
-    SQL_CHAR, SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DEFAULT_PARAM, SQL_DOUBLE, SQL_FLOAT, SQL_GUID,
-    SQL_INTEGER, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NTS,
-    SQL_NULL_DATA, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
-    SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR,
-    SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlDateStruct, SqlGuid, SqlLen, SqlNumericStruct,
-    SqlSmallInt, SqlSsTime2Struct, SqlSsTimestampoffsetStruct, SqlTimeStruct, SqlTimestampStruct,
+    SQL_CHAR, SQL_DATA_AT_EXEC, SQL_DATETIME, SQL_DECIMAL, SQL_DEFAULT_PARAM, SQL_DOUBLE,
+    SQL_FLOAT, SQL_GUID, SQL_INTEGER, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY,
+    SQL_LONGVARCHAR, SQL_NTS, SQL_NULL_DATA, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2,
+    SQL_SS_TIMESTAMPOFFSET, SQL_TIME, SQL_TIMESTAMP, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME,
+    SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR,
+    SqlDateStruct, SqlGuid, SqlLen, SqlNumericStruct, SqlSmallInt, SqlSsTime2Struct,
+    SqlSsTimestampoffsetStruct, SqlTimeStruct, SqlTimestampStruct,
 };
 use crate::api::sqlstate::ERR_INVALID_STRING_OR_BUFFER_LENGTH;
 use crate::params::BoundParam;
@@ -101,13 +102,38 @@ pub(crate) unsafe fn bound_param_to_rpc_with_data(
                 param.sql_type,
             ))?
         }
-        Some(None) => null_value(
-            param.sql_type,
-            effective_c_type(param.c_type, param.sql_type),
-        ),
+        Some(None) => null_value(param),
         None => unsafe { bound_param_to_value(param) }?,
     };
-    Ok(RpcParameter::new(Some(name), StatusFlags::NONE, value))
+    let numeric_meta = null_decimal_meta(&value, param);
+    let rpc = RpcParameter::new(Some(name), StatusFlags::NONE, value);
+    Ok(match numeric_meta {
+        Some((precision, scale)) => rpc.with_numeric_meta(precision, scale),
+        None => rpc,
+    })
+}
+
+/// Precision and scale to declare for a NULL `decimal`/`numeric` parameter.
+///
+/// A NULL carries no precision, so it would otherwise be declared with the TDS
+/// default. When a prepared plan is built from a parameter-array row whose
+/// value is NULL, that narrow declaration is reused for every later row and
+/// rejects wider values, so the application's binding is used instead. Only
+/// NULLs need this: a value declares itself.
+fn null_decimal_meta(value: &SqlType, param: &BoundParam) -> Option<(u8, u8)> {
+    if !matches!(value, SqlType::Decimal(None) | SqlType::Numeric(None)) {
+        return None;
+    }
+    let scale = u8::try_from(param.decimal_digits)
+        .unwrap_or(0)
+        .min(MAX_DECIMAL_PRECISION);
+    // An unspecified column size means the application never told us how wide
+    // the column is, so the widest declaration is the only safe one.
+    let precision = match u8::try_from(param.column_size).unwrap_or(0) {
+        0 => MAX_DECIMAL_PRECISION,
+        p => p.max(scale).min(MAX_DECIMAL_PRECISION),
+    };
+    Some((precision, scale))
 }
 
 /// Reports whether an indicator value requests data-at-execution.
@@ -168,7 +194,7 @@ pub(crate) unsafe fn bound_param_to_value(param: &BoundParam) -> Result<SqlType,
 
     if let Some(ind) = indicator {
         if ind == SQL_NULL_DATA {
-            return Ok(null_value(param.sql_type, c_type));
+            return Ok(null_value(param));
         }
         if ind == SQL_DEFAULT_PARAM {
             return Err(ParamConvError::DefaultParamUnsupported);
@@ -218,17 +244,24 @@ fn effective_c_type(c_type: SqlSmallInt, sql_type: SqlSmallInt) -> SqlSmallInt {
         SQL_REAL => SQL_C_FLOAT,
         SQL_FLOAT | SQL_DOUBLE => SQL_C_DOUBLE,
         SQL_GUID => SQL_C_GUID,
-        SQL_TYPE_DATE => SQL_C_TYPE_DATE,
-        SQL_TYPE_TIME => SQL_C_TYPE_TIME,
+        SQL_TYPE_DATE | SQL_DATETIME => SQL_C_TYPE_DATE,
+        SQL_TYPE_TIME | SQL_TIME => SQL_C_TYPE_TIME,
         SQL_SS_TIME2 => SQL_C_SS_TIME2,
-        SQL_TYPE_TIMESTAMP => SQL_C_TYPE_TIMESTAMP,
+        SQL_TYPE_TIMESTAMP | SQL_TIMESTAMP => SQL_C_TYPE_TIMESTAMP,
         SQL_SS_TIMESTAMPOFFSET => SQL_C_SS_TIMESTAMPOFFSET,
         _ => SQL_C_CHAR,
     }
 }
 
 /// Typed NULL for the requested SQL type.
-fn null_value(sql_type: SqlSmallInt, c_type: SqlSmallInt) -> SqlType {
+///
+/// A NULL still has to be declared with the application's `ColumnSize` and
+/// `DecimalDigits`: the server derives the RPC parameter's type from the first
+/// execution, so a NULL declared as the default `decimal(18,0)` would reject
+/// wider values on later executions of the same parameter array.
+fn null_value(param: &BoundParam) -> SqlType {
+    let sql_type = param.sql_type;
+    let c_type = effective_c_type(param.c_type, param.sql_type);
     match sql_type {
         SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR => SqlType::VarcharMax(None),
         SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR => SqlType::NVarcharMax(None),
@@ -242,9 +275,9 @@ fn null_value(sql_type: SqlSmallInt, c_type: SqlSmallInt) -> SqlType {
         SQL_FLOAT | SQL_DOUBLE => SqlType::Float(None),
         SQL_DECIMAL | SQL_NUMERIC => SqlType::Decimal(None),
         SQL_GUID => SqlType::Uuid(None),
-        SQL_TYPE_DATE => SqlType::Date(None),
-        SQL_TYPE_TIME | SQL_SS_TIME2 => SqlType::Time(None),
-        SQL_TYPE_TIMESTAMP => SqlType::DateTime2(None),
+        SQL_TYPE_DATE | SQL_DATETIME => SqlType::Date(None),
+        SQL_TYPE_TIME | SQL_TIME | SQL_SS_TIME2 => SqlType::Time(None),
+        SQL_TYPE_TIMESTAMP | SQL_TIMESTAMP => SqlType::DateTime2(None),
         SQL_SS_TIMESTAMPOFFSET => SqlType::DateTimeOffset(None),
         // No parameter type was supplied: fall back to the C type's family so
         // the server still receives a typed NULL.
@@ -258,6 +291,18 @@ fn null_value(sql_type: SqlSmallInt, c_type: SqlSmallInt) -> SqlType {
 
 fn utf16_bytes(text: &str) -> Vec<u8> {
     text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// SQL Server's `tinyint` is unsigned 0..=255, but ODBC reads `SQL_C_TINYINT`
+/// as a signed byte, so applications binding 128..=255 hand us -128..=-1.
+/// Reinterpret that half of the range instead of rejecting it, matching
+/// msodbcsql, which accepts the whole byte.
+fn to_tinyint(value: i64) -> Option<u8> {
+    match value {
+        0..=255 => u8::try_from(value).ok(),
+        -128..=-1 => Some(value as u8),
+        _ => None,
+    }
 }
 
 /// Coerces a decoded C value into the TDS type named by the application's
@@ -275,7 +320,7 @@ fn to_sql_type(cvalue: &CValue, param: &BoundParam) -> Option<SqlType> {
             SqlType::VarBinaryMax(Some(to_bytes(cvalue)?))
         }
         SQL_BIT => SqlType::Bit(Some(to_i64(cvalue)? != 0)),
-        SQL_TINYINT => SqlType::TinyInt(Some(u8::try_from(to_i64(cvalue)?).ok()?)),
+        SQL_TINYINT => SqlType::TinyInt(Some(to_tinyint(to_i64(cvalue)?)?)),
         SQL_SMALLINT => SqlType::SmallInt(Some(i16::try_from(to_i64(cvalue)?).ok()?)),
         SQL_INTEGER => SqlType::Int(Some(i32::try_from(to_i64(cvalue)?).ok()?)),
         SQL_BIGINT => SqlType::BigInt(Some(to_i64(cvalue)?)),
@@ -283,9 +328,11 @@ fn to_sql_type(cvalue: &CValue, param: &BoundParam) -> Option<SqlType> {
         SQL_FLOAT | SQL_DOUBLE => SqlType::Float(Some(to_f64(cvalue)?)),
         SQL_DECIMAL | SQL_NUMERIC => SqlType::Decimal(Some(to_decimal(cvalue, param)?)),
         SQL_GUID => SqlType::Uuid(Some(to_uuid(cvalue)?)),
-        SQL_TYPE_DATE => SqlType::Date(Some(to_date(cvalue)?)),
-        SQL_TYPE_TIME | SQL_SS_TIME2 => SqlType::Time(Some(to_time(cvalue, param)?)),
-        SQL_TYPE_TIMESTAMP => SqlType::DateTime2(Some(to_datetime2(cvalue, param)?)),
+        SQL_TYPE_DATE | SQL_DATETIME => SqlType::Date(Some(to_date(cvalue)?)),
+        SQL_TYPE_TIME | SQL_TIME | SQL_SS_TIME2 => SqlType::Time(Some(to_time(cvalue, param)?)),
+        SQL_TYPE_TIMESTAMP | SQL_TIMESTAMP => {
+            SqlType::DateTime2(Some(to_datetime2(cvalue, param)?))
+        }
         SQL_SS_TIMESTAMPOFFSET => SqlType::DateTimeOffset(Some(to_datetimeoffset(cvalue, param)?)),
         // Unknown parameter type: send the value in its natural family.
         _ => natural_sql_type(cvalue),
@@ -506,9 +553,15 @@ fn time_scale(param: &BoundParam) -> u8 {
     }
 }
 
+/// TDS carries time-of-day as 100-nanosecond ticks since midnight, so callers
+/// must convert before populating [`SqlTime`].
+fn time_ticks(cvalue: &CValue) -> Option<u64> {
+    Some(time_nanos(cvalue)? / 100)
+}
+
 fn to_time(cvalue: &CValue, param: &BoundParam) -> Option<SqlTime> {
     Some(SqlTime {
-        time_nanoseconds: time_nanos(cvalue)?,
+        time_nanoseconds: time_ticks(cvalue)?,
         scale: time_scale(param),
     })
 }
@@ -519,7 +572,7 @@ fn to_datetime2(cvalue: &CValue, param: &BoundParam) -> Option<SqlDateTime2> {
     Some(SqlDateTime2 {
         days: u32::try_from(days).ok()?,
         time: SqlTime {
-            time_nanoseconds: time_nanos(cvalue).unwrap_or(0),
+            time_nanoseconds: time_ticks(cvalue).unwrap_or(0),
             scale: time_scale(param),
         },
     })
@@ -564,6 +617,10 @@ pub(crate) fn is_valid_sql_type(sql_type: SqlSmallInt) -> bool {
             | SQL_TYPE_DATE
             | SQL_TYPE_TIME
             | SQL_TYPE_TIMESTAMP
+            // ODBC 2.x aliases; mssql-python still binds Python `date` as 9.
+            | SQL_DATETIME
+            | SQL_TIME
+            | SQL_TIMESTAMP
             | SQL_SS_TIME2
             | SQL_SS_TIMESTAMPOFFSET
     )
@@ -611,9 +668,9 @@ fn sql_family(sql_type: SqlSmallInt) -> Option<Family> {
         SQL_DECIMAL | SQL_NUMERIC | SQL_SMALLINT | SQL_INTEGER | SQL_BIGINT | SQL_TINYINT
         | SQL_BIT | SQL_REAL | SQL_FLOAT | SQL_DOUBLE => Family::Number,
         SQL_GUID => Family::Guid,
-        SQL_TYPE_DATE => Family::Date,
-        SQL_TYPE_TIME | SQL_SS_TIME2 => Family::Time,
-        SQL_TYPE_TIMESTAMP | SQL_SS_TIMESTAMPOFFSET => Family::Timestamp,
+        SQL_TYPE_DATE | SQL_DATETIME => Family::Date,
+        SQL_TYPE_TIME | SQL_TIME | SQL_SS_TIME2 => Family::Time,
+        SQL_TYPE_TIMESTAMP | SQL_TIMESTAMP | SQL_SS_TIMESTAMPOFFSET => Family::Timestamp,
         _ => return None,
     };
     Some(family)
@@ -675,6 +732,56 @@ mod tests {
         let mut p = param(c_type, ptr, ind);
         p.sql_type = sql_type;
         p
+    }
+
+    #[test]
+    fn null_decimal_declares_the_bound_precision_and_scale() {
+        let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), std::ptr::null_mut());
+        p.column_size = 31;
+        p.decimal_digits = 10;
+        assert_eq!(
+            null_decimal_meta(&SqlType::Decimal(None), &p),
+            Some((31, 10))
+        );
+    }
+
+    #[test]
+    fn null_decimal_without_a_column_size_declares_the_widest_type() {
+        let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), std::ptr::null_mut());
+        p.decimal_digits = 4;
+        assert_eq!(
+            null_decimal_meta(&SqlType::Numeric(None), &p),
+            Some((MAX_DECIMAL_PRECISION, 4))
+        );
+    }
+
+    #[test]
+    fn null_decimal_precision_is_never_below_its_scale() {
+        let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), std::ptr::null_mut());
+        p.column_size = 2;
+        p.decimal_digits = 10;
+        assert_eq!(
+            null_decimal_meta(&SqlType::Decimal(None), &p),
+            Some((10, 10))
+        );
+    }
+
+    #[test]
+    fn non_null_and_non_decimal_values_declare_themselves() {
+        let p = param(SQL_C_CHAR, std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(null_decimal_meta(&SqlType::Int(None), &p), None);
+        assert_eq!(
+            null_decimal_meta(
+                &SqlType::Decimal(Some(DecimalParts {
+                    is_positive: true,
+                    scale: 2,
+                    precision: 10,
+                    int_parts: vec![1],
+                })),
+                &p
+            ),
+            None
+        );
     }
 
     #[test]
@@ -922,7 +1029,7 @@ mod tests {
                 assert_eq!(dt.days, (days_from_civil(2024, 3, 15) + 719_162) as u32);
                 assert_eq!(
                     dt.time.time_nanoseconds,
-                    (12 * 3600 + 30 * 60 + 45) * 1_000_000_000 + 500_000_000
+                    (12 * 3600 + 30 * 60 + 45) * 10_000_000 + 5_000_000
                 );
             }
             other => panic!("expected DateTime2, got {other:?}"),

@@ -36,10 +36,14 @@ pub(crate) enum WriteError {
 }
 
 /// Normalized view of a column value, decoupled from the TDS representation.
-enum Cell {
+pub(crate) enum Cell {
     Int(i64),
     UInt(u64),
     Double(f64),
+    /// `money` / `smallmoney` as its raw scaled integer (4 decimal places).
+    /// Kept exact so character and `SQL_C_NUMERIC` targets don't inherit `f64`
+    /// rounding at the edges of the `money` range.
+    Money(i64),
     Bool(bool),
     Text(String),
     Binary(Vec<u8>),
@@ -52,14 +56,14 @@ enum Cell {
 }
 
 #[derive(Clone, Copy)]
-struct CivilDate {
+pub(in crate::api) struct CivilDate {
     year: i32,
     month: u32,
     day: u32,
 }
 
 #[derive(Clone, Copy, Default)]
-struct CivilTime {
+pub(in crate::api) struct CivilTime {
     hour: u32,
     minute: u32,
     second: u32,
@@ -93,6 +97,9 @@ fn civil_from_days(z: i64) -> CivilDate {
     }
 }
 
+/// TDS `SqlTime::time_nanoseconds` is actually a count of 100ns ticks (the
+/// decoder normalizes every scale to that unit), so callers converting a TDS
+/// time must go through [`time_from_ticks`], not this helper.
 fn time_from_nanos(total_nanos: u64, scale: u8) -> CivilTime {
     let secs = total_nanos / 1_000_000_000;
     CivilTime {
@@ -102,6 +109,11 @@ fn time_from_nanos(total_nanos: u64, scale: u8) -> CivilTime {
         nanos: (total_nanos % 1_000_000_000) as u32,
         scale,
     }
+}
+
+/// Converts TDS 100ns ticks since midnight into a civil time.
+fn time_from_ticks(ticks_100ns: u64, scale: u8) -> CivilTime {
+    time_from_nanos(ticks_100ns.saturating_mul(100), scale)
 }
 
 impl CivilDate {
@@ -122,13 +134,19 @@ impl CivilTime {
     }
 }
 
-fn money_to_f64(lsb: i32, msb: i32) -> f64 {
-    let combined = ((msb as i64) << 32) | ((lsb as u32) as i64);
-    combined as f64 / 10_000.0
+fn money_scaled(lsb: i32, msb: i32) -> i64 {
+    ((msb as i64) << 32) | ((lsb as u32) as i64)
+}
+
+/// Renders a scaled `money` integer with its four implied decimal places.
+fn money_text(scaled: i64) -> String {
+    let sign = if scaled < 0 { "-" } else { "" };
+    let abs = scaled.unsigned_abs();
+    format!("{sign}{}.{:04}", abs / 10_000, abs % 10_000)
 }
 
 /// Projects a TDS column value onto the normalized [`Cell`] model.
-fn to_cell(v: &ColumnValues) -> Option<Cell> {
+pub(crate) fn to_cell(v: &ColumnValues) -> Option<Cell> {
     Some(match v {
         ColumnValues::TinyInt(x) => Cell::UInt(u64::from(*x)),
         ColumnValues::SmallInt(x) => Cell::Int(i64::from(*x)),
@@ -143,19 +161,19 @@ fn to_cell(v: &ColumnValues) -> Option<Cell> {
         ColumnValues::Json(j) => Cell::Text(j.as_string()),
         ColumnValues::Bytes(b) => Cell::Binary(b.clone()),
         ColumnValues::Uuid(u) => Cell::Guid(*u.as_bytes()),
-        ColumnValues::SmallMoney(m) => Cell::Double(f64::from(m.int_val) / 10_000.0),
-        ColumnValues::Money(m) => Cell::Double(money_to_f64(m.lsb_part, m.msb_part)),
+        ColumnValues::SmallMoney(m) => Cell::Money(i64::from(m.int_val)),
+        ColumnValues::Money(m) => Cell::Money(money_scaled(m.lsb_part, m.msb_part)),
         ColumnValues::Date(d) => Cell::Date(civil_from_days(
             i64::from(d.get_days()) - DAYS_YEAR_ONE_TO_EPOCH,
         )),
-        ColumnValues::Time(t) => Cell::Time(time_from_nanos(t.time_nanoseconds, t.scale)),
+        ColumnValues::Time(t) => Cell::Time(time_from_ticks(t.time_nanoseconds, t.scale)),
         ColumnValues::DateTime2(dt) => Cell::Timestamp(
             civil_from_days(i64::from(dt.days) - DAYS_YEAR_ONE_TO_EPOCH),
-            time_from_nanos(dt.time.time_nanoseconds, dt.time.scale),
+            time_from_ticks(dt.time.time_nanoseconds, dt.time.scale),
         ),
         ColumnValues::DateTimeOffset(dto) => Cell::TimestampOffset(
             civil_from_days(i64::from(dto.datetime2.days) - DAYS_YEAR_ONE_TO_EPOCH),
-            time_from_nanos(
+            time_from_ticks(
                 dto.datetime2.time.time_nanoseconds,
                 dto.datetime2.time.scale,
             ),
@@ -185,6 +203,7 @@ impl Cell {
             Cell::Int(x) => x.to_string(),
             Cell::UInt(x) => x.to_string(),
             Cell::Double(x) => x.to_string(),
+            Cell::Money(x) => money_text(*x),
             Cell::Bool(x) => (if *x { "1" } else { "0" }).to_string(),
             Cell::Text(s) => s.clone(),
             Cell::Binary(b) => b.iter().map(|byte| format!("{byte:02X}")).collect(),
@@ -207,11 +226,12 @@ impl Cell {
         }
     }
 
-    fn as_i64(&self) -> Option<i64> {
+    pub(crate) fn as_i64(&self) -> Option<i64> {
         match self {
             Cell::Int(x) => Some(*x),
             Cell::UInt(x) => i64::try_from(*x).ok(),
             Cell::Double(x) => Some(x.round() as i64),
+            Cell::Money(x) => Some(x / 10_000),
             Cell::Bool(x) => Some(i64::from(*x)),
             Cell::Decimal(d) => d.to_decimal_string().parse::<f64>().ok().map(|f| f as i64),
             Cell::Text(s) => s.trim().parse::<i64>().ok(),
@@ -224,6 +244,7 @@ impl Cell {
             Cell::Int(x) => Some(*x as f64),
             Cell::UInt(x) => Some(*x as f64),
             Cell::Double(x) => Some(*x),
+            Cell::Money(x) => Some(*x as f64 / 10_000.0),
             Cell::Bool(x) => Some(f64::from(u8::from(*x))),
             Cell::Decimal(d) => d.to_decimal_string().parse::<f64>().ok(),
             Cell::Text(s) => s.trim().parse::<f64>().ok(),
@@ -355,12 +376,15 @@ pub(crate) unsafe fn write_c_value(
             let v = cell.as_i64().ok_or(WriteError::RestrictedConversion)?;
             Ok(unsafe { write_pod::<u8>(target_value_ptr, strlen_or_ind_ptr, u8::from(v != 0)) })
         }
-        SQL_C_STINYINT | SQL_C_TINYINT => {
+        SQL_C_STINYINT => {
             let v = cell.as_i64().ok_or(WriteError::RestrictedConversion)?;
             let v = i8::try_from(v).map_err(|_| WriteError::OutOfRange)?;
             Ok(unsafe { write_pod(target_value_ptr, strlen_or_ind_ptr, v) })
         }
-        SQL_C_UTINYINT => {
+        // SQL Server's `tinyint` is unsigned 0..=255 and msodbcsql treats the
+        // unqualified `SQL_C_TINYINT` alias as unsigned for it, so 128..=255
+        // round-trips instead of overflowing a signed byte.
+        SQL_C_UTINYINT | SQL_C_TINYINT => {
             let v = cell.as_i64().ok_or(WriteError::RestrictedConversion)?;
             let v = u8::try_from(v).map_err(|_| WriteError::OutOfRange)?;
             Ok(unsafe { write_pod(target_value_ptr, strlen_or_ind_ptr, v) })
@@ -779,8 +803,10 @@ mod tests {
 
     #[test]
     fn time_to_ss_time2() {
+        // The TDS field counts 100-nanosecond ticks, and SQL_SS_TIME2 reports
+        // nanoseconds.
         let value = ColumnValues::Time(SqlTime {
-            time_nanoseconds: (13 * 3600 + 45 * 60 + 7) * 1_000_000_000 + 123_456_700,
+            time_nanoseconds: (13 * 3600 + 45 * 60 + 7) * 10_000_000 + 1_234_567,
             scale: 7,
         });
         let mut out = SqlSsTime2Struct::default();
