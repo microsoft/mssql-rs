@@ -110,7 +110,7 @@ Section "SUMMARY [$Label]"
 $results | Format-Table -AutoSize | Out-String | Write-Host
 Write-Host "##[section]DISK-THROUGHPUT-RESULT label=$Label"
 foreach ($r in $results) {
-    Write-Host ("RESULT|{0}|{1}|{2:N2}|{3:N2}" -f $Label, $r.Scenario, $r.'MB/s', $r.'IOPS')
+    Write-Host ("RESULT|{0}|{1}|{2:F2}|{3:F2}" -f $Label, $r.Scenario, $r.'MB/s', $r.'IOPS')
 }
 
 # --- Publish a per-job markdown summary to the build Summary tab ---
@@ -122,7 +122,7 @@ $md = New-Object System.Text.StringBuilder
 [void]$md.AppendLine("| Scenario | MB/s | IOPS |")
 [void]$md.AppendLine("|---|---:|---:|")
 foreach ($r in $results) {
-    [void]$md.AppendLine("| {0} | {1:N2} | {2:N2} |" -f $r.Scenario, $r.'MB/s', $r.'IOPS')
+    [void]$md.AppendLine(("| {0} | {1:F2} | {2:F2} |" -f $r.Scenario, $r.'MB/s', $r.'IOPS'))
 }
 $tempDir = $env:AGENT_TEMPDIRECTORY; if (-not $tempDir) { $tempDir = $TargetDir }
 $summaryPath = Join-Path $tempDir 'disk-summary.md'
@@ -134,7 +134,7 @@ $staging = $env:BUILD_ARTIFACTSTAGINGDIRECTORY
 if ($staging) {
     New-Item -ItemType Directory -Force -Path $staging | Out-Null
     $lines = foreach ($r in $results) {
-        "RESULT|{0}|{1}|{2:N2}|{3:N2}" -f $Label, $r.Scenario, $r.'MB/s', $r.'IOPS'
+        "RESULT|{0}|{1}|{2:F2}|{3:F2}" -f $Label, $r.Scenario, $r.'MB/s', $r.'IOPS'
     }
     Set-Content -Path (Join-Path $staging 'results.txt') -Value $lines
 }
