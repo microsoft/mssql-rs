@@ -148,6 +148,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         Ok(mut state) => {
             if let Some(row) = state.buffered_rows.pop_front() {
                 state.current_row = Some(row);
+                state.reset_getdata();
                 debug!("SQLFetch: row served from read-ahead buffer");
                 return SQL_SUCCESS;
             }
@@ -250,6 +251,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 return SQL_ERROR;
             };
             stmt_state.current_row = Some(row);
+            stmt_state.reset_getdata();
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();

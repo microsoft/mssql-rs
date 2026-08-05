@@ -119,59 +119,6 @@ pub(crate) unsafe fn sql_describe_param(
     })
 }
 
-/// Implements `SQLParamData`.
-///
-/// The driver never returns `SQL_NEED_DATA`, so reaching this entry point means
-/// the application called it out of sequence.
-///
-/// # Safety
-/// `statement_handle` must be a valid `StmtHandle` or null.
-pub(crate) unsafe fn sql_param_data(
-    statement_handle: SqlHandle,
-    _value_ptr_ptr: *mut SqlPointer,
-) -> SqlReturn {
-    crate::ffi_entry!("SQLParamData", unsafe {
-        sequence_error(statement_handle, "SQLParamData")
-    })
-}
-
-/// Implements `SQLPutData`.
-///
-/// # Safety
-/// `statement_handle` must be a valid `StmtHandle` or null.
-pub(crate) unsafe fn sql_put_data(
-    statement_handle: SqlHandle,
-    _data_ptr: SqlPointer,
-    _str_len_or_ind: SqlLen,
-) -> SqlReturn {
-    crate::ffi_entry!("SQLPutData", unsafe {
-        sequence_error(statement_handle, "SQLPutData")
-    })
-}
-
-/// # Safety
-/// `statement_handle` must be a valid `StmtHandle` or null.
-unsafe fn sequence_error(statement_handle: SqlHandle, name: &str) -> SqlReturn {
-    if statement_handle.is_null() {
-        error!("{name}: statement_handle is null");
-        return SQL_INVALID_HANDLE;
-    }
-    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
-    debug_assert_eq!(stmt.object_type, HandleType::Stmt);
-    let Ok(mut state) = stmt.inner.lock() else {
-        error!("{name}: stmt mutex poisoned");
-        return SQL_ERROR;
-    };
-    free_errors(&mut state);
-    post_sql_error(
-        &mut state,
-        super::sqlstate::SQLSTATE_HY010,
-        0,
-        "Function sequence error",
-    );
-    SQL_ERROR
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,20 +166,6 @@ mod tests {
                 std::ptr::null_mut(),
             )
         };
-        assert_eq!(ret, SQL_ERROR);
-    }
-
-    #[test]
-    fn param_data_out_of_sequence() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let ret = unsafe { sql_param_data(h.stmt, std::ptr::null_mut()) };
-        assert_eq!(ret, SQL_ERROR);
-    }
-
-    #[test]
-    fn put_data_out_of_sequence() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let ret = unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), 0) };
         assert_eq!(ret, SQL_ERROR);
     }
 }

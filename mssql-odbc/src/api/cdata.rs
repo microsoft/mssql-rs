@@ -10,6 +10,7 @@
 
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::decoder::DecimalParts;
+use mssql_tds::datatypes::sql_string::EncodingType;
 
 use super::odbc_types::*;
 use super::util::{copy_with_nul, write_if_some};
@@ -555,7 +556,7 @@ fn numeric_struct(d: &DecimalParts) -> SqlNumericStruct {
     }
 }
 
-fn wchar_capacity(buffer_length: SqlLen) -> usize {
+pub(crate) fn wchar_capacity(buffer_length: SqlLen) -> usize {
     (buffer_length.max(0) as usize) / std::mem::size_of::<SqlWChar>()
 }
 
@@ -602,6 +603,91 @@ unsafe fn write_binary(
         WriteOutcome::Truncated
     } else {
         WriteOutcome::Complete
+    }
+}
+
+/// Character/binary payload for a column, ready to be streamed by `SQLGetData`.
+///
+/// `SQLGetData` returns long values in chunks, so the payload has to be
+/// materialized once and then sliced at a byte offset across calls. Fixed-width
+/// C types are never chunked and are served directly by [`write_c_value`].
+pub(crate) enum StreamPayload {
+    /// Narrow character bytes, terminated with a single NUL when copied out.
+    Narrow(Vec<u8>),
+    /// UTF-16LE code units.
+    Wide(Vec<SqlWChar>),
+    /// Raw bytes, copied without a terminator.
+    Binary(Vec<u8>),
+}
+
+/// Materializes the streamable payload for a column value, or `None` when the
+/// target C type is fixed-width.
+pub(crate) fn stream_payload(
+    value: &ColumnValues,
+    target_type: SqlSmallInt,
+) -> Option<Result<StreamPayload, WriteError>> {
+    match target_type {
+        SQL_C_CHAR | SQL_C_DEFAULT => Some(Ok(StreamPayload::Narrow(narrow_bytes(value)?))),
+        SQL_C_WCHAR => {
+            let cell = to_cell(value)?;
+            Some(Ok(StreamPayload::Wide(
+                cell.to_text().encode_utf16().collect(),
+            )))
+        }
+        SQL_C_BINARY => {
+            let Some(cell) = to_cell(value) else {
+                // Vectors and other values without a Cell projection still have
+                // a byte form on the wire; treat them as opaque binary.
+                return Some(Err(WriteError::RestrictedConversion));
+            };
+            Some(match cell.as_bytes() {
+                Some(bytes) => Ok(StreamPayload::Binary(bytes)),
+                None => Err(WriteError::RestrictedConversion),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Produces the bytes msodbcsql hands back for a narrow (`SQL_C_CHAR`) target.
+///
+/// Character columns with a collation-derived encoding are passed through in
+/// their original code page rather than transcoded to UTF-8: that is what the
+/// native driver does on Windows, and clients decode using the column collation.
+fn narrow_bytes(value: &ColumnValues) -> Option<Vec<u8>> {
+    if let ColumnValues::String(s) = value
+        && matches!(s.encoding_type(), EncodingType::LcidBased(_))
+    {
+        return Some(s.bytes.clone());
+    }
+    Some(to_cell(value)?.to_text().into_bytes())
+}
+
+/// Maps a column value to the `SQL_C_*` code msodbcsql reports through
+/// `SQL_CA_SS_VARIANT_TYPE` for a `sql_variant` column.
+pub(crate) fn variant_c_type(value: &ColumnValues) -> SqlSmallInt {
+    match value {
+        ColumnValues::TinyInt(_) => SQL_C_UTINYINT,
+        ColumnValues::SmallInt(_) => SQL_C_SSHORT,
+        ColumnValues::Int(_) => SQL_C_SLONG,
+        ColumnValues::BigInt(_) => SQL_C_SBIGINT,
+        ColumnValues::Real(_) => SQL_C_FLOAT,
+        ColumnValues::Float(_) => SQL_C_DOUBLE,
+        ColumnValues::Bit(_) => SQL_C_BIT,
+        ColumnValues::Decimal(_)
+        | ColumnValues::Numeric(_)
+        | ColumnValues::Money(_)
+        | ColumnValues::SmallMoney(_) => SQL_C_NUMERIC,
+        ColumnValues::Bytes(_) => SQL_C_BINARY,
+        ColumnValues::Uuid(_) => SQL_C_GUID,
+        ColumnValues::Date(_) => SQL_C_TYPE_DATE,
+        ColumnValues::Time(_) => SQL_C_TYPE_TIME,
+        ColumnValues::DateTime2(_) | ColumnValues::DateTime(_) | ColumnValues::SmallDateTime(_) => {
+            SQL_C_TYPE_TIMESTAMP
+        }
+        ColumnValues::String(s) if s.is_utf16() => SQL_C_WCHAR,
+        ColumnValues::String(_) => SQL_C_CHAR,
+        _ => SQL_C_WCHAR,
     }
 }
 

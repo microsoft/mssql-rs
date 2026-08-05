@@ -10,6 +10,7 @@ mod close_cursor;
 mod col_attribute;
 mod conn_exec;
 mod connect;
+mod dae;
 mod desc;
 mod describe_col;
 mod disconnect;

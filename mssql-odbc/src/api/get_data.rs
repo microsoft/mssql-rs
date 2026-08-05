@@ -3,16 +3,21 @@
 
 //! Minimal SQLGetData implementation for Phase 1.
 
+use mssql_tds::datatypes::column_values::ColumnValues;
 use tracing::{debug, error};
 
-use super::cdata::{WriteError, WriteOutcome, write_c_value};
+use super::cdata::{
+    StreamPayload, WriteError, WriteOutcome, stream_payload, wchar_capacity, write_c_value,
+};
 use super::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen,
-    SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt,
+    SQL_C_CHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NULL_DATA, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt,
+    SqlWChar,
 };
 use super::sqlstate::*;
+use super::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
+use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Implements SQLGetData for current-row retrieval.
@@ -120,6 +125,55 @@ fn sql_get_data_safe(
     }
 
     let value = row[col_index - 1].clone();
+
+    // A NULL buffer is the "how long is this value?" probe (and, for
+    // sql_variant, the call that primes SQL_CA_SS_VARIANT_TYPE). It must report
+    // the length without consuming any of the value, and must succeed even when
+    // the requested C type could not actually render the value — clients probe
+    // with SQL_C_BINARY before they know the underlying type. `BufferLength` is
+    // ignored for fixed-width C types, so a zero length only means "probe" for
+    // the character and binary targets.
+    let streamable = stream_payload(&value, target_type).is_some();
+    if target_value_ptr.is_null() || (buffer_length == 0 && streamable) {
+        let indicator = if matches!(value, ColumnValues::Null) {
+            SQL_NULL_DATA
+        } else {
+            probe_length(&value, target_type)
+        };
+        unsafe { write_if_some(strlen_or_ind_ptr, indicator) };
+        return SQL_SUCCESS;
+    }
+
+    if let Some(payload) = stream_payload(&value, target_type) {
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(WriteError::RestrictedConversion) => {
+                post_diag(&mut stmt_state, ERR_RESTRICTED_DATA_TYPE);
+                return SQL_ERROR;
+            }
+            Err(_) => {
+                post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
+                return SQL_ERROR;
+            }
+        };
+        return get_data_chunk(
+            &mut stmt_state,
+            col_index,
+            &payload,
+            target_value_ptr,
+            buffer_length,
+            strlen_or_ind_ptr,
+        );
+    }
+
+    // Fixed-width targets are delivered whole; a repeat call yields SQL_NO_DATA.
+    if stmt_state.getdata_col == Some(col_index) && stmt_state.getdata_done {
+        return SQL_NO_DATA;
+    }
+    stmt_state.getdata_col = Some(col_index);
+    stmt_state.getdata_offset = 0;
+    stmt_state.getdata_done = true;
+
     match unsafe {
         write_c_value(
             &value,
@@ -151,6 +205,97 @@ fn sql_get_data_safe(
             );
             SQL_ERROR
         }
+    }
+}
+
+/// Byte length reported for a zero-length `SQLGetData` probe.
+///
+/// Falls back to the narrow rendering when the requested C type cannot express
+/// the value, so that a probe never fails.
+fn probe_length(value: &ColumnValues, target_type: SqlSmallInt) -> SqlLen {
+    match stream_payload(value, target_type) {
+        Some(Ok(StreamPayload::Narrow(b))) | Some(Ok(StreamPayload::Binary(b))) => {
+            b.len() as SqlLen
+        }
+        Some(Ok(StreamPayload::Wide(w))) => (w.len() * size_of::<SqlWChar>()) as SqlLen,
+        _ => match stream_payload(value, SQL_C_CHAR) {
+            Some(Ok(StreamPayload::Narrow(b))) => b.len() as SqlLen,
+            _ => 0,
+        },
+    }
+}
+
+/// Copies the next chunk of a streamable column value into the caller's buffer,
+/// advancing the per-column offset.
+///
+/// Returns `SQL_SUCCESS_WITH_INFO` (01004) while data remains, `SQL_SUCCESS` on
+/// the chunk that completes the value, and `SQL_NO_DATA` on any call after that.
+/// The indicator always reports the number of bytes still available *before*
+/// this call, which is what ODBC clients use to size the next read.
+fn get_data_chunk(
+    stmt_state: &mut StmtState,
+    col_index: usize,
+    payload: &StreamPayload,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
+    if stmt_state.getdata_col != Some(col_index) {
+        stmt_state.getdata_col = Some(col_index);
+        stmt_state.getdata_offset = 0;
+        stmt_state.getdata_done = false;
+    }
+
+    let (total_units, unit_size) = match payload {
+        StreamPayload::Narrow(b) | StreamPayload::Binary(b) => (b.len(), 1usize),
+        StreamPayload::Wide(w) => (w.len(), size_of::<SqlWChar>()),
+    };
+
+    if stmt_state.getdata_done {
+        return SQL_NO_DATA;
+    }
+
+    let offset = stmt_state.getdata_offset;
+    let remaining = total_units.saturating_sub(offset);
+    unsafe { write_if_some(strlen_or_ind_ptr, (remaining * unit_size) as SqlLen) };
+
+    // Character targets reserve one unit for the terminator; binary does not.
+    let capacity = match payload {
+        StreamPayload::Narrow(_) => (buffer_length.max(0) as usize).saturating_sub(1),
+        StreamPayload::Wide(_) => wchar_capacity(buffer_length).saturating_sub(1),
+        StreamPayload::Binary(_) => buffer_length.max(0) as usize,
+    };
+    let copied = remaining.min(capacity);
+
+    unsafe {
+        match payload {
+            StreamPayload::Narrow(b) => {
+                let dst = target_value_ptr as *mut u8;
+                std::ptr::copy_nonoverlapping(b[offset..offset + copied].as_ptr(), dst, copied);
+                *dst.add(copied) = 0;
+            }
+            StreamPayload::Wide(w) => {
+                let dst = target_value_ptr as *mut SqlWChar;
+                std::ptr::copy_nonoverlapping(w[offset..offset + copied].as_ptr(), dst, copied);
+                *dst.add(copied) = 0;
+            }
+            StreamPayload::Binary(b) => {
+                std::ptr::copy_nonoverlapping(
+                    b[offset..offset + copied].as_ptr(),
+                    target_value_ptr as *mut u8,
+                    copied,
+                );
+            }
+        }
+    }
+
+    stmt_state.getdata_offset = offset + copied;
+    if stmt_state.getdata_offset >= total_units {
+        stmt_state.getdata_done = true;
+        SQL_SUCCESS
+    } else {
+        post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+        SQL_SUCCESS_WITH_INFO
     }
 }
 

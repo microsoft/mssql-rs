@@ -107,8 +107,52 @@ pub(crate) struct StmtState {
     /// `None` slots are gaps left by binding a higher ordinal first, or columns
     /// explicitly unbound with a null buffer pointer.
     pub(crate) bound_cols: Vec<Option<BoundCol>>,
+    /// Column currently being streamed by `SQLGetData`.
+    pub(crate) getdata_col: Option<usize>,
+    /// Units of that column already delivered.
+    pub(crate) getdata_offset: usize,
+    /// Whether the streamed column has been fully delivered.
+    pub(crate) getdata_done: bool,
+    /// Number of parameter-array elements per execution (`SQL_ATTR_PARAMSET_SIZE`).
+    pub(crate) paramset_size: SqlULen,
+    /// In-flight data-at-execution state, present between the `SQL_NEED_DATA`
+    /// return from `SQLExecute`/`SQLExecDirect` and the final `SQLParamData`
+    /// that actually runs the statement.
+    pub(crate) dae: Option<DaeState>,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
+}
+
+/// Deferred execution state for data-at-execution (DAE) parameters.
+///
+/// ODBC streams oversized parameter values *after* `SQLExecute` returns
+/// `SQL_NEED_DATA`: the application loops `SQLParamData` (which names the next
+/// hungry parameter) and `SQLPutData` (which feeds it) until every DAE
+/// parameter is satisfied, at which point `SQLParamData` performs the real
+/// execution. The statement text and prepared-handle bookkeeping captured at
+/// staging time are parked here for that final call.
+#[derive(Debug)]
+pub(crate) struct DaeState {
+    /// Rewritten SQL (`?` markers replaced with `@P<n>`).
+    pub(crate) rewritten_sql: String,
+    /// Number of parameter markers in the statement.
+    pub(crate) marker_count: usize,
+    /// Cached server-side prepared handle, if the statement was already
+    /// prepared.
+    pub(crate) handle: Option<i32>,
+    /// A superseded prepared handle to drop on the server during execution.
+    pub(crate) drop_handle: Option<i32>,
+    /// Zero-based indexes of parameters awaiting data, in ODBC order.
+    pub(crate) order: Vec<usize>,
+    /// Position within `order` of the next parameter to hand out.
+    pub(crate) next: usize,
+    /// Parameter currently being fed by `SQLPutData`.
+    pub(crate) current: Option<usize>,
+    /// Accumulated bytes per parameter index (`None` = the application sent
+    /// `SQL_NULL_DATA`).
+    pub(crate) data: Vec<Option<Vec<u8>>>,
+    /// Entry point that started the DAE sequence, for diagnostics.
+    pub(crate) op: &'static str,
 }
 
 /// A result column bound to an application buffer by `SQLBindCol`.
@@ -136,6 +180,15 @@ impl StmtState {
         self.current_row = None;
         self.buffered_rows.clear();
         self.buffered_eof = false;
+        self.reset_getdata();
+    }
+
+    /// Clears `SQLGetData` streaming position; called whenever the current row
+    /// changes, since offsets are only meaningful within a single row.
+    pub(crate) fn reset_getdata(&mut self) {
+        self.getdata_col = None;
+        self.getdata_offset = 0;
+        self.getdata_done = false;
     }
 
     pub(crate) fn has_state(&self, mask: u32) -> bool {
@@ -207,6 +260,11 @@ impl StmtHandle {
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
                 bound_cols: Vec::new(),
+                getdata_col: None,
+                getdata_offset: 0,
+                getdata_done: false,
+                paramset_size: 1,
+                dae: None,
                 state_flags: 0,
             }),
         }

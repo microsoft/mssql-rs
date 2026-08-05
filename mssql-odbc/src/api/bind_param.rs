@@ -234,7 +234,8 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_INTEGER, SQL_NULL_HANDLE, SQL_PARAM_OUTPUT, SQL_VARCHAR,
+        SQL_C_CHAR, SQL_C_TYPE_TIMESTAMP, SQL_INTEGER, SQL_NULL_HANDLE, SQL_PARAM_OUTPUT,
+        SQL_VARCHAR,
     };
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
@@ -399,7 +400,7 @@ mod tests {
                 h.stmt,
                 1,
                 SQL_PARAM_INPUT,
-                SQL_INTEGER,
+                SQL_C_TYPE_TIMESTAMP,
                 SQL_INTEGER,
                 0,
                 0,

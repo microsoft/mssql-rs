@@ -848,7 +848,7 @@ pub unsafe extern "C" fn SQLParamData(
     value_ptr_ptr: *mut SqlPointer,
 ) -> SqlReturn {
     crate::init_tracing();
-    unsafe { super::desc::sql_param_data(statement_handle, value_ptr_ptr) }
+    unsafe { super::dae::sql_param_data(statement_handle, value_ptr_ptr) }
 }
 
 /// Supplies a chunk of data-at-execution parameter data.
@@ -862,7 +862,7 @@ pub unsafe extern "C" fn SQLPutData(
     str_len_or_ind: SqlLen,
 ) -> SqlReturn {
     crate::init_tracing();
-    unsafe { super::desc::sql_put_data(statement_handle, data_ptr, str_len_or_ind) }
+    unsafe { super::dae::sql_put_data(statement_handle, data_ptr, str_len_or_ind) }
 }
 
 // ---- Catalog functions -------------------------------------------------------

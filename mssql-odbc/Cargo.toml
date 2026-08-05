@@ -26,6 +26,7 @@ azure_core = { version = "1.1", default-features = false, features = [
 ] }
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream"] }
 url = "2"
+uuid = "1.19.0"
 
 [dev-dependencies]
 # Enable the `test-util` feature on mssql-tds so unit tests can build a
@@ -34,3 +35,4 @@ url = "2"
 mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
 
 [build-dependencies]
+

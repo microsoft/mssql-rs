@@ -9,10 +9,10 @@ use tracing::{debug, error};
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DECIMAL, SQL_DOUBLE, SQL_ERROR, SQL_GUID,
     SQL_INTEGER, SQL_INVALID_HANDLE, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NO_NULLS,
-    SQL_NULLABLE, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIMESTAMP, SQL_UNKNOWN_TYPE,
-    SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlHandle, SqlReturn,
-    SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_NULLABLE, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT,
+    SQL_SS_VARIANT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE,
+    SQL_TYPE_TIMESTAMP, SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
+    SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_INDEX, ERR_STRING_RIGHT_TRUNCATION, post_diag,
@@ -210,7 +210,13 @@ pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -
         TdsDataType::Image => SQL_LONGVARBINARY,
         TdsDataType::Guid => SQL_GUID,
         TdsDataType::Xml | TdsDataType::Json => SQL_WLONGVARCHAR,
-        TdsDataType::Vector | TdsDataType::SsVariant | TdsDataType::Udt => SQL_VARCHAR,
+        TdsDataType::Vector => SQL_VARCHAR,
+        // sql_variant and UDTs (hierarchyid, geometry, geography) carry their own
+        // SQL Server-specific type codes. Reporting them as SQL_VARCHAR would make
+        // clients ask for SQL_C_CHAR and receive a rendered string instead of the
+        // typed value / raw UDT bytes.
+        TdsDataType::SsVariant => SQL_SS_VARIANT,
+        TdsDataType::Udt => SQL_SS_UDT,
         _ => SQL_UNKNOWN_TYPE,
     }
 }

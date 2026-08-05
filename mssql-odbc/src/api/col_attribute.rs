@@ -5,6 +5,7 @@
 
 use tracing::{debug, error};
 
+use super::cdata::variant_c_type;
 use super::describe_col::{column_size, decimal_digits, odbc_sql_type};
 use super::odbc_types::*;
 use super::sqlstate::{
@@ -119,6 +120,15 @@ unsafe fn sql_col_attribute_w_impl(
 
     let numeric: SqlLen = match field_identifier {
         SQL_DESC_COUNT => state.column_metadata.len() as SqlLen,
+        // sql_variant columns report the C type of the value in the current row;
+        // clients probe this to pick the right SQLGetData target type.
+        SQL_CA_SS_VARIANT_TYPE => state
+            .current_row
+            .as_ref()
+            .and_then(|row| row.get(usize::from(column_number) - 1))
+            .map_or(SqlLen::from(SQL_C_WCHAR), |v| {
+                SqlLen::from(variant_c_type(v))
+            }),
         SQL_DESC_TYPE | SQL_DESC_CONCISE_TYPE => SqlLen::from(sql_type),
         SQL_DESC_LENGTH | SQL_DESC_DISPLAY_SIZE | SQL_DESC_OCTET_LENGTH | SQL_COLUMN_LENGTH => {
             column_size(meta) as SqlLen

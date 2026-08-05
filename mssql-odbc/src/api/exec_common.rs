@@ -23,7 +23,10 @@ use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
 };
 use crate::handles::{DbcHandle, StmtHandle};
-use crate::params::convert::{ParamConvError, bound_param_to_rpc};
+use crate::params::BoundParam;
+use crate::params::convert::{
+    ParamConvError, bound_param_to_rpc_with_data, c_type_stride, is_data_at_exec,
+};
 
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
 /// statement is reusable.
@@ -204,6 +207,55 @@ pub(super) unsafe fn build_named_params(
     marker_count: usize,
     op: &str,
 ) -> Result<Vec<RpcParameter>, SqlReturn> {
+    unsafe { build_named_params_row(stmt_state, marker_count, op, None, 0) }
+}
+
+/// Reports the zero-based indexes of bound parameters whose indicator requests
+/// data-at-execution, in ODBC order.
+///
+/// # Safety
+/// Each bound parameter's indicator pointer must still satisfy the
+/// `SQLBindParameter` contract.
+pub(super) unsafe fn collect_dae_params(stmt_state: &StmtState, marker_count: usize) -> Vec<usize> {
+    (0..marker_count)
+        .filter(|&i| {
+            let Some(Some(param)) = stmt_state.bound_params.get(i) else {
+                return false;
+            };
+            !param.strlen_or_ind_ptr.is_null()
+                && is_data_at_exec(unsafe { *param.strlen_or_ind_ptr })
+        })
+        .collect()
+}
+
+/// Builds the RPC parameter list, substituting values streamed through
+/// `SQLPutData` for any parameter that was bound as data-at-execution.
+///
+/// # Safety
+/// See [`build_named_params`].
+pub(super) unsafe fn build_named_params_with_dae(
+    stmt_state: &mut StmtState,
+    marker_count: usize,
+    op: &str,
+    dae_data: Option<&[Option<Vec<u8>>]>,
+) -> Result<Vec<RpcParameter>, SqlReturn> {
+    unsafe { build_named_params_row(stmt_state, marker_count, op, dae_data, 0) }
+}
+
+/// Builds the RPC parameter list for one row of a column-wise parameter array.
+///
+/// `row` selects the element within each bound parameter's array; it is `0` for
+/// ordinary single-row execution.
+///
+/// # Safety
+/// See [`build_named_params`].
+pub(super) unsafe fn build_named_params_row(
+    stmt_state: &mut StmtState,
+    marker_count: usize,
+    op: &str,
+    dae_data: Option<&[Option<Vec<u8>>]>,
+    row: usize,
+) -> Result<Vec<RpcParameter>, SqlReturn> {
     let mut named_params = Vec::with_capacity(marker_count);
     for i in 0..marker_count {
         let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
@@ -211,8 +263,14 @@ pub(super) unsafe fn build_named_params(
             post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
             return Err(SQL_ERROR);
         };
+        let bound_param = offset_bound_param(bound_param, row);
+        let dae = dae_data.and_then(|d| {
+            let is_dae = !bound_param.strlen_or_ind_ptr.is_null()
+                && is_data_at_exec(unsafe { *bound_param.strlen_or_ind_ptr });
+            is_dae.then(|| d.get(i).and_then(|v| v.as_deref()))
+        });
         let name = format!("@P{}", i + 1);
-        match unsafe { bound_param_to_rpc(name, bound_param) } {
+        match unsafe { bound_param_to_rpc_with_data(name, &bound_param, dae) } {
             Ok(param) => named_params.push(param),
             Err(ParamConvError::InvalidLength(len)) => {
                 error!("{op}: parameter {} has invalid StrLen_or_Ind {len}", i + 1);
@@ -231,6 +289,23 @@ pub(super) unsafe fn build_named_params(
         }
     }
     Ok(named_params)
+}
+
+/// Advances a bound parameter's value and indicator pointers to element `row`
+/// of a column-wise parameter array.
+fn offset_bound_param(param: &BoundParam, row: usize) -> BoundParam {
+    let mut param = *param;
+    if row == 0 {
+        return param;
+    }
+    let stride = c_type_stride(param.c_type, param.sql_type, param.buffer_length);
+    if !param.parameter_value_ptr.is_null() {
+        param.parameter_value_ptr = param.parameter_value_ptr.wrapping_byte_add(row * stride);
+    }
+    if !param.strlen_or_ind_ptr.is_null() {
+        param.strlen_or_ind_ptr = param.strlen_or_ind_ptr.wrapping_add(row);
+    }
+    param
 }
 
 /// Captures the server-side prepared-statement handle from `sp_prepexec`'s
