@@ -3,47 +3,141 @@
 trigger:
 - development
 
+# =============================================================================
+# TEMPORARILY HIJACKED: disk-throughput probe (old pool vs NVMe pool).
+# Spawns 4 short jobs (Windows old/new, Linux old/new) that measure raw disk
+# throughput where the agent work folder lives, using cache-bypass I/O.
+# The original validation entry point is preserved (commented) at the bottom.
+# REVERT this file before merge.
+# =============================================================================
+
 parameters:
-- name: buildType
-  displayName: Type of the build to produce
-  type: string
-  values:
-  - Both
-  - Debug
-  - Release
-  default: Both
-
-- name: RunFuzz
-  displayName: Run Fuzz Tests (30 min)
-  type: boolean
-  default: false
-
-- name: RunLongHaul
-  displayName: Run Long-Haul BCP Test (30 min)
-  type: boolean
-  default: false
-
-- name: sqlInstanceMode
-  displayName: SQL host cardinality for ARM test stages
-  type: string
-  values:
-  - shared
-  - per-job
-  default: shared
-
-- name: sqlImageTag
-  displayName: SQL Server docker image tag for ARM test stages
-  type: string
-  default: '2025-latest'
+- name: fileSizeGB
+  displayName: Probe file size (GB)
+  type: number
+  default: 4
+- name: durationSec
+  displayName: Duration per scenario (seconds)
+  type: number
+  default: 20
 
 stages:
-- template: templates/validation-stages.yml
-  parameters:
-    buildType: ${{ parameters.buildType }}
-    RunFuzz: ${{ parameters.RunFuzz }}
-    RunLongHaul: ${{ parameters.RunLongHaul }}
-    sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
-    sqlImageTag: ${{ parameters.sqlImageTag }}
-    # PR validation for internal ADO and GitHub PRs. GitHub PRs run in the public
-    # project, which lacks 'Magnitude Test', so exclude the infra stages here.
-    includeInfraStages: false
+- stage: DiskThroughput
+  displayName: Disk throughput (old vs NVMe pool)
+  jobs:
+  - job: WindowsOld
+    displayName: Windows disk throughput - OLD pool
+    timeoutInMinutes: 30
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-Win22-Sql25-1P
+    steps:
+    - checkout: self
+      fetchDepth: 1
+    - task: PowerShell@2
+      displayName: Measure disk throughput (diskspd)
+      inputs:
+        filePath: .pipeline/scripts/Measure-DiskThroughput.ps1
+        arguments: >-
+          -Label "WINDOWS-OLD (RUST-1ES-POOL-WUS3)"
+          -FileSizeGB ${{ parameters.fileSizeGB }}
+          -DurationSec ${{ parameters.durationSec }}
+
+  - job: WindowsNvme
+    displayName: Windows disk throughput - NVMe pool
+    timeoutInMinutes: 30
+    pool:
+      name: RUST-1ES-POOL-WUS3-NVME
+      demands:
+        - imageOverride -equals RUST-Win22-Sql25-1P-NVME
+    steps:
+    - checkout: self
+      fetchDepth: 1
+    - task: PowerShell@2
+      displayName: Measure disk throughput (diskspd)
+      inputs:
+        filePath: .pipeline/scripts/Measure-DiskThroughput.ps1
+        arguments: >-
+          -Label "WINDOWS-NVMe (RUST-1ES-POOL-WUS3-NVME)"
+          -FileSizeGB ${{ parameters.fileSizeGB }}
+          -DurationSec ${{ parameters.durationSec }}
+
+  - job: LinuxOld
+    displayName: Linux disk throughput - OLD pool
+    timeoutInMinutes: 30
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - checkout: self
+      fetchDepth: 1
+    - bash: |
+        chmod +x .pipeline/scripts/measure-disk-throughput.sh
+        .pipeline/scripts/measure-disk-throughput.sh "LINUX-OLD (RUST-1ES-POOL-WUS3)" "" "${{ parameters.fileSizeGB }}" "${{ parameters.durationSec }}"
+      displayName: Measure disk throughput (fio)
+
+  - job: LinuxNvme
+    displayName: Linux disk throughput - NVMe pool
+    timeoutInMinutes: 30
+    pool:
+      name: RUST-1ES-POOL-WUS3-NVME
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM-NVME
+    steps:
+    - checkout: self
+      fetchDepth: 1
+    - bash: |
+        chmod +x .pipeline/scripts/measure-disk-throughput.sh
+        .pipeline/scripts/measure-disk-throughput.sh "LINUX-NVMe (RUST-1ES-POOL-WUS3-NVME)" "" "${{ parameters.fileSizeGB }}" "${{ parameters.durationSec }}"
+      displayName: Measure disk throughput (fio)
+
+# =============================================================================
+# ORIGINAL VALIDATION ENTRY POINT (restore when un-hijacking):
+#
+# parameters:
+# - name: buildType
+#   displayName: Type of the build to produce
+#   type: string
+#   values:
+#   - Both
+#   - Debug
+#   - Release
+#   default: Both
+#
+# - name: RunFuzz
+#   displayName: Run Fuzz Tests (30 min)
+#   type: boolean
+#   default: false
+#
+# - name: RunLongHaul
+#   displayName: Run Long-Haul BCP Test (30 min)
+#   type: boolean
+#   default: false
+#
+# - name: sqlInstanceMode
+#   displayName: SQL host cardinality for ARM test stages
+#   type: string
+#   values:
+#   - shared
+#   - per-job
+#   default: shared
+#
+# - name: sqlImageTag
+#   displayName: SQL Server docker image tag for ARM test stages
+#   type: string
+#   default: '2025-latest'
+#
+# stages:
+# - template: templates/validation-stages.yml
+#   parameters:
+#     buildType: ${{ parameters.buildType }}
+#     RunFuzz: ${{ parameters.RunFuzz }}
+#     RunLongHaul: ${{ parameters.RunLongHaul }}
+#     sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+#     sqlImageTag: ${{ parameters.sqlImageTag }}
+#     # PR validation for internal ADO and GitHub PRs. GitHub PRs run in the public
+#     # project, which lacks 'Magnitude Test', so exclude the infra stages here.
+#     includeInfraStages: false
+# =============================================================================
