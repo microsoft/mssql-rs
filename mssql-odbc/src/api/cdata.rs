@@ -319,10 +319,10 @@ pub(crate) unsafe fn write_c_value(
 
     match target_type {
         SQL_C_CHAR | SQL_C_DEFAULT => {
-            let text = cell.to_text();
+            let ansi = narrow_bytes(value).ok_or(WriteError::RestrictedConversion)?;
             Ok(unsafe {
                 write_text(
-                    text.as_bytes(),
+                    &ansi,
                     target_value_ptr as *mut u8,
                     buffer_length.max(0) as usize,
                     strlen_or_ind_ptr,
@@ -654,13 +654,15 @@ pub(crate) fn stream_payload(
 /// Character columns with a collation-derived encoding are passed through in
 /// their original code page rather than transcoded to UTF-8: that is what the
 /// native driver does on Windows, and clients decode using the column collation.
+/// Everything else is rendered as text and encoded into the client ANSI code
+/// page, which is what `SQL_C_CHAR` means to an ODBC application.
 fn narrow_bytes(value: &ColumnValues) -> Option<Vec<u8>> {
     if let ColumnValues::String(s) = value
         && matches!(s.encoding_type(), EncodingType::LcidBased(_))
     {
         return Some(s.bytes.clone());
     }
-    Some(to_cell(value)?.to_text().into_bytes())
+    Some(crate::api::ansi::encode(&to_cell(value)?.to_text()))
 }
 
 /// Maps a column value to the `SQL_C_*` code msodbcsql reports through

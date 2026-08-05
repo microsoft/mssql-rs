@@ -185,7 +185,7 @@ pub(crate) unsafe fn read_c_value(
         SQL_C_CHAR => {
             let bytes = unsafe { read_char_bytes(ptr, len_spec) };
             CValue::Text {
-                text: String::from_utf8_lossy(&bytes).into_owned(),
+                text: crate::api::ansi::decode(&bytes),
                 wide: false,
             }
         }
