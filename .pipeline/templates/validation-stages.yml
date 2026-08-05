@@ -74,14 +74,15 @@ stages:
       )
     )
   jobs:
-  # On-demand x64 SQL host for the ARM64 build's integration tests. ARM agents
-  # cannot run the x64 SQL Server image natively, so Build_Linux_ARM connects
-  # cross-pool to this host instead. PR-only: the ARM build only runs its test
-  # pass on PRs, and this job would otherwise idle an x64 agent on every merge.
+  # On-demand x64 SQL host for the ARM64 builds' integration tests. ARM agents
+  # cannot run the x64 SQL Server image natively, so Build_Linux_ARM and the
+  # Windows ARM ODBC e2e leg connect cross-pool to this host instead. PR-only:
+  # the ARM builds only run their test pass on PRs, and this job would otherwise
+  # idle an x64 agent on every merge.
   - template: sql-host-template.yml
     parameters:
       instanceId: build_arm
-      expectedSentinels: build_arm
+      expectedSentinels: build_arm,build_win_arm
       sqlImageTag: ${{ parameters.sqlImageTag }}
       jobCondition: eq(variables['Build.Reason'], 'PullRequest')
   - job: Build_Windows
@@ -201,6 +202,15 @@ stages:
           - '3.12'
           - '3.13'
           - '3.14'
+
+      # ODBC C++ e2e against the cross-pool x64 SQL host booted above. This image
+      # has no local SQL Server, so it joins the same artifact-sentinel rendezvous
+      # Build_Linux_ARM uses. Intentionally no `dependsOn` on the SQL host job.
+      - template: odbc-e2e-windows-remote-sql-template.yml
+        parameters:
+          sqlReadyInstanceId: build_arm
+          sentinelName: build_win_arm
+          testRunTitle: 'ODBC e2e (Windows ARM)'
 
   - job: Build_Linux
     displayName: Build Linux

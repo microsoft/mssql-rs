@@ -27,7 +27,7 @@ use mssql_tds::message::login_options::ApplicationIntent;
 use std::path::PathBuf;
 
 use super::util::read_utf16;
-use crate::auth::configure_auth;
+use crate::auth::{UnsupportedAuth, configure_auth};
 use crate::connection::odbc_authentication_transformer::transform_auth;
 use crate::connection::odbc_authentication_validator::validate_auth;
 use crate::connection::{ConnectionParams, parse_connection_string};
@@ -246,25 +246,45 @@ fn do_connect(
     );
 
     // Build ClientContext. T1 wired SQL password, integrated (SSPI/GSSAPI), and
-    // pre-acquired access tokens; T2 adds Entra service principal (secret) and
-    // managed identity via an Azure-SDK token factory. Methods that still need
-    // token acquisition (AD password, interactive, device code, workload
-    // identity, default credential, AD integrated) are rejected with HYC00
-    // until a later tier.
+    // pre-acquired access tokens; T2 added Entra service principal (secret) and
+    // managed identity; T3 adds interactive sign-in (Windows only, matching
+    // msodbcsql) — all via a token factory. Methods that still need token
+    // acquisition (AD password, device code, workload identity, default
+    // credential, AD integrated) are rejected with HYC00 until a later tier.
+    // Off Windows an interactive request is reported as AD integrated, the same
+    // method msodbcsql falls through to there.
     let mut context = ClientContext::default();
     context.database = params.database.clone();
 
-    if let Err(method) = configure_auth(&mut context, resolved) {
+    // Apply an app-set SQL_ATTR_LOGIN_TIMEOUT before configuring auth so an
+    // explicit login timeout takes precedence over any method-specific default
+    // (e.g. the larger default interactive sign-in installs).
+    if let Some(secs) = state.login_timeout {
+        context.login_timeout = Some(secs);
+    }
+
+    if let Err(unsupported) = configure_auth(&mut context, resolved, &params.server) {
+        let UnsupportedAuth {
+            requested,
+            resolved,
+        } = &unsupported;
         error!(
-            ?method,
+            ?requested,
+            ?resolved,
             "SQLDriverConnectW: authentication method not implemented"
         );
-        post_sql_error(
-            state,
-            SQLSTATE_HYC00,
-            0,
-            format!("Authentication method {method:?} is not yet supported"),
-        );
+        // Name the keyword the application actually supplied. Where the
+        // platform maps it to another method, say so rather than reporting a
+        // method the connection string never mentioned.
+        let message = if requested == resolved {
+            format!("Authentication method {requested:?} is not yet supported")
+        } else {
+            format!(
+                "Authentication method {requested:?} resolves to {resolved:?} on this platform, \
+                 which is not yet supported"
+            )
+        };
+        post_sql_error(state, SQLSTATE_HYC00, 0, message);
         return SQL_ERROR;
     }
 
@@ -502,14 +522,14 @@ mod tests {
     }
 
     #[test]
-    fn interactive_method_not_implemented_returns_hyc00() {
-        // ActiveDirectoryInteractive is recognized but not yet implemented (T3);
-        // the gate must reject it with HYC00 before any network activity.
-        // (T2 now implements ServicePrincipal and ManagedIdentity, so those no
-        // longer hit this gate.)
+    fn device_code_method_not_implemented_returns_hyc00() {
+        // ActiveDirectoryDeviceCodeFlow is recognized but not yet implemented;
+        // the gate must reject it with HYC00 before any network activity. (T2
+        // implements ServicePrincipal and ManagedIdentity and T3 implements
+        // Interactive, so those no longer hit this gate.)
         let h = TestHandles::with_env_dbc();
         let dbc = h.dbc;
-        let conn_str: Vec<u16> = cs("Server=s;Authentication=ActiveDirectoryInteractive")
+        let conn_str: Vec<u16> = cs("Server=s;Authentication=ActiveDirectoryDeviceCodeFlow")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();

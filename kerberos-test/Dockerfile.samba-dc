@@ -1,6 +1,10 @@
 # Samba Active Directory Domain Controller
 # Use ACR-imported image to avoid Docker Hub rate limits
-FROM tdslibrs.azurecr.io/import/debian:bookworm
+# Pre-built and published by .pipeline/sync-container-images.yml. The init
+# script is mounted from ./scripts at runtime rather than baked in, so the
+# pre-built image stays valid when a PR edits the script.
+ARG BASE_IMAGE=tdslibrs.azurecr.io/import/debian:bookworm
+FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -19,12 +23,8 @@ RUN apt-get update && apt-get install -y \
     expect \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy initialization script
-COPY scripts/init-samba-dc.sh /init-samba-dc.sh
-RUN chmod +x /init-samba-dc.sh
-
 EXPOSE 53 88 135 139 389 445 464 636 3268 3269
 
 VOLUME /var/lib/samba
 
-CMD ["/init-samba-dc.sh"]
+CMD ["/bin/bash", "/scripts/init-samba-dc.sh"]

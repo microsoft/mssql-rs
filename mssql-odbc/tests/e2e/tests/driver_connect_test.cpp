@@ -338,7 +338,21 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
             ";;PWD=" + cfg.Pwd() +
             ";TrustServerCertificate=" + cfg.TrustCert() + ";;;");
         EXPECT_EQ(SQL_SUCCESS_WITH_INFO, r.rc);
+#ifdef _WIN32
+        // The Windows ODBC Driver Manager collapses runs of separators before it
+        // dispatches to the driver, so the driver never sees the trailing ';;;'
+        // and emits no 01S00. On Windows this case therefore exercises odbc32.dll,
+        // not the driver's own parser -- the parser's trailing-run behavior has
+        // direct unit coverage in connection_string_parser.rs
+        // (trailing_separator_run_matches_msodbcsql, separator_and_empty_edge_cases).
+        // Verified empirically against ODBC Driver 18 by registry-swapping in the
+        // real msodbcsql18.dll: it also emits no 01S00 here -- i.e. it failed the
+        // original EXPECT_TRUE(r.has01S00) too, confirming this is DM
+        // normalization, not a driver gap. See AB#46973.
+        EXPECT_FALSE(r.has01S00);
+#else
         EXPECT_TRUE(r.has01S00);
+#endif
     }
 
     // Unknown keys are ignored with a 01S00 warning; the connection succeeds.
@@ -415,9 +429,15 @@ TEST_F(DriverConnectLiveTest, ConnectionStringParserParityBehaviors) {
         EXPECT_FALSE(r.has01S00);
     }
 
-    // First-wins duplicates: on a repeated key the FIRST occurrence is kept and
-    // later ones are ignored. A valid UID followed by a bogus UID keeps the
-    // valid one -> the login succeeds.
+    // Duplicate keys are DM-dependent. The driver's own parser keeps the FIRST
+    // occurrence (unixODBC pass-through -> first-wins), but the Windows DM rewrites
+    // the string LAST-wins before the driver ever runs. So a valid UID followed by
+    // a bogus UID keeps the valid one and succeeds on unixODBC, but on Windows the
+    // trailing bogus UID wins and the login is rejected. On Windows this exercises
+    // odbc32.dll's de-duplication, not the driver's parser -- which has direct
+    // first-wins unit coverage in connection_string_parser.rs
+    // (duplicates_follow_first_wins, duplicate_recognized_key_first_wins,
+    // auth_keys_follow_first_wins).
     {
         auto r = tryConnect(
             "Driver={" + cfg.Driver() + "}"
@@ -426,12 +446,23 @@ TEST_F(DriverConnectLiveTest, ConnectionStringParserParityBehaviors) {
             ";UID=bogus_user_should_be_ignored" +
             ";PWD=" + cfg.Pwd() +
             ";TrustServerCertificate=" + cfg.TrustCert());
+#ifdef _WIN32
+        // Last-wins under the Windows DM (see above): the trailing bogus UID wins,
+        // so the server rejects the login with 28000. Verified empirically against
+        // ODBC Driver 18 by registry-swapping in the real msodbcsql18.dll -- it
+        // returns the same SQL_ERROR/28000 here. See AB#46973.
+        EXPECT_EQ(SQL_ERROR, r.rc);
+        EXPECT_TRUE(r.has28000);
+#else
         EXPECT_TRUE(SQL_SUCCEEDED(r.rc))
             << "rc=" << r.rc;
+#endif
     }
 
-    // First-wins, negative: a bogus UID BEFORE the valid one wins, so the login
-    // is attempted as the bogus user and the server rejects it -> 28000.
+    // Duplicate keys, negative case (DM-dependent, see above): a bogus UID BEFORE
+    // the valid one. The driver's own parser keeps the bogus first UID
+    // (first-wins) so the server rejects it -> 28000 on unixODBC; the Windows DM
+    // keeps the valid trailing UID (last-wins) so the login succeeds.
     {
         auto r = tryConnect(
             "Driver={" + cfg.Driver() + "}"
@@ -440,8 +471,17 @@ TEST_F(DriverConnectLiveTest, ConnectionStringParserParityBehaviors) {
             ";UID=" + cfg.Uid() +
             ";PWD=" + cfg.Pwd() +
             ";TrustServerCertificate=" + cfg.TrustCert());
+#ifdef _WIN32
+        // Last-wins under the Windows DM (see above): the valid trailing UID wins,
+        // so the login succeeds. Verified empirically against ODBC Driver 18 by
+        // registry-swapping in the real msodbcsql18.dll -- it also succeeds here.
+        // See AB#46973.
+        EXPECT_TRUE(SQL_SUCCEEDED(r.rc))
+            << "rc=" << r.rc;
+#else
         EXPECT_EQ(SQL_ERROR, r.rc);
         EXPECT_TRUE(r.has28000);
+#endif
     }
 
     // Keys are matched verbatim -- they are NOT trimmed. A space before '='

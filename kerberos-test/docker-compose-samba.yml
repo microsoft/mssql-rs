@@ -23,10 +23,6 @@ services:
     volumes:
       - samba-data:/var/lib/samba
       - ./scripts:/scripts:ro
-    # Run the mounted script, not the copy baked into the image, so edits to
-    # scripts/ take effect without republishing the image. bash is required:
-    # the scripts are not executable in git.
-    command: ["bash", "/scripts/init-samba-dc.sh"]
     networks:
       kerberos-net:
         ipv4_address: 172.20.0.10
@@ -68,8 +64,6 @@ services:
     volumes:
       - mssql-data:/var/opt/mssql
       - ./scripts:/scripts:ro
-    # See the dc service above: run the mounted script, not the baked copy.
-    entrypoint: ["bash", "/scripts/init-mssql-ad.sh"]
     networks:
       kerberos-net:
         ipv4_address: 172.20.0.20

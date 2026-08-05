@@ -28,8 +28,8 @@ This directory contains a containerized Kerberos authentication test environment
 | `docker-compose-matrix.yml` | Docker Compose for multi-distro matrix testing |
 | `Dockerfile.client` | Default client container (based on .NET SDK) |
 | `Dockerfile.client.matrix` | Parameterized client for all distros (uses build args) |
-| `Dockerfile.samba-dc` | Samba AD Domain Controller |
-| `Dockerfile.mssql-ad` | SQL Server with AD integration |
+| `Dockerfile.samba-dc` | Samba AD Domain Controller (init script mounted from `scripts/`) |
+| `Dockerfile.mssql-ad` | SQL Server with AD integration (init script mounted from `scripts/`) |
 | `configure-kerberos.sh` | Script to configure Kerberos after containers start |
 | `run-kerberos-tests.sh` | Run tests on a specific distro |
 | `run-all-distros.sh` | Run tests on all distros in the matrix |
@@ -140,10 +140,9 @@ docker compose -f docker-compose-matrix.yml --profile ubuntu22 build  # build lo
 Override the source registry/tag with `KERBEROS_IMAGE_REGISTRY` and
 `KERBEROS_IMAGE_TAG`.
 
-The DC and SQL containers run their init script from the mounted `./scripts`
-directory rather than the copy baked into the image (via `command:` /
-`entrypoint:` overrides in the compose files), so edits to `scripts/init-*.sh`
-take effect without republishing the image.
+The DC and SQL images run their init script from the mounted `./scripts`
+directory rather than a copy baked into the image, so edits to
+`scripts/init-*.sh` take effect without republishing the image.
 
 ### Test a Specific Distro
 

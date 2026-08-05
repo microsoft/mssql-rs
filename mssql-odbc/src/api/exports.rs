@@ -617,15 +617,15 @@ pub unsafe extern "C" fn SQLGetConnectAttrW(
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
     crate::init_tracing();
-    tracing::debug!(
-        ?connection_handle,
-        attribute,
-        ?value_ptr,
-        buffer_length,
-        ?string_length_ptr,
-        "SQLGetConnectAttrW called (stub)",
-    );
-    super::odbc_types::SQL_ERROR
+    unsafe {
+        super::get_connect_attr::sql_get_connect_attr_w(
+            connection_handle,
+            attribute,
+            value_ptr,
+            buffer_length,
+            string_length_ptr,
+        )
+    }
 }
 
 /// Sets a statement attribute.
