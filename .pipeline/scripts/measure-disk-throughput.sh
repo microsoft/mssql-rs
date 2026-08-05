@@ -30,8 +30,10 @@ lsblk -o NAME,SIZE,TYPE,TRAN,ROTA,MODEL,MOUNTPOINT 2>/dev/null || true
 # rotational + transport for the specific backing device
 BASE_DEV="$(lsblk -no PKNAME "$SRC_DEV" 2>/dev/null | head -1)"
 [ -z "$BASE_DEV" ] && BASE_DEV="$(basename "${SRC_DEV:-}")"
+ROTA="?"
 if [ -n "$BASE_DEV" ] && [ -e "/sys/block/$BASE_DEV/queue/rotational" ]; then
-  echo "Device $BASE_DEV rotational=$(cat /sys/block/$BASE_DEV/queue/rotational) (0=SSD/NVMe, 1=HDD)"
+  ROTA="$(cat /sys/block/$BASE_DEV/queue/rotational)"
+  echo "Device $BASE_DEV rotational=$ROTA (0=SSD/NVMe, 1=HDD)"
 fi
 
 # --- Ensure fio is available ---
@@ -54,6 +56,7 @@ fio --version
 
 TEST="$TARGET_DIR/fio_probe.dat"
 IOENGINE="libaio"
+RESULTS_FILE="$(mktemp)"
 
 run_scenario() { # name rw bs iodepth numjobs [rwmixread]
   local name="$1" rw="$2" bs="$3" iod="$4" nj="$5" mix="${6:-}"
@@ -65,7 +68,8 @@ run_scenario() { # name rw bs iodepth numjobs [rwmixread]
       --size="${SIZE_GB}G" --runtime="$DURATION" --time_based --rw="$rw" --bs="$bs" \
       --iodepth="$iod" --numjobs="$nj" --group_reporting --output-format=json $extra 2>/tmp/fio.err)"
   if [ -z "$json" ]; then echo "fio failed:"; cat /tmp/fio.err; return; fi
-  echo "$json" | python3 -c "
+  local pyout
+  pyout="$(echo "$json" | python3 -c "
 import sys,json
 d=json.load(sys.stdin); j=d['jobs'][0]
 r=j['read']; w=j['write']
@@ -74,7 +78,9 @@ print(f'  read : {rb:8.2f} MB/s  {r[\"iops\"]:10.1f} IOPS')
 print(f'  write: {wb:8.2f} MB/s  {w[\"iops\"]:10.1f} IOPS')
 tot=rb+wb; tiops=r['iops']+w['iops']
 print(f'RESULT|$LABEL|$name|{tot:.2f}|{tiops:.2f}')
-"
+")"
+  echo "$pyout"
+  echo "$pyout" | grep '^RESULT|' >> "$RESULTS_FILE"
 }
 
 # block size / pattern / queue depth chosen to mirror build-like I/O
@@ -86,4 +92,19 @@ run_scenario 'rand-rw-64K-30w' randrw    64k 8 4 70
 
 rm -f "$TEST"
 section "SUMMARY [$LABEL]"
-echo "See RESULT| lines above (aggregate MB/s and IOPS per scenario)."
+cat "$RESULTS_FILE"
+
+# Publish a per-job markdown summary to the build Summary tab.
+SUMMARY_MD="$(mktemp --suffix=.md)"
+{
+  echo "### Disk throughput - $LABEL"
+  echo ""
+  echo "Work dir \`$TARGET_DIR\` backed by \`${SRC_DEV:-unknown}\` (rotational=$ROTA), cache-bypass (fio --direct=1)."
+  echo ""
+  echo "| Scenario | MB/s | IOPS |"
+  echo "|---|---:|---:|"
+  while IFS='|' read -r _ _lbl scen mbs iops; do
+    echo "| $scen | $mbs | $iops |"
+  done < "$RESULTS_FILE"
+} > "$SUMMARY_MD"
+echo "##vso[task.uploadsummary]$SUMMARY_MD"

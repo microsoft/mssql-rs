@@ -42,8 +42,10 @@ try {
     $letter = $drive.TrimEnd(':')
     $part = Get-Partition -DriveLetter $letter -ErrorAction Stop
     $pdisk = Get-Disk -Number $part.DiskNumber | Get-PhysicalDisk
+    $busType = [string]$pdisk.BusType
+    $mediaType = [string]$pdisk.MediaType
     Write-Host ("Target volume {0} -> disk #{1}: {2} BusType={3} MediaType={4}" -f `
-        $drive, $part.DiskNumber, $pdisk.FriendlyName, $pdisk.BusType, $pdisk.MediaType)
+        $drive, $part.DiskNumber, $pdisk.FriendlyName, $busType, $mediaType)
 } catch { Write-Host "volume->disk mapping failed: $($_.Exception.Message)" }
 
 # --- Download diskspd ---
@@ -72,8 +74,16 @@ function Invoke-Scenario($name, [string[]]$scArgs) {
     Section "Scenario: $name"
     $all = @($scArgs + @('-L', '-W3', "-d$DurationSec", "-c${FileSizeGB}G", $testFile))
     Write-Host "diskspd $($all -join ' ')"
+    # diskspd writes warnings to stderr; don't let that become a terminating error.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     $out = & $diskspd.FullName @all 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
     Write-Host $out
+    if ($code -ne 0) {
+        Write-Host "##vso[task.logissue type=warning]diskspd exited $code for scenario $name"
+    }
     $mib = $null; $iops = $null
     foreach ($line in ($out -split "`r?`n")) {
         if ($line -match '^total:\s+\d+\s*\|\s*\d+\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)') {
@@ -84,9 +94,10 @@ function Invoke-Scenario($name, [string[]]$scArgs) {
     $results.Add([pscustomobject]@{ Scenario = $name; 'MB/s' = $mib; 'IOPS' = $iops })
 }
 
-# block size / pattern / queue depth / threads chosen to mirror build-like I/O
-Invoke-Scenario 'seq-write-1M'   @('-w100','-b1M','-o8','-t4','-Sh')
-Invoke-Scenario 'seq-read-1M'    @('-w0','-b1M','-o8','-t4','-Sh')
+# block size / pattern / queue depth / threads chosen to mirror build-like I/O.
+# Sequential runs use a single thread (-t1) so the pattern stays truly sequential.
+Invoke-Scenario 'seq-write-1M'   @('-w100','-b1M','-o8','-t1','-Sh')
+Invoke-Scenario 'seq-read-1M'    @('-w0','-b1M','-o8','-t1','-Sh')
 Invoke-Scenario 'rand-read-4K'   @('-w0','-r','-b4K','-o8','-t4','-Sh')
 Invoke-Scenario 'rand-write-4K'  @('-w100','-r','-b4K','-o8','-t4','-Sh')
 Invoke-Scenario 'rand-rw-64K-30w' @('-w30','-r','-b64K','-o8','-t4','-Sh')
@@ -100,4 +111,30 @@ $results | Format-Table -AutoSize | Out-String | Write-Host
 Write-Host "##[section]DISK-THROUGHPUT-RESULT label=$Label"
 foreach ($r in $results) {
     Write-Host ("RESULT|{0}|{1}|{2:N2}|{3:N2}" -f $Label, $r.Scenario, $r.'MB/s', $r.'IOPS')
+}
+
+# --- Publish a per-job markdown summary to the build Summary tab ---
+$md = New-Object System.Text.StringBuilder
+[void]$md.AppendLine("### Disk throughput - $Label")
+[void]$md.AppendLine("")
+[void]$md.AppendLine("Work dir ``$TargetDir`` on drive $drive (BusType=$busType, MediaType=$mediaType), cache-bypass (diskspd -Sh).")
+[void]$md.AppendLine("")
+[void]$md.AppendLine("| Scenario | MB/s | IOPS |")
+[void]$md.AppendLine("|---|---:|---:|")
+foreach ($r in $results) {
+    [void]$md.AppendLine("| {0} | {1:N2} | {2:N2} |" -f $r.Scenario, $r.'MB/s', $r.'IOPS')
+}
+$tempDir = $env:AGENT_TEMPDIRECTORY; if (-not $tempDir) { $tempDir = $TargetDir }
+$summaryPath = Join-Path $tempDir 'disk-summary.md'
+[System.IO.File]::WriteAllText($summaryPath, $md.ToString())
+Write-Host "##vso[task.uploadsummary]$summaryPath"
+
+# --- Emit machine-readable results for the aggregation job ---
+$staging = $env:BUILD_ARTIFACTSTAGINGDIRECTORY
+if ($staging) {
+    New-Item -ItemType Directory -Force -Path $staging | Out-Null
+    $lines = foreach ($r in $results) {
+        "RESULT|{0}|{1}|{2:N2}|{3:N2}" -f $Label, $r.Scenario, $r.'MB/s', $r.'IOPS'
+    }
+    Set-Content -Path (Join-Path $staging 'results.txt') -Value $lines
 }
