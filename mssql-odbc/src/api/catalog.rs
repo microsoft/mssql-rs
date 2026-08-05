@@ -39,6 +39,25 @@ unsafe fn opt_arg(ptr: *const SqlWChar, len: SqlSmallInt) -> Arg {
     }
 }
 
+/// Renders the `SQLTables` table-type list the way `sp_tables` expects it:
+/// each element of the comma-separated list individually quoted, so `TABLE,VIEW`
+/// becomes `N'''TABLE'',''VIEW'''`. Mirrors `ValidateTableType` in msodbcsql.
+fn table_type_literal(arg: &Arg) -> String {
+    match arg {
+        None => "NULL".to_string(),
+        Some(v) if v.trim().is_empty() => "NULL".to_string(),
+        Some(v) if v.trim() == "%" => "N'%'".to_string(),
+        Some(v) => {
+            let quoted = v
+                .split(',')
+                .map(|t| format!("''{}''", t.trim().trim_matches('\'').replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("N'{quoted}'")
+        }
+    }
+}
+
 /// Renders a catalog argument as a T-SQL literal, escaping embedded quotes.
 fn literal(arg: &Arg) -> String {
     match arg {
@@ -51,14 +70,33 @@ fn literal(arg: &Arg) -> String {
 ///
 /// Catalog scoping matters: `sp_tables` only sees the current database, so a
 /// non-empty qualifier has to be turned into a three-part procedure name.
+///
+/// A qualifier naming a database that does not exist must produce an empty
+/// result set rather than an error, so the batch is guarded by `DB_ID` and
+/// falls back to running the same procedure locally with an unmatchable object
+/// name. That keeps the column shape identical while returning no rows.
 fn build_exec(catalog: &Arg, proc_name: &str, args: &[String]) -> String {
-    let qualified = match catalog {
-        Some(db) if !db.is_empty() => {
-            format!("[{}].sys.{}", db.replace(']', "]]"), proc_name)
-        }
-        _ => format!("sys.{proc_name}"),
+    let Some(db) = catalog.as_deref().filter(|db| !db.is_empty()) else {
+        return format!("EXEC sys.{} {}", proc_name, args.join(", "));
     };
-    format!("EXEC {} {}", qualified, args.join(", "))
+    let qualified = format!("[{}].sys.{}", db.replace(']', "]]"), proc_name);
+    let mut empty_args = args.to_vec();
+    if let Some(first) = empty_args.first_mut() {
+        let prefix = first
+            .find('=')
+            .filter(|_| first.starts_with('@'))
+            .map(|i| first[..=i].to_string())
+            .unwrap_or_default();
+        *first = format!("{prefix}N'\u{1}no such object\u{1}'");
+    }
+    format!(
+        "IF DB_ID(N'{}') IS NULL EXEC sys.{} {} ELSE EXEC {} {}",
+        db.replace('\'', "''"),
+        proc_name,
+        empty_args.join(", "),
+        qualified,
+        args.join(", ")
+    )
 }
 
 fn build_exec_named(catalog: &Arg, proc_name: &str, args: &[(&str, String)]) -> String {
@@ -75,7 +113,12 @@ fn build_exec_named(catalog: &Arg, proc_name: &str, args: &[(&str, String)]) -> 
 ///
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
-unsafe fn run_catalog(statement_handle: SqlHandle, name: &str, sql: String) -> SqlReturn {
+unsafe fn run_catalog(
+    statement_handle: SqlHandle,
+    name: &str,
+    sql: String,
+    renames: &[(usize, &str)],
+) -> SqlReturn {
     if statement_handle.is_null() {
         error!("{name}: statement_handle is null");
         return SQL_INVALID_HANDLE;
@@ -102,6 +145,7 @@ unsafe fn run_catalog(statement_handle: SqlHandle, name: &str, sql: String) -> S
         stmt_state.row_count = -1;
         stmt_state.pending_row_counts.clear();
         stmt_state.prepared_sql = None;
+        stmt_state.described_params = None;
         stmt_state.orphan_prepared_handle();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
@@ -127,7 +171,21 @@ unsafe fn run_catalog(statement_handle: SqlHandle, name: &str, sql: String) -> S
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    finish_execute(dbc, stmt, statement_handle, client, name)
+    let rc = finish_execute(dbc, stmt, statement_handle, client, name);
+
+    // The sp_* procedures still emit the ODBC 2.x column names. msodbcsql
+    // rewrites them to the ODBC 3.x names the spec mandates, and callers bind
+    // result attributes straight from SQLDescribeCol, so the rename is what
+    // makes `row.table_cat` and friends exist.
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        for (index, new_name) in renames {
+            if let Some(meta) = stmt_state.column_metadata.get_mut(*index) {
+                meta.column_name = (*new_name).to_string();
+            }
+        }
+    }
+
+    rc
 }
 
 /// Implements `SQLTablesW`.
@@ -161,11 +219,16 @@ pub(crate) unsafe fn sql_tables_w(
                 // three-part qualified, but sp_tables validates it against the
                 // current database, so pass NULL.
                 "NULL".to_string(),
-                literal(&types),
+                table_type_literal(&types),
                 "1".to_string(),
             ],
         );
-        run_catalog(statement_handle, "SQLTablesW", sql)
+        run_catalog(
+            statement_handle,
+            "SQLTablesW",
+            sql,
+            &[(0, "TABLE_CAT"), (1, "TABLE_SCHEM")],
+        )
     })
 }
 
@@ -202,7 +265,19 @@ pub(crate) unsafe fn sql_columns_w(
                 ("fUsePattern", "1".to_string()),
             ],
         );
-        run_catalog(statement_handle, "SQLColumnsW", sql)
+        run_catalog(
+            statement_handle,
+            "SQLColumnsW",
+            sql,
+            &[
+                (0, "TABLE_CAT"),
+                (1, "TABLE_SCHEM"),
+                (6, "COLUMN_SIZE"),
+                (7, "BUFFER_LENGTH"),
+                (8, "DECIMAL_DIGITS"),
+                (9, "NUM_PREC_RADIX"),
+            ],
+        )
     })
 }
 
@@ -228,7 +303,12 @@ pub(crate) unsafe fn sql_primary_keys_w(
             "sp_pkeys",
             &[literal(&table), literal(&schema), "NULL".to_string()],
         );
-        run_catalog(statement_handle, "SQLPrimaryKeysW", sql)
+        run_catalog(
+            statement_handle,
+            "SQLPrimaryKeysW",
+            sql,
+            &[(0, "TABLE_CAT"), (1, "TABLE_SCHEM")],
+        )
     })
 }
 
@@ -278,7 +358,17 @@ pub(crate) unsafe fn sql_foreign_keys_w(
                 "NULL".to_string(),
             ],
         );
-        run_catalog(statement_handle, "SQLForeignKeysW", sql)
+        run_catalog(
+            statement_handle,
+            "SQLForeignKeysW",
+            sql,
+            &[
+                (0, "PKTABLE_CAT"),
+                (1, "PKTABLE_SCHEM"),
+                (4, "FKTABLE_CAT"),
+                (5, "FKTABLE_SCHEM"),
+            ],
+        )
     })
 }
 
@@ -313,12 +403,24 @@ pub(crate) unsafe fn sql_statistics_w(
                 literal(&table),
                 literal(&schema),
                 "NULL".to_string(),
-                "NULL".to_string(),
+                // msodbcsql always passes '%' here: sp_statistics filters
+                // `index_name LIKE @index_name`, so NULL returns no index rows.
+                "N'%'".to_string(),
                 is_unique.to_string(),
                 accuracy.to_string(),
             ],
         );
-        run_catalog(statement_handle, "SQLStatisticsW", sql)
+        run_catalog(
+            statement_handle,
+            "SQLStatisticsW",
+            sql,
+            &[
+                (0, "TABLE_CAT"),
+                (1, "TABLE_SCHEM"),
+                (7, "ORDINAL_POSITION"),
+                (9, "ASC_OR_DESC"),
+            ],
+        )
     })
 }
 
@@ -360,7 +462,16 @@ pub(crate) unsafe fn sql_special_columns_w(
                 "3".to_string(),
             ],
         );
-        run_catalog(statement_handle, "SQLSpecialColumnsW", sql)
+        run_catalog(
+            statement_handle,
+            "SQLSpecialColumnsW",
+            sql,
+            &[
+                (4, "COLUMN_SIZE"),
+                (5, "BUFFER_LENGTH"),
+                (6, "DECIMAL_DIGITS"),
+            ],
+        )
     })
 }
 
@@ -391,7 +502,12 @@ pub(crate) unsafe fn sql_procedures_w(
                 "1".to_string(),
             ],
         );
-        run_catalog(statement_handle, "SQLProceduresW", sql)
+        run_catalog(
+            statement_handle,
+            "SQLProceduresW",
+            sql,
+            &[(0, "PROCEDURE_CAT"), (1, "PROCEDURE_SCHEM")],
+        )
     })
 }
 
@@ -415,7 +531,7 @@ mod tests {
     #[test]
     fn build_exec_qualifies_with_catalog() {
         let sql = build_exec(&Some("mydb".into()), "sp_tables", &["NULL".into()]);
-        assert_eq!(sql, "EXEC [mydb].sys.sp_tables NULL");
+        assert!(sql.ends_with("ELSE EXEC [mydb].sys.sp_tables NULL"));
     }
 
     #[test]
@@ -427,7 +543,7 @@ mod tests {
     #[test]
     fn build_exec_escapes_bracket_in_catalog() {
         let sql = build_exec(&Some("we]ird".into()), "sp_tables", &[]);
-        assert!(sql.starts_with("EXEC [we]]ird].sys.sp_tables"));
+        assert!(sql.contains("EXEC [we]]ird].sys.sp_tables"));
     }
 
     #[test]
@@ -463,6 +579,50 @@ mod tests {
     }
 
     #[test]
+    fn table_type_quotes_each_element_individually() {
+        assert_eq!(
+            table_type_literal(&Some("TABLE,VIEW".to_string())),
+            "N'''TABLE'',''VIEW'''"
+        );
+    }
+
+    #[test]
+    fn table_type_passes_wildcard_through() {
+        assert_eq!(table_type_literal(&Some("%".to_string())), "N'%'");
+    }
+
+    #[test]
+    fn table_type_treats_blank_as_null() {
+        assert_eq!(table_type_literal(&Some("   ".to_string())), "NULL");
+        assert_eq!(table_type_literal(&None), "NULL");
+    }
+
+    #[test]
+    fn build_exec_without_catalog_runs_locally() {
+        let sql = build_exec(&None, "sp_tables", &["NULL".to_string()]);
+        assert_eq!(sql, "EXEC sys.sp_tables NULL");
+    }
+
+    #[test]
+    fn build_exec_with_catalog_guards_on_db_id() {
+        let sql = build_exec(
+            &Some("other".to_string()),
+            "sp_tables",
+            &["@table_name = N'%'".to_string(), "NULL".to_string()],
+        );
+        assert!(sql.starts_with("IF DB_ID(N'other') IS NULL EXEC sys.sp_tables "));
+        assert!(sql.contains("ELSE EXEC [other].sys.sp_tables @table_name = N'%', NULL"));
+        // The fallback keeps the named-argument prefix so the call still binds.
+        assert!(sql.contains("@table_name =N'\u{1}no such object\u{1}'"));
+    }
+
+    #[test]
+    fn build_exec_escapes_bracketed_catalog_name() {
+        let sql = build_exec(&Some("we]ird".to_string()), "sp_tables", &[]);
+        assert!(sql.contains("[we]]ird].sys.sp_tables"));
+    }
+
+    #[test]
     fn procedures_null_handle_is_invalid_handle() {
         let ret = unsafe {
             sql_procedures_w(
@@ -489,8 +649,14 @@ mod tests {
             state.pending_row_counts.push_back(3);
         }
 
-        let ret =
-            unsafe { run_catalog(h.stmt, "SQLTablesW", "EXEC sys.sp_tables NULL".to_string()) };
+        let ret = unsafe {
+            run_catalog(
+                h.stmt,
+                "SQLTablesW",
+                "EXEC sys.sp_tables NULL".to_string(),
+                &[],
+            )
+        };
         assert_eq!(ret, SQL_ERROR);
 
         let state = stmt.inner.lock().unwrap();

@@ -69,6 +69,7 @@ unsafe fn sql_exec_direct_w_impl(
     );
 
     let sql = unsafe { read_utf16(statement_text, text_length) };
+    let sql = super::util::translate_odbc_escapes(&sql);
     sql_exec_direct_w_safe(statement_handle, stmt, sql)
 }
 
@@ -110,6 +111,7 @@ pub(crate) fn sql_exec_direct_w_safe(
         stmt_state.row_count = -1;
         stmt_state.pending_row_counts.clear();
         stmt_state.prepared_sql = None;
+        stmt_state.described_params = None;
         // Superseding a prepared plan orphans its server handle; release it
         // (deferred) once we hold the client below.
         stmt_state.orphan_prepared_handle();

@@ -12,7 +12,7 @@ mod col_attribute;
 mod conn_exec;
 mod connect;
 mod dae;
-mod desc;
+pub(crate) mod desc;
 mod describe_col;
 mod disconnect;
 mod driver_connect;

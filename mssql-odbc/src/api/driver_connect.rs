@@ -376,6 +376,9 @@ const MAX_PACKET_SIZE: u32 = 32768;
 /// (matching msodbcsql). Kept separate from `do_connect` so the mapping is
 /// unit-testable without a live server.
 fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParams) {
+    if let Some(app) = &params.app {
+        context.application_name = app.clone();
+    }
     context.encryption_options.host_name_in_cert = params.host_name_in_certificate.clone();
     context.encryption_options.server_certificate =
         params.server_certificate.as_deref().map(PathBuf::from);
