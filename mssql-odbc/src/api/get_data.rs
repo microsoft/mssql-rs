@@ -40,6 +40,7 @@ use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 
 /// Implements SQLGetData for current-row retrieval.
 ///
@@ -223,14 +224,22 @@ fn sql_get_data_safe(
         return SQL_ERROR;
     }
 
-    let Some(as_text) = column_value_to_text(value) else {
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_HYC00,
-            0,
-            "Column type conversion not yet implemented",
-        );
-        return SQL_ERROR;
+    let as_text = match column_value_to_text(value) {
+        Ok(t) => t,
+        Err(TextError::Malformed) => {
+            error!("SQLGetData: column payload could not be decoded as text");
+            post_diag(&mut stmt_state, ERR_INVALID_CHARACTER_VALUE);
+            return SQL_ERROR;
+        }
+        Err(TextError::Unsupported) => {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HYC00,
+                0,
+                "Column type conversion not yet implemented",
+            );
+            return SQL_ERROR;
+        }
     };
 
     // buffer_length is always in bytes per the ODBC spec; SQL_C_WCHAR streams in
@@ -424,35 +433,71 @@ fn column_value_to_bytes(v: &ColumnValues) -> Option<&[u8]> {
     }
 }
 
-fn column_value_to_text(v: &ColumnValues) -> Option<String> {
+/// Why a column value could not be rendered as text.
+enum TextError {
+    /// No text rendering is defined for this column type.
+    Unsupported,
+    /// The server payload could not be decoded (bad UTF-8/UTF-16 or a truncated
+    /// UTF-16 code unit).
+    Malformed,
+}
+
+/// Decodes a character column without the panicking paths in
+/// `SqlString::to_utf8_string` (its UTF-8 branch unwraps); the UTF-16 and
+/// LCID branches decode through `encoding_rs`, which substitutes replacement
+/// characters rather than failing.
+fn sql_string_to_text(s: &SqlString) -> Result<String, TextError> {
+    match s.encoding_type() {
+        EncodingType::Utf8 => String::from_utf8(s.bytes.clone()).map_err(|_| TextError::Malformed),
+        _ => Ok(s.to_utf8_string()),
+    }
+}
+
+/// Decodes UTF-16LE `xml` bytes without the panicking indexing/unwrap in
+/// `SqlXml::as_string`.
+fn xml_to_text(bytes: &[u8]) -> Result<String, TextError> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(TextError::Malformed);
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16(&units).map_err(|_| TextError::Malformed)
+}
+
+fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError> {
     match v {
-        ColumnValues::TinyInt(x) => Some(x.to_string()),
-        ColumnValues::SmallInt(x) => Some(x.to_string()),
-        ColumnValues::Int(x) => Some(x.to_string()),
-        ColumnValues::BigInt(x) => Some(x.to_string()),
-        ColumnValues::Real(x) => Some(x.to_string()),
-        ColumnValues::Float(x) => Some(x.to_string()),
-        ColumnValues::Bit(x) => Some(if *x { "1".into() } else { "0".into() }),
-        ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => Some(d.to_string()),
-        ColumnValues::Money(m) => Some(money_scaled_to_string(
+        ColumnValues::TinyInt(x) => Ok(x.to_string()),
+        ColumnValues::SmallInt(x) => Ok(x.to_string()),
+        ColumnValues::Int(x) => Ok(x.to_string()),
+        ColumnValues::BigInt(x) => Ok(x.to_string()),
+        ColumnValues::Real(x) => Ok(x.to_string()),
+        ColumnValues::Float(x) => Ok(x.to_string()),
+        ColumnValues::Bit(x) => Ok(if *x { "1".into() } else { "0".into() }),
+        ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => Ok(d.to_string()),
+        ColumnValues::Money(m) => Ok(money_scaled_to_string(
             (i64::from(m.lsb_part) & 0xFFFF_FFFF) | (i64::from(m.msb_part) << 32),
         )),
-        ColumnValues::SmallMoney(m) => Some(money_scaled_to_string(i64::from(m.int_val))),
-        ColumnValues::String(s) => Some(s.to_utf8_string()),
-        ColumnValues::Xml(x) => Some(x.as_string()),
-        ColumnValues::Json(j) => Some(j.as_string()),
-        ColumnValues::Uuid(u) => Some(u.to_string()),
-        ColumnValues::Vector(vec) => Some(format_vector(vec)),
+        ColumnValues::SmallMoney(m) => Ok(money_scaled_to_string(i64::from(m.int_val))),
+        ColumnValues::String(s) => sql_string_to_text(s),
+        ColumnValues::Xml(x) => xml_to_text(&x.bytes),
+        // `SqlJson::as_string` unwraps; decode fallibly instead.
+        ColumnValues::Json(j) => {
+            String::from_utf8(j.bytes.clone()).map_err(|_| TextError::Malformed)
+        }
+        ColumnValues::Uuid(u) => Ok(u.to_string()),
+        ColumnValues::Vector(vec) => Ok(format_vector(vec)),
         ColumnValues::Date(_)
         | ColumnValues::Time(_)
         | ColumnValues::DateTime(_)
         | ColumnValues::DateTime2(_)
         | ColumnValues::DateTimeOffset(_)
-        | ColumnValues::SmallDateTime(_) => {
-            extract_datetime_parts(v).map(|p| format_datetime_parts(&p))
-        }
-        ColumnValues::Null => Some(String::new()),
-        _ => None,
+        | ColumnValues::SmallDateTime(_) => extract_datetime_parts(v)
+            .map(|p| format_datetime_parts(&p))
+            .ok_or(TextError::Unsupported),
+        ColumnValues::Null => Ok(String::new()),
+        _ => Err(TextError::Unsupported),
     }
 }
 
@@ -1156,6 +1201,96 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(&buf[..ind as usize], b"[1,2.5,3]");
+    }
+
+    #[test]
+    fn get_data_malformed_xml_reports_error_and_keeps_handle_usable() {
+        use mssql_tds::datatypes::column_values::SqlXml;
+        let h = TestHandles::with_env_dbc_stmt();
+        // Odd byte count: not a whole number of UTF-16 code units.
+        open_row(
+            h.stmt,
+            ColumnValues::Xml(SqlXml {
+                bytes: vec![0x41, 0x00, 0x42],
+            }),
+        );
+
+        let mut buf = [0u8; 32];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+
+        // The statement must survive: a malformed payload previously panicked
+        // while the state mutex was held, poisoning it and killing the handle.
+        open_row(h.stmt, ColumnValues::Int(42));
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(&buf[..ind as usize], b"42");
+    }
+
+    #[test]
+    fn get_data_malformed_json_reports_error() {
+        use mssql_tds::datatypes::sql_json::SqlJson;
+        let h = TestHandles::with_env_dbc_stmt();
+        open_row(
+            h.stmt,
+            ColumnValues::Json(SqlJson::new(vec![0xFF, 0xFE, 0xFD])),
+        );
+
+        let mut buf = [0u8; 16];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn get_data_malformed_utf8_string_reports_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        open_row(
+            h.stmt,
+            ColumnValues::String(SqlString::new(vec![0xFF, 0xFE, 0xFD], EncodingType::Utf8)),
+        );
+
+        let mut buf = [0u8; 16];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
     }
 
     #[test]
