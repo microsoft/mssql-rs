@@ -8,6 +8,7 @@ use mssql_tds::connection::tds_client::TdsClient;
 use tokio::runtime::Runtime;
 
 use super::{EnvHandle, HandleType, HasObjectType};
+use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE};
 use crate::error::{DiagRecord, HasDiagnostics};
 
 /// Connection state machine — tracks whether the DBC is connected.
@@ -63,6 +64,17 @@ pub(crate) struct DbcState {
     /// Pre-connect access token set via `SQL_COPT_SS_ACCESS_TOKEN`.
     /// Consumed by `SQLDriverConnect` to select `AccessToken` authentication.
     pub(crate) access_token: Option<String>,
+    /// Login timeout in seconds set via `SQL_ATTR_LOGIN_TIMEOUT`. Applied to the
+    /// TDS login deadline at connect time. `Some(0)` means wait indefinitely.
+    pub(crate) login_timeout: Option<u32>,
+    /// `SQL_ATTR_ACCESS_MODE`. Stored so a set/get round-trip agrees; the driver
+    /// does not yet vary its behaviour on it.
+    pub(crate) access_mode: u32,
+    /// `SQL_ATTR_CONNECTION_TIMEOUT` in seconds. Stored, not yet honored.
+    /// `0` is the ODBC default and means "no timeout".
+    pub(crate) connection_timeout: u32,
+    /// `SQL_ATTR_PACKET_SIZE` in bytes. Stored, not yet honored.
+    pub(crate) packet_size: u32,
 }
 
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
@@ -79,6 +91,7 @@ impl std::fmt::Debug for DbcState {
                 "access_token",
                 &self.access_token.as_ref().map(|_| "<REDACTED>"),
             )
+            .field("login_timeout", &self.login_timeout)
             .finish()
     }
 }
@@ -105,6 +118,10 @@ impl DbcHandle {
                 active_stmt: None,
                 client: None,
                 access_token: None,
+                login_timeout: None,
+                access_mode: SQL_MODE_READ_WRITE,
+                connection_timeout: 0,
+                packet_size: DEFAULT_PACKET_SIZE,
             }),
         }
     }

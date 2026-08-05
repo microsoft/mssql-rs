@@ -67,6 +67,12 @@ pub const SQL_ATTR_PACKET_SIZE: SqlInteger = 112;
 pub const SQL_ATTR_CONNECTION_TIMEOUT: SqlInteger = 113;
 pub const SQL_ATTR_ANSI_APP: SqlInteger = 115;
 
+// `SQL_ATTR_ACCESS_MODE` values.
+pub const SQL_MODE_READ_WRITE: u32 = 0;
+
+/// Default `SQL_ATTR_PACKET_SIZE`, matching `ClientContext::packet_size`.
+pub const DEFAULT_PACKET_SIZE: u32 = 8000;
+
 // Sentinel `StringLength` meaning "the value is a pointer" (ODBC).
 pub const SQL_IS_POINTER: SqlInteger = -4;
 

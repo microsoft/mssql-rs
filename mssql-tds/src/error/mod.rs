@@ -701,6 +701,16 @@ mod tests {
         assert!(!err.is_transient_connect_error());
     }
 
+    #[test]
+    fn authentication_denied_is_not_transient() {
+        // Interactive/browser auth denials (user cancel, `invalid_grant`, …) map to
+        // this variant so the connect-retry loop does not relaunch the sign-in.
+        let err = Error::Security(SecurityError::AuthenticationDenied(
+            "access_denied".to_string(),
+        ));
+        assert!(!err.is_transient_connect_error());
+    }
+
     // ── SqlServerDiagnostics wrapper ──
 
     fn sample_error(number: u32, message: &str) -> SqlErrorInfo {
