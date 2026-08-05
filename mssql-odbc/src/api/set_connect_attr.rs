@@ -9,15 +9,49 @@
 
 use tracing::{debug, error};
 
+use super::conn_exec::exec_on_connection;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT,
-    SQL_ATTR_PACKET_SIZE, SQL_COPT_SS_ACCESS_TOKEN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
-    SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT,
+    SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_RESET_CONNECTION,
+    SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_COPT_SS_ACCESS_TOKEN,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_TXN_READ_COMMITTED, SQL_TXN_READ_UNCOMMITTED,
+    SQL_TXN_REPEATABLE_READ, SQL_TXN_SERIALIZABLE, SQL_TXN_SS_SNAPSHOT, SqlHandle, SqlInteger,
+    SqlPointer, SqlReturn,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
+
+/// Maps an ODBC isolation level to its `SET TRANSACTION ISOLATION LEVEL` clause.
+pub(crate) fn isolation_level_sql(level: u32) -> Option<&'static str> {
+    match level {
+        SQL_TXN_READ_UNCOMMITTED => Some("READ UNCOMMITTED"),
+        SQL_TXN_READ_COMMITTED => Some("READ COMMITTED"),
+        SQL_TXN_REPEATABLE_READ => Some("REPEATABLE READ"),
+        SQL_TXN_SERIALIZABLE => Some("SERIALIZABLE"),
+        SQL_TXN_SS_SNAPSHOT => Some("SNAPSHOT"),
+        _ => None,
+    }
+}
+
+/// Switches the session between autocommit and manual-commit mode.
+///
+/// Manual-commit mode is expressed as `SET IMPLICIT_TRANSACTIONS ON`, matching
+/// msodbcsql: the server opens a transaction on the next statement and
+/// `SQLEndTran` closes it. Returning to autocommit commits any transaction that
+/// is still open, because ODBC requires the switch itself to be a commit point.
+pub(crate) fn apply_autocommit(dbc: &DbcHandle, autocommit: bool) -> SqlReturn {
+    let sql = if autocommit {
+        "IF @@TRANCOUNT > 0 COMMIT TRANSACTION; SET IMPLICIT_TRANSACTIONS OFF"
+    } else {
+        "SET IMPLICIT_TRANSACTIONS ON"
+    };
+    match exec_on_connection(dbc, sql, "SQLSetConnectAttrW") {
+        Ok(()) => SQL_SUCCESS,
+        Err(rc) => rc,
+    }
+}
 
 /// Sets a connection attribute.
 ///
@@ -124,6 +158,77 @@ unsafe fn sql_set_connect_attr_w_impl(
         | SQL_ATTR_CONNECTION_TIMEOUT
         | SQL_ATTR_PACKET_SIZE
         | SQL_ATTR_ANSI_APP => SQL_SUCCESS,
+        SQL_ATTR_AUTOCOMMIT => {
+            let requested = value_ptr as usize as u32;
+            let autocommit = match requested {
+                SQL_AUTOCOMMIT_ON => true,
+                SQL_AUTOCOMMIT_OFF => false,
+                other => {
+                    error!(
+                        other,
+                        "SQLSetConnectAttrW: invalid SQL_ATTR_AUTOCOMMIT value"
+                    );
+                    post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                    return SQL_ERROR;
+                }
+            };
+            if autocommit == state.autocommit {
+                return SQL_SUCCESS;
+            }
+            state.autocommit = autocommit;
+            if state.connection_state != ConnectionState::Connected {
+                // Applied by SQLDriverConnect once the session exists.
+                return SQL_SUCCESS;
+            }
+            drop(state);
+            apply_autocommit(dbc, autocommit)
+        }
+        SQL_ATTR_TXN_ISOLATION => {
+            let requested = value_ptr as usize as u32;
+            let Some(level) = isolation_level_sql(requested) else {
+                error!(
+                    requested,
+                    "SQLSetConnectAttrW: invalid SQL_ATTR_TXN_ISOLATION value"
+                );
+                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                return SQL_ERROR;
+            };
+            state.txn_isolation = requested;
+            if state.connection_state != ConnectionState::Connected {
+                return SQL_SUCCESS;
+            }
+            drop(state);
+            match exec_on_connection(
+                dbc,
+                &format!("SET TRANSACTION ISOLATION LEVEL {level}"),
+                "SQLSetConnectAttrW",
+            ) {
+                Ok(()) => SQL_SUCCESS,
+                Err(rc) => rc,
+            }
+        }
+        SQL_ATTR_RESET_CONNECTION => {
+            // Pooling reset: the DM sets this just before returning a connection
+            // to the pool. There is no TDS reset primitive exposed here yet, so
+            // roll back any in-flight work and report success.
+            if state.connection_state != ConnectionState::Connected {
+                return SQL_SUCCESS;
+            }
+            let autocommit = state.autocommit;
+            drop(state);
+            if autocommit {
+                SQL_SUCCESS
+            } else {
+                match exec_on_connection(
+                    dbc,
+                    "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+                    "SQLSetConnectAttrW",
+                ) {
+                    Ok(()) => SQL_SUCCESS,
+                    Err(rc) => rc,
+                }
+            }
+        }
         // Any other attribute is genuinely unsupported: surface a clear error
         // (HYC00) instead of silently pretending it took effect.
         _ => {

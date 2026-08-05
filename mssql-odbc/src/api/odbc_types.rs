@@ -67,8 +67,45 @@ pub const SQL_ATTR_PACKET_SIZE: SqlInteger = 112;
 pub const SQL_ATTR_CONNECTION_TIMEOUT: SqlInteger = 113;
 pub const SQL_ATTR_ANSI_APP: SqlInteger = 115;
 
+// Connection attributes the driver honors.
+pub const SQL_ATTR_AUTOCOMMIT: SqlInteger = 102;
+pub const SQL_ATTR_TXN_ISOLATION: SqlInteger = 108;
+pub const SQL_ATTR_CURRENT_CATALOG: SqlInteger = 109;
+pub const SQL_ATTR_RESET_CONNECTION: SqlInteger = 116;
+pub const SQL_ATTR_CONNECTION_DEAD: SqlInteger = 1209;
+
+pub const SQL_AUTOCOMMIT_OFF: u32 = 0;
+pub const SQL_AUTOCOMMIT_ON: u32 = 1;
+pub const SQL_RESET_CONNECTION_YES: u32 = 1;
+pub const SQL_CD_FALSE: u32 = 0;
+pub const SQL_CD_TRUE: u32 = 1;
+
+// Transaction isolation levels (SQL_ATTR_TXN_ISOLATION / SQL_TXN_ISOLATION_OPTION).
+pub const SQL_TXN_READ_UNCOMMITTED: u32 = 0x0000_0001;
+pub const SQL_TXN_READ_COMMITTED: u32 = 0x0000_0002;
+pub const SQL_TXN_REPEATABLE_READ: u32 = 0x0000_0004;
+pub const SQL_TXN_SERIALIZABLE: u32 = 0x0000_0008;
+/// msodbcsql-specific snapshot isolation level (`SQL_TXN_SS_SNAPSHOT`).
+pub const SQL_TXN_SS_SNAPSHOT: u32 = 0x0000_0020;
+
+// SQLEndTran completion types.
+pub const SQL_COMMIT: SqlSmallInt = 0;
+pub const SQL_ROLLBACK: SqlSmallInt = 1;
+
+// SQLFetchScroll orientations.
+pub const SQL_FETCH_NEXT: SqlSmallInt = 1;
+pub const SQL_FETCH_FIRST: SqlSmallInt = 2;
+pub const SQL_FETCH_LAST: SqlSmallInt = 3;
+pub const SQL_FETCH_PRIOR: SqlSmallInt = 4;
+pub const SQL_FETCH_ABSOLUTE: SqlSmallInt = 5;
+pub const SQL_FETCH_RELATIVE: SqlSmallInt = 6;
+
 // Sentinel `StringLength` meaning "the value is a pointer" (ODBC).
 pub const SQL_IS_POINTER: SqlInteger = -4;
+pub const SQL_IS_UINTEGER: SqlInteger = -5;
+pub const SQL_IS_INTEGER: SqlInteger = -6;
+pub const SQL_IS_USMALLINT: SqlInteger = -7;
+pub const SQL_IS_SMALLINT: SqlInteger = -8;
 
 // Four types of descriptor handles
 pub const SQL_ATTR_APP_ROW_DESC: SqlInteger = 10010;
@@ -293,6 +330,42 @@ pub const SQL_C_SS_TIMESTAMPOFFSET: SqlSmallInt = SQL_C_TYPES_EXTENDED + 1; // 0
 // sql_variant probe.
 pub const SQL_CA_SS_VARIANT_TYPE: SqlUSmallInt = 1215;
 
+/// Descriptor field identifiers accepted by `SQLColAttributeW`.
+pub const SQL_DESC_CONCISE_TYPE: SqlUSmallInt = 2;
+pub const SQL_DESC_DISPLAY_SIZE: SqlUSmallInt = 6;
+pub const SQL_DESC_UNSIGNED: SqlUSmallInt = 8;
+pub const SQL_DESC_UPDATABLE: SqlUSmallInt = 10;
+pub const SQL_DESC_AUTO_UNIQUE_VALUE: SqlUSmallInt = 11;
+pub const SQL_DESC_CASE_SENSITIVE: SqlUSmallInt = 12;
+pub const SQL_DESC_SEARCHABLE: SqlUSmallInt = 13;
+pub const SQL_DESC_TYPE_NAME: SqlUSmallInt = 14;
+pub const SQL_DESC_TABLE_NAME: SqlUSmallInt = 15;
+pub const SQL_DESC_SCHEMA_NAME: SqlUSmallInt = 16;
+pub const SQL_DESC_CATALOG_NAME: SqlUSmallInt = 17;
+pub const SQL_DESC_LABEL: SqlUSmallInt = 18;
+pub const SQL_DESC_BASE_COLUMN_NAME: SqlUSmallInt = 22;
+pub const SQL_DESC_BASE_TABLE_NAME: SqlUSmallInt = 23;
+pub const SQL_DESC_LITERAL_PREFIX: SqlUSmallInt = 27;
+pub const SQL_DESC_LITERAL_SUFFIX: SqlUSmallInt = 28;
+pub const SQL_DESC_LOCAL_TYPE_NAME: SqlUSmallInt = 29;
+pub const SQL_DESC_FIXED_PREC_SCALE: SqlUSmallInt = 9;
+pub const SQL_DESC_NUM_PREC_RADIX: SqlUSmallInt = 32;
+pub const SQL_DESC_COUNT: SqlUSmallInt = 1001;
+pub const SQL_DESC_TYPE: SqlUSmallInt = 1002;
+pub const SQL_DESC_LENGTH: SqlUSmallInt = 1003;
+pub const SQL_DESC_PRECISION: SqlUSmallInt = 1005;
+pub const SQL_DESC_SCALE: SqlUSmallInt = 1006;
+pub const SQL_DESC_NULLABLE: SqlUSmallInt = 1008;
+pub const SQL_DESC_NAME: SqlUSmallInt = 1011;
+pub const SQL_DESC_DATA_PTR: SqlUSmallInt = 1010;
+pub const SQL_DESC_UNNAMED: SqlUSmallInt = 1012;
+pub const SQL_DESC_OCTET_LENGTH: SqlUSmallInt = 1013;
+/// ODBC 2.x column attribute aliases still emitted by some applications.
+pub const SQL_COLUMN_NAME: SqlUSmallInt = 1;
+pub const SQL_COLUMN_LENGTH: SqlUSmallInt = 3;
+pub const SQL_COLUMN_PRECISION: SqlUSmallInt = 4;
+pub const SQL_COLUMN_SCALE: SqlUSmallInt = 5;
+
 // ---- Statement attribute identifiers (SQLSetStmtAttr / SQLGetStmtAttr) ------
 pub const SQL_ATTR_ROW_BIND_TYPE: SqlInteger = 5;
 pub const SQL_ATTR_CURSOR_TYPE: SqlInteger = 6;
@@ -319,6 +392,7 @@ pub const SQL_CONCUR_READ_ONLY: SqlULen = 1;
 pub const SQL_ROW_SUCCESS: SqlUSmallInt = 0;
 pub const SQL_ROW_SUCCESS_WITH_INFO: SqlUSmallInt = 6;
 pub const SQL_ROW_NOROW: SqlUSmallInt = 3;
+pub const SQL_ROW_ERROR: SqlUSmallInt = 5;
 
 // ---- ODBC C interop structs (SQLBindCol / SQLGetData targets) ---------------
 /// Maximum byte length of a `SQL_NUMERIC_STRUCT` mantissa.

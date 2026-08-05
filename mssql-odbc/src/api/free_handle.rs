@@ -49,9 +49,11 @@ pub(crate) unsafe fn sql_free_handle(handle_type: SqlSmallInt, handle: SqlHandle
 
 /// Mirrors msodbcsql's `SQLFreeEnv` behavior.
 ///
-/// No mutex is acquired - per the ODBC spec, the DM guarantees the
-/// connection count on this ENV is 0 before calling `SQLFreeEnv`. DM also
-/// ensures no concurrent SQLFreeHandle calls on the same handle.
+/// A Driver Manager normally guarantees every child DBC is freed first, but
+/// applications that load the driver directly (no DM) rely on the driver
+/// cascading the free itself, so any surviving connections are dropped here
+/// before the ENV goes away — otherwise they would hold dangling
+/// `parent_env` pointers.
 ///
 /// # Safety
 /// `handle` must be a live `EnvHandle` created by `alloc_env`.
@@ -67,13 +69,19 @@ unsafe fn free_env(handle: SqlHandle) -> SqlReturn {
         free_errors(&mut state);
     }
 
-    debug_assert!(
-        env.inner
-            .lock()
-            .map(|s| s.connections.is_empty())
-            .unwrap_or(true),
-        "SQLFreeHandle(ENV): DM should have freed all DBCs before calling SQLFreeEnv"
-    );
+    let orphans: Vec<SqlHandle> = match env.inner.lock() {
+        Ok(state) => state.connections.clone(),
+        Err(_) => Vec::new(),
+    };
+    if !orphans.is_empty() {
+        debug!(
+            count = orphans.len(),
+            "SQLFreeHandle(ENV): cascading free of connections still allocated"
+        );
+        for dbc in orphans {
+            unsafe { free_dbc(dbc) };
+        }
+    }
 
     unsafe { free_handle::<EnvHandle>(handle) };
     SQL_SUCCESS
@@ -81,9 +89,9 @@ unsafe fn free_env(handle: SqlHandle) -> SqlReturn {
 
 /// Mirrors msodbcsql's `SQLFreeConnect` behavior.
 ///
-/// No DBC mutex is acquired — the DM guarantees the DBC is disconnected
-/// before calling `SQLFreeConnect`, and `SQLDisconnect` drops all child
-/// handles. msodbcsql's `SQLFreeConnect` doesn't lock the connection mutex either.
+/// Applications that load the driver without a Driver Manager expect freeing
+/// a DBC to implicitly free its statements (and drop a live connection), so
+/// both are handled here instead of asserting the DM did it.
 ///
 /// # Safety
 /// `handle` must be a live `DbcHandle` created by `alloc_dbc`.
@@ -95,17 +103,33 @@ unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
         "SQLFreeHandle(DBC): handle is not a DBC"
     );
 
+    let still_connected = dbc
+        .inner
+        .lock()
+        .map(|s| s.client.is_some())
+        .unwrap_or(false);
+    if still_connected {
+        debug!("SQLFreeHandle(DBC): connection still live — disconnecting first");
+        unsafe { super::disconnect::sql_disconnect(handle) };
+    }
+
     if let Ok(mut state) = dbc.inner.lock() {
         free_errors(&mut state);
     }
 
-    debug_assert!(
-        dbc.inner
-            .lock()
-            .map(|s| s.statements.is_empty())
-            .unwrap_or(true),
-        "SQLFreeHandle(DBC): DM should have freed all STMTs before calling SQLFreeConnect"
-    );
+    let orphans: Vec<SqlHandle> = match dbc.inner.lock() {
+        Ok(state) => state.statements.clone(),
+        Err(_) => Vec::new(),
+    };
+    if !orphans.is_empty() {
+        debug!(
+            count = orphans.len(),
+            "SQLFreeHandle(DBC): cascading free of statements still allocated"
+        );
+        for stmt in orphans {
+            unsafe { free_stmt(stmt) };
+        }
+    }
 
     // Unregister from parent ENV
     let env = unsafe { handle_from_raw::<EnvHandle>(dbc.parent_env) };
@@ -315,10 +339,9 @@ mod tests {
     }
 
     #[test]
-    fn free_env_with_outstanding_dbc_fails_in_debug() {
-        // The DM guarantees all DBCs are freed before calling SQLFreeEnv.
-        // The driver trusts this and frees unconditionally (matching msodbcsql).
-        // In debug builds, debug_assert! fires and catch_unwind returns SQL_ERROR.
+    fn free_env_cascades_to_outstanding_dbc() {
+        // Applications that load the driver without a DM expect SQLFreeEnv to
+        // implicitly free any connections still allocated on the ENV.
         let env = alloc_env();
 
         let mut dbc: SqlHandle = ptr::null_mut();
@@ -326,17 +349,7 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
 
         let ret = unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
-        if cfg!(debug_assertions) {
-            // debug_assert! panics, catch_unwind converts to SQL_ERROR.
-            assert_eq!(ret, SQL_ERROR);
-            // ENV was not freed due to panic — clean up both handles.
-            unsafe { free_handle::<DbcHandle>(dbc) };
-            unsafe { free_handle::<EnvHandle>(env) };
-        } else {
-            assert_eq!(ret, SQL_SUCCESS);
-            // ENV freed, DBC orphaned — clean up directly.
-            unsafe { free_handle::<DbcHandle>(dbc) };
-        }
+        assert_eq!(ret, SQL_SUCCESS);
     }
 
     // --- Helper: alloc ENV + DBC for STMT tests ---
@@ -383,10 +396,8 @@ mod tests {
     }
 
     #[test]
-    fn free_dbc_with_outstanding_stmt_fails_in_debug() {
-        // The DM guarantees all STMTs are freed before calling SQLFreeConnect.
-        // The driver trusts this and frees unconditionally (matching msodbcsql).
-        // In debug builds, debug_assert! fires and catch_unwind returns SQL_ERROR.
+    fn free_dbc_cascades_to_outstanding_stmt() {
+        // Without a DM, freeing a DBC must implicitly free its statements.
         let (env, dbc) = alloc_env_dbc();
 
         let mut stmt: SqlHandle = ptr::null_mut();
@@ -394,17 +405,7 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
 
         let ret = unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
-        if cfg!(debug_assertions) {
-            // debug_assert! panics, catch_unwind converts to SQL_ERROR.
-            assert_eq!(ret, SQL_ERROR);
-            // DBC was not freed due to panic — clean up all handles.
-            unsafe { free_handle::<StmtHandle>(stmt) };
-            unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
-        } else {
-            assert_eq!(ret, SQL_SUCCESS);
-            // DBC freed, STMT orphaned — clean up directly.
-            unsafe { free_handle::<StmtHandle>(stmt) };
-        }
+        assert_eq!(ret, SQL_SUCCESS);
 
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }

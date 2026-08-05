@@ -60,13 +60,21 @@ pub(super) fn claim_connection(
     if let Some(busy_stmt) = dbc_state.active_stmt
         && busy_stmt != statement_handle
     {
-        error!("{op}: connection is busy with results for another statement");
         drop(dbc_state);
-        if let Ok(mut stmt_state) = stmt.inner.lock() {
-            post_diag(&mut stmt_state, ERR_CONNECTION_BUSY);
+        if !crate::api::spill::try_release_connection(dbc, busy_stmt) {
+            error!("{op}: connection is busy with results for another statement");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_diag(&mut stmt_state, ERR_CONNECTION_BUSY);
+            }
+            clear_exec_started(stmt);
+            return Err(SQL_ERROR);
         }
-        clear_exec_started(stmt);
-        return Err(SQL_ERROR);
+        let Ok(state) = dbc.inner.lock() else {
+            error!("{op}: dbc mutex poisoned");
+            clear_exec_started(stmt);
+            return Err(SQL_ERROR);
+        };
+        dbc_state = state;
     }
 
     // Claim the connection before releasing the lock so concurrent threads see

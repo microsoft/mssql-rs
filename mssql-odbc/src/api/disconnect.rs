@@ -6,7 +6,7 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
-use crate::api::sqlstate::{ERR_CONNECTION_DOES_NOT_EXIST, post_diag};
+
 use crate::error::free_errors;
 use crate::handles::DbcHandle;
 use crate::handles::StmtHandle;
@@ -47,9 +47,12 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     free_errors(&mut state);
 
     if state.connection_state != ConnectionState::Connected {
-        error!("SQLDisconnect: not connected");
-        post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
-        return SQL_ERROR;
+        // msodbcsql returns SQL_SUCCESS here rather than the spec's 08003.
+        // Applications call SQLDisconnect from destructors that run while a
+        // failed-connect exception is unwinding, and an error return makes
+        // them throw a second exception -> std::terminate. Match msodbcsql.
+        debug!("SQLDisconnect: not connected — no-op");
+        return SQL_SUCCESS;
     }
 
     // TODO: check for active local transaction → post SQLSTATE 25000
@@ -113,10 +116,9 @@ mod tests {
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) };
         assert_eq!(ret, SQL_SUCCESS);
 
-        // Disconnect without connecting — should error
+        // Disconnecting an unconnected DBC is a no-op, matching msodbcsql.
         let ret = unsafe { sql_disconnect(dbc) };
-        assert_eq!(ret, SQL_ERROR);
-        // TODO: verify SQLSTATE 08003 via SQLGetDiagRec
+        assert_eq!(ret, SQL_SUCCESS);
 
         unsafe {
             sql_free_handle(SQL_HANDLE_DBC, dbc);

@@ -71,6 +71,14 @@ pub(crate) struct StmtState {
     pub(crate) pending_unprepare: Option<i32>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
+    /// Rows of the open result set that were read off the wire ahead of time so
+    /// the connection could be handed to another statement. `SQLFetch` drains
+    /// this before touching the connection. Mirrors msodbcsql, which serves a
+    /// second statement as soon as the first result set is fully buffered.
+    pub(crate) buffered_rows: VecDeque<Vec<ColumnValues>>,
+    /// `true` once `buffered_rows` holds the complete remainder of the open
+    /// result set, so an empty buffer means `SQL_NO_DATA` rather than a read.
+    pub(crate) buffered_eof: bool,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
     /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
@@ -95,11 +103,41 @@ pub(crate) struct StmtState {
     /// Row binding orientation (`SQL_ATTR_ROW_BIND_TYPE`): `SQL_BIND_BY_COLUMN`
     /// (0) for column-wise arrays, otherwise a row-struct byte size.
     pub(crate) row_bind_type: SqlULen,
+    /// Result columns bound via `SQLBindCol`, indexed by `(ColumnNumber - 1)`.
+    /// `None` slots are gaps left by binding a higher ordinal first, or columns
+    /// explicitly unbound with a null buffer pointer.
+    pub(crate) bound_cols: Vec<Option<BoundCol>>,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
 }
 
+/// A result column bound to an application buffer by `SQLBindCol`.
+///
+/// For block fetches the buffers are arrays of `row_array_size` elements, each
+/// `buffer_length` bytes wide (column-wise binding).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoundCol {
+    pub(crate) target_type: crate::api::odbc_types::SqlSmallInt,
+    pub(crate) target_value_ptr: *mut c_void,
+    pub(crate) buffer_length: crate::api::odbc_types::SqlLen,
+    pub(crate) strlen_or_ind_ptr: *mut crate::api::odbc_types::SqlLen,
+}
+
+// SAFETY: the raw pointers are application-owned buffers that the ODBC contract
+// requires to stay valid until the column is unbound; they are only written
+// while the statement mutex is held, exactly like `rows_fetched_ptr`.
+unsafe impl Send for BoundCol {}
+unsafe impl Sync for BoundCol {}
+
 impl StmtState {
+    /// Discards the current row and any rows buffered ahead of the cursor.
+    /// Called whenever the cursor is repositioned, closed, or re-executed.
+    pub(crate) fn reset_rows(&mut self) {
+        self.current_row = None;
+        self.buffered_rows.clear();
+        self.buffered_eof = false;
+    }
+
     pub(crate) fn has_state(&self, mask: u32) -> bool {
         (self.state_flags & mask) != 0
     }
@@ -160,12 +198,15 @@ impl StmtHandle {
                 prepared_handle: None,
                 pending_unprepare: None,
                 current_row: None,
+                buffered_rows: VecDeque::new(),
+                buffered_eof: false,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
                 row_array_size: 1,
                 rows_fetched_ptr: std::ptr::null_mut(),
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                bound_cols: Vec::new(),
                 state_flags: 0,
             }),
         }

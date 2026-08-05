@@ -17,6 +17,10 @@ pub(crate) const SQLSTATE_07009: [u8; 5] = *b"07009";
 pub(crate) const SQLSTATE_08001: [u8; 5] = *b"08001";
 pub(crate) const SQLSTATE_08003: [u8; 5] = *b"08003";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
+/// Numeric value out of range.
+pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
+/// Fetch type out of range.
+pub(crate) const SQLSTATE_HY106: [u8; 5] = *b"HY106";
 pub(crate) const SQLSTATE_HY000: [u8; 5] = *b"HY000";
 pub(crate) const SQLSTATE_HY003: [u8; 5] = *b"HY003";
 pub(crate) const SQLSTATE_HY004: [u8; 5] = *b"HY004";
@@ -26,6 +30,8 @@ pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
 pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
 pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
+/// Invalid descriptor field identifier.
+pub(crate) const SQLSTATE_HY091: [u8; 5] = *b"HY091";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
 pub(crate) const SQLSTATE_HY096: [u8; 5] = *b"HY096";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";

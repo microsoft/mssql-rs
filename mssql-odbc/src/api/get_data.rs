@@ -5,17 +5,15 @@
 
 use tracing::{debug, error};
 
+use super::cdata::{WriteError, WriteOutcome, write_c_value};
 use super::odbc_types::{
-    SQL_C_CHAR, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NULL_DATA, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen,
+    SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt,
 };
 use super::sqlstate::*;
-use crate::api::odbc_types::SqlWChar;
-use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
-use mssql_tds::datatypes::column_values::ColumnValues;
 
 /// Implements SQLGetData for current-row retrieval.
 ///
@@ -121,120 +119,49 @@ fn sql_get_data_safe(
         return SQL_ERROR;
     }
 
-    if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_HYC00,
-            0,
-            "Target type not yet implemented",
-        );
-        return SQL_ERROR;
-    }
-
-    // Output buffer capacity in element units (u8 for SQL_C_CHAR, SqlWChar for
-    // SQL_C_WCHAR). buffer_length is always in bytes per the ODBC spec.
-    let buf_elements = if target_type == SQL_C_WCHAR {
-        (buffer_length as usize) / std::mem::size_of::<SqlWChar>()
-    } else {
-        buffer_length as usize
-    };
-
-    let value = &row[col_index - 1];
-    if matches!(value, ColumnValues::Null) {
-        unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
-        // Write a NUL terminator into the caller buffer when there's room. The
-        // helper handles null `dst` and zero-length uniformly.
-        if target_type == SQL_C_WCHAR {
-            unsafe {
-                copy_with_nul(target_value_ptr as *mut SqlWChar, buf_elements, &[]);
-            }
-        } else {
-            unsafe {
-                copy_with_nul(target_value_ptr as *mut u8, buf_elements, &[]);
-            }
+    let value = row[col_index - 1].clone();
+    match unsafe {
+        write_c_value(
+            &value,
+            target_type,
+            target_value_ptr,
+            buffer_length,
+            strlen_or_ind_ptr,
+        )
+    } {
+        Ok(WriteOutcome::Complete) => SQL_SUCCESS,
+        Ok(WriteOutcome::Truncated) => {
+            post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+            SQL_SUCCESS_WITH_INFO
         }
-        return SQL_SUCCESS;
-    }
-
-    let Some(as_text) = column_value_to_text(value) else {
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_HYC00,
-            0,
-            "Column type conversion not yet implemented",
-        );
-        return SQL_ERROR;
-    };
-
-    if target_type == SQL_C_WCHAR {
-        let utf16: Vec<u16> = as_text.encode_utf16().collect();
-        write_string_result(
-            &mut stmt_state,
-            &utf16,
-            target_value_ptr as *mut SqlWChar,
-            buf_elements,
-            strlen_or_ind_ptr,
-        )
-    } else {
-        write_string_result(
-            &mut stmt_state,
-            as_text.as_bytes(),
-            target_value_ptr as *mut u8,
-            buf_elements,
-            strlen_or_ind_ptr,
-        )
-    }
-}
-
-/// Writes `src` to the caller's output buffer with ODBC string semantics:
-/// the indicator (when present) reports the untruncated byte length, the
-/// payload is NUL-terminated within the buffer, and truncation is reported via
-/// SQLSTATE 01004 + `SQL_SUCCESS_WITH_INFO`.
-///
-/// `buf_elements` is the buffer capacity in units of `T` (not bytes).
-///
-/// The caller-provided pointers are written through small `unsafe` blocks
-/// inside this function; both pointer arguments are obligations of the FFI
-/// caller (validated against the buffer length passed by the DM).
-fn write_string_result<T: Copy + Default>(
-    stmt_state: &mut crate::handles::stmt::StmtState,
-    src: &[T],
-    target_value_ptr: *mut T,
-    buf_elements: usize,
-    strlen_or_ind_ptr: *mut SqlLen,
-) -> SqlReturn {
-    let byte_len = std::mem::size_of_val(src) as SqlLen;
-    unsafe { write_if_some(strlen_or_ind_ptr, byte_len) };
-    let truncated = unsafe { copy_with_nul(target_value_ptr, buf_elements, src) };
-    if truncated {
-        post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION);
-        SQL_SUCCESS_WITH_INFO
-    } else {
-        SQL_SUCCESS
-    }
-}
-
-fn column_value_to_text(v: &ColumnValues) -> Option<String> {
-    match v {
-        ColumnValues::TinyInt(x) => Some(x.to_string()),
-        ColumnValues::SmallInt(x) => Some(x.to_string()),
-        ColumnValues::Int(x) => Some(x.to_string()),
-        ColumnValues::BigInt(x) => Some(x.to_string()),
-        ColumnValues::Real(x) => Some(x.to_string()),
-        ColumnValues::Float(x) => Some(x.to_string()),
-        ColumnValues::Bit(x) => Some(if *x { "1".into() } else { "0".into() }),
-        ColumnValues::String(s) => Some(s.to_utf8_string()),
-        ColumnValues::Uuid(u) => Some(u.to_string()),
-        ColumnValues::Null => Some(String::new()),
-        _ => None,
+        Err(WriteError::InvalidCType) => {
+            post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
+            SQL_ERROR
+        }
+        Err(WriteError::RestrictedConversion) => {
+            post_diag(&mut stmt_state, ERR_RESTRICTED_DATA_TYPE);
+            SQL_ERROR
+        }
+        Err(WriteError::OutOfRange) => {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_22003,
+                0,
+                "Numeric value out of range",
+            );
+            SQL_ERROR
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_LONG, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::{
+        SQL_C_CHAR, SQL_C_LONG, SQL_C_WCHAR, SQL_NULL_DATA, SQL_NULL_HANDLE, SqlWChar,
+    };
     use crate::test_support::TestHandles;
+    use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::datatypes::sql_string::SqlString;
 
     #[test]
@@ -391,13 +318,41 @@ mod tests {
             sql_get_data(
                 stmt,
                 1,
-                SQL_C_LONG,
+                12345,
                 (&mut out as *mut i32).cast(),
                 std::mem::size_of::<i32>() as SqlLen,
                 &mut ind,
             )
         };
         assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn get_data_long_target_type_succeeds() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = h.stmt;
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.current_row = Some(vec![ColumnValues::Int(7)]);
+        }
+
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                stmt,
+                1,
+                SQL_C_LONG,
+                (&mut out as *mut i32).cast(),
+                std::mem::size_of::<i32>() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 7);
+        assert_eq!(ind, 4);
     }
 
     #[test]
