@@ -20,6 +20,44 @@ use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 
+const SQL_DATA_SOURCE_NAME: SqlUSmallInt = 2;
+const SQL_SERVER_NAME: SqlUSmallInt = 13;
+const SQL_SEARCH_PATTERN_ESCAPE: SqlUSmallInt = 14;
+const SQL_ACCESSIBLE_TABLES: SqlUSmallInt = 19;
+const SQL_ACCESSIBLE_PROCEDURES: SqlUSmallInt = 20;
+const SQL_PROCEDURES: SqlUSmallInt = 21;
+const SQL_DATA_SOURCE_READ_ONLY: SqlUSmallInt = 25;
+const SQL_DEFAULT_TXN_ISOLATION: SqlUSmallInt = 26;
+const SQL_EXPRESSIONS_IN_ORDERBY: SqlUSmallInt = 27;
+const SQL_MAX_COLUMN_NAME_LEN: SqlUSmallInt = 30;
+const SQL_MAX_SCHEMA_NAME_LEN: SqlUSmallInt = 32;
+const SQL_MAX_CATALOG_NAME_LEN: SqlUSmallInt = 34;
+const SQL_MAX_TABLE_NAME_LEN: SqlUSmallInt = 35;
+const SQL_MULTIPLE_ACTIVE_TXN: SqlUSmallInt = 37;
+const SQL_OUTER_JOINS: SqlUSmallInt = 38;
+const SQL_SCHEMA_TERM: SqlUSmallInt = 39;
+const SQL_PROCEDURE_TERM: SqlUSmallInt = 40;
+const SQL_CATALOG_NAME_SEPARATOR: SqlUSmallInt = 41;
+const SQL_CATALOG_TERM: SqlUSmallInt = 42;
+const SQL_TABLE_TERM: SqlUSmallInt = 45;
+const SQL_TXN_CAPABLE: SqlUSmallInt = 46;
+const SQL_USER_NAME: SqlUSmallInt = 47;
+const SQL_NUMERIC_FUNCTIONS: SqlUSmallInt = 49;
+const SQL_STRING_FUNCTIONS: SqlUSmallInt = 50;
+const SQL_DATETIME_FUNCTIONS: SqlUSmallInt = 51;
+const SQL_KEYWORDS: SqlUSmallInt = 89;
+const SQL_SPECIAL_CHARACTERS: SqlUSmallInt = 94;
+const SQL_MAX_STATEMENT_LEN: SqlUSmallInt = 105;
+const SQL_LIKE_ESCAPE_CLAUSE: SqlUSmallInt = 113;
+const SQL_SQL_CONFORMANCE: SqlUSmallInt = 118;
+const SQL_MAX_IDENTIFIER_LEN: SqlUSmallInt = 10005;
+
+const SQL_TC_ALL: u16 = 2;
+const SQL_SC_SQL92_ENTRY: u32 = 0x0000_0001;
+const SQL_FN_NUM_SPT: u32 = 0x00FF_FFFF;
+const SQL_FN_STR_SPT: u32 = 0x004F_FFFF;
+const SQL_FN_TD_SPT: u32 = 0x001F_FFFF;
+
 /// Returns driver/data-source metadata for a connection.
 ///
 /// # Safety
@@ -104,6 +142,13 @@ fn sql_get_info_w_safe(
             write_u16(info_value_ptr, 0, string_length_ptr)
         }
         SQL_ACTIVE_STATEMENTS => write_u16(info_value_ptr, 0, string_length_ptr),
+        SQL_DATA_SOURCE_NAME => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "",
+        ),
         SQL_DRIVER_NAME => write_wide_str(
             &mut state,
             info_value_ptr,
@@ -125,6 +170,106 @@ fn sql_get_info_w_safe(
             string_length_ptr,
             "03.80",
         ),
+        SQL_SERVER_NAME => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "localhost",
+        ),
+        SQL_SEARCH_PATTERN_ESCAPE => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "\\",
+        ),
+        SQL_ACCESSIBLE_TABLES
+        | SQL_ACCESSIBLE_PROCEDURES
+        | SQL_EXPRESSIONS_IN_ORDERBY
+        | SQL_MULTIPLE_ACTIVE_TXN
+        | SQL_OUTER_JOINS
+        | SQL_PROCEDURES
+        | SQL_LIKE_ESCAPE_CLAUSE
+        | SQL_NEED_LONG_DATA_LEN => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "Y",
+        ),
+        SQL_DATA_SOURCE_READ_ONLY => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "N",
+        ),
+        SQL_DEFAULT_TXN_ISOLATION => write_u32(
+            info_value_ptr,
+            crate::api::odbc_types::SQL_TXN_READ_COMMITTED,
+            string_length_ptr,
+        ),
+        SQL_MAX_COLUMN_NAME_LEN
+        | SQL_MAX_SCHEMA_NAME_LEN
+        | SQL_MAX_CATALOG_NAME_LEN
+        | SQL_MAX_TABLE_NAME_LEN
+        | SQL_MAX_IDENTIFIER_LEN => write_u16(info_value_ptr, 128, string_length_ptr),
+        SQL_MAX_STATEMENT_LEN => write_u32(info_value_ptr, 0, string_length_ptr),
+        SQL_SCHEMA_TERM => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "owner",
+        ),
+        SQL_PROCEDURE_TERM => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "stored procedure",
+        ),
+        SQL_CATALOG_NAME_SEPARATOR => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            ".",
+        ),
+        SQL_CATALOG_TERM => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "database",
+        ),
+        SQL_TABLE_TERM => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "table",
+        ),
+        SQL_TXN_CAPABLE => write_u16(info_value_ptr, SQL_TC_ALL, string_length_ptr),
+        SQL_USER_NAME => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "",
+        ),
+        SQL_NUMERIC_FUNCTIONS => write_u32(info_value_ptr, SQL_FN_NUM_SPT, string_length_ptr),
+        SQL_STRING_FUNCTIONS => write_u32(info_value_ptr, SQL_FN_STR_SPT, string_length_ptr),
+        SQL_DATETIME_FUNCTIONS => write_u32(info_value_ptr, SQL_FN_TD_SPT, string_length_ptr),
+        SQL_KEYWORDS | SQL_SPECIAL_CHARACTERS => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "",
+        ),
+        SQL_SQL_CONFORMANCE => write_u32(info_value_ptr, SQL_SC_SQL92_ENTRY, string_length_ptr),
         SQL_ODBC_API_CONFORMANCE => write_u16(info_value_ptr, SQL_OAC_LEVEL2, string_length_ptr),
         SQL_ODBC_SQL_CONFORMANCE => write_u16(info_value_ptr, SQL_OSC_CORE, string_length_ptr),
         SQL_CURSOR_COMMIT_BEHAVIOR => write_u16(info_value_ptr, SQL_CB_CLOSE, string_length_ptr),
@@ -165,13 +310,6 @@ fn sql_get_info_w_safe(
             buffer_length,
             string_length_ptr,
             "\"",
-        ),
-        SQL_NEED_LONG_DATA_LEN => write_wide_str(
-            &mut state,
-            info_value_ptr,
-            buffer_length,
-            string_length_ptr,
-            "N",
         ),
         SQL_ASYNC_DBC_FUNCTIONS => {
             write_u32(info_value_ptr, SQL_ASYNC_DBC_NOT_CAPABLE, string_length_ptr)
@@ -316,6 +454,12 @@ mod tests {
             (SQL_ODBC_SQL_CONFORMANCE, SQL_OSC_CORE),
             (SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CB_CLOSE),
             (SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_CB_CLOSE),
+            (SQL_MAX_COLUMN_NAME_LEN, 128),
+            (SQL_MAX_SCHEMA_NAME_LEN, 128),
+            (SQL_MAX_CATALOG_NAME_LEN, 128),
+            (SQL_MAX_TABLE_NAME_LEN, 128),
+            (SQL_MAX_IDENTIFIER_LEN, 128),
+            (SQL_TXN_CAPABLE, SQL_TC_ALL),
         ] {
             let (rc, val, len) = get_u16(h.dbc, info_type);
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
@@ -331,6 +475,15 @@ mod tests {
             (SQL_GETDATA_EXTENSIONS, SQL_GD_ANY_COLUMN | SQL_GD_ANY_ORDER),
             (SQL_ASYNC_DBC_FUNCTIONS, SQL_ASYNC_DBC_NOT_CAPABLE),
             (SQL_ASYNC_NOTIFICATION, SQL_ASYNC_NOTIFICATION_NOT_CAPABLE),
+            (
+                SQL_DEFAULT_TXN_ISOLATION,
+                crate::api::odbc_types::SQL_TXN_READ_COMMITTED,
+            ),
+            (SQL_MAX_STATEMENT_LEN, 0),
+            (SQL_NUMERIC_FUNCTIONS, SQL_FN_NUM_SPT),
+            (SQL_STRING_FUNCTIONS, SQL_FN_STR_SPT),
+            (SQL_DATETIME_FUNCTIONS, SQL_FN_TD_SPT),
+            (SQL_SQL_CONFORMANCE, SQL_SC_SQL92_ENTRY),
         ] {
             let (rc, val, len) = get_u32(h.dbc, info_type);
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
@@ -377,6 +530,44 @@ mod tests {
         assert_eq!(String::from_utf16_lossy(&buf[..n]), expected);
         // Null-terminated just past the copied text.
         assert_eq!(buf[n], 0);
+    }
+
+    #[test]
+    fn getinfo_string_table_reports_expected_values() {
+        let h = TestHandles::with_env_dbc();
+        for (info_type, expected) in [
+            (SQL_SERVER_NAME, "localhost"),
+            (SQL_SEARCH_PATTERN_ESCAPE, "\\"),
+            (SQL_ACCESSIBLE_TABLES, "Y"),
+            (SQL_ACCESSIBLE_PROCEDURES, "Y"),
+            (SQL_PROCEDURES, "Y"),
+            (SQL_DATA_SOURCE_READ_ONLY, "N"),
+            (SQL_EXPRESSIONS_IN_ORDERBY, "Y"),
+            (SQL_MULTIPLE_ACTIVE_TXN, "Y"),
+            (SQL_OUTER_JOINS, "Y"),
+            (SQL_SCHEMA_TERM, "owner"),
+            (SQL_PROCEDURE_TERM, "stored procedure"),
+            (SQL_CATALOG_NAME_SEPARATOR, "."),
+            (SQL_CATALOG_TERM, "database"),
+            (SQL_TABLE_TERM, "table"),
+            (SQL_LIKE_ESCAPE_CLAUSE, "Y"),
+            (SQL_NEED_LONG_DATA_LEN, "Y"),
+        ] {
+            let mut buf = [0u16; 32];
+            let mut len: SqlSmallInt = -1;
+            let rc = unsafe {
+                sql_get_info_w(
+                    h.dbc,
+                    info_type,
+                    buf.as_mut_ptr() as SqlPointer,
+                    (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
+            let n = (len as usize) / 2;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), expected);
+        }
     }
 
     #[test]

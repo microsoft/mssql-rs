@@ -8,11 +8,12 @@ use tracing::{debug, error};
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_DEAD,
-    SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE,
-    SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_CD_FALSE, SQL_CD_TRUE,
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
+    SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
+    SQL_CD_FALSE, SQL_CD_TRUE, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlWChar,
 };
-use crate::api::util::write_if_some;
+use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
@@ -22,8 +23,8 @@ const SQL_MODE_READ_WRITE: u32 = 0;
 
 /// Retrieves the current setting of a connection attribute.
 ///
-/// Only fixed-length (`SQLUINTEGER`) attributes are supported; string-valued
-/// attributes report `HYC00`.
+/// Fixed-length (`SQLUINTEGER`) attributes plus the string-valued
+/// `SQL_ATTR_CURRENT_CATALOG` are supported; anything else reports `HYC00`.
 ///
 /// # Safety
 /// - `connection_handle` must be a valid `DbcHandle` from `SQLAllocHandle`.
@@ -46,7 +47,13 @@ pub(crate) unsafe fn sql_get_connect_attr_w(
     );
 
     crate::ffi_entry!("SQLGetConnectAttrW", unsafe {
-        sql_get_connect_attr_w_impl(connection_handle, attribute, value_ptr, string_length_ptr)
+        sql_get_connect_attr_w_impl(
+            connection_handle,
+            attribute,
+            value_ptr,
+            buffer_length,
+            string_length_ptr,
+        )
     })
 }
 
@@ -54,6 +61,7 @@ unsafe fn sql_get_connect_attr_w_impl(
     connection_handle: SqlHandle,
     attribute: SqlInteger,
     value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
     if connection_handle.is_null() {
@@ -73,6 +81,46 @@ unsafe fn sql_get_connect_attr_w_impl(
         return SQL_ERROR;
     };
     free_errors(&mut state);
+
+    // String-valued attributes are written as UTF-16 with a byte length, so they
+    // cannot share the SQLUINTEGER path below.
+    if attribute == SQL_ATTR_CURRENT_CATALOG {
+        if value_ptr.is_null() {
+            error!(attribute, "SQLGetConnectAttrW: value_ptr is null");
+            post_diag(&mut state, ERR_INVALID_NULL_POINTER);
+            return SQL_ERROR;
+        }
+        let catalog: Vec<SqlWChar> = state
+            .current_catalog
+            .as_deref()
+            .unwrap_or_default()
+            .encode_utf16()
+            .collect();
+        let capacity_chars = if buffer_length > 0 {
+            (buffer_length as usize) / size_of::<SqlWChar>()
+        } else {
+            0
+        };
+        let truncated = unsafe {
+            copy_with_nul(
+                value_ptr.cast::<SqlWChar>(),
+                capacity_chars,
+                catalog.as_slice(),
+            )
+        };
+        unsafe {
+            write_if_some(
+                string_length_ptr,
+                (catalog.len() * size_of::<SqlWChar>()) as SqlInteger,
+            )
+        };
+        return if truncated {
+            post_diag(&mut state, ERR_STRING_RIGHT_TRUNCATION);
+            SQL_SUCCESS_WITH_INFO
+        } else {
+            SQL_SUCCESS
+        };
+    }
 
     let value: u32 = match attribute {
         SQL_ATTR_AUTOCOMMIT => {

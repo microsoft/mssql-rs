@@ -69,6 +69,9 @@ pub(crate) struct DbcState {
     pub(crate) autocommit: bool,
     /// `SQL_ATTR_TXN_ISOLATION`, applied via `SET TRANSACTION ISOLATION LEVEL`.
     pub(crate) txn_isolation: u32,
+    /// `SQL_ATTR_CURRENT_CATALOG`. Tracks the database the session is using so
+    /// `SQLGetConnectAttr` can report it without a round trip.
+    pub(crate) current_catalog: Option<String>,
     /// Set once the connection is known to be unusable, so
     /// `SQL_ATTR_CONNECTION_DEAD` can report it without a round trip.
     pub(crate) dead: bool,
@@ -119,6 +122,7 @@ impl DbcHandle {
                 access_token: None,
                 autocommit: true,
                 txn_isolation: crate::api::odbc_types::SQL_TXN_READ_COMMITTED,
+                current_catalog: None,
                 dead: false,
             }),
         }

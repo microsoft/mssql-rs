@@ -11,13 +11,15 @@ use tracing::{debug, error};
 
 use super::conn_exec::exec_on_connection;
 use super::sqlstate::*;
+use super::util::read_utf16;
 use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT,
-    SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_RESET_CONNECTION,
-    SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_COPT_SS_ACCESS_TOKEN,
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_TXN_READ_COMMITTED, SQL_TXN_READ_UNCOMMITTED,
-    SQL_TXN_REPEATABLE_READ, SQL_TXN_SERIALIZABLE, SQL_TXN_SS_SNAPSHOT, SqlHandle, SqlInteger,
-    SqlPointer, SqlReturn,
+    SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE,
+    SQL_ATTR_RESET_CONNECTION, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
+    SQL_COPT_SS_ACCESS_TOKEN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS,
+    SQL_TXN_READ_COMMITTED, SQL_TXN_READ_UNCOMMITTED, SQL_TXN_REPEATABLE_READ,
+    SQL_TXN_SERIALIZABLE, SQL_TXN_SS_SNAPSHOT, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SqlSmallInt, SqlWChar,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
@@ -87,7 +89,7 @@ unsafe fn sql_set_connect_attr_w_impl(
     connection_handle: SqlHandle,
     attribute: SqlInteger,
     value_ptr: SqlPointer,
-    _string_length: SqlInteger,
+    string_length: SqlInteger,
 ) -> SqlReturn {
     if connection_handle.is_null() {
         error!("SQLSetConnectAttrW: connection_handle is null");
@@ -204,6 +206,53 @@ unsafe fn sql_set_connect_attr_w_impl(
                 "SQLSetConnectAttrW",
             ) {
                 Ok(()) => SQL_SUCCESS,
+                Err(rc) => rc,
+            }
+        }
+        SQL_ATTR_CURRENT_CATALOG => {
+            if value_ptr.is_null() {
+                error!("SQLSetConnectAttrW: SQL_ATTR_CURRENT_CATALOG value is null");
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_HY009,
+                    0,
+                    "SQL_ATTR_CURRENT_CATALOG value pointer is null",
+                );
+                return SQL_ERROR;
+            }
+            // `string_length` is in bytes (SQL_NTS when the caller passes a
+            // NUL-terminated string); `read_utf16` counts SQLWCHARs.
+            let chars = if string_length == SQL_NTS as SqlInteger {
+                SQL_NTS
+            } else {
+                match SqlSmallInt::try_from(string_length / 2) {
+                    Ok(chars) => chars,
+                    Err(_) => {
+                        post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                        return SQL_ERROR;
+                    }
+                }
+            };
+            let catalog = unsafe { read_utf16(value_ptr.cast::<SqlWChar>(), chars) };
+            if catalog.is_empty() {
+                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                return SQL_ERROR;
+            }
+            if state.connection_state != ConnectionState::Connected {
+                // Pre-connect: the catalog is carried by the connection string's
+                // Database keyword, which SQLDriverConnect already honors.
+                state.current_catalog = Some(catalog);
+                return SQL_SUCCESS;
+            }
+            drop(state);
+            let quoted = catalog.replace(']', "]]");
+            match exec_on_connection(dbc, &format!("USE [{quoted}]"), "SQLSetConnectAttrW") {
+                Ok(()) => {
+                    if let Ok(mut state) = dbc.inner.lock() {
+                        state.current_catalog = Some(catalog);
+                    }
+                    SQL_SUCCESS
+                }
                 Err(rc) => rc,
             }
         }
