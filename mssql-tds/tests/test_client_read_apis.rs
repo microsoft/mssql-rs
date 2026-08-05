@@ -1173,4 +1173,46 @@ mod client_based_iterators {
         client.close_query().await?;
         Ok(())
     }
+
+    // Pulling a column that precedes the cursor's current position is a
+    // forward-only violation: its bytes are already gone, so the pull reports
+    // AlreadyConsumed and leaves the cursor where it is for a later valid pull.
+    #[tokio::test]
+    async fn read_row_column_backward_reports_already_consumed() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute(
+                "SELECT CAST(10 AS INT) AS c1, CAST(20 AS INT) AS c2, CAST(30 AS INT) AS c3"
+                    .to_string(),
+                (),
+            )
+            .await?;
+
+        if client.on_rows() {
+            assert!(client.next_row_cursor().await?);
+
+            // Pull the middle column c2 (0-based 1); the cursor pauses at c3, so
+            // the row stays paused (not fully consumed).
+            assert!(matches!(
+                client.read_row_column(1).await?,
+                CursorColumn::Value(ColumnValues::Int(20))
+            ));
+
+            // c1 (0-based 0) is now behind the cursor: forward-only violation.
+            assert!(matches!(
+                client.read_row_column(0).await?,
+                CursorColumn::AlreadyConsumed
+            ));
+
+            assert!(!client.next_row_cursor().await?);
+        }
+
+        client.close_query().await?;
+        Ok(())
+    }
 }
