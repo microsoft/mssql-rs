@@ -140,8 +140,11 @@ docker compose -f docker-compose-matrix.yml --profile ubuntu22 build  # build lo
 Override the source registry/tag with `KERBEROS_IMAGE_REGISTRY` and
 `KERBEROS_IMAGE_TAG`.
 
-The DC and SQL images mount `./scripts` at runtime rather than baking the init
-scripts in, so edits to `scripts/init-*.sh` take effect without a rebuild.
+The DC and SQL containers run their init script from the mounted `./scripts`
+directory rather than the copy baked into the image (via `command:` /
+`entrypoint:` overrides in the compose files), so edits to `scripts/init-*.sh`
+take effect without republishing the image.
+
 ### Test a Specific Distro
 
 ```bash

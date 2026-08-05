@@ -176,8 +176,15 @@ if [ "$ARCHIVE_MODE" = true ]; then
     echo "Step 4: Install cargo-nextest..."
     echo "----------------------------------------------"
     docker exec "$CONTAINER_NAME" bash -c '
-        command -v cargo-nextest >/dev/null && exit 0
-        cargo install cargo-nextest --version 0.9.99 --locked
+        NEXTEST_VERSION=0.9.99
+        HAVE=$(cargo nextest --version 2>/dev/null)
+        case "$HAVE" in
+            *"$NEXTEST_VERSION"*)
+                echo "cargo-nextest $NEXTEST_VERSION already present (pre-built image)"
+                exit 0 ;;
+        esac
+        [ -n "$HAVE" ] && echo "Found [$HAVE], want $NEXTEST_VERSION; reinstalling"
+        cargo install cargo-nextest --version "$NEXTEST_VERSION" --locked --force
     '
     echo "✓ cargo-nextest installed"
     
@@ -261,8 +268,15 @@ OUTER_EOF
         echo "Step 4: Install cargo-nextest (CI mode)..."
         echo "----------------------------------------------"
         docker exec "$CONTAINER_NAME" bash -c '
-            command -v cargo-nextest >/dev/null && exit 0
-            cargo install cargo-nextest --version 0.9.99 --locked
+            NEXTEST_VERSION=0.9.99
+            HAVE=$(cargo nextest --version 2>/dev/null)
+            case "$HAVE" in
+                *"$NEXTEST_VERSION"*)
+                    echo "cargo-nextest $NEXTEST_VERSION already present (pre-built image)"
+                    exit 0 ;;
+            esac
+            [ -n "$HAVE" ] && echo "Found [$HAVE], want $NEXTEST_VERSION; reinstalling"
+            cargo install cargo-nextest --version "$NEXTEST_VERSION" --locked --force
         '
         echo "✓ cargo-nextest installed"
     fi
