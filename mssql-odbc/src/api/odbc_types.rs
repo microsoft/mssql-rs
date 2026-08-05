@@ -116,6 +116,7 @@ pub const SQL_API_SQLDRIVERCONNECT: SqlUSmallInt = 41;
 pub const SQL_API_SQLGETDATA: SqlUSmallInt = 43;
 pub const SQL_API_SQLGETFUNCTIONS: SqlUSmallInt = 44;
 pub const SQL_API_SQLGETINFO: SqlUSmallInt = 45;
+pub const SQL_API_SQLGETTYPEINFO: SqlUSmallInt = 47;
 pub const SQL_API_SQLBINDPARAMETER: SqlUSmallInt = 72;
 pub const SQL_API_SQLMORERESULTS: SqlUSmallInt = 61;
 pub const SQL_API_SQLALLOCHANDLE: SqlUSmallInt = 1001;
@@ -127,6 +128,7 @@ pub const SQL_API_SQLGETENVATTR: SqlUSmallInt = 1012;
 pub const SQL_API_SQLGETSTMTATTR: SqlUSmallInt = 1014;
 pub const SQL_API_SQLSETCONNECTATTR: SqlUSmallInt = 1016;
 pub const SQL_API_SQLSETENVATTR: SqlUSmallInt = 1019;
+pub const SQL_API_SQLSETSTMTATTR: SqlUSmallInt = 1020;
 
 // SQLGetInfo info-type identifiers.
 pub const SQL_MAX_DRIVER_CONNECTIONS: SqlUSmallInt = 0;
