@@ -26,6 +26,8 @@ use crate::connection::transport::network_transport::TransportSslHandler;
 use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult};
 use crate::datatypes::row_writer::RowWriter;
+use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
+use crate::query::metadata::ColumnMetadata;
 use crate::handler::handler_factory::create_test_negotiated_settings_internal;
 use crate::io::reader_writer::{NetworkReader, NetworkWriter};
 use crate::io::token_stream::{
@@ -195,6 +197,26 @@ pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
 /// An empty COLMETADATA token — a row-returning result set with zero columns.
 pub fn col_metadata_empty() -> ScriptedToken {
     ScriptedToken(Tokens::ColMetadata(ColMetadataToken::default()))
+}
+
+/// A `Vec<ColumnMetadata>` of `n` nullable `int` columns named `c1..=cn`.
+///
+/// For consumer-side tests (e.g. the ODBC `SQLGetData` column-range and
+/// forward-only guards) that only need a result set with a given column count;
+/// the type detail is irrelevant to those checks.
+pub fn int_columns(n: usize) -> Vec<ColumnMetadata> {
+    (1..=n)
+        .map(|i| ColumnMetadata {
+            user_type: 0,
+            flags: 0x01, // nullable
+            type_info: TypeInfo::fixed_len(TdsDataType::Int4)
+                .expect("Int4 is a fixed-length type"),
+            data_type: TdsDataType::Int4,
+            column_name: format!("c{i}"),
+            multi_part_name: None,
+            crypto_metadata: None,
+        })
+        .collect()
 }
 
 /// A DONE token with the MORE flag set (more results follow in the batch).

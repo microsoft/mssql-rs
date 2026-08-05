@@ -2854,6 +2854,13 @@ impl TdsClient {
             ));
         }
 
+        // Idempotent at end-of-set: after the terminating DONE, calling again
+        // must report exhaustion instead of blocking on a wire read for a
+        // packet the server will never send (until the caller advances).
+        if self.current_result_set_has_been_read_till_end {
+            return Ok(false);
+        }
+
         self.drain_active_row().await?;
 
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
@@ -2908,6 +2915,14 @@ impl TdsClient {
             return Err(UsageError(
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
             ));
+        }
+
+        // Idempotent at end-of-set: once the terminating DONE has been read the
+        // wire holds nothing more for this result set until the caller advances
+        // (SQLMoreResults). Re-reading here would block on a packet the server
+        // will never send, so report exhaustion without touching the transport.
+        if self.current_result_set_has_been_read_till_end {
+            return Ok(false);
         }
 
         self.drain_active_row().await?;

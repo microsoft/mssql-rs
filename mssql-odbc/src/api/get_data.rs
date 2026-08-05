@@ -674,8 +674,24 @@ fn column_value_to_text(v: &ColumnValues) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::api::odbc_types::{SQL_NO_DATA, SQL_NULL_HANDLE};
+    use crate::error::diag::DiagRecord;
     use crate::test_support::TestHandles;
+    use mssql_tds::test_client_support::int_columns;
+
+    /// Assert the most recent diagnostic matches the expected canonical
+    /// SQLSTATE and message text (the message is prefixed by the driver, so we
+    /// match on a substring).
+    fn assert_last_diag(records: &[DiagRecord], expected: DiagMsg) {
+        let d = records.last().expect("expected a diagnostic record");
+        assert_eq!(d.sql_state, expected.state, "SQLSTATE mismatch");
+        assert!(
+            d.message.contains(expected.text),
+            "message {:?} did not contain {:?}",
+            d.message,
+            expected.text
+        );
+    }
 
     #[test]
     fn get_data_null_handle() {
@@ -696,6 +712,7 @@ mod tests {
     fn get_data_without_cursor_returns_24000() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = h.stmt;
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         let mut buf = [0u8; 16];
         let mut ind: SqlLen = 0;
         let ret = unsafe {
@@ -709,5 +726,141 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
+        let s = stmt_handle.inner.lock().unwrap();
+        assert_last_diag(&s.diag_records, ERR_INVALID_CURSOR_STATE);
+    }
+
+    /// CURSOR_OPEN with column 0 requested: an invalid descriptor index
+    /// (07009) regardless of row state, since ordinal 0 is the bookmark column
+    /// which this driver does not support.
+    #[test]
+    fn get_data_column_zero_is_invalid() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(2);
+        }
+
+        let mut buf = [0u8; 8];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                0,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let s = stmt_handle.inner.lock().unwrap();
+        assert_last_diag(&s.diag_records, ERR_INVALID_DESCRIPTOR_INDEX);
+    }
+
+    /// Cursor is open but no row is positioned (SQLGetData before a successful
+    /// SQLFetch): expect SQL_ERROR with SQLSTATE 24000.
+    #[test]
+    fn get_data_cursor_open_but_no_active_row_returns_24000() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(2);
+            // row_positioned stays false: no SQLFetch has landed on a row yet.
+        }
+
+        let mut buf = [0u8; 16];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let s = stmt_handle.inner.lock().unwrap();
+        let d = s.diag_records.last().unwrap();
+        assert_eq!(d.sql_state, SQLSTATE_24000);
+        assert!(
+            d.message.contains("No current row"),
+            "message was: {}",
+            d.message
+        );
+    }
+
+    /// Columns 1..=3 were consumed (cursor at 3). Requesting an earlier column
+    /// (2) is backward retrieval, which this driver rejects with 07009 — the
+    /// guard fires on statement state alone, before any wire access.
+    #[test]
+    fn get_data_backward_column_is_rejected() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(4);
+            s.row_positioned = true;
+            s.current_row_last_col = 3; // columns 1..=3 already consumed
+        }
+
+        let mut buf = [0u8; 8];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                2,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let s = stmt_handle.inner.lock().unwrap();
+        assert_last_diag(&s.diag_records, ERR_INVALID_DESCRIPTOR_INDEX);
+    }
+
+    /// Re-requesting the most recently retrieved column (cursor == its ordinal)
+    /// reports end-of-data, matching the SQLGetData streaming contract. This is
+    /// a clean SQL_NO_DATA — no diagnostic is posted.
+    #[test]
+    fn get_data_reread_just_consumed_column_returns_no_data() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(4);
+            s.row_positioned = true;
+            s.current_row_last_col = 3; // column 3 was the last consumed
+        }
+
+        let mut buf = [0u8; 8];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                3,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_NO_DATA);
+        let s = stmt_handle.inner.lock().unwrap();
+        assert!(
+            s.diag_records.is_empty(),
+            "SQL_NO_DATA must not post a diagnostic, got: {:?}",
+            s.diag_records
+        );
     }
 }
