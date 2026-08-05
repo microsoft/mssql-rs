@@ -179,6 +179,16 @@ the first-pass spike for a benchmark the gate had already cleared as noise, and 
 summary would appear to contradict the verdict. The median (rather than the best passing
 re-run) keeps the displayed number from being cherry-picked.
 
+**Large improvements are verified too.** The gate is one-directional, so a *baseline*-slower
+result is never challenged and an implausible "3× faster" would be published unverified —
+a real risk, since a sustained host disturbance during one pass produces a large, tight-CI
+delta that does not look like noise. Any benchmark where the baseline is slower by
+≥ `BENCH_IMPROVEMENT_VERIFY_RATIO` (default `1.50`) joins the same re-measure set, and the
+summary reports whether the win reproduced in a majority of re-runs. This never fails the
+run: it exists so a one-off artifact is not reported as a real gain, and because a win that
+*does* reproduce is itself worth a look — an implausible speed-up can mean the candidate is
+doing less work rather than the same work faster.
+
 **Compilation failures fail loudly.** Both runners compile the candidate and baseline
 bench binaries in an explicit `cargo bench --no-run` step with human-readable output
 before enumerating them. The enumeration itself parses cargo's JSON and discards stderr,

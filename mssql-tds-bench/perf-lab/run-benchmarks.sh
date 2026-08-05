@@ -327,6 +327,26 @@ regression_pairs() {
 
 OFFENDERS=$(regression_ids "$RESULTS_DIR/comparison.txt")
 
+# The gate is one-directional, so a *baseline*-slower result is never challenged
+# and an implausible "3x faster" gets published unverified. critcmp normalizes
+# the faster side to 1.00, so field 2 carries the baseline's ratio: select IDs
+# where the baseline is slower by at least BENCH_IMPROVEMENT_VERIFY_RATIO and
+# re-measure them too. Only large deltas qualify, so normal runs pay nothing.
+improvement_ids() {
+    awk -v thr="${BENCH_IMPROVEMENT_VERIFY_RATIO:-1.50}" '
+        $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ && ($2 + 0) >= thr { print $1 }
+    ' "$1"
+}
+improvement_pairs() {
+    awk -v thr="${BENCH_IMPROVEMENT_VERIFY_RATIO:-1.50}" '
+        $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ && ($2 + 0) >= thr { print $1, $2 }
+    ' "$1"
+}
+
+IMPROVEMENTS=$(improvement_ids "$RESULTS_DIR/comparison.txt")
+# One re-measure set covers both directions, so the re-runs cost one pass.
+VERIFY_IDS=$(printf '%s\n%s\n' "$OFFENDERS" "$IMPROVEMENTS" | grep -E '.' | sort -u)
+
 # --- Auto-confirm regressions: re-measure the offenders N times, require a
 # --- majority to confirm ---
 # A strict gate can trip on a transient single-benchmark outlier — short,
@@ -341,13 +361,17 @@ OFFENDERS=$(regression_ids "$RESULTS_DIR/comparison.txt")
 CONFIRM_RUNS="${BENCH_CONFIRM_RUNS:-4}"
 QUORUM="${BENCH_CONFIRM_QUORUM:-$(( CONFIRM_RUNS / 2 + 1 ))}"
 CONFIRMED_IDS=""
+IMP_CONFIRMED=""
 TALLY_FILE="$RESULTS_DIR/confirm-tally.txt"
+IMP_TALLY_FILE="$RESULTS_DIR/improvement-tally.txt"
 : > "$TALLY_FILE"
+: > "$IMP_TALLY_FILE"
 
-if [ -n "$OFFENDERS" ]; then
-    FILTER=$(printf '%s\n' "$OFFENDERS" | sed 's|^|^|; s|$|$|' | paste -sd '|' -)
-    echo ">>> Gate tripped by: $(printf '%s ' $OFFENDERS)"
-    echo ">>> Auto-confirm: re-measuring those benchmark(s) ${CONFIRM_RUNS}x; a regression counts only if it trips in >= ${QUORUM} of ${CONFIRM_RUNS} re-runs."
+if [ -n "$VERIFY_IDS" ]; then
+    FILTER=$(printf '%s\n' "$VERIFY_IDS" | sed 's|^|^|; s|$|$|' | paste -sd '|' -)
+    [ -n "$OFFENDERS" ] && echo ">>> Gate tripped by: $(printf '%s ' $OFFENDERS)"
+    [ -n "$IMPROVEMENTS" ] && echo ">>> Verifying large apparent improvement(s): $(printf '%s ' $IMPROVEMENTS)"
+    echo ">>> Auto-confirm: re-measuring those benchmark(s) ${CONFIRM_RUNS}x; a result counts only if it reproduces in >= ${QUORUM} of ${CONFIRM_RUNS} re-runs."
     # One warm-up before the loop; the re-runs are back-to-back so caches stay hot.
     warmup_pass "$FILTER"
     for run in $(seq 1 "$CONFIRM_RUNS"); do
@@ -355,9 +379,12 @@ if [ -n "$OFFENDERS" ]; then
         interleave_run "candidate_confirm${run}" "base_confirm${run}" "$FILTER"
         critcmp "base_confirm${run}" "candidate_confirm${run}" | tee "$RESULTS_DIR/confirm-run${run}.txt"
         regression_pairs "$RESULTS_DIR/confirm-run${run}.txt" >> "$TALLY_FILE"
+        improvement_pairs "$RESULTS_DIR/confirm-run${run}.txt" >> "$IMP_TALLY_FILE"
     done
     # Confirmed = benchmarks that tripped in at least QUORUM of the re-runs.
     CONFIRMED_IDS=$(awk '{ print $1 }' "$TALLY_FILE" | sort | uniq -c \
+        | awk -v q="$QUORUM" '$1 >= q { print $2 }')
+    IMP_CONFIRMED=$(awk '{ print $1 }' "$IMP_TALLY_FILE" | sort | uniq -c \
         | awk -v q="$QUORUM" '$1 >= q { print $2 }')
 fi
 rm -rf "$REPO_ROOT/target-base" 2>/dev/null || true
@@ -366,6 +393,10 @@ rm -rf "$REPO_ROOT/target-base" 2>/dev/null || true
 offender_hits() { awk -v id="$1" '$1 == id { c++ } END { print c + 0 }' "$TALLY_FILE"; }
 # Per-offender worst candidate ratio among the re-runs it tripped ("" if none).
 offender_worst() { awk -v id="$1" '$1 == id && $2 + 0 > w { w = $2 + 0 } END { if (w > 0) print w }' "$TALLY_FILE"; }
+# Same, for apparent improvements (how many re-runs reproduced it, and the best
+# baseline-slower ratio seen).
+imp_hits() { awk -v id="$1" '$1 == id { c++ } END { print c + 0 }' "$IMP_TALLY_FILE"; }
+imp_best() { awk -v id="$1" '$1 == id && $2 + 0 > w { w = $2 + 0 } END { if (w > 0) print w }' "$IMP_TALLY_FILE"; }
 
 # Candidate/base ratio for a benchmark id in a critcmp file ("" if absent).
 ratio_in_file() { awk -v id="$1" '$1 == id && $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ { print $6 / $2; exit }' "$2"; }
@@ -379,7 +410,7 @@ median_stdin() { sort -n | awk '{ v[NR] = $1 } END { if (NR == 0) exit; if (NR %
 # critcmp block in the summary keeps the untouched first-pass data.
 MEDIANS_FILE="$RESULTS_DIR/offender-medians.txt"
 : > "$MEDIANS_FILE"
-for id in $OFFENDERS; do
+for id in $VERIFY_IDS; do
     med=$(
         {
             ratio_in_file "$id" "$RESULTS_DIR/comparison.txt"
@@ -391,7 +422,9 @@ done
 
 # --- Verdict (based on the majority-confirmed regressions) ---
 THR="${BENCH_REGRESSION_RATIO:-1.10}"
+IMP_THR="${BENCH_IMPROVEMENT_VERIFY_RATIO:-1.50}"
 PCT=$(awk -v t="$THR" 'BEGIN { printf "%d", (t - 1) * 100 + 0.5 }')
+IMP_PCT=$(awk -v t="$IMP_THR" 'BEGIN { printf "%d", (t - 1) * 100 + 0.5 }')
 NCONF=$(printf '%s\n' ${CONFIRMED_IDS:-} | grep -c . || true)
 if [ "${NCONF:-0}" -gt 0 ]; then
     # Worst confirmed benchmark by its max observed ratio across the re-runs.
@@ -461,6 +494,10 @@ emoji_bar_table() {
         echo "_Auto-confirm re-measured the initially-tripping benchmark(s) ${CONFIRM_RUNS}× (interleaved, offenders only). A regression is counted only when it trips in at least ${QUORUM} of ${CONFIRM_RUNS} re-runs; a benchmark that spikes once but not consistently is treated as transient noise._"
         echo ""
     fi
+    if [ -n "$IMPROVEMENTS" ]; then
+        echo "_Benchmark(s) where the baseline looked slower by ≥${IMP_PCT}% were re-measured the same way, so an apparent win that does not reproduce is not reported as real._"
+        echo ""
+    fi
     echo "### Change vs baseline"
     echo ""
     echo "_🟩 faster · 🟥 slower · 1 square ≈ 1% (drawn only for |Δ| ≥ 1%) · ⟳ re-measured (median of re-runs)_"
@@ -478,7 +515,7 @@ emoji_bar_table() {
     echo '```'
     if [ -n "$OFFENDERS" ]; then
         echo ""
-        echo "### Auto-confirm re-runs (offenders only)"
+        echo "### Regressions (auto-confirm)"
         echo ""
         echo "Initially tripped: $(printf '%s ' $OFFENDERS)"
         echo ""
@@ -496,6 +533,33 @@ emoji_bar_table() {
         done
         echo ""
         echo "_Confirmed (tripped in ≥ ${QUORUM}/${CONFIRM_RUNS}): ${CONFIRMED_IDS:-none}_"
+        echo ""
+    fi
+    if [ -n "$IMPROVEMENTS" ]; then
+        echo ""
+        echo "### Large improvements (verification)"
+        echo ""
+        echo "_Baseline slower by ≥${IMP_PCT}%. These never fail the gate; they are re-measured so a one-off artifact is not published as a real gain. A win that **does** reproduce is also worth a look — it can mean the candidate is doing less work rather than the same work faster._"
+        echo ""
+        echo "| benchmark | reproduced | best |"
+        echo "|-----------|------------|------|"
+        for id in $IMPROVEMENTS; do
+            ihits=$(imp_hits "$id")
+            ib=$(imp_best "$id")
+            if [ -n "$ib" ]; then
+                ibcell=$(awk -v r="$ib" 'BEGIN { printf "%.2fx faster", r }')
+            else
+                ibcell="—"
+            fi
+            echo "| ${id} | ${ihits}/${CONFIRM_RUNS} | ${ibcell} |"
+        done
+        echo ""
+        echo "_Verified (reproduced in ≥ ${QUORUM}/${CONFIRM_RUNS}): ${IMP_CONFIRMED:-none}_"
+        echo ""
+    fi
+    if [ -n "$VERIFY_IDS" ]; then
+        echo ""
+        echo "### Re-run detail (re-measured benchmarks only)"
         echo ""
         for run in $(seq 1 "$CONFIRM_RUNS"); do
             echo "#### Re-run ${run}"
@@ -531,3 +595,9 @@ fi
 if [ -n "$OFFENDERS" ]; then
     echo ">>> Auto-confirm cleared all $(printf '%s\n' $OFFENDERS | grep -c .) initial regression(s) as transient (none tripped in >= ${QUORUM}/${CONFIRM_RUNS}); passing."
 fi
+for id in ${IMPROVEMENTS:-}; do
+    ihits=$(imp_hits "$id")
+    if [ "$ihits" -lt "$QUORUM" ]; then
+        echo ">>> NOTE: apparent improvement in '${id}' did not reproduce (${ihits}/${CONFIRM_RUNS}); reported as a measurement artifact, not a real gain."
+    fi
+done
