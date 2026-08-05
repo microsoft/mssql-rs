@@ -33,6 +33,7 @@ tests/e2e/
 │   └── alloc_env_test.cpp      # SQLAllocHandle(ENV) variations
 ├── third_party/                # Reserved for git submodule (unused — using FetchContent)
 ├── run_e2e.sh                  # Build + test runner (Linux / macOS)
+├── build_e2e.sh                # Build-only half for CI artifact reuse (Linux / macOS)
 ├── run_e2e.ps1                 # Build + test runner (Windows, requires admin)
 └── README.md                   # This file
 ```
@@ -110,6 +111,37 @@ and the Merge Coverage stage unions it into the diff-coverage report.
 .\run_e2e.ps1
 ```
 
+Like `run_e2e.sh`, it can rerun the suite against msodbcsql 18 and print a
+parity table.
+```powershell
+# Use the currently registered msodbcsql18.dll as the reference
+.\run_e2e.ps1 -CompareWithMsodbcsql
+
+# Point at a specific reference driver
+.\run_e2e.ps1 -CompareWithMsodbcsql -MsodbcsqlDll 'C:\path\to\msodbcsql18.dll'
+```
+
+`run_e2e.ps1 -Coverage` builds the Rust driver with LLVM source-based
+instrumentation so the driver code exercised by the C++ tests — which load the
+DLL through the Windows Driver Manager as separate processes — is measured. It
+writes a Cobertura report for `mssql-tds` + `mssql-odbc` (the cdylib statically
+links `mssql-tds`, so both are covered).
+
+```powershell
+# Report to the default path: <repo>\target\cobertura-odbc-e2e.xml
+.\run_e2e.ps1 -Coverage
+
+# Custom output path
+.\run_e2e.ps1 -Coverage -CoverageOutput 'C:\tmp\odbc-e2e.xml'
+```
+
+This uses the same mechanism as `run_e2e.sh --coverage`: everything runs through
+`cargo llvm-cov` (`show-env` to instrument the build, `report` to emit the
+report), so the LLVM version that reads the `.profraw` always matches the rustc
+that produced the instrumented DLL. In CI, the Windows x64 PR build runs the
+suite with `-Coverage`, publishes the report as `CoberturaCoverageOdbcE2E_Windows`,
+and the Merge Coverage stage unions it into the diff-coverage report.
+
 Both scripts:
 1. Build the Rust cdylib (`cargo build` from `mssql-odbc/`)
 2. Register the driver with the platform's ODBC Driver Manager
@@ -176,15 +208,16 @@ then:
 ```cmd
 cd mssql-odbc && cargo build
 cd tests\e2e
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DODBC_E2E_FORCE_UNICODE=ON
 cmake --build build --config Debug
 cd build && ctest --output-on-failure -C Debug
 ```
 
 ## Running Connected Tests
 
-Tests that require a live SQL Server are automatically **skipped** when no
-connection is configured. Set environment variables to enable them:
+Tests that require a live SQL Server **fail** when no connection is configured,
+so an unconfigured environment is surfaced instead of silently passing. Set
+environment variables to enable them:
 
 ### Auto-detection
 
@@ -246,3 +279,35 @@ cmake --build build && ctest --test-dir build --output-on-failure
 Each test calls standard ODBC C APIs (`SQLAllocHandle`, `SQLDriverConnect`,
 etc.) through the Driver Manager, which loads our shared library — the same
 code path a real application uses.
+
+## CI: prebuilt artifact flow (build once, test on many distros)
+
+CI (the main-branch pipeline) does not rebuild the driver in every distro. It
+splits the flow into a build half and a run half so a single set of binaries can
+be exercised on many Linux versions:
+
+- **`build_e2e.sh [--release] [--out=DIR]`** — builds the Rust driver and the
+  C++ gtest binaries, then stages `build/` (with `libmsodbcsql18.so` copied
+  inside) into `DIR`. That directory is published as a pipeline artifact.
+- **`run_e2e.sh --skip-build [--driver=PATH]`** — skips all compilation. It
+  restores the prebuilt `build/` tree, auto-resolves the driver from
+  `build/libmsodbcsql18.so` (or `--driver`), registers it, and reruns the
+  prebuilt binaries via CTest.
+
+`CTestTestfile.cmake` bakes **absolute** paths to the test executables, so the
+consumer must place `build/` back at the *same* absolute path it was built at.
+In CI both the build and test jobs mount the repo at `/workspace`, so the paths
+line up.
+
+Binaries are libc/OpenSSL specific, so CI builds three tracks and reuses each
+across matching distros:
+
+| Track | Build base | Reused on |
+|---|---|---|
+| glibc modern (x64, arm64) | Ubuntu 22.04 (glibc 2.35, OpenSSL 3) | Debian bookworm, Ubuntu 22.04/24.04, Azure Linux 3 |
+| musl (x64, arm64) | Alpine 3.18 (musl, OpenSSL 3) | Alpine 3.18–3.21 |
+| glibc 2.28 (x64) | manylinux_2_28 / AlmaLinux 8 (OpenSSL 1.1) | RHEL 8 / UBI 8 |
+
+A glibc-2.35 binary may fail to load on older glibc (e.g. RHEL 8's 2.28), and an
+OpenSSL 3 binary won't find `libssl.so.1.1`, which is why the glibc-2.28 track
+exists as a separate build.

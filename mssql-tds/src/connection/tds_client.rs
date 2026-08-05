@@ -427,6 +427,12 @@ impl TdsClient {
         self.negotiated_settings.session_settings.packet_size
     }
 
+    /// Returns the SQL Server version reported in the `LOGINACK` token, if the
+    /// server sent one during login.
+    pub fn server_version(&self) -> Option<crate::core::Version> {
+        self.negotiated_settings.login_ack_server_version
+    }
+
     /// Returns `true` if the connection is known to be dead.
     ///
     /// This surfaces the connection's last-known liveness status, updated

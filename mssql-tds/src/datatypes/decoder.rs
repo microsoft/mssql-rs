@@ -1475,7 +1475,11 @@ impl SqlTypeDecode for GenericDecoder {
                 }
             }
             TdsDataType::Xml => {
-                assert!(metadata.is_plp());
+                if !metadata.is_plp() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "XML column metadata is not partially-length-prefixed".to_string(),
+                    ));
+                }
                 let some_bytes = GenericDecoder::read_plp_bytes(reader).await?;
                 match some_bytes {
                     Some(bytes) => ColumnValues::Xml(SqlXml { bytes }),
@@ -1483,7 +1487,11 @@ impl SqlTypeDecode for GenericDecoder {
                 }
             }
             TdsDataType::Json => {
-                assert!(metadata.is_plp());
+                if !metadata.is_plp() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "JSON column metadata is not partially-length-prefixed".to_string(),
+                    ));
+                }
                 let some_bytes = GenericDecoder::read_plp_bytes(reader).await?;
                 match some_bytes {
                     Some(bytes) => ColumnValues::Json(SqlJson::new(bytes)),
@@ -1618,7 +1626,11 @@ impl SqlTypeDecode for GenericDecoder {
                 }
             }
             TdsDataType::Udt => {
-                assert!(metadata.is_plp());
+                if !metadata.is_plp() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "UDT column metadata is not partially-length-prefixed".to_string(),
+                    ));
+                }
                 let some_bytes = GenericDecoder::read_plp_bytes(reader).await?;
                 match some_bytes {
                     Some(bytes) => ColumnValues::Bytes(bytes),
@@ -2129,10 +2141,14 @@ async fn decode_seven_propbyte_variant<T>(
 where
     T: TdsPacketReader + Send + Sync,
 {
-    assert!(matches!(
+    if !matches!(
         tds_type,
         TdsDataType::BigVarChar | TdsDataType::BigChar | TdsDataType::NVarChar | TdsDataType::NChar
-    ));
+    ) {
+        return Err(crate::error::Error::ProtocolError(format!(
+            "Unexpected SQL variant base type for len(7) prop bytes: {tds_type:?}. Expected a character type."
+        )));
+    }
     let mut collation_bytes = vec![0u8; 5];
     reader.read_bytes(&mut collation_bytes).await?;
     let _max_length = reader.read_uint16().await? as usize;
@@ -3863,6 +3879,45 @@ mod test {
         }
 
         #[tokio::test]
+        async fn decode_xml_rejects_non_plp_metadata() {
+            let md = varlen_metadata(TdsDataType::Xml, 100);
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(plp_wire(b"x"));
+            let err = decoder.decode(&mut reader, &md).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("XML column metadata is not partially-length-prefixed"),
+                "unexpected: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn decode_json_rejects_non_plp_metadata() {
+            let md = varlen_metadata(TdsDataType::Json, 100);
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(plp_wire(b"x"));
+            let err = decoder.decode(&mut reader, &md).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("JSON column metadata is not partially-length-prefixed"),
+                "unexpected: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn decode_udt_rejects_non_plp_metadata() {
+            let md = varlen_metadata(TdsDataType::Udt, 100);
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(plp_wire(b"x"));
+            let err = decoder.decode(&mut reader, &md).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("UDT column metadata is not partially-length-prefixed"),
+                "unexpected: {err}"
+            );
+        }
+
+        #[tokio::test]
         async fn plp_chunk_stream_reader_known_length_overflow_errors() {
             let mut buf = Vec::new();
             buf.extend_from_slice(&4u64.to_le_bytes());
@@ -4181,6 +4236,21 @@ mod test {
             buf.push(TdsDataType::IntN as u8); // not binary/decimal → error
             buf.push(2); // prop_bytes=2
             buf.extend_from_slice(&[0; 4]); // prop data + value data
+            assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn ssvariant_seven_prop_unexpected_type() {
+            // Regression for fuzz crash-80c55599: a SQL_VARIANT advertising 7
+            // property bytes with a non-character base type used to trip a
+            // debug assertion in decode_seven_propbyte_variant. It must now
+            // return a ProtocolError instead of panicking.
+            let md = ssvariant_metadata();
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&20u32.to_le_bytes()); // length
+            buf.push(TdsDataType::IntN as u8); // not a character type → error
+            buf.push(7); // prop_bytes=7 selects the character-type decoder
+            buf.extend_from_slice(&[0; 11]); // padding, never read
             assert_decode_err(buf, &md).await;
         }
 

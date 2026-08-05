@@ -1,0 +1,43 @@
+# filepath: .pipeline/templates/build-odbc-glibc228-template.yml
+#
+# Build the mssql-odbc driver + C++ gtest e2e binaries once on a glibc-2.28 base
+# (PyPA manylinux_2_28 = AlmaLinux 8, OpenSSL 1.1) and publish them as a pipeline
+# artifact, so the Test_odbc_rhel8 stage can download and rerun the prebuilt
+# binaries in a RHEL 8 / UBI 8 container (run_e2e.sh --skip-build).
+#
+# x64 only. CI (non-PR) only, mirroring build-odbc-template.yml.
+
+parameters:
+  # Pipeline artifact name, e.g. 'Odbc_glibc228_x64'.
+  - name: artifactName
+    type: string
+  # glibc-2.28 build container image (manylinux_2_28 + rust, mirrored to GHCR).
+  - name: buildImage
+    type: string
+    default: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_x86_64_rust:latest'
+  # Build architecture, used only for the step display name (x64 | arm64).
+  - name: architecture
+    type: string
+    default: 'x64'
+
+steps:
+  - script: |
+      set -e
+      bash .pipeline/scripts/docker-cargo-run.sh --rm \
+        -v "$PWD:/workspace" \
+        -e ODBC_DROP_DIR=/workspace/odbc-drop \
+        -w /workspace \
+        ${{ parameters.buildImage }} \
+        /workspace/.pipeline/scripts/containerized-odbc-build-glibc228.sh
+    displayName: 'Build ODBC driver + e2e binaries glibc-2.28 (${{ parameters.architecture }})'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    env:
+      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish ${{ parameters.artifactName }}'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)/odbc-drop'
+      artifact: ${{ parameters.artifactName }}

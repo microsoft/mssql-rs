@@ -27,6 +27,7 @@ pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
 pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
+pub(crate) const SQLSTATE_HY096: [u8; 5] = *b"HY096";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
 
 // Driver-raised diagnostics: a fixed SQLSTATE paired with its canonical
@@ -111,6 +112,10 @@ pub(crate) const ERR_INVALID_CONNECTION_STRING_ATTRIBUTE: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_STRING_OR_BUFFER_LENGTH: DiagMsg = DiagMsg {
     state: SQLSTATE_HY090,
     text: "Invalid string or buffer length",
+};
+pub(crate) const ERR_INVALID_INFO_TYPE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY096,
+    text: "Information type out of range",
 };
 
 /// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with
