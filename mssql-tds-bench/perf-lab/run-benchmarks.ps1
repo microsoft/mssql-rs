@@ -424,10 +424,15 @@ Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree...
 Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
 Write-Host '>>> Building baseline bench binaries (target-base/)...'
 Set-BaselineSource
-Invoke-CompileBenches (Join-Path $RepoRoot 'target-base') 'baseline'
-$script:BaseBins = Get-BenchBinaries (Join-Path $RepoRoot 'target-base')
-Restore-CandidateSource
-Invoke-Native { git worktree remove --force $BaselineTree }
+# finally, so a baseline compile failure cannot leave the checkout holding the
+# baseline source with the candidate stranded in the stash directory.
+try {
+    Invoke-CompileBenches (Join-Path $RepoRoot 'target-base') 'baseline'
+    $script:BaseBins = Get-BenchBinaries (Join-Path $RepoRoot 'target-base')
+} finally {
+    Restore-CandidateSource
+    git worktree remove --force $BaselineTree 2>&1 | Out-Null
+}
 if ($script:BaseBins.Count -eq 0) { throw 'no baseline bench binaries found' }
 
 # Warm-up once; interleaving keeps each candidate/baseline pair adjacent so one
@@ -484,6 +489,11 @@ $verifyNames = @(@($regressions | ForEach-Object { $_.Name }) + @($improvements 
 #   BENCH_CONFIRM_QUORUM (default majority = N/2+1)  - re-runs required to confirm
 $confirmRuns = if ($env:BENCH_CONFIRM_RUNS) { [int]$env:BENCH_CONFIRM_RUNS } else { 4 }
 $quorum = if ($env:BENCH_CONFIRM_QUORUM) { [int]$env:BENCH_CONFIRM_QUORUM } else { [int][math]::Floor($confirmRuns / 2) + 1 }
+# Reject settings that would silently disable the gate rather than tune it:
+# 0 re-runs skips the loop and clears every regression, and a quorum above the
+# run count can never be met, so nothing is ever confirmed.
+if ($confirmRuns -lt 1) { throw "BENCH_CONFIRM_RUNS must be >= 1 (got: $confirmRuns); 0 would clear every regression unconfirmed." }
+if ($quorum -lt 1 -or $quorum -gt $confirmRuns) { throw "BENCH_CONFIRM_QUORUM must be between 1 and BENCH_CONFIRM_RUNS (got: $quorum of $confirmRuns)." }
 $confirmed = @()
 $impConfirmed = @()
 $confirmRunComparisons = @()
@@ -526,10 +536,13 @@ if ($verifyNames.Count -gt 0) {
 }
 Remove-Item -Recurse -Force (Join-Path $RepoRoot 'target-base') -ErrorAction SilentlyContinue
 
-# Reconcile each offender's headline number with the gate: replace its
-# (possibly anomalous) first-pass ratio with the MEDIAN of {main run + all
-# re-runs}, so the chart matches the majority decision instead of the one-off
-# spike. Only offenders are re-measured, so only they are reconciled.
+# Reconcile each re-measured benchmark's headline number with the gate: replace
+# its first-pass ratio with the MEDIAN OF THE RE-RUNS, the same measurements the
+# quorum counts. The first pass is excluded deliberately: a benchmark is only
+# re-measured because that pass was extreme, so including it re-counts the very
+# outlier under test and would give it a tie-breaking vote the gate does not have
+# (2-of-4 re-runs clears the gate, yet 3 of those 5 values are trips, so the
+# median could stay above the threshold and contradict a passing verdict).
 function Get-RatioFor {
     param([string]$Comparison, [string]$Name)
     foreach ($line in ($Comparison -split "\r?\n")) {
@@ -549,8 +562,6 @@ function Get-Median {
 $overrides = @{}
 foreach ($name in $verifyNames) {
     $vals = @()
-    $mr = Get-RatioFor $comparison $name
-    if ($null -ne $mr) { $vals += $mr }
     foreach ($cc in $confirmRunComparisons) {
         $rr = Get-RatioFor $cc $name
         if ($null -ne $rr) { $vals += $rr }

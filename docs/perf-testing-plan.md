@@ -173,11 +173,16 @@ Summary tab is not visible when triaging from the log alone.
 
 `summary.md` leads with a **diverging bar table** (🟩 faster / 🟥 slower, one square ≈ 1%,
 drawn only for |Δ| ≥ 1%) so a run's shape is readable at a glance; the raw `critcmp`
-output follows it. A benchmark that auto-confirm re-measured is shown as the **median** of
-its first pass plus all re-runs and marked `⟳` — otherwise the chart would keep rendering
-the first-pass spike for a benchmark the gate had already cleared as noise, and the
-summary would appear to contradict the verdict. The median (rather than the best passing
-re-run) keeps the displayed number from being cherry-picked.
+output follows it. A benchmark that auto-confirm re-measured is shown as the **median of
+its re-runs** and marked `⟳` — otherwise the chart would keep rendering the first-pass
+spike for a benchmark the gate had already cleared as noise, and the summary would appear
+to contradict the verdict. The median (rather than the best passing re-run) keeps the
+displayed number from being cherry-picked. The first pass is deliberately **excluded**:
+a benchmark is re-measured precisely because that pass was extreme, so including it
+re-counts the outlier under test and would give it a tie-breaking vote the gate does not
+have — with 2 of 4 re-runs tripping the gate clears the benchmark, yet 3 of those 5 values
+are trips, so the median could stay above the threshold and contradict a passing verdict.
+Reconciling from the same measurements the quorum counts keeps the two aligned.
 
 **Large improvements are verified too.** The gate is one-directional, so a *baseline*-slower
 result is never challenged and an unverified "3× faster" would be published — a real risk,

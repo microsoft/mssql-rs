@@ -271,10 +271,15 @@ echo ">>> Adding baseline worktree for ${BASELINE_COMMIT} at ${BASELINE_TREE}...
 git worktree add --detach "$BASELINE_TREE" "$BASELINE_COMMIT"
 echo ">>> Building baseline bench binaries (target-base/)..."
 swap_to_baseline
+# From here until the swap is undone, any exit (a baseline compile failure, or
+# set -e on anything else) would otherwise leave mssql-tds/ holding the baseline
+# source and the candidate stranded in .mssql-tds-candidate.
+trap 'restore_candidate 2>/dev/null || true; git worktree remove --force "$BASELINE_TREE" 2>/dev/null || true' EXIT
 compile_benches "$REPO_ROOT/target-base" "baseline"
 BASE_BINS="$(bench_bins "$REPO_ROOT/target-base")"
 restore_candidate
 git worktree remove --force "$BASELINE_TREE" || true
+trap - EXIT
 [ -n "$BASE_BINS" ] || { echo "ERROR: no baseline bench binaries found"; exit 1; }
 
 # Run every bench binary once per side, candidate then baseline back-to-back,
@@ -365,7 +370,22 @@ VERIFY_IDS=$(printf '%s\n%s\n' "$OFFENDERS" "$IMPROVEMENTS" | grep -E '.' | sort
 #   BENCH_CONFIRM_RUNS   (default 4)              — number of re-runs
 #   BENCH_CONFIRM_QUORUM (default majority = N/2+1) — re-runs required to confirm
 CONFIRM_RUNS="${BENCH_CONFIRM_RUNS:-4}"
+# Reject settings that would silently disable the gate rather than tune it:
+# CONFIRM_RUNS=0 skips the loop and clears every regression, and a quorum above
+# the run count can never be met, so nothing is ever confirmed. CONFIRM_RUNS is
+# checked before QUORUM is derived, since that default is an arithmetic
+# expansion that would fail confusingly on a non-numeric value.
+case "$CONFIRM_RUNS" in ''|*[!0-9]*) echo "ERROR: BENCH_CONFIRM_RUNS must be a positive integer (got: '${CONFIRM_RUNS}')" >&2; exit 1 ;; esac
+if [ "$CONFIRM_RUNS" -lt 1 ]; then
+    echo "ERROR: BENCH_CONFIRM_RUNS must be >= 1 (got: ${CONFIRM_RUNS}); 0 would clear every regression unconfirmed." >&2
+    exit 1
+fi
 QUORUM="${BENCH_CONFIRM_QUORUM:-$(( CONFIRM_RUNS / 2 + 1 ))}"
+case "$QUORUM" in ''|*[!0-9]*) echo "ERROR: BENCH_CONFIRM_QUORUM must be a positive integer (got: '${QUORUM}')" >&2; exit 1 ;; esac
+if [ "$QUORUM" -lt 1 ] || [ "$QUORUM" -gt "$CONFIRM_RUNS" ]; then
+    echo "ERROR: BENCH_CONFIRM_QUORUM must be between 1 and BENCH_CONFIRM_RUNS (got: ${QUORUM} of ${CONFIRM_RUNS})." >&2
+    exit 1
+fi
 CONFIRMED_IDS=""
 IMP_CONFIRMED=""
 TALLY_FILE="$RESULTS_DIR/confirm-tally.txt"
@@ -409,17 +429,19 @@ ratio_in_file() { awk -v id="$1" '$1 == id && $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^
 # Median of the numbers read on stdin.
 median_stdin() { sort -n | awk '{ v[NR] = $1 } END { if (NR == 0) exit; if (NR % 2) print v[(NR + 1) / 2]; else print (v[NR / 2] + v[NR / 2 + 1]) / 2 }'; }
 
-# Reconcile each offender's headline number with the gate: replace its
-# (possibly anomalous) first-pass ratio with the MEDIAN of {main run + all
-# re-runs}, so the chart matches the majority decision instead of the one-off
-# spike. Only offenders are re-measured, so only they are reconciled; the raw
-# critcmp block in the summary keeps the untouched first-pass data.
+# Reconcile each re-measured benchmark's headline number with the gate: replace
+# its first-pass ratio with the MEDIAN OF THE RE-RUNS, the same measurements the
+# quorum counts. The first pass is excluded deliberately: a benchmark is only
+# re-measured because that pass was extreme, so including it re-counts the very
+# outlier under test and would give it a tie-breaking vote the gate does not
+# have (2-of-4 re-runs clears the gate, yet 3 of those 5 values are trips, so the
+# median could stay above the threshold and contradict a passing verdict).
+# The raw critcmp block in the summary keeps the untouched first-pass data.
 MEDIANS_FILE="$RESULTS_DIR/offender-medians.txt"
 : > "$MEDIANS_FILE"
 for id in $VERIFY_IDS; do
     med=$(
         {
-            ratio_in_file "$id" "$RESULTS_DIR/comparison.txt"
             for run in $(seq 1 "$CONFIRM_RUNS"); do ratio_in_file "$id" "$RESULTS_DIR/confirm-run${run}.txt"; done
         } | grep -E '^[0-9.]+$' | median_stdin
     ) || med=""
