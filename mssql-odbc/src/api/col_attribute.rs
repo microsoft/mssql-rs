@@ -79,6 +79,11 @@ unsafe fn sql_col_attribute_w_impl(
         post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
         return SQL_ERROR;
     }
+    if field_identifier == SQL_DESC_COUNT {
+        unsafe { write_if_some(numeric_attribute_ptr, state.column_metadata.len() as SqlLen) };
+        return SQL_SUCCESS;
+    }
+
     if column_number == 0 || usize::from(column_number) > state.column_metadata.len() {
         post_diag(&mut state, ERR_INVALID_DESCRIPTOR_INDEX);
         return SQL_ERROR;
@@ -119,7 +124,6 @@ unsafe fn sql_col_attribute_w_impl(
     }
 
     let numeric: SqlLen = match field_identifier {
-        SQL_DESC_COUNT => state.column_metadata.len() as SqlLen,
         // sql_variant columns report the C type of the value in the current row;
         // clients probe this to pick the right SQLGetData target type.
         SQL_CA_SS_VARIANT_TYPE => state
@@ -235,5 +239,30 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
+    }
+
+    #[test]
+    fn col_attribute_count_allows_header_record() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .set_state(STMT_STATE_EXEC_CONTEXT);
+
+        let mut num: SqlLen = -1;
+        let ret = unsafe {
+            sql_col_attribute_w(
+                h.stmt,
+                0,
+                SQL_DESC_COUNT,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut num,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(num, 0);
     }
 }

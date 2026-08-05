@@ -11,9 +11,18 @@
 
 use tracing::{debug, error};
 
-use super::exec_direct::sql_exec_direct_w_safe;
-use super::odbc_types::{SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar};
+use super::exec_common::{
+    claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
+};
+use super::odbc_types::{
+    SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
+};
+use super::sqlstate::{ERR_INVALID_CURSOR_STATE, post_diag};
 use super::util::read_utf16;
+use crate::error::free_errors;
+use crate::handles::stmt::{
+    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_PREPARED,
+};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// A catalog argument: absent (`NULL`) or a literal value.
@@ -52,6 +61,14 @@ fn build_exec(catalog: &Arg, proc_name: &str, args: &[String]) -> String {
     format!("EXEC {} {}", qualified, args.join(", "))
 }
 
+fn build_exec_named(catalog: &Arg, proc_name: &str, args: &[(&str, String)]) -> String {
+    let named = args
+        .iter()
+        .map(|(name, value)| format!("@{name} = {value}"))
+        .collect::<Vec<_>>();
+    build_exec(catalog, proc_name, &named)
+}
+
 /// Shared entry: validate the handle, then run the generated catalog batch
 /// through the ordinary direct-execution path so cursor/metadata state is
 /// managed exactly as for a user query.
@@ -66,7 +83,51 @@ unsafe fn run_catalog(statement_handle: SqlHandle, name: &str, sql: String) -> S
     let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(stmt.object_type, HandleType::Stmt);
     debug!(%sql, "{name}: executing catalog query");
-    sql_exec_direct_w_safe(statement_handle, stmt, sql)
+    let dbc = stmt.parent_dbc();
+
+    {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("{name}: stmt mutex poisoned");
+            return SQL_ERROR;
+        };
+        free_errors(&mut stmt_state);
+        if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
+            error!("{name}: statement has an active execute or open cursor");
+            post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
+            return SQL_ERROR;
+        }
+        stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
+        stmt_state.column_metadata.clear();
+        stmt_state.reset_rows();
+        stmt_state.row_count = -1;
+        stmt_state.pending_row_counts.clear();
+        stmt_state.prepared_sql = None;
+        stmt_state.orphan_prepared_handle();
+        stmt_state.clear_state(STMT_STATE_PREPARED);
+        stmt_state.set_state(STMT_STATE_EXEC_STARTED);
+    }
+
+    let mut client = match claim_connection(dbc, stmt, statement_handle, name) {
+        Ok(client) => client,
+        Err(rc) => return rc,
+    };
+
+    flush_pending_unprepare(dbc, stmt, &mut client, name);
+
+    if let Err(e) = dbc.runtime.block_on(client.execute(sql, ())).map(|_| ()) {
+        error!(%e, "{name}: execution failed");
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
+
+    if !client.on_rows()
+        && client.has_open_batch()
+        && let Err(e) = dbc.runtime.block_on(client.advance_to_rows())
+    {
+        error!(%e, "{name}: advancing to catalog rows failed");
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
+
+    finish_execute(dbc, stmt, statement_handle, client, name)
 }
 
 /// Implements `SQLTablesW`.
@@ -129,17 +190,16 @@ pub(crate) unsafe fn sql_columns_w(
         let schema = opt_arg(schema_name, name_length_2);
         let table = opt_arg(table_name, name_length_3);
         let column = opt_arg(column_name, name_length_4);
-        let sql = build_exec(
+        let sql = build_exec_named(
             &catalog,
             "sp_columns_100",
             &[
-                literal(&table),
-                literal(&schema),
-                "NULL".to_string(),
-                literal(&column),
-                "NULL".to_string(),
-                "3".to_string(),
-                "1".to_string(),
+                ("table_name", literal(&table)),
+                ("table_owner", literal(&schema)),
+                ("table_qualifier", "NULL".to_string()),
+                ("column_name", literal(&column)),
+                ("ODBCVer", "3".to_string()),
+                ("fUsePattern", "1".to_string()),
             ],
         );
         run_catalog(statement_handle, "SQLColumnsW", sql)
@@ -338,7 +398,9 @@ pub(crate) unsafe fn sql_procedures_w(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_NTS, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::{SQL_ERROR, SQL_NTS, SQL_NULL_HANDLE};
+    use crate::handles::handle_from_raw;
+    use crate::test_support::TestHandles;
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -366,6 +428,19 @@ mod tests {
     fn build_exec_escapes_bracket_in_catalog() {
         let sql = build_exec(&Some("we]ird".into()), "sp_tables", &[]);
         assert!(sql.starts_with("EXEC [we]]ird].sys.sp_tables"));
+    }
+
+    #[test]
+    fn build_exec_named_renders_named_arguments() {
+        let sql = build_exec_named(
+            &None,
+            "sp_columns_100",
+            &[("table_name", "N't'".into()), ("ODBCVer", "3".into())],
+        );
+        assert_eq!(
+            sql,
+            "EXEC sys.sp_columns_100 @table_name = N't', @ODBCVer = 3"
+        );
     }
 
     #[test]
@@ -401,5 +476,27 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn catalog_execution_resets_stale_statement_state_before_claiming_connection() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_EXEC_CONTEXT);
+            state.row_count = 7;
+            state.pending_row_counts.push_back(3);
+        }
+
+        let ret =
+            unsafe { run_catalog(h.stmt, "SQLTablesW", "EXEC sys.sp_tables NULL".to_string()) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+        assert!(!state.has_state(STMT_STATE_EXEC_CONTEXT));
+        assert_eq!(state.row_count, -1);
+        assert!(state.pending_row_counts.is_empty());
     }
 }

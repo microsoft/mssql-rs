@@ -36,10 +36,26 @@ pub(crate) fn exec_on_connection(dbc: &DbcHandle, sql: &str, op: &str) -> Result
             post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
             return Err(SQL_ERROR);
         }
-        if state.active_stmt.is_some() {
-            error!("{op}: connection is busy with another statement's results");
-            post_diag(&mut state, ERR_CONNECTION_BUSY);
-            return Err(SQL_ERROR);
+        // A statement holding an open cursor would otherwise block transaction
+        // control and the `SET`-backed connection attributes forever. Spill its
+        // remaining rows so the connection goes idle, which is what a
+        // non-MARS session requires before another batch can run.
+        if let Some(busy_stmt) = state.active_stmt {
+            drop(state);
+            if !crate::api::spill::try_release_connection(dbc, busy_stmt) {
+                let Ok(mut state) = dbc.inner.lock() else {
+                    error!("{op}: dbc mutex poisoned");
+                    return Err(SQL_ERROR);
+                };
+                error!("{op}: connection is busy with another statement's results");
+                post_diag(&mut state, ERR_CONNECTION_BUSY);
+                return Err(SQL_ERROR);
+            }
+            let Ok(reacquired) = dbc.inner.lock() else {
+                error!("{op}: dbc mutex poisoned");
+                return Err(SQL_ERROR);
+            };
+            state = reacquired;
         }
         let Some(client) = state.client.take() else {
             error!("{op}: no active TDS client");

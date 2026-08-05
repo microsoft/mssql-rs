@@ -411,12 +411,29 @@ pub(super) fn finish_execute(
     }
 
     // Result-bearing query: leave the cursor open for SQLFetch.
+    //
+    // msodbcsql does not return from execute until the server has produced the
+    // first row of the rowset. Errors raised *after* COLMETADATA — lock
+    // timeouts, mid-scan conversion failures, aborted queries — must therefore
+    // surface from SQLExecute rather than from the first SQLFetch. Pull one row
+    // eagerly and hand it to the fetch path through the spill buffer.
+    let (first_row, prefetched_eof) = match dbc.runtime.block_on(client.next_row()) {
+        Ok(Some(row)) => (Some(row), false),
+        Ok(None) => (None, true),
+        Err(e) => return fail_with_tds(dbc, stmt, statement_handle, client, &e),
+    };
+
     let info_messages = client.take_info_messages();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned");
         return_client_busy(dbc, client);
         return SQL_ERROR;
     };
+    stmt_state.reset_rows();
+    if let Some(row) = first_row {
+        stmt_state.buffered_rows.push_back(row);
+    }
+    stmt_state.buffered_eof = prefetched_eof;
     stmt_state.column_metadata = metadata;
     stmt_state.row_count = client.last_rows_affected();
     stmt_state.pending_row_counts.clear();
