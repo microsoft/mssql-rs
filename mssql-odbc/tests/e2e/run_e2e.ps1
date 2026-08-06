@@ -1,8 +1,13 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 #
-# Build the Rust ODBC driver, register it in the Windows registry,
-# and run C++ gtest e2e tests against it via the ODBC Driver Manager.
+# Build the Rust ODBC driver, register it in the Windows registry under its own
+# driver name, and run C++ gtest e2e tests against it via the ODBC Driver Manager.
+#
+# The Rust driver registers as "ODBC Driver 18 for SQL Server (Rust)", so an
+# installed msodbcsql18 ("ODBC Driver 18 for SQL Server") is left untouched and
+# both can be used side by side. Each test leg selects its driver by name via
+# ODBC_TEST_DRIVER.
 #
 # The test fixture itself does NOT handle driver registration — this script
 # (or manual registry edits) is required. See run_e2e.sh for Linux/macOS.
@@ -24,15 +29,17 @@
 # reads the .profraw matches the rustc that produced the instrumented DLL.
 #
 # With -CompareWithMsodbcsql, the script reruns the same suite against the
-# Microsoft C++ driver and prints a parity table. Unlike Linux (which uses
-# per-run odbcinst.ini files via ODBCSYSINI), the Windows Driver Manager
-# reads the registry, so the two runs swap the registered driver in HKLM
-# between them and the original registration is restored at the end.
+# Microsoft C++ driver and prints a parity table. Because the two drivers are
+# registered under different names, no registry swap happens between the runs —
+# only the driver name in the connection string changes.
 #
-# The reference driver defaults to whatever msodbcsql18.dll was registered
-# before this script ran (typically C:\WINDOWS\system32\msodbcsql18.dll).
-# Override it with -MsodbcsqlDll PATH. The script exits 0 only if BOTH runs
-# pass.
+# The reference driver defaults to the installed "ODBC Driver 18 for SQL Server"
+# registration (typically C:\WINDOWS\system32\msodbcsql18.dll). Override it with
+# -MsodbcsqlDll PATH, which temporarily repoints that registration and restores
+# it at the end. The script exits 0 only if BOTH runs pass.
+#
+# ODBC_TEST_CONNSTR overrides the whole connection string and would pin both
+# legs to one driver, so comparison mode rejects it.
 #
 # Examples:
 #   .\run_e2e.ps1
@@ -66,14 +73,16 @@ if ($Coverage -and -not $CoverageOutput) {
     $CoverageOutput = Join-Path $WorkspaceDir "target\cobertura-odbc-e2e.xml"
 }
 
-$DriverRegKey  = "HKLM:\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server"
-$DriversRegKey = "HKLM:\Software\ODBC\ODBCINST.INI\ODBC Drivers"
-$DriverName    = "ODBC Driver 18 for SQL Server"
+$OdbcInstRoot     = "HKLM:\Software\ODBC\ODBCINST.INI"
+$DriversRegKey    = "$OdbcInstRoot\ODBC Drivers"
+$MsodbcsqlName    = "ODBC Driver 18 for SQL Server"
+$RustDriverName   = "ODBC Driver 18 for SQL Server (Rust)"
+$MsodbcsqlRegKey  = "$OdbcInstRoot\$MsodbcsqlName"
+$RustDriverRegKey = "$OdbcInstRoot\$RustDriverName"
 
-# Track whether we modified the registry so cleanup knows what to do. Each value
-# is snapshotted independently (did it exist, and its prior value) so a partial
-# or custom pre-existing registration is restored exactly, not left pointing at
-# the test DLL or a stray "Installed" entry.
+# The Rust driver registers under its own name, so an installed msodbcsql18 is
+# never touched. Only our own key is snapshotted, in case a developer has a Rust
+# driver permanently installed under the same name.
 $script:OrigDriver = $null
 $script:OrigSetup  = $null
 $script:HadExistingKey = $false
@@ -82,43 +91,85 @@ $script:HadSetupValue = $false
 $script:HadDriversListEntry = $false
 $script:OrigDriversListValue = $null
 $script:Registered = $false
+# Set only when -MsodbcsqlDll overrides the installed reference registration.
+$script:MsodbcsqlOverridden = $false
+$script:OrigMsodbcsqlDriver = $null
 
 function Save-OriginalRegistration {
-    if (Test-Path $DriverRegKey) {
+    if (Test-Path $RustDriverRegKey) {
         $script:HadExistingKey = $true
-        $d = Get-ItemProperty -Path $DriverRegKey -Name "Driver" -ErrorAction SilentlyContinue
+        $d = Get-ItemProperty -Path $RustDriverRegKey -Name "Driver" -ErrorAction SilentlyContinue
         if ($null -ne $d) { $script:HadDriverValue = $true; $script:OrigDriver = $d.Driver }
-        $s = Get-ItemProperty -Path $DriverRegKey -Name "Setup" -ErrorAction SilentlyContinue
+        $s = Get-ItemProperty -Path $RustDriverRegKey -Name "Setup" -ErrorAction SilentlyContinue
         if ($null -ne $s) { $script:HadSetupValue = $true; $script:OrigSetup = $s.Setup }
     }
     if (Test-Path $DriversRegKey) {
-        $e = Get-ItemProperty -Path $DriversRegKey -Name $DriverName -ErrorAction SilentlyContinue
+        $e = Get-ItemProperty -Path $DriversRegKey -Name $RustDriverName -ErrorAction SilentlyContinue
         if ($null -ne $e) {
             $script:HadDriversListEntry = $true
-            $script:OrigDriversListValue = $e.$DriverName
+            $script:OrigDriversListValue = $e.$RustDriverName
         }
     }
 }
 
-# Point the registered driver at $DriverPath without touching the saved
-# original. Used to swap between the Rust and reference drivers across runs.
-function Set-DriverRegistration([string]$DriverPath) {
-    if (-not (Test-Path $DriverRegKey)) {
-        New-Item -Path $DriverRegKey -Force | Out-Null
+# Register the Rust driver under its own name, alongside any installed
+# msodbcsql18. Both legs then run without swapping registrations.
+function Register-RustDriver([string]$DriverPath) {
+    if (-not (Test-Path $RustDriverRegKey)) {
+        New-Item -Path $RustDriverRegKey -Force | Out-Null
     }
-    Set-ItemProperty -Path $DriverRegKey -Name "Driver" -Value $DriverPath
-    Set-ItemProperty -Path $DriverRegKey -Name "Setup"  -Value $DriverPath
+    Set-ItemProperty -Path $RustDriverRegKey -Name "Driver" -Value $DriverPath
+    Set-ItemProperty -Path $RustDriverRegKey -Name "Setup"  -Value $DriverPath
 
     if (-not (Test-Path $DriversRegKey)) {
         New-Item -Path $DriversRegKey -Force | Out-Null
     }
-    Set-ItemProperty -Path $DriversRegKey -Name $DriverName -Value "Installed"
+    Set-ItemProperty -Path $DriversRegKey -Name $RustDriverName -Value "Installed"
 
     $script:Registered = $true
-    Write-Host "[  DRIVER ] Registered in HKLM: $DriverPath"
+    Write-Host "[  DRIVER ] Registered '$RustDriverName' in HKLM: $DriverPath"
+}
+
+# Resolve the installed reference driver from its own registry key.
+function Get-MsodbcsqlDriverPath {
+    $d = Get-ItemProperty -Path $MsodbcsqlRegKey -Name "Driver" -ErrorAction SilentlyContinue
+    if ($null -ne $d) { return $d.Driver }
+    return $null
+}
+
+# Point the reference registration at an explicit DLL for the comparison leg,
+# saving the installed value so Restore-Registration can put it back.
+function Set-MsodbcsqlOverride([string]$DriverPath) {
+    $script:OrigMsodbcsqlDriver = Get-MsodbcsqlDriverPath
+    if (-not (Test-Path $MsodbcsqlRegKey)) {
+        New-Item -Path $MsodbcsqlRegKey -Force | Out-Null
+    }
+    Set-ItemProperty -Path $MsodbcsqlRegKey -Name "Driver" -Value $DriverPath
+    Set-ItemProperty -Path $MsodbcsqlRegKey -Name "Setup"  -Value $DriverPath
+    if (-not (Test-Path $DriversRegKey)) {
+        New-Item -Path $DriversRegKey -Force | Out-Null
+    }
+    Set-ItemProperty -Path $DriversRegKey -Name $MsodbcsqlName -Value "Installed"
+    $script:MsodbcsqlOverridden = $true
+    Write-Host "[  DRIVER ] Overrode '$MsodbcsqlName' in HKLM: $DriverPath"
 }
 
 function Restore-Registration {
+    if ($script:MsodbcsqlOverridden) {
+        if ($script:OrigMsodbcsqlDriver) {
+            Set-ItemProperty -Path $MsodbcsqlRegKey -Name "Driver" -Value $script:OrigMsodbcsqlDriver
+            Set-ItemProperty -Path $MsodbcsqlRegKey -Name "Setup"  -Value $script:OrigMsodbcsqlDriver
+            Write-Host "[  DRIVER ] Restored original HKLM registration for '$MsodbcsqlName'"
+        } else {
+            Remove-Item -Path $MsodbcsqlRegKey -Force -ErrorAction SilentlyContinue
+            if (Test-Path $DriversRegKey) {
+                Remove-ItemProperty -Path $DriversRegKey -Name $MsodbcsqlName -ErrorAction SilentlyContinue
+            }
+            Write-Host "[  DRIVER ] Removed HKLM registration for '$MsodbcsqlName' (no prior driver)"
+        }
+        $script:MsodbcsqlOverridden = $false
+    }
+
     if (-not $script:Registered) { return }
 
     if ($script:HadExistingKey) {
@@ -126,27 +177,27 @@ function Restore-Registration {
         # exist before we ran (leaving a Driver/Setup value behind would point a
         # pre-existing key at the test DLL).
         if ($script:HadDriverValue) {
-            Set-ItemProperty -Path $DriverRegKey -Name "Driver" -Value $script:OrigDriver
+            Set-ItemProperty -Path $RustDriverRegKey -Name "Driver" -Value $script:OrigDriver
         } else {
-            Remove-ItemProperty -Path $DriverRegKey -Name "Driver" -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $RustDriverRegKey -Name "Driver" -ErrorAction SilentlyContinue
         }
         if ($script:HadSetupValue) {
-            Set-ItemProperty -Path $DriverRegKey -Name "Setup" -Value $script:OrigSetup
+            Set-ItemProperty -Path $RustDriverRegKey -Name "Setup" -Value $script:OrigSetup
         } else {
-            Remove-ItemProperty -Path $DriverRegKey -Name "Setup" -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $RustDriverRegKey -Name "Setup" -ErrorAction SilentlyContinue
         }
-        Write-Host "[  DRIVER ] Restored original HKLM registration"
+        Write-Host "[  DRIVER ] Restored original HKLM registration for '$RustDriverName'"
     } else {
-        Remove-Item -Path $DriverRegKey -Force -ErrorAction SilentlyContinue
-        Write-Host "[  DRIVER ] Removed HKLM registration (no prior driver)"
+        Remove-Item -Path $RustDriverRegKey -Force -ErrorAction SilentlyContinue
+        Write-Host "[  DRIVER ] Removed HKLM registration for '$RustDriverName'"
     }
 
     # Restore or remove the "ODBC Drivers" list entry independently of the driver
     # key above, since the two can pre-exist in either combination.
     if ($script:HadDriversListEntry) {
-        Set-ItemProperty -Path $DriversRegKey -Name $DriverName -Value $script:OrigDriversListValue
+        Set-ItemProperty -Path $DriversRegKey -Name $RustDriverName -Value $script:OrigDriversListValue
     } elseif (Test-Path $DriversRegKey) {
-        Remove-ItemProperty -Path $DriversRegKey -Name $DriverName -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $DriversRegKey -Name $RustDriverName -ErrorAction SilentlyContinue
     }
 
     $script:Registered = $false
@@ -154,11 +205,13 @@ function Restore-Registration {
 
 # Run the (already-built) ctest suite, writing JUnit XML to $JunitName inside
 # the build dir. Returns ctest's exit code without aborting the script.
-function Invoke-CtestRun([string]$Label, [string]$JunitName) {
+function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName) {
     Write-Host ""
     Write-Host "=== Running e2e tests against $Label ==="
+    Write-Host "ODBC_TEST_DRIVER=$DriverName"
     Push-Location (Join-Path $ScriptDir "build")
     $prevTarget = $env:ODBC_TEST_TARGET
+    $prevDriver = $env:ODBC_TEST_DRIVER
     try {
         $ctestArgs = @('--output-on-failure', '-C', 'Debug', '--output-junit', $JunitName)
         if ($Retries -gt 0) {
@@ -171,13 +224,16 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName) {
         # ODBC_TEST_TARGET tells tests which driver implementation this leg runs
         # against ("mssql-odbc" or "msodbcsql") so mssql-odbc-specific tests can
         # SKIP_IF_COMPARING_MSODBCSQL() on the reference-driver leg.
+        # ODBC_TEST_DRIVER selects the driver by name in the connection string.
         $env:ODBC_TEST_TARGET = $Label
+        $env:ODBC_TEST_DRIVER = $DriverName
         # Stream ctest output to the host so only the exit code is returned
         # from this function (an uncaptured pipeline would be returned too).
         ctest @ctestArgs | Out-Host
         return $LASTEXITCODE
     } finally {
         $env:ODBC_TEST_TARGET = $prevTarget
+        $env:ODBC_TEST_DRIVER = $prevDriver
         Pop-Location
     }
 }
@@ -402,19 +458,23 @@ try {
         Write-Host "Coverage: LLVM_PROFILE_FILE=$($env:LLVM_PROFILE_FILE)"
     }
 
-    # Capture the existing registration before we overwrite it. In comparison
-    # mode this is also the default reference (msodbcsql) driver.
+    # Snapshot our own registration (if a Rust driver is already installed under
+    # the same name) so it can be restored on exit.
     Save-OriginalRegistration
 
-    # Resolve the reference driver for comparison mode.
+    # Resolve the reference driver for comparison mode from its own registration.
     $RefDriverPath = $null
     if ($CompareWithMsodbcsql) {
+        if ($env:ODBC_TEST_CONNSTR) {
+            Write-Error "ODBC_TEST_CONNSTR is set; it overrides the driver name and would pin both comparison legs to the same driver. Unset it to compare."
+        }
         if ($MsodbcsqlDll) {
             $RefDriverPath = $MsodbcsqlDll
-        } elseif ($script:OrigDriver) {
-            $RefDriverPath = $script:OrigDriver
         } else {
-            Write-Error "No existing msodbcsql18.dll registration found. Pass -MsodbcsqlDll PATH to point at the reference driver."
+            $RefDriverPath = Get-MsodbcsqlDriverPath
+        }
+        if (-not $RefDriverPath) {
+            Write-Error "No '$MsodbcsqlName' registration found. Pass -MsodbcsqlDll PATH to point at the reference driver."
         }
         if (-not (Test-Path $RefDriverPath)) {
             Write-Error "Reference driver not found: $RefDriverPath"
@@ -445,9 +505,9 @@ try {
     # read old results if ctest fails to execute (e.g. 0 tests run).
     Remove-Item -Path $RustJunit, $MsJunit -Force -ErrorAction SilentlyContinue
 
-    # Run 1: the Rust driver.
-    Set-DriverRegistration $DriverPath
-    $RustExit = Invoke-CtestRun "mssql-odbc" "junit-mssql-odbc.xml"
+    # Run 1: the Rust driver, registered under its own name.
+    Register-RustDriver $DriverPath
+    $RustExit = Invoke-CtestRun "mssql-odbc" "junit-mssql-odbc.xml" $RustDriverName
 
     # Report on the instrumented mssql-odbc leg before the (uninstrumented)
     # msodbcsql reference leg runs, so the profraw reflects our driver only.
@@ -465,8 +525,14 @@ try {
     }
 
     # Run 2: the reference msodbcsql driver, sharing the same built binaries.
-    Set-DriverRegistration $RefDriverPath
-    $MsExit = Invoke-CtestRun "msodbcsql" "junit-msodbcsql.xml"
+    # No registry swap is needed — the two drivers are registered side by side,
+    # so only the driver name in the connection string changes. When
+    # -MsodbcsqlDll points somewhere other than the installed registration, that
+    # DLL is registered under the reference name for the duration of this leg.
+    if ($MsodbcsqlDll) {
+        Set-MsodbcsqlOverride $RefDriverPath
+    }
+    $MsExit = Invoke-CtestRun "msodbcsql" "junit-msodbcsql.xml" $MsodbcsqlName
 
     Write-ParityReport $RustJunit $MsJunit
 

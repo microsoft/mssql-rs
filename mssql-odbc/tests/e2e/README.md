@@ -77,9 +77,18 @@ the two drivers.
 ./run_e2e.sh --compare-with-msodbcsql --msodbcsql-ini=/opt/msodbcsql/odbcinst.ini
 ```
 
-Both INIs must register the driver under the same section name
-(`[ODBC Driver 18 for SQL Server]`). The script exits `0` only if **both**
-runs pass.
+The two drivers register under **different** names, so both can be installed
+side by side:
+
+| Leg | Driver name (`ODBC_TEST_DRIVER`) |
+|---|---|
+| `mssql-odbc` | `ODBC Driver 18 for SQL Server (Rust)` |
+| `msodbcsql` | `ODBC Driver 18 for SQL Server` |
+
+Each leg exports `ODBC_TEST_DRIVER` so the same test binaries connect through
+the right driver. Setting `ODBC_TEST_CONNSTR` overrides the whole connection
+string and would pin both legs to one driver, so comparison mode rejects it.
+The script exits `0` only if **both** runs pass.
 
 ### Collecting coverage
 
@@ -112,9 +121,10 @@ and the Merge Coverage stage unions it into the diff-coverage report.
 ```
 
 Like `run_e2e.sh`, it can rerun the suite against msodbcsql 18 and print a
-parity table.
+parity table. The Rust driver registers under its own name, so no registry swap
+happens between the two legs.
 ```powershell
-# Use the currently registered msodbcsql18.dll as the reference
+# Use the installed "ODBC Driver 18 for SQL Server" registration as the reference
 .\run_e2e.ps1 -CompareWithMsodbcsql
 
 # Point at a specific reference driver
@@ -158,31 +168,41 @@ infrastructure works (`runtests.c`).
 ### How the scripts register the driver
 
 - **Linux / macOS (`run_e2e.sh`)**: Creates a temp directory with an
-  `odbcinst.ini` file and sets `ODBCSYSINI` to point at it. The env var is
-  scoped to the script process, so the parent shell is never affected. A
-  `trap cleanup EXIT` ensures the temp directory is removed even on failure.
+  `odbcinst.ini` file registering the Rust driver as
+  `[ODBC Driver 18 for SQL Server (Rust)]`, and sets `ODBCSYSINI` to point at
+  it. The env var is scoped to the script process, so the parent shell is never
+  affected. A `trap cleanup EXIT` ensures the temp directory is removed even on
+  failure.
 
 - **Windows (`run_e2e.ps1`)**: Writes `Driver` and `Setup` values under
-  `HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server`. The
-  original values are saved beforehand and restored in a `try/finally` block,
-  so an existing production driver installation is not permanently overwritten.
+  `HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server (Rust)`, so an
+  installed msodbcsql18 registration is left untouched. Any pre-existing values
+  under that key are saved beforehand and restored in a `try/finally` block.
+  Only `-MsodbcsqlDll` temporarily repoints the reference registration, and it
+  too is restored on exit.
 
 ### Manual registration (without the scripts)
 
-If you prefer not to use the scripts, register the driver yourself:
+If you prefer not to use the scripts, register the driver yourself. You can use
+either name — the canonical `ODBC Driver 18 for SQL Server` (the default when
+`ODBC_TEST_DRIVER` is unset), or a distinct name such as
+`ODBC Driver 18 for SQL Server (Rust)` if you want it installed alongside
+msodbcsql18. With a distinct name, set `ODBC_TEST_DRIVER` to match before
+running the tests.
 
 - **Linux / macOS**: Either add an entry to `/etc/odbcinst.ini`, or create
   your own `odbcinst.ini` in any directory and set `ODBCSYSINI` env var to that
   directory before running the tests.
 
-- **Windows**: Add the following registry values (requires Administrator):
+- **Windows**: Add the following registry values (requires Administrator),
+  substituting your chosen driver name for `<driver name>`:
   ```
-  HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server
+  HKLM\Software\ODBC\ODBCINST.INI\<driver name>
       Driver = <path to msodbcsql18.dll>
       Setup  = <path to msodbcsql18.dll>
 
   HKLM\Software\ODBC\ODBCINST.INI\ODBC Drivers
-      ODBC Driver 18 for SQL Server = Installed
+      <driver name> = Installed
   ```
 
 ## Manual Build
@@ -240,7 +260,7 @@ To bring up a local SQL Server in Docker:
 | `ODBC_TEST_UID` | Yes (for SQL auth) | *(none)* | SQL login username (e.g. `sa`) |
 | `ODBC_TEST_PWD` | Yes (for SQL auth) | *(none)* | SQL login password |
 | `ODBC_TEST_DATABASE` | No | `tempdb` | Database to connect to |
-| `ODBC_TEST_DRIVER` | No | `ODBC Driver 18 for SQL Server` | ODBC driver name |
+| `ODBC_TEST_DRIVER` | No | `ODBC Driver 18 for SQL Server` | ODBC driver name (the run scripts set this per leg) |
 | `ODBC_TEST_DSN` | No | *(none)* | Pre-configured DSN (overrides server/driver) |
 | `ODBC_TEST_CONNSTR` | No | *(none)* | Full connection string (overrides all above) |
 | `ODBC_TEST_TRUST_CERT` | No | `Yes` | Trust server certificate (`Yes`/`No`) |

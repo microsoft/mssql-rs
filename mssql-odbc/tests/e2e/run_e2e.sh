@@ -37,8 +37,14 @@
 # /etc/odbcinst.ini) and prints a parity table. The script exits 0 only
 # if BOTH runs pass.
 #
-# Both INIs must register the driver under the same section name:
-#   [ODBC Driver 18 for SQL Server]
+# The two drivers register under distinct names, so they can be installed side
+# by side:
+#   Rust:      [ODBC Driver 18 for SQL Server (Rust)]
+#   reference: [ODBC Driver 18 for SQL Server]
+# Each leg selects its driver via ODBC_TEST_DRIVER, so the same test binaries
+# run unchanged against both. Setting ODBC_TEST_CONNSTR overrides the whole
+# connection string and would pin both legs to one driver; the script rejects
+# that in comparison mode.
 #
 # Rust driver logs are controlled by MSSQL_TDS_TRACE and
 # MSSQL_TDS_TRACE_LEVEL.
@@ -59,7 +65,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ODBC_CRATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
-DRIVER_SECTION="ODBC Driver 18 for SQL Server"
+MSODBCSQL_DRIVER_SECTION="ODBC Driver 18 for SQL Server"
+RUST_DRIVER_SECTION="ODBC Driver 18 for SQL Server (Rust)"
 
 BUILD_TYPE="debug"
 VERBOSE=0
@@ -221,31 +228,39 @@ build_rust_driver() {
 }
 
 # ----------------------------------------------------------------------------
-# Step 3: Register the Rust driver in a temporary odbcinst.ini
+# Step 3: Register the Rust driver in a temporary odbcinst.ini under its own
+# section name, so it never collides with an installed msodbcsql18.
 # ----------------------------------------------------------------------------
 register_rust_driver() {
     RUST_INI_DIR="$(mktemp -d)"
     cat > "$RUST_INI_DIR/odbcinst.ini" <<EOF
-[$DRIVER_SECTION]
+[$RUST_DRIVER_SECTION]
 Description=Microsoft ODBC Driver 18 for SQL Server (Rust)
 Driver=$RUST_DRIVER_PATH
 UsageCount=1
 EOF
     echo "Rust driver registered at: $RUST_INI_DIR/odbcinst.ini"
+    echo "Rust driver name: $RUST_DRIVER_SECTION"
 }
 
 # ----------------------------------------------------------------------------
 # Step 4: Validate the msodbcsql odbcinst.ini for the comparison run
 # ----------------------------------------------------------------------------
 validate_msodbcsql_ini() {
+    # A full connection-string override ignores ODBC_TEST_DRIVER, which would
+    # silently run both legs against whichever driver it names.
+    if [ -n "${ODBC_TEST_CONNSTR:-}" ]; then
+        echo "Error: ODBC_TEST_CONNSTR is set; it overrides the driver name and would" >&2
+        echo "  pin both comparison legs to the same driver. Unset it to compare." >&2
+        exit 1
+    fi
     if [ ! -f "$MSODBCSQL_INI" ]; then
         echo "Error: msodbcsql odbcinst.ini not found: $MSODBCSQL_INI" >&2
         echo "  Pass --msodbcsql-ini=PATH or install the C++ driver." >&2
         exit 1
     fi
-    if ! grep -qE "^\[$DRIVER_SECTION\]" "$MSODBCSQL_INI"; then
-        echo "Error: $MSODBCSQL_INI does not contain a [$DRIVER_SECTION] section." >&2
-        echo "  Both INIs must register the driver under the same name." >&2
+    if ! grep -qE "^\[$MSODBCSQL_DRIVER_SECTION\]" "$MSODBCSQL_INI"; then
+        echo "Error: $MSODBCSQL_INI does not contain a [$MSODBCSQL_DRIVER_SECTION] section." >&2
         exit 1
     fi
     # Resolve to absolute path so subprocesses see the same file regardless of cwd.
@@ -324,13 +339,15 @@ configure_and_build_tests() {
 #   $1 = label (printed in headers)
 #   $2 = ODBCSYSINI directory
 #   $3 = absolute path to JUnit XML output
+#   $4 = odbcinst.ini section name the tests should connect through
 # Returns ctest's exit code (does not abort the script).
 # ----------------------------------------------------------------------------
 run_tests() {
-    local label="$1" ini_dir="$2" junit_out="$3"
+    local label="$1" ini_dir="$2" junit_out="$3" driver_name="$4"
     echo ""
     echo "=== Running e2e tests against $label ==="
     echo "ODBCSYSINI=$ini_dir"
+    echo "ODBC_TEST_DRIVER=$driver_name"
 
     local rc=0
     (
@@ -338,7 +355,9 @@ run_tests() {
         # ODBC_TEST_TARGET tells tests which driver implementation this leg runs
         # against ("mssql-odbc" or "msodbcsql") so mssql-odbc-specific tests can
         # SKIP_IF_COMPARING_MSODBCSQL() on the reference-driver leg.
-        ODBC_TEST_TARGET="$label" ODBCSYSINI="$ini_dir" ctest "${CTEST_ARGS[@]}" --output-junit "$junit_out"
+        # ODBC_TEST_DRIVER selects the driver by name in the connection string.
+        ODBC_TEST_TARGET="$label" ODBC_TEST_DRIVER="$driver_name" \
+            ODBCSYSINI="$ini_dir" ctest "${CTEST_ARGS[@]}" --output-junit "$junit_out"
     ) || rc=$?
     return $rc
 }
@@ -461,7 +480,7 @@ main() {
     local ms_junit="$BUILD_DIR/junit-msodbcsql.xml"
     local rust_rc=0 ms_rc=0
 
-    run_tests "mssql-odbc" "$RUST_INI_DIR" "$rust_junit" || rust_rc=$?
+    run_tests "mssql-odbc" "$RUST_INI_DIR" "$rust_junit" "$RUST_DRIVER_SECTION" || rust_rc=$?
 
     # Report on the instrumented mssql-odbc leg before the (uninstrumented)
     # msodbcsql reference leg runs, so the profraw reflects our driver only.
@@ -482,7 +501,7 @@ main() {
     # Comparison mode: also run against the C++ driver, then print the table.
     local ms_ini_dir
     ms_ini_dir="$(dirname "$MSODBCSQL_INI")"
-    run_tests "msodbcsql"  "$ms_ini_dir"  "$ms_junit" || ms_rc=$?
+    run_tests "msodbcsql"  "$ms_ini_dir"  "$ms_junit" "$MSODBCSQL_DRIVER_SECTION" || ms_rc=$?
 
     print_parity_report "$rust_junit" "$ms_junit"
 
