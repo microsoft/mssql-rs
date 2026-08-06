@@ -68,7 +68,7 @@ Section "Rust / cargo cache warmth"
 foreach ($exe in 'rustc', 'cargo') {
     $cmd = Get-Command $exe -ErrorAction SilentlyContinue
     if ($cmd) { Write-Host ("{0}: {1}" -f $exe, (& $exe --version)) }
-    else { Write-Host "$exe: not on PATH" }
+    else { Write-Host "${exe}: not on PATH" }
 }
 $cargoHome = $env:CARGO_HOME
 if (-not $cargoHome) { $cargoHome = Join-Path $env:USERPROFILE '.cargo' }
