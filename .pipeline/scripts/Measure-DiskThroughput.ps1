@@ -48,6 +48,39 @@ try {
         $drive, $part.DiskNumber, $pdisk.FriendlyName, $busType, $mediaType)
 } catch { Write-Host "volume->disk mapping failed: $($_.Exception.Message)" }
 
+# --- Agent CPU / RAM / Azure SKU ---
+Section "Agent info"
+try {
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $cs  = Get-CimInstance Win32_ComputerSystem
+    Write-Host ("CPU        : {0}" -f $cpu.Name.Trim())
+    Write-Host ("Cores      : {0} physical / {1} logical" -f $cpu.NumberOfCores, $cpu.NumberOfLogicalProcessors)
+    Write-Host ("RAM        : {0:N1} GB" -f ($cs.TotalPhysicalMemory / 1GB))
+} catch { Write-Host "cpu info failed: $($_.Exception.Message)" }
+try {
+    $imds = Invoke-RestMethod -Headers @{Metadata='true'} -TimeoutSec 5 `
+        -Uri 'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01'
+    Write-Host ("Azure VM   : size={0} location={1} zone={2}" -f $imds.vmSize, $imds.location, $imds.zone)
+} catch { Write-Host "IMDS query failed: $($_.Exception.Message)" }
+
+# --- Rust / cargo cache warmth (fresh ephemeral images start cold) ---
+Section "Rust / cargo cache warmth"
+foreach ($exe in 'rustc', 'cargo') {
+    $cmd = Get-Command $exe -ErrorAction SilentlyContinue
+    if ($cmd) { Write-Host ("{0}: {1}" -f $exe, (& $exe --version)) }
+    else { Write-Host "$exe: not on PATH" }
+}
+$cargoHome = $env:CARGO_HOME
+if (-not $cargoHome) { $cargoHome = Join-Path $env:USERPROFILE '.cargo' }
+$registry = Join-Path $cargoHome 'registry'
+if (Test-Path $registry) {
+    $files = Get-ChildItem -Path $registry -Recurse -File -ErrorAction SilentlyContinue
+    $szMB = (($files | Measure-Object Length -Sum).Sum) / 1MB
+    Write-Host ("cargo registry cache: {0} files, {1:N1} MB at {2}" -f $files.Count, $szMB, $registry)
+} else {
+    Write-Host "cargo registry cache: NONE at $registry (cold)"
+}
+
 # --- Download diskspd ---
 Section "Downloading diskspd"
 $toolDir = Join-Path $env:AGENT_TEMPDIRECTORY 'diskspd'

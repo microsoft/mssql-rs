@@ -36,6 +36,31 @@ if [ -n "$BASE_DEV" ] && [ -e "/sys/block/$BASE_DEV/queue/rotational" ]; then
   echo "Device $BASE_DEV rotational=$ROTA (0=SSD/NVMe, 1=HDD)"
 fi
 
+# --- Agent CPU / RAM / Azure SKU ---
+section "Agent info"
+echo "CPU model : $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
+echo "Cores     : $(nproc) logical"
+echo "RAM       : $(grep MemTotal /proc/meminfo | awk '{printf "%.1f GB", $2/1024/1024}')"
+VM="$(curl -s -H Metadata:true --max-time 5 'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01' 2>/dev/null)"
+if [ -n "$VM" ]; then
+  echo "$VM" | python3 -c "import sys,json;d=json.load(sys.stdin);print('Azure VM  : size=%s location=%s zone=%s'%(d.get('vmSize'),d.get('location'),d.get('zone')))" 2>/dev/null || echo "Azure VM  : (parse failed)"
+else
+  echo "Azure VM  : IMDS unreachable"
+fi
+
+# --- Rust / cargo cache warmth (fresh ephemeral images start cold) ---
+section "Rust / cargo cache warmth"
+for e in rustc cargo; do
+  if command -v "$e" >/dev/null 2>&1; then echo "$e: $($e --version)"; else echo "$e: not on PATH"; fi
+done
+CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+REG="$CARGO_HOME/registry"
+if [ -d "$REG" ]; then
+  echo "cargo registry cache: $(du -sh "$REG" 2>/dev/null | cut -f1) at $REG"
+else
+  echo "cargo registry cache: NONE at $REG (cold)"
+fi
+
 # --- Ensure fio is available ---
 section "Ensuring fio is installed"
 if ! command -v fio >/dev/null 2>&1; then
