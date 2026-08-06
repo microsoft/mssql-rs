@@ -34,8 +34,8 @@
 #
 # With --compare-with-msodbcsql, the script reruns the same suite against
 # the Microsoft C++ driver registered in --msodbcsql-ini (default
-# /etc/odbcinst.ini) and prints a parity table. The script exits 0 only
-# if BOTH runs pass.
+# /etc/odbcinst.ini) and prints a parity table. The script exits 0 only if both
+# runs pass AND every test reaches the same verdict in both legs.
 #
 # The two drivers register under distinct names, so they can be installed side
 # by side:
@@ -58,6 +58,54 @@
 #   ./run_e2e.sh --compare-with-msodbcsql --msodbcsql-ini=/opt/msodbcsql/odbcinst.ini
 
 set -euo pipefail
+
+# CI only controls how much diagnostic context is printed on failure; every
+# failure mode below is fatal locally too.
+IS_CI=0
+if [ -n "${TF_BUILD:-}" ] || [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ]; then
+    IS_CI=1
+fi
+
+# Dump the logs that explain a configure/build/test failure. CI has no working
+# copy to inspect afterwards, so the evidence has to be in the build log.
+print_failure_diagnostics() {
+    [ "$IS_CI" -eq 1 ] || return 0
+    local context="$1"
+    echo ""
+    echo "=== CI diagnostics: $context ==="
+    local log
+    for log in "$BUILD_DIR/CMakeFiles/CMakeOutput.log" \
+               "$BUILD_DIR/CMakeFiles/CMakeError.log" \
+               "$BUILD_DIR/Testing/Temporary/LastTest.log"; do
+        if [ -f "$log" ]; then
+            echo ""
+            echo "--- tail of $log ---"
+            tail -n 100 "$log"
+        fi
+    done
+    echo ""
+    echo "--- test executables in $BUILD_DIR ---"
+    find "$BUILD_DIR" -type f -name '*_test' 2>/dev/null || echo "(none found)"
+}
+
+# A ctest run that executed nothing still exits 0 and prints "No tests were
+# found!!!" — historically that turned a broken CMake configure into a green
+# build. Treat an empty JUnit as a hard failure.
+assert_tests_executed() {
+    local junit="$1" label="$2" count=0
+    if [ -f "$junit" ]; then
+        # -o counts occurrences rather than matching lines, so a JUnit file that
+        # puts several <testcase> elements on one line is still counted correctly.
+        count=$(grep -o '<testcase' "$junit" 2>/dev/null | wc -l) || count=0
+    fi
+    if [ "$count" -eq 0 ]; then
+        print_failure_diagnostics "no tests executed for '$label'"
+        echo "Error: no tests were executed for '$label'." >&2
+        echo "  The CMake project produced no ctest entries, or ctest failed to run them." >&2
+        exit 1
+    fi
+    echo "$label leg executed $count test(s)."
+}
 
 # ----------------------------------------------------------------------------
 # Globals
@@ -366,7 +414,7 @@ run_tests() {
 # Step 8: Parse two JUnit XMLs and print a parity table.
 #   $1 = mssql-odbc JUnit XML
 #   $2 = msodbcsql  JUnit XML
-# Always returns 0 — exit code is decided by the caller.
+# Returns non-zero when any test reached a different verdict in the two legs.
 # ----------------------------------------------------------------------------
 print_parity_report() {
     local rust_xml="$1" ms_xml="$2"
@@ -374,7 +422,7 @@ print_parity_report() {
 import sys, xml.etree.ElementTree as ET
 
 def load(path):
-    """Returns {test_name: 'PASS'|'FAIL'|'MISSING'}."""
+    """Returns {test_name: 'PASS'|'FAIL'|'SKIP'}."""
     out = {}
     try:
         root = ET.parse(path).getroot()
@@ -383,27 +431,35 @@ def load(path):
     # ctest --output-junit emits <testsuite><testcase name="..."> ...
     for tc in root.iter("testcase"):
         name = tc.get("name") or "<unnamed>"
-        failed = any(child.tag in ("failure", "error") for child in tc)
-        out[name] = "FAIL" if failed else "PASS"
+        tags = {child.tag for child in tc}
+        if tags & {"failure", "error"}:
+            out[name] = "FAIL"
+        elif "skipped" in tags:
+            out[name] = "SKIP"
+        else:
+            out[name] = "PASS"
     return out
 
 rust = load(sys.argv[1])
 ms   = load(sys.argv[2])
 names = sorted(set(rust) | set(ms))
 
+# Verdicts describe only the observed outcome pairing, not a root cause: a
+# per-test PASS/FAIL divergence does not by itself establish which side is
+# wrong, and a shared failure does not prove the test is buggy.
 def verdict(r, m):
-    if r == "PASS" and m == "PASS": return ("parity",          "ok")
-    if r == "FAIL" and m == "PASS": return ("FIX mssql-odbc",  "bug")
-    if r == "PASS" and m == "FAIL": return ("mssql-odbc bug, but test hides it (msodbcsql fails)", "warn")
-    if r == "FAIL" and m == "FAIL": return ("test bug (both fail)",       "warn")
-    return ("missing run", "warn")
+    if r == "SKIP" or m == "SKIP":  return ("skipped (not compared)", "skip")
+    if r == "PASS" and m == "PASS": return ("parity", "parity")
+    if r == "FAIL" and m == "FAIL": return ("shared failure - investigate", "shared")
+    if r != m:                      return ("divergence - investigate", "divergence")
+    return ("missing run - investigate", "divergence")
 
 w = max((len(n) for n in names), default=4)
 print()
 print("=== Parity report (mssql-odbc vs msodbcsql) ===")
 print(f"{'Test'.ljust(w)}  {'mssql-odbc':<10}  {'msodbcsql':<10}  Verdict")
 print(f"{'-'*w}  {'-'*10}  {'-'*10}  {'-'*30}")
-counts = {"ok":0, "bug":0, "warn":0}
+counts = {"parity":0, "divergence":0, "shared":0, "skip":0}
 for n in names:
     r = rust.get(n, "MISSING")
     m = ms.get(n, "MISSING")
@@ -411,7 +467,13 @@ for n in names:
     counts[kind] += 1
     print(f"{n.ljust(w)}  {r:<10}  {m:<10}  {v}")
 print()
-print(f"Summary: {counts['ok']} parity, {counts['bug']} mssql-odbc bug(s), {counts['warn']} test issue(s)")
+print(f"Summary: {counts['parity']} parity, {counts['divergence']} divergence(s), "
+      f"{counts['shared']} shared failure(s), {counts['skip']} skipped")
+
+# Any non-parity outcome fails the run. ctest exit codes alone are not enough:
+# a test present in only one leg leaves both legs green while the comparison is
+# meaningless.
+sys.exit(1 if counts["divergence"] or counts["shared"] else 0)
 PY
 }
 
@@ -481,6 +543,7 @@ main() {
     local rust_rc=0 ms_rc=0
 
     run_tests "mssql-odbc" "$RUST_INI_DIR" "$rust_junit" "$RUST_DRIVER_SECTION" || rust_rc=$?
+    assert_tests_executed "$rust_junit" "mssql-odbc"
 
     # Report on the instrumented mssql-odbc leg before the (uninstrumented)
     # msodbcsql reference leg runs, so the profraw reflects our driver only.
@@ -490,6 +553,7 @@ main() {
 
     if [ "$COMPARE" -eq 0 ]; then
         if [ "$rust_rc" -ne 0 ]; then
+            print_failure_diagnostics "e2e tests failed"
             echo "=== e2e tests FAILED (mssql-odbc) ==="
             exit "$rust_rc"
         fi
@@ -502,14 +566,17 @@ main() {
     local ms_ini_dir
     ms_ini_dir="$(dirname "$MSODBCSQL_INI")"
     run_tests "msodbcsql"  "$ms_ini_dir"  "$ms_junit" "$MSODBCSQL_DRIVER_SECTION" || ms_rc=$?
+    assert_tests_executed "$ms_junit" "msodbcsql"
 
-    print_parity_report "$rust_junit" "$ms_junit"
+    local parity_rc=0
+    print_parity_report "$rust_junit" "$ms_junit" || parity_rc=$?
 
-    if [ "$rust_rc" -eq 0 ] && [ "$ms_rc" -eq 0 ]; then
-        echo "=== Both runs passed ==="
+    if [ "$rust_rc" -eq 0 ] && [ "$ms_rc" -eq 0 ] && [ "$parity_rc" -eq 0 ]; then
+        echo "=== Both runs passed with full parity ==="
         exit 0
     fi
-    echo "=== Parity check FAILED (mssql-odbc rc=$rust_rc, msodbcsql rc=$ms_rc) ==="
+    print_failure_diagnostics "parity check failed"
+    echo "=== Parity check FAILED (mssql-odbc rc=$rust_rc, msodbcsql rc=$ms_rc, parity rc=$parity_rc) ==="
     exit 1
 }
 

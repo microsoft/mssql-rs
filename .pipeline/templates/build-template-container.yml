@@ -265,6 +265,11 @@ steps:
   # job already uses. Runs inside the build container; the containerized script
   # installs cmake + unixODBC-dev (absent from the build image) then invokes
   # run_e2e.sh. PR-only, matching the Rust test pass above.
+  #
+  # ODBC_E2E_COMPARE also installs the Microsoft ODBC Driver 18 and reruns the
+  # suite against it, so a behavioural divergence between the Rust driver and
+  # msodbcsql18 fails the build. Only this leg does it: it owns a local SQL
+  # Server in docker, so the doubled test time is contained.
   - script: |
       BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
 
@@ -280,11 +285,12 @@ steps:
         -e ODBC_TEST_TRUST_CERT="Yes" \
         -e ODBC_E2E_RETRIES="3" \
         -e ODBC_E2E_COVERAGE="${{ lower(parameters.collectRustCoverage) }}" \
+        -e ODBC_E2E_COMPARE="1" \
         -e RUST_BACKTRACE=full \
         -w /workspace \
         $BUILD_IMAGE \
         /workspace/.pipeline/scripts/containerized-odbc-e2e.sh
-    displayName: Run ODBC e2e tests
+    displayName: Run ODBC e2e tests (with msodbcsql parity comparison)
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
@@ -376,6 +382,20 @@ steps:
     testResultsFormat: JUnit
     testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
     testRunTitle: $(System.PhaseName)-ODBC
+    failTaskOnFailedTests: false
+    publishRunAttachments: true
+
+# Reference-driver leg, produced only by the x64 job (ODBC_E2E_COMPARE=1).
+# Published so a parity divergence can be triaged from the test tab rather than
+# by reading the build log. Absent on ARM, where the task just warns.
+- task: PublishTestResults@2
+  condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+  displayName: Publish ODBC e2e test results (msodbcsql reference)
+  continueOnError: true
+  inputs:
+    testResultsFormat: JUnit
+    testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-msodbcsql.xml
+    testRunTitle: $(System.PhaseName)-ODBC-msodbcsql
     failTaskOnFailedTests: false
     publishRunAttachments: true
 

@@ -36,10 +36,14 @@
 # The reference driver defaults to the installed "ODBC Driver 18 for SQL Server"
 # registration (typically C:\WINDOWS\system32\msodbcsql18.dll). Override it with
 # -MsodbcsqlDll PATH, which temporarily repoints that registration and restores
-# it at the end. The script exits 0 only if BOTH runs pass.
+# it at the end. The script exits 0 only if both runs pass AND every test reaches
+# the same verdict in both legs.
 #
 # ODBC_TEST_CONNSTR overrides the whole connection string and would pin both
 # legs to one driver, so comparison mode rejects it.
+#
+# When ODBC_TEST_SERVER is unset, a dev SQL Server on localhost:1433 is
+# auto-detected (matching run_e2e.sh).
 #
 # Examples:
 #   .\run_e2e.ps1
@@ -71,6 +75,53 @@ $BuildType   = if ($Release) { "release" } else { "debug" }
 # on $WorkspaceDir.
 if ($Coverage -and -not $CoverageOutput) {
     $CoverageOutput = Join-Path $WorkspaceDir "target\cobertura-odbc-e2e.xml"
+}
+
+# CI only changes how much diagnostic context is printed on failure. Every
+# failure mode below is fatal locally too — a broken build must never report
+# "passed" just because a developer ran it by hand.
+$script:IsCI = [bool]($env:TF_BUILD -or $env:CI -or $env:GITHUB_ACTIONS)
+
+# Native commands ignore $ErrorActionPreference, so a failing cargo/cmake would
+# otherwise fall through to ctest and produce an empty-but-green run.
+function Invoke-Checked([string]$What, [scriptblock]$Command) {
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "$What failed (exit $LASTEXITCODE)"
+    }
+}
+
+# Dump the logs that explain a configure/build/test failure. CI has no working
+# copy to inspect afterwards, so the evidence has to be in the build log.
+function Write-FailureDiagnostics([string]$Context) {
+    if (-not $script:IsCI) { return }
+    Write-Host ""
+    Write-Host "=== CI diagnostics: $Context ==="
+    $buildDir = Join-Path $ScriptDir "build"
+    $logs = @(
+        (Join-Path $buildDir "CMakeFiles\CMakeOutput.log"),
+        (Join-Path $buildDir "CMakeFiles\CMakeError.log"),
+        (Join-Path $buildDir "Testing\Temporary\LastTest.log")
+    )
+    foreach ($log in $logs) {
+        if (Test-Path $log) {
+            Write-Host ""
+            Write-Host "--- tail of $log ---"
+            Get-Content -Path $log -Tail 100 | ForEach-Object { Write-Host $_ }
+        }
+    }
+    if (Test-Path $buildDir) {
+        Write-Host ""
+        Write-Host "--- test executables in $buildDir ---"
+        $exes = @(Get-ChildItem -Path $buildDir -Filter '*_test.exe' -Recurse -ErrorAction SilentlyContinue)
+        if ($exes.Count -eq 0) {
+            Write-Host "(none found)"
+        } else {
+            $exes | ForEach-Object { Write-Host $_.FullName }
+        }
+    } else {
+        Write-Host "build directory does not exist: $buildDir"
+    }
 }
 
 $OdbcInstRoot     = "HKLM:\Software\ODBC\ODBCINST.INI"
@@ -238,6 +289,26 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
     }
 }
 
+# A ctest run that executed nothing still exits 0 and prints "No tests were
+# found!!!" — historically that turned a broken CMake configure into a green
+# build. Treat an empty JUnit as a hard failure.
+function Assert-TestsExecuted([string]$JunitPath, [string]$Label) {
+    $count = 0
+    if (Test-Path $JunitPath) {
+        try {
+            [xml]$doc = Get-Content -Raw -Path $JunitPath
+            $count = @($doc.SelectNodes("//testcase")).Count
+        } catch {
+            $count = 0
+        }
+    }
+    if ($count -eq 0) {
+        Write-FailureDiagnostics "no tests executed for '$Label'"
+        throw "No tests were executed for '$Label'. The CMake project produced no ctest entries, or ctest failed to run them."
+    }
+    Write-Host "$Label leg executed $count test(s)."
+}
+
 # Parse a ctest JUnit XML into a hashtable of { test-name = 'PASS' | 'FAIL' }.
 function Get-JunitResults([string]$Path) {
     $map = @{}
@@ -267,6 +338,7 @@ function Get-JunitResults([string]$Path) {
 }
 
 # Print a side-by-side parity table comparing the mssql-odbc and msodbcsql runs.
+# Returns the verdict counts so the caller can fail on any non-parity outcome.
 function Write-ParityReport([string]$RustXml, [string]$MsXml) {
     $rust = Get-JunitResults $RustXml
     $ms   = Get-JunitResults $MsXml
@@ -303,6 +375,7 @@ function Write-ParityReport([string]$RustXml, [string]$MsXml) {
     }
     Write-Host ""
     Write-Host ("Summary: {0} parity, {1} divergence(s), {2} shared failure(s), {3} skipped" -f $counts.parity, $counts.divergence, $counts.shared, $counts.skip)
+    return $counts
 }
 
 # Enable LLVM source-based instrumentation for the driver build.
@@ -381,6 +454,53 @@ function New-CoverageReport([string]$OutputPath) {
     }
 }
 
+# Mirror of setup_dev_sql_env in run_e2e.sh: point the tests at a dev SQL Server
+# on localhost:1433 when the caller hasn't configured a server, so `.\run_e2e.ps1`
+# works out of the box against dev\dev-launchsql.
+function Initialize-DevSqlEnv {
+    if ($env:ODBC_TEST_SERVER) { return }
+
+    $reachable = $false
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $reachable = $client.ConnectAsync('localhost', 1433).Wait(2000)
+    } catch {
+        $reachable = $false
+    } finally {
+        if ($client) { $client.Dispose() }
+    }
+    if (-not $reachable) { return }
+
+    $env:ODBC_TEST_SERVER = 'localhost'
+    if (-not $env:ODBC_TEST_UID) { $env:ODBC_TEST_UID = 'sa' }
+    if (-not $env:ODBC_TEST_TRUST_CERT) { $env:ODBC_TEST_TRUST_CERT = 'Yes' }
+
+    if (-not $env:ODBC_TEST_PWD) {
+        if ($env:SQL_PASSWORD) {
+            $env:ODBC_TEST_PWD = $env:SQL_PASSWORD
+        } else {
+            $dotenv = Join-Path $WorkspaceDir "mssql-tds\.env"
+            if (Test-Path $dotenv) {
+                $line = Get-Content -Path $dotenv | Where-Object { $_ -match '^SQL_PASSWORD=' } | Select-Object -First 1
+                if ($line) {
+                    $value = $line.Substring($line.IndexOf('=') + 1).Trim()
+                    if ($value) { $env:ODBC_TEST_PWD = $value }
+                }
+            }
+        }
+    }
+
+    if ($env:ODBC_TEST_PWD) {
+        Write-Host "Auto-detected dev SQL Server at localhost:1433 ($($env:ODBC_TEST_UID) login)"
+    } else {
+        # Without a password the fixture falls back to Trusted_Connection, which
+        # is a valid local setup — warn rather than fail.
+        Write-Host "Warning: SQL Server detected on localhost:1433 but no password found; using integrated auth."
+        Write-Host "  Set SQL_PASSWORD or ODBC_TEST_PWD, or run dev\dev-launchsql.ps1 first, to use SQL auth."
+    }
+}
+
 # Ensure cmake is resolvable. CI Windows agents have Visual Studio (used to link
 # the Rust MSVC build) which bundles CMake, but it isn't on PATH by default.
 # Locate it via vswhere and prepend it, falling back to a standalone install.
@@ -422,14 +542,19 @@ try {
         Enable-CoverageInstrumentation
     }
 
+    Initialize-DevSqlEnv
+
     Write-Host "=== Building mssql-odbc ($BuildType) ==="
     Push-Location $OdbcCrateDir
-    if ($Release) {
-        cargo build --release
-    } else {
-        cargo build
+    try {
+        if ($Release) {
+            Invoke-Checked "cargo build --release" { cargo build --release }
+        } else {
+            Invoke-Checked "cargo build" { cargo build }
+        }
+    } finally {
+        Pop-Location
     }
-    Pop-Location
 
     # Cargo builds into the workspace root's target/ by default, but honors
     # CARGO_TARGET_DIR (set by CI). Resolve via `cargo metadata` so the driver is
@@ -490,12 +615,22 @@ try {
     Write-Host "=== Configuring e2e tests (CMake) ==="
     Initialize-CMake
     Push-Location $ScriptDir
-    cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DODBC_E2E_FORCE_UNICODE=ON
+    try {
+        try {
+            Invoke-Checked "CMake configure" {
+                cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DODBC_E2E_FORCE_UNICODE=ON
+            }
 
-    Write-Host ""
-    Write-Host "=== Building e2e tests ==="
-    cmake --build build --config Debug
-    Pop-Location
+            Write-Host ""
+            Write-Host "=== Building e2e tests ==="
+            Invoke-Checked "CMake build" { cmake --build build --config Debug }
+        } catch {
+            Write-FailureDiagnostics "CMake configure/build failed"
+            throw
+        }
+    } finally {
+        Pop-Location
+    }
 
     $BuildDir  = Join-Path $ScriptDir "build"
     $RustJunit = Join-Path $BuildDir "junit-mssql-odbc.xml"
@@ -508,6 +643,7 @@ try {
     # Run 1: the Rust driver, registered under its own name.
     Register-RustDriver $DriverPath
     $RustExit = Invoke-CtestRun "mssql-odbc" "junit-mssql-odbc.xml" $RustDriverName
+    Assert-TestsExecuted $RustJunit "mssql-odbc"
 
     # Report on the instrumented mssql-odbc leg before the (uninstrumented)
     # msodbcsql reference leg runs, so the profraw reflects our driver only.
@@ -517,6 +653,7 @@ try {
 
     if (-not $CompareWithMsodbcsql) {
         if ($RustExit -ne 0) {
+            Write-FailureDiagnostics "e2e tests failed"
             throw "e2e tests FAILED (ctest exit $RustExit)"
         }
         Write-Host ""
@@ -533,15 +670,22 @@ try {
         Set-MsodbcsqlOverride $RefDriverPath
     }
     $MsExit = Invoke-CtestRun "msodbcsql" "junit-msodbcsql.xml" $MsodbcsqlName
+    Assert-TestsExecuted $MsJunit "msodbcsql"
 
-    Write-ParityReport $RustJunit $MsJunit
+    $parity = Write-ParityReport $RustJunit $MsJunit
 
-    if ($RustExit -eq 0 -and $MsExit -eq 0) {
-        Write-Host ""
-        Write-Host "=== Both runs passed ==="
-    } else {
-        throw "Parity check FAILED (mssql-odbc exit $RustExit, msodbcsql exit $MsExit)"
+    # Any non-parity outcome fails the run. ctest exit codes alone are not
+    # enough: a test present in only one leg leaves both legs green while the
+    # comparison is meaningless.
+    $nonParity = $parity.divergence + $parity.shared
+    if ($RustExit -ne 0 -or $MsExit -ne 0 -or $nonParity -gt 0) {
+        Write-FailureDiagnostics "parity check failed"
+        throw ("Parity check FAILED (mssql-odbc exit $RustExit, msodbcsql exit $MsExit; " +
+               "$($parity.divergence) divergence(s), $($parity.shared) shared failure(s))")
     }
+
+    Write-Host ""
+    Write-Host "=== Both runs passed with full parity ==="
 }
 finally {
     Restore-Registration

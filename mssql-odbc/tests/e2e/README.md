@@ -88,7 +88,33 @@ side by side:
 Each leg exports `ODBC_TEST_DRIVER` so the same test binaries connect through
 the right driver. Setting `ODBC_TEST_CONNSTR` overrides the whole connection
 string and would pin both legs to one driver, so comparison mode rejects it.
-The script exits `0` only if **both** runs pass.
+
+The script exits `0` only if **both** runs pass *and* every test reaches the
+same verdict in both legs. A divergence, a shared failure, or a test that ran
+in only one leg fails the run:
+
+```
+Summary: 15 parity, 1 divergence(s), 0 shared failure(s), 0 skipped
+=== Parity check FAILED (mssql-odbc rc=0, msodbcsql rc=0, parity rc=1) ===
+```
+
+CI runs this comparison on the Linux x64 PR build, which owns a SQL Server in
+docker. `.pipeline/scripts/containerized-odbc-e2e.sh` installs a pinned
+`msodbcsql18` from `packages.microsoft.com` when `ODBC_E2E_COMPARE=1`.
+
+### Failure modes that are never silently green
+
+Both runners abort — locally and in CI — when:
+
+- `cargo build` or either `cmake` invocation exits non-zero.
+- A ctest leg executes zero tests. ctest exits `0` and prints
+  `No tests were found!!!` in that case, which previously turned a broken CMake
+  configure into a passing run reporting `0 parity`.
+- Any test diverges between the two legs (comparison mode).
+
+In CI the scripts additionally dump `CMakeOutput.log`, `CMakeError.log`,
+`LastTest.log`, and the discovered test executables, since there is no working
+copy left to inspect afterwards.
 
 ### Collecting coverage
 
@@ -122,7 +148,8 @@ and the Merge Coverage stage unions it into the diff-coverage report.
 
 Like `run_e2e.sh`, it can rerun the suite against msodbcsql 18 and print a
 parity table. The Rust driver registers under its own name, so no registry swap
-happens between the two legs.
+happens between the two legs, and the same parity gate applies: any divergence
+fails the run.
 ```powershell
 # Use the installed "ODBC Driver 18 for SQL Server" registration as the reference
 .\run_e2e.ps1 -CompareWithMsodbcsql
@@ -130,6 +157,20 @@ happens between the two legs.
 # Point at a specific reference driver
 .\run_e2e.ps1 -CompareWithMsodbcsql -MsodbcsqlDll 'C:\path\to\msodbcsql18.dll'
 ```
+
+Install the reference driver with:
+
+```powershell
+winget install --id Microsoft.msodbcsql.18 --version 18.6.2.1 --exact
+```
+
+CI runs this comparison on the Windows x64 PR build (the leg with a local SQL
+Server), installing the same pinned version before the suite.
+
+When `ODBC_TEST_SERVER` is unset, a dev SQL Server on `localhost:1433` is
+auto-detected — the password is taken from `ODBC_TEST_PWD`, then `SQL_PASSWORD`,
+then `SQL_PASSWORD=` in `mssql-tds\.env`, falling back to integrated auth. This
+matches `run_e2e.sh`.
 
 `run_e2e.ps1 -Coverage` builds the Rust driver with LLVM source-based
 instrumentation so the driver code exercised by the C++ tests — which load the

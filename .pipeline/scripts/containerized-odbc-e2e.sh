@@ -13,6 +13,8 @@
 # ODBC_E2E_RETRIES controls the ctest until-pass retry count (default 3).
 # ODBC_E2E_COVERAGE=1 builds the driver instrumented and emits a Cobertura
 # report (x64 Linux PR builds only).
+# ODBC_E2E_COMPARE=1 additionally installs the Microsoft ODBC Driver 18 and
+# reruns the same suite against it, failing on any parity divergence.
 
 set -euo pipefail
 
@@ -21,6 +23,27 @@ source ~/.cargo/env
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends cmake unixodbc-dev
+
+# The reference driver for comparison mode. Pinned so a new upstream release
+# can't silently change what the parity table is comparing against.
+MSODBCSQL_VERSION="18.6.2.1-1"
+
+compare_args=()
+case "$(printf '%s' "${ODBC_E2E_COMPARE:-0}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes)
+        apt-get install -y --no-install-recommends curl gnupg ca-certificates
+        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+            -o /etc/apt/trusted.gpg.d/microsoft.asc
+        curl -fsSL "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release && echo "$VERSION_ID")/prod.list" \
+            -o /etc/apt/sources.list.d/mssql-release.list
+        apt-get update
+        ACCEPT_EULA=Y apt-get install -y --no-install-recommends "msodbcsql18=$MSODBCSQL_VERSION"
+        # msodbcsql18 registers itself as [ODBC Driver 18 for SQL Server] in
+        # /etc/odbcinst.ini, which is run_e2e.sh's default --msodbcsql-ini.
+        compare_args+=(--compare-with-msodbcsql)
+        ;;
+esac
+
 rm -rf /var/lib/apt/lists/*
 
 # When ODBC_E2E_COVERAGE=1 (x64 Linux PR builds), build the driver with LLVM
@@ -34,4 +57,5 @@ case "$(printf '%s' "${ODBC_E2E_COVERAGE:-0}" | tr '[:upper:]' '[:lower:]')" in
         ;;
 esac
 
-exec /workspace/mssql-odbc/tests/e2e/run_e2e.sh --retries="${ODBC_E2E_RETRIES:-3}" "${coverage_args[@]}"
+exec /workspace/mssql-odbc/tests/e2e/run_e2e.sh --retries="${ODBC_E2E_RETRIES:-3}" \
+    "${coverage_args[@]}" "${compare_args[@]}"
