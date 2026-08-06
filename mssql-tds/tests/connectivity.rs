@@ -545,7 +545,7 @@ mod connectivity {
 
             // Prepare + execute "SELECT @P1" and capture the server-side handle.
             client
-                .execute_sp_prepexec("SELECT @P1".to_string(), vec![make_param()], None, ())
+                .execute_sp_prepexec_raw("SELECT @P1".to_string(), vec![make_param()], None, ())
                 .await?;
             while client.next_row().await?.is_some() {}
             client.advance().await?;
@@ -573,7 +573,7 @@ mod connectivity {
             // Reusing the pre-reconnect handle must fail: it lived in the dead
             // session, so the new session rejects it with error 8179.
             let reuse = client
-                .execute_sp_execute(handle, None, Some(vec![make_param()]), ())
+                .execute_sp_execute_raw(handle, None, Some(vec![make_param()]), ())
                 .await;
             let err = reuse.expect_err("sp_execute on a superseded-session handle must fail");
             assert!(
@@ -586,7 +586,7 @@ mod connectivity {
             // A fresh prepare on the recovered session works — the statement
             // remains usable once the caller re-prepares.
             client
-                .execute_sp_prepexec("SELECT @P1".to_string(), vec![make_param()], None, ())
+                .execute_sp_prepexec_raw("SELECT @P1".to_string(), vec![make_param()], None, ())
                 .await?;
             let value = get_scalar_value(&mut client).await?;
             assert!(

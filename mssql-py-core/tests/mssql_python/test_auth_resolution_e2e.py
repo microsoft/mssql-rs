@@ -406,7 +406,7 @@ class TestAuthTcClash:
         Interactive before ODBC sees the conn string.
         """
         cs = _base(tc="Yes", auth="ActiveDirectoryInteractive")
-        with patch("mssql_python.auth.get_auth_token", return_value=None):
+        with patch("mssql_python.connection.get_auth_token_info", return_value=None):
             _expect_connect_error(cs)
 
     def test_row28_tc_yes_admsi(self):
@@ -424,7 +424,7 @@ class TestAuthTcClash:
         Must mock — auth.py intercepts Default before ODBC sees the clash.
         """
         cs = _base(tc="Yes", auth="ActiveDirectoryDefault")
-        with patch("mssql_python.auth.get_auth_token", return_value=None):
+        with patch("mssql_python.connection.get_auth_token_info", return_value=None):
             _expect_connect_error(cs)
 
 

@@ -109,10 +109,11 @@ fn sql_exec_direct_w_safe(
         stmt_state.current_row = None;
         stmt_state.row_count = -1;
         stmt_state.pending_row_counts.clear();
-        stmt_state.prepared_sql = None;
         // Superseding a prepared plan orphans its server handle; release it
         // (deferred) once we hold the client below.
         stmt_state.orphan_prepared_handle();
+        stmt_state.prepared_stmt = None;
+        stmt_state.prepared_marker_count = 0;
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
         (named_params, rewritten_sql, marker_count)
@@ -214,15 +215,13 @@ mod tests {
 
     #[test]
     fn exec_direct_clears_stale_prepared_plan() {
+        use mssql_tds::connection::tds_client::PreparedStatement;
+
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.prepared_sql = Some("SELECT 1".to_string());
-            state.prepared_handle = Some(crate::handles::stmt::PreparedHandle {
-                id: 42,
-                session_epoch: 0,
-            });
+            state.prepared_stmt = Some(PreparedStatement::materialized_for_test("SELECT 1", 42, 0));
             state.set_state(STMT_STATE_PREPARED);
         }
 
@@ -237,18 +236,15 @@ mod tests {
         );
 
         let state = stmt.inner.lock().unwrap();
-        assert!(state.prepared_sql.is_none());
-        assert!(state.prepared_handle.is_none());
+        assert!(state.prepared_stmt.is_none());
         assert!(!state.has_state(STMT_STATE_PREPARED));
         // The superseded handle is queued for sp_unprepare. The flush never ran
         // here because the connection claim failed, so it remains pending.
-        assert_eq!(
-            state.pending_unprepare,
-            Some(crate::handles::stmt::PreparedHandle {
-                id: 42,
-                session_epoch: 0,
-            })
-        );
+        let orphaned = state
+            .pending_unprepare
+            .expect("superseded handle queued for release");
+        assert_eq!(orphaned.id(), 42);
+        assert_eq!(orphaned.session_epoch(), 0);
     }
 
     #[test]

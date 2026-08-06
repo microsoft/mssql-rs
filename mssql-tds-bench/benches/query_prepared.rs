@@ -36,7 +36,7 @@ fn prepared_execute(c: &mut Criterion) {
             SqlType::Int(None),
         )];
         client
-            .execute_sp_prepare("SELECT @id AS v".to_string(), decls, ())
+            .execute_sp_prepare_raw("SELECT @id AS v".to_string(), decls, ())
             .await
             .expect("sp_prepare failed")
     });
@@ -50,7 +50,7 @@ fn prepared_execute(c: &mut Criterion) {
                     SqlType::Int(Some(42)),
                 )];
                 client
-                    .execute_sp_execute(handle, None, Some(params), ())
+                    .execute_sp_execute_raw(handle, None, Some(params), ())
                     .await
                     .expect("sp_execute failed");
                 drain(&mut client).await;
@@ -61,7 +61,7 @@ fn prepared_execute(c: &mut Criterion) {
     // Release the handle (un-measured).
     rt.block_on(async {
         client
-            .execute_sp_unprepare(handle, ())
+            .execute_sp_unprepare_raw(handle, ())
             .await
             .expect("sp_unprepare failed");
     });
@@ -89,12 +89,12 @@ fn prepared_prepexec(c: &mut Criterion) {
                     SqlType::Int(Some(42)),
                 )];
                 client
-                    .execute_sp_prepexec("SELECT @id AS v".to_string(), params, None, ())
+                    .execute_sp_prepexec_raw("SELECT @id AS v".to_string(), params, None, ())
                     .await
                     .expect("sp_prepexec failed");
                 let handle = drain_capture_handle(&mut client).await;
                 client
-                    .execute_sp_unprepare(handle, ())
+                    .execute_sp_unprepare_raw(handle, ())
                     .await
                     .expect("sp_unprepare failed");
             });

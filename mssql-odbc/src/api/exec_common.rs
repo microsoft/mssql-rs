@@ -7,7 +7,7 @@
 //! execution paths stay in lockstep. None of these helpers hold a lock across
 //! network I/O.
 
-use tracing::{debug, error};
+use tracing::error;
 
 use std::collections::VecDeque;
 
@@ -20,8 +20,7 @@ use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlH
 use crate::error::post_sql_error;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
-    PreparedHandle, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
-    StmtState,
+    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
 };
 use crate::handles::{DbcHandle, StmtHandle};
 use crate::params::convert::{ParamConvError, bound_param_to_rpc};
@@ -169,32 +168,20 @@ pub(super) fn flush_pending_unprepare(
     client: &mut TdsClient,
     op: &str,
 ) {
-    let handle = match stmt.inner.lock() {
+    let pending = match stmt.inner.lock() {
         Ok(mut stmt_state) => stmt_state.pending_unprepare.take(),
         Err(_) => {
             error!("{op}: stmt mutex poisoned taking pending unprepare");
             return;
         }
     };
-    let Some(handle) = handle else {
+    let Some(handle) = pending else {
         return;
     };
-    let current_epoch = client.connection_recovery_count();
-    if handle.session_epoch != current_epoch {
-        // Orphan from a superseded session — already gone server-side.
-        debug!(
-            handle = handle.id,
-            handle_epoch = handle.session_epoch,
-            current_epoch,
-            "{op}: skipping stale pending unprepare (session changed, handle already released server-side)"
-        );
-        return;
-    }
-    if let Err(e) = dbc
-        .runtime
-        .block_on(client.execute_sp_unprepare(handle.id, ()))
-    {
-        error!(%e, handle = handle.id, "{op}: sp_unprepare failed — handle leaked until disconnect");
+    // `unprepare` is epoch-aware: a handle from a superseded session is already
+    // gone server-side, so it is dropped locally without an RPC.
+    if let Err(e) = dbc.runtime.block_on(client.unprepare(handle, ())) {
+        error!(%e, "{op}: sp_unprepare failed — handle leaked until disconnect");
     }
 }
 
@@ -249,14 +236,10 @@ pub(super) unsafe fn build_named_params(
 /// drained via `close_query`. Capture-if-absent: the handle is stable for the
 /// prepared plan, and `sp_execute` re-runs don't re-issue it.
 pub(super) fn capture_prepared_handle(stmt: &StmtHandle, client: &mut TdsClient) {
-    let Some(id) = client.take_prepared_statement_handle() else {
-        return;
-    };
-    let session_epoch = client.connection_recovery_count();
     if let Ok(mut stmt_state) = stmt.inner.lock()
-        && stmt_state.prepared_handle.is_none()
+        && let Some(prepared) = stmt_state.prepared_stmt.as_mut()
     {
-        stmt_state.prepared_handle = Some(PreparedHandle { id, session_epoch });
+        client.capture_prepared_handle_into(prepared);
     }
 }
 
