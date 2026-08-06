@@ -6,6 +6,8 @@
 # Key difference from docker-compose-matrix.yml:
 #   - Uses Dockerfile.client.validation (no Rust, ~5s build vs ~30s)
 #   - Only validates kinit/klist works
+#   - dc/mssql use the pre-built images; the client-* services are always built
+#     locally, since no pre-built validation-client images are published
 #
 # Usage: 
 #   docker compose -f docker-compose-validation.yml --profile <distro> up -d
@@ -34,6 +36,7 @@ x-client-common: &client-common
 services:
   # Samba AD Domain Controller (shared by all clients)
   dc:
+    image: ${KERBEROS_IMAGE_REGISTRY:-ghcr.io/microsoft/mssql-rs}/kerberos/samba-dc:${KERBEROS_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile.samba-dc
@@ -74,6 +77,7 @@ services:
 
   # SQL Server on Linux with SSSD/AD integration (shared by all clients)
   mssql:
+    image: ${KERBEROS_IMAGE_REGISTRY:-ghcr.io/microsoft/mssql-rs}/kerberos/mssql-ad:${KERBEROS_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile.mssql-ad
