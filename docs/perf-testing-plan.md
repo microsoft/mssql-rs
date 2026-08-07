@@ -193,7 +193,8 @@ the same re-measure set, and the summary reports whether the win reproduced in a
 re-runs. Verifying both directions at the same magnitude matters because the measurements are
 recorded for run-over-run trend comparison: an anomalously slow *baseline* pass corrupts that
 record exactly as much as an anomalously slow candidate one, and since both directions share
-one re-measure set the extra confidence costs nothing per run. This never fails the run: it
+one re-measure set the extra confidence adds no extra *pass* — though each benchmark in the
+set does add its own re-run time, which is what the cap below bounds. This never fails the run: it
 exists so a one-off artifact is not reported as a real gain, and because a win that *does*
 reproduce is itself worth a look — an implausible speed-up can mean the candidate is doing
 less work rather than the same work faster. Unlike regressions, improvements are **not

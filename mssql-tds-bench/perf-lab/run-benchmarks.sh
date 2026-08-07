@@ -371,6 +371,7 @@ improvement_pairs() {
 # just not re-measured.
 IMP_MAX="${BENCH_IMPROVEMENT_VERIFY_MAX:-3}"
 case "$IMP_MAX" in ''|*[!0-9]*) echo "ERROR: BENCH_IMPROVEMENT_VERIFY_MAX must be a positive integer (got: '${IMP_MAX}')" >&2; exit 1 ;; esac
+IMP_MAX=$((10#$IMP_MAX))
 if [ "$IMP_MAX" -lt 1 ]; then
     echo "ERROR: BENCH_IMPROVEMENT_VERIFY_MAX must be >= 1 (got: ${IMP_MAX}); use a higher BENCH_IMPROVEMENT_VERIFY_RATIO to verify fewer." >&2
     exit 1
@@ -405,12 +406,17 @@ CONFIRM_RUNS="${BENCH_CONFIRM_RUNS:-4}"
 # checked before QUORUM is derived, since that default is an arithmetic
 # expansion that would fail confusingly on a non-numeric value.
 case "$CONFIRM_RUNS" in ''|*[!0-9]*) echo "ERROR: BENCH_CONFIRM_RUNS must be a positive integer (got: '${CONFIRM_RUNS}')" >&2; exit 1 ;; esac
+# Force base 10: bash arithmetic reads a leading zero as octal, so "08"/"09" are
+# invalid literals that abort the script, and "010" would silently mean 8 here
+# while the PowerShell runner reads it as 10.
+CONFIRM_RUNS=$((10#$CONFIRM_RUNS))
 if [ "$CONFIRM_RUNS" -lt 1 ]; then
     echo "ERROR: BENCH_CONFIRM_RUNS must be >= 1 (got: ${CONFIRM_RUNS}); 0 would clear every regression unconfirmed." >&2
     exit 1
 fi
 QUORUM="${BENCH_CONFIRM_QUORUM:-$(( CONFIRM_RUNS / 2 + 1 ))}"
 case "$QUORUM" in ''|*[!0-9]*) echo "ERROR: BENCH_CONFIRM_QUORUM must be a positive integer (got: '${QUORUM}')" >&2; exit 1 ;; esac
+QUORUM=$((10#$QUORUM))
 if [ "$QUORUM" -lt 1 ] || [ "$QUORUM" -gt "$CONFIRM_RUNS" ]; then
     echo "ERROR: BENCH_CONFIRM_QUORUM must be between 1 and BENCH_CONFIRM_RUNS (got: ${QUORUM} of ${CONFIRM_RUNS})." >&2
     exit 1
