@@ -34,6 +34,22 @@ function Invoke-Native {
     }
 }
 
+# Read an integer knob strictly. A bare [int] cast silently ROUNDS a fractional
+# string ("1.5" -> 2), which the bash runner rejects outright, so the same
+# environment would produce different settings on the two platforms. NumberStyles
+# None (no sign, no surrounding whitespace) and the invariant culture match the
+# bash guard's `case $x in *[!0-9]*)` exactly.
+function Get-IntEnv {
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][int]$Default)
+    $raw = [Environment]::GetEnvironmentVariable($Name)
+    if ($null -eq $raw -or $raw -eq '') { return $Default }
+    $parsed = 0
+    if (-not [int]::TryParse($raw, [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+        throw "$Name must be a non-negative integer (got: '$raw')."
+    }
+    return $parsed
+}
+
 # Convert a taskset-style CPU list ("16-31", "8,9,10", "8-11,14") into a Win32
 # process-affinity bitmask. Returns $null when the list is empty. Mirrors the
 # `taskset -c` contract that run-benchmarks.sh consumes on Linux.
@@ -477,7 +493,7 @@ if (-not $impThr) { $impThr = $thr }
 # added to the verify set costs $confirmRuns release-grade re-runs of BOTH sides.
 # Cap the set at the largest apparent wins so the re-run budget stays bounded;
 # the rest are still reported, just not re-measured.
-$impMax = if ($env:BENCH_IMPROVEMENT_VERIFY_MAX) { [int]$env:BENCH_IMPROVEMENT_VERIFY_MAX } else { 3 }
+$impMax = Get-IntEnv 'BENCH_IMPROVEMENT_VERIFY_MAX' 3
 if ($impMax -lt 1) { throw "BENCH_IMPROVEMENT_VERIFY_MAX must be >= 1 (got: $impMax); use a higher BENCH_IMPROVEMENT_VERIFY_RATIO to verify fewer." }
 $improvementsAll = @(Get-CritcmpImprovements $comparison $impThr | Sort-Object -Property Ratio -Descending)
 $improvements = @($improvementsAll | Select-Object -First $impMax)
@@ -500,8 +516,8 @@ $verifyNames = @(@($regressions | ForEach-Object { $_.Name }) + @($improvements 
 # offenders are a small subset, so the extra re-runs stay cheap.
 #   BENCH_CONFIRM_RUNS   (default 4)                - number of re-runs
 #   BENCH_CONFIRM_QUORUM (default majority = N/2+1)  - re-runs required to confirm
-$confirmRuns = if ($env:BENCH_CONFIRM_RUNS) { [int]$env:BENCH_CONFIRM_RUNS } else { 4 }
-$quorum = if ($env:BENCH_CONFIRM_QUORUM) { [int]$env:BENCH_CONFIRM_QUORUM } else { [int][math]::Floor($confirmRuns / 2) + 1 }
+$confirmRuns = Get-IntEnv 'BENCH_CONFIRM_RUNS' 4
+$quorum = Get-IntEnv 'BENCH_CONFIRM_QUORUM' ([int][math]::Floor($confirmRuns / 2) + 1)
 # Reject settings that would silently disable the gate rather than tune it:
 # 0 re-runs skips the loop and clears every regression, and a quorum above the
 # run count can never be met, so nothing is ever confirmed.
