@@ -573,18 +573,24 @@ TEST_F(DriverConnectLiveTest, NewConnectionAttributesParity) {
         EXPECT_FALSE(r.has01S00);
     }
 
-    // Invalid enum value on a validated key -> E_FAIL -> HY024, connect fails.
-    {
-        auto r = tryConnect(base + ";ApplicationIntent=sideways");
-        EXPECT_EQ(SQL_ERROR, r.rc);
-        EXPECT_TRUE(r.hasHY024);
-    }
+    // Rejecting invalid attribute values with HY024 is mssql-odbc-specific:
+    // msodbcsql accepts both of these (SQL_ERROR without HY024 for the bad enum,
+    // SQL_SUCCESS_WITH_INFO for the non-numeric integer), so run them on the
+    // driver under test only.
+    if (!ComparingMsodbcsql()) {
+        // Invalid enum value on a validated key -> E_FAIL -> HY024, connect fails.
+        {
+            auto r = tryConnect(base + ";ApplicationIntent=sideways");
+            EXPECT_EQ(SQL_ERROR, r.rc);
+            EXPECT_TRUE(r.hasHY024);
+        }
 
-    // Non-numeric integer value -> HY024, connect fails.
-    {
-        auto r = tryConnect(base + ";PacketSize=notanumber");
-        EXPECT_EQ(SQL_ERROR, r.rc);
-        EXPECT_TRUE(r.hasHY024);
+        // Non-numeric integer value -> HY024, connect fails.
+        {
+            auto r = tryConnect(base + ";PacketSize=notanumber");
+            EXPECT_EQ(SQL_ERROR, r.rc);
+            EXPECT_TRUE(r.hasHY024);
+        }
     }
 
     // Out-of-domain IpAddressPreference is accepted and falls back to IPv4First

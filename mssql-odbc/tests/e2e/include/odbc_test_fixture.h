@@ -69,6 +69,14 @@ using SqlTString = std::basic_string<SQLTCHAR>;
     EXPECT_EQ(std::string(expected_state),                                     \
               ODBCTestUtils::GetDiagState(handle_type, handle))
 
+// Predicate form of SKIP_IF_COMPARING_MSODBCSQL, for tests whose assertions are
+// only partly mssql-odbc-specific: guard the divergent blocks with this and let
+// the shared ones keep running on both legs.
+inline bool ComparingMsodbcsql() {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    return target && std::string(target) == "msodbcsql";
+}
+
 // Skip the current test on the msodbcsql leg of a --compare-with-msodbcsql run.
 // The same test binary runs against both drivers; use this at the top of a test
 // that asserts mssql-odbc-specific behavior the full msodbcsql driver does not
@@ -77,8 +85,7 @@ using SqlTString = std::basic_string<SQLTCHAR>;
 // gtest case does not fail the binary, so the parity run stays green.
 #define SKIP_IF_COMPARING_MSODBCSQL()                                          \
     do {                                                                       \
-        const char* _target = std::getenv("ODBC_TEST_TARGET");                 \
-        if (_target && std::string(_target) == "msodbcsql") {                  \
+        if (ComparingMsodbcsql()) {                                            \
             GTEST_SKIP() << "mssql-odbc-specific test; skipped on msodbcsql "   \
                             "comparison leg";                                  \
         }                                                                      \
