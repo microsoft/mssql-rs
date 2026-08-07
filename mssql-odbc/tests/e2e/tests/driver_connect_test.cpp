@@ -573,26 +573,6 @@ TEST_F(DriverConnectLiveTest, NewConnectionAttributesParity) {
         EXPECT_FALSE(r.has01S00);
     }
 
-    // Rejecting invalid attribute values with HY024 is mssql-odbc-specific:
-    // msodbcsql accepts both of these (SQL_ERROR without HY024 for the bad enum,
-    // SQL_SUCCESS_WITH_INFO for the non-numeric integer), so run them on the
-    // driver under test only.
-    if (!ComparingMsodbcsql()) {
-        // Invalid enum value on a validated key -> E_FAIL -> HY024, connect fails.
-        {
-            auto r = tryConnect(base + ";ApplicationIntent=sideways");
-            EXPECT_EQ(SQL_ERROR, r.rc);
-            EXPECT_TRUE(r.hasHY024);
-        }
-
-        // Non-numeric integer value -> HY024, connect fails.
-        {
-            auto r = tryConnect(base + ";PacketSize=notanumber");
-            EXPECT_EQ(SQL_ERROR, r.rc);
-            EXPECT_TRUE(r.hasHY024);
-        }
-    }
-
     // Out-of-domain IpAddressPreference is accepted and falls back to IPv4First
     // at connect time (msodbcsql parity), so the parser raises no error and the
     // connection succeeds without an 01S00 warning.
@@ -600,5 +580,67 @@ TEST_F(DriverConnectLiveTest, NewConnectionAttributesParity) {
         auto r = tryConnect(base + ";IpAddressPreference=IPv7");
         EXPECT_TRUE(SQL_SUCCEEDED(r.rc)) << "rc=" << r.rc;
         EXPECT_FALSE(r.has01S00);
+    }
+}
+
+// mssql-odbc rejects an invalid value on a validated connection-string key with
+// HY024 at connect time. The reference msodbcsql driver is laxer: it treats an
+// invalid ApplicationIntent enum as a plain SQL_ERROR without HY024, and a
+// non-numeric PacketSize as SQL_SUCCESS_WITH_INFO. That strictness is
+// mssql-odbc-specific, so the whole test is skipped on the msodbcsql leg.
+TEST_F(DriverConnectLiveTest, InvalidConnectionAttributeValuesRejected) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    auto& cfg = ODBCTestConfig::Instance();
+    if (!cfg.HasSqlAuth()) {
+        GTEST_SKIP() << "Requires SQL auth (ODBC_TEST_SERVER + ODBC_TEST_UID + "
+                        "ODBC_TEST_PWD); see follow-up issue for capability gating";
+    }
+
+    struct ConnResult {
+        SQLRETURN rc;
+        bool hasHY024;
+    };
+
+    auto tryConnect = [&](const std::string& cs) -> ConnResult {
+        SQLHDBC hdbc = SQL_NULL_HDBC;
+        SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
+        EXPECT_EQ(SQL_SUCCESS, rc);
+        if (rc != SQL_SUCCESS) return {rc, false};
+
+        SqlTString connstr = ODBCTestUtils::ToSqlTStr(cs);
+        SQLTCHAR outStr[1024] = {};
+        SQLSMALLINT outLen = 0;
+        rc = SQLDriverConnect(hdbc, nullptr,
+                              const_cast<SQLTCHAR*>(connstr.c_str()),
+                              static_cast<SQLSMALLINT>(connstr.size()),
+                              outStr, 1024, &outLen, SQL_DRIVER_NOPROMPT);
+
+        bool hasHY024 = (rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR) &&
+                        ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "HY024");
+
+        if (SQL_SUCCEEDED(rc)) SQLDisconnect(hdbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+        return {rc, hasHY024};
+    };
+
+    const std::string base =
+        "Driver={" + cfg.Driver() + "}"
+        ";Server=" + cfg.Server() +
+        ";UID=" + cfg.Uid() +
+        ";PWD=" + cfg.Pwd() + ";TrustServerCertificate=" + cfg.TrustCert();
+
+    // Invalid enum value on a validated key -> E_FAIL -> HY024, connect fails.
+    {
+        auto r = tryConnect(base + ";ApplicationIntent=sideways");
+        EXPECT_EQ(SQL_ERROR, r.rc);
+        EXPECT_TRUE(r.hasHY024);
+    }
+
+    // Non-numeric integer value -> HY024, connect fails.
+    {
+        auto r = tryConnect(base + ";PacketSize=notanumber");
+        EXPECT_EQ(SQL_ERROR, r.rc);
+        EXPECT_TRUE(r.hasHY024);
     }
 }
