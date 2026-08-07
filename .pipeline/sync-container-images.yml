@@ -428,9 +428,9 @@ stages:
     displayName: 'Import Alpine 3.22 & 3.23'
     condition: eq('${{ parameters.syncAlpine3 }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -668,9 +668,9 @@ stages:
     displayName: 'Import CentOS Stream 9'
     condition: eq('${{ parameters.syncCentOS }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -692,9 +692,9 @@ stages:
     displayName: 'Import openSUSE Leap 15.6'
     condition: eq('${{ parameters.syncSUSE }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -862,9 +862,9 @@ stages:
     timeoutInMinutes: 120
     condition: eq('${{ parameters.buildKerberosImages }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ variables.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ variables.imageName }}
     steps:
     - checkout: self
       displayName: Checkout repository
