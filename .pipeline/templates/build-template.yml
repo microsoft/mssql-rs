@@ -194,59 +194,18 @@ steps:
 # mssql-tds). The report is unioned into the Merge Coverage stage so lines
 # reachable only via the ODBC surface count toward PR diff coverage.
 - ${{ if and(eq(parameters.osType, 'Windows'), eq(parameters.enableOdbcE2E, true)) }}:
-  # Reference driver for the parity comparison below. Pinned so a new upstream
-  # release can't silently change what the parity table is comparing against.
-  # It installs as "ODBC Driver 18 for SQL Server"; the Rust driver registers
-  # separately as "... (Rust)", so the two coexist.
-  #
-  # winget is the intended path, but it is not present on every Windows Server
-  # image, so fall back to the MSI winget itself would download (URL and hash
-  # taken from the pinned winget manifest). Skipping the install is deliberately
-  # not an option: it would silently downgrade the job to a single-leg run.
-  - pwsh: |
-      $ErrorActionPreference = 'Stop'
-      $name = 'ODBC Driver 18 for SQL Server'
-      $key  = "HKLM:\Software\ODBC\ODBCINST.INI\$name"
-      $version = '18.6.2.1'
-
-      if (Test-Path $key) {
-        Write-Host "$name is already registered; skipping install."
-        Get-ItemProperty -Path $key | Format-List | Out-String | Write-Host
-        exit 0
-      }
-
-      if (Get-Command winget -ErrorAction SilentlyContinue) {
-        Write-Host "Installing msodbcsql $version via winget..."
-        winget install --id Microsoft.msodbcsql.18 --version $version --exact `
-          --silent --accept-package-agreements --accept-source-agreements `
-          --disable-interactivity
-        if ($LASTEXITCODE -ne 0) {
-          throw "winget install of msodbcsql $version failed (exit $LASTEXITCODE)"
-        }
-      } else {
-        $url    = 'https://download.microsoft.com/download/7bf9fad4-0f21-486d-a750-fc990ded5624/amd64/1033/msodbcsql.msi'
-        $sha256 = '20314529110da3365a252164a657bdc837a18be5839105aa5f5acf0a8d2f4b82'
-        $msi    = Join-Path $env:TEMP 'msodbcsql.msi'
-        Write-Host "winget not available; downloading msodbcsql $version MSI..."
-        Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
-        $actual = (Get-FileHash $msi -Algorithm SHA256).Hash
-        if ($actual -ne $sha256) {
-          throw "msodbcsql MSI hash mismatch: expected $sha256, got $actual"
-        }
-        $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-          '/i', "`"$msi`"", '/qn', '/norestart', 'IACCEPTMSODBCSQLLICENSETERMS=YES'
-        )
-        if ($p.ExitCode -ne 0) {
-          throw "msiexec install of msodbcsql $version failed (exit $($p.ExitCode))"
-        }
-      }
-
-      if (-not (Test-Path $key)) {
-        throw "Install reported success but '$name' is not registered under HKLM."
-      }
-      Write-Host "Installed and registered '$name'."
-    displayName: Install msodbcsql 18.6.2.1 (parity reference driver)
+  # Reference driver for the parity comparison below, installed by
+  # install-msodbcsql.ps1. Pinned to the msodbcsqlVersion pipeline variable so a
+  # new upstream release can't silently change what the parity table compares
+  # against. It installs as "ODBC Driver 18 for SQL Server"; the Rust driver
+  # registers separately as "... (Rust)", so the two coexist.
+  - task: PowerShell@2
+    displayName: Install msodbcsql $(msodbcsqlVersion) (parity reference driver)
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    inputs:
+      pwsh: true
+      filePath: $(Build.SourcesDirectory)/.pipeline/scripts/install-msodbcsql.ps1
+      arguments: -Version '$(msodbcsqlVersion)'
 
   - pwsh: |
       $env:ODBC_TEST_SERVER   = 'localhost'

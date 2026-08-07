@@ -418,63 +418,7 @@ run_tests() {
 # ----------------------------------------------------------------------------
 print_parity_report() {
     local rust_xml="$1" ms_xml="$2"
-    python3 - "$rust_xml" "$ms_xml" <<'PY'
-import sys, xml.etree.ElementTree as ET
-
-def load(path):
-    """Returns {test_name: 'PASS'|'FAIL'|'SKIP'}."""
-    out = {}
-    try:
-        root = ET.parse(path).getroot()
-    except (ET.ParseError, FileNotFoundError):
-        return out
-    # ctest --output-junit emits <testsuite><testcase name="..."> ...
-    for tc in root.iter("testcase"):
-        name = tc.get("name") or "<unnamed>"
-        tags = {child.tag for child in tc}
-        if tags & {"failure", "error"}:
-            out[name] = "FAIL"
-        elif "skipped" in tags:
-            out[name] = "SKIP"
-        else:
-            out[name] = "PASS"
-    return out
-
-rust = load(sys.argv[1])
-ms   = load(sys.argv[2])
-names = sorted(set(rust) | set(ms))
-
-# Verdicts describe only the observed outcome pairing, not a root cause: a
-# per-test PASS/FAIL divergence does not by itself establish which side is
-# wrong, and a shared failure does not prove the test is buggy.
-def verdict(r, m):
-    if r == "SKIP" or m == "SKIP":  return ("skipped (not compared)", "skip")
-    if r == "PASS" and m == "PASS": return ("parity", "parity")
-    if r == "FAIL" and m == "FAIL": return ("shared failure - investigate", "shared")
-    if r != m:                      return ("divergence - investigate", "divergence")
-    return ("missing run - investigate", "divergence")
-
-w = max((len(n) for n in names), default=4)
-print()
-print("=== Parity report (mssql-odbc vs msodbcsql) ===")
-print(f"{'Test'.ljust(w)}  {'mssql-odbc':<10}  {'msodbcsql':<10}  Verdict")
-print(f"{'-'*w}  {'-'*10}  {'-'*10}  {'-'*30}")
-counts = {"parity":0, "divergence":0, "shared":0, "skip":0}
-for n in names:
-    r = rust.get(n, "MISSING")
-    m = ms.get(n, "MISSING")
-    v, kind = verdict(r, m)
-    counts[kind] += 1
-    print(f"{n.ljust(w)}  {r:<10}  {m:<10}  {v}")
-print()
-print(f"Summary: {counts['parity']} parity, {counts['divergence']} divergence(s), "
-      f"{counts['shared']} shared failure(s), {counts['skip']} skipped")
-
-# Any non-parity outcome fails the run. ctest exit codes alone are not enough:
-# a test present in only one leg leaves both legs green while the comparison is
-# meaningless.
-sys.exit(1 if counts["divergence"] or counts["shared"] else 0)
-PY
+    python3 "$SCRIPT_DIR/parity_report.py" "$rust_xml" "$ms_xml"
 }
 
 # ----------------------------------------------------------------------------

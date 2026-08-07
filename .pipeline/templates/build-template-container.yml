@@ -286,6 +286,7 @@ steps:
         -e ODBC_E2E_RETRIES="3" \
         -e ODBC_E2E_COVERAGE="${{ lower(parameters.collectRustCoverage) }}" \
         -e ODBC_E2E_COMPARE="1" \
+        -e ODBC_E2E_MSODBCSQL_VERSION="$(msodbcsqlVersion)" \
         -e RUST_BACKTRACE=full \
         -w /workspace \
         $BUILD_IMAGE \

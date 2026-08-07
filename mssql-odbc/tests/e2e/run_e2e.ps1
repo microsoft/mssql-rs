@@ -143,8 +143,16 @@ $script:HadDriversListEntry = $false
 $script:OrigDriversListValue = $null
 $script:Registered = $false
 # Set only when -MsodbcsqlDll overrides the installed reference registration.
-$script:MsodbcsqlOverridden = $false
-$script:OrigMsodbcsqlDriver = $null
+# Driver, Setup, and the "ODBC Drivers" list entry are snapshotted independently
+# so each is restored exactly as it was (they can pre-exist in any combination).
+$script:MsodbcsqlOverridden    = $false
+$script:HadMsodbcsqlKey        = $false
+$script:HadMsodbcsqlDriver     = $false
+$script:HadMsodbcsqlSetup      = $false
+$script:OrigMsodbcsqlDriver    = $null
+$script:OrigMsodbcsqlSetup     = $null
+$script:HadMsodbcsqlListEntry  = $false
+$script:OrigMsodbcsqlListValue = $null
 
 function Save-OriginalRegistration {
     if (Test-Path $RustDriverRegKey) {
@@ -189,15 +197,28 @@ function Get-MsodbcsqlDriverPath {
 }
 
 # Point the reference registration at an explicit DLL for the comparison leg,
-# saving the installed value so Restore-Registration can put it back.
+# snapshotting the installed Driver, Setup, and "ODBC Drivers" list values
+# independently so Restore-Registration can put each back exactly as it was.
 function Set-MsodbcsqlOverride([string]$DriverPath) {
-    $script:OrigMsodbcsqlDriver = Get-MsodbcsqlDriverPath
-    if (-not (Test-Path $MsodbcsqlRegKey)) {
+    if (Test-Path $MsodbcsqlRegKey) {
+        $script:HadMsodbcsqlKey = $true
+        $d = Get-ItemProperty -Path $MsodbcsqlRegKey -Name "Driver" -ErrorAction SilentlyContinue
+        if ($null -ne $d) { $script:HadMsodbcsqlDriver = $true; $script:OrigMsodbcsqlDriver = $d.Driver }
+        $s = Get-ItemProperty -Path $MsodbcsqlRegKey -Name "Setup" -ErrorAction SilentlyContinue
+        if ($null -ne $s) { $script:HadMsodbcsqlSetup = $true; $script:OrigMsodbcsqlSetup = $s.Setup }
+    } else {
         New-Item -Path $MsodbcsqlRegKey -Force | Out-Null
     }
     Set-ItemProperty -Path $MsodbcsqlRegKey -Name "Driver" -Value $DriverPath
     Set-ItemProperty -Path $MsodbcsqlRegKey -Name "Setup"  -Value $DriverPath
-    if (-not (Test-Path $DriversRegKey)) {
+
+    if (Test-Path $DriversRegKey) {
+        $e = Get-ItemProperty -Path $DriversRegKey -Name $MsodbcsqlName -ErrorAction SilentlyContinue
+        if ($null -ne $e) {
+            $script:HadMsodbcsqlListEntry = $true
+            $script:OrigMsodbcsqlListValue = $e.$MsodbcsqlName
+        }
+    } else {
         New-Item -Path $DriversRegKey -Force | Out-Null
     }
     Set-ItemProperty -Path $DriversRegKey -Name $MsodbcsqlName -Value "Installed"
@@ -207,17 +228,32 @@ function Set-MsodbcsqlOverride([string]$DriverPath) {
 
 function Restore-Registration {
     if ($script:MsodbcsqlOverridden) {
-        if ($script:OrigMsodbcsqlDriver) {
-            Set-ItemProperty -Path $MsodbcsqlRegKey -Name "Driver" -Value $script:OrigMsodbcsqlDriver
-            Set-ItemProperty -Path $MsodbcsqlRegKey -Name "Setup"  -Value $script:OrigMsodbcsqlDriver
+        if ($script:HadMsodbcsqlKey) {
+            # Restore each value we may have overwritten, or remove it if it did
+            # not exist before, mirroring the Rust driver restore below.
+            if ($script:HadMsodbcsqlDriver) {
+                Set-ItemProperty -Path $MsodbcsqlRegKey -Name "Driver" -Value $script:OrigMsodbcsqlDriver
+            } else {
+                Remove-ItemProperty -Path $MsodbcsqlRegKey -Name "Driver" -ErrorAction SilentlyContinue
+            }
+            if ($script:HadMsodbcsqlSetup) {
+                Set-ItemProperty -Path $MsodbcsqlRegKey -Name "Setup" -Value $script:OrigMsodbcsqlSetup
+            } else {
+                Remove-ItemProperty -Path $MsodbcsqlRegKey -Name "Setup" -ErrorAction SilentlyContinue
+            }
             Write-Host "[  DRIVER ] Restored original HKLM registration for '$MsodbcsqlName'"
         } else {
             Remove-Item -Path $MsodbcsqlRegKey -Force -ErrorAction SilentlyContinue
-            if (Test-Path $DriversRegKey) {
-                Remove-ItemProperty -Path $DriversRegKey -Name $MsodbcsqlName -ErrorAction SilentlyContinue
-            }
-            Write-Host "[  DRIVER ] Removed HKLM registration for '$MsodbcsqlName' (no prior driver)"
+            Write-Host "[  DRIVER ] Removed HKLM registration for '$MsodbcsqlName' (no prior key)"
         }
+
+        # Restore or remove the "ODBC Drivers" list entry independently of the key.
+        if ($script:HadMsodbcsqlListEntry) {
+            Set-ItemProperty -Path $DriversRegKey -Name $MsodbcsqlName -Value $script:OrigMsodbcsqlListValue
+        } elseif (Test-Path $DriversRegKey) {
+            Remove-ItemProperty -Path $DriversRegKey -Name $MsodbcsqlName -ErrorAction SilentlyContinue
+        }
+
         $script:MsodbcsqlOverridden = $false
     }
 
@@ -591,7 +627,7 @@ try {
     $RefDriverPath = $null
     if ($CompareWithMsodbcsql) {
         if ($env:ODBC_TEST_CONNSTR) {
-            Write-Error "ODBC_TEST_CONNSTR is set; it overrides the driver name and would pin both comparison legs to the same driver. Unset it to compare."
+            throw "ODBC_TEST_CONNSTR is set; it overrides the driver name and would pin both comparison legs to the same driver. Unset it to compare."
         }
         if ($MsodbcsqlDll) {
             $RefDriverPath = $MsodbcsqlDll

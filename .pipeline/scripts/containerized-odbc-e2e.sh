@@ -15,6 +15,8 @@
 # report (x64 Linux PR builds only).
 # ODBC_E2E_COMPARE=1 additionally installs the Microsoft ODBC Driver 18 and
 # reruns the same suite against it, failing on any parity divergence.
+# ODBC_E2E_MSODBCSQL_VERSION overrides the reference driver's upstream version
+# (default 18.6.2.1); the Debian package revision is appended automatically.
 
 set -euo pipefail
 
@@ -24,9 +26,12 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends cmake unixodbc-dev
 
-# The reference driver for comparison mode. Pinned so a new upstream release
-# can't silently change what the parity table is comparing against.
-MSODBCSQL_VERSION="18.6.2.1-1"
+# The reference driver for comparison mode. The upstream version defaults to a
+# pinned value but can be overridden by the msodbcsqlVersion pipeline variable
+# (passed as ODBC_E2E_MSODBCSQL_VERSION), so a new release can't silently change
+# what the parity table compares against. apt pins the full <upstream>-<revision>
+# package; the Debian revision suffix is appended here.
+MSODBCSQL_VERSION="${ODBC_E2E_MSODBCSQL_VERSION:-18.6.2.1}-1"
 
 compare_args=()
 case "$(printf '%s' "${ODBC_E2E_COMPARE:-0}" | tr '[:upper:]' '[:lower:]')" in

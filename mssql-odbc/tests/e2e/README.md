@@ -165,7 +165,11 @@ winget install --id Microsoft.msodbcsql.18 --version 18.6.2.1 --exact
 ```
 
 CI runs this comparison on the Windows x64 PR build (the leg with a local SQL
-Server), installing the same pinned version before the suite.
+Server), installing the same pinned version before the suite. The version is
+set once via the `msodbcsqlVersion` pipeline variable (in
+`.pipeline/validation-pipeline*.yml`) and consumed on Windows by
+`.pipeline/scripts/install-msodbcsql.ps1` and on Linux by
+`.pipeline/scripts/containerized-odbc-e2e.sh`.
 
 When `ODBC_TEST_SERVER` is unset, a dev SQL Server on `localhost:1433` is
 auto-detected — the password is taken from `ODBC_TEST_PWD`, then `SQL_PASSWORD`,
