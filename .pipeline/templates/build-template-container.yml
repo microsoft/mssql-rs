@@ -387,17 +387,18 @@ steps:
 
 # Reference-driver leg, produced only by the x64 job (ODBC_E2E_COMPARE=1).
 # Published so a parity divergence can be triaged from the test tab rather than
-# by reading the build log. Absent on ARM, where the task just warns.
-- task: PublishTestResults@2
-  condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
-  displayName: Publish ODBC e2e test results (msodbcsql reference)
-  continueOnError: true
-  inputs:
-    testResultsFormat: JUnit
-    testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-msodbcsql.xml
-    testRunTitle: $(System.PhaseName)-ODBC-msodbcsql
-    failTaskOnFailedTests: false
-    publishRunAttachments: true
+# by reading the build log.
+- ${{ if ne(parameters.architecture, 'ARM64') }}:
+  - task: PublishTestResults@2
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Publish ODBC e2e test results (msodbcsql reference)
+    continueOnError: true
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-msodbcsql.xml
+      testRunTitle: $(System.PhaseName)-ODBC-msodbcsql
+      failTaskOnFailedTests: false
+      publishRunAttachments: true
 
 # Coverage is not published to the ADO coverage tab from this job. The Linux
 # mssql-tds Rust Cobertura report is published as a per-OS artifact; the
