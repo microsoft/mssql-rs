@@ -86,7 +86,7 @@ ODBC Appendix D requires a driver to support conversions to **all** ODBC C types
 - Character sources (`char` / `varchar` / `nchar` / `nvarchar`) → numeric and date/time C targets (e.g. `'123'` → `SQL_C_SLONG`, `'2023-06-15'` → `SQL_C_TYPE_DATE`), with `22018` when the text is not a valid literal for the target.
 - Lossy **numeric** conversions must report fractional truncation with `01S07` + `SQL_SUCCESS_WITH_INFO` (e.g. `float` `1234.99` → `SQL_C_SLONG` yields `1234` + `01S07`). The `01S07` diagnostic and the `ConvOk::Truncated` plumbing already exist (P1 uses them for date/time targets that discard a component); P1a extends them to the numeric conversions above.
 
-Until then these pairings return `HYC00` (not implemented) rather than converting.
+Implemented on `david/odbc-p1a-conversions` (stacked on P1): a `NumericSource` abstraction keeps exact sources exact so integer targets report `01S07` truncation instead of silently dropping a fraction; character sources parse decimal literals exactly (falling back to `f64` for exponent forms) and the `date` / `time` / `datetime2` / `datetimeoffset` character forms; invalid text returns `22018`. A source with no interpretation for the requested target (binary, guid) is `07006`.
 
 ### P2 — SQLColAttributeW — Task [46579](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46579)
 
@@ -132,7 +132,7 @@ Both of those landed with the fetch rework in [#153](https://github.com/microsof
 | --- | --- | --- |
 | P0 — Prerequisites & plumbing | 46577 | Implemented (build + clippy clean, 332 tests pass) |
 | P1 — Typed SQLGetData | 46578 | Implemented (int/float/guid/date-time C targets + char/binary rendering; 491 tests pass). Chunked retrieval and incremental PLP streaming are owned by #153 (merged), on top of which the typed targets are dispatched; missing source-type conversions tracked as P1a; `sql_variant` underlying-type resolution deferred to P2. |
-| P1a — Mandatory source-type conversions | 47107 | Not started |
+| P1a — Mandatory source-type conversions | 47107 | Implemented (decimal, money and character sources into the numeric and date/time C targets; `01S07` on lossy numeric conversion, `22018` on an invalid character literal). |
 | P2 — SQLColAttributeW | 46579 | Not started |
 | P3 — SQLBindCol + SQLFetchScroll | 46580 | Not started |
 | P4 — Exports & driver-load compat | 46581 | Not started |

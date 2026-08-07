@@ -545,20 +545,127 @@ pub(crate) fn is_datetime_c_target(target_type: SqlSmallInt) -> bool {
 /// # Safety
 /// Same pointer contract as [`convert_integer_c`]; `target_value_ptr` must be
 /// valid for a write of the target struct's size.
+/// Parses `YYYY-MM-DD`.
+fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
+    let mut it = s.split('-');
+    let (y, m, d) = (it.next()?, it.next()?, it.next()?);
+    if it.next().is_some() || y.len() != 4 {
+        return None;
+    }
+    let year: i16 = y.parse().ok()?;
+    let month: u16 = m.parse().ok()?;
+    let day: u16 = d.parse().ok()?;
+    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+/// Parses `HH:MM[:SS[.fffffff]]`, returning the components plus the number of
+/// fractional digits written (the effective scale).
+fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
+    let mut it = s.split(':');
+    let hour: u16 = it.next()?.parse().ok()?;
+    let minute: u16 = it.next()?.parse().ok()?;
+    let sec_part = it.next().unwrap_or("0");
+    if it.next().is_some() {
+        return None;
+    }
+    let (sec_digits, frac_digits) = match sec_part.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (sec_part, ""),
+    };
+    let second: u16 = sec_digits.parse().ok()?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    if !frac_digits.is_empty() && !frac_digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Normalize the fraction to 100 ns resolution (7 digits).
+    let scale = frac_digits.len().min(7);
+    let mut hundred_ns: u32 = 0;
+    for i in 0..7 {
+        let digit = frac_digits
+            .as_bytes()
+            .get(i)
+            .map_or(0, |b| u32::from(b - b'0'));
+        hundred_ns = hundred_ns * 10 + digit;
+    }
+    Some((hour, minute, second, hundred_ns * 100, scale as u8))
+}
+
+/// Parses the character forms of `date`, `time`, `datetime2` and
+/// `datetimeoffset` into [`DateTimeParts`].
+fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
+    let mut s = text.trim();
+    let mut p = DateTimeParts::default();
+
+    // A trailing "+HH:MM" / "-HH:MM" is a UTC offset. Match it only in that
+    // exact shape so the hyphens inside a date are never mistaken for one.
+    if s.len() >= 6 {
+        let tail = &s[s.len() - 6..];
+        let tb = tail.as_bytes();
+        if (tb[0] == b'+' || tb[0] == b'-') && tb[3] == b':' {
+            let sign: i16 = if tb[0] == b'+' { 1 } else { -1 };
+            let hh: i16 = tail[1..3].parse().ok()?;
+            let mm: i16 = tail[4..6].parse().ok()?;
+            if hh > 14 || mm > 59 {
+                return None;
+            }
+            p.tz_hour = sign * hh;
+            p.tz_minute = sign * mm;
+            p.has_tz = true;
+            s = s[..s.len() - 6].trim_end();
+        }
+    }
+
+    let (date_str, time_str) = match s.split_once(['T', ' ']) {
+        Some((d, t)) => (Some(d), Some(t.trim())),
+        None if s.contains(':') => (None, Some(s)),
+        None => (Some(s), None),
+    };
+
+    if let Some(d) = date_str {
+        let (y, m, day) = parse_date_literal(d)?;
+        p.year = y;
+        p.month = m;
+        p.day = day;
+        p.has_date = true;
+    }
+    if let Some(t) = time_str.filter(|t| !t.is_empty()) {
+        let (h, mi, sec, frac_ns, scale) = parse_time_literal(t)?;
+        p.hour = h;
+        p.minute = mi;
+        p.second = sec;
+        p.fraction_ns = frac_ns;
+        p.scale = scale;
+        p.has_time = true;
+    }
+    if !p.has_date && !p.has_time {
+        return None;
+    }
+    // An offset is only meaningful alongside a date and time.
+    if p.has_tz && !(p.has_date && p.has_time) {
+        return None;
+    }
+    Some(p)
+}
+
 pub(crate) unsafe fn convert_datetime_c(
     value: &ColumnValues,
     target_type: SqlSmallInt,
     target_value_ptr: SqlPointer,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> Result<ConvOk, ConvError> {
-    let Some(p) = extract_datetime_parts(value) else {
-        // Character sources are a legal date/time conversion per Appendix D and
-        // land in P1a; report "not implemented" rather than claiming the
-        // pairing is restricted. Everything else genuinely cannot convert.
-        return Err(match value {
-            ColumnValues::String(_) => ConvError::NotHandledHere,
-            _ => ConvError::Restricted,
-        });
+    let p = match value {
+        // A character column must hold a valid literal for the target.
+        ColumnValues::String(s) => {
+            let text = sql_string_to_text(s).ok_or(ConvError::InvalidCharacterValue)?;
+            parse_datetime_literal(&text).ok_or(ConvError::InvalidCharacterValue)?
+        }
+        // A date/time C target for a non-temporal column is illegal.
+        _ => extract_datetime_parts(value).ok_or(ConvError::Restricted)?,
     };
     let ret = match target_type {
         SQL_C_TYPE_DATE | SQL_C_DATE if p.has_date => {
@@ -1092,6 +1199,134 @@ mod tests {
         assert_eq!(parse_decimal_literal("1e5"), None);
         assert_eq!(parse_decimal_literal("abc"), None);
         assert_eq!(parse_decimal_literal(""), None);
+    }
+
+    #[test]
+    fn character_source_into_date_target() {
+        let mut out = SqlDateStruct::default();
+        let mut ind: SqlLen = 0;
+        let ok = unsafe {
+            convert_datetime_c(
+                &utf8_col("2023-06-15"),
+                SQL_C_TYPE_DATE,
+                (&mut out as *mut SqlDateStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(ok, ConvOk::Exact);
+        assert_eq!(
+            out,
+            SqlDateStruct {
+                year: 2023,
+                month: 6,
+                day: 15
+            }
+        );
+    }
+
+    #[test]
+    fn character_source_into_timestamp_target() {
+        let mut out = SqlTimestampStruct::default();
+        let mut ind: SqlLen = 0;
+        unsafe {
+            convert_datetime_c(
+                &utf8_col("2023-06-15 12:34:56.1234567"),
+                SQL_C_TYPE_TIMESTAMP,
+                (&mut out as *mut SqlTimestampStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!((out.year, out.month, out.day), (2023, 6, 15));
+        assert_eq!((out.hour, out.minute, out.second), (12, 34, 56));
+        assert_eq!(out.fraction, 123_456_700);
+    }
+
+    #[test]
+    fn character_source_iso_t_separator_and_offset() {
+        let mut out = SqlSsTimestampoffsetStruct::default();
+        let mut ind: SqlLen = 0;
+        unsafe {
+            convert_datetime_c(
+                &utf8_col("2023-01-01T12:34:56.1234567+05:30"),
+                SQL_C_SS_TIMESTAMPOFFSET,
+                (&mut out as *mut SqlSsTimestampoffsetStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        // A character literal already carries the local wall clock, so the
+        // fields are used as written.
+        assert_eq!((out.year, out.month, out.day), (2023, 1, 1));
+        assert_eq!((out.hour, out.minute, out.second), (12, 34, 56));
+        assert_eq!((out.timezone_hour, out.timezone_minute), (5, 30));
+    }
+
+    #[test]
+    fn character_source_time_only_into_time_target() {
+        let mut out = SqlSsTime2Struct::default();
+        let mut ind: SqlLen = 0;
+        unsafe {
+            convert_datetime_c(
+                &utf8_col("13:45:30.1234567"),
+                SQL_C_SS_TIME2,
+                (&mut out as *mut SqlSsTime2Struct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            out,
+            SqlSsTime2Struct {
+                hour: 13,
+                minute: 45,
+                second: 30,
+                fraction: 123_456_700
+            }
+        );
+    }
+
+    #[test]
+    fn character_source_into_date_target_truncates_time() {
+        let mut out = SqlDateStruct::default();
+        let mut ind: SqlLen = 0;
+        let ok = unsafe {
+            convert_datetime_c(
+                &utf8_col("2023-06-15 12:34:56"),
+                SQL_C_TYPE_DATE,
+                (&mut out as *mut SqlDateStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out.day, 15);
+    }
+
+    #[test]
+    fn invalid_datetime_literals_are_rejected() {
+        for bad in [
+            "not-a-date",
+            "2023-13-01",       // month out of range
+            "2023-06-32",       // day out of range
+            "2023-06-15 25:00", // hour out of range
+            "23-06-15",         // year not 4 digits
+            "",
+        ] {
+            let mut out = SqlTimestampStruct::default();
+            let mut ind: SqlLen = 0;
+            let err = unsafe {
+                convert_datetime_c(
+                    &utf8_col(bad),
+                    SQL_C_TYPE_TIMESTAMP,
+                    (&mut out as *mut SqlTimestampStruct).cast(),
+                    &mut ind,
+                )
+            }
+            .unwrap_err();
+            assert_eq!(err, ConvError::InvalidCharacterValue, "input: {bad:?}");
+        }
     }
 
     #[test]

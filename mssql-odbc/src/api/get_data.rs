@@ -1538,10 +1538,10 @@ mod tests {
         assert_last_diag(&s.diag_records, ERR_INVALID_CHARACTER_VALUE);
     }
 
-    /// Character into a date/time target is legal per Appendix D and lands in
-    /// P1a, so it must report "not implemented" rather than claiming 07006.
+    /// Character into a date/time target is legal per Appendix D and is
+    /// implemented as of P1a.
     #[test]
-    fn get_data_character_into_date_target_is_not_implemented() {
+    fn get_data_character_into_date_target_converts() {
         use crate::api::odbc_types::SqlDateStruct;
         use mssql_tds::datatypes::sql_string::SqlString;
         let h = TestHandles::with_env_dbc_stmt();
@@ -1562,12 +1562,41 @@ mod tests {
                 &mut ind,
             )
         };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!((out.year, out.month, out.day), (2023, 6, 15));
+        assert_eq!(ind, std::mem::size_of::<SqlDateStruct>() as SqlLen);
+    }
+
+    /// Character that is not a valid literal for the target is 22018, not a
+    /// silent zero value.
+    #[test]
+    fn get_data_invalid_character_into_date_target_is_22018() {
+        use crate::api::odbc_types::SqlDateStruct;
+        use mssql_tds::datatypes::sql_string::SqlString;
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(
+            &h,
+            ColumnValues::String(SqlString::from_utf8_string("not a date".to_string())),
+        );
+
+        let mut out = SqlDateStruct::default();
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                crate::api::odbc_types::SQL_C_TYPE_DATE,
+                (&mut out as *mut SqlDateStruct).cast(),
+                std::mem::size_of::<SqlDateStruct>() as SqlLen,
+                &mut ind,
+            )
+        };
         assert_eq!(ret, SQL_ERROR);
         let s = unsafe { handle_from_raw::<StmtHandle>(h.stmt) }
             .inner
             .lock()
             .unwrap();
         let last = s.diag_records.last().unwrap();
-        assert_eq!(&last.sql_state, b"HYC00");
+        assert_eq!(&last.sql_state, b"22018");
     }
 }
