@@ -386,11 +386,15 @@ function Write-ParityReport([string]$RustXml, [string]$MsXml) {
     # investigation rather than asserting blame.
     $verdict = {
         param($r, $m)
+        # Classify MISSING first: a test present in only one leg is a divergence,
+        # even when its lone result is SKIP (otherwise the skip shortcut below
+        # would mask a one-sided run as an allowed skip).
+        if ($r -eq "MISSING" -or $m -eq "MISSING") { return @("missing run - investigate", "divergence") }
         if ($r -eq "SKIP" -or $m -eq "SKIP") { return @("skipped (not compared)", "skip") }
         if ($r -eq "PASS" -and $m -eq "PASS") { return @("parity", "parity") }
         if ($r -eq "FAIL" -and $m -eq "FAIL") { return @("shared failure - investigate", "shared") }
         if ($r -ne $m) { return @("divergence - investigate", "divergence") }
-        return @("missing run - investigate", "divergence")
+        return @("unexpected - investigate", "divergence")
     }
 
     $width = 4

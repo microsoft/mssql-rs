@@ -35,11 +35,15 @@ def load(path):
 # per-test PASS/FAIL divergence does not by itself establish which side is
 # wrong, and a shared failure does not prove the test is buggy.
 def verdict(r, m):
+    # Classify MISSING first: a test present in only one leg is a divergence,
+    # even when its lone result is SKIP (otherwise the skip shortcut below would
+    # mask a one-sided run as an allowed skip).
+    if r == "MISSING" or m == "MISSING": return ("missing run - investigate", "divergence")
     if r == "SKIP" or m == "SKIP":  return ("skipped (not compared)", "skip")
     if r == "PASS" and m == "PASS": return ("parity", "parity")
     if r == "FAIL" and m == "FAIL": return ("shared failure - investigate", "shared")
     if r != m:                      return ("divergence - investigate", "divergence")
-    return ("missing run - investigate", "divergence")
+    return ("unexpected - investigate", "divergence")
 
 
 def main(argv):
