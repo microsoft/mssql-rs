@@ -82,13 +82,6 @@ pub(crate) struct StmtState {
     /// (in memory — no cursor or connection), mirroring msodbcsql's one
     /// result set per DML statement.
     pub(crate) pending_row_counts: VecDeque<i64>,
-    /// The 1-based column of the in-progress `SQLGetData` streaming read, or 0
-    /// when no read is active. Used to detect resumption vs. a new column.
-    pub(crate) getdata_col: SqlUSmallInt,
-    /// Bytes/elements of the current `getdata_col` value already returned by
-    /// prior `SQLGetData` calls. `usize::MAX` marks a value that has been fully
-    /// returned (so a further call yields `SQL_NO_DATA`). Reset on each fetch.
-    pub(crate) getdata_offset: usize,
     /// Rowset size for block fetches (`SQL_ATTR_ROW_ARRAY_SIZE`). Defaults to 1
     /// (single-row). Consumed by the columnar `SQLFetchScroll` path.
     pub(crate) row_array_size: SqlULen,
@@ -117,15 +110,6 @@ impl StmtState {
 
     pub(crate) fn clear_state(&mut self, mask: u32) {
         self.state_flags &= !mask;
-    }
-
-    /// Sets the current row, resetting the `SQLGetData` streaming cursor with
-    /// it. Row changes must go through here so a stale per-column offset can
-    /// never be applied to a different row.
-    pub(crate) fn set_current_row(&mut self, row: Option<Vec<ColumnValues>>) {
-        self.current_row = row;
-        self.getdata_col = 0;
-        self.getdata_offset = 0;
     }
 
     /// Moves the cached `prepared_handle` (if any) into `pending_unprepare` so
@@ -178,8 +162,6 @@ impl StmtHandle {
                 current_row: None,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
-                getdata_col: 0,
-                getdata_offset: 0,
                 row_array_size: 1,
                 rows_fetched_ptr: std::ptr::null_mut(),
                 row_status_ptr: std::ptr::null_mut(),

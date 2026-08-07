@@ -12,10 +12,11 @@
 //! - the date/time C structs (`SQL_C_TYPE_DATE` / `TIME` / `TIMESTAMP`,
 //!   `SQL_C_SS_TIME2`, `SQL_C_SS_TIMESTAMPOFFSET`);
 //! - character targets (`SQL_C_CHAR` / `SQL_C_WCHAR`) for every scalar type via
-//!   text formatting, and `SQL_C_BINARY` for binary/xml/json;
-//! - chunked-offset streaming for the variable-length (character / binary)
-//!   targets: repeated calls advance a per-column offset, report the remaining
-//!   length, warn with `01004`, and yield `SQL_NO_DATA` once exhausted.
+//!   text formatting, and `SQL_C_BINARY` for binary/xml/json. Values are
+//!   returned in a single call; truncation is reported with `01004`.
+//!
+//! Chunked retrieval of a long value across repeated calls (and true
+//! incremental PLP streaming) is owned by the fetch rework in #153.
 //!
 //! A `NULL` column reports `SQL_NULL_DATA` for any target (this also serves the
 //! `sql_variant` `SQL_C_BINARY` NULL probe). Full `sql_variant` underlying-type
@@ -29,7 +30,7 @@ use super::fetch_convert::{
     is_integer_c_target,
 };
 use super::odbc_types::{
-    SQL_C_BINARY, SQL_C_CHAR, SQL_C_GUID, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA,
+    SQL_C_BINARY, SQL_C_CHAR, SQL_C_GUID, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE,
     SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer, SqlReturn,
     SqlSmallInt, SqlUSmallInt,
 };
@@ -146,26 +147,17 @@ fn sql_get_data_safe(
         return SQL_ERROR;
     }
 
-    // A repeated SQLGetData on a column whose value was already fully returned
-    // yields SQL_NO_DATA (the streaming cursor is exhausted).
-    if stmt_state.getdata_col == column_number && stmt_state.getdata_offset == usize::MAX {
-        return SQL_NO_DATA;
-    }
-
     let value = &row[col_index - 1];
     if matches!(value, ColumnValues::Null) {
-        let ret = write_null_result(
+        return write_null_result(
             target_type,
             target_value_ptr,
             buffer_length,
             strlen_or_ind_ptr,
         );
-        mark_column_done(&mut stmt_state, column_number);
-        return ret;
     }
 
-    // Fixed / typed C targets go through the shared conversion core. They return
-    // the whole value in one call, so the column is marked done on success.
+    // Fixed / typed C targets go through the shared conversion core.
     let typed = if is_integer_c_target(target_type) {
         Some(unsafe { convert_integer_c(value, target_type, target_value_ptr, strlen_or_ind_ptr) })
     } else if is_float_c_target(target_type) {
@@ -178,21 +170,8 @@ fn sql_get_data_safe(
         None
     };
     if let Some(r) = typed {
-        let ret = finish_typed_conv(&mut stmt_state, r);
-        if ret == SQL_SUCCESS || ret == SQL_SUCCESS_WITH_INFO {
-            mark_column_done(&mut stmt_state, column_number);
-        }
-        return ret;
+        return finish_typed_conv(&mut stmt_state, r);
     }
-
-    // Variable-length targets (character and binary) stream across repeated
-    // calls, advancing a per-column offset.
-    let resuming = stmt_state.getdata_col == column_number;
-    let offset = if resuming {
-        stmt_state.getdata_offset
-    } else {
-        0
-    };
 
     if target_type == SQL_C_BINARY {
         let Some(bytes) = column_value_to_bytes(value) else {
@@ -204,14 +183,20 @@ fn sql_get_data_safe(
             );
             return SQL_ERROR;
         };
-        let outcome = stream_binary(
-            offset,
-            bytes,
-            target_value_ptr as *mut u8,
-            buffer_length as usize,
-            strlen_or_ind_ptr,
-        );
-        return finish_stream(&mut stmt_state, column_number, outcome);
+        let truncated = unsafe {
+            write_binary_result(
+                bytes,
+                target_value_ptr as *mut u8,
+                buffer_length as usize,
+                strlen_or_ind_ptr,
+            )
+        };
+        return if truncated {
+            post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+            SQL_SUCCESS_WITH_INFO
+        } else {
+            SQL_SUCCESS
+        };
     }
 
     if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
@@ -242,35 +227,27 @@ fn sql_get_data_safe(
         }
     };
 
-    // buffer_length is always in bytes per the ODBC spec; SQL_C_WCHAR streams in
-    // units of SqlWChar.
-    let outcome = if target_type == SQL_C_WCHAR {
+    // buffer_length is always in bytes per the ODBC spec; SQL_C_WCHAR is
+    // measured in units of SqlWChar.
+    if target_type == SQL_C_WCHAR {
         let utf16: Vec<u16> = as_text.encode_utf16().collect();
         let buf_elements = (buffer_length as usize) / std::mem::size_of::<SqlWChar>();
-        stream_text(
-            offset,
+        write_string_result(
+            &mut stmt_state,
             &utf16,
             target_value_ptr as *mut SqlWChar,
             buf_elements,
             strlen_or_ind_ptr,
         )
     } else {
-        stream_text(
-            offset,
+        write_string_result(
+            &mut stmt_state,
             as_text.as_bytes(),
             target_value_ptr as *mut u8,
             buffer_length as usize,
             strlen_or_ind_ptr,
         )
-    };
-    finish_stream(&mut stmt_state, column_number, outcome)
-}
-
-/// Marks `column_number` as fully returned so a subsequent `SQLGetData` on the
-/// same column yields `SQL_NO_DATA`.
-fn mark_column_done(stmt_state: &mut crate::handles::stmt::StmtState, column_number: SqlUSmallInt) {
-    stmt_state.getdata_col = column_number;
-    stmt_state.getdata_offset = usize::MAX;
+    }
 }
 
 /// Maps a [`ConvError`] result from the shared conversion core to an ODBC
@@ -285,7 +262,11 @@ fn finish_typed_conv(
             post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE);
             SQL_ERROR
         }
-        Err(ConvError::Unsupported) => {
+        Err(ConvError::Restricted) => {
+            post_diag(stmt_state, ERR_RESTRICTED_DATA_TYPE);
+            SQL_ERROR
+        }
+        Err(ConvError::NotHandledHere) => {
             post_sql_error(
                 stmt_state,
                 SQLSTATE_HYC00,
@@ -322,84 +303,49 @@ fn write_null_result(
     SQL_SUCCESS
 }
 
-/// Result of a single streaming chunk: the new per-column offset and whether
-/// the value was truncated (more remains). Carries no borrow so the caller can
-/// update the statement state after the row borrow is released.
-struct StreamOutcome {
-    new_offset: usize,
-    truncated: bool,
-}
-
-/// Applies a [`StreamOutcome`] to the statement's streaming cursor and returns
-/// the ODBC code: `01004` + `SQL_SUCCESS_WITH_INFO` on truncation, otherwise the
-/// column is marked done and `SQL_SUCCESS` is returned.
-fn finish_stream(
-    stmt_state: &mut crate::handles::stmt::StmtState,
-    column_number: SqlUSmallInt,
-    outcome: StreamOutcome,
-) -> SqlReturn {
-    stmt_state.getdata_col = column_number;
-    if outcome.truncated {
-        stmt_state.getdata_offset = outcome.new_offset;
-        post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION);
-        SQL_SUCCESS_WITH_INFO
-    } else {
-        stmt_state.getdata_offset = usize::MAX;
-        SQL_SUCCESS
-    }
-}
-
-/// Streams a character value (`src` in units of `T` = `u8` for `SQL_C_CHAR` or
-/// `SqlWChar` for `SQL_C_WCHAR`) from `offset` (in elements). Reports the
-/// remaining post-offset byte length in the indicator and NUL-terminates the
-/// chunk within the buffer.
+/// Writes a character value (`src` in units of `T` = `u8` for `SQL_C_CHAR` or
+/// `SqlWChar` for `SQL_C_WCHAR`), reporting the full byte length in the
+/// indicator and NUL-terminating within the buffer. Truncation is reported with
+/// `01004` + `SQL_SUCCESS_WITH_INFO`.
 ///
 /// The caller-provided pointers are obligations of the FFI caller (validated
 /// against the buffer length passed by the DM).
-fn stream_text<T: Copy + Default>(
-    offset: usize,
+fn write_string_result<T: Copy + Default>(
+    stmt_state: &mut crate::handles::stmt::StmtState,
     src: &[T],
     target_value_ptr: *mut T,
     buf_elements: usize,
     strlen_or_ind_ptr: *mut SqlLen,
-) -> StreamOutcome {
-    let remaining = &src[offset.min(src.len())..];
-    let byte_len = std::mem::size_of_val(remaining) as SqlLen;
-    unsafe { write_if_some(strlen_or_ind_ptr, byte_len) };
-
-    // `copy_with_nul` reserves one element for the terminator; it copies
-    // `min(remaining, buf_elements - 1)` data elements.
-    let data_fit = buf_elements.saturating_sub(1);
-    let truncated = unsafe { copy_with_nul(target_value_ptr, buf_elements, remaining) };
-    StreamOutcome {
-        new_offset: offset + data_fit,
-        truncated,
+) -> SqlReturn {
+    unsafe { write_if_some(strlen_or_ind_ptr, std::mem::size_of_val(src) as SqlLen) };
+    if unsafe { copy_with_nul(target_value_ptr, buf_elements, src) } {
+        post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+        SQL_SUCCESS_WITH_INFO
+    } else {
+        SQL_SUCCESS
     }
 }
 
-/// Streams a binary value from `offset` (in bytes). Binary data is not
-/// NUL-terminated: copies up to `buffer_len` bytes and reports the remaining
-/// byte length in the indicator.
-fn stream_binary(
-    offset: usize,
+/// Writes a binary value, reporting the full byte length in the indicator, and
+/// returns whether the value was truncated. Binary data is not NUL-terminated.
+///
+/// # Safety
+/// `target_value_ptr` must be valid for `buffer_len` bytes when non-null, and
+/// `strlen_or_ind_ptr` null or valid for a `SqlLen` write.
+unsafe fn write_binary_result(
     src: &[u8],
     target_value_ptr: *mut u8,
     buffer_len: usize,
     strlen_or_ind_ptr: *mut SqlLen,
-) -> StreamOutcome {
-    let remaining = &src[offset.min(src.len())..];
-    unsafe { write_if_some(strlen_or_ind_ptr, remaining.len() as SqlLen) };
-
-    let copy_n = remaining.len().min(buffer_len);
+) -> bool {
+    unsafe { write_if_some(strlen_or_ind_ptr, src.len() as SqlLen) };
+    let copy_n = src.len().min(buffer_len);
     if copy_n > 0 && !target_value_ptr.is_null() {
         unsafe {
-            std::ptr::copy_nonoverlapping(remaining.as_ptr(), target_value_ptr, copy_n);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), target_value_ptr, copy_n);
         }
     }
-    StreamOutcome {
-        new_offset: offset + copy_n,
-        truncated: copy_n < remaining.len(),
-    }
+    copy_n < src.len()
 }
 
 /// Formats a SQL Server `vector` value as a JSON-style array of its float
@@ -516,8 +462,7 @@ fn money_scaled_to_string(scaled: i64) -> String {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_BINARY, SQL_C_BIT, SQL_C_DOUBLE, SQL_C_SLONG, SQL_C_TYPE_TIMESTAMP, SQL_NO_DATA,
-        SQL_NULL_HANDLE,
+        SQL_C_BINARY, SQL_C_BIT, SQL_C_DOUBLE, SQL_C_SLONG, SQL_C_TYPE_TIMESTAMP, SQL_NULL_HANDLE,
     };
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::SqlString;
@@ -925,49 +870,11 @@ mod tests {
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         let mut s = stmt_handle.inner.lock().unwrap();
         s.set_state(STMT_STATE_CURSOR_OPEN);
-        s.set_current_row(Some(vec![value]));
+        s.current_row = Some(vec![value]);
     }
 
     #[test]
-    fn get_data_offset_resets_on_new_row() {
-        let h = TestHandles::with_env_dbc_stmt();
-        open_row(h.stmt, ColumnValues::Bytes(vec![1, 2, 3, 4]));
-
-        // Partially read column 1, leaving a streaming offset behind.
-        let mut buf = [0u8; 2];
-        let mut ind: SqlLen = 0;
-        let ret = unsafe {
-            sql_get_data(
-                h.stmt,
-                1,
-                SQL_C_BINARY,
-                buf.as_mut_ptr() as SqlPointer,
-                2,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        assert_eq!(buf, [1, 2]);
-
-        // Moving to a new row must restart the column from its first byte.
-        open_row(h.stmt, ColumnValues::Bytes(vec![9, 8, 7, 6]));
-        let ret = unsafe {
-            sql_get_data(
-                h.stmt,
-                1,
-                SQL_C_BINARY,
-                buf.as_mut_ptr() as SqlPointer,
-                2,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        assert_eq!(ind, 4);
-        assert_eq!(buf, [9, 8]);
-    }
-
-    #[test]
-    fn get_data_binary_full_read_then_no_data() {
+    fn get_data_binary_full_read() {
         let h = TestHandles::with_env_dbc_stmt();
         open_row(h.stmt, ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]));
 
@@ -986,27 +893,14 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(ind, 4);
         assert_eq!(&buf[..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
-
-        // A second call on the fully-read column yields SQL_NO_DATA.
-        let ret = unsafe {
-            sql_get_data(
-                h.stmt,
-                1,
-                SQL_C_BINARY,
-                buf.as_mut_ptr() as SqlPointer,
-                buf.len() as SqlLen,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_NO_DATA);
     }
 
     #[test]
-    fn get_data_binary_chunked_streaming() {
+    fn get_data_binary_truncation_returns_info() {
         let h = TestHandles::with_env_dbc_stmt();
         open_row(h.stmt, ColumnValues::Bytes(vec![1, 2, 3, 4, 5]));
 
-        // First 2-byte chunk: 5 remaining reported, truncation warning.
+        // The indicator reports the full length even when the buffer is short.
         let mut buf = [0u8; 2];
         let mut ind: SqlLen = 0;
         let ret = unsafe {
@@ -1022,103 +916,6 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
         assert_eq!(ind, 5);
         assert_eq!(buf, [1, 2]);
-
-        // Second chunk.
-        let ret = unsafe {
-            sql_get_data(
-                h.stmt,
-                1,
-                SQL_C_BINARY,
-                buf.as_mut_ptr() as SqlPointer,
-                2,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        assert_eq!(ind, 3);
-        assert_eq!(buf, [3, 4]);
-
-        // Final byte: fits, SUCCESS.
-        let ret = unsafe {
-            sql_get_data(
-                h.stmt,
-                1,
-                SQL_C_BINARY,
-                buf.as_mut_ptr() as SqlPointer,
-                2,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS);
-        assert_eq!(ind, 1);
-        assert_eq!(buf[0], 5);
-
-        // Exhausted.
-        let ret = unsafe {
-            sql_get_data(
-                h.stmt,
-                1,
-                SQL_C_BINARY,
-                buf.as_mut_ptr() as SqlPointer,
-                2,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_NO_DATA);
-    }
-
-    #[test]
-    fn get_data_char_chunked_streaming() {
-        let h = TestHandles::with_env_dbc_stmt();
-        open_row(
-            h.stmt,
-            ColumnValues::String(SqlString::from_utf8_string("abcde".to_string())),
-        );
-
-        // 3-byte buffer holds 2 data chars + NUL each chunk.
-        let mut buf = [0u8; 3];
-        let mut ind: SqlLen = 0;
-        let ret = unsafe {
-            sql_get_data(
-                h.stmt,
-                1,
-                SQL_C_CHAR,
-                buf.as_mut_ptr() as SqlPointer,
-                3,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        assert_eq!(ind, 5);
-        assert_eq!(&buf[..2], b"ab");
-        assert_eq!(buf[2], 0);
-
-        let ret = unsafe {
-            sql_get_data(
-                h.stmt,
-                1,
-                SQL_C_CHAR,
-                buf.as_mut_ptr() as SqlPointer,
-                3,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        assert_eq!(&buf[..2], b"cd");
-
-        let ret = unsafe {
-            sql_get_data(
-                h.stmt,
-                1,
-                SQL_C_CHAR,
-                buf.as_mut_ptr() as SqlPointer,
-                3,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS);
-        assert_eq!(buf[0], b'e');
-        assert_eq!(buf[1], 0);
     }
 
     #[test]
@@ -1294,35 +1091,26 @@ mod tests {
     }
 
     #[test]
-    fn get_data_fixed_repeat_yields_no_data() {
+    fn get_data_fixed_target_is_repeatable() {
         let h = TestHandles::with_env_dbc_stmt();
         open_row(h.stmt, ColumnValues::Int(7));
 
-        let mut out: i32 = 0;
-        let mut ind: SqlLen = 0;
-        let ret = unsafe {
-            sql_get_data(
-                h.stmt,
-                1,
-                SQL_C_SLONG,
-                (&mut out as *mut i32).cast(),
-                4,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_SUCCESS);
-        assert_eq!(out, 7);
-
-        let ret = unsafe {
-            sql_get_data(
-                h.stmt,
-                1,
-                SQL_C_SLONG,
-                (&mut out as *mut i32).cast(),
-                4,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_NO_DATA);
+        // Without a streaming cursor, re-reading a column returns it again.
+        for _ in 0..2 {
+            let mut out: i32 = 0;
+            let mut ind: SqlLen = 0;
+            let ret = unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut out as *mut i32).cast(),
+                    4,
+                    &mut ind,
+                )
+            };
+            assert_eq!(ret, SQL_SUCCESS);
+            assert_eq!(out, 7);
+        }
     }
 }

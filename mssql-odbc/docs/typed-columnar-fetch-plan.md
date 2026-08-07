@@ -73,9 +73,20 @@ Both paths must share one conversion core: `ColumnValues -> requested SQL_C_* ta
 
 - Build the shared `ColumnValues -> requested SQL_C_*` conversion core (reused by `SQLBindCol` in P3).
 - Start with int types (existing child task [46404](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46404)) and int→char/wchar (existing child task [46405](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46405)), then floats, decimal/numeric (→ `SQL_C_CHAR`), strings, binary, guid, date/time/timestamp/time2/timestampoffset, money, xml, json/vector.
-- Add chunked-offset streaming so repeated `SQLGetData` calls advance (`01004` + `SQL_SUCCESS_WITH_INFO` reporting remaining length). This chunks over the already-materialized `ColumnValues` (see the PLP scope boundary below).
+- Add chunked-offset streaming so repeated `SQLGetData` calls advance (`01004` + `SQL_SUCCESS_WITH_INFO` reporting remaining length). **Moved out of P1** — chunked retrieval and incremental PLP streaming are owned by the fetch rework in [#153](https://github.com/microsoft/mssql-rs/pull/153) (column-wise fetch + incremental PLP), which uses ODBC wire-stream state rather than an offset over a materialized value. P1 returns each value in a single call and reports truncation with `01004`.
 - Implement `sql_variant` probe semantics (`SQL_C_BINARY` NULL detection + variant metadata init).
 - Add the e2e coverage deferred from P0: a `set_stmt_attr_test.cpp` (parity with `set_env_attr_test.cpp`) plus a live-connection test that drives typed `SQLGetData` through the Driver Manager. P0's statement attributes (`SQL_ATTR_ROW_ARRAY_SIZE`, etc.) are descriptor-backed and intercepted by unixODBC, so they are only meaningfully observable end-to-end once a fetch path consumes them here (block fetch lands in P3).
+
+### P1a — Mandatory source-type conversions — Task [47107](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47107)
+
+ODBC Appendix D requires a driver to support conversions to **all** ODBC C types from every SQL type it supports. P1 implements the integer, floating-point, GUID and date/time targets, but only from a subset of sources. The following pairings still fail and must be added:
+
+- `decimal` / `numeric` → the numeric C targets (`SQL_C_DOUBLE`, `SQL_C_FLOAT`, `SQL_C_SLONG`, `SQL_C_SBIGINT`, …). `numeric_source_as_f64` currently rejects the exact-decimal types.
+- `money` / `smallmoney` → the numeric C targets.
+- Character sources (`char` / `varchar` / `nchar` / `nvarchar`) → numeric and date/time C targets (e.g. `'123'` → `SQL_C_SLONG`, `'2023-06-15'` → `SQL_C_TYPE_DATE`), with `22018` when the text is not a valid literal for the target.
+- Lossy numeric conversions must report fractional truncation with `01S07` + `SQL_SUCCESS_WITH_INFO` (e.g. `float` `1234.99` → `SQL_C_SLONG` yields `1234` + `01S07`), which requires adding `SQLSTATE_01S07`.
+
+Until then these pairings return `HYC00` (not implemented) rather than converting.
 
 ### P2 — SQLColAttributeW — Task [46579](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46579)
 
@@ -109,24 +120,19 @@ Both paths must share one conversion core: `ColumnValues -> requested SQL_C_* ta
 
 Descriptor handles are not implemented in the crate yet, so `SQLGetStmtAttrW(SQL_ATTR_APP_PARAM_DESC)` currently returns `HY092`. `mssql-python`'s `ddbc_bindings.cpp` calls this (then `SQLSetDescField` on the returned handle) only when binding a `SQL_C_NUMERIC` **input parameter**, and aborts the bind if it fails — so numeric input-parameter binding will not work until a descriptor subsystem exists. There is no correct minimal shim (a non-null fake handle would crash `SQLSetDescField`). This is deferred to the Descriptors work item [46374](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46374) (APD handle alloc/free, `SQLGetStmtAttr` returning it, and `SQLSetDescField` support for `SQL_DESC_TYPE`/`SQL_DESC_CONCISE_TYPE`/precision/scale), rather than expanding this P0 plumbing PR.
 
-## Scope boundary — incremental PLP (LOB) streaming
+## Scope boundary — chunked retrieval and incremental PLP (LOB) streaming
 
-`SQLGetData` chunking is implemented over the fully-materialized `ColumnValues` that `TdsClient::next_row` returns: the value is decoded once, then handed to the application in buffer-sized pieces. That is correct per the ODBC contract, but it holds the whole LOB in memory, so a large `varbinary(max)` / `nvarchar(max)` is not streamed off the wire incrementally.
+`SQLGetData` in P1 returns each value in a single call from the materialized `ColumnValues` that `TdsClient::next_row` produces, reporting truncation with `01004`. It does **not** advance a per-call offset, and it does not stream LOBs off the wire.
 
-PR [#109](https://github.com/microsoft/mssql-rs/pull/109) added true incremental PLP reading inside `mssql-tds` (`PlpChunkStreamReader`, `receive_row_into` / `resume_row_into` / `read_active_plp_bytes`, and the `RowPauseState` / `PlpPauseState` pause-resume types). Those are `pub(crate)` to `mssql-tds` today, so the ODBC crate cannot consume them, and adopting them requires more than a swap:
-
-1. a **public** streaming row/column API on `TdsClient` wrapping the pause/resume + `read_active_plp_bytes` flow;
-2. an ODBC **connection-ownership** change — `SQLFetch` currently materializes the row and returns the TDS client to the DBC, whereas streaming requires the statement to hold the client across `SQLGetData` calls; and
-3. reconciling with P3's `SQLBindCol` block fetch, which materializes whole rowsets.
-
-This is therefore tracked as follow-up work rather than folded into P1.
+Both of those belong to the fetch rework in [#153](https://github.com/microsoft/mssql-rs/pull/153) (column-wise fetch + incremental PLP support), which carries ODBC wire-stream state and builds on the PLP reader added in [#109](https://github.com/microsoft/mssql-rs/pull/109) (`PlpChunkStreamReader`, `receive_row_into` / `resume_row_into` / `read_active_plp_bytes`). Those primitives are `pub(crate)` to `mssql-tds`, and consuming them from the ODBC crate additionally requires a public `TdsClient` streaming API plus an ODBC connection-ownership change (today `SQLFetch` returns the TDS client to the DBC, whereas streaming requires the statement to hold it across `SQLGetData` calls). P1 therefore stays on the conversion layer and leaves the fetch mechanics to #153.
 
 ## Status
 
 | Phase | Task | State |
 | --- | --- | --- |
 | P0 — Prerequisites & plumbing | 46577 | Implemented (build + clippy clean, 332 tests pass) |
-| P1 — Typed SQLGetData | 46578 | Implemented (int/float/decimal/money/guid/date-time/char/binary + chunked streaming; 440 tests pass). `sql_variant` underlying-type resolution deferred to P2; `SQL_C_NUMERIC` output struct not yet emitted (decimal is delivered as char, which is what mssql-python requests); incremental PLP streaming deferred (see scope boundary above). |
+| P1 — Typed SQLGetData | 46578 | Implemented (int/float/guid/date-time C targets + char/binary rendering; 491 tests pass). Chunked retrieval and incremental PLP streaming moved to #153; missing source-type conversions tracked as P1a; `sql_variant` underlying-type resolution deferred to P2. |
+| P1a — Mandatory source-type conversions | 47107 | Not started |
 | P2 — SQLColAttributeW | 46579 | Not started |
 | P3 — SQLBindCol + SQLFetchScroll | 46580 | Not started |
 | P4 — Exports & driver-load compat | 46581 | Not started |

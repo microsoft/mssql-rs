@@ -16,7 +16,7 @@
 //! (`SQL_C_TYPE_DATE` / `TIME` / `TIMESTAMP`, `SQL_C_SS_TIME2`,
 //! `SQL_C_SS_TIMESTAMPOFFSET`), plus an ISO-style text formatter for date/time
 //! character output. Unhandled source/target pairs return
-//! [`ConvError::Unsupported`] so callers can fall back to their existing paths
+//! [`ConvError::NotHandledHere`] so callers can fall back to their existing paths
 //! (e.g. the character conversion in `get_data`).
 
 use super::odbc_types::{
@@ -36,9 +36,12 @@ use mssql_tds::datatypes::column_values::ColumnValues;
 pub(crate) enum ConvError {
     /// The value does not fit the requested C type (SQLSTATE `22003`).
     OutOfRange,
-    /// This source/target pairing is not handled here (SQLSTATE `HYC00`), and
-    /// the caller should try another path or report "not implemented".
-    Unsupported,
+    /// This source/target pairing is not handled by this converter; the caller
+    /// should try another path. Never surfaced to the application directly.
+    NotHandledHere,
+    /// The requested C type is not a legal target for this SQL type
+    /// (SQLSTATE `07006`). Terminal.
+    Restricted,
 }
 
 /// Widen any integer-valued column to `i128`, which losslessly holds every
@@ -93,7 +96,7 @@ unsafe fn write_fixed<T: Copy>(ptr: SqlPointer, value: T, ind: *mut SqlLen) -> S
 /// Converts an integer column value to a fixed-width integer C target,
 /// range-checking against the target type.
 ///
-/// Returns [`ConvError::Unsupported`] when either the source is not an integer
+/// Returns [`ConvError::NotHandledHere`] when either the source is not an integer
 /// column or the target is not a fixed-width integer C type, letting the caller
 /// fall back to another conversion path.
 ///
@@ -108,7 +111,7 @@ pub(crate) unsafe fn convert_integer_c(
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> Result<SqlReturn, ConvError> {
     let Some(v) = integer_source_as_i128(value) else {
-        return Err(ConvError::Unsupported);
+        return Err(ConvError::NotHandledHere);
     };
 
     // Helper: narrow `v` to the target's range or fail with OutOfRange.
@@ -143,7 +146,7 @@ pub(crate) unsafe fn convert_integer_c(
             };
             unsafe { write_fixed(target_value_ptr, b, strlen_or_ind_ptr) }
         }
-        _ => return Err(ConvError::Unsupported),
+        _ => return Err(ConvError::NotHandledHere),
     };
     Ok(ret)
 }
@@ -171,7 +174,7 @@ pub(crate) fn is_float_c_target(target_type: SqlSmallInt) -> bool {
 
 /// Converts a numeric column value to a floating-point C target.
 ///
-/// Returns [`ConvError::Unsupported`] when the source is not numeric or the
+/// Returns [`ConvError::NotHandledHere`] when the source is not numeric or the
 /// target is not a floating-point C type.
 ///
 /// # Safety
@@ -183,7 +186,7 @@ pub(crate) unsafe fn convert_float_c(
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> Result<SqlReturn, ConvError> {
     let Some(v) = numeric_source_as_f64(value) else {
-        return Err(ConvError::Unsupported);
+        return Err(ConvError::NotHandledHere);
     };
     let ret = match target_type {
         // SQL_C_FLOAT is 32-bit. A finite value outside the f32 range must be
@@ -196,7 +199,7 @@ pub(crate) unsafe fn convert_float_c(
             unsafe { write_fixed(target_value_ptr, v as f32, strlen_or_ind_ptr) }
         }
         SQL_C_DOUBLE => unsafe { write_fixed(target_value_ptr, v, strlen_or_ind_ptr) },
-        _ => return Err(ConvError::Unsupported),
+        _ => return Err(ConvError::NotHandledHere),
     };
     Ok(ret)
 }
@@ -212,10 +215,12 @@ pub(crate) unsafe fn convert_guid_c(
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> Result<SqlReturn, ConvError> {
     if target_type != SQL_C_GUID {
-        return Err(ConvError::Unsupported);
+        return Err(ConvError::NotHandledHere);
     }
+    // The target is SQL_C_GUID but the column is not a uniqueidentifier: an
+    // illegal cast rather than a gap in this converter.
     let ColumnValues::Uuid(u) = value else {
-        return Err(ConvError::Unsupported);
+        return Err(ConvError::Restricted);
     };
     // `Uuid::as_fields` yields the GUID components in the same host-order layout
     // as `SQLGUID` (data1/data2/data3 native-endian, data4 as raw bytes).
@@ -269,10 +274,20 @@ fn civil_from_days_since_0001(days_since_0001: i64) -> (i16, u16, u16) {
     (year as i16, m as u16, d as u16)
 }
 
-/// (hour, minute, second, fraction_ns) from nanoseconds since midnight.
-fn hms_from_nanos(nanos: u64) -> (u16, u16, u16, u32) {
-    let secs = nanos / 1_000_000_000;
-    let fraction_ns = (nanos % 1_000_000_000) as u32;
+/// Number of 100 ns ticks in one day.
+const TICKS_PER_DAY: i64 = 864_000_000_000;
+
+/// Day number of `9999-12-31`, the maximum SQL Server date. Used to reject a
+/// `datetimeoffset` whose offset adjustment would leave the representable range.
+const MAX_DAYS_SINCE_0001: i64 = 3_652_058;
+
+/// (hour, minute, second, fraction_ns) from 100-nanosecond ticks since midnight.
+///
+/// `SqlTime::time_nanoseconds` is a misnomer: the decoder normalizes every
+/// fractional-seconds scale to 100 ns ticks, not nanoseconds.
+fn hms_from_ticks_100ns(ticks: u64) -> (u16, u16, u16, u32) {
+    let secs = ticks / 10_000_000;
+    let fraction_ns = ((ticks % 10_000_000) * 100) as u32;
     (
         (secs / 3600) as u16,
         ((secs % 3600) / 60) as u16,
@@ -294,7 +309,7 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
             p.has_date = true;
         }
         ColumnValues::Time(t) => {
-            let (h, mi, s, f) = hms_from_nanos(t.time_nanoseconds);
+            let (h, mi, s, f) = hms_from_ticks_100ns(t.time_nanoseconds);
             p.hour = h;
             p.minute = mi;
             p.second = s;
@@ -303,7 +318,7 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
         }
         ColumnValues::DateTime2(dt) => {
             let (y, m, day) = civil_from_days_since_0001(i64::from(dt.days));
-            let (h, mi, s, f) = hms_from_nanos(dt.time.time_nanoseconds);
+            let (h, mi, s, f) = hms_from_ticks_100ns(dt.time.time_nanoseconds);
             p.year = y;
             p.month = m;
             p.day = day;
@@ -315,8 +330,19 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
             p.has_time = true;
         }
         ColumnValues::DateTimeOffset(dto) => {
-            let (y, m, day) = civil_from_days_since_0001(i64::from(dto.datetime2.days));
-            let (h, mi, s, f) = hms_from_nanos(dto.datetime2.time.time_nanoseconds);
+            // The wire value is UTC; `offset` is what must be added to reach the
+            // local wall clock the application wrote, which is what the ODBC
+            // struct and the character rendering report.
+            let utc_ticks = dto.datetime2.time.time_nanoseconds as i64
+                + i64::from(dto.offset) * 60 * 10_000_000;
+            // Euclidean division so a negative offset borrows a day rather than
+            // producing a negative time-of-day.
+            let days = i64::from(dto.datetime2.days) + utc_ticks.div_euclid(TICKS_PER_DAY);
+            if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
+                return None;
+            }
+            let (y, m, day) = civil_from_days_since_0001(days);
+            let (h, mi, s, f) = hms_from_ticks_100ns(utc_ticks.rem_euclid(TICKS_PER_DAY) as u64);
             p.year = y;
             p.month = m;
             p.day = day;
@@ -388,8 +414,9 @@ pub(crate) unsafe fn convert_datetime_c(
     target_value_ptr: SqlPointer,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> Result<SqlReturn, ConvError> {
+    // A date/time C target was requested for a non-temporal column: illegal.
     let Some(p) = extract_datetime_parts(value) else {
-        return Err(ConvError::Unsupported);
+        return Err(ConvError::Restricted);
     };
     let ret = match target_type {
         SQL_C_TYPE_DATE | SQL_C_DATE if p.has_date => unsafe {
@@ -458,7 +485,9 @@ pub(crate) unsafe fn convert_datetime_c(
                 strlen_or_ind_ptr,
             )
         },
-        _ => return Err(ConvError::Unsupported),
+        // Reached when the value lacks the component the target needs (e.g. a
+        // `time` column into `SQL_C_TYPE_DATE`).
+        _ => return Err(ConvError::Restricted),
     };
     Ok(ret)
 }
@@ -617,7 +646,7 @@ mod tests {
             &mut ind,
         )
         .unwrap_err();
-        assert_eq!(err, ConvError::Unsupported);
+        assert_eq!(err, ConvError::NotHandledHere);
     }
 
     #[test]
@@ -631,7 +660,7 @@ mod tests {
             &mut ind,
         )
         .unwrap_err();
-        assert_eq!(err, ConvError::Unsupported);
+        assert_eq!(err, ConvError::NotHandledHere);
     }
 
     #[test]
@@ -727,7 +756,7 @@ mod tests {
             &mut ind,
         )
         .unwrap_err();
-        assert_eq!(err, ConvError::Unsupported);
+        assert_eq!(err, ConvError::NotHandledHere);
     }
 
     #[test]
@@ -813,7 +842,7 @@ mod tests {
             )
         }
         .unwrap_err();
-        assert_eq!(err, ConvError::Unsupported);
+        assert_eq!(err, ConvError::NotHandledHere);
     }
 
     // ---- Date / time -----------------------------------------------------
@@ -855,14 +884,14 @@ mod tests {
     #[test]
     fn time_to_ss_time2_struct() {
         use mssql_tds::datatypes::column_values::SqlTime;
-        // 13:45:30.123456700 -> nanoseconds since midnight.
-        let nanos = ((13 * 3600 + 45 * 60 + 30) as u64) * 1_000_000_000 + 123_456_700;
+        // 13:45:30.1234567 in 100 ns ticks since midnight.
+        let ticks = ((13 * 3600 + 45 * 60 + 30) as u64) * 10_000_000 + 1_234_567;
         let mut out = SqlSsTime2Struct::default();
         let mut ind: SqlLen = 0;
         unsafe {
             convert_datetime_c(
                 &ColumnValues::Time(SqlTime {
-                    time_nanoseconds: nanos,
+                    time_nanoseconds: ticks,
                     scale: 7,
                 }),
                 SQL_C_SS_TIME2,
@@ -885,7 +914,8 @@ mod tests {
     #[test]
     fn datetime2_to_timestamp_struct() {
         use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlTime};
-        let nanos = ((3600 + 2 * 60 + 3) as u64) * 1_000_000_000 + 500_000_000;
+        // 01:02:03.5 in 100 ns ticks since midnight.
+        let ticks = ((3600 + 2 * 60 + 3) as u64) * 10_000_000 + 5_000_000;
         let mut out = SqlTimestampStruct::default();
         let mut ind: SqlLen = 0;
         unsafe {
@@ -893,7 +923,7 @@ mod tests {
                 &ColumnValues::DateTime2(SqlDateTime2 {
                     days: 738_685,
                     time: SqlTime {
-                        time_nanoseconds: nanos,
+                        time_nanoseconds: ticks,
                         scale: 7,
                     },
                 }),
@@ -940,11 +970,72 @@ mod tests {
             )
         }
         .unwrap();
+        // UTC 2000-02-29 00:00 at -05:30 is local 2000-02-28 18:30, so the
+        // negative offset must borrow a day.
         assert_eq!(out.year, 2000);
         assert_eq!(out.month, 2);
-        assert_eq!(out.day, 29);
+        assert_eq!(out.day, 28);
+        assert_eq!(out.hour, 18);
+        assert_eq!(out.minute, 30);
         assert_eq!(out.timezone_hour, -5);
         assert_eq!(out.timezone_minute, -30);
+    }
+
+    #[test]
+    fn datetimeoffset_positive_offset_rolls_day_forward() {
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset, SqlTime};
+        let mut out = SqlSsTimestampoffsetStruct::default();
+        let mut ind: SqlLen = 0;
+        unsafe {
+            convert_datetime_c(
+                &ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 738_685, // 2023-06-15 UTC
+                        time: SqlTime {
+                            // 22:00:00 UTC
+                            time_nanoseconds: 22 * 3600 * 10_000_000,
+                            scale: 7,
+                        },
+                    },
+                    offset: 330, // +05:30 -> local 2023-06-16 03:30
+                }),
+                SQL_C_SS_TIMESTAMPOFFSET,
+                (&mut out as *mut SqlSsTimestampoffsetStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!((out.year, out.month, out.day), (2023, 6, 16));
+        assert_eq!((out.hour, out.minute), (3, 30));
+        assert_eq!((out.timezone_hour, out.timezone_minute), (5, 30));
+    }
+
+    #[test]
+    fn datetimeoffset_out_of_range_after_offset_is_rejected() {
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset, SqlTime};
+        let mut out = SqlSsTimestampoffsetStruct::default();
+        let mut ind: SqlLen = 0;
+        // 0001-01-01 00:00 UTC with a negative offset falls before the minimum
+        // representable date.
+        let err = unsafe {
+            convert_datetime_c(
+                &ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 0,
+                        time: SqlTime {
+                            time_nanoseconds: 0,
+                            scale: 7,
+                        },
+                    },
+                    offset: -60,
+                }),
+                SQL_C_SS_TIMESTAMPOFFSET,
+                (&mut out as *mut SqlSsTimestampoffsetStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, ConvError::Restricted);
     }
 
     #[test]
@@ -969,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn time_into_date_target_unsupported() {
+    fn time_into_date_target_is_restricted() {
         use mssql_tds::datatypes::column_values::SqlTime;
         let mut out = SqlDateStruct::default();
         let mut ind: SqlLen = 0;
@@ -985,7 +1076,7 @@ mod tests {
             )
         }
         .unwrap_err();
-        assert_eq!(err, ConvError::Unsupported);
+        assert_eq!(err, ConvError::Restricted);
     }
 
     #[test]
@@ -995,7 +1086,7 @@ mod tests {
             ColumnValues::DateTime2(SqlDateTime2 {
                 days: 738_685,
                 time: SqlTime {
-                    time_nanoseconds: 123_456_700,
+                    time_nanoseconds: 1_234_567,
                     scale: 7,
                 },
             })
