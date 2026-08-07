@@ -84,7 +84,7 @@ ODBC Appendix D requires a driver to support conversions to **all** ODBC C types
 - `decimal` / `numeric` → the numeric C targets (`SQL_C_DOUBLE`, `SQL_C_FLOAT`, `SQL_C_SLONG`, `SQL_C_SBIGINT`, …). `numeric_source_as_f64` currently rejects the exact-decimal types.
 - `money` / `smallmoney` → the numeric C targets.
 - Character sources (`char` / `varchar` / `nchar` / `nvarchar`) → numeric and date/time C targets (e.g. `'123'` → `SQL_C_SLONG`, `'2023-06-15'` → `SQL_C_TYPE_DATE`), with `22018` when the text is not a valid literal for the target.
-- Lossy numeric conversions must report fractional truncation with `01S07` + `SQL_SUCCESS_WITH_INFO` (e.g. `float` `1234.99` → `SQL_C_SLONG` yields `1234` + `01S07`), which requires adding `SQLSTATE_01S07`.
+- Lossy **numeric** conversions must report fractional truncation with `01S07` + `SQL_SUCCESS_WITH_INFO` (e.g. `float` `1234.99` → `SQL_C_SLONG` yields `1234` + `01S07`). The `01S07` diagnostic and the `ConvOk::Truncated` plumbing already exist (P1 uses them for date/time targets that discard a component); P1a extends them to the numeric conversions above.
 
 Until then these pairings return `HYC00` (not implemented) rather than converting.
 

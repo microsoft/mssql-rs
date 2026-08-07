@@ -25,7 +25,7 @@
 use tracing::{debug, error};
 
 use super::fetch_convert::{
-    ConvError, convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c,
+    ConvError, ConvOk, convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c,
     extract_datetime_parts, format_datetime_parts, is_datetime_c_target, is_float_c_target,
     is_integer_c_target,
 };
@@ -254,10 +254,14 @@ fn sql_get_data_safe(
 /// return code, posting the appropriate diagnostic on the statement.
 fn finish_typed_conv(
     stmt_state: &mut crate::handles::stmt::StmtState,
-    r: Result<SqlReturn, ConvError>,
+    r: Result<ConvOk, ConvError>,
 ) -> SqlReturn {
     match r {
-        Ok(ret) => ret,
+        Ok(ConvOk::Exact) => SQL_SUCCESS,
+        Ok(ConvOk::Truncated) => {
+            post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION);
+            SQL_SUCCESS_WITH_INFO
+        }
         Err(ConvError::OutOfRange) => {
             post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE);
             SQL_ERROR

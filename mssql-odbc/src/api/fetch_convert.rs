@@ -23,12 +23,22 @@ use super::odbc_types::{
     SQL_C_BIT, SQL_C_DATE, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_LONG, SQL_C_SBIGINT,
     SQL_C_SHORT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT,
     SQL_C_STINYINT, SQL_C_TIME, SQL_C_TIMESTAMP, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME,
-    SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_SUCCESS,
-    SqlDateStruct, SqlGuid, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlSsTime2Struct,
-    SqlSsTimestampoffsetStruct, SqlTimeStruct, SqlTimestampStruct,
+    SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SqlDateStruct,
+    SqlGuid, SqlLen, SqlPointer, SqlSmallInt, SqlSsTime2Struct, SqlSsTimestampoffsetStruct,
+    SqlTimeStruct, SqlTimestampStruct,
 };
 use super::util::write_if_some;
 use mssql_tds::datatypes::column_values::ColumnValues;
+
+/// Outcome of a successful conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConvOk {
+    /// The value was represented exactly.
+    Exact,
+    /// Precision was lost (e.g. a date/time component the target cannot hold).
+    /// The caller posts `01S07` and returns `SQL_SUCCESS_WITH_INFO`.
+    Truncated,
+}
 
 /// Why a value-level conversion could not be completed. The caller maps each
 /// variant to the appropriate SQLSTATE on its own diagnostic target.
@@ -85,12 +95,12 @@ pub(crate) fn is_integer_c_target(target_type: SqlSmallInt) -> bool {
 /// `ptr`, when non-null, must be valid for a write of `size_of::<T>()` bytes.
 /// The write is unaligned-safe. `ind` follows the same contract as
 /// [`write_if_some`].
-unsafe fn write_fixed<T: Copy>(ptr: SqlPointer, value: T, ind: *mut SqlLen) -> SqlReturn {
+unsafe fn write_fixed<T: Copy>(ptr: SqlPointer, value: T, ind: *mut SqlLen) -> ConvOk {
     if !ptr.is_null() {
         unsafe { (ptr as *mut T).write_unaligned(value) };
     }
     unsafe { write_if_some(ind, std::mem::size_of::<T>() as SqlLen) };
-    SQL_SUCCESS
+    ConvOk::Exact
 }
 
 /// Converts an integer column value to a fixed-width integer C target,
@@ -109,7 +119,7 @@ pub(crate) unsafe fn convert_integer_c(
     target_type: SqlSmallInt,
     target_value_ptr: SqlPointer,
     strlen_or_ind_ptr: *mut SqlLen,
-) -> Result<SqlReturn, ConvError> {
+) -> Result<ConvOk, ConvError> {
     let Some(v) = integer_source_as_i128(value) else {
         return Err(ConvError::NotHandledHere);
     };
@@ -184,7 +194,7 @@ pub(crate) unsafe fn convert_float_c(
     target_type: SqlSmallInt,
     target_value_ptr: SqlPointer,
     strlen_or_ind_ptr: *mut SqlLen,
-) -> Result<SqlReturn, ConvError> {
+) -> Result<ConvOk, ConvError> {
     let Some(v) = numeric_source_as_f64(value) else {
         return Err(ConvError::NotHandledHere);
     };
@@ -213,7 +223,7 @@ pub(crate) unsafe fn convert_guid_c(
     target_type: SqlSmallInt,
     target_value_ptr: SqlPointer,
     strlen_or_ind_ptr: *mut SqlLen,
-) -> Result<SqlReturn, ConvError> {
+) -> Result<ConvOk, ConvError> {
     if target_type != SQL_C_GUID {
         return Err(ConvError::NotHandledHere);
     }
@@ -250,6 +260,9 @@ pub(crate) struct DateTimeParts {
     pub second: u16,
     /// Fractional seconds in nanoseconds.
     pub fraction_ns: u32,
+    /// Declared fractional-seconds scale (0-7) of the source column. Character
+    /// rendering pads to exactly this many digits, matching msodbcsql.
+    pub scale: u8,
     pub tz_hour: i16,
     pub tz_minute: i16,
     pub has_date: bool,
@@ -310,6 +323,7 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
         }
         ColumnValues::Time(t) => {
             let (h, mi, s, f) = hms_from_ticks_100ns(t.time_nanoseconds);
+            p.scale = t.scale;
             p.hour = h;
             p.minute = mi;
             p.second = s;
@@ -319,6 +333,7 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
         ColumnValues::DateTime2(dt) => {
             let (y, m, day) = civil_from_days_since_0001(i64::from(dt.days));
             let (h, mi, s, f) = hms_from_ticks_100ns(dt.time.time_nanoseconds);
+            p.scale = dt.time.scale;
             p.year = y;
             p.month = m;
             p.day = day;
@@ -343,6 +358,7 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
             }
             let (y, m, day) = civil_from_days_since_0001(days);
             let (h, mi, s, f) = hms_from_ticks_100ns(utc_ticks.rem_euclid(TICKS_PER_DAY) as u64);
+            p.scale = dto.datetime2.time.scale;
             p.year = y;
             p.month = m;
             p.day = day;
@@ -369,6 +385,8 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
             p.minute = ((secs % 3600) / 60) as u16;
             p.second = (secs % 60) as u16;
             p.fraction_ns = fraction_ns;
+            // `datetime` always renders 3 fractional digits.
+            p.scale = 3;
             p.has_date = true;
             p.has_time = true;
         }
@@ -413,34 +431,50 @@ pub(crate) unsafe fn convert_datetime_c(
     target_type: SqlSmallInt,
     target_value_ptr: SqlPointer,
     strlen_or_ind_ptr: *mut SqlLen,
-) -> Result<SqlReturn, ConvError> {
+) -> Result<ConvOk, ConvError> {
     // A date/time C target was requested for a non-temporal column: illegal.
     let Some(p) = extract_datetime_parts(value) else {
         return Err(ConvError::Restricted);
     };
     let ret = match target_type {
-        SQL_C_TYPE_DATE | SQL_C_DATE if p.has_date => unsafe {
-            write_fixed(
-                target_value_ptr,
-                SqlDateStruct {
-                    year: p.year,
-                    month: p.month,
-                    day: p.day,
-                },
-                strlen_or_ind_ptr,
-            )
-        },
-        SQL_C_TYPE_TIME | SQL_C_TIME if p.has_time => unsafe {
-            write_fixed(
-                target_value_ptr,
-                SqlTimeStruct {
-                    hour: p.hour,
-                    minute: p.minute,
-                    second: p.second,
-                },
-                strlen_or_ind_ptr,
-            )
-        },
+        SQL_C_TYPE_DATE | SQL_C_DATE if p.has_date => {
+            let written = unsafe {
+                write_fixed(
+                    target_value_ptr,
+                    SqlDateStruct {
+                        year: p.year,
+                        month: p.month,
+                        day: p.day,
+                    },
+                    strlen_or_ind_ptr,
+                )
+            };
+            // Dropping a non-zero time component is a truncation.
+            if p.has_time && (p.hour | p.minute | p.second) != 0 || p.fraction_ns != 0 {
+                ConvOk::Truncated
+            } else {
+                written
+            }
+        }
+        SQL_C_TYPE_TIME | SQL_C_TIME if p.has_time => {
+            let written = unsafe {
+                write_fixed(
+                    target_value_ptr,
+                    SqlTimeStruct {
+                        hour: p.hour,
+                        minute: p.minute,
+                        second: p.second,
+                    },
+                    strlen_or_ind_ptr,
+                )
+            };
+            // SQL_TIME_STRUCT has no fractional field.
+            if p.fraction_ns != 0 {
+                ConvOk::Truncated
+            } else {
+                written
+            }
+        }
         SQL_C_SS_TIME2 if p.has_time => unsafe {
             write_fixed(
                 target_value_ptr,
@@ -505,15 +539,14 @@ pub(crate) fn format_datetime_parts(p: &DateTimeParts) -> String {
             s.push(' ');
         }
         s.push_str(&format!("{:02}:{:02}:{:02}", p.hour, p.minute, p.second));
-        if p.fraction_ns != 0 {
-            // Render in 100 ns units (7 digits) and trim trailing zeros.
+        // Pad to the column's declared scale so every row of a column renders
+        // the same width, matching msodbcsql (which applications rely on when
+        // sizing buffers from SQLDescribeCol).
+        if p.scale > 0 {
             let hundred_ns = p.fraction_ns / 100;
             let frac = format!("{hundred_ns:07}");
-            let frac = frac.trim_end_matches('0');
-            if !frac.is_empty() {
-                s.push('.');
-                s.push_str(frac);
-            }
+            s.push('.');
+            s.push_str(&frac[..usize::from(p.scale).min(frac.len())]);
         }
     }
     if p.has_tz {
@@ -541,7 +574,7 @@ mod tests {
         target: SqlSmallInt,
         ptr: SqlPointer,
         ind: *mut SqlLen,
-    ) -> Result<SqlReturn, ConvError> {
+    ) -> Result<ConvOk, ConvError> {
         unsafe { convert_integer_c(v, target, ptr, ind) }
     }
 
@@ -556,7 +589,7 @@ mod tests {
             &mut ind,
         )
         .unwrap();
-        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ret, ConvOk::Exact);
         assert_eq!(out, -123456);
         assert_eq!(ind, 4);
     }
@@ -572,7 +605,7 @@ mod tests {
             &mut ind,
         )
         .unwrap();
-        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ret, ConvOk::Exact);
         assert_eq!(out, 200);
         assert_eq!(ind, 1);
     }
@@ -673,7 +706,7 @@ mod tests {
             &mut ind,
         )
         .unwrap();
-        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ret, ConvOk::Exact);
         assert_eq!(ind, 4);
     }
 
@@ -696,7 +729,7 @@ mod tests {
         target: SqlSmallInt,
         ptr: SqlPointer,
         ind: *mut SqlLen,
-    ) -> Result<SqlReturn, ConvError> {
+    ) -> Result<ConvOk, ConvError> {
         unsafe { convert_float_c(v, target, ptr, ind) }
     }
 
@@ -711,7 +744,7 @@ mod tests {
             &mut ind,
         )
         .unwrap();
-        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ret, ConvOk::Exact);
         assert_eq!(out, 1.5);
         assert_eq!(ind, 4);
     }
@@ -771,7 +804,7 @@ mod tests {
             &mut ind,
         )
         .unwrap();
-        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ret, ConvOk::Exact);
         assert_eq!(out, 200);
     }
 
@@ -820,7 +853,7 @@ mod tests {
             )
         }
         .unwrap();
-        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ret, ConvOk::Exact);
         assert_eq!(out.data1, 0x0011_2233);
         assert_eq!(out.data2, 0x4455);
         assert_eq!(out.data3, 0x6677);
@@ -869,7 +902,7 @@ mod tests {
             )
         }
         .unwrap();
-        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ret, ConvOk::Exact);
         assert_eq!(
             out,
             SqlDateStruct {
@@ -979,6 +1012,164 @@ mod tests {
         assert_eq!(out.minute, 30);
         assert_eq!(out.timezone_hour, -5);
         assert_eq!(out.timezone_minute, -30);
+    }
+
+    #[test]
+    fn datetimeoffset_matches_msodbcsql_wall_clock() {
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset, SqlTime};
+        // SELECT CAST('2023-01-01 12:34:56.1234567 +05:30' AS datetimeoffset(7))
+        // msodbcsql18 -> 2023-01-01 12:34:56.123456700 +05:30
+        // Stored UTC is 2023-01-01 07:04:56.1234567 with offset +330.
+        let utc_ticks = ((7 * 3600 + 4 * 60 + 56) as u64) * 10_000_000 + 1_234_567;
+        let mut out = SqlSsTimestampoffsetStruct::default();
+        let mut ind: SqlLen = 0;
+        unsafe {
+            convert_datetime_c(
+                &ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 738_520, // 2023-01-01
+                        time: SqlTime {
+                            time_nanoseconds: utc_ticks,
+                            scale: 7,
+                        },
+                    },
+                    offset: 330,
+                }),
+                SQL_C_SS_TIMESTAMPOFFSET,
+                (&mut out as *mut SqlSsTimestampoffsetStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!((out.year, out.month, out.day), (2023, 1, 1));
+        assert_eq!((out.hour, out.minute, out.second), (12, 34, 56));
+        assert_eq!(out.fraction, 123_456_700);
+        assert_eq!((out.timezone_hour, out.timezone_minute), (5, 30));
+    }
+
+    #[test]
+    fn datetimeoffset_negative_offset_rolls_day_backward() {
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset, SqlTime};
+        // UTC 2023-06-15 02:00 at -05:00 is local 2023-06-14 21:00.
+        let mut out = SqlSsTimestampoffsetStruct::default();
+        let mut ind: SqlLen = 0;
+        unsafe {
+            convert_datetime_c(
+                &ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 738_685,
+                        time: SqlTime {
+                            time_nanoseconds: 2 * 3600 * 10_000_000,
+                            scale: 7,
+                        },
+                    },
+                    offset: -300,
+                }),
+                SQL_C_SS_TIMESTAMPOFFSET,
+                (&mut out as *mut SqlSsTimestampoffsetStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!((out.year, out.month, out.day), (2023, 6, 14));
+        assert_eq!((out.hour, out.minute), (21, 0));
+        assert_eq!((out.timezone_hour, out.timezone_minute), (-5, 0));
+    }
+
+    #[test]
+    fn datetime2_into_date_target_reports_truncation() {
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlTime};
+        let mut out = SqlDateStruct::default();
+        let mut ind: SqlLen = 0;
+        let ok = unsafe {
+            convert_datetime_c(
+                &ColumnValues::DateTime2(SqlDateTime2 {
+                    days: 738_685,
+                    time: SqlTime {
+                        time_nanoseconds: ((12 * 3600 + 34 * 60 + 56) as u64) * 10_000_000,
+                        scale: 7,
+                    },
+                }),
+                SQL_C_TYPE_DATE,
+                (&mut out as *mut SqlDateStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out.day, 15);
+    }
+
+    #[test]
+    fn datetime2_into_time_target_reports_fraction_truncation() {
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlTime};
+        let mut out = SqlTimeStruct::default();
+        let mut ind: SqlLen = 0;
+        let ok = unsafe {
+            convert_datetime_c(
+                &ColumnValues::DateTime2(SqlDateTime2 {
+                    days: 738_685,
+                    time: SqlTime {
+                        time_nanoseconds: ((12 * 3600 + 34 * 60 + 56) as u64) * 10_000_000
+                            + 1_234_567,
+                        scale: 7,
+                    },
+                }),
+                SQL_C_TYPE_TIME,
+                (&mut out as *mut SqlTimeStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        // SQL_TIME_STRUCT cannot carry the fraction.
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!((out.hour, out.minute, out.second), (12, 34, 56));
+    }
+
+    #[test]
+    fn character_rendering_pads_to_declared_scale() {
+        use mssql_tds::datatypes::column_values::{
+            SqlDateTime, SqlDateTime2, SqlSmallDateTime, SqlTime,
+        };
+        // datetime2(7) with a whole-second value still renders 7 digits.
+        let p = extract_datetime_parts(&ColumnValues::DateTime2(SqlDateTime2 {
+            days: 738_685,
+            time: SqlTime {
+                time_nanoseconds: 12 * 3600 * 10_000_000,
+                scale: 7,
+            },
+        }))
+        .unwrap();
+        let s = format_datetime_parts(&p);
+        assert_eq!(s, "2023-06-15 12:00:00.0000000");
+        assert_eq!(s.len(), 27);
+
+        // datetime2(3) renders exactly 3.
+        let p = extract_datetime_parts(&ColumnValues::DateTime2(SqlDateTime2 {
+            days: 738_685,
+            time: SqlTime {
+                time_nanoseconds: 12 * 3600 * 10_000_000 + 1_000_000,
+                scale: 3,
+            },
+        }))
+        .unwrap();
+        assert_eq!(format_datetime_parts(&p), "2023-06-15 12:00:00.100");
+
+        // Legacy `datetime` is always scale 3.
+        let p = extract_datetime_parts(&ColumnValues::DateTime(SqlDateTime {
+            days: 45_090, // 2023-06-15
+            time: 12 * 3600 * 300,
+        }))
+        .unwrap();
+        assert_eq!(format_datetime_parts(&p), "2023-06-15 12:00:00.000");
+
+        // `smalldatetime` is scale 0: no fractional part at all.
+        let p = extract_datetime_parts(&ColumnValues::SmallDateTime(SqlSmallDateTime {
+            days: 45_090,
+            time: 12 * 60,
+        }))
+        .unwrap();
+        assert_eq!(format_datetime_parts(&p), "2023-06-15 12:00:00");
     }
 
     #[test]
