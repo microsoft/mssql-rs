@@ -1736,7 +1736,8 @@ impl StringDecoder {
             if length == 0xFFFF {
                 writer.write_null(col);
             } else {
-                let mut buffer = vec![0u8; length];
+                let mut buffer = writer.take_string_buffer(length);
+                buffer.resize(length, 0);
                 reader.read_bytes(&mut buffer).await?;
                 writer.write_string(col, SqlString::new(buffer, encoding_type));
             }

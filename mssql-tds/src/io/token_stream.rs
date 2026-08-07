@@ -408,10 +408,11 @@ async fn decode_row_columns<R: TdsPacketReader + Send + Sync>(
     writer: &mut (dyn RowWriter + Send),
 ) -> TdsResult<RowReadResult> {
     let decoder = GenericDecoder::default();
+    let may_pause = writer.may_pause();
     for (col, meta) in columns.iter().enumerate().skip(start_col) {
         // For PLP target columns, pause before payload consumption so callers
         // can stream SQLGetData-style chunks from wire.
-        if meta.is_plp() && writer.pause_after_column(col) {
+        if may_pause && meta.is_plp() && writer.pause_after_column(col) {
             // TODO: Add AE-aware PLP streaming path for paused row reads.
             // Until then, fail fast to avoid streaming ciphertext bytes to callers.
             if meta.crypto_metadata.is_some() {
@@ -451,7 +452,7 @@ async fn decode_row_columns<R: TdsPacketReader + Send + Sync>(
         }
 
         decode_or_decrypt_column(&decoder, reader, meta, decryptor, col, writer).await?;
-        if writer.pause_after_column(col) && col + 1 < columns.len() {
+        if may_pause && writer.pause_after_column(col) && col + 1 < columns.len() {
             return Ok(RowReadResult::RowPaused(RowPauseState {
                 next_column_index: col + 1,
                 columns: columns.to_vec(),
@@ -473,11 +474,12 @@ async fn decode_nbcrow_columns<R: TdsPacketReader + Send + Sync>(
     writer: &mut (dyn RowWriter + Send),
 ) -> TdsResult<RowReadResult> {
     let decoder = GenericDecoder::default();
+    let may_pause = writer.may_pause();
     for (col, meta) in columns.iter().enumerate().skip(start_col) {
         if bitmap[col / 8] & (1 << (col % 8)) != 0 {
             writer.write_null(col);
         } else {
-            if meta.is_plp() && writer.pause_after_column(col) {
+            if may_pause && meta.is_plp() && writer.pause_after_column(col) {
                 // TODO: Add AE-aware PLP streaming path for paused row reads.
                 // Until then, fail fast to avoid streaming ciphertext bytes to callers.
                 if meta.crypto_metadata.is_some() {
@@ -518,7 +520,7 @@ async fn decode_nbcrow_columns<R: TdsPacketReader + Send + Sync>(
 
             decode_or_decrypt_column(&decoder, reader, meta, decryptor, col, writer).await?;
         }
-        if writer.pause_after_column(col) && col + 1 < columns.len() {
+        if may_pause && writer.pause_after_column(col) && col + 1 < columns.len() {
             return Ok(RowReadResult::RowPaused(RowPauseState {
                 next_column_index: col + 1,
                 columns: columns.to_vec(),
