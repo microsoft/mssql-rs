@@ -64,19 +64,9 @@ pub(crate) enum ConvError {
     /// The requested C type is not a legal target for this SQL type
     /// (SQLSTATE `07006`). Terminal.
     Restricted,
-}
-
-/// Widen any integer-valued column to `i128`, which losslessly holds every
-/// integer `ColumnValues` variant. Returns `None` for non-integer sources.
-fn integer_source_as_i128(value: &ColumnValues) -> Option<i128> {
-    match value {
-        ColumnValues::TinyInt(x) => Some(i128::from(*x)),
-        ColumnValues::SmallInt(x) => Some(i128::from(*x)),
-        ColumnValues::Int(x) => Some(i128::from(*x)),
-        ColumnValues::BigInt(x) => Some(i128::from(*x)),
-        ColumnValues::Bit(b) => Some(i128::from(*b)),
-        _ => None,
-    }
+    /// A character column's text is not a valid literal for the requested target
+    /// (SQLSTATE `22018`). Terminal.
+    InvalidCharacterValue,
 }
 
 /// Returns `true` if `target_type` is one of the fixed-width integer C types
@@ -126,22 +116,147 @@ unsafe fn write_fixed<T: Copy>(ptr: SqlPointer, value: T, ind: *mut SqlLen) -> C
 /// `target_value_ptr`, when non-null, must be valid for a write of the target
 /// C type's size, and `strlen_or_ind_ptr` must be null or valid for a
 /// `SqlLen` write.
+/// A numeric column value in a form that keeps exact sources exact, so an
+/// integer target can report truncation instead of silently dropping a
+/// fraction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum NumericSource {
+    Int(i128),
+    /// `mantissa / 10^scale` — the exact decimal types (`decimal`, `numeric`,
+    /// `money`, `smallmoney`) and decimal literals in character columns.
+    Scaled {
+        mantissa: i128,
+        scale: u32,
+    },
+    Float(f64),
+}
+
+impl NumericSource {
+    fn as_f64(&self) -> f64 {
+        match self {
+            NumericSource::Int(v) => *v as f64,
+            NumericSource::Scaled { mantissa, scale } => {
+                *mantissa as f64 / 10f64.powi(*scale as i32)
+            }
+            NumericSource::Float(f) => *f,
+        }
+    }
+
+    /// Value truncated toward zero plus whether a fractional part was dropped.
+    /// `None` when the value cannot be represented as an integer at all.
+    fn to_i128_truncating(self) -> Option<(i128, bool)> {
+        match self {
+            NumericSource::Int(v) => Some((v, false)),
+            NumericSource::Scaled { mantissa, scale } => {
+                let divisor = 10i128.checked_pow(scale)?;
+                Some((mantissa / divisor, mantissa % divisor != 0))
+            }
+            NumericSource::Float(f) => {
+                if !f.is_finite() || !(-1.7e38..=1.7e38).contains(&f) {
+                    return None;
+                }
+                Some((f.trunc() as i128, f.fract() != 0.0))
+            }
+        }
+    }
+}
+
+/// Parses a plain decimal literal (`-12.34`, `+7`, `.5`) into an exact
+/// [`NumericSource::Scaled`]. Exponent forms are left to the `f64` fallback.
+fn parse_decimal_literal(text: &str) -> Option<NumericSource> {
+    let t = text.trim();
+    let (negative, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (int_digits, frac_digits) = match body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (body, ""),
+    };
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return None;
+    }
+    if !int_digits
+        .bytes()
+        .chain(frac_digits.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let mantissa: i128 = format!("{int_digits}{frac_digits}").parse().ok()?;
+    Some(NumericSource::Scaled {
+        mantissa: if negative { -mantissa } else { mantissa },
+        scale: frac_digits.len() as u32,
+    })
+}
+
+/// The `money` / `smallmoney` wire value as an integer scaled by 10^4.
+fn money_scaled(lsb: i32, msb: i32) -> i128 {
+    i128::from((i64::from(lsb) & 0xFFFF_FFFF) | (i64::from(msb) << 32))
+}
+
+/// Interprets a column as a number, or `None` when the column type has no
+/// numeric interpretation.
+fn numeric_source(value: &ColumnValues) -> Option<NumericSource> {
+    match value {
+        ColumnValues::TinyInt(x) => Some(NumericSource::Int(i128::from(*x))),
+        ColumnValues::SmallInt(x) => Some(NumericSource::Int(i128::from(*x))),
+        ColumnValues::Int(x) => Some(NumericSource::Int(i128::from(*x))),
+        ColumnValues::BigInt(x) => Some(NumericSource::Int(i128::from(*x))),
+        ColumnValues::Bit(b) => Some(NumericSource::Int(i128::from(*b))),
+        ColumnValues::Real(x) => Some(NumericSource::Float(f64::from(*x))),
+        ColumnValues::Float(x) => Some(NumericSource::Float(*x)),
+        // `DecimalParts` renders itself exactly; parse that back rather than
+        // reassembling its base-2^32 limbs.
+        ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
+            parse_decimal_literal(&d.to_string())
+        }
+        ColumnValues::Money(m) => Some(NumericSource::Scaled {
+            mantissa: money_scaled(m.lsb_part, m.msb_part),
+            scale: 4,
+        }),
+        ColumnValues::SmallMoney(m) => Some(NumericSource::Scaled {
+            mantissa: i128::from(m.int_val),
+            scale: 4,
+        }),
+        ColumnValues::String(_) => None,
+        _ => None,
+    }
+}
+
+/// Interprets a column as a number, including character columns holding a
+/// numeric literal. `Err` distinguishes "not a numeric column" from "character
+/// column whose text is not a valid number" (`22018`).
+fn numeric_source_or_parse(value: &ColumnValues) -> Result<NumericSource, ConvError> {
+    if let ColumnValues::String(s) = value {
+        let text = sql_string_to_text(s).ok_or(ConvError::InvalidCharacterValue)?;
+        return parse_decimal_literal(&text)
+            .or_else(|| text.trim().parse::<f64>().ok().map(NumericSource::Float))
+            .ok_or(ConvError::InvalidCharacterValue);
+    }
+    numeric_source(value).ok_or(ConvError::Restricted)
+}
+
 pub(crate) unsafe fn convert_integer_c(
     value: &ColumnValues,
     target_type: SqlSmallInt,
     target_value_ptr: SqlPointer,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> Result<ConvOk, ConvError> {
-    let Some(v) = integer_source_as_i128(value) else {
+    // Reject an unhandled target before interpreting the value, so the caller
+    // can still route elsewhere.
+    if !is_integer_c_target(target_type) {
         return Err(ConvError::NotHandledHere);
-    };
+    }
+    let source = numeric_source_or_parse(value)?;
+    let (v, truncated) = source.to_i128_truncating().ok_or(ConvError::OutOfRange)?;
 
     // Helper: narrow `v` to the target's range or fail with OutOfRange.
     macro_rules! narrow {
         ($ty:ty) => {{ <$ty>::try_from(v).map_err(|_| ConvError::OutOfRange)? }};
     }
 
-    let ret = match target_type {
+    match target_type {
         // SQL_C_TINYINT maps to an unsigned SQLCHAR (SQL Server `tinyint` is
         // 0-255 and mssql-python fetches it unsigned); only SQL_C_STINYINT is
         // the signed form.
@@ -159,7 +274,7 @@ pub(crate) unsafe fn convert_integer_c(
         SQL_C_ULONG => unsafe { write_fixed(target_value_ptr, narrow!(u32), strlen_or_ind_ptr) },
         SQL_C_SBIGINT => unsafe { write_fixed(target_value_ptr, narrow!(i64), strlen_or_ind_ptr) },
         SQL_C_UBIGINT => unsafe { write_fixed(target_value_ptr, narrow!(u64), strlen_or_ind_ptr) },
-        // A bit target only accepts 0 or 1; any other integer is out of range.
+        // A bit target only accepts 0 or 1; any other value is out of range.
         SQL_C_BIT => {
             let b: u8 = match v {
                 0 => 0,
@@ -170,24 +285,15 @@ pub(crate) unsafe fn convert_integer_c(
         }
         _ => return Err(ConvError::NotHandledHere),
     };
-    Ok(ret)
+    Ok(if truncated {
+        ConvOk::Truncated
+    } else {
+        ConvOk::Exact
+    })
 }
 
 /// Widen a numeric column (integer or floating) to `f64`. Returns `None` for
 /// non-numeric sources.
-fn numeric_source_as_f64(value: &ColumnValues) -> Option<f64> {
-    match value {
-        ColumnValues::TinyInt(x) => Some(f64::from(*x)),
-        ColumnValues::SmallInt(x) => Some(f64::from(*x)),
-        ColumnValues::Int(x) => Some(f64::from(*x)),
-        ColumnValues::BigInt(x) => Some(*x as f64),
-        ColumnValues::Bit(b) => Some(if *b { 1.0 } else { 0.0 }),
-        ColumnValues::Real(x) => Some(f64::from(*x)),
-        ColumnValues::Float(x) => Some(*x),
-        _ => None,
-    }
-}
-
 /// Returns `true` if `target_type` is one of the floating-point C types handled
 /// by [`convert_float_c`].
 pub(crate) fn is_float_c_target(target_type: SqlSmallInt) -> bool {
@@ -207,9 +313,10 @@ pub(crate) unsafe fn convert_float_c(
     target_value_ptr: SqlPointer,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> Result<ConvOk, ConvError> {
-    let Some(v) = numeric_source_as_f64(value) else {
+    if !is_float_c_target(target_type) {
         return Err(ConvError::NotHandledHere);
-    };
+    }
+    let v = numeric_source_or_parse(value)?.as_f64();
     let ret = match target_type {
         // SQL_C_FLOAT is 32-bit. A finite value outside the f32 range must be
         // reported as an overflow (22003) rather than silently becoming
@@ -686,17 +793,18 @@ mod tests {
     }
 
     #[test]
-    fn non_integer_source_is_unsupported() {
+    fn real_into_integer_target_truncates() {
         let mut out: i32 = 0;
         let mut ind: SqlLen = 0;
-        let err = conv(
+        let ok = conv(
             &ColumnValues::Real(1.5),
             SQL_C_SLONG,
             (&mut out as *mut i32).cast(),
             &mut ind,
         )
-        .unwrap_err();
-        assert_eq!(err, ConvError::NotHandledHere);
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, 1);
     }
 
     #[test]
@@ -795,8 +903,199 @@ mod tests {
         assert_eq!(out, 42.0);
     }
 
+    // ---- P1a: mandatory source-type conversions --------------------------
+    /// Builds a `decimal`/`numeric` column value from a literal.
+    fn dec(s: &str, precision: u8, scale: u8) -> ColumnValues {
+        use mssql_tds::datatypes::decoder::DecimalParts;
+        ColumnValues::Numeric(DecimalParts::from_string(s, precision, scale).unwrap())
+    }
+
+    fn utf8_col(s: &str) -> ColumnValues {
+        ColumnValues::String(SqlString::from_utf8_string(s.to_string()))
+    }
+
     #[test]
-    fn non_numeric_source_float_unsupported() {
+    fn decimal_into_double_target() {
+        let mut out: f64 = 0.0;
+        let mut ind: SqlLen = 0;
+        let ok = conv_f(
+            &dec("12345.6789", 18, 4),
+            SQL_C_DOUBLE,
+            (&mut out as *mut f64).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ok, ConvOk::Exact);
+        assert!((out - 12345.6789).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decimal_into_bigint_target_truncates() {
+        let mut out: i64 = 0;
+        let mut ind: SqlLen = 0;
+        let ok = conv(
+            &dec("12345.6789", 18, 4),
+            SQL_C_SBIGINT,
+            (&mut out as *mut i64).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, 12345);
+    }
+
+    #[test]
+    fn money_into_double_target() {
+        use mssql_tds::datatypes::column_values::SqlMoney;
+        // 1234.5678 scaled by 10^4 = 12_345_678.
+        let mut out: f64 = 0.0;
+        let mut ind: SqlLen = 0;
+        let ok = conv_f(
+            &ColumnValues::Money(SqlMoney::from(12_345_678i32)),
+            SQL_C_DOUBLE,
+            (&mut out as *mut f64).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ok, ConvOk::Exact);
+        assert!((out - 1234.5678).abs() < 1e-9);
+    }
+
+    #[test]
+    fn smallmoney_into_integer_target_truncates() {
+        use mssql_tds::datatypes::column_values::SqlSmallMoney;
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let ok = conv(
+            &ColumnValues::SmallMoney(SqlSmallMoney::from(12_345_678i32)),
+            SQL_C_SLONG,
+            (&mut out as *mut i32).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, 1234);
+    }
+
+    #[test]
+    fn float_into_integer_target_truncates() {
+        // msodbcsql18: CAST(1234.99 AS float) -> SQL_C_SLONG gives 1234 + 01S07.
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let ok = conv(
+            &ColumnValues::Float(1234.99),
+            SQL_C_SLONG,
+            (&mut out as *mut i32).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, 1234);
+    }
+
+    #[test]
+    fn character_source_into_integer_target() {
+        // msodbcsql18: CAST('123' AS varchar(10)) -> SQL_C_SLONG gives 123.
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let ok = conv(
+            &utf8_col("123"),
+            SQL_C_SLONG,
+            (&mut out as *mut i32).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ok, ConvOk::Exact);
+        assert_eq!(out, 123);
+    }
+
+    #[test]
+    fn character_source_with_fraction_truncates() {
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let ok = conv(
+            &utf8_col(" -42.75 "),
+            SQL_C_SLONG,
+            (&mut out as *mut i32).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, -42);
+    }
+
+    #[test]
+    fn character_source_into_double_target() {
+        let mut out: f64 = 0.0;
+        let mut ind: SqlLen = 0;
+        conv_f(
+            &utf8_col("1.5e3"),
+            SQL_C_DOUBLE,
+            (&mut out as *mut f64).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(out, 1500.0);
+    }
+
+    #[test]
+    fn non_numeric_character_source_is_invalid_character_value() {
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let err = conv(
+            &utf8_col("not-a-number"),
+            SQL_C_SLONG,
+            (&mut out as *mut i32).cast(),
+            &mut ind,
+        )
+        .unwrap_err();
+        assert_eq!(err, ConvError::InvalidCharacterValue);
+    }
+
+    #[test]
+    fn decimal_out_of_range_for_target_is_rejected() {
+        let mut out: i16 = 0;
+        let mut ind: SqlLen = 0;
+        let err = conv(
+            &dec("99999.5", 18, 1),
+            SQL_C_SSHORT,
+            (&mut out as *mut i16).cast(),
+            &mut ind,
+        )
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
+    }
+
+    #[test]
+    fn parse_decimal_literal_forms() {
+        assert_eq!(
+            parse_decimal_literal("12.34"),
+            Some(NumericSource::Scaled {
+                mantissa: 1234,
+                scale: 2
+            })
+        );
+        assert_eq!(
+            parse_decimal_literal("-0.01"),
+            Some(NumericSource::Scaled {
+                mantissa: -1,
+                scale: 2
+            })
+        );
+        assert_eq!(
+            parse_decimal_literal("+7"),
+            Some(NumericSource::Scaled {
+                mantissa: 7,
+                scale: 0
+            })
+        );
+        assert_eq!(parse_decimal_literal("1e5"), None);
+        assert_eq!(parse_decimal_literal("abc"), None);
+        assert_eq!(parse_decimal_literal(""), None);
+    }
+
+    #[test]
+    fn binary_source_into_numeric_target_is_restricted() {
         let mut out: f64 = 0.0;
         let mut ind: SqlLen = 0;
         let err = conv_f(
@@ -806,7 +1105,7 @@ mod tests {
             &mut ind,
         )
         .unwrap_err();
-        assert_eq!(err, ConvError::NotHandledHere);
+        assert_eq!(err, ConvError::Restricted);
     }
 
     #[test]
