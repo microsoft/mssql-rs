@@ -129,6 +129,20 @@ function Get-CritcmpRegressions {
     }
 }
 
+# Same parse, but for the other direction: the BASELINE is slower by at least
+# $Threshold (its ratio is the 2nd field). These never fail the gate, so without
+# a check an implausible "3x faster" would be published unverified.
+function Get-CritcmpImprovements {
+    param([string]$Comparison, [double]$Threshold)
+    foreach ($line in ($Comparison -split "\r?\n")) {
+        $f = @($line -split '\s+' | Where-Object { $_ -ne '' })
+        if ($f.Count -ge 6 -and $f[1] -match '^[0-9]+\.[0-9]+$' -and $f[5] -match '^[0-9]+\.[0-9]+$') {
+            $base = [double]$f[1]
+            if ($base -ge $Threshold) { [pscustomobject]@{ Name = $f[0]; Ratio = $base } }
+        }
+    }
+}
+
 # Fast, discarded run that primes SQL Server's buffer pool and the OS page cache
 # so the measured pass that follows starts warm. Run before BOTH the candidate
 # and baseline passes: the baseline mssql-tds is rebuilt after a long candidate
@@ -347,6 +361,23 @@ function Get-BenchBinaries {
     $bins
 }
 
+# Compile one side's bench binaries with visible output so any compile error
+# surfaces in the log and fails the run loudly; Get-BenchBinaries above discards
+# cargo's stderr and only extracts paths.
+function Invoke-CompileBenches {
+    param([Parameter(Mandatory)][string]$TargetDir, [Parameter(Mandatory)][string]$Label)
+    Write-Host ">>> Compiling $Label bench binaries ($TargetDir)..."
+    $prev = $env:CARGO_TARGET_DIR
+    $env:CARGO_TARGET_DIR = $TargetDir
+    try {
+        Invoke-Native { cargo bench -p mssql-tds-bench --no-run }
+    } catch {
+        throw "$Label bench compilation failed - see the cargo errors above. $($_.Exception.Message)"
+    } finally {
+        if ($null -eq $prev) { Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue } else { $env:CARGO_TARGET_DIR = $prev }
+    }
+}
+
 # Run every bench binary once per side, candidate then baseline back-to-back,
 # saving to Criterion baselines $CandName / $BaseName; $Filter optionally limits
 # to a Criterion benchmark-id regex. Both binaries write to the shared
@@ -385,6 +416,7 @@ function Restore-CandidateSource {
 }
 
 Write-Host '>>> Building candidate bench binaries (target/)...'
+Invoke-CompileBenches (Join-Path $RepoRoot 'target') 'candidate'
 $script:CandBins = Get-BenchBinaries (Join-Path $RepoRoot 'target')
 if ($script:CandBins.Count -eq 0) { throw 'no candidate bench binaries found' }
 
@@ -392,9 +424,15 @@ Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree...
 Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
 Write-Host '>>> Building baseline bench binaries (target-base/)...'
 Set-BaselineSource
-$script:BaseBins = Get-BenchBinaries (Join-Path $RepoRoot 'target-base')
-Restore-CandidateSource
-Invoke-Native { git worktree remove --force $BaselineTree }
+# finally, so a baseline compile failure cannot leave the checkout holding the
+# baseline source with the candidate stranded in the stash directory.
+try {
+    Invoke-CompileBenches (Join-Path $RepoRoot 'target-base') 'baseline'
+    $script:BaseBins = Get-BenchBinaries (Join-Path $RepoRoot 'target-base')
+} finally {
+    Restore-CandidateSource
+    git worktree remove --force $BaselineTree 2>&1 | Out-Null
+}
 if ($script:BaseBins.Count -eq 0) { throw 'no baseline bench binaries found' }
 
 # Warm-up once; interleaving keeps each candidate/baseline pair adjacent so one
@@ -428,50 +466,163 @@ Write-Host $comparison
 $thr = [double]($env:BENCH_REGRESSION_RATIO)
 if (-not $thr) { $thr = 1.10 }
 $regressions = @(Get-CritcmpRegressions $comparison $thr)
+$impThr = [double]($env:BENCH_IMPROVEMENT_VERIFY_RATIO)
+# Same magnitude as the regression threshold by default: a baseline-slower
+# anomaly pollutes the recorded numbers (and the run-over-run trend they feed)
+# exactly as much as a candidate-slower one, and both directions share one
+# re-measure set.
+if (-not $impThr) { $impThr = $thr }
+$improvements = @(Get-CritcmpImprovements $comparison $impThr)
+# One re-measure set covers both directions, so the re-runs cost one pass.
+$verifyNames = @(@($regressions | ForEach-Object { $_.Name }) + @($improvements | ForEach-Object { $_.Name }) | Select-Object -Unique)
 
-# --- Auto-confirm regressions (re-measure only the offenders, interleaved) ---
-# A strict gate can trip on a transient single-benchmark outlier. Re-measure ONLY
-# the benchmarks that tripped - interleaved per binary, same as the main run - and
-# keep as a real regression only those that trip AGAIN. Both binaries are already
-# built, so this just replays the offenders (adds only their run time).
-$gateComparison = $comparison
-$gateRegressions = $regressions
-$confirmComparison = $null
-if ($regressions.Count -gt 0) {
-    $filter = (($regressions | ForEach-Object { '^' + $_.Name + '$' }) -join '|')
-    Write-Host (">>> Gate tripped by: " + (($regressions | ForEach-Object { $_.Name }) -join ', '))
-    Write-Host ">>> Auto-confirm: re-measuring only those benchmarks (filter: $filter)"
+# --- Auto-confirm regressions: re-measure the offenders N times, require a
+# --- majority to confirm ---
+# A strict gate can trip on a transient single-benchmark outlier - short,
+# CPU-bound benches (e.g. the decode microbenches) can swing double digits on a
+# shared VM. So re-measure ONLY the benchmarks that tripped - interleaved per
+# binary, same as the main run - several times, and keep as a real regression
+# only those that trip in a MAJORITY of the re-runs. A true regression reproduces
+# consistently; noise does not. Both bench binaries are already built and the
+# offenders are a small subset, so the extra re-runs stay cheap.
+#   BENCH_CONFIRM_RUNS   (default 4)                - number of re-runs
+#   BENCH_CONFIRM_QUORUM (default majority = N/2+1)  - re-runs required to confirm
+$confirmRuns = if ($env:BENCH_CONFIRM_RUNS) { [int]$env:BENCH_CONFIRM_RUNS } else { 4 }
+$quorum = if ($env:BENCH_CONFIRM_QUORUM) { [int]$env:BENCH_CONFIRM_QUORUM } else { [int][math]::Floor($confirmRuns / 2) + 1 }
+# Reject settings that would silently disable the gate rather than tune it:
+# 0 re-runs skips the loop and clears every regression, and a quorum above the
+# run count can never be met, so nothing is ever confirmed.
+if ($confirmRuns -lt 1) { throw "BENCH_CONFIRM_RUNS must be >= 1 (got: $confirmRuns); 0 would clear every regression unconfirmed." }
+if ($quorum -lt 1 -or $quorum -gt $confirmRuns) { throw "BENCH_CONFIRM_QUORUM must be between 1 and BENCH_CONFIRM_RUNS (got: $quorum of $confirmRuns)." }
+$confirmed = @()
+$impConfirmed = @()
+$confirmRunComparisons = @()
+$tally = @{}
+$worstRatio = @{}
+$impTally = @{}
+$impBest = @{}
+if ($verifyNames.Count -gt 0) {
+    $filter = (($verifyNames | ForEach-Object { '^' + $_ + '$' }) -join '|')
+    if ($regressions.Count -gt 0) { Write-Host (">>> Gate tripped by: " + (($regressions | ForEach-Object { $_.Name }) -join ', ')) }
+    if ($improvements.Count -gt 0) { Write-Host (">>> Verifying large apparent improvement(s): " + (($improvements | ForEach-Object { $_.Name }) -join ', ')) }
+    Write-Host ">>> Auto-confirm: re-measuring those benchmark(s) ${confirmRuns}x; a result counts only if it reproduces in >= $quorum of $confirmRuns re-runs."
+    # One warm-up before the loop; the re-runs are back-to-back so caches stay hot.
     Invoke-WarmupPass $filter
-    Invoke-Interleave 'candidate_confirm' 'base_confirm' $filter
-
-    Write-Host '>>> Auto-confirm comparison (base_confirm -> candidate_confirm):'
-    $confirmComparison = & {
-        $ErrorActionPreference = 'Continue'
-        $out = critcmp base_confirm candidate_confirm | Out-String
-        if ($LASTEXITCODE -ne 0) { throw "critcmp (confirm) failed (exit $LASTEXITCODE)" }
-        $out
+    for ($run = 1; $run -le $confirmRuns; $run++) {
+        Write-Host ">>> Auto-confirm re-run $run/$confirmRuns..."
+        Invoke-Interleave "candidate_confirm$run" "base_confirm$run" $filter
+        $ct = & {
+            $ErrorActionPreference = 'Continue'
+            $out = critcmp "base_confirm$run" "candidate_confirm$run" | Out-String
+            if ($LASTEXITCODE -ne 0) { throw "critcmp (confirm $run) failed (exit $LASTEXITCODE)" }
+            $out
+        }
+        $ct = $ct.TrimEnd()
+        Write-Host $ct
+        [System.IO.File]::WriteAllText((Join-Path $ResultsDir "confirm-run$run.txt"), $ct + "`n", $Utf8NoBom)
+        $confirmRunComparisons += , $ct
+        foreach ($r in @(Get-CritcmpRegressions $ct $thr)) {
+            if ($tally.ContainsKey($r.Name)) { $tally[$r.Name]++ } else { $tally[$r.Name] = 1 }
+            if (-not $worstRatio.ContainsKey($r.Name) -or $r.Ratio -gt $worstRatio[$r.Name]) { $worstRatio[$r.Name] = $r.Ratio }
+        }
+        foreach ($i in @(Get-CritcmpImprovements $ct $impThr)) {
+            if ($impTally.ContainsKey($i.Name)) { $impTally[$i.Name]++ } else { $impTally[$i.Name] = 1 }
+            if (-not $impBest.ContainsKey($i.Name) -or $i.Ratio -gt $impBest[$i.Name]) { $impBest[$i.Name] = $i.Ratio }
+        }
     }
-    $confirmComparison = $confirmComparison.TrimEnd()
-    Write-Host $confirmComparison
-    [System.IO.File]::WriteAllText((Join-Path $ResultsDir 'confirm.txt'), $confirmComparison + "`n", $Utf8NoBom)
-    $gateComparison = $confirmComparison
-    $gateRegressions = @(Get-CritcmpRegressions $confirmComparison $thr)
+    # Confirmed = benchmarks that tripped in at least $quorum of the re-runs.
+    $confirmed = @($tally.Keys | Where-Object { $tally[$_] -ge $quorum })
+    $impConfirmed = @($impTally.Keys | Where-Object { $impTally[$_] -ge $quorum })
 }
 Remove-Item -Recurse -Force (Join-Path $RepoRoot 'target-base') -ErrorAction SilentlyContinue
 
-# --- Verdict (based on the gate comparison: the re-measured offenders after
-# auto-confirm, or the full run when nothing tripped) ---
-$pct = [int][math]::Round(($thr - 1) * 100)
-$warn = [char]::ConvertFromUtf32(0x26A0) + [char]::ConvertFromUtf32(0xFE0F)
-$check = [char]::ConvertFromUtf32(0x2705)
-if ($gateRegressions.Count -gt 0) {
-    $worst = $gateRegressions | Sort-Object Ratio -Descending | Select-Object -First 1
-    $wpct = [int][math]::Round(($worst.Ratio - 1) * 100)
-    $verdict = "$warn $($gateRegressions.Count) benchmark(s) slower by >=$pct% vs baseline (worst: $($worst.Name) +$wpct%)"
-} else {
-    $verdict = "$check No benchmark slower by >=$pct% vs baseline"
+# Reconcile each re-measured benchmark's headline number with the gate: replace
+# its first-pass ratio with the MEDIAN OF THE RE-RUNS, the same measurements the
+# quorum counts. The first pass is excluded deliberately: a benchmark is only
+# re-measured because that pass was extreme, so including it re-counts the very
+# outlier under test and would give it a tie-breaking vote the gate does not have
+# (2-of-4 re-runs clears the gate, yet 3 of those 5 values are trips, so the
+# median could stay above the threshold and contradict a passing verdict).
+function Get-RatioFor {
+    param([string]$Comparison, [string]$Name)
+    foreach ($line in ($Comparison -split "\r?\n")) {
+        $f = @($line -split '\s+' | Where-Object { $_ -ne '' })
+        if ($f.Count -ge 6 -and $f[0] -eq $Name -and $f[1] -match '^[0-9]+\.[0-9]+$' -and $f[5] -match '^[0-9]+\.[0-9]+$') {
+            return [double]$f[5] / [double]$f[1]
+        }
+    }
+    return $null
+}
+function Get-Median {
+    param([double[]]$Values)
+    if (-not $Values -or $Values.Count -eq 0) { return $null }
+    $s = @($Values | Sort-Object); $n = $s.Count
+    if ($n % 2) { return $s[[int](($n - 1) / 2)] } else { return ($s[[int]($n / 2 - 1)] + $s[[int]($n / 2)]) / 2 }
+}
+$overrides = @{}
+foreach ($name in $verifyNames) {
+    $vals = @()
+    foreach ($cc in $confirmRunComparisons) {
+        $rr = Get-RatioFor $cc $name
+        if ($null -ne $rr) { $vals += $rr }
+    }
+    if ($vals.Count -gt 0) { $overrides[$name] = Get-Median $vals }
 }
 
+# --- Verdict (based on the majority-confirmed regressions) ---
+$pct = [int][math]::Round(($thr - 1) * 100)
+$impPct = [int][math]::Round(($impThr - 1) * 100)
+$warn = [char]::ConvertFromUtf32(0x26A0) + [char]::ConvertFromUtf32(0xFE0F)
+$check = [char]::ConvertFromUtf32(0x2705)
+if ($confirmed.Count -gt 0) {
+    $worstName = $confirmed | Sort-Object { $worstRatio[$_] } -Descending | Select-Object -First 1
+    $wpct = [int][math]::Round(($worstRatio[$worstName] - 1) * 100)
+    $whits = $tally[$worstName]
+    $verdict = "$warn $($confirmed.Count) benchmark(s) consistently slower by >=$pct% vs baseline (worst: $worstName +$wpct%, tripped $whits/$confirmRuns re-runs)"
+} else {
+    $verdict = "$check No benchmark consistently slower by >=$pct% vs baseline"
+}
+
+# Emit each benchmark's % change as a compact, colored "diverging bar" markdown
+# table (renders with color on the run Summary tab, unlike the fixed-width critcmp
+# block). Green = faster, red = slower, one square per ~1%, drawn only outside ±1%.
+# $Overrides maps a re-measured offender to its median ratio (marked ⟳).
+function Get-EmojiBarTable {
+    param([string]$Comparison, [hashtable]$Overrides)
+    $g = [char]::ConvertFromUtf32(0x1F7E9)  # green square
+    $r = [char]::ConvertFromUtf32(0x1F7E5)  # red square
+    if (-not $Overrides) { $Overrides = @{} }
+    $rows = @()
+    foreach ($line in ($Comparison -split "\r?\n")) {
+        $f = @($line -split '\s+' | Where-Object { $_ -ne '' })
+        if ($f.Count -ge 6 -and $f[1] -match '^[0-9]+\.[0-9]+$' -and $f[5] -match '^[0-9]+\.[0-9]+$') {
+            $name = $f[0]
+            if ($Overrides.ContainsKey($name)) {
+                $rows += [pscustomobject]@{ Name = $name; Pct = ($Overrides[$name] - 1) * 100; Rem = $true }
+            } else {
+                $rows += [pscustomobject]@{ Name = $name; Pct = ([double]$f[5] / [double]$f[1] - 1) * 100; Rem = $false }
+            }
+        }
+    }
+    $lines = @(
+        ('| Benchmark | faster ' + [char]0x25C4 + ' | ' + [char]0x0394 + '% | ' + [char]0x25BA + ' slower |')
+        '|---|--:|:--:|:--|'
+    )
+    foreach ($row in ($rows | Sort-Object Pct)) {
+        $p = $row.Pct; $n = [int][math]::Round([math]::Abs($p)); if ($n -gt 12) { $n = 12 }
+        $gs = ''; $rs = ''
+        if ($p -le -1) { $gs = $g * $n } elseif ($p -ge 1) { $rs = $r * $n }
+        if ($p -le -0.05) { $lbl = ('{0:0.0}' -f $p) }
+        elseif ($p -ge 0.05) { $lbl = ('+{0:0.0}' -f $p) }
+        else { $lbl = [char]0x00B1 + '0.0' }
+        $mark = if ($row.Rem) { ' ' + [char]0x27F3 } else { '' }
+        $lines += "| ``$($row.Name)``$mark | $gs | $lbl | $rs |"
+    }
+    return $lines
+}
+
+$gsq = [char]::ConvertFromUtf32(0x1F7E9)
+$rsq = [char]::ConvertFromUtf32(0x1F7E5)
 $summaryLines = @(
     '## mssql-tds perf - base -> candidate'
     ''
@@ -479,11 +630,27 @@ $summaryLines = @(
     ''
 )
 if ($regressions.Count -gt 0) {
-    $summaryLines += '_Auto-confirm re-ran the gate-tripping benchmark(s); the verdict reflects that re-measurement. Benchmarks that tripped once but not on the re-run are treated as transient noise._'
+    $summaryLines += "_Auto-confirm re-measured the initially-tripping benchmark(s) ${confirmRuns}x (interleaved, offenders only). A regression is counted only when it trips in at least $quorum of $confirmRuns re-runs; a benchmark that spikes once but not consistently is treated as transient noise._"
+    $summaryLines += ''
+}
+if ($improvements.Count -gt 0) {
+    $summaryLines += "_Benchmark(s) where the baseline looked slower by at least $impPct% were re-measured the same way, so an apparent win that does not reproduce is not reported as real._"
     $summaryLines += ''
 }
 $summaryLines += @(
+    '### Change vs baseline'
+    ''
+    "_$gsq faster, $rsq slower; 1 square ~ 1% (drawn only for changes of at least 1%); $([char]0x27F3) re-measured (median of re-runs)_"
+    ''
+)
+$summaryLines += (Get-EmojiBarTable $comparison $overrides)
+$summaryLines += ''
+$summaryLines += @(
     "Baseline commit: ``$BaselineCommit``"
+    ''
+    '### Raw first-pass measurements'
+    ''
+    "_Full critcmp table from the initial run. Benchmarks marked $([char]0x27F3) above were re-measured; the chart shows the median and the re-runs are detailed below._"
     ''
     '```'
     $comparison
@@ -492,30 +659,83 @@ $summaryLines += @(
 if ($regressions.Count -gt 0) {
     $summaryLines += @(
         ''
-        '### Auto-confirm re-run (offenders only)'
+        '### Regressions (auto-confirm)'
         ''
-        ('Tripped on the first pass: ' + (($regressions | ForEach-Object { $_.Name }) -join ', '))
+        ('Initially tripped: ' + (($regressions | ForEach-Object { $_.Name }) -join ', '))
         ''
-        '```'
-        $confirmComparison
-        '```'
+        '| benchmark | re-runs tripped | worst |'
+        '|-----------|-----------------|-------|'
     )
+    foreach ($r in $regressions) {
+        $hits = if ($tally.ContainsKey($r.Name)) { $tally[$r.Name] } else { 0 }
+        if ($worstRatio.ContainsKey($r.Name)) {
+            $wcell = '+' + [string][int][math]::Round(($worstRatio[$r.Name] - 1) * 100) + '%'
+        } else {
+            $wcell = [string][char]0x2014
+        }
+        $summaryLines += "| $($r.Name) | $hits/$confirmRuns | $wcell |"
+    }
+    $confList = if ($confirmed.Count -gt 0) { ($confirmed -join ', ') } else { 'none' }
+    $summaryLines += @('', "_Confirmed (tripped in >= $quorum/$confirmRuns): ${confList}_", '')
+}
+if ($improvements.Count -gt 0) {
+    $summaryLines += @(
+        ''
+        '### Large improvements (verification)'
+        ''
+        "_Baseline slower by at least $impPct%. These never fail the gate; they are re-measured so a one-off artifact is not published as a real gain. A win that **does** reproduce is also worth a look - it can mean the candidate is doing less work rather than the same work faster._"
+        ''
+        '| benchmark | reproduced | best |'
+        '|-----------|------------|------|'
+    )
+    foreach ($i in $improvements) {
+        $ihits = if ($impTally.ContainsKey($i.Name)) { $impTally[$i.Name] } else { 0 }
+        if ($impBest.ContainsKey($i.Name)) {
+            $ibcell = ('{0:0.00}x faster' -f $impBest[$i.Name])
+        } else {
+            $ibcell = [string][char]0x2014
+        }
+        $summaryLines += "| $($i.Name) | $ihits/$confirmRuns | $ibcell |"
+    }
+    $impList = if ($impConfirmed.Count -gt 0) { ($impConfirmed -join ', ') } else { 'none' }
+    $summaryLines += @('', "_Verified (reproduced in >= $quorum/$confirmRuns): ${impList}_", '')
+}
+if ($verifyNames.Count -gt 0) {
+    $summaryLines += @('### Re-run detail (re-measured benchmarks only)', '')
+    for ($run = 1; $run -le $confirmRuns; $run++) {
+        $summaryLines += @("#### Re-run $run", '', '```', $confirmRunComparisons[$run - 1], '```', '')
+    }
 }
 $summary = $summaryLines -join "`n"
 [System.IO.File]::WriteAllText((Join-Path $ResultsDir 'summary.md'), $summary + "`n", $Utf8NoBom)
+
+# Also echo the summary into the log: task.uploadsummary only surfaces it on the
+# run's Summary tab, so without this the verdict is invisible when triaging from
+# the log alone.
+Write-Host ''
+Write-Host '===== summary.md ====='
+Write-Host $summary
+Write-Host '===== end summary.md ====='
+Write-Host ''
 
 Copy-Item -Recurse -Force 'target/criterion' (Join-Path $ResultsDir 'criterion') -ErrorAction SilentlyContinue
 
 Write-Host ">>> Done. Results in $ResultsDir"
 
-# Fail the run only on CONFIRMED regressions (the gate comparison). Use `throw`,
-# not `exit`: the scheduled-task wrapper relies on its finally block to write the
-# EXIT_CODE/DONE sentinels, and `exit` from a called .ps1 terminates the whole
-# process and would skip it (leaving run-remote to hang until timeout). summary.md
-# names the offenders and shows the auto-confirm re-run.
-if ($gateRegressions.Count -gt 0) {
+# Fail the run only on CONFIRMED regressions (tripped in a majority of re-runs).
+# Use `throw`, not `exit`: the scheduled-task wrapper relies on its finally block
+# to write the EXIT_CODE/DONE sentinels, and `exit` from a called .ps1 terminates
+# the whole process and would skip it (leaving run-remote to hang until timeout).
+# summary.md names the offenders and shows the auto-confirm re-runs.
+if ($confirmed.Count -gt 0) {
     throw "PERF REGRESSION: $verdict"
 }
 if ($regressions.Count -gt 0) {
-    Write-Host ">>> Auto-confirm cleared all $($regressions.Count) initial regression(s) as transient; passing."
+    Write-Host ">>> Auto-confirm cleared all $($regressions.Count) initial regression(s) as transient (none tripped in >= $quorum/$confirmRuns); passing."
+}
+foreach ($i in $improvements) {
+    $ihits = if ($impTally.ContainsKey($i.Name)) { $impTally[$i.Name] } else { 0 }
+    if ($ihits -lt $quorum) {
+        Write-Host ">>> NOTE: apparent improvement in '$($i.Name)' did not reproduce ($ihits/$confirmRuns); reported as a measurement artifact, not a real gain."
+    }
 }
