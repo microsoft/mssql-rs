@@ -77,7 +77,7 @@ steps:
         Invoke-Sql -Description 'Enable sa' -Arguments @('-Q', 'ALTER LOGIN sa ENABLE;')
         Invoke-Sql -Description 'Relax sa password policy' -Arguments @('-Q', 'ALTER LOGIN sa WITH CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;')
         Invoke-Sql -Description 'Set sa password' -Arguments @('-Q', "ALTER LOGIN sa WITH PASSWORD = '$pw'")
-        Invoke-Sql -Description 'Create testuser' -Arguments @('-Q', "IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'testuser') CREATE LOGIN testuser WITH PASSWORD = '$pw', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;")
+        Invoke-Sql -Description 'Create or update testuser' -Arguments @('-Q', "IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'testuser') CREATE LOGIN testuser WITH PASSWORD = '$pw', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN testuser WITH CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN testuser WITH PASSWORD = '$pw'; ALTER LOGIN testuser ENABLE;")
         Restart-Service -Name 'MSSQLSERVER' -Force
         Wait-ForSql -Label 'MSSQLSERVER'
         Invoke-Sql -Description 'Grant testuser sysadmin' -Arguments @('-Q', 'ALTER SERVER ROLE sysadmin ADD MEMBER testuser;')
@@ -90,7 +90,7 @@ steps:
           $dev = @('-S', 'localhost\SQLDEV', '-C')
           Wait-ForSql -ConnArgs $dev -Label 'SQLDEV'
           Invoke-Sql -Description 'SQLDEV mixed-mode auth' -Arguments ($dev + @('-Q', "EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'LoginMode', REG_DWORD, 2"))
-          Invoke-Sql -Description 'SQLDEV logins' -Arguments ($dev + @('-Q', "ALTER LOGIN sa ENABLE; ALTER LOGIN sa WITH CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN sa WITH PASSWORD = '$pw'; IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'testuser') CREATE LOGIN testuser WITH PASSWORD = '$pw', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER SERVER ROLE sysadmin ADD MEMBER testuser;"))
+          Invoke-Sql -Description 'SQLDEV logins' -Arguments ($dev + @('-Q', "ALTER LOGIN sa ENABLE; ALTER LOGIN sa WITH CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN sa WITH PASSWORD = '$pw'; IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'testuser') CREATE LOGIN testuser WITH PASSWORD = '$pw', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN testuser WITH CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN testuser WITH PASSWORD = '$pw'; ALTER LOGIN testuser ENABLE; ALTER SERVER ROLE sysadmin ADD MEMBER testuser;"))
           Restart-Service -Name 'MSSQL$SQLDEV' -Force
           Wait-ForSql -ConnArgs $dev -Label 'SQLDEV'
           Invoke-Sql -Description 'Verify SQLDEV sa login' -Arguments ($dev + @('-U', 'sa', '-P', $pw, '-Q', 'SELECT @@VERSION'))
