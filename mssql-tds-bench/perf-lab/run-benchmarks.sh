@@ -350,11 +350,12 @@ OFFENDERS=$(regression_ids "$RESULTS_DIR/comparison.txt")
 # The gate is one-directional, so a *baseline*-slower result is never challenged
 # and an unverified "3x faster" gets published. critcmp normalizes the faster
 # side to 1.00, so field 2 carries the baseline's ratio: select IDs where the
-# baseline is slower by at least IMP_THR and re-measure them too.
-improvement_ids() {
+# baseline is slower by at least IMP_THR and re-measure them too, ranked by
+# magnitude so the cap below keeps the largest (most suspicious) claims.
+improvement_ranked() {
     awk -v thr="$IMP_THR" '
-        $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ && ($2 + 0) >= thr { print $1 }
-    ' "$1"
+        $2 ~ /^[0-9]+\.[0-9]+$/ && $6 ~ /^[0-9]+\.[0-9]+$/ && ($2 + 0) >= thr { print $2, $1 }
+    ' "$1" | sort -rn | awk '{ print $2 }'
 }
 improvement_pairs() {
     awk -v thr="$IMP_THR" '
@@ -362,7 +363,25 @@ improvement_pairs() {
     ' "$1"
 }
 
-IMPROVEMENTS=$(improvement_ids "$RESULTS_DIR/comparison.txt")
+# Unlike regressions, improvements are not self-limiting: a PR that genuinely
+# optimizes a hot path can turn a dozen benchmarks green at once, and each one
+# added to the verify set costs CONFIRM_RUNS release-grade re-runs of BOTH sides.
+# Cap the set at the largest apparent wins so the re-run budget stays bounded on
+# exactly the PRs that most deserve a fast signal; the rest are still reported,
+# just not re-measured.
+IMP_MAX="${BENCH_IMPROVEMENT_VERIFY_MAX:-3}"
+case "$IMP_MAX" in ''|*[!0-9]*) echo "ERROR: BENCH_IMPROVEMENT_VERIFY_MAX must be a positive integer (got: '${IMP_MAX}')" >&2; exit 1 ;; esac
+if [ "$IMP_MAX" -lt 1 ]; then
+    echo "ERROR: BENCH_IMPROVEMENT_VERIFY_MAX must be >= 1 (got: ${IMP_MAX}); use a higher BENCH_IMPROVEMENT_VERIFY_RATIO to verify fewer." >&2
+    exit 1
+fi
+IMP_RANKED=$(improvement_ranked "$RESULTS_DIR/comparison.txt")
+IMP_TOTAL=$(printf '%s\n' "$IMP_RANKED" | awk 'NF' | wc -l | tr -d ' ')
+IMPROVEMENTS=$(printf '%s\n' "$IMP_RANKED" | awk 'NF' | head -n "$IMP_MAX")
+IMP_SKIPPED=$(( IMP_TOTAL > IMP_MAX ? IMP_TOTAL - IMP_MAX : 0 ))
+if [ "$IMP_SKIPPED" -gt 0 ]; then
+    echo ">>> ${IMP_TOTAL} benchmark(s) look faster by >=$(awk -v t="$IMP_THR" 'BEGIN { printf "%d", (t - 1) * 100 + 0.5 }')%; verifying the largest ${IMP_MAX} (BENCH_IMPROVEMENT_VERIFY_MAX)."
+fi
 # One re-measure set covers both directions, so the re-runs cost one pass.
 # awk 'NF' drops the blank lines rather than grep, which would exit 1 when both
 # lists are empty (a clean run) and kill the script under set -e.
@@ -576,6 +595,10 @@ emoji_bar_table() {
         echo "### Large improvements (verification)"
         echo ""
         echo "_Baseline slower by ≥${IMP_PCT}%. These never fail the gate; they are re-measured so a one-off artifact is not published as a real gain. A win that **does** reproduce is also worth a look — it can mean the candidate is doing less work rather than the same work faster._"
+        if [ "$IMP_SKIPPED" -gt 0 ]; then
+            echo ""
+            echo "_${IMP_TOTAL} benchmark(s) qualified; the largest ${IMP_MAX} were re-measured (\`BENCH_IMPROVEMENT_VERIFY_MAX\`). The other ${IMP_SKIPPED} keep their first-pass numbers in the chart, unverified._"
+        fi
         echo ""
         echo "| benchmark | reproduced | best |"
         echo "|-----------|------------|------|"

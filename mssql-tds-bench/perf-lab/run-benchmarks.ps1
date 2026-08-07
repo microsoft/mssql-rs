@@ -472,7 +472,20 @@ $impThr = [double]($env:BENCH_IMPROVEMENT_VERIFY_RATIO)
 # exactly as much as a candidate-slower one, and both directions share one
 # re-measure set.
 if (-not $impThr) { $impThr = $thr }
-$improvements = @(Get-CritcmpImprovements $comparison $impThr)
+# Unlike regressions, improvements are not self-limiting: a PR that genuinely
+# optimizes a hot path can turn a dozen benchmarks green at once, and each one
+# added to the verify set costs $confirmRuns release-grade re-runs of BOTH sides.
+# Cap the set at the largest apparent wins so the re-run budget stays bounded;
+# the rest are still reported, just not re-measured.
+$impMax = if ($env:BENCH_IMPROVEMENT_VERIFY_MAX) { [int]$env:BENCH_IMPROVEMENT_VERIFY_MAX } else { 3 }
+if ($impMax -lt 1) { throw "BENCH_IMPROVEMENT_VERIFY_MAX must be >= 1 (got: $impMax); use a higher BENCH_IMPROVEMENT_VERIFY_RATIO to verify fewer." }
+$improvementsAll = @(Get-CritcmpImprovements $comparison $impThr | Sort-Object -Property Ratio -Descending)
+$improvements = @($improvementsAll | Select-Object -First $impMax)
+$impTotal = $improvementsAll.Count
+$impSkipped = $impTotal - $improvements.Count
+if ($impSkipped -gt 0) {
+    Write-Host ">>> $impTotal benchmark(s) look faster by >= $([int][math]::Round(($impThr - 1) * 100, [MidpointRounding]::AwayFromZero))%; verifying the largest $impMax (BENCH_IMPROVEMENT_VERIFY_MAX)."
+}
 # One re-measure set covers both directions, so the re-runs cost one pass.
 $verifyNames = @(@($regressions | ForEach-Object { $_.Name }) + @($improvements | ForEach-Object { $_.Name }) | Select-Object -Unique)
 
@@ -570,13 +583,16 @@ foreach ($name in $verifyNames) {
 }
 
 # --- Verdict (based on the majority-confirmed regressions) ---
-$pct = [int][math]::Round(($thr - 1) * 100)
-$impPct = [int][math]::Round(($impThr - 1) * 100)
+# AwayFromZero to match the bash runner's half-up `printf "%d", x + 0.5`;
+# [math]::Round defaults to banker's rounding, which would render an exact .5%
+# differently on the two platforms.
+$pct = [int][math]::Round(($thr - 1) * 100, [MidpointRounding]::AwayFromZero)
+$impPct = [int][math]::Round(($impThr - 1) * 100, [MidpointRounding]::AwayFromZero)
 $warn = [char]::ConvertFromUtf32(0x26A0) + [char]::ConvertFromUtf32(0xFE0F)
 $check = [char]::ConvertFromUtf32(0x2705)
 if ($confirmed.Count -gt 0) {
     $worstName = $confirmed | Sort-Object { $worstRatio[$_] } -Descending | Select-Object -First 1
-    $wpct = [int][math]::Round(($worstRatio[$worstName] - 1) * 100)
+    $wpct = [int][math]::Round(($worstRatio[$worstName] - 1) * 100, [MidpointRounding]::AwayFromZero)
     $whits = $tally[$worstName]
     $verdict = "$warn $($confirmed.Count) benchmark(s) consistently slower by >=$pct% vs baseline (worst: $worstName +$wpct%, tripped $whits/$confirmRuns re-runs)"
 } else {
@@ -609,7 +625,7 @@ function Get-EmojiBarTable {
         '|---|--:|:--:|:--|'
     )
     foreach ($row in ($rows | Sort-Object Pct)) {
-        $p = $row.Pct; $n = [int][math]::Round([math]::Abs($p)); if ($n -gt 12) { $n = 12 }
+        $p = $row.Pct; $n = [int][math]::Round([math]::Abs($p), [MidpointRounding]::AwayFromZero); if ($n -gt 12) { $n = 12 }
         $gs = ''; $rs = ''
         if ($p -le -1) { $gs = $g * $n } elseif ($p -ge 1) { $rs = $r * $n }
         if ($p -le -0.05) { $lbl = ('{0:0.0}' -f $p) }
@@ -669,7 +685,7 @@ if ($regressions.Count -gt 0) {
     foreach ($r in $regressions) {
         $hits = if ($tally.ContainsKey($r.Name)) { $tally[$r.Name] } else { 0 }
         if ($worstRatio.ContainsKey($r.Name)) {
-            $wcell = '+' + [string][int][math]::Round(($worstRatio[$r.Name] - 1) * 100) + '%'
+            $wcell = '+' + [string][int][math]::Round(($worstRatio[$r.Name] - 1) * 100, [MidpointRounding]::AwayFromZero) + '%'
         } else {
             $wcell = [string][char]0x2014
         }
@@ -685,6 +701,11 @@ if ($improvements.Count -gt 0) {
         ''
         "_Baseline slower by at least $impPct%. These never fail the gate; they are re-measured so a one-off artifact is not published as a real gain. A win that **does** reproduce is also worth a look - it can mean the candidate is doing less work rather than the same work faster._"
         ''
+    )
+    if ($impSkipped -gt 0) {
+        $summaryLines += @("_$impTotal benchmark(s) qualified; the largest $impMax were re-measured (``BENCH_IMPROVEMENT_VERIFY_MAX``). The other $impSkipped keep their first-pass numbers in the chart, unverified._", '')
+    }
+    $summaryLines += @(
         '| benchmark | reproduced | best |'
         '|-----------|------------|------|'
     )
