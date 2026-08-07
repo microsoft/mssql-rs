@@ -45,6 +45,18 @@ pub(crate) trait TdsPacketReader {
     async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()>;
     async fn cancel_read_stream(&mut self) -> TdsResult<()>;
     fn reset_reader(&mut self);
+
+    /// Non-async fast path for fixed-width reads of at most 8 bytes.
+    ///
+    /// Returns the bytes left-aligned in the array and consumes them when the
+    /// current packet buffer already holds them; returns None when a refill is
+    /// needed so the caller falls back to the async method. Bypassing the
+    /// `#[async_trait]` methods here avoids a boxed future allocation for every
+    /// scalar read on the row-decode hot path.
+    fn try_take_fixed(&mut self, n: usize) -> Option<[u8; 8]> {
+        let _ = n;
+        None
+    }
 }
 
 /// Low-level TDS packet reading operations (public under `fuzzing` cfg).
@@ -76,6 +88,60 @@ pub trait TdsPacketReader {
     async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()>;
     async fn cancel_read_stream(&mut self) -> TdsResult<()>;
     fn reset_reader(&mut self);
+
+    /// Non-async fast path for fixed-width reads of at most 8 bytes.
+    ///
+    /// Returns the bytes left-aligned in the array and consumes them when the
+    /// current packet buffer already holds them; returns None when a refill is
+    /// needed so the caller falls back to the async method. Bypassing the
+    /// `#[async_trait]` methods here avoids a boxed future allocation for every
+    /// scalar read on the row-decode hot path.
+    fn try_take_fixed(&mut self, n: usize) -> Option<[u8; 8]> {
+        let _ = n;
+        None
+    }
+}
+
+/// Zero-allocation fixed-width reads.
+///
+/// Each helper first tries [`TdsPacketReader::try_take_fixed`], which serves the
+/// value straight from the packet buffer without constructing the boxed future
+/// that `#[async_trait]` allocates for every trait method call. Only a buffer
+/// refill falls back to the async method.
+pub(crate) mod fast {
+    use super::{TdsPacketReader, TdsResult};
+    use byteorder::{ByteOrder, LittleEndian};
+
+    macro_rules! fast_read {
+        ($name:ident, $ty:ty, $n:expr, $slow:ident, $decode:expr) => {
+            #[inline]
+            pub(crate) async fn $name<R>(reader: &mut R) -> TdsResult<$ty>
+            where
+                R: TdsPacketReader + Send + Sync + ?Sized,
+            {
+                #[allow(clippy::redundant_closure_call)]
+                match reader.try_take_fixed($n) {
+                    Some(bytes) => Ok($decode(&bytes[..$n])),
+                    None => reader.$slow().await,
+                }
+            }
+        };
+    }
+
+    fast_read!(read_byte, u8, 1, read_byte, |b: &[u8]| b[0]);
+    fast_read!(read_int16, i16, 2, read_int16, LittleEndian::read_i16);
+    fast_read!(read_uint16, u16, 2, read_uint16, LittleEndian::read_u16);
+    fast_read!(read_int32, i32, 4, read_int32, LittleEndian::read_i32);
+    fast_read!(read_uint32, u32, 4, read_uint32, LittleEndian::read_u32);
+    fast_read!(read_int64, i64, 8, read_int64, LittleEndian::read_i64);
+    fast_read!(read_float32, f32, 4, read_float32, LittleEndian::read_f32);
+    fast_read!(read_float64, f64, 8, read_float64, LittleEndian::read_f64);
+    fast_read!(read_uint24, u32, 3, read_uint24, |b: &[u8]| {
+        LittleEndian::read_uint(b, 3) as u32
+    });
+    fast_read!(read_uint40, u64, 5, read_uint40, |b: &[u8]| {
+        LittleEndian::read_uint(b, 5)
+    });
 }
 
 /// Buffered reader that reassembles TDS packets from the network stream.
@@ -261,6 +327,22 @@ impl TdsPacketReader for PacketReader<'_> {
         let result: u8 = self.working_buffer[self.buffer_position];
         self.consume_bytes(1)?;
         Ok(result)
+    }
+
+    fn try_take_fixed(&mut self, n: usize) -> Option<[u8; 8]> {
+        debug_assert!(n <= 8);
+        if n > 8 || !self.do_we_have_enough_data(n) {
+            return None;
+        }
+        let mut out = [0u8; 8];
+        out[..n]
+            .copy_from_slice(&self.working_buffer[self.buffer_position..self.buffer_position + n]);
+        self.buffer_position += n;
+        if self.buffer_length == self.buffer_position {
+            self.buffer_length = 0;
+            self.buffer_position = 0;
+        }
+        Some(out)
     }
 
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
@@ -500,6 +582,10 @@ impl TdsPacketReader for PacketReader<'_> {
 impl TdsPacketReader for Box<dyn TdsPacketReader + Send + Sync> {
     async fn read_byte(&mut self) -> TdsResult<u8> {
         (**self).read_byte().await
+    }
+
+    fn try_take_fixed(&mut self, n: usize) -> Option<[u8; 8]> {
+        (**self).try_take_fixed(n)
     }
 
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {

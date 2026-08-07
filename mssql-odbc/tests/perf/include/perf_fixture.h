@@ -131,6 +131,12 @@ private:
 /// the comparison meaningful.
 int64_t DrainRows(SQLHSTMT stmt, std::string* error);
 
+/// Advances the cursor to exhaustion without retrieving any column data.
+///
+/// Isolates the per-row cost of the cursor and token-stream path from the
+/// per-column `SQLGetData` conversion cost measured by `DrainRows`.
+int64_t DrainRowsNoGetData(SQLHSTMT stmt, std::string* error);
+
 /// Close the cursor so the statement can be reused for the next iteration.
 void CloseCursor(SQLHSTMT stmt);
 

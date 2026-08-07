@@ -95,6 +95,9 @@ pub struct TdsClient {
     /// the metadata it was built for so it is rebuilt when the result set
     /// changes. `None` until the first encrypted result set is seen.
     current_decryptor: Option<MemoizedCellDecryptor>,
+    /// Row-decode parser context for `current_metadata`, built once per result
+    /// set instead of once per row. Rebuilt when the metadata `Arc` changes.
+    current_parser_context: Option<ParserContext>,
     count_map: HashMap<CurrentCommand, u64>,
     /// Rows affected by the most recent statement; see [`last_rows_affected`](Self::last_rows_affected).
     last_rows_affected: i64,
@@ -193,6 +196,7 @@ impl TdsClient {
             recovery_context: Box::new(recovery_context),
             current_metadata: None,
             current_decryptor: None,
+            current_parser_context: None,
             count_map: HashMap::new(),
             last_rows_affected: -1,
             dml_result_counts: Vec::new(),
@@ -2086,7 +2090,6 @@ impl TdsClient {
 
     /// This functions returns to the next row in the result set.
     /// If there are no more rows, it returns None.
-    #[instrument(skip(self), level = "info")]
     pub(crate) async fn get_next_row(&mut self) -> TdsResult<Option<Vec<ColumnValues>>> {
         let col_count = self
             .current_metadata
@@ -2099,6 +2102,160 @@ impl TdsClient {
         } else {
             Ok(None)
         }
+    }
+
+    /// Fetches the next row, reusing `buffer`'s allocation instead of returning
+    /// a freshly allocated `Vec` per row.
+    ///
+    /// Returns `false` when the result set is exhausted, leaving `buffer`
+    /// cleared. Callers driving a cursor row-by-row (ODBC `SQLFetch`) should
+    /// prefer this over [`ResultSet::next_row`]: it avoids both the per-row
+    /// `Vec` allocation and the boxed future that `#[async_trait]` introduces
+    /// for the trait method.
+    pub async fn fetch_next_row_into_vec(
+        &mut self,
+        buffer: &mut Vec<ColumnValues>,
+    ) -> TdsResult<bool> {
+        if !self.maybe_has_unread_rows() {
+            buffer.clear();
+            return Ok(false);
+        }
+        let col_count = self
+            .current_metadata
+            .as_ref()
+            .map(|m| m.columns.len())
+            .unwrap_or(0);
+        let mut writer = DefaultRowWriter::with_buffer(std::mem::take(buffer), col_count);
+        // Boxed deliberately: measurably faster than letting this future be
+        // materialized inline in the caller's frame on every fetch.
+        let has_row = Box::pin(self.get_next_row_into(&mut writer)).await?;
+        *buffer = writer.take_row();
+        if !has_row {
+            buffer.clear();
+        }
+        Ok(has_row)
+    }
+
+    /// Fetches up to `max_rows` rows in a single decode call, appending them to
+    /// `out`.
+    ///
+    /// The per-row cost of a cursor is dominated by constructing and polling the
+    /// decode state machine, not by the decoding itself. Draining several rows
+    /// inside one future amortizes that cost over the whole batch. `spare`
+    /// supplies row buffers the caller has already consumed so the batch does
+    /// not allocate a fresh `Vec` per row.
+    ///
+    /// Returns the number of rows appended; a short batch means the result set
+    /// is exhausted. Falls back to a single row when decoding pauses mid-row
+    /// (incremental PLP / column streaming), preserving the paused-cursor
+    /// contract of [`Self::fetch_next_row_into_vec`].
+    pub async fn fetch_rows_batch(
+        &mut self,
+        out: &mut Vec<Vec<ColumnValues>>,
+        spare: Vec<Vec<ColumnValues>>,
+        max_rows: usize,
+    ) -> TdsResult<usize> {
+        if max_rows == 0 || !self.maybe_has_unread_rows() {
+            return Ok(0);
+        }
+        let col_count = self
+            .current_metadata
+            .as_ref()
+            .map(|m| m.columns.len())
+            .unwrap_or(0);
+        let mut writer = DefaultRowWriter::batching(col_count, spare);
+        // Boxed deliberately: materializing this future inline in the caller's
+        // frame is measurably slower than the single allocation.
+        let count = Box::pin(self.get_rows_into(&mut writer, max_rows)).await?;
+        out.append(&mut writer.take_completed());
+        Ok(count)
+    }
+
+    /// Decodes up to `max_rows` rows through a batch-mode writer inside a single
+    /// future, hoisting the per-result-set setup (metadata resolution, parser
+    /// context, decryptor lookup) out of the per-row path.
+    async fn get_rows_into(
+        &mut self,
+        writer: &mut DefaultRowWriter,
+        max_rows: usize,
+    ) -> TdsResult<usize> {
+        if self.current_metadata.is_none() {
+            return Err(UsageError(
+                "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
+            ));
+        }
+        if !matches!(self.active_row_read_state, ActiveRowReadState::Idle) {
+            return Err(crate::error::Error::ImplementationError(
+                "Batched fetch cannot start while a row read is paused".to_string(),
+            ));
+        }
+
+        let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
+        let cached = matches!(
+            &self.current_parser_context,
+            Some(ParserContext::ColumnMetadata(built_for, _)) if Arc::ptr_eq(built_for, &metadata)
+        );
+        if !cached {
+            let decryptor = self.resolve_cell_decryptor(&metadata).await?;
+            self.current_parser_context = Some(ParserContext::ColumnMetadata(metadata, decryptor));
+        }
+        let parser_context = self.current_parser_context.clone().unwrap();
+
+        let mut count = 0;
+        while count < max_rows {
+            // `Instant::now` is a counter read on every call; skip both of them
+            // when no request timeout is being tracked.
+            let start = self.remaining_request_timeout.map(|_| Instant::now());
+            let batch = self
+                .transport
+                .receive_rows_into(
+                    &parser_context,
+                    self.remaining_request_timeout,
+                    self.cancel_handle.as_ref(),
+                    writer,
+                    max_rows - count,
+                )
+                .await?;
+            if let Some(start) = start {
+                self.update_remaining_timeout(start);
+            }
+            count += batch.rows;
+
+            match batch.stopped_at {
+                None => break,
+                Some(RowReadResult::RowWritten) => unreachable!("batch consumes written rows"),
+                Some(RowReadResult::RowPaused(_) | RowReadResult::PlpPaused(_)) => {
+                    return Err(crate::error::Error::ImplementationError(
+                        "Row decode paused against a non-pausing batch writer".to_string(),
+                    ));
+                }
+                Some(RowReadResult::Token(token)) => {
+                    // Boxed: non-row tokens appear once per result set, but the
+                    // handler inlines every token parser's state machine.
+                    if Box::pin(self.handle_row_read_token(token)).await?.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Diagnostic: byte sizes of the futures on the row-fetch hot path.
+    ///
+    /// Exposed so perf work can verify that changes actually shrink the
+    /// per-row state machines rather than just moving allocations around.
+    #[doc(hidden)]
+    pub fn row_future_sizes(&mut self) -> (usize, usize) {
+        let mut writer = DefaultRowWriter::new(0);
+        let inner = self.get_next_row_into(&mut writer);
+        let size_inner = std::mem::size_of_val(&inner);
+        drop(inner);
+        let mut buf = Vec::new();
+        let outer = self.fetch_next_row_into_vec(&mut buf);
+        let size_outer = std::mem::size_of_val(&outer);
+        drop(outer);
+        (size_inner, size_outer)
     }
 
     /// Returns `true` when transparent parameter encryption should be attempted:
@@ -2834,7 +2991,6 @@ impl TdsClient {
     ///
     /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
     /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
-    #[instrument(skip(self, writer), level = "info")]
     pub(crate) async fn get_next_row_into(
         &mut self,
         writer: &mut (dyn RowWriter + Send),
@@ -2851,7 +3007,10 @@ impl TdsClient {
                 return self.resume_row_loop(*pause_state, writer).await;
             }
             ActiveRowReadState::PlpPaused(mut plp_state) => {
-                let mut buffer = [0u8; 8192];
+                // Heap-allocated deliberately: an inline `[u8; 8192]` would be
+                // baked into this function's future and paid for on every row,
+                // not just on the rare paused-PLP path.
+                let mut buffer = vec![0u8; 8192];
                 while !plp_state.reached_end() {
                     let start = Instant::now();
                     let read = self
@@ -2878,8 +3037,15 @@ impl TdsClient {
         }
 
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
-        let decryptor = self.resolve_cell_decryptor(&metadata).await?;
-        let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
+        let cached = matches!(
+            &self.current_parser_context,
+            Some(ParserContext::ColumnMetadata(built_for, _)) if Arc::ptr_eq(built_for, &metadata)
+        );
+        if !cached {
+            let decryptor = self.resolve_cell_decryptor(&metadata).await?;
+            self.current_parser_context = Some(ParserContext::ColumnMetadata(metadata, decryptor));
+        }
+        let parser_context = self.current_parser_context.clone().unwrap();
         loop {
             let start = Instant::now();
             let result = self
@@ -2896,7 +3062,6 @@ impl TdsClient {
             match result {
                 RowReadResult::RowWritten => {
                     writer.end_row();
-                    info!("Row Received");
                     return Ok(true);
                 }
                 RowReadResult::RowPaused(pause_state) => {
@@ -2937,7 +3102,6 @@ impl TdsClient {
         match result {
             RowReadResult::RowWritten => {
                 writer.end_row();
-                info!("Row Received");
                 Ok(true)
             }
             RowReadResult::RowPaused(next_pause) => {
@@ -3466,7 +3630,6 @@ impl ResultSet for TdsClient {
             .unwrap_or(&self.empty_metadata)
     }
 
-    #[instrument(skip(self), level = "info")]
     async fn next_row(&mut self) -> TdsResult<Option<Vec<ColumnValues>>> {
         if self.maybe_has_unread_rows() {
             self.get_next_row().await
@@ -3475,7 +3638,6 @@ impl ResultSet for TdsClient {
         }
     }
 
-    #[instrument(skip(self, writer), level = "info")]
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool> {
         if self.maybe_has_unread_rows() {
             self.get_next_row_into(writer).await

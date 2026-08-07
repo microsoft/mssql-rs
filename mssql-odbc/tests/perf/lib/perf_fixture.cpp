@@ -257,6 +257,24 @@ int64_t DrainRows(SQLHSTMT stmt, std::string* error) {
     return rows;
 }
 
+int64_t DrainRowsNoGetData(SQLHSTMT stmt, std::string* error) {
+    int64_t rows = 0;
+    for (;;) {
+        SQLRETURN rc = SQLFetch(stmt);
+        if (rc == SQL_NO_DATA) {
+            break;
+        }
+        if (!SQL_SUCCEEDED(rc)) {
+            if (error) {
+                *error = "SQLFetch failed: " + DiagText(SQL_HANDLE_STMT, stmt);
+            }
+            return -1;
+        }
+        rows++;
+    }
+    return rows;
+}
+
 void CloseCursor(SQLHSTMT stmt) {
     // SQLCloseCursor returns 24000 when no cursor is open (e.g. after a DDL
     // statement); that is expected, so the return code is deliberately ignored.

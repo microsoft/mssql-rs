@@ -149,6 +149,8 @@ fn sql_get_type_info_w_safe(
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.column_metadata.clear();
         stmt_state.current_row = None;
+        stmt_state.reset_get_data_cursor();
+        stmt_state.discard_row_batch();
         stmt_state.prepared_sql = None;
         // A cached prepared plan is superseded; release its server handle
         // (deferred) once we hold the client below.

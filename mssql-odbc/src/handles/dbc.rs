@@ -60,7 +60,7 @@ pub(crate) struct DbcState {
     /// one statement may hold an open cursor per connection at a time.
     pub(crate) active_stmt: Option<*mut c_void>,
     /// Active TDS connection, present only when `connection_state == Connected`.
-    pub(crate) client: Option<TdsClient>,
+    pub(crate) client: Option<Box<TdsClient>>,
     /// Pre-connect access token set via `SQL_COPT_SS_ACCESS_TOKEN`.
     /// Consumed by `SQLDriverConnect` to select `AccessToken` authentication.
     pub(crate) access_token: Option<String>,

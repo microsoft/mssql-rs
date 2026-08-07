@@ -71,6 +71,16 @@ pub(crate) struct StmtState {
     pub(crate) pending_unprepare: Option<i32>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
+    /// Rows decoded ahead of the cursor by the last batched fetch, oldest first.
+    /// `SQLFetch` serves from here before going back to the wire, which keeps
+    /// the async decode state machine off the per-row path.
+    pub(crate) row_batch: VecDeque<Vec<ColumnValues>>,
+    /// Row buffers already consumed by the cursor, recycled by the next batch.
+    pub(crate) row_batch_spare: Vec<Vec<ColumnValues>>,
+    /// Chunked-read progress for `SQLGetData`, so successive calls on the same
+    /// column advance through a long value instead of re-returning the same
+    /// prefix. Reset by `SQLFetch` and whenever a different column is read.
+    pub(crate) get_data_cursor: Option<GetDataCursor>,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
     /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
@@ -99,9 +109,67 @@ pub(crate) struct StmtState {
     pub(crate) state_flags: u32,
 }
 
+/// Chunked-read progress for `SQLGetData`.
+///
+/// ODBC lets an application pull a long value in pieces by calling
+/// `SQLGetData` repeatedly on the same column until it returns `SQL_NO_DATA`.
+/// That requires the driver to remember how much of the value it has already
+/// handed back; without it the application receives the same prefix forever and
+/// the loop never terminates.
+#[derive(Debug)]
+pub(crate) struct GetDataCursor {
+    /// 1-based column ordinal this cursor tracks.
+    pub(crate) column: SqlUSmallInt,
+    /// Whether the buffered payload was produced for `SQL_C_WCHAR`. A change of
+    /// target type restarts the read rather than reusing an incompatible buffer.
+    pub(crate) wide: bool,
+    /// The converted value, buffered only when a chunk had to be truncated.
+    /// `None` means the value was delivered in full and the next call on this
+    /// column reports `SQL_NO_DATA`.
+    pub(crate) payload: Option<GetDataPayload>,
+    /// Number of elements already delivered from `payload`.
+    pub(crate) offset: usize,
+}
+
+/// Buffered `SQLGetData` value, in the element width of the requested C type.
+#[derive(Debug)]
+pub(crate) enum GetDataPayload {
+    /// `SQL_C_CHAR` payload.
+    Narrow(Vec<u8>),
+    /// `SQL_C_WCHAR` payload.
+    Wide(Vec<u16>),
+}
+
+impl GetDataCursor {
+    /// Cursor for a value that was delivered in full, so the next read on the
+    /// same column reports `SQL_NO_DATA`. Holds no buffer.
+    pub(crate) fn exhausted(column: SqlUSmallInt, wide: bool) -> Self {
+        Self {
+            column,
+            wide,
+            payload: None,
+            offset: 0,
+        }
+    }
+}
+
 impl StmtState {
     pub(crate) fn has_state(&self, mask: u32) -> bool {
         (self.state_flags & mask) != 0
+    }
+
+    /// Discards any chunked `SQLGetData` progress. Called whenever the current
+    /// row changes so each column's read restarts from the beginning.
+    pub(crate) fn reset_get_data_cursor(&mut self) {
+        self.get_data_cursor = None;
+    }
+
+    /// Drops rows read ahead of the cursor. Called whenever the cursor is
+    /// closed or repositioned onto a different result set, so a stale batch is
+    /// never served after the underlying rowset has changed.
+    pub(crate) fn discard_row_batch(&mut self) {
+        self.row_batch.clear();
+        self.row_batch_spare.clear();
     }
 
     pub(crate) fn set_state(&mut self, mask: u32) {
@@ -160,6 +228,9 @@ impl StmtHandle {
                 prepared_handle: None,
                 pending_unprepare: None,
                 current_row: None,
+                row_batch: VecDeque::new(),
+                row_batch_spare: Vec::new(),
+                get_data_cursor: None,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
                 row_array_size: 1,

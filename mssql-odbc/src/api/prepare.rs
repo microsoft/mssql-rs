@@ -115,6 +115,8 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     stmt_state.orphan_prepared_handle();
     stmt_state.column_metadata.clear();
     stmt_state.current_row = None;
+    stmt_state.reset_get_data_cursor();
+    stmt_state.discard_row_batch();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.set_state(STMT_STATE_PREPARED);
 

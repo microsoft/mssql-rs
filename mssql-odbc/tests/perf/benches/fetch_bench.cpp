@@ -29,7 +29,8 @@ struct Session {
     }
 };
 
-void FetchRange(benchmark::State& state, const std::string& columns) {
+void FetchRange(benchmark::State& state, const std::string& columns,
+                bool get_data = true) {
     PERF_REQUIRE(perf::Config::Instance().HasConnection(), state,
                  "no connection configured (set ODBC_TEST_SERVER)");
     Session s;
@@ -48,7 +49,8 @@ void FetchRange(benchmark::State& state, const std::string& columns) {
             return;
         }
         std::string err;
-        int64_t n = perf::DrainRows(s.conn.stmt(), &err);
+        int64_t n = get_data ? perf::DrainRows(s.conn.stmt(), &err)
+                             : perf::DrainRowsNoGetData(s.conn.stmt(), &err);
         if (n < 0) {
             state.SkipWithError(err.c_str());
             return;
@@ -71,6 +73,11 @@ void BM_Fetch_WideRows(benchmark::State& state) {
                "payload AS p5, payload AS p6, payload AS p7");
 }
 
+/// Cursor-only advance — isolates SQLFetch cost from SQLGetData conversion.
+void BM_Fetch_RowsOnly(benchmark::State& state) {
+    FetchRange(state, "id", /*get_data=*/false);
+}
+
 BENCHMARK(BM_Fetch_NarrowRows)
     ->Arg(100)
     ->Arg(1000)
@@ -81,6 +88,7 @@ BENCHMARK(BM_Fetch_WideRows)
     ->Arg(1000)
     ->Arg(10000)
     ->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_Fetch_RowsOnly)->Arg(10000)->Unit(benchmark::kMillisecond);
 
 }  // namespace
 

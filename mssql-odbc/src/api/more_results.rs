@@ -115,6 +115,8 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // Refresh the count for the newly-positioned result set (-1 for a SELECT).
             stmt_state.row_count = client.last_rows_affected();
             stmt_state.current_row = None;
+            stmt_state.reset_get_data_cursor();
+            stmt_state.discard_row_batch();
             // Drain INFO only after the lock is held.
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
@@ -148,6 +150,8 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // SQLRowCount now that we are positioned on it.
             stmt_state.row_count = client.last_rows_affected();
             stmt_state.current_row = None;
+            stmt_state.reset_get_data_cursor();
+            stmt_state.discard_row_batch();
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
@@ -246,7 +250,7 @@ mod tests {
         }
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
+            ds.client = Some(Box::new(client));
             ds.active_stmt = Some(h.stmt);
         }
         first

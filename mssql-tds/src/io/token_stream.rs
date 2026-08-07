@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use crate::io::packet_reader::fast;
+
 use crate::core::{CancelHandle, TdsResult};
 use crate::datatypes::decoder::{GenericDecoder, PlpColumnStream, decrypt_encrypted_column};
 use crate::datatypes::row_writer::{RowWriter, write_column_value};
@@ -111,6 +113,14 @@ impl PlpPauseState {
     }
 }
 
+/// Outcome of a batched row read: the number of rows decoded, plus the
+/// non-row result that ended the batch (a token, or a mid-row pause) when the
+/// batch stopped before reaching its row limit.
+pub(crate) struct BatchRowsResult {
+    pub(crate) rows: usize,
+    pub(crate) stopped_at: Option<RowReadResult>,
+}
+
 #[async_trait]
 #[cfg(not(fuzzing))]
 pub(crate) trait TdsTokenStreamReader {
@@ -128,6 +138,45 @@ pub(crate) trait TdsTokenStreamReader {
         cancel_handle: Option<&CancelHandle>,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult>;
+
+    /// Decodes up to `max_rows` consecutive ROW/NBCROW tokens in one call,
+    /// calling [`RowWriter::end_row`] after each.
+    ///
+    /// Cursor drivers use this so the cost of the boxed trait future and the
+    /// surrounding cancellation and timeout machinery is paid once per rowset
+    /// rather than once per row. The default implementation preserves exact
+    /// per-row behavior; transports on the hot path override it.
+    async fn receive_rows_into(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        writer: &mut (dyn RowWriter + Send),
+        max_rows: usize,
+    ) -> TdsResult<BatchRowsResult> {
+        let mut rows = 0;
+        while rows < max_rows {
+            match self
+                .receive_row_into(context, remaining_request_timeout, cancel_handle, writer)
+                .await?
+            {
+                RowReadResult::RowWritten => {
+                    writer.end_row();
+                    rows += 1;
+                }
+                stopped_at => {
+                    return Ok(BatchRowsResult {
+                        rows,
+                        stopped_at: Some(stopped_at),
+                    });
+                }
+            }
+        }
+        Ok(BatchRowsResult {
+            rows,
+            stopped_at: None,
+        })
+    }
 
     /// Resume a paused row decode from the column after the one that triggered
     /// [`pause_after_column`](RowWriter::pause_after_column).
@@ -171,6 +220,38 @@ pub trait TdsTokenStreamReader {
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult>;
 
+    async fn receive_rows_into(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        writer: &mut (dyn RowWriter + Send),
+        max_rows: usize,
+    ) -> TdsResult<BatchRowsResult> {
+        let mut rows = 0;
+        while rows < max_rows {
+            match self
+                .receive_row_into(context, remaining_request_timeout, cancel_handle, writer)
+                .await?
+            {
+                RowReadResult::RowWritten => {
+                    writer.end_row();
+                    rows += 1;
+                }
+                stopped_at => {
+                    return Ok(BatchRowsResult {
+                        rows,
+                        stopped_at: Some(stopped_at),
+                    });
+                }
+            }
+        }
+        Ok(BatchRowsResult {
+            rows,
+            stopped_at: None,
+        })
+    }
+
     async fn resume_row_into(
         &mut self,
         pause_state: RowPauseState,
@@ -209,7 +290,7 @@ type RowDecodeContext<'a> = (&'a [ColumnMetadata], Option<&'a Arc<dyn CellDecryp
 /// NBC row token parser.
 /// The consumer of the TokenStreamReader is supposed to set/reset this context.
 /// Incorrectly managing this context, can lead to bad context being used for subsequent operations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cfg(not(fuzzing))]
 pub(crate) enum ParserContext {
     /// Column metadata for the current result set, paired with an optional
@@ -224,7 +305,7 @@ pub(crate) enum ParserContext {
     None(()),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cfg(fuzzing)]
 #[allow(private_interfaces)]
 pub enum ParserContext {
@@ -307,7 +388,7 @@ pub(crate) async fn receive_token_internal<R: TdsPacketReader + Send + Sync>(
     registry: &impl TokenParserRegistry,
     context: &ParserContext,
 ) -> TdsResult<Tokens> {
-    let token_type_byte = reader.read_byte().await?;
+    let token_type_byte = fast::read_byte(reader).await?;
     let token_type: TokenType = token_type_byte.try_into()?;
     debug!(
         "Received token type: {:?} ({})",
@@ -342,7 +423,7 @@ async fn decode_row_columns<R: TdsPacketReader + Send + Sync>(
                     ),
                 });
             }
-            match PlpColumnStream::begin(meta, reader).await? {
+            match Box::pin(PlpColumnStream::begin(meta, reader)).await? {
                 None => {
                     writer.write_null(col);
                     if col + 1 < columns.len() {
@@ -408,7 +489,7 @@ async fn decode_nbcrow_columns<R: TdsPacketReader + Send + Sync>(
                         ),
                     });
                 }
-                match PlpColumnStream::begin(meta, reader).await? {
+                match Box::pin(PlpColumnStream::begin(meta, reader)).await? {
                     None => {
                         writer.write_null(col);
                         if col + 1 < columns.len() {
@@ -457,24 +538,22 @@ async fn decode_or_decrypt_column<R: TdsPacketReader + Send + Sync>(
     col: usize,
     writer: &mut (dyn RowWriter + Send),
 ) -> TdsResult<()> {
-    match (meta.crypto_metadata.is_some(), decryptor) {
-        (true, Some(dec)) => {
-            let value = decrypt_encrypted_column(decoder, reader, meta, dec).await?;
+    if meta.crypto_metadata.is_some() {
+        if let Some(dec) = decryptor {
+            // Boxed: Always Encrypted is a cold path but its state machine would
+            // otherwise be baked into this per-column future.
+            let value = Box::pin(decrypt_encrypted_column(decoder, reader, meta, dec)).await?;
             write_column_value(writer, col, value);
+            return Ok(());
         }
-        (true, None) => {
-            tracing::info!(
-                column = %meta.column_name,
-                "Encrypted column has no column-encryption decryptor available \
-                 (Always Encrypted disabled for this command, or no key-store \
-                 provider registered); returning the raw ciphertext varbinary"
-            );
-            decoder.decode_into(reader, meta, col, writer).await?;
-        }
-        (false, _) => {
-            decoder.decode_into(reader, meta, col, writer).await?;
-        }
+        tracing::info!(
+            column = %meta.column_name,
+            "Encrypted column has no column-encryption decryptor available \
+             (Always Encrypted disabled for this command, or no key-store \
+             provider registered); returning the raw ciphertext varbinary"
+        );
     }
+    decoder.decode_into(reader, meta, col, writer).await?;
     Ok(())
 }
 
@@ -484,7 +563,7 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
     context: &ParserContext,
     writer: &mut (dyn RowWriter + Send),
 ) -> TdsResult<RowReadResult> {
-    let token_type_byte = reader.read_byte().await?;
+    let token_type_byte = fast::read_byte(reader).await?;
     let token_type: TokenType = token_type_byte.try_into()?;
     debug!("Parsing token type: {:?}", &token_type);
 
@@ -501,15 +580,48 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
             decode_nbcrow_columns(reader, columns, decryptor, &bitmap, 0, writer).await
         }
         _ => {
-            let token = dispatch_token(reader, registry, token_type, context).await?;
+            // Boxed on purpose: `dispatch_token` inlines every token parser's
+            // state machine, and leaving it unboxed would make this function's
+            // future — constructed for every row — as large as the largest
+            // parser. Non-row tokens appear once per result set, so the
+            // allocation is negligible there.
+            let token = Box::pin(dispatch_token(reader, registry, token_type, context)).await?;
             Ok(RowReadResult::Token(token))
         }
     }
 }
 
+/// Decodes up to `max_rows` consecutive rows without leaving this future,
+/// so the caller pays for the surrounding async machinery once per batch.
+pub(crate) async fn receive_rows_into_internal<R: TdsPacketReader + Send + Sync>(
+    reader: &mut R,
+    registry: &impl TokenParserRegistry,
+    context: &ParserContext,
+    writer: &mut (dyn RowWriter + Send),
+    max_rows: usize,
+) -> TdsResult<BatchRowsResult> {
+    let mut rows = 0;
+    while rows < max_rows {
+        match receive_row_into_internal(reader, registry, context, writer).await? {
+            RowReadResult::RowWritten => {
+                writer.end_row();
+                rows += 1;
+            }
+            stopped_at => {
+                return Ok(BatchRowsResult {
+                    rows,
+                    stopped_at: Some(stopped_at),
+                });
+            }
+        }
+    }
+    Ok(BatchRowsResult {
+        rows,
+        stopped_at: None,
+    })
+}
+
 /// Resumes a paused row decode from `pause_state.next_column_index`.
-///
-/// Does not read a token-type byte — the token has already been consumed.
 pub(crate) async fn resume_row_into_internal<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
     pause_state: RowPauseState,

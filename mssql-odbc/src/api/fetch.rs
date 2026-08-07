@@ -13,7 +13,6 @@ use crate::api::odbc_types::{
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
-use mssql_tds::connection::tds_client::ResultSet;
 
 /// Implements SQLFetch for the current forward-only result set.
 ///
@@ -54,8 +53,35 @@ fn sql_fetch_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     fetch_rows_next(statement_handle, stmt)
 }
 
+/// Rows decoded per wire round through the async decode path. The per-row cost
+/// of a cursor is dominated by building and polling that state machine, so
+/// draining a batch amortizes it; the cap bounds the memory a single fetch can
+/// buffer for wide rows.
+const FETCH_BATCH_ROWS: usize = 64;
+
 /// Row materialization step for one forward fetch operation.
 fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    // Fast path: a previous fetch already decoded this row. The batch is only
+    // ever non-empty while this statement holds the connection, so the busy and
+    // cursor checks below are already satisfied and the DBC lock is not needed.
+    //
+    // Server INFO is not drained here. It cannot be attributed to a specific
+    // row anyway, and it stays on the client's buffer until the next call that
+    // can report it (see the SQL_NO_DATA arm below).
+    {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLFetch: stmt mutex poisoned serving prefetched row");
+            return SQL_ERROR;
+        };
+        if let Some(row) = stmt_state.row_batch.pop_front() {
+            if let Some(previous) = stmt_state.current_row.replace(row) {
+                stmt_state.row_batch_spare.push(previous);
+            }
+            stmt_state.reset_get_data_cursor();
+            return SQL_SUCCESS;
+        }
+    }
+
     let dbc = stmt.parent_dbc();
 
     let mut client = {
@@ -130,10 +156,23 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         }
     }
 
-    let fetch_result = dbc.runtime.block_on(client.next_row());
+    let spare = match stmt.inner.lock() {
+        Ok(mut ss) => {
+            let mut spare = std::mem::take(&mut ss.row_batch_spare);
+            if let Some(previous) = ss.current_row.take() {
+                spare.push(previous);
+            }
+            spare
+        }
+        Err(_) => Vec::new(),
+    };
+    let mut rows = Vec::new();
+    let fetch_result =
+        dbc.runtime
+            .block_on(client.fetch_rows_batch(&mut rows, spare, FETCH_BATCH_ROWS));
 
     match fetch_result {
-        Ok(Some(row)) => {
+        Ok(count) if count > 0 => {
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLFetch: stmt mutex poisoned storing row");
                 if let Ok(mut ds) = dbc.inner.lock() {
@@ -144,7 +183,10 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 }
                 return SQL_ERROR;
             };
-            stmt_state.current_row = Some(row);
+            let mut rows = rows.into_iter();
+            stmt_state.current_row = rows.next();
+            stmt_state.row_batch.extend(rows);
+            stmt_state.reset_get_data_cursor();
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();
@@ -163,7 +205,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 SQL_SUCCESS
             }
         }
-        Ok(None) => {
+        Ok(_) => {
             // End of current rowset. SQLFetch must return SQL_NO_DATA here per the
             // cursor contract, and SQL_NO_DATA cannot be upgraded to
             // SQL_SUCCESS_WITH_INFO — so this call has no way to signal "there are
@@ -201,6 +243,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 return SQL_ERROR;
             };
             stmt_state.current_row = None;
+            stmt_state.reset_get_data_cursor();
             // Don't clear CURSOR_OPEN here: the cursor stays open until
             // SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE).
             drop(stmt_state);
@@ -215,6 +258,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             error!(%e, "SQLFetch: row fetch failed");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.current_row = None;
+                stmt_state.reset_get_data_cursor();
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
                 let info_messages = client.take_info_messages();
@@ -333,7 +377,7 @@ mod tests {
         let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut dbc_state = dbc_handle.inner.lock().unwrap();
-            dbc_state.client = Some(client);
+            dbc_state.client = Some(Box::new(client));
             dbc_state.active_stmt = Some(h.stmt);
         }
 
