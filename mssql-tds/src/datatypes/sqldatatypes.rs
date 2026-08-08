@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use crate::io::packet_reader::fast;
+
 use crate::core::TdsResult;
 use crate::datatypes::sqltypes::get_time_length_from_scale;
 use crate::error::Error;
@@ -726,7 +728,7 @@ where
     if let Ok(vdt) = var_len_type {
         let type_info = match vdt {
             VariableLengthTypes::TimeN => {
-                let scale = reader.read_byte().await?;
+                let scale = fast::read_byte(reader).await?;
                 let length = get_time_length_from_scale(scale)? as usize;
                 trace!(
                     "Parsing TimeN: scale={}, calculated length={}",
@@ -739,7 +741,7 @@ where
                 }
             }
             VariableLengthTypes::DateTime2N => {
-                let scale = reader.read_byte().await?;
+                let scale = fast::read_byte(reader).await?;
                 let time_length = get_time_length_from_scale(scale)? as usize;
                 let length = time_length + 3; // time + 3 bytes for date
                 TypeInfo {
@@ -749,7 +751,7 @@ where
                 }
             }
             VariableLengthTypes::DateTimeOffsetN => {
-                let scale = reader.read_byte().await?;
+                let scale = fast::read_byte(reader).await?;
                 let time_length = get_time_length_from_scale(scale)? as usize;
                 let length = time_length + 3 + 2; // time + 3 bytes for date + 2 bytes for offset
                 TypeInfo {
@@ -760,8 +762,8 @@ where
             }
             VariableLengthTypes::Vector => {
                 // Vector uses USHORTLEN (u16) for max length and SCALE byte for base type
-                let length = reader.read_uint16().await? as usize;
-                let base_type_byte = reader.read_byte().await?;
+                let length = fast::read_uint16(reader).await? as usize;
+                let base_type_byte = fast::read_byte(reader).await?;
 
                 // Validate base type
                 let _base_type = VectorBaseType::try_from(base_type_byte)?;
@@ -778,7 +780,7 @@ where
             | VariableLengthTypes::FltN
             | VariableLengthTypes::Guid
             | VariableLengthTypes::BitN => {
-                let length: usize = reader.read_byte().await? as usize;
+                let length: usize = fast::read_byte(reader).await? as usize;
                 TypeInfo {
                     tds_type: data_type,
                     length,
@@ -796,9 +798,9 @@ where
             | VariableLengthTypes::Numeric => {
                 let len_byte_count = vdt.get_len_byte_count();
                 let length = match len_byte_count {
-                    1 => reader.read_byte().await? as usize,
-                    2 => reader.read_uint16().await? as usize,
-                    4 => reader.read_int32().await? as usize,
+                    1 => fast::read_byte(reader).await? as usize,
+                    2 => fast::read_uint16(reader).await? as usize,
+                    4 => fast::read_int32(reader).await? as usize,
                     _ => {
                         unreachable!(
                             "Invalid tds length {:?} for type: {:?}",
@@ -806,8 +808,8 @@ where
                         )
                     }
                 };
-                let precision = reader.read_byte().await?;
-                let scale = reader.read_byte().await?;
+                let precision = fast::read_byte(reader).await?;
+                let scale = fast::read_byte(reader).await?;
                 TypeInfo {
                     tds_type: data_type,
                     length,
@@ -931,11 +933,11 @@ where
     if let Ok(pt) = plp_type {
         let type_info = match pt {
             PartialLengthType::Udt => {
-                let len = reader.read_uint16().await? as usize;
+                let len = fast::read_uint16(reader).await? as usize;
                 let db_name = reader.read_varchar_u8_length().await?;
                 let schema_name = reader.read_varchar_u8_length().await?;
                 let type_name = reader.read_varchar_u8_length().await?;
-                // let assembly_qualified_name_length = reader.read_uint16().await? as usize;
+                // let assembly_qualified_name_length = fast::read_uint16(reader).await? as usize;
                 let assembly_qualified_name = reader.read_varchar_u16_length().await?;
                 let assembly_qualified_name: String = match assembly_qualified_name {
                     Some(name) => name,
@@ -969,7 +971,7 @@ where
                 type_info_variant: TypeInfoVariant::PartialLen(pt, None, None, None, None),
             },
             PartialLengthType::Xml => {
-                let schema_present = reader.read_byte().await?;
+                let schema_present = fast::read_byte(reader).await?;
                 let db_name = if schema_present == 0x01 {
                     Some(reader.read_varchar_u8_length().await?)
                 } else {
@@ -1030,10 +1032,10 @@ where
 {
     let len_byte_count = data_type.get_len_byte_count();
     let length = match len_byte_count {
-        1 => reader.read_byte().await? as usize,
-        2 => reader.read_uint16().await? as usize,
+        1 => fast::read_byte(reader).await? as usize,
+        2 => fast::read_uint16(reader).await? as usize,
         4 => {
-            let len_i32 = reader.read_int32().await?;
+            let len_i32 = fast::read_int32(reader).await?;
             // Negative values indicate invalid protocol data and should error out
             // to prevent capacity overflow from casting negative i32 to huge usize values
             if len_i32 < 0 {

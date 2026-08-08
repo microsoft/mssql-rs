@@ -40,7 +40,7 @@ pub(super) fn claim_connection(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     op: &str,
-) -> Result<TdsClient, SqlReturn> {
+) -> Result<Box<TdsClient>, SqlReturn> {
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("{op}: dbc mutex poisoned");
         clear_exec_started(stmt);
@@ -88,7 +88,11 @@ pub(super) fn claim_connection(
 
 /// Returns `client` to the DBC and releases the busy claim. Used on the
 /// DDL/DML success path and on error recovery.
-pub(super) fn return_client_idle(dbc: &DbcHandle, statement_handle: SqlHandle, client: TdsClient) {
+pub(super) fn return_client_idle(
+    dbc: &DbcHandle,
+    statement_handle: SqlHandle,
+    client: Box<TdsClient>,
+) {
     if let Ok(mut dbc_state) = dbc.inner.lock() {
         dbc_state.client = Some(client);
         if dbc_state.active_stmt == Some(statement_handle) {
@@ -109,7 +113,7 @@ pub(super) fn return_client_idle(dbc: &DbcHandle, statement_handle: SqlHandle, c
 pub(super) fn try_claim_idle_client(
     dbc: &DbcHandle,
     statement_handle: SqlHandle,
-) -> Option<TdsClient> {
+) -> Option<Box<TdsClient>> {
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         return None;
     };
@@ -123,7 +127,7 @@ pub(super) fn try_claim_idle_client(
 
 /// Returns `client` to the DBC but **keeps** the busy claim — used when a
 /// cursor is left open for `SQLFetch`.
-pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
+pub(super) fn return_client_busy(dbc: &DbcHandle, client: Box<TdsClient>) {
     if let Ok(mut dbc_state) = dbc.inner.lock() {
         dbc_state.client = Some(client);
     }
@@ -136,7 +140,7 @@ pub(super) fn fail_with_tds(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
-    mut client: TdsClient,
+    mut client: Box<TdsClient>,
     err: &TdsError,
 ) -> SqlReturn {
     let info_messages = client.take_info_messages();
@@ -256,7 +260,7 @@ pub(super) fn finish_execute(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
-    mut client: TdsClient,
+    mut client: Box<TdsClient>,
     op: &str,
 ) -> SqlReturn {
     let metadata = client.get_metadata().clone();

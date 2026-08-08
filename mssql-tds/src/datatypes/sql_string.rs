@@ -43,6 +43,12 @@ impl SqlString {
         }
     }
 
+    /// Consumes the `SqlString`, returning its backing byte buffer so the
+    /// allocation can be recycled.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
     /// Creates a UTF-16LE–encoded `SqlString` from a Rust `String`.
     pub fn from_utf8_string(string: String) -> Self {
         let utf16_bytes = string

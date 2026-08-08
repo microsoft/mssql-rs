@@ -338,7 +338,7 @@ fn do_connect(
 
     let has_server_info = post_tds_info_messages(state, &info_messages);
 
-    state.client = Some(client);
+    state.client = Some(Box::new(client));
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
 

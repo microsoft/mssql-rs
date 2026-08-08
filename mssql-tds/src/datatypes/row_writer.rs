@@ -19,6 +19,15 @@ use uuid::Uuid;
 /// enabling consumers (Arrow writers, N-API binary encoders, etc.) to
 /// receive values without going through the intermediate `ColumnValues` enum.
 pub trait RowWriter {
+    /// Returns `false` when this writer never pauses, letting the decoder skip
+    /// the per-column [`RowWriter::pause_after_column`] check entirely.
+    ///
+    /// The default is `true` so overriding only `pause_after_column` stays
+    /// correct; writers that never pause should override this to `false`.
+    fn may_pause(&self) -> bool {
+        true
+    }
+
     /// Returns `true` to pause row decoding after reading column `col`.
     ///
     /// Writers that need incremental column fetch behavior (for example,
@@ -103,12 +112,33 @@ pub trait RowWriter {
     fn write_vector(&mut self, col: usize, val: SqlVector);
     /// Signals the end of the current row.
     fn end_row(&mut self);
+
+    /// Supplies a byte buffer of at least `capacity` bytes for a variable-length
+    /// value the decoder is about to read.
+    ///
+    /// Writers that recycle rows can hand back a buffer harvested from a
+    /// previously consumed row, which removes an allocate/free pair per
+    /// variable-length column. The buffer is logically empty; the decoder sizes
+    /// it before filling it.
+    fn take_string_buffer(&mut self, capacity: usize) -> Vec<u8> {
+        Vec::with_capacity(capacity)
+    }
 }
 
 /// Default implementation that assembles `Vec<ColumnValues>`, preserving
 /// the current decoder behavior. Existing `next_row()` callers see no change.
+///
+/// In *batch mode* (see [`DefaultRowWriter::batching`]) each `end_row` pushes
+/// the completed row into an internal queue instead of leaving it in place, so
+/// one decode call can materialize many rows. Cursor drivers use this to
+/// amortize the cost of building and polling the async decode state machine
+/// across a whole rowset rather than paying it per row.
 pub struct DefaultRowWriter {
     row: Vec<ColumnValues>,
+    completed: Vec<Vec<ColumnValues>>,
+    spare: Vec<Vec<ColumnValues>>,
+    string_pool: Vec<Vec<u8>>,
+    batching: bool,
 }
 
 impl DefaultRowWriter {
@@ -116,7 +146,68 @@ impl DefaultRowWriter {
     pub fn new(col_count: usize) -> Self {
         Self {
             row: Vec::with_capacity(col_count),
+            completed: Vec::new(),
+            spare: Vec::new(),
+            string_pool: Vec::new(),
+            batching: false,
         }
+    }
+
+    /// Creates a writer that reuses `buffer`'s existing allocation.
+    pub fn with_buffer(mut buffer: Vec<ColumnValues>, col_count: usize) -> Self {
+        buffer.clear();
+        buffer.reserve(col_count.saturating_sub(buffer.capacity()));
+        Self {
+            row: buffer,
+            completed: Vec::new(),
+            spare: Vec::new(),
+            string_pool: Vec::new(),
+            batching: false,
+        }
+    }
+
+    /// Creates a batch-mode writer that queues completed rows internally.
+    ///
+    /// `spare` supplies row `Vec`s the caller has finished with; they are
+    /// recycled instead of allocating a fresh `Vec` per row.
+    pub fn batching(col_count: usize, spare: Vec<Vec<ColumnValues>>) -> Self {
+        let mut writer = Self {
+            row: Vec::new(),
+            completed: Vec::new(),
+            spare,
+            string_pool: Vec::new(),
+            batching: true,
+        };
+        writer.row = writer.next_row_buffer(col_count);
+        writer
+    }
+
+    fn next_row_buffer(&mut self, col_count: usize) -> Vec<ColumnValues> {
+        match self.spare.pop() {
+            Some(mut buf) => {
+                // Reclaim the byte buffers from the row we're about to drop so
+                // variable-length columns can refill them instead of asking the
+                // allocator for a fresh one on every column of every row.
+                for value in buf.drain(..) {
+                    if let ColumnValues::String(s) = value {
+                        self.string_pool.push(s.into_bytes());
+                    }
+                }
+                buf.reserve(col_count.saturating_sub(buf.capacity()));
+                buf
+            }
+            None => Vec::with_capacity(col_count),
+        }
+    }
+
+    /// Number of rows queued by batch mode so far.
+    pub fn completed_len(&self) -> usize {
+        self.completed.len()
+    }
+
+    /// Takes the rows queued by batch mode, leaving the writer ready for reuse.
+    pub fn take_completed(&mut self) -> Vec<Vec<ColumnValues>> {
+        std::mem::take(&mut self.completed)
     }
 
     /// Takes the completed row, leaving the writer ready for reuse.
@@ -126,6 +217,10 @@ impl DefaultRowWriter {
 }
 
 impl RowWriter for DefaultRowWriter {
+    fn may_pause(&self) -> bool {
+        false
+    }
+
     fn write_null(&mut self, _col: usize) {
         self.row.push(ColumnValues::Null);
     }
@@ -223,7 +318,24 @@ impl RowWriter for DefaultRowWriter {
     }
 
     fn end_row(&mut self) {
-        // No-op for DefaultRowWriter — row is taken via take_row().
+        // Non-batch mode: the row stays in place and is taken via take_row().
+        if self.batching {
+            let col_count = self.row.len();
+            let replacement = self.next_row_buffer(col_count);
+            let finished = std::mem::replace(&mut self.row, replacement);
+            self.completed.push(finished);
+        }
+    }
+
+    fn take_string_buffer(&mut self, capacity: usize) -> Vec<u8> {
+        match self.string_pool.pop() {
+            Some(mut buf) => {
+                buf.clear();
+                buf.reserve(capacity.saturating_sub(buf.capacity()));
+                buf
+            }
+            None => Vec::with_capacity(capacity),
+        }
     }
 }
 
@@ -263,6 +375,81 @@ pub fn write_column_value<W: RowWriter + ?Sized>(writer: &mut W, col: usize, val
 mod tests {
     use super::*;
     use crate::datatypes::sql_string::EncodingType;
+
+    #[test]
+    fn batching_writer_recycles_string_buffers_from_consumed_rows() {
+        let mut writer = DefaultRowWriter::batching(1, Vec::new());
+        // No pool yet, so the buffer is freshly allocated at the asked capacity.
+        assert_eq!(writer.take_string_buffer(32).capacity(), 32);
+
+        // Feed back a consumed row carrying a string allocation.
+        let consumed = vec![ColumnValues::String(SqlString::new(
+            Vec::with_capacity(128),
+            EncodingType::Utf16,
+        ))];
+        writer.spare.push(consumed);
+
+        // Recycling the row harvests the string allocation into the pool.
+        let recycled = writer.next_row_buffer(1);
+        assert!(recycled.is_empty());
+        let buf = writer.take_string_buffer(16);
+        assert!(buf.is_empty());
+        assert_eq!(buf.capacity(), 128);
+    }
+
+    #[test]
+    fn default_row_writer_never_pauses() {
+        assert!(!DefaultRowWriter::new(1).may_pause());
+    }
+
+    #[test]
+    fn batching_writer_queues_rows_and_recycles_spares() {
+        let mut writer = DefaultRowWriter::batching(2, Vec::new());
+        assert_eq!(writer.completed_len(), 0);
+
+        for i in 0..3i32 {
+            writer.write_i32(0, i);
+            writer.write_null(1);
+            writer.end_row();
+        }
+        assert_eq!(writer.completed_len(), 3);
+
+        let rows = writer.take_completed();
+        assert_eq!(writer.completed_len(), 0);
+        assert_eq!(rows.len(), 3);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), 2);
+            assert_eq!(row[0], ColumnValues::Int(i as i32));
+            assert_eq!(row[1], ColumnValues::Null);
+        }
+    }
+
+    #[test]
+    fn batching_writer_reuses_spare_allocations() {
+        let spare = vec![Vec::with_capacity(64)];
+        let spare_ptr = spare[0].as_ptr();
+
+        let mut writer = DefaultRowWriter::batching(2, spare);
+        // The first row buffer should be the recycled one, cleared but keeping
+        // its capacity.
+        assert_eq!(writer.row.capacity(), 64);
+        assert!(writer.row.is_empty());
+        assert_eq!(writer.row.as_ptr(), spare_ptr);
+
+        writer.write_i32(0, 7);
+        writer.end_row();
+        // Spare pool exhausted, so the next buffer is freshly allocated.
+        assert_eq!(writer.take_completed().len(), 1);
+    }
+
+    #[test]
+    fn non_batching_writer_keeps_row_in_place_on_end_row() {
+        let mut writer = DefaultRowWriter::new(1);
+        writer.write_i32(0, 1);
+        writer.end_row();
+        assert_eq!(writer.completed_len(), 0);
+        assert_eq!(writer.take_row(), vec![ColumnValues::Int(1)]);
+    }
 
     #[test]
     fn default_row_writer_assembles_column_values() {

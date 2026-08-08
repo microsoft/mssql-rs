@@ -18,9 +18,9 @@ use crate::io::packet_reader::{PacketReader, TdsPacketReader};
 use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
 use crate::io::token_stream::{
-    ParserContext, PlpPauseState, RowPauseState, RowReadResult, TdsTokenStreamReader,
-    read_active_plp_bytes_internal, receive_row_into_internal, receive_token_internal,
-    resume_row_into_internal,
+    BatchRowsResult, ParserContext, PlpPauseState, RowPauseState, RowReadResult,
+    TdsTokenStreamReader, read_active_plp_bytes_internal, receive_row_into_internal,
+    receive_rows_into_internal, receive_token_internal, resume_row_into_internal,
 };
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
@@ -1143,6 +1143,17 @@ impl TdsPacketReader for NetworkTransport {
         Ok(result)
     }
 
+    fn try_take_fixed(&mut self, n: usize) -> Option<[u8; 8]> {
+        debug_assert!(n <= 8);
+        if n > 8 || !self.tds_read_buffer.do_we_have_enough_data(n) {
+            return None;
+        }
+        let mut out = [0u8; 8];
+        out[..n].copy_from_slice(&self.tds_read_buffer.get_slice()[..n]);
+        self.tds_read_buffer.consume_bytes(n);
+        Some(out)
+    }
+
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
         if !self.tds_read_buffer.do_we_have_enough_data(2) {
             self.read_tds_packet().await?;
@@ -1413,6 +1424,38 @@ impl TdsTokenStreamReader for NetworkTransport {
         let cancellable = CancelHandle::run_until_cancelled(
             cancel_handle,
             receive_row_into_internal(self, &*PARSER_REGISTRY, context, writer),
+        );
+        let result = match remaining_request_timeout.as_ref() {
+            Some(t) => match timeout(*t, cancellable).await {
+                Ok(r) => r,
+                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
+            },
+            None => cancellable.await,
+        };
+
+        match &result {
+            Ok(_) => {}
+            Err(err) => match err {
+                OperationCancelledError(_) | TimeoutError(_) => {
+                    self.cancel_read_stream_and_wait().await?;
+                }
+                _ => {}
+            },
+        }
+        result
+    }
+
+    async fn receive_rows_into(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        writer: &mut (dyn RowWriter + Send),
+        max_rows: usize,
+    ) -> TdsResult<BatchRowsResult> {
+        let cancellable = CancelHandle::run_until_cancelled(
+            cancel_handle,
+            receive_rows_into_internal(self, &*PARSER_REGISTRY, context, writer, max_rows),
         );
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {
