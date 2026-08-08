@@ -125,3 +125,13 @@ add_odbc_test(more_results_test  tests/more_results_test.cpp)
 add_odbc_test(execute_test       tests/execute_test.cpp)
 add_odbc_test(get_type_info_test tests/get_type_info_test.cpp)
 add_odbc_test(row_count_test     tests/row_count_test.cpp)
+
+# ---------------------------------------------------------------------------
+# Benchmarks (not registered with CTest — perf tools, not pass/fail tests)
+# ---------------------------------------------------------------------------
+# fetch_bench times the SQLFetch drain over a large result set for one or more
+# ODBC drivers selected by name and prints an A/B comparison. It reuses
+# odbc_test_lib for connection config + diagnostics but is a plain executable so
+# a normal `ctest` run does not invoke it. Drive it via run_bench.ps1.
+add_executable(fetch_bench bench/fetch_bench.cpp)
+target_link_libraries(fetch_bench PRIVATE odbc_test_lib)
