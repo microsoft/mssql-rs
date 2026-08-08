@@ -21,6 +21,7 @@ use crate::datatypes::column_values::{
 };
 use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::row_writer::RowWriter;
+use crate::datatypes::sql_string::{SqlString, get_encoding_type};
 use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfoVariant};
 use crate::error::Error;
 use crate::io::packet_buffer::{NeedBytes, PacketBuffer};
@@ -61,6 +62,17 @@ pub(crate) fn is_supported(meta: &ColumnMetadata) -> bool {
             | TdsDataType::DateTime2N
             | TdsDataType::DateTimeOffsetN
             | TdsDataType::Guid
+            // Variable-length non-PLP strings (USHORT length prefix, 0xFFFF = NULL).
+            // Long-length LOB types (Text/NText) keep the legacy async path.
+            | TdsDataType::Char
+            | TdsDataType::VarChar
+            | TdsDataType::BigChar
+            | TdsDataType::BigVarChar
+            | TdsDataType::NChar
+            | TdsDataType::NVarChar
+            // Variable-length non-PLP binary (USHORT length prefix, 0xFFFF = NULL).
+            | TdsDataType::BigBinary
+            | TdsDataType::BigVarBinary
     )
 }
 
@@ -89,6 +101,34 @@ pub(crate) fn column_wire_len(
     };
     if let Some(width) = fixed {
         return Ok(width);
+    }
+
+    // Variable-length non-PLP strings and binary are 2-byte (USHORT) length
+    // prefixed; 0xFFFF is the NULL marker (no body). The prefix width is the
+    // absolute byte count needed to compute the total, so a shortfall re-drives
+    // ensure() for the whole prefix.
+    if matches!(
+        meta.data_type,
+        TdsDataType::Char
+            | TdsDataType::VarChar
+            | TdsDataType::BigChar
+            | TdsDataType::BigVarChar
+            | TdsDataType::NChar
+            | TdsDataType::NVarChar
+            | TdsDataType::BigBinary
+            | TdsDataType::BigVarBinary
+    ) {
+        return match buf.peek_bytes(2) {
+            Some(prefix) => {
+                let length = u16::from_le_bytes([prefix[0], prefix[1]]);
+                if length == 0xFFFF {
+                    Ok(2)
+                } else {
+                    Ok(2 + length as usize)
+                }
+            }
+            None => Err(NeedBytes { shortfall: 2 }),
+        };
     }
 
     // Every remaining supported type is 1-byte length-prefixed; the prefix value
@@ -238,6 +278,32 @@ pub(crate) fn decode_column_body(
             }
         }
 
+        // === Variable-length non-PLP strings (USHORT prefix, 0xFFFF = NULL) ===
+        TdsDataType::Char
+        | TdsDataType::VarChar
+        | TdsDataType::BigChar
+        | TdsDataType::BigVarChar
+        | TdsDataType::NChar
+        | TdsDataType::NVarChar => {
+            let length = buf.take_u16_le()?;
+            if length == 0xFFFF {
+                writer.write_null(col);
+            } else {
+                let bytes = take_bytes(buf, length as usize);
+                writer.write_string(col, SqlString::new(bytes, get_encoding_type(meta)));
+            }
+        }
+
+        // === Variable-length non-PLP binary (USHORT prefix, 0xFFFF = NULL) ===
+        TdsDataType::BigBinary | TdsDataType::BigVarBinary => {
+            let length = buf.take_u16_le()?;
+            if length == 0xFFFF {
+                writer.write_null(col);
+            } else {
+                writer.write_bytes(col, take_bytes(buf, length as usize));
+            }
+        }
+
         other => {
             unreachable!("decode_column_body called for unsupported type {other:?}");
         }
@@ -248,6 +314,18 @@ pub(crate) fn decode_column_body(
 fn scale_of(meta: &ColumnMetadata, type_name: &str) -> TdsResult<u8> {
     meta.get_scale()
         .ok_or_else(|| Error::ImplementationError(format!("{type_name} type should have scale")))
+}
+
+/// Consumes exactly `n` bytes from `buf`. The column driver guarantees the whole
+/// cell is buffered before calling into the body, so the copy always fills.
+fn take_bytes(buf: &mut PacketBuffer, n: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; n];
+    let copied = buf.copy_out(&mut bytes);
+    debug_assert_eq!(
+        copied, n,
+        "cell not fully buffered before decode_column_body"
+    );
+    bytes
 }
 
 fn take_money4(buf: &mut PacketBuffer) -> TdsResult<SqlSmallMoney> {
