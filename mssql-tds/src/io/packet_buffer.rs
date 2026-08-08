@@ -547,4 +547,155 @@ mod tests {
         assert_eq!(buf.available(), 0);
         assert_eq!(buf.ensure(1), Err(NeedBytes { shortfall: 1 }));
     }
+
+    /// Stages `bytes` as fully-buffered readable payload at position 0, without
+    /// staging a header or socket read — the fast path for exercising the
+    /// positional accessors directly.
+    fn staged(bytes: &[u8]) -> PacketBuffer {
+        let mut buf = PacketBuffer::with_packet_size(4096);
+        buf.working_buffer_mut()[..bytes.len()].copy_from_slice(bytes);
+        buf.set_positions_for_test(0, bytes.len());
+        buf
+    }
+
+    /// Each fixed-width accessor decodes the right bytes and advances the read
+    /// position by exactly its width. A trailing sentinel byte keeps the buffer
+    /// live so the advance is observable (a full drain resets the cursor — see
+    /// [`take_exact_drain_resets_cursor`]).
+    #[test]
+    fn take_scalars_roundtrip_and_advance() {
+        let mut buf = staged(&[0x7F, 0xFF]);
+        assert_eq!(buf.take_u8().unwrap(), 0x7F);
+        assert_eq!(buf.position(), 1);
+        assert_eq!(buf.available(), 1);
+
+        let mut buf = staged(&[0x34, 0x12, 0x00]);
+        assert_eq!(buf.take_u16_le().unwrap(), 0x1234);
+        assert_eq!(buf.position(), 2);
+
+        let mut buf = staged(&[0x12, 0x34, 0x00]);
+        assert_eq!(buf.take_i16_be().unwrap(), 0x1234);
+        assert_eq!(buf.position(), 2);
+
+        let mut buf = staged(&[0x56, 0x34, 0x12, 0x00]);
+        assert_eq!(buf.take_u24_le().unwrap(), 0x0012_3456);
+        assert_eq!(buf.position(), 3);
+
+        let mut buf = staged(&[0x78, 0x56, 0x34, 0x12, 0x00]);
+        assert_eq!(buf.take_u32_le().unwrap(), 0x1234_5678);
+        assert_eq!(buf.position(), 4);
+
+        let mut buf = staged(&[0x12, 0x34, 0x56, 0x78, 0x00]);
+        assert_eq!(buf.take_i32_be().unwrap(), 0x1234_5678);
+        assert_eq!(buf.position(), 4);
+
+        let mut buf = staged(&[1, 0, 0, 0, 0, 0, 0, 0, 0xFF]);
+        assert_eq!(buf.take_u64_le().unwrap(), 1);
+        assert_eq!(buf.position(), 8);
+    }
+
+    /// The remaining signed/float/40-bit accessors round-trip through their
+    /// little-endian decoders.
+    #[test]
+    fn take_scalar_breadth_decodes_all_widths() {
+        let mut buf = staged(&(-12345i16).to_le_bytes());
+        assert_eq!(buf.take_i16_le().unwrap(), -12345);
+
+        let mut buf = staged(&(-123456789i32).to_le_bytes());
+        assert_eq!(buf.take_i32_le().unwrap(), -123456789);
+
+        let mut buf = staged(&(-1234567890123i64).to_le_bytes());
+        assert_eq!(buf.take_i64_le().unwrap(), -1234567890123);
+
+        let mut buf = staged(&std::f32::consts::PI.to_le_bytes());
+        assert_eq!(buf.take_f32_le().unwrap(), std::f32::consts::PI);
+
+        let mut buf = staged(&std::f64::consts::E.to_le_bytes());
+        assert_eq!(buf.take_f64_le().unwrap(), std::f64::consts::E);
+
+        // 40-bit unsigned: the low five bytes, little-endian.
+        let mut buf = staged(&[0x05, 0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(buf.take_uint40_le().unwrap(), 0x01_0203_0405);
+    }
+
+    /// A read that consumes the last buffered byte collapses the cursor back to
+    /// the front, leaving a clean empty buffer ready for the next refill.
+    #[test]
+    fn take_exact_drain_resets_cursor() {
+        let mut buf = staged(&[0x34, 0x12]);
+        assert_eq!(buf.take_u16_le().unwrap(), 0x1234);
+        assert_eq!(buf.position(), 0);
+        assert_eq!(buf.length(), 0);
+        assert_eq!(buf.available(), 0);
+    }
+
+    /// Atomicity: a fixed-width read wider than the buffer holds must not
+    /// partially advance. The bytes stay intact so the read is safe to re-drive
+    /// after a refill.
+    #[test]
+    fn take_on_short_buffer_is_noop() {
+        let mut buf = staged(&[0xAA, 0xBB]);
+        assert!(buf.take_u32_le().is_err());
+        assert_eq!(buf.position(), 0);
+        assert_eq!(buf.available(), 2);
+        assert_eq!(buf.take_u16_le().unwrap(), 0xBBAA);
+    }
+
+    /// `skip_available` and `copy_out` operate from the current position and are
+    /// bounded by what is buffered — never reading or discarding past the end.
+    #[test]
+    fn skip_and_copy_out_advance_from_current_position() {
+        let mut buf = staged(&[0x01, 0x02, 0x03, 0x04, 0x05]);
+
+        assert_eq!(buf.skip_available(2), 2);
+        assert_eq!(buf.position(), 2);
+        assert_eq!(buf.available(), 3);
+
+        let mut dst = [0u8; 2];
+        assert_eq!(buf.copy_out(&mut dst), 2);
+        assert_eq!(dst, [0x03, 0x04]);
+        assert_eq!(buf.available(), 1);
+
+        // Requesting more than remains copies only the tail — no over-read.
+        let mut big = [0u8; 8];
+        assert_eq!(buf.copy_out(&mut big), 1);
+        assert_eq!(big[0], 0x05);
+        assert_eq!(buf.position(), 0);
+        assert_eq!(buf.length(), 0);
+    }
+
+    /// `skip_available` saturates at what is buffered instead of advancing the
+    /// cursor past the filled end.
+    #[test]
+    fn skip_available_saturates_at_available() {
+        let mut buf = staged(&[0xAA, 0xBB]);
+        assert_eq!(buf.skip_available(10), 2);
+        assert_eq!(buf.available(), 0);
+        assert_eq!(buf.position(), 0);
+    }
+
+    /// Over-consume bounds guard: a `take` wider than what is buffered is
+    /// rejected outright and leaves the cursor untouched — no silent under-read,
+    /// no corruption. This is the backstop for the L3 loop-termination
+    /// invariant: a failed read reports a shortfall to re-drive rather than
+    /// returning garbage or advancing past the end.
+    #[test]
+    fn take_beyond_available_errors_without_corrupting_cursor() {
+        let mut buf = staged(&[0xAA, 0xBB, 0xCC]);
+
+        let err = buf.take_u32_le().unwrap_err();
+        assert!(
+            err.to_string().contains("Buffer underflow"),
+            "expected underflow guard, got: {err}"
+        );
+        assert_eq!(buf.position(), 0);
+        assert_eq!(buf.length(), 3);
+        assert_eq!(buf.available(), 3);
+
+        // ensure agrees a refill is needed rather than signalling readiness.
+        assert_eq!(buf.ensure(4), Err(NeedBytes { shortfall: 1 }));
+
+        // After a satisfied guard the same bytes read back intact.
+        assert_eq!(buf.take_u8().unwrap(), 0xAA);
+    }
 }
