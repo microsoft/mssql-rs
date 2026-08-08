@@ -1442,21 +1442,16 @@ mod tests {
     /// decode byte-identically to the single-packet baseline, proving the
     /// inverted step and the async PLP path share ONE coherent row cursor
     /// (`next_column_index`) no matter where the packet boundary lands.
-    #[tokio::test]
-    async fn mixed_row_inverted_then_plp_is_byte_identical_across_refill_boundary() {
-        use crate::datatypes::column_values::ColumnValues;
-        use crate::datatypes::row_writer::DefaultRowWriter;
-        use crate::io::packet_reader::PacketReader;
-        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
-        use crate::message::messages::PacketType;
-
+    /// Shared fixture for the hybrid non-PLP -> PLP mid-row seam tests: a row
+    /// `[int4 (fixed inverted)][varchar(64) (var-length inverted)][nvarchar(max) PLP (legacy async)]`.
+    fn mixed_seam_columns() -> Vec<ColumnMetadata> {
         let collation = SqlCollation {
             info: 0x0409,
             lcid_language_id: 0x0409,
             col_flags: 0,
             sort_id: 52,
         };
-        let columns = vec![
+        vec![
             ColumnMetadata {
                 user_type: 0,
                 flags: 0,
@@ -1486,65 +1481,136 @@ mod tests {
                 multi_part_name: None,
                 crypto_metadata: None,
             },
-        ];
+        ]
+    }
 
-        // ROW payload: [Row token][int4 = 42][varchar "ab"][nvarchar(max) PLP "Hi"].
+    /// ROW payload `[Row token][int4 = 42][varchar "ab"][nvarchar(max) PLP "Hi"]`.
+    ///
+    /// Returns `(payload, varchar_cell_range, nonplp_to_plp_transition_offset)`.
+    /// `varchar_cell_range` is the interior byte range of the inverted varchar cell
+    /// (USHORT prefix + data); `transition_offset` is the first byte of the PLP column —
+    /// the exact whole-column non-PLP -> PLP boundary governed by `next_column_index`.
+    fn mixed_seam_payload() -> (Vec<u8>, std::ops::Range<usize>, usize) {
         let mut payload = vec![TokenType::Row as u8];
         payload.extend_from_slice(&42_i32.to_le_bytes());
+        let varchar_start = payload.len();
         let ab = [0x61u8, 0x62]; // "ab"
         payload.extend_from_slice(&(ab.len() as u16).to_le_bytes()); // USHORT length prefix
         payload.extend_from_slice(&ab);
+        let transition = payload.len(); // first byte of the PLP column
         payload.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // SQL_PLP_UNKNOWNLEN
         let hi_utf16 = [0x48u8, 0x00, 0x69, 0x00]; // "Hi"
         payload.extend_from_slice(&(hi_utf16.len() as u32).to_le_bytes());
         payload.extend_from_slice(&hi_utf16);
         payload.extend_from_slice(&0u32.to_le_bytes()); // PLP zero-length terminator
+        (payload, varchar_start..transition, transition)
+    }
 
-        async fn decode(read_data: Vec<u8>, columns: &[ColumnMetadata]) -> Vec<ColumnValues> {
-            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
-            let mut reader = PacketReader::new(&mut mock);
-            reader.read_tds_packet_for_test().await.unwrap();
-            let context = ParserContext::ColumnMetadata(
-                Arc::new(ColMetadataToken {
-                    column_count: columns.len() as u16,
-                    columns: columns.to_vec(),
-                    cek_table: vec![],
-                }),
-                None,
-            );
-            let registry = GenericTokenParserRegistry::default();
-            let mut writer = DefaultRowWriter::new(columns.len());
-            let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
-                .await
-                .unwrap();
-            assert!(matches!(result, RowReadResult::RowWritten));
-            writer.take_row()
-        }
+    async fn decode_mixed_seam(
+        read_data: Vec<u8>,
+    ) -> Vec<crate::datatypes::column_values::ColumnValues> {
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::MockNetworkReaderWriter;
 
-        fn one_packet(payload: &[u8]) -> Vec<u8> {
-            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
-            builder.append_bytes(payload).build()
-        }
-        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
-            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
-            let mut first = first_builder.append_bytes(&payload[..split]).build();
-            first[1] = 0x00; // clear EOM so the buffer keeps reading into the second packet
-            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
-            let second = second_builder.append_bytes(&payload[split..]).build();
-            [first, second].concat()
-        }
+        let columns = mixed_seam_columns();
+        let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+        let mut reader = PacketReader::new(&mut mock);
+        reader.read_tds_packet_for_test().await.unwrap();
+        let context = ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: columns.len() as u16,
+                columns: columns.clone(),
+                cek_table: vec![],
+            }),
+            None,
+        );
+        let registry = GenericTokenParserRegistry::default();
+        let mut writer = DefaultRowWriter::new(columns.len());
+        let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+            .await
+            .unwrap();
+        assert!(matches!(result, RowReadResult::RowWritten));
+        writer.take_row()
+    }
 
-        let baseline = decode(one_packet(&payload), &columns).await;
+    fn seam_one_packet(payload: &[u8]) -> Vec<u8> {
+        use crate::io::packet_reader::tests::TestPacketBuilder;
+        use crate::message::messages::PacketType;
+        let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+        builder.append_bytes(payload).build()
+    }
+
+    fn seam_two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+        use crate::io::packet_reader::tests::TestPacketBuilder;
+        use crate::message::messages::PacketType;
+        let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+        let mut first = first_builder.append_bytes(&payload[..split]).build();
+        first[1] = 0x00; // clear EOM so the buffer keeps reading into the second packet
+        let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+        let second = second_builder.append_bytes(&payload[split..]).build();
+        [first, second].concat()
+    }
+
+    #[tokio::test]
+    async fn mixed_row_inverted_then_plp_is_byte_identical_across_refill_boundary() {
+        use crate::datatypes::column_values::ColumnValues;
+
+        let (payload, _varchar, _transition) = mixed_seam_payload();
+        let baseline = decode_mixed_seam(seam_one_packet(&payload)).await;
         assert_eq!(baseline.len(), 3);
         assert_eq!(baseline[0], ColumnValues::Int(42));
         assert_ne!(baseline[1], ColumnValues::Null); // varchar "ab"
         assert_ne!(baseline[2], ColumnValues::Null); // nvarchar(max) "Hi"
 
         for split in 1..payload.len() {
-            let got = decode(two_packets(&payload, split), &columns).await;
+            let got = decode_mixed_seam(seam_two_packets(&payload, split)).await;
             assert_eq!(
                 got, baseline,
                 "mixed row decode diverged when the refill boundary landed at offset {split}"
+            );
+        }
+    }
+
+    /// Mandatory blocking test (L4a sharpened): the refill boundary lands EXACTLY at the
+    /// whole-column non-PLP -> PLP transition. The inverted step fully consumes the last
+    /// non-PLP cell (varchar) inside packet 1; the PLP column's first `ensure()` then
+    /// returns `NeedBytes` -> refill -> the legacy async PLP path resumes at
+    /// `next_column_index`. Proves the whole-column seam (governed by `RowPauseState`'s
+    /// column cursor, not a mid-value pause) hands off cleanly and byte-identically.
+    #[tokio::test]
+    async fn refill_boundary_at_nonplp_to_plp_column_transition_resumes_into_async_plp() {
+        use crate::datatypes::column_values::ColumnValues;
+
+        let (payload, _varchar, transition) = mixed_seam_payload();
+        let baseline = decode_mixed_seam(seam_one_packet(&payload)).await;
+        assert_eq!(baseline.len(), 3);
+        assert_eq!(baseline[0], ColumnValues::Int(42));
+        assert_ne!(baseline[2], ColumnValues::Null); // PLP nvarchar(max) "Hi"
+
+        let got = decode_mixed_seam(seam_two_packets(&payload, transition)).await;
+        assert_eq!(
+            got, baseline,
+            "resume into the async PLP path diverged when the refill boundary landed exactly \
+             at the non-PLP -> PLP column transition (offset {transition})"
+        );
+    }
+
+    /// Cheap companion: the refill boundary lands inside the inverted var-length varchar
+    /// cell — both inside its 2-byte USHORT length prefix (peek-only re-drive) and
+    /// mid-data. Confirms the inverted step's OWN resume is coherent, independent of the
+    /// downstream PLP handoff.
+    #[tokio::test]
+    async fn refill_boundary_within_inverted_varchar_cell_resumes_coherently() {
+        let (payload, varchar, _transition) = mixed_seam_payload();
+        let baseline = decode_mixed_seam(seam_one_packet(&payload)).await;
+
+        for split in varchar {
+            let got = decode_mixed_seam(seam_two_packets(&payload, split)).await;
+            assert_eq!(
+                got, baseline,
+                "inverted varchar cell resume diverged when the refill boundary landed at \
+                 offset {split}"
             );
         }
     }
