@@ -339,6 +339,12 @@ I/O bound; see PR #186); the query returns many rows so row decode dominates.
   so nothing is optimised away — it matches across both legs, confirming an
   identical, fair workload.
 
+> **Always benchmark the Rust leg as a `--release` build.** A debug `mssql-odbc`
+> build is 10–30x slower purely from codegen (no inlining, overflow checks), which
+> swamps the real driver-path cost and produces a badly misleading gap. Pass
+> `-Release` to `run_bench.ps1` (it builds `cargo build --release` and points the
+> Rust leg at `target\release\msodbcsql18.dll`).
+
 ### Driver-manager bypass (no admin, no registry)
 
 Each leg loads a driver **DLL directly** (`LoadLibrary` + `GetProcAddress`,
