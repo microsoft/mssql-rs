@@ -2,7 +2,6 @@
 // Licensed under the MIT License.
 
 use crate::connection::client_context::{IPAddressPreference, TransportContext};
-use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
 use crate::connection::transport::parallel_connect::{ParallelConnectConfig, parallel_connect};
 use crate::connection::transport::ssl_handler::SslHandler;
@@ -14,6 +13,7 @@ use crate::datatypes::row_writer::RowWriter;
 use crate::error::Error::{OperationCancelledError, TimeoutError};
 use crate::error::TimeoutErrorType;
 use crate::handler::handler_factory::SessionSettings;
+use crate::io::packet_buffer::PacketBuffer;
 use crate::io::packet_reader::{PacketReader, TdsPacketReader};
 use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
@@ -27,8 +27,6 @@ use crate::message::login_options::TdsVersion;
 use crate::message::messages::{Request, ResetConnectionMode};
 use crate::token::tokens::{DoneStatus, Tokens};
 use async_trait::async_trait;
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use std::cmp::min;
 use std::io::Error;
 use std::io::ErrorKind::{self, UnexpectedEof};
 use std::net::ToSocketAddrs;
@@ -506,7 +504,7 @@ pub(crate) struct NetworkTransport {
     stream: Option<Box<dyn Stream>>,
     ssl_handler: SslHandler,
     encryption_setting: EncryptionSetting,
-    tds_read_buffer: TdsReadBuffer,
+    tds_read_buffer: PacketBuffer,
     use_tds74_tls_wrapping: bool,
     /// Handle to extract the underlying stream when disabling TLS.
     /// This is set during enable_ssl and used during disable_ssl for "Login Only" mode.
@@ -617,7 +615,7 @@ impl NetworkTransport {
             ssl_handler,
             packet_size,
             encryption_setting,
-            tds_read_buffer: TdsReadBuffer::new(packet_size as usize),
+            tds_read_buffer: PacketBuffer::with_packet_size(packet_size as usize),
             use_tds74_tls_wrapping,
             extractable_stream_handle: None,
             pending_reset: ResetConnectionMode::None,
@@ -774,20 +772,8 @@ impl NetworkTransport {
     }
 
     async fn read_tds_packet(&mut self) -> TdsResult<()> {
-        // let remaining_bytes = self.buffer_length - self.buffer_position;
-        let remaining_bytes = self.tds_read_buffer.get_remaining_byte_count();
-        if remaining_bytes > 0 {
-            // Move the remaining bytes to the beginning of the buffer.
-            self.tds_read_buffer.shift_data_to_front();
-            let new_packet_size = self.get_new_tds_packet().await?;
-            self.tds_read_buffer
-                .remove_header_from_packet(new_packet_size);
-        } else {
-            self.tds_read_buffer.reset_to_length(0);
-            let new_packet_size = self.get_new_tds_packet().await?;
-            self.tds_read_buffer
-                .remove_header_from_packet(new_packet_size);
-        }
+        let packet_len = self.get_new_tds_packet().await?;
+        self.tds_read_buffer.strip_header(packet_len);
         Ok(())
     }
 
@@ -874,34 +860,11 @@ impl NetworkTransport {
     ///
     /// The fix ensures all bytes from `read()` are accounted for, not just the first packet.
     async fn get_new_tds_packet(&mut self) -> TdsResult<usize> {
-        let base_offset = self.tds_read_buffer.buffer_length;
-
-        // Check if we have pending bytes from a previous read that included multiple packets
-        let mut bytes_available = self.tds_read_buffer.pending_bytes;
-        let pending_offset = self.tds_read_buffer.pending_bytes_offset;
-
-        if bytes_available > 0 {
-            // Validate bounds before copy_within to avoid panic on malformed data.
-            // These values are derived from packet lengths on the wire, so we must
-            // guard against corrupted or malicious packets.
-            let src_end = pending_offset.saturating_add(bytes_available);
-            let dest_end = base_offset.saturating_add(bytes_available);
-            let buffer_len = self.tds_read_buffer.working_buffer.len();
-
-            if src_end > buffer_len || dest_end > buffer_len {
-                return Err(crate::error::Error::ProtocolError(format!(
-                    "Invalid pending bytes range: src {}..{}, dest {}, buffer_len {}",
-                    pending_offset, src_end, base_offset, buffer_len
-                )));
-            }
-
-            // We have pending bytes - move them to base_offset
-            self.tds_read_buffer
-                .working_buffer
-                .copy_within(pending_offset..src_end, base_offset);
-            self.tds_read_buffer.pending_bytes = 0;
-            self.tds_read_buffer.pending_bytes_offset = 0;
-        }
+        // Compact readable bytes and replay any pending bytes from a prior
+        // multi-packet read; `base` is where this raw packet begins and
+        // `already` is how many of its bytes are already buffered.
+        let (base, already) = self.tds_read_buffer.begin_refill()?;
+        let mut bytes_available = already;
 
         let stream = self.stream.as_mut().ok_or_else(|| {
             crate::error::Error::ConnectionClosed(
@@ -912,7 +875,7 @@ impl NetworkTransport {
         // Read more data if we don't have enough for the header
         while bytes_available < PacketWriter::PACKET_HEADER_SIZE {
             let bytes_read = match stream
-                .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
+                .read(self.tds_read_buffer.refill_window(base, bytes_available))
                 .await
             {
                 Ok(n) => n,
@@ -932,42 +895,14 @@ impl NetworkTransport {
             bytes_available += bytes_read;
         }
 
-        let length_from_packet_header = BigEndian::read_u16(
-            &self.tds_read_buffer.working_buffer[base_offset + 2..base_offset + 4],
-        );
-
-        let packet_size_from_header: usize = length_from_packet_header as usize;
-
-        // Validate packet_size_from_header against protocol constraints.
-        // A malicious or corrupted server could send invalid lengths.
-        if packet_size_from_header < PacketWriter::PACKET_HEADER_SIZE {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "Invalid TDS packet length {}: must be at least {} bytes (header size)",
-                packet_size_from_header,
-                PacketWriter::PACKET_HEADER_SIZE
-            )));
-        }
-
-        if packet_size_from_header > self.tds_read_buffer.max_packet_size {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "TDS packet length {} exceeds negotiated max packet size {}",
-                packet_size_from_header, self.tds_read_buffer.max_packet_size
-            )));
-        }
-
-        // Also ensure we won't exceed buffer capacity
-        let buffer_len = self.tds_read_buffer.working_buffer.len();
-        if base_offset.saturating_add(packet_size_from_header) > buffer_len {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "TDS packet length {} at offset {} exceeds buffer capacity {}",
-                packet_size_from_header, base_offset, buffer_len
-            )));
-        }
+        // Validate the declared length (>= header, <= max packet size, fits in
+        // the buffer) before trusting it to bound the payload read.
+        let packet_size_from_header = self.tds_read_buffer.validate_packet_length(base)?;
 
         // Keep reading until we have the complete packet in memory.
         while bytes_available < packet_size_from_header {
             let bytes_read = match stream
-                .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
+                .read(self.tds_read_buffer.refill_window(base, bytes_available))
                 .await
             {
                 Ok(n) => n,
@@ -985,17 +920,9 @@ impl NetworkTransport {
             bytes_available += bytes_read;
         }
 
-        // Calculate how many extra bytes we read beyond this packet
-        let extra_bytes = bytes_available - packet_size_from_header;
-
-        if extra_bytes > 0 {
-            // Track where the extra bytes are - they're right after this packet in the buffer
-            self.tds_read_buffer.pending_bytes = extra_bytes;
-            self.tds_read_buffer.pending_bytes_offset = base_offset + packet_size_from_header;
-        } else {
-            self.tds_read_buffer.pending_bytes = 0;
-            self.tds_read_buffer.pending_bytes_offset = 0;
-        }
+        // Bytes read past this packet belong to the next one; carry them forward.
+        self.tds_read_buffer
+            .record_pending(base, packet_size_from_header, bytes_available);
 
         event!(
             tracing::Level::DEBUG,
@@ -1008,8 +935,8 @@ impl NetworkTransport {
         event!(
             tracing::Level::DEBUG,
             "Packet content: {:?}",
-            &mut self.tds_read_buffer.working_buffer
-                [base_offset..base_offset + packet_size_from_header]
+            self.tds_read_buffer
+                .raw_packet(base, packet_size_from_header)
                 .hex_dump()
         );
         Ok(packet_size_from_header)
@@ -1128,154 +1055,103 @@ impl TransportSslHandler for NetworkTransport {
 impl TdsPacketReader for NetworkTransport {
     fn reset_reader(&mut self) {
         // Make sure that we have read all the data from the buffer.
-        assert!(self.tds_read_buffer.buffer_length == self.tds_read_buffer.buffer_position);
+        assert!(self.tds_read_buffer.is_drained());
         self.tds_read_buffer
             .change_packet_size(NetworkReader::packet_size(self));
         self.tds_read_buffer.reset_to_length(0);
     }
 
     async fn read_byte(&mut self) -> TdsResult<u8> {
-        if !self.tds_read_buffer.do_we_have_enough_data(1) {
+        if !self.tds_read_buffer.has(1) {
             self.read_tds_packet().await?;
         }
-        let result: u8 = self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position];
-        self.tds_read_buffer.consume_bytes(1);
-        Ok(result)
+        self.tds_read_buffer.take_u8()
     }
 
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
-        if !self.tds_read_buffer.do_we_have_enough_data(2) {
+        if !self.tds_read_buffer.has(2) {
             self.read_tds_packet().await?;
         }
-        let result = BigEndian::read_i16(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(2);
-        Ok(result)
+        self.tds_read_buffer.take_i16_be()
     }
     async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
-        if !self.tds_read_buffer.do_we_have_enough_data(4) {
+        if !self.tds_read_buffer.has(4) {
             self.read_tds_packet().await?;
         }
-        let result = BigEndian::read_i32(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(4);
-        Ok(result)
+        self.tds_read_buffer.take_i32_be()
     }
 
     async fn read_uint40(&mut self) -> TdsResult<u64> {
-        if !self.tds_read_buffer.do_we_have_enough_data(5) {
+        if !self.tds_read_buffer.has(5) {
             self.read_tds_packet().await?;
         }
-
-        let result = LittleEndian::read_uint(self.tds_read_buffer.get_slice(), 5);
-        self.tds_read_buffer.consume_bytes(5);
-        Ok(result)
+        self.tds_read_buffer.take_uint40_le()
     }
 
     async fn read_float32(&mut self) -> TdsResult<f32> {
-        if !self.tds_read_buffer.do_we_have_enough_data(4) {
+        if !self.tds_read_buffer.has(4) {
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_f32(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(4);
-        Ok(result)
+        self.tds_read_buffer.take_f32_le()
     }
     async fn read_float64(&mut self) -> TdsResult<f64> {
-        if !self.tds_read_buffer.do_we_have_enough_data(8) {
+        if !self.tds_read_buffer.has(8) {
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_f64(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(8);
-        Ok(result)
+        self.tds_read_buffer.take_f64_le()
     }
     async fn read_int16(&mut self) -> TdsResult<i16> {
-        if !self.tds_read_buffer.do_we_have_enough_data(2) {
+        if !self.tds_read_buffer.has(2) {
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_i16(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(2);
-        Ok(result)
+        self.tds_read_buffer.take_i16_le()
     }
     async fn read_uint16(&mut self) -> TdsResult<u16> {
-        if !self.tds_read_buffer.do_we_have_enough_data(2) {
+        if !self.tds_read_buffer.has(2) {
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_u16(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(2);
-        Ok(result)
+        self.tds_read_buffer.take_u16_le()
     }
     async fn read_uint24(&mut self) -> TdsResult<u32> {
-        if !self.tds_read_buffer.do_we_have_enough_data(3) {
+        if !self.tds_read_buffer.has(3) {
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_u24(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(3);
-        Ok(result)
+        self.tds_read_buffer.take_u24_le()
     }
 
     async fn read_int32(&mut self) -> TdsResult<i32> {
-        if !self.tds_read_buffer.do_we_have_enough_data(4) {
+        if !self.tds_read_buffer.has(4) {
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_i32(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(4);
-        Ok(result)
+        self.tds_read_buffer.take_i32_le()
     }
 
     async fn read_uint32(&mut self) -> TdsResult<u32> {
-        if !self.tds_read_buffer.do_we_have_enough_data(4) {
+        if !self.tds_read_buffer.has(4) {
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_u32(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(4);
-        Ok(result)
+        self.tds_read_buffer.take_u32_le()
     }
     async fn read_int64(&mut self) -> TdsResult<i64> {
-        if !self.tds_read_buffer.do_we_have_enough_data(8) {
+        if !self.tds_read_buffer.has(8) {
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_i64(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(8);
-        Ok(result)
+        self.tds_read_buffer.take_i64_le()
     }
     async fn read_uint64(&mut self) -> TdsResult<u64> {
-        if !self.tds_read_buffer.do_we_have_enough_data(8) {
+        if !self.tds_read_buffer.has(8) {
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_u64(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(8);
-        Ok(result)
+        self.tds_read_buffer.take_u64_le()
     }
 
     async fn read_bytes(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
         let mut total_read = 0;
-        let mut length_to_read = buffer.len();
-        let mut offset = 0;
-        while length_to_read > 0 {
-            if !self
-                .tds_read_buffer
-                .do_we_have_enough_data(min(self.tds_read_buffer.max_packet_size, length_to_read))
-            {
+        while total_read < buffer.len() {
+            if self.tds_read_buffer.available() == 0 {
                 self.read_tds_packet().await?;
             }
-            let available = self.tds_read_buffer.get_remaining_byte_count();
-
-            // We can read the minimum of what is available, or the actual length needed or the packet size.
-            let to_read = min(
-                available,
-                min(length_to_read, self.tds_read_buffer.max_packet_size - 8),
-            );
-
-            if to_read > 0 {
-                // Copy from self.working_buffer to buffer from self.buffer_position to offset.
-                buffer[offset..offset + to_read].copy_from_slice(
-                    &self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position
-                        ..self.tds_read_buffer.buffer_position + to_read],
-                );
-                offset += to_read;
-                length_to_read -= to_read;
-                total_read += to_read;
-
-                self.tds_read_buffer.consume_bytes(to_read);
-            }
+            total_read += self.tds_read_buffer.copy_out(&mut buffer[total_read..]);
         }
         Ok(total_read)
     }
@@ -1337,26 +1213,12 @@ impl TdsPacketReader for NetworkTransport {
     }
 
     async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()> {
-        let mut length_to_read = skip_count;
-        while length_to_read > 0 {
-            if !self.tds_read_buffer.do_we_have_enough_data(min(
-                self.tds_read_buffer.max_packet_size - 8,
-                length_to_read,
-            )) {
+        let mut remaining = skip_count;
+        while remaining > 0 {
+            if self.tds_read_buffer.available() == 0 {
                 self.read_tds_packet().await?;
             }
-            let available = self.tds_read_buffer.get_remaining_byte_count();
-
-            // We can read the minimum of what is available, or the actual length needed or the packet size.
-            let to_read = min(
-                available,
-                min(length_to_read, self.tds_read_buffer.max_packet_size - 8),
-            );
-
-            if to_read > 0 {
-                length_to_read -= to_read;
-                self.tds_read_buffer.consume_bytes(to_read);
-            }
+            remaining -= self.tds_read_buffer.skip_available(remaining);
         }
         Ok(())
     }
@@ -1759,8 +1621,8 @@ pub(crate) mod tests {
 
         // Verify initial state: buffer sized for 4096 packets
         assert_eq!(transport.packet_size, initial_packet_size);
-        assert_eq!(transport.tds_read_buffer.working_buffer.len(), 8192); // 4096 * 2
-        assert_eq!(transport.tds_read_buffer.max_packet_size, 4096);
+        assert_eq!(transport.tds_read_buffer.working_buffer().len(), 8192); // 4096 * 2
+        assert_eq!(transport.tds_read_buffer.max_packet_size(), 4096);
 
         // Simulate packet size negotiation (what happens after login)
         transport.packet_size = negotiated_packet_size;
@@ -1770,20 +1632,23 @@ pub(crate) mod tests {
 
         // Verify the fix: buffer should now be sized for 8000-byte packets
         assert_eq!(
-            transport.tds_read_buffer.working_buffer.len(),
+            transport.tds_read_buffer.working_buffer().len(),
             16000,
             "Buffer should be resized to 8000 * 2 = 16000 bytes after reset_reader()"
         );
         assert_eq!(
-            transport.tds_read_buffer.max_packet_size, 8000,
+            transport.tds_read_buffer.max_packet_size(),
+            8000,
             "max_packet_size should be updated to 8000"
         );
         assert_eq!(
-            transport.tds_read_buffer.buffer_position, 0,
+            transport.tds_read_buffer.position(),
+            0,
             "buffer_position should be reset to 0"
         );
         assert_eq!(
-            transport.tds_read_buffer.buffer_length, 0,
+            transport.tds_read_buffer.length(),
+            0,
             "buffer_length should be reset to 0"
         );
     }
@@ -1808,7 +1673,7 @@ pub(crate) mod tests {
         let (mut transport, _server_side) = create_readable_network_transport(&context);
 
         // Verify initial buffer size
-        let initial_buffer_len = transport.tds_read_buffer.working_buffer.len();
+        let initial_buffer_len = transport.tds_read_buffer.working_buffer().len();
         assert_eq!(initial_buffer_len, 8192);
 
         // Call reset_reader - packet size hasn't changed
@@ -1816,10 +1681,10 @@ pub(crate) mod tests {
 
         // Buffer size should remain the same (no unnecessary reallocation)
         assert_eq!(
-            transport.tds_read_buffer.working_buffer.len(),
+            transport.tds_read_buffer.working_buffer().len(),
             initial_buffer_len
         );
-        assert_eq!(transport.tds_read_buffer.max_packet_size, 4096);
+        assert_eq!(transport.tds_read_buffer.max_packet_size(), 4096);
     }
 
     /// Test that get_new_tds_packet correctly handles multiple TDS packets arriving in a single read.
@@ -1911,7 +1776,7 @@ pub(crate) mod tests {
         );
 
         // Verify packet 1 payload is correct (starts at buffer_length which is 0 initially)
-        let packet1_in_buffer = &transport.tds_read_buffer.working_buffer[0..size1];
+        let packet1_in_buffer = &transport.tds_read_buffer.working_buffer()[0..size1];
         assert_eq!(
             packet1_in_buffer,
             &packet1[..],
@@ -1920,13 +1785,13 @@ pub(crate) mod tests {
 
         // Check that pending_bytes was set correctly for the second packet
         assert_eq!(
-            transport.tds_read_buffer.pending_bytes, packet2_total_len as usize,
+            transport.tds_read_buffer.pending_bytes(),
+            packet2_total_len as usize,
             "pending_bytes should track the second packet"
         );
 
         // Reset buffer state to simulate processing the first packet
-        transport.tds_read_buffer.buffer_length = 0;
-        transport.tds_read_buffer.buffer_position = 0;
+        transport.tds_read_buffer.reset_to_length(0);
 
         // Second call to get_new_tds_packet should return packet 2 from pending bytes
         let size2 = transport
@@ -1939,7 +1804,7 @@ pub(crate) mod tests {
         );
 
         // Verify packet 2 payload is correct
-        let packet2_in_buffer = &transport.tds_read_buffer.working_buffer[0..size2];
+        let packet2_in_buffer = &transport.tds_read_buffer.working_buffer()[0..size2];
         assert_eq!(
             packet2_in_buffer,
             &packet2[..],
@@ -1948,7 +1813,8 @@ pub(crate) mod tests {
 
         // After reading both packets, pending_bytes should be 0
         assert_eq!(
-            transport.tds_read_buffer.pending_bytes, 0,
+            transport.tds_read_buffer.pending_bytes(),
+            0,
             "pending_bytes should be 0 after consuming all data"
         );
     }
@@ -2002,11 +1868,11 @@ pub(crate) mod tests {
         assert_eq!(size, total_len as usize);
 
         // Verify content
-        let packet_in_buffer = &transport.tds_read_buffer.working_buffer[0..size];
+        let packet_in_buffer = &transport.tds_read_buffer.working_buffer()[0..size];
         assert_eq!(packet_in_buffer, &packet[..]);
 
         // No pending bytes
-        assert_eq!(transport.tds_read_buffer.pending_bytes, 0);
+        assert_eq!(transport.tds_read_buffer.pending_bytes(), 0);
     }
 
     /// Test that demonstrates the multi-packet read bug WITHOUT checking internal fields.
@@ -2086,9 +1952,9 @@ pub(crate) mod tests {
 
         // Verify first packet content (especially the payload bytes 8..32)
         // Copy data to owned values to avoid borrow issues
-        let read_packet1_id = transport.tds_read_buffer.working_buffer[6];
+        let read_packet1_id = transport.tds_read_buffer.working_buffer()[6];
         let read_packet1_payload: Vec<u8> =
-            transport.tds_read_buffer.working_buffer[8..size1].to_vec();
+            transport.tds_read_buffer.working_buffer()[8..size1].to_vec();
 
         assert_eq!(
             &read_packet1_payload[..],
@@ -2136,9 +2002,9 @@ pub(crate) mod tests {
         );
 
         // Verify second packet content - this catches data corruption bugs
-        let read_packet2_id = transport.tds_read_buffer.working_buffer[6];
+        let read_packet2_id = transport.tds_read_buffer.working_buffer()[6];
         let read_packet2_payload: Vec<u8> =
-            transport.tds_read_buffer.working_buffer[8..size2].to_vec();
+            transport.tds_read_buffer.working_buffer()[8..size2].to_vec();
 
         assert_eq!(
             &read_packet2_payload[..],
@@ -2176,9 +2042,10 @@ pub(crate) mod tests {
         // Simulate corrupted state: pending_bytes_offset points way past buffer end.
         // Direct field mutation is intentional here - we're testing defense against
         // invalid state that could only arise from malformed packet data.
-        let buffer_len = transport.tds_read_buffer.working_buffer.len();
-        transport.tds_read_buffer.pending_bytes = 100;
-        transport.tds_read_buffer.pending_bytes_offset = buffer_len + 1000; // Way out of bounds
+        let buffer_len = transport.tds_read_buffer.working_buffer().len();
+        transport
+            .tds_read_buffer
+            .set_pending_for_test(100, buffer_len + 1000); // Way out of bounds
 
         // This should return an error, not panic
         let result = transport.get_new_tds_packet().await;
@@ -2197,8 +2064,9 @@ pub(crate) mod tests {
         // Reset buffer to clean state, then inject another invalid scenario.
         // Direct mutation is intentional - testing defense against malformed data.
         transport.tds_read_buffer.reset_to_length(0);
-        transport.tds_read_buffer.pending_bytes = buffer_len + 500; // Larger than buffer
-        transport.tds_read_buffer.pending_bytes_offset = 0;
+        transport
+            .tds_read_buffer
+            .set_pending_for_test(buffer_len + 500, 0); // Larger than buffer
 
         let result = transport.get_new_tds_packet().await;
         assert!(
@@ -2209,8 +2077,7 @@ pub(crate) mod tests {
         // Reset buffer, then test: src range valid but dest would overflow.
         // We set buffer_length near the end so base_offset leaves no room for pending bytes.
         transport.tds_read_buffer.reset_to_length(buffer_len - 10);
-        transport.tds_read_buffer.pending_bytes = 100; // 100 bytes won't fit at dest
-        transport.tds_read_buffer.pending_bytes_offset = 0; // src is valid
+        transport.tds_read_buffer.set_pending_for_test(100, 0); // 100 bytes won't fit at dest
 
         let result = transport.get_new_tds_packet().await;
         assert!(

@@ -107,9 +107,9 @@ impl<'a> PacketReader<'a> {
     }
 
     async fn read_tds_packet(&mut self) -> TdsResult<()> {
-        let base = self.buffer.begin_refill();
-        let raw_len = self.receive_packet(base).await?;
-        self.buffer.commit_packet(base, raw_len);
+        let (base, already) = self.buffer.begin_refill()?;
+        let received = self.receive_packet(base, already).await?;
+        self.buffer.strip_header(received);
         Ok(())
     }
 
@@ -119,27 +119,40 @@ impl<'a> PacketReader<'a> {
         self.read_tds_packet().await
     }
 
-    async fn receive_packet(&mut self, base: usize) -> TdsResult<usize> {
-        let mut received = self
-            .network_reader_writer
-            .receive(self.buffer.refill_window(base, 0))
-            .await?;
+    /// Reads one TDS packet's raw bytes into the buffer and returns the total
+    /// number of bytes read (header + payload). The header's declared length is
+    /// used only as a lower bound on how much to read; the caller strips the
+    /// header from whatever was actually received.
+    async fn receive_packet(&mut self, base: usize, already: usize) -> TdsResult<usize> {
+        let mut received = already;
 
         // The 8-byte header may arrive split across reads; keep reading until it
         // is complete before trusting its declared length.
         while received < PacketWriter::PACKET_HEADER_SIZE {
-            received += self
+            let bytes_read = self
                 .network_reader_writer
                 .receive(self.buffer.refill_window(base, received))
                 .await?;
+            if bytes_read == 0 {
+                return Err(crate::error::Error::ConnectionClosed(
+                    "Connection closed by server while reading TDS packet header".to_string(),
+                ));
+            }
+            received += bytes_read;
         }
 
         let packet_size_from_header = self.buffer.packet_header_length(base);
         while received < packet_size_from_header {
-            received += self
+            let bytes_read = self
                 .network_reader_writer
                 .receive(self.buffer.refill_window(base, received))
                 .await?;
+            if bytes_read == 0 {
+                return Err(crate::error::Error::ConnectionClosed(
+                    "Connection closed by server while reading TDS packet payload".to_string(),
+                ));
+            }
+            received += bytes_read;
         }
 
         event!(
@@ -154,6 +167,7 @@ impl<'a> PacketReader<'a> {
             "Packet content: {:?}",
             self.buffer.raw_packet(base, received).hex_dump()
         );
+
         Ok(received)
     }
 }
