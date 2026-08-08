@@ -1325,6 +1325,112 @@ mod tests {
         }
     }
 
+    /// Mandatory blocking test (L4a test A): a non-PLP column followed by a PLP
+    /// column decoded through the buffer-owning `PacketReader` — the reader whose
+    /// sync driver L4a inverts. The refill boundary is swept across every byte
+    /// offset (including the exact non-PLP -> PLP transition and mid-cell splits)
+    /// and every split must decode byte-identically to the single-packet
+    /// baseline. This proves the inverted sync step consumes the non-PLP cell
+    /// atomically and hands off to the async PLP path with a coherent shared
+    /// cursor, regardless of where the packet boundary lands.
+    #[tokio::test]
+    async fn nonplp_to_plp_transition_is_byte_identical_across_refill_boundary() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
+        use crate::message::messages::PacketType;
+
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let columns = vec![
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: "n".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::NVarChar,
+                type_info: TypeInfo::partial_len(TdsDataType::NVarChar, 0xFFFF, Some(collation))
+                    .unwrap(),
+                column_name: "s".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+        ];
+
+        // ROW payload: [Row token][int4 = 42][nvarchar(max) PLP = "Hi"].
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend_from_slice(&42_i32.to_le_bytes());
+        payload.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // SQL_PLP_UNKNOWNLEN
+        let hi_utf16 = [0x48u8, 0x00, 0x69, 0x00]; // "Hi"
+        payload.extend_from_slice(&(hi_utf16.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&hi_utf16);
+        payload.extend_from_slice(&0u32.to_le_bytes()); // PLP zero-length terminator
+
+        async fn decode(read_data: Vec<u8>, columns: &[ColumnMetadata]) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        fn one_packet(payload: &[u8]) -> Vec<u8> {
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            builder.append_bytes(payload).build()
+        }
+        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut first = first_builder.append_bytes(&payload[..split]).build();
+            // Clear EOM on the first packet so the buffer keeps reading into the second.
+            first[1] = 0x00;
+            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let second = second_builder.append_bytes(&payload[split..]).build();
+            [first, second].concat()
+        }
+
+        let wire = one_packet(&payload);
+        let baseline = decode(wire, &columns).await;
+        assert_eq!(baseline.len(), 2);
+        assert_eq!(baseline[0], ColumnValues::Int(42));
+        assert_ne!(baseline[1], ColumnValues::Null);
+
+        // Sweep the refill boundary across every interior byte offset. Offset 5
+        // is the exact non-PLP -> PLP transition (token + int4); others land
+        // mid-int4 and mid-PLP-chunk. All must match the single-packet decode.
+        for split in 1..payload.len() {
+            let got = decode(two_packets(&payload, split), &columns).await;
+            assert_eq!(
+                got, baseline,
+                "row decode diverged when the refill boundary landed at offset {split}"
+            );
+        }
+    }
+
     struct MockTokenParserRegistry {
         parsers: HashMap<TokenType, TokenParsers>,
     }

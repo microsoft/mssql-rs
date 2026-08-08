@@ -194,8 +194,8 @@ impl<'a> PacketReader<'a> {
 
     async fn read_tds_packet(&mut self) -> TdsResult<()> {
         let (base, already) = self.buffer.begin_refill()?;
-        let received = self.receive_packet(base, already).await?;
-        self.buffer.strip_header(received);
+        let packet_len = self.receive_packet(base, already).await?;
+        self.buffer.strip_header(packet_len);
         Ok(())
     }
 
@@ -205,10 +205,10 @@ impl<'a> PacketReader<'a> {
         self.read_tds_packet().await
     }
 
-    /// Reads one TDS packet's raw bytes into the buffer and returns the total
-    /// number of bytes read (header + payload). The header's declared length is
-    /// used only as a lower bound on how much to read; the caller strips the
-    /// header from whatever was actually received.
+    /// Reads one TDS packet into the buffer and returns that packet's declared
+    /// length (header + payload). A single socket read may pull bytes past this
+    /// packet; the surplus is carried forward via `record_pending` so the next
+    /// refill strips its header too, exactly as the production transport does.
     async fn receive_packet(&mut self, base: usize, already: usize) -> TdsResult<usize> {
         let mut received = already;
 
@@ -227,7 +227,7 @@ impl<'a> PacketReader<'a> {
             received += bytes_read;
         }
 
-        let packet_size_from_header = self.buffer.packet_header_length(base);
+        let packet_size_from_header = self.buffer.validate_packet_length(base)?;
         while received < packet_size_from_header {
             let bytes_read = self
                 .network_reader_writer
@@ -241,20 +241,26 @@ impl<'a> PacketReader<'a> {
             received += bytes_read;
         }
 
+        // Bytes read past this packet belong to the next one; carry them forward.
+        self.buffer
+            .record_pending(base, packet_size_from_header, received);
+
         event!(
             tracing::Level::DEBUG,
             "Received packet of size: {:?}",
-            received
+            packet_size_from_header
         );
 
         use pretty_hex::PrettyHex;
         event!(
             tracing::Level::DEBUG,
             "Packet content: {:?}",
-            self.buffer.raw_packet(base, received).hex_dump()
+            self.buffer
+                .raw_packet(base, packet_size_from_header)
+                .hex_dump()
         );
 
-        Ok(received)
+        Ok(packet_size_from_header)
     }
 }
 
@@ -659,7 +665,11 @@ pub(crate) mod tests {
         append_method!(append_u64, u64, 8, write_u64);
 
         pub(crate) fn build(&mut self) -> Vec<u8> {
-            BigEndian::write_u16(&mut self.data[2..4], self.payload_length);
+            // The TDS header length field is the total packet size (header +
+            // payload), matching the production serializer and what
+            // `validate_packet_length` expects.
+            let total_length = self.payload_length + PacketWriter::PACKET_HEADER_SIZE as u16;
+            BigEndian::write_u16(&mut self.data[2..4], total_length);
             self.data.clone()
         }
     }
@@ -1183,5 +1193,83 @@ pub(crate) mod tests {
                 || err.to_string().contains("no progress"),
             "expected termination error, got: {err}"
         );
+    }
+
+    /// Mandatory blocking test (L4a test B): an inverted variable-length non-PLP
+    /// cell (nvarchar) whose bytes are split across a packet refill boundary at
+    /// every interior offset — including inside the 2-byte length prefix
+    /// (peek-only re-drive from the column start) and mid-data (whole-cell
+    /// `ensure` across the boundary). Every split must decode identically to the
+    /// single-packet cell, proving the sync driver never partially consumes the
+    /// buffer or writes to the row before the shortfall is satisfied.
+    #[tokio::test]
+    async fn var_length_cell_redrive_is_byte_identical_across_refill_boundary() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
+        use crate::token::tokens::SqlCollation;
+
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let meta = ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            data_type: TdsDataType::NVarChar,
+            type_info: TypeInfo::partial_len(TdsDataType::NVarChar, 100, Some(collation)).unwrap(),
+            column_name: "s".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+
+        // nvarchar cell wire: [u16 byte length][utf16-le data]. "Hello" = 5 units.
+        let hello: Vec<u8> = "Hello"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        let mut cell = (hello.len() as u16).to_le_bytes().to_vec();
+        cell.extend_from_slice(&hello);
+
+        async fn decode(read_data: Vec<u8>, meta: &ColumnMetadata) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            let mut writer = DefaultRowWriter::new(1);
+            reader
+                .decode_column_into(meta, 0, &mut writer)
+                .await
+                .unwrap();
+            writer.take_row()
+        }
+
+        fn one_packet(payload: &[u8]) -> Vec<u8> {
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            builder.append_bytes(payload).build()
+        }
+        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut first = first_builder.append_bytes(&payload[..split]).build();
+            // Clear EOM so the buffer keeps reading into the second packet.
+            first[1] = 0x00;
+            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let second = second_builder.append_bytes(&payload[split..]).build();
+            [first, second].concat()
+        }
+
+        let baseline = decode(one_packet(&cell), &meta).await;
+        assert_eq!(baseline.len(), 1);
+        assert_ne!(baseline[0], ColumnValues::Null);
+
+        // split == 1 lands inside the 2-byte length prefix (peek-only re-drive);
+        // splits >= 2 land mid-data (whole-cell ensure across the boundary).
+        for split in 1..cell.len() {
+            let got = decode(two_packets(&cell, split), &meta).await;
+            assert_eq!(
+                got, baseline,
+                "cell decode diverged when the refill boundary landed at offset {split}"
+            );
+        }
     }
 }
