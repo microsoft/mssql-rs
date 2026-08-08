@@ -97,6 +97,39 @@ impl PacketBuffer {
         &self.working_buffer[self.position..self.length]
     }
 
+    /// Non-consuming view of the first `n` readable bytes, or `None` when fewer
+    /// than `n` are buffered.
+    ///
+    /// Unlike [`take`](Self::take) this never advances the read position, so the
+    /// column-atomic decode path can inspect a length prefix and then re-drive
+    /// from the column start after a refill without having consumed anything.
+    pub(crate) fn peek_bytes(&self, n: usize) -> Option<&[u8]> {
+        if self.has(n) {
+            Some(&self.working_buffer[self.position..self.position + n])
+        } else {
+            None
+        }
+    }
+
+    /// Builds a transient, refill-free buffer whose entire readable payload is
+    /// `bytes`.
+    ///
+    /// Used by the async column driver to stage a fully-assembled non-PLP cell
+    /// so the single synchronous `decode_column_body` can run over it, without a
+    /// socket or packet framing. There is no header and no refill source, so the
+    /// paired `take_*` accessors serve straight from `bytes`.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        let len = bytes.len();
+        PacketBuffer {
+            working_buffer: bytes.to_vec(),
+            position: 0,
+            length: len,
+            max_packet_size: len.max(1),
+            pending_bytes: 0,
+            pending_bytes_offset: 0,
+        }
+    }
+
     /// Returns the first `n` readable bytes, erroring if fewer are buffered.
     ///
     /// Callers ensure enough bytes are present (via a refill) before calling; a
@@ -697,5 +730,29 @@ mod tests {
 
         // After a satisfied guard the same bytes read back intact.
         assert_eq!(buf.take_u8().unwrap(), 0xAA);
+    }
+
+    /// `peek_bytes` returns a non-consuming prefix view and yields `None` once
+    /// the request exceeds what is buffered — the length-prefix inspection the
+    /// column-atomic decode path relies on to re-drive without consuming.
+    #[test]
+    fn peek_bytes_is_non_consuming_and_bounded() {
+        let mut buf = staged(&[0x04, 0x00, 0xAA, 0xBB]);
+
+        // Peeking the 2-byte USHORT length prefix does not advance the cursor.
+        assert_eq!(buf.peek_bytes(2), Some([0x04, 0x00].as_slice()));
+        assert_eq!(buf.position(), 0);
+        assert_eq!(buf.available(), 4);
+
+        // Repeated peeks are idempotent.
+        assert_eq!(buf.peek_bytes(1), Some([0x04].as_slice()));
+        assert_eq!(buf.peek_bytes(4), Some([0x04, 0x00, 0xAA, 0xBB].as_slice()));
+
+        // Beyond what is buffered => None (a refill request, not a peek).
+        assert_eq!(buf.peek_bytes(5), None);
+
+        // The bytes are still fully readable afterwards.
+        assert_eq!(buf.take_u16_le().unwrap(), 0x0004);
+        assert_eq!(buf.position(), 2);
     }
 }

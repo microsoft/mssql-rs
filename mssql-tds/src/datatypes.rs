@@ -29,4 +29,6 @@ pub mod sql_vector;
 pub mod sqldatatypes;
 /// Input parameter types for RPC calls.
 pub mod sqltypes;
+/// Column-atomic synchronous decode of non-PLP cells over [`PacketBuffer`].
+pub(crate) mod sync_decoder;
 pub(crate) mod tds_value_serializer;

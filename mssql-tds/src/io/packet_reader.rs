@@ -6,10 +6,12 @@ use tracing::event;
 
 use super::packet_writer::PacketWriter;
 use crate::core::TdsResult;
+use crate::datatypes::row_writer::RowWriter;
 use crate::io::packet_buffer::PacketBuffer;
 use crate::io::reader_writer::NetworkReaderWriter;
 use crate::message::attention::AttentionRequest;
 use crate::message::messages::Request;
+use crate::query::metadata::ColumnMetadata;
 use std::io::{Error, ErrorKind};
 
 #[async_trait]
@@ -42,6 +44,39 @@ pub(crate) trait TdsPacketReader {
     async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()>;
     async fn cancel_read_stream(&mut self) -> TdsResult<()>;
     fn reset_reader(&mut self);
+
+    /// Decodes one non-PLP column cell into `writer` as a column-atomic step.
+    ///
+    /// The caller guarantees `meta` is a non-PLP type accepted by
+    /// [`sync_decoder::is_supported`](crate::datatypes::sync_decoder::is_supported).
+    /// The default assembles the whole cell via `read_bytes` (for readers that do
+    /// not own a [`PacketBuffer`]) and runs the shared `decode_column_body`;
+    /// buffer-owning readers override this to drive the sync core in place.
+    async fn decode_column_into(
+        &mut self,
+        meta: &ColumnMetadata,
+        col: usize,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<()> {
+        use crate::datatypes::sync_decoder;
+        use crate::io::packet_buffer::PacketBuffer;
+
+        let mut cell: Vec<u8> = Vec::new();
+        loop {
+            let probe = PacketBuffer::from_bytes(&cell);
+            let needed = match sync_decoder::column_wire_len(&probe, meta) {
+                Ok(total) if cell.len() >= total => {
+                    let mut body = PacketBuffer::from_bytes(&cell[..total]);
+                    return sync_decoder::decode_column_body(&mut body, meta, col, writer);
+                }
+                Ok(total) => total - cell.len(),
+                Err(need) => need.shortfall,
+            };
+            let mut extra = vec![0u8; needed];
+            self.read_bytes(&mut extra).await?;
+            cell.extend_from_slice(&extra);
+        }
+    }
 }
 
 /// Low-level TDS packet reading operations (public under `fuzzing` cfg).
@@ -73,6 +108,39 @@ pub trait TdsPacketReader {
     async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()>;
     async fn cancel_read_stream(&mut self) -> TdsResult<()>;
     fn reset_reader(&mut self);
+
+    /// Decodes one non-PLP column cell into `writer` as a column-atomic step.
+    ///
+    /// The caller guarantees `meta` is a non-PLP type accepted by
+    /// [`sync_decoder::is_supported`](crate::datatypes::sync_decoder::is_supported).
+    /// The default assembles the whole cell via `read_bytes` (for readers that do
+    /// not own a [`PacketBuffer`]) and runs the shared `decode_column_body`;
+    /// buffer-owning readers override this to drive the sync core in place.
+    async fn decode_column_into(
+        &mut self,
+        meta: &ColumnMetadata,
+        col: usize,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<()> {
+        use crate::datatypes::sync_decoder;
+        use crate::io::packet_buffer::PacketBuffer;
+
+        let mut cell: Vec<u8> = Vec::new();
+        loop {
+            let probe = PacketBuffer::from_bytes(&cell);
+            let needed = match sync_decoder::column_wire_len(&probe, meta) {
+                Ok(total) if cell.len() >= total => {
+                    let mut body = PacketBuffer::from_bytes(&cell[..total]);
+                    return sync_decoder::decode_column_body(&mut body, meta, col, writer);
+                }
+                Ok(total) => total - cell.len(),
+                Err(need) => need.shortfall,
+            };
+            let mut extra = vec![0u8; needed];
+            self.read_bytes(&mut extra).await?;
+            cell.extend_from_slice(&extra);
+        }
+    }
 }
 
 /// Buffered reader that reassembles TDS packets from the network stream.
@@ -196,6 +264,29 @@ impl TdsPacketReader for PacketReader<'_> {
         // Make sure that we have read all the data from the buffer.
         assert!(self.buffer.is_drained());
         // No Op after this.
+    }
+
+    async fn decode_column_into(
+        &mut self,
+        meta: &ColumnMetadata,
+        col: usize,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<()> {
+        use crate::datatypes::sync_decoder;
+
+        // Sync driver: peek the wire width over the owned buffer, ensure the
+        // whole cell, then decode it in place with zero copy. `column_wire_len`
+        // only peeks, so a shortfall (missing length prefix) re-drives from the
+        // column start with nothing consumed or written.
+        loop {
+            match sync_decoder::column_wire_len(&self.buffer, meta) {
+                Ok(total) => {
+                    self.ensure(total).await?;
+                    return sync_decoder::decode_column_body(&mut self.buffer, meta, col, writer);
+                }
+                Err(need) => self.ensure(need.shortfall).await?,
+            }
+        }
     }
 
     async fn cancel_read_stream(&mut self) -> TdsResult<()> {
@@ -472,6 +563,15 @@ impl TdsPacketReader for Box<dyn TdsPacketReader + Send + Sync> {
 
     fn reset_reader(&mut self) {
         (**self).reset_reader()
+    }
+
+    async fn decode_column_into(
+        &mut self,
+        meta: &ColumnMetadata,
+        col: usize,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<()> {
+        (**self).decode_column_into(meta, col, writer).await
     }
 }
 

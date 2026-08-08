@@ -469,13 +469,34 @@ async fn decode_or_decrypt_column<R: TdsPacketReader + Send + Sync>(
                  (Always Encrypted disabled for this command, or no key-store \
                  provider registered); returning the raw ciphertext varbinary"
             );
-            decoder.decode_into(reader, meta, col, writer).await?;
+            decode_non_plp_column(decoder, reader, meta, col, writer).await?;
         }
         (false, _) => {
-            decoder.decode_into(reader, meta, col, writer).await?;
+            decode_non_plp_column(decoder, reader, meta, col, writer).await?;
         }
     }
     Ok(())
+}
+
+/// Decodes a single non-encrypted, non-PLP-or-PLP column.
+///
+/// Routes cells whose type is owned by the synchronous column-atomic path
+/// (`sync_decoder::is_supported`) through `reader.decode_column_into`, which
+/// lifts the `.await` out of the middle of the cell to the column boundary.
+/// PLP cells and not-yet-ported types fall back to the legacy async
+/// `decode_into`, preserving byte-identical decoding.
+async fn decode_non_plp_column<R: TdsPacketReader + Send + Sync>(
+    decoder: &GenericDecoder,
+    reader: &mut R,
+    meta: &ColumnMetadata,
+    col: usize,
+    writer: &mut (dyn RowWriter + Send),
+) -> TdsResult<()> {
+    if crate::datatypes::sync_decoder::is_supported(meta) {
+        reader.decode_column_into(meta, col, writer).await
+    } else {
+        decoder.decode_into(reader, meta, col, writer).await
+    }
 }
 
 pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(

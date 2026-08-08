@@ -1088,6 +1088,33 @@ impl TdsPacketReader for NetworkTransport {
         self.tds_read_buffer.reset_to_length(0);
     }
 
+    async fn decode_column_into(
+        &mut self,
+        meta: &crate::query::metadata::ColumnMetadata,
+        col: usize,
+        writer: &mut (dyn crate::datatypes::row_writer::RowWriter + Send),
+    ) -> TdsResult<()> {
+        use crate::datatypes::sync_decoder;
+
+        // Sync driver over the owned read buffer: peek the wire width, ensure the
+        // whole cell, then decode in place. `column_wire_len` only peeks, so a
+        // shortfall re-drives from the column start with nothing consumed.
+        loop {
+            match sync_decoder::column_wire_len(&self.tds_read_buffer, meta) {
+                Ok(total) => {
+                    self.ensure_or_refill(total).await?;
+                    return sync_decoder::decode_column_body(
+                        &mut self.tds_read_buffer,
+                        meta,
+                        col,
+                        writer,
+                    );
+                }
+                Err(need) => self.ensure_or_refill(need.shortfall).await?,
+            }
+        }
+    }
+
     async fn read_byte(&mut self) -> TdsResult<u8> {
         self.ensure_or_refill(1).await?;
         self.tds_read_buffer.take_u8()
