@@ -73,9 +73,9 @@ where
 // Maximum reasonable allocation size for a single value (100MB)
 // This prevents fuzzer-induced capacity overflow panics
 #[cfg(fuzzing)]
-const MAX_ALLOC_SIZE: usize = 64 * 1024; // 64KB for fuzzing
+pub(crate) const MAX_ALLOC_SIZE: usize = 64 * 1024; // 64KB for fuzzing
 #[cfg(not(fuzzing))]
-const MAX_ALLOC_SIZE: usize = 100 * 1024 * 1024;
+pub(crate) const MAX_ALLOC_SIZE: usize = 100 * 1024 * 1024;
 
 // Maximum allocation size for PLP (Partial Length Pointer) types
 // SQL Server supports PLP types up to 2GB (i32::MAX is approximately 2.1GB)
