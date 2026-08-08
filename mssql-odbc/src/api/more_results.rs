@@ -147,7 +147,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // Surface this no-row statement's own affected-row count for
             // SQLRowCount now that we are positioned on it.
             stmt_state.row_count = client.last_rows_affected();
-            stmt_state.current_row = None;
+            stmt_state.reset_row_stream();
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);

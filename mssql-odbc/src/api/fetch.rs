@@ -130,8 +130,11 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
     }
 
     // Position the pull cursor on the next row without decoding any column
-    // (SQLFetch semantics). Columns are pulled lazily by subsequent SQLGetData
-    // calls via `read_row_column`.
+    // (SQLFetch semantics). Any unread remainder of the previous row —
+    // including an in-flight PLP stream — is drained first (see
+    // `drain_active_row` in tds_client), so a failure here may originate from
+    // the prior row rather than the new one. Columns of the new row are pulled
+    // lazily by subsequent SQLGetData calls via `read_row_column`.
     let fetch_result = dbc.runtime.block_on(client.next_row_cursor());
 
     match fetch_result {
@@ -146,8 +149,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 }
                 return SQL_ERROR;
             };
-            stmt_state.reset_row_stream();
-            stmt_state.row_positioned = true; // row positioned, columns streamed on demand
+            stmt_state.begin_row(); // clears per-row state and marks positioned
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();

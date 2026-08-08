@@ -83,26 +83,42 @@ impl ColumnMetadata {
         )
     }
 
-    /// Returns `true` for Unicode character columns (`nvarchar`, `nchar`, `xml`).
-    /// The wire encoding for these types is UTF-16LE.
-    pub fn is_unicode_text(&self) -> bool {
-        matches!(
-            self.data_type,
-            TdsDataType::NVarChar | TdsDataType::NChar | TdsDataType::Xml
-        )
-    }
-
-    /// Returns `true` for binary columns (`varbinary`, `binary`, `image`, `udt`, etc.).
-    pub fn is_binary_type(&self) -> bool {
-        matches!(
-            self.data_type,
+    /// Classifies the wire encoding of this column when it is streamed as a PLP
+    /// (partially-length-prefixed) value, or `None` for non-PLP columns.
+    ///
+    /// This is exhaustive over the PLP type set so a new PLP type can't silently
+    /// fall through to a wrong default. Note `json` is UTF-8 on the wire (no
+    /// collation) and is kept distinct from `varchar(max)` single-byte text —
+    /// they only coincide today because the single-byte path is a verbatim copy;
+    /// once codepage conversion lands for `varchar(max)`, folding `json` into it
+    /// would corrupt data.
+    pub fn plp_encoding(&self) -> Option<PlpEncoding> {
+        if !self.is_plp() {
+            return None;
+        }
+        Some(match self.data_type {
+            // UTF-16LE on the wire.
+            TdsDataType::NVarChar | TdsDataType::NChar | TdsDataType::Xml => PlpEncoding::Utf16Text,
+            // UTF-8 on the wire, carries no collation.
+            TdsDataType::Json => PlpEncoding::Utf8Text,
+            // Single-byte / codepage text.
+            TdsDataType::BigVarChar
+            | TdsDataType::BigChar
+            | TdsDataType::VarChar
+            | TdsDataType::Char
+            | TdsDataType::Text => PlpEncoding::SingleByteText,
+            // Opaque bytes.
             TdsDataType::BigVarBinary
-                | TdsDataType::BigBinary
-                | TdsDataType::VarBinary
-                | TdsDataType::Binary
-                | TdsDataType::Image
-                | TdsDataType::Udt
-        )
+            | TdsDataType::BigBinary
+            | TdsDataType::VarBinary
+            | TdsDataType::Binary
+            | TdsDataType::Image
+            | TdsDataType::Udt
+            | TdsDataType::Vector => PlpEncoding::Binary,
+            // Any other type that is somehow flagged PLP: treat as opaque bytes
+            // rather than guessing a text codepage.
+            _ => PlpEncoding::Binary,
+        })
     }
     /// Returns the scale for decimal/numeric/time types.
     ///
@@ -148,6 +164,21 @@ impl ColumnMetadata {
             _ => None,
         }
     }
+}
+
+/// Wire encoding of a PLP (partially-length-prefixed) column, returned by
+/// [`ColumnMetadata::plp_encoding`]. A streaming consumer uses this to pick the
+/// delivered SQL C type and any transcoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlpEncoding {
+    /// `nvarchar(max)`, `nchar`, `xml` — UTF-16LE on the wire.
+    Utf16Text,
+    /// `json` — UTF-8 on the wire, no collation.
+    Utf8Text,
+    /// `varchar(max)`, `char`, `text` — single-byte / codepage text.
+    SingleByteText,
+    /// `varbinary(max)`, `image`, `udt`, `vector` — opaque bytes.
+    Binary,
 }
 
 impl fmt::Display for ColumnMetadata {
@@ -344,6 +375,62 @@ mod tests {
         let metadata =
             create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
         assert!(!metadata.is_sparse_column_set());
+    }
+
+    /// Builds a PLP column of the given SQL Server type: `is_plp()` keys off the
+    /// `PartialLen` type-info variant while `plp_encoding()` keys off
+    /// `data_type`, so both must be set for a faithful fixture.
+    fn plp_column(data_type: TdsDataType) -> ColumnMetadata {
+        let mut column = create_test_column_metadata(
+            0x00,
+            TypeInfoVariant::PartialLen(PartialLengthType::BigVarChar, None, None, None, None),
+        );
+        column.data_type = data_type;
+        column
+    }
+
+    #[test]
+    fn test_plp_encoding_classifies_full_type_set() {
+        // UTF-16LE text.
+        for dt in [TdsDataType::NVarChar, TdsDataType::NChar, TdsDataType::Xml] {
+            assert_eq!(
+                plp_column(dt).plp_encoding(),
+                Some(PlpEncoding::Utf16Text),
+                "{dt:?} should be Utf16Text"
+            );
+        }
+
+        // json is UTF-8 on the wire and must stay distinct from single-byte
+        // text, otherwise codepage conversion for varchar(max) would corrupt it.
+        assert_eq!(
+            plp_column(TdsDataType::Json).plp_encoding(),
+            Some(PlpEncoding::Utf8Text),
+            "json should be Utf8Text, not SingleByteText"
+        );
+
+        // Single-byte / codepage text.
+        assert_eq!(
+            plp_column(TdsDataType::BigVarChar).plp_encoding(),
+            Some(PlpEncoding::SingleByteText)
+        );
+
+        // Opaque bytes.
+        for dt in [
+            TdsDataType::BigVarBinary,
+            TdsDataType::Image,
+            TdsDataType::Udt,
+        ] {
+            assert_eq!(
+                plp_column(dt).plp_encoding(),
+                Some(PlpEncoding::Binary),
+                "{dt:?} should be Binary"
+            );
+        }
+
+        // Non-PLP columns have no PLP encoding.
+        let non_plp =
+            create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert_eq!(non_plp.plp_encoding(), None);
     }
 
     #[test]

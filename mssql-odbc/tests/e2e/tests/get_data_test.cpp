@@ -147,8 +147,10 @@ TEST_F(GetDataLiveTest, ColumnWiseAscending) {
 }
 
 // Re-requesting a column strictly earlier than the last one retrieved is
-// backward retrieval, which this driver rejects (SQLSTATE 07009). Re-requesting
-// the column just retrieved reports end-of-data (SQL_NO_DATA).
+// backward retrieval, which this forward-only driver rejects (SQLSTATE 07009).
+// Re-requesting the column just retrieved is not backward movement, but its data
+// has already been consumed, so the driver reports end-of-data (SQL_NO_DATA)
+// rather than replaying the value.
 TEST_F(GetDataLiveTest, BackwardColumnRejectedRereadIsNoData) {
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT CAST(10 AS INT) AS c1, "
@@ -600,6 +602,162 @@ TEST_F(GetDataLiveTest, PlpColumnUnsupportedCTypeReturnsHyc00) {
     SQLLEN ind = 0;
     SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_SSHORT, &sbuf, 0, &ind);
     EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+
+    SQLCloseCursor(stmt_);
+}
+
+// ===================================================================
+// Non-PLP resumable SQLGetData (regression coverage for column-wise
+// truncated reads). A fixed-size varchar(n)/nvarchar(n) column larger than
+// the caller buffer must be deliverable across repeated calls, and a length
+// probe must not consume the column — exactly as a PLP column behaves.
+// ===================================================================
+
+// A length probe must report the total length with 01004 and leave the column
+// readable, so the app can re-call with a right-sized buffer. BufferLength 1
+// (room for the terminator only) is the portable probe form: the Windows Driver
+// Manager rejects a NULL pointer and a 0 length for character C types.
+TEST_F(GetDataLiveTest, NonPlpProbeThenFetchReturnsValue) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(REPLICATE('0123456789', 10) AS VARCHAR(100)) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Probe: 1-byte buffer holds only the terminator, so this truncates and
+    // reports the full length without consuming the column.
+    SQLCHAR probe[1] = {0};
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, probe, sizeof(probe), &ind);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_EQ(100, ind) << "probe must report the full length";
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+
+    // A second call with a real buffer must still return the whole value.
+    SQLCHAR buf[256] = {0};
+    SQLLEN ind2 = 0;
+    SQLRETURN rc2 = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind2);
+    ASSERT_SQL_OK(rc2, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(RepeatToken("0123456789", 10),
+              std::string(reinterpret_cast<const char*>(buf)));
+
+    SQLCloseCursor(stmt_);
+}
+
+// A non-PLP character column larger than the caller's buffer must be delivered
+// across repeated calls, exactly as a PLP column is.
+TEST_F(GetDataLiveTest, NonPlpChunkedReadAccumulatesFullValue) {
+    const std::string expected = RepeatToken("0123456789", 100);  // 1000 bytes
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(REPLICATE('0123456789', 100) AS VARCHAR(1000)) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // 100-byte buffer over a 1000-byte value: 11 calls, ten SUCCESS_WITH_INFO
+    // then one SUCCESS. Before the fix this delivered one chunk then SQL_NO_DATA.
+    EXPECT_EQ(expected, ReadCharDataInChunks(stmt_, 1, 100));
+
+    SQLCloseCursor(stmt_);
+}
+
+// ===================================================================
+// Chunked PLP transcoding into SQL_C_CHAR / SQL_C_WCHAR (regression coverage
+// for the UTF-16->UTF-8 framing defect). The SQL_C_WCHAR path is the control;
+// the SQL_C_CHAR path is where the byte-shift/overflow bug lived.
+// ===================================================================
+
+// Control: nvarchar(max) delivered as SQL_C_WCHAR in small chunks round-trips.
+TEST_F(GetDataLiveTest, NvarcharMaxToWcharChunkedRoundTrip) {
+    const std::string ascii = RepeatToken("0123456789", 300);  // 3000 chars
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(N'0123456789' AS NVARCHAR(MAX)), 300) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    std::u16string observed;
+    int guard = 0;
+    while (true) {
+        SQLWCHAR wbuf[17] = {0};  // 16 code units + terminator
+        SQLLEN ind = 0;
+        SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_WCHAR, wbuf, sizeof(wbuf), &ind);
+        ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO)
+            << "unexpected rc=" << rc;
+        for (size_t i = 0; wbuf[i] != 0; ++i) {
+            observed.push_back(static_cast<char16_t>(wbuf[i]));
+        }
+        if (rc == SQL_SUCCESS) {
+            break;
+        }
+        ASSERT_LT(++guard, 10000);
+    }
+    ASSERT_EQ(ascii.size(), observed.size());
+    for (size_t i = 0; i < ascii.size(); ++i) {
+        ASSERT_EQ(static_cast<char16_t>(ascii[i]), observed[i])
+            << "first mismatch at code unit " << i;
+    }
+
+    SQLCloseCursor(stmt_);
+}
+
+// nvarchar(max) delivered as SQL_C_CHAR (UTF-8) in small chunks must reassemble
+// byte-for-byte. ASCII content keeps UTF-16 -> UTF-8 1:1 so any framing error
+// surfaces as a shifted or dropped byte. Buffer size 1024 is the one the
+// reviewer used to pin the original defect (first mismatch at byte 511).
+TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAsciiRoundTrip) {
+    const std::string expected = RepeatToken("0123456789", 300);  // 3000 bytes
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(N'0123456789' AS NVARCHAR(MAX)), 300) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadCharDataInChunks(stmt_, 1, 1024));
+
+    SQLCloseCursor(stmt_);
+}
+
+// A PLP read into a buffer too small to hold even one character plus the null
+// terminator must fail deterministically with HY090 rather than spin forever
+// making zero-length reads. buffer_length 2 leaves no payload room for a
+// UTF-8/UTF-16 unit once the terminator is reserved.
+TEST_F(GetDataLiveTest, PlpZeroCapacityBufferDoesNotSpin) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(N'abcd' AS NVARCHAR(MAX)), 50) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR tiny[2] = {0};
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, tiny, sizeof(tiny), &ind);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY090");
+
+    SQLCloseCursor(stmt_);
+}
+
+// A non-PLP column whose type has no character conversion (e.g. DATETIME) must
+// fail with HYC00 and leave the column readable, so a retry with a compatible C
+// type still works. The reference msodbcsql driver converts DATETIME to
+// character data, so the HYC00 assertion is mssql-odbc-specific.
+TEST_F(GetDataLiveTest, UnsupportedColumnTypeHyc00PreservesValue) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST('2020-01-02T03:04:05' AS DATETIME) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // First attempt with an unsupported target for this column type fails soft.
+    SQLCHAR buf[64] = {0};
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+
+    // The column is still addressable: a retry (again HYC00, not 24000) proves
+    // the value was not consumed by the failed attempt.
+    SQLCHAR buf2[64] = {0};
+    SQLLEN ind2 = 0;
+    SQLRETURN rc2 = SQLGetData(stmt_, 1, SQL_C_CHAR, buf2, sizeof(buf2), &ind2);
+    EXPECT_EQ(SQL_ERROR, rc2);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 
     SQLCloseCursor(stmt_);

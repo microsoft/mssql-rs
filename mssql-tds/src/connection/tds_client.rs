@@ -31,7 +31,9 @@ use crate::{
     },
     datatypes::column_values::ColumnValues,
     handler::handler_factory::NegotiatedSettings,
-    io::token_stream::{ParserContext, PlpPauseState, RowPauseState, RowPlan, RowReadResult},
+    io::token_stream::{
+        ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
+    },
     message::{batch::SqlBatch, messages::Request},
     token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, EnvChangeTokenSubType, Tokens},
 };
@@ -73,20 +75,45 @@ type MemoizedCellDecryptor = (
 
 #[derive(Debug)]
 enum ActiveRowReadState {
+    /// No row is positioned: either nothing has been fetched yet or the result
+    /// set is exhausted. `read_row_column` reports `RowEnded` here.
     Idle,
+    /// A row is positioned and partially read; `next_column_index` columns have
+    /// been consumed and more remain on the wire.
     RowPaused(Box<RowPauseState>),
+    /// A row is positioned with an active PLP column stream mid-flight.
     PlpPaused(Box<PlpPauseState>),
 }
 
+/// One chunk of an active PLP (partially-length-prefixed) column stream,
+/// returned by [`TdsClient::read_active_plp_chunk`].
+///
+/// Carries both facts a streaming consumer needs after each read: how many
+/// bytes landed in the output buffer, and whether the stream is now finished.
+/// Combining them avoids a second `&self` call and keeps the "reached end"
+/// answer consistent with the read that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlpChunk {
+    /// Number of bytes written into the caller's buffer by this read.
+    pub read: usize,
+    /// `true` once the PLP stream has been fully consumed; the caller should
+    /// stop reading and resume the row cursor.
+    pub reached_end: bool,
+}
+
 /// Outcome of [`TdsClient::read_row_column`], the ODBC pull-cursor column fetch.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum CursorColumn {
     /// A fully decoded, materialized column value (non-PLP).
     Value(ColumnValues),
     /// `target` is a PLP column; its bytes are streamed via
-    /// [`TdsClient::read_active_plp_bytes`] until
-    /// [`TdsClient::active_plp_reached_end`] is `true`.
-    PlpStreaming,
+    /// [`TdsClient::read_active_plp_chunk`] until
+    /// [`PlpChunk::reached_end`] is `true`.
+    PlpStreaming {
+        /// Collation for the whole stream, fixed for its lifetime. `None` for
+        /// binary PLP types, so callers do not need a separate lookup per chunk.
+        collation: Option<SqlCollation>,
+    },
     /// `target` was already read or skipped (forward-only violation). The
     /// cursor is left positioned on its next undecoded column.
     AlreadyConsumed,
@@ -1728,6 +1755,13 @@ impl TdsClient {
     #[instrument(skip(self), level = "info")]
     async fn drain_rows(&mut self) -> TdsResult<()> {
         if self.maybe_has_unread_rows() {
+            // A pull cursor (`next_row_cursor`) may have left the current row
+            // partially read (`RowPaused`/`PlpPaused`). The push API used below
+            // rejects that state to avoid silently skipping a row the caller
+            // still expects to see — but here we are intentionally discarding
+            // the rest of the result set, so realign the stream past that parked
+            // row first. `drain_active_row` is a no-op when nothing is parked.
+            self.drain_active_row().await?;
             // Drain the current result set.
             while let Some(row) = self.get_next_row().await? {
                 info!("Consuming row while draining result set {:?}", row.len());
@@ -2806,13 +2840,6 @@ impl TdsClient {
         Ok(Some(decryptor))
     }
 
-    pub(crate) fn active_plp_collation(&self) -> Option<SqlCollation> {
-        match &self.active_row_read_state {
-            ActiveRowReadState::PlpPaused(plp_state) => plp_state.collation(),
-            _ => None,
-        }
-    }
-
     pub(crate) fn active_plp_reached_end(&self) -> bool {
         match &self.active_row_read_state {
             ActiveRowReadState::PlpPaused(plp_state) => plp_state.reached_end(),
@@ -2822,7 +2849,15 @@ impl TdsClient {
 
     pub(crate) async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
         let ActiveRowReadState::PlpPaused(plp_state) = &mut self.active_row_read_state else {
-            return Ok(0);
+            // No active stream is a sequencing error, not EOF: returning `Ok(0)`
+            // here is indistinguishable from a legitimately exhausted stream, so
+            // a mis-ordered call would silently yield an empty value instead of
+            // surfacing the bug.
+            return Err(UsageError(
+                "read_active_plp_bytes called with no active PLP stream; \
+                 read_row_column must report CursorColumn::PlpStreaming first"
+                    .to_string(),
+            ));
         };
 
         let start = Instant::now();
@@ -2839,13 +2874,39 @@ impl TdsClient {
         Ok(read)
     }
 
+    /// Streams the next chunk of the active PLP column into `out`, returning the
+    /// bytes written and whether the stream is now finished ([`PlpChunk`]).
+    ///
+    /// This is the public continuation for [`CursorColumn::PlpStreaming`]: after
+    /// [`read_row_column`](Self::read_row_column) reports a PLP column, call this
+    /// in a loop until [`PlpChunk::reached_end`] is `true`, then resume the
+    /// cursor with the next [`read_row_column`](Self::read_row_column).
+    ///
+    /// # Errors
+    ///
+    /// Returns `UsageError` when no PLP stream is active — i.e. when called
+    /// without a preceding [`CursorColumn::PlpStreaming`] from
+    /// [`read_row_column`](Self::read_row_column). This is a sequencing error,
+    /// deliberately distinct from a legitimately exhausted stream (which reports
+    /// `read == 0, reached_end == true`).
+    #[instrument(skip(self, out), level = "info")]
+    pub async fn read_active_plp_chunk(&mut self, out: &mut [u8]) -> TdsResult<PlpChunk> {
+        let read = self.read_active_plp_bytes(out).await?;
+        Ok(PlpChunk {
+            read,
+            reached_end: self.active_plp_reached_end(),
+        })
+    }
+
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
     ///
     /// This is the **push** entry point used by bulk consumers (Arrow / N-API /
-    /// `next_row`). It always decodes a full row ([`RowPlan::DecodeAll`]) and
-    /// never pauses. Any row left partially read by the pull cursor is drained
-    /// first (allocation-free) so a fresh ROW/NBCROW token is read.
+    /// `next_row`). It always decodes a full row ([`ColumnPolicy::DecodeAll`]) and
+    /// never pauses. If the pull cursor
+    /// ([`next_row_cursor`](Self::next_row_cursor)) left a row *partially* read,
+    /// this returns a [`UsageError`] rather than silently draining and skipping
+    /// that row; a fully-consumed or absent row is drained as a no-op.
     ///
     /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
     /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
@@ -2867,6 +2928,23 @@ impl TdsClient {
             return Ok(false);
         }
 
+        // The push path decodes whole rows and never pauses, so it must not run
+        // while the pull cursor has a row *partially* read: silently draining it
+        // would discard that row and return the *next* one, mapping the caller's
+        // earlier `next_row_cursor() == true` to a row it never sees. An absent
+        // (`Idle`) row is fine — there is nothing left to skip, so it drains to a
+        // no-op below.
+        if matches!(
+            self.active_row_read_state,
+            ActiveRowReadState::RowPaused(_) | ActiveRowReadState::PlpPaused(_)
+        ) {
+            return Err(UsageError(
+                "get_next_row_into called while a pull-cursor row is still active; \
+                 advance the cursor with next_row_cursor before using the push row API"
+                    .to_string(),
+            ));
+        }
+
         self.drain_active_row().await?;
 
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
@@ -2880,7 +2958,7 @@ impl TdsClient {
                     &parser_context,
                     self.remaining_request_timeout,
                     self.cancel_handle.as_ref(),
-                    RowPlan::DecodeAll,
+                    ColumnPolicy::DecodeAll,
                     writer,
                 )
                 .await?;
@@ -2895,7 +2973,7 @@ impl TdsClient {
                 RowReadResult::RowPaused(_) | RowReadResult::PlpPaused(_) => {
                     // DecodeAll never pauses; a pause here is a protocol/logic error.
                     return Err(crate::error::Error::ProtocolError(
-                        "Unexpected pause while decoding a full row (RowPlan::DecodeAll)"
+                        "Unexpected pause while decoding a full row (ColumnPolicy::DecodeAll)"
                             .to_string(),
                     ));
                 }
@@ -2937,38 +3015,27 @@ impl TdsClient {
         let decryptor = self.resolve_cell_decryptor(&metadata).await?;
         let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
         loop {
-            let mut sink = DiscardRowWriter;
             let start = Instant::now();
-            let result = self
+            let header = self
                 .transport
-                .receive_row_into(
+                .receive_row_header(
                     &parser_context,
                     self.remaining_request_timeout,
                     self.cancel_handle.as_ref(),
-                    RowPlan::PositionOnly,
-                    &mut sink,
                 )
                 .await?;
             self.update_remaining_timeout(start);
 
-            match result {
-                RowReadResult::RowPaused(pause_state) => {
+            match header {
+                RowHeader::Positioned(pause_state) => {
+                    // Positioned before column 0; columns are pulled lazily via
+                    // `read_row_column`. A zero-column row parks here too and
+                    // drains as a no-op on the next advance.
                     self.active_row_read_state =
                         ActiveRowReadState::RowPaused(Box::new(pause_state));
                     return Ok(true);
                 }
-                RowReadResult::RowWritten => {
-                    // A zero-column row: positioned, nothing to pull.
-                    self.active_row_read_state = ActiveRowReadState::Idle;
-                    return Ok(true);
-                }
-                RowReadResult::PlpPaused(_) => {
-                    return Err(crate::error::Error::ProtocolError(
-                        "Unexpected PLP pause while positioning a row (RowPlan::PositionOnly)"
-                            .to_string(),
-                    ));
-                }
-                RowReadResult::Token(token) => {
+                RowHeader::Token(token) => {
                     if let Some(has_row) = self.handle_row_read_token(token).await? {
                         return Ok(has_row);
                     }
@@ -2984,9 +3051,31 @@ impl TdsClient {
     /// Returns:
     /// - [`CursorColumn::Value`] with the decoded value for non-PLP columns,
     /// - [`CursorColumn::PlpStreaming`] when `target` is a PLP column whose
-    ///   bytes must be pulled via [`read_active_plp_bytes`](Self::read_active_plp_bytes),
-    /// - [`CursorColumn::AlreadyConsumed`] if `target` was already read/skipped,
+    ///   bytes must be pulled via [`read_active_plp_chunk`](Self::read_active_plp_chunk),
+    /// - [`CursorColumn::AlreadyConsumed`] if `target` was already read/skipped
+    ///   (including after the whole row has been consumed),
     /// - [`CursorColumn::RowEnded`] when no row is positioned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UsageError` when `target` is out of range **and** a row is
+    /// still positioned with unread columns (partially read). When no row is
+    /// positioned — including after the final column has been read — an
+    /// out-of-range or backward `target` yields [`CursorColumn::RowEnded`]
+    /// instead of an error.
+    ///
+    /// # Notes
+    ///
+    /// Reading the final column advances the cursor to idle, so a subsequent
+    /// backward or out-of-range request returns [`CursorColumn::RowEnded`]. A
+    /// caller that needs to distinguish "I rewound past the last column" from
+    /// "no row is positioned" must track the column it last read itself (as the
+    /// ODBC layer does).
+    ///
+    /// A `true` return from [`next_row_cursor`](Self::next_row_cursor) does not
+    /// guarantee `read_row_column(0)` yields a value: a zero-column row is
+    /// positioned with a column count of 0, so `read_row_column(0)` is
+    /// out-of-range and returns `UsageError`.
     #[instrument(skip(self), level = "info")]
     pub async fn read_row_column(&mut self, target: usize) -> TdsResult<CursorColumn> {
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
@@ -3008,7 +3097,7 @@ impl TdsClient {
         target: usize,
     ) -> TdsResult<CursorColumn> {
         if target >= pause_state.columns.len() {
-            // Out-of-range: decoding with RowPlan::Column(target) would skip
+            // Out-of-range: decoding with ColumnPolicy::DecodeOne(target) would skip
             // every remaining column and report RowWritten, silently consuming
             // the row. Reject without touching the transport and keep the
             // cursor positioned so valid pulls still work. ODBC validates the
@@ -3036,7 +3125,7 @@ impl TdsClient {
                 pause_state,
                 self.remaining_request_timeout,
                 self.cancel_handle.as_ref(),
-                RowPlan::Column(target),
+                ColumnPolicy::DecodeOne(target),
                 &mut capture,
             )
             .await?;
@@ -3045,26 +3134,30 @@ impl TdsClient {
         match result {
             RowReadResult::RowPaused(next_pause) => {
                 self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(next_pause));
-                let value = capture
-                    .take_row()
-                    .into_iter()
-                    .next()
-                    .unwrap_or(ColumnValues::Null);
+                let value = capture.take_row().into_iter().next().ok_or_else(|| {
+                    crate::error::Error::ProtocolError(format!(
+                        "Decoder produced no value for non-null column {target}"
+                    ))
+                })?;
                 Ok(CursorColumn::Value(value))
             }
             RowReadResult::RowWritten => {
                 // `target` was the last column; the row is now fully consumed.
+                // Advance the cursor to idle — a later out-of-range or backward
+                // pull reports `RowEnded`. Callers needing to distinguish a
+                // rewind from "no row positioned" track the column themselves.
                 self.active_row_read_state = ActiveRowReadState::Idle;
-                let value = capture
-                    .take_row()
-                    .into_iter()
-                    .next()
-                    .unwrap_or(ColumnValues::Null);
+                let value = capture.take_row().into_iter().next().ok_or_else(|| {
+                    crate::error::Error::ProtocolError(format!(
+                        "Decoder produced no value for non-null column {target}"
+                    ))
+                })?;
                 Ok(CursorColumn::Value(value))
             }
             RowReadResult::PlpPaused(plp_state) => {
+                let collation = plp_state.collation();
                 self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(plp_state));
-                Ok(CursorColumn::PlpStreaming)
+                Ok(CursorColumn::PlpStreaming { collation })
             }
             RowReadResult::Token(_) => Err(crate::error::Error::ProtocolError(
                 "Unexpected token while resuming to a target column".to_string(),
@@ -3080,14 +3173,14 @@ impl TdsClient {
             ActiveRowReadState::Idle => Ok(()),
             ActiveRowReadState::RowPaused(pause_state) => {
                 let mut sink = DiscardRowWriter;
-                self.resume_row_loop(*pause_state, RowPlan::DrainToEnd, &mut sink)
+                self.resume_row_loop(*pause_state, ColumnPolicy::SkipAll, &mut sink)
                     .await?;
                 Ok(())
             }
             ActiveRowReadState::PlpPaused(mut plp_state) => {
                 self.drain_active_plp(&mut plp_state).await?;
                 let mut sink = DiscardRowWriter;
-                self.resume_row_loop(plp_state.row_pause_state, RowPlan::DrainToEnd, &mut sink)
+                self.resume_row_loop(plp_state.row_pause_state, ColumnPolicy::SkipAll, &mut sink)
                     .await?;
                 Ok(())
             }
@@ -3122,7 +3215,7 @@ impl TdsClient {
     async fn resume_row_loop(
         &mut self,
         pause_state: RowPauseState,
-        plan: RowPlan,
+        plan: ColumnPolicy,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<bool> {
         let current = pause_state;
@@ -3688,18 +3781,6 @@ impl ResultSet for TdsClient {
         }
     }
 
-    async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
-        TdsClient::read_active_plp_bytes(self, out).await
-    }
-
-    fn active_plp_reached_end(&self) -> bool {
-        TdsClient::active_plp_reached_end(self)
-    }
-
-    fn active_plp_collation(&self) -> Option<SqlCollation> {
-        TdsClient::active_plp_collation(self)
-    }
-
     fn maybe_has_unread_rows(&self) -> bool {
         !self.current_result_set_has_been_read_till_end
     }
@@ -3822,27 +3903,14 @@ pub trait ResultSet {
     /// This is the bulk push path: it decodes a full row into `writer` and does
     /// not pause. The ODBC column-at-a-time pull path uses the client cursor
     /// (`next_row_cursor` / `read_row_column`) instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns a usage error if called while a pull-cursor row is still
+    /// partially read. Draining that row here would silently discard it and
+    /// return the *next* one, so callers must first finish the row with
+    /// `next_row_cursor`. A fully-consumed or absent row is fine.
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool>;
-
-    /// Reads bytes from the active PLP stream captured after a `PlpPaused` result from
-    /// `next_row_into`. The caller must drain the stream to completion before calling
-    /// `next_row_into` again.
-    async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
-        let _ = out;
-        Ok(0)
-    }
-
-    /// Returns `true` when the active PLP stream has been fully consumed or when
-    /// there is no active PLP stream.
-    fn active_plp_reached_end(&self) -> bool {
-        true
-    }
-
-    /// Returns the TDS collation for the active PLP string stream, or `None` for
-    /// binary types or when there is no active PLP stream.
-    fn active_plp_collation(&self) -> Option<SqlCollation> {
-        None
-    }
 
     /// Returns `true` if the result set may still contain unread rows.
     fn maybe_has_unread_rows(&self) -> bool;
@@ -3862,7 +3930,7 @@ mod tests {
     use crate::datatypes::row_writer::RowWriter;
     use crate::io::reader_writer::{NetworkReader, NetworkWriter};
     use crate::io::token_stream::{
-        ParserContext, RowPauseState, RowPlan, RowReadResult, TdsTokenStreamReader,
+        ColumnPolicy, ParserContext, RowHeader, RowPauseState, RowReadResult, TdsTokenStreamReader,
     };
     use crate::token::tokens::{
         ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
@@ -3882,6 +3950,10 @@ mod tests {
         sent: Arc<std::sync::Mutex<Vec<u8>>>,
         packet_data: Vec<u8>,
         packet_pos: usize,
+        /// Results the mock replays from `resume_row_into`, so tests can drive
+        /// `read_row_column` down a specific arm (e.g. a `PlpPaused` result that
+        /// makes the cursor emit `CursorColumn::PlpStreaming`).
+        resume_results: VecDeque<RowReadResult>,
     }
 
     impl TestTransport {
@@ -3893,6 +3965,7 @@ mod tests {
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data: Vec::new(),
                 packet_pos: 0,
+                resume_results: VecDeque::new(),
             }
         }
 
@@ -3904,6 +3977,7 @@ mod tests {
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data: Vec::new(),
                 packet_pos: 0,
+                resume_results: VecDeque::new(),
             }
         }
 
@@ -3915,6 +3989,7 @@ mod tests {
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data,
                 packet_pos: 0,
+                resume_results: VecDeque::new(),
             }
         }
 
@@ -3950,7 +4025,7 @@ mod tests {
             _context: &ParserContext,
             _remaining_request_timeout: Option<Duration>,
             _cancel_handle: Option<&CancelHandle>,
-            _plan: RowPlan,
+            _plan: ColumnPolicy,
             _writer: &mut (dyn RowWriter + Send),
         ) -> TdsResult<RowReadResult> {
             // The mock has no row bytes to materialize, so it replays the queued
@@ -3964,14 +4039,31 @@ mod tests {
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
 
+        async fn receive_row_header(
+            &mut self,
+            _context: &ParserContext,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+        ) -> TdsResult<RowHeader> {
+            // Mirrors `receive_row_into`: the mock replays queued control tokens
+            // and has no row bytes, so a row header is only ever a `Token`.
+            if let Some(tok) = self.pending_tokens.pop_front() {
+                return Ok(RowHeader::Token(tok));
+            }
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+
         async fn resume_row_into(
             &mut self,
             _pause_state: RowPauseState,
             _remaining_request_timeout: Option<Duration>,
             _cancel_handle: Option<&CancelHandle>,
-            _plan: RowPlan,
+            _plan: ColumnPolicy,
             _writer: &mut (dyn RowWriter + Send),
         ) -> TdsResult<RowReadResult> {
+            if let Some(result) = self.resume_results.pop_front() {
+                return Ok(result);
+            }
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
 
@@ -4124,7 +4216,11 @@ mod tests {
     }
 
     fn create_test_client() -> TdsClient {
-        let transport = Box::new(TestTransport::new());
+        create_test_client_with_transport(TestTransport::new())
+    }
+
+    fn create_test_client_with_transport(transport: TestTransport) -> TdsClient {
+        let transport = Box::new(transport);
         let negotiated_settings =
             crate::handler::handler_factory::create_test_negotiated_settings_internal();
         let execution_context = crate::connection::execution_context::ExecutionContext::new();
@@ -4422,13 +4518,21 @@ mod tests {
     // ── PLP streaming lifecycle contract tests ──
 
     #[tokio::test]
-    async fn plp_read_bytes_no_active_stream_returns_zero() {
+    async fn plp_read_bytes_no_active_stream_errors() {
         let mut client = create_test_client();
         let mut buf = [0u8; 4];
 
-        let read = client.read_active_plp_bytes(&mut buf).await.unwrap();
+        // With no PLP stream positioned this is a sequencing error, not EOF:
+        // an `Ok(0)` here would be indistinguishable from an exhausted stream.
+        let err = client
+            .read_active_plp_bytes(&mut buf)
+            .await
+            .expect_err("read with no active PLP stream must error");
 
-        assert_eq!(read, 0);
+        assert!(
+            matches!(err, UsageError(_)),
+            "expected UsageError, got {err:?}"
+        );
     }
 
     #[test]
@@ -4438,14 +4542,11 @@ mod tests {
         assert!(client.active_plp_reached_end());
     }
 
-    #[test]
-    fn plp_collation_returns_none_when_no_stream_active() {
-        let client = create_test_client();
-        assert!(client.active_plp_collation().is_none());
-    }
-
     #[tokio::test]
-    async fn active_plp_collation_reports_stream_collation_when_paused() {
+    async fn read_row_column_carries_stream_collation_on_plp_variant() {
+        // When resuming to a PLP column, the fixed stream collation must ride on
+        // the `CursorColumn::PlpStreaming` variant so callers get it atomically
+        // with the "this is a PLP column" signal, without a separate lookup.
         let collation = SqlCollation {
             info: 0x0409,
             lcid_language_id: 0x0409,
@@ -4471,20 +4572,39 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let row_pause_state = RowPauseState {
+        let inner_pause_state = RowPauseState {
             next_column_index: 1,
-            columns: vec![metadata],
+            columns: vec![metadata.clone()],
             nbc_null_bitmap: None,
             decryptor: None,
         };
 
-        let mut client = create_test_client();
-        client.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(PlpPauseState {
-            row_pause_state,
-            plp_stream,
+        // The mock replays this `PlpPaused` result from `resume_row_into`, so the
+        // cursor takes the branch that builds `PlpStreaming { collation }`.
+        let mut transport = TestTransport::new();
+        transport
+            .resume_results
+            .push_back(RowReadResult::PlpPaused(PlpPauseState {
+                row_pause_state: inner_pause_state,
+                plp_stream,
+            }));
+
+        let mut client = create_test_client_with_transport(transport);
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            columns: vec![metadata],
+            nbc_null_bitmap: None,
+            decryptor: None,
         }));
 
-        assert_eq!(client.active_plp_collation(), Some(collation));
+        let outcome = client.read_row_column(0).await.unwrap();
+        assert_eq!(
+            outcome,
+            CursorColumn::PlpStreaming {
+                collation: Some(collation)
+            },
+            "PLP stream collation must ride on the variant"
+        );
     }
 
     #[test]
@@ -4498,7 +4618,43 @@ mod tests {
         }));
 
         assert!(client.active_plp_reached_end());
-        assert!(client.active_plp_collation().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_next_row_into_rejects_active_pull_cursor_row() {
+        // A row parked by the pull cursor (`next_row_cursor`) must not be
+        // silently drained by the push path. Mixing the two would discard the
+        // parked row and hand back the *next* one, so the earlier
+        // `next_row_cursor() == true` would map to a row the caller never sees.
+        let mut client = create_test_client();
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 1,
+            columns: Vec::new(),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+
+        let mut sink = DiscardRowWriter;
+        let err = client
+            .get_next_row_into(&mut sink)
+            .await
+            .expect_err("push path must reject a parked pull-cursor row");
+        assert!(
+            matches!(err, UsageError(_)),
+            "expected UsageError, got {err:?}"
+        );
+
+        // The guard must leave the parked row in place (not consume the wire),
+        // so the caller can still finish it with `next_row_cursor`.
+        assert!(
+            matches!(
+                client.active_row_read_state,
+                ActiveRowReadState::RowPaused(_)
+            ),
+            "guard must not disturb the parked row state"
+        );
     }
 
     #[test]

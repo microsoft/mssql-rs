@@ -30,7 +30,8 @@ use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
 use crate::handler::handler_factory::create_test_negotiated_settings_internal;
 use crate::io::reader_writer::{NetworkReader, NetworkWriter};
 use crate::io::token_stream::{
-    ParserContext, PlpPauseState, RowPauseState, RowPlan, RowReadResult, TdsTokenStreamReader,
+    ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
+    TdsTokenStreamReader,
 };
 use crate::message::messages::ResetConnectionMode;
 use crate::query::metadata::ColumnMetadata;
@@ -80,11 +81,26 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         _context: &ParserContext,
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
-        _plan: RowPlan,
+        _plan: ColumnPolicy,
         _writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         if let Some(tok) = self.pending_tokens.pop_front() {
             return Ok(RowReadResult::Token(tok));
+        }
+        Err(crate::error::Error::ConnectionClosed("test".to_string()))
+    }
+
+    // The scripted transport surfaces every queued token as a control token and
+    // has no row bytes, so `receive_row_header` likewise only ever yields a
+    // `RowHeader::Token`, never `Positioned`.
+    async fn receive_row_header(
+        &mut self,
+        _context: &ParserContext,
+        _remaining_request_timeout: Option<Duration>,
+        _cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<RowHeader> {
+        if let Some(tok) = self.pending_tokens.pop_front() {
+            return Ok(RowHeader::Token(tok));
         }
         Err(crate::error::Error::ConnectionClosed("test".to_string()))
     }
@@ -97,7 +113,7 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         _pause_state: RowPauseState,
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
-        _plan: RowPlan,
+        _plan: ColumnPolicy,
         _writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         Err(crate::error::Error::ConnectionClosed("test".to_string()))

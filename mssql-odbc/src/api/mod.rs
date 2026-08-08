@@ -14,7 +14,6 @@ mod execute;
 pub(crate) mod fetch;
 pub(crate) mod free_handle;
 mod get_data;
-pub(crate) use get_data::PlpEncoding;
 mod get_diag;
 mod get_env_attr;
 mod get_functions;
