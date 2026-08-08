@@ -1010,109 +1010,26 @@ impl GenericDecoder {
     /// [`RowWriter`], bypassing the intermediate `ColumnValues` enum for
     /// common types. Rare types (XML, JSON, Vector, Image, UDT, SsVariant)
     /// fall back to `decode()` + `write_column_value()`.
-    pub(crate) async fn decode_into<T, W>(
+    pub(crate) async fn decode_into<T>(
         &self,
         reader: &mut T,
         metadata: &ColumnMetadata,
         col: usize,
-        writer: &mut W,
+        writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<()>
     where
         T: TdsPacketReader + Send + Sync,
-        W: RowWriter + ?Sized,
     {
+        // Non-PLP cells owned by the column-atomic sync path route through the
+        // single shared `decode_column_body` (one body, refill lifted to the
+        // column boundary). No non-PLP leaf logic is duplicated here.
+        if crate::datatypes::sync_decoder::is_supported(metadata) {
+            return reader.decode_column_into(metadata, col, writer).await;
+        }
+
         match metadata.data_type {
-            // === Fixed-length integer types ===
-            TdsDataType::Int1 => {
-                writer.write_u8(col, reader.read_byte().await?);
-            }
-            TdsDataType::Int2 => {
-                writer.write_i16(col, reader.read_int16().await?);
-            }
-            TdsDataType::Int4 => {
-                writer.write_i32(col, reader.read_int32().await?);
-            }
-            TdsDataType::Int8 => {
-                writer.write_i64(col, reader.read_int64().await?);
-            }
-            TdsDataType::IntN => {
-                let byte_len = reader.read_byte().await?;
-                match byte_len {
-                    1 => writer.write_u8(col, reader.read_byte().await?),
-                    2 => writer.write_i16(col, reader.read_int16().await?),
-                    4 => writer.write_i32(col, reader.read_int32().await?),
-                    8 => writer.write_i64(col, reader.read_int64().await?),
-                    0 => writer.write_null(col),
-                    _ => {
-                        return Err(crate::error::Error::from(Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Invalid IntN length",
-                        )));
-                    }
-                }
-            }
-
-            // === Fixed-length float types ===
-            TdsDataType::Flt4 => {
-                writer.write_f32(col, reader.read_float32().await?);
-            }
-            TdsDataType::Flt8 => {
-                writer.write_f64(col, reader.read_float64().await?);
-            }
-            TdsDataType::FltN => {
-                let length = reader.read_byte().await?;
-                match length {
-                    0 => writer.write_null(col),
-                    4 => writer.write_f32(col, reader.read_float32().await?),
-                    _ => writer.write_f64(col, reader.read_float64().await?),
-                }
-            }
-
-            // === Bit types ===
-            TdsDataType::Bit => {
-                writer.write_bool(col, reader.read_byte().await? == 1);
-            }
-            TdsDataType::BitN => {
-                let byte_len = reader.read_byte().await?;
-                if byte_len > 0 {
-                    writer.write_bool(col, reader.read_byte().await? == 1);
-                } else {
-                    writer.write_null(col);
-                }
-            }
-
-            // === Money types ===
-            TdsDataType::Money4 => {
-                writer.write_smallmoney(col, self.read_money4(reader).await?);
-            }
-            TdsDataType::Money => {
-                writer.write_money(col, self.read_money8(reader).await?);
-            }
-            TdsDataType::MoneyN => {
-                let byte_len = reader.read_byte().await?;
-                match byte_len {
-                    4 => writer.write_smallmoney(col, self.read_money4(reader).await?),
-                    8 => writer.write_money(col, self.read_money8(reader).await?),
-                    0 => writer.write_null(col),
-                    _ => {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "Invalid MoneyN length - {byte_len}"
-                        )));
-                    }
-                }
-            }
-
-            // === Decimal / Numeric ===
-            TdsDataType::DecimalN => match self.read_decimal(reader, metadata).await? {
-                Some(val) => writer.write_decimal(col, val),
-                None => writer.write_null(col),
-            },
-            TdsDataType::NumericN => match self.read_decimal(reader, metadata).await? {
-                Some(val) => writer.write_numeric(col, val),
-                None => writer.write_null(col),
-            },
-
-            // === String types — delegate to StringDecoder ===
+            // === String types — StringDecoder owns PLP strings + Text/NText LOB.
+            // Non-PLP, non-LOB strings are handled by the sync path above. ===
             TdsDataType::NChar
             | TdsDataType::NVarChar
             | TdsDataType::BigChar
@@ -1126,160 +1043,11 @@ impl GenericDecoder {
                     .await?;
             }
 
-            // === Binary types ===
-            TdsDataType::BigBinary => {
-                let length = reader.read_uint16().await?;
-                // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
-                if length == 0xFFFF {
-                    writer.write_null(col);
-                } else {
-                    if length as usize > MAX_ALLOC_SIZE {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
-                        )));
-                    }
-                    let mut bytes = vec![0u8; length as usize];
-                    reader.read_bytes(&mut bytes).await?;
-                    writer.write_bytes(col, bytes);
-                }
-            }
-            TdsDataType::BigVarBinary => {
-                if metadata.is_plp() {
-                    match GenericDecoder::collect_plp(reader).await? {
-                        Some(bytes) => writer.write_bytes(col, bytes),
-                        None => writer.write_null(col),
-                    }
-                } else {
-                    let length = reader.read_uint16().await?;
-                    // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
-                    if length == 0xFFFF {
-                        writer.write_null(col);
-                    } else {
-                        if length as usize > MAX_ALLOC_SIZE {
-                            return Err(crate::error::Error::ProtocolError(format!(
-                                "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
-                            )));
-                        }
-                        let mut bytes = vec![0u8; length as usize];
-                        reader.read_bytes(&mut bytes).await?;
-                        writer.write_bytes(col, bytes);
-                    }
-                }
-            }
-
-            // === DateTime types ===
-            TdsDataType::DateTime => {
-                writer.write_datetime(col, self.read_datetime(reader).await?);
-            }
-            TdsDataType::DateTim4 => {
-                let daypart = reader.read_uint16().await?;
-                let timepart = reader.read_uint16().await?;
-                writer.write_smalldatetime(
-                    col,
-                    SqlSmallDateTime {
-                        days: daypart,
-                        time: timepart,
-                    },
-                );
-            }
-            TdsDataType::DateTimeN => {
-                let length = reader.read_byte().await?;
-                match length {
-                    0 => writer.write_null(col),
-                    4 => writer.write_smalldatetime(col, self.read_small_datetime(reader).await?),
-                    _ => writer.write_datetime(col, self.read_datetime(reader).await?),
-                }
-            }
-            TdsDataType::DateN => {
-                let length = reader.read_byte().await?;
-                if length == 0 {
-                    writer.write_null(col);
-                } else {
-                    writer.write_date(col, Self::read_date(reader).await?);
-                }
-            }
-            TdsDataType::TimeN => {
-                let length = reader.read_byte().await?;
-                if length == 0 {
-                    writer.write_null(col);
-                } else {
-                    writer.write_time(
-                        col,
-                        self.read_time(
-                            reader,
-                            length,
-                            metadata.get_scale().ok_or_else(|| {
-                                crate::error::Error::ImplementationError(
-                                    "TimeN type should have scale".to_string(),
-                                )
-                            })?,
-                        )
-                        .await?,
-                    );
-                }
-            }
-            TdsDataType::DateTime2N => {
-                let length = reader.read_byte().await?;
-                if length == 0 {
-                    writer.write_null(col);
-                } else {
-                    let cv = self
-                        .read_datetime2(
-                            reader,
-                            length,
-                            metadata.get_scale().ok_or_else(|| {
-                                crate::error::Error::ImplementationError(
-                                    "DateTime2N type should have scale".to_string(),
-                                )
-                            })?,
-                        )
-                        .await?;
-                    if let ColumnValues::DateTime2(dt2) = cv {
-                        writer.write_datetime2(col, dt2);
-                    }
-                }
-            }
-            TdsDataType::DateTimeOffsetN => {
-                let length = reader.read_byte().await?;
-                if length == 0 {
-                    writer.write_null(col);
-                } else {
-                    let cv = self
-                        .read_datetime_offset(
-                            reader,
-                            length,
-                            metadata.get_scale().ok_or_else(|| {
-                                crate::error::Error::ImplementationError(
-                                    "DateTimeOffsetN type should have scale".to_string(),
-                                )
-                            })?,
-                        )
-                        .await?;
-                    if let ColumnValues::DateTimeOffset(dto) = cv {
-                        writer.write_datetimeoffset(col, dto);
-                    }
-                }
-            }
-
-            // === GUID ===
-            TdsDataType::Guid => {
-                let length = reader.read_byte().await?;
-                if length == 0 {
-                    writer.write_null(col);
-                } else {
-                    if length != 16 {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "Invalid GUID length: expected 16 bytes, got {length}"
-                        )));
-                    }
-                    let mut bytes = [0u8; 16];
-                    reader.read_bytes(&mut bytes).await?;
-                    let uuid = uuid::Uuid::from_slice_le(&bytes).map_err(|e| {
-                        crate::error::Error::ProtocolError(format!("Failed to parse UUID: {e}"))
-                    })?;
-                    writer.write_uuid(col, uuid);
-                }
-            }
+            // === PLP binary (varbinary(max)); non-PLP binary uses the sync path. ===
+            TdsDataType::BigVarBinary => match GenericDecoder::collect_plp(reader).await? {
+                Some(bytes) => writer.write_bytes(col, bytes),
+                None => writer.write_null(col),
+            },
 
             // === Fallback: rare types go through decode() → write_column_value() ===
             _ => {
