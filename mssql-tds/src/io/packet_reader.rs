@@ -2,18 +2,15 @@
 // Licensed under the MIT License.
 
 use async_trait::async_trait;
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use tracing::event;
 
 use super::packet_writer::PacketWriter;
 use crate::core::TdsResult;
+use crate::io::packet_buffer::PacketBuffer;
 use crate::io::reader_writer::NetworkReaderWriter;
 use crate::message::attention::AttentionRequest;
 use crate::message::messages::Request;
-use std::{
-    cmp::min,
-    io::{Error, ErrorKind},
-};
+use std::io::{Error, ErrorKind};
 
 #[async_trait]
 #[cfg(not(fuzzing))]
@@ -79,12 +76,13 @@ pub trait TdsPacketReader {
 }
 
 /// Buffered reader that reassembles TDS packets from the network stream.
+///
+/// The buffer math and every scalar/byte read live in the I/O-free
+/// [`PacketBuffer`]; this type only adds the one thing the buffer cannot do
+/// itself — pull more bytes off the socket when a read needs them.
 pub struct PacketReader<'a> {
     network_reader_writer: &'a mut dyn NetworkReaderWriter,
-    buffer_position: usize,
-    buffer_length: usize,
-    max_packet_size: usize,
-    working_buffer: Vec<u8>,
+    buffer: PacketBuffer,
 }
 
 impl<'a> PacketReader<'a> {
@@ -93,47 +91,25 @@ impl<'a> PacketReader<'a> {
     #[cfg(test)]
     pub(crate) fn new(network_reader_writer: &'a mut dyn NetworkReaderWriter) -> PacketReader<'a> {
         let packet_size: usize = network_reader_writer.as_writer().packet_size() as usize;
-        let packet_storage = packet_size * 2;
-        let buffer: Vec<u8> = vec![0; packet_storage]; // Adjust the capacity as needed
-
         PacketReader {
             network_reader_writer,
-            buffer_length: 0,
-            buffer_position: 0,
-            working_buffer: buffer,
-            max_packet_size: packet_size,
+            buffer: PacketBuffer::with_packet_size(packet_size),
         }
     }
 
-    fn do_we_have_enough_data(&self, byte_count: usize) -> bool {
-        let remaining_bytes = self.buffer_length - self.buffer_position;
-        remaining_bytes >= byte_count
+    /// Ensures at least `byte_count` bytes are readable, refilling once if not.
+    /// A scalar never exceeds one packet, so a single refill always suffices.
+    async fn ensure(&mut self, byte_count: usize) -> TdsResult<()> {
+        if !self.buffer.has(byte_count) {
+            self.read_tds_packet().await?;
+        }
+        Ok(())
     }
 
     async fn read_tds_packet(&mut self) -> TdsResult<()> {
-        let remaining_bytes = self.buffer_length - self.buffer_position;
-
-        if remaining_bytes > 0 {
-            // Move the remaining bytes to the beginning of the buffer.
-            self.working_buffer
-                .copy_within(self.buffer_position..(self.buffer_length), 0);
-            self.buffer_length = remaining_bytes;
-            self.buffer_position = 0;
-            let new_packet_size = self.get_new_tds_packet().await?;
-            self.working_buffer.copy_within(
-                self.buffer_length + 8..self.buffer_length + new_packet_size,
-                self.buffer_length,
-            );
-            self.buffer_length += new_packet_size;
-            self.buffer_length -= 8;
-        } else {
-            self.buffer_length = 0;
-            self.buffer_position = 0;
-            let new_packet_size = self.get_new_tds_packet().await?;
-            self.working_buffer
-                .copy_within(8..new_packet_size, self.buffer_length);
-            self.buffer_length = new_packet_size - 8;
-        }
+        let base = self.buffer.begin_refill();
+        let raw_len = self.receive_packet(base).await?;
+        self.buffer.commit_packet(base, raw_len);
         Ok(())
     }
 
@@ -143,98 +119,42 @@ impl<'a> PacketReader<'a> {
         self.read_tds_packet().await
     }
 
-    async fn get_new_tds_packet(&mut self) -> TdsResult<usize> {
-        let packet_buffer: &mut Vec<u8> = &mut self.working_buffer;
-        let base_offset_to_write = self.buffer_length;
-
-        let mut bytes_read_from_transport = self
+    async fn receive_packet(&mut self, base: usize) -> TdsResult<usize> {
+        let mut received = self
             .network_reader_writer
-            .receive(&mut packet_buffer[base_offset_to_write..])
+            .receive(self.buffer.refill_window(base, 0))
             .await?;
 
-        // We need the 8 byte header. Re-read, in case the new_packet_byte_length has less bytes than 8 bytes to complete
-        // the header.
-        while bytes_read_from_transport < PacketWriter::PACKET_HEADER_SIZE {
-            bytes_read_from_transport += self
+        // The 8-byte header may arrive split across reads; keep reading until it
+        // is complete before trusting its declared length.
+        while received < PacketWriter::PACKET_HEADER_SIZE {
+            received += self
                 .network_reader_writer
-                .receive(
-                    &mut packet_buffer[base_offset_to_write + bytes_read_from_transport
-                        ..base_offset_to_write + self.max_packet_size],
-                )
+                .receive(self.buffer.refill_window(base, received))
                 .await?;
         }
 
-        let length_from_packet_header =
-            BigEndian::read_u16(&packet_buffer[base_offset_to_write + 2..base_offset_to_write + 4]);
-
-        let packet_size_from_header: usize = length_from_packet_header as usize;
-
-        // Keep reading until we have the complete packet in memory.
-        while bytes_read_from_transport < packet_size_from_header {
-            bytes_read_from_transport += self
+        let packet_size_from_header = self.buffer.packet_header_length(base);
+        while received < packet_size_from_header {
+            received += self
                 .network_reader_writer
-                .receive(
-                    &mut packet_buffer[base_offset_to_write + bytes_read_from_transport
-                        ..base_offset_to_write + self.max_packet_size],
-                )
+                .receive(self.buffer.refill_window(base, received))
                 .await?;
         }
+
         event!(
             tracing::Level::DEBUG,
             "Received packet of size: {:?}",
-            bytes_read_from_transport
+            received
         );
 
         use pretty_hex::PrettyHex;
-
         event!(
             tracing::Level::DEBUG,
             "Packet content: {:?}",
-            &packet_buffer[base_offset_to_write..base_offset_to_write + bytes_read_from_transport]
-                .hex_dump()
+            self.buffer.raw_packet(base, received).hex_dump()
         );
-        Ok(bytes_read_from_transport)
-    }
-
-    fn consume_bytes(&mut self, byte_count: usize) -> TdsResult<()> {
-        if byte_count > (self.buffer_length - self.buffer_position) {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "Buffer underflow: attempted to consume {} bytes but only {} available",
-                byte_count,
-                self.buffer_length - self.buffer_position
-            )));
-        }
-
-        self.buffer_position += byte_count;
-        if self.buffer_length == self.buffer_position {
-            self.buffer_length = 0;
-            self.buffer_position = 0;
-        }
-        Ok(())
-    }
-
-    /// Skips a specified number of bytes in the packet stream.
-    #[allow(dead_code)]
-    pub async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()> {
-        let mut length_to_read = skip_count;
-        while length_to_read > 0 {
-            // If we don't have enough data, read a new TDS packet.
-            if !self.do_we_have_enough_data(min(self.max_packet_size - 8, length_to_read)) {
-                self.read_tds_packet().await?;
-            }
-            let available = self.buffer_length - self.buffer_position;
-
-            // We still may not have enough data, and we can, at a time, only skip a max of packet payload.
-            // We can read the minimum of what is available, or the actual length needed or the packet size.
-            // If we have a need to skip a large amount of data, then we will skip in chunks.
-            let to_read = min(available, min(length_to_read, self.max_packet_size - 8));
-
-            if to_read > 0 {
-                length_to_read -= to_read;
-                self.consume_bytes(to_read)?;
-            }
-        }
-        Ok(())
+        Ok(received)
     }
 }
 
@@ -242,7 +162,7 @@ impl<'a> PacketReader<'a> {
 impl TdsPacketReader for PacketReader<'_> {
     fn reset_reader(&mut self) {
         // Make sure that we have read all the data from the buffer.
-        assert!(self.buffer_length == self.buffer_position);
+        assert!(self.buffer.is_drained());
         // No Op after this.
     }
 
@@ -255,147 +175,77 @@ impl TdsPacketReader for PacketReader<'_> {
     }
 
     async fn read_byte(&mut self) -> TdsResult<u8> {
-        if !self.do_we_have_enough_data(1) {
-            self.read_tds_packet().await?;
-        }
-        let result: u8 = self.working_buffer[self.buffer_position];
-        self.consume_bytes(1)?;
-        Ok(result)
+        self.ensure(1).await?;
+        self.buffer.take_u8()
     }
 
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
-        if !self.do_we_have_enough_data(2) {
-            self.read_tds_packet().await?;
-        }
-        let result = BigEndian::read_i16(&self.working_buffer[self.buffer_position..]);
-        self.consume_bytes(2)?;
-        Ok(result)
+        self.ensure(2).await?;
+        self.buffer.take_i16_be()
     }
 
     async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
-        if !self.do_we_have_enough_data(4) {
-            self.read_tds_packet().await?;
-        }
-        let result = BigEndian::read_i32(&self.working_buffer[self.buffer_position..]);
-        self.consume_bytes(4)?;
-        Ok(result)
+        self.ensure(4).await?;
+        self.buffer.take_i32_be()
     }
 
     async fn read_uint40(&mut self) -> TdsResult<u64> {
-        if !self.do_we_have_enough_data(5) {
-            self.read_tds_packet().await?;
-        }
-
-        let result = LittleEndian::read_uint(&self.working_buffer[self.buffer_position..], 5);
-        self.consume_bytes(5)?;
-        Ok(result)
+        self.ensure(5).await?;
+        self.buffer.take_uint40_le()
     }
 
     async fn read_float32(&mut self) -> TdsResult<f32> {
-        if !self.do_we_have_enough_data(4) {
-            self.read_tds_packet().await?;
-        }
-        let result = LittleEndian::read_f32(&self.working_buffer[self.buffer_position..]);
-        self.consume_bytes(4)?;
-        Ok(result)
+        self.ensure(4).await?;
+        self.buffer.take_f32_le()
     }
 
     async fn read_float64(&mut self) -> TdsResult<f64> {
-        if !self.do_we_have_enough_data(8) {
-            self.read_tds_packet().await?;
-        }
-        let result = LittleEndian::read_f64(&self.working_buffer[self.buffer_position..]);
-        self.consume_bytes(8)?;
-        Ok(result)
+        self.ensure(8).await?;
+        self.buffer.take_f64_le()
     }
 
     async fn read_int16(&mut self) -> TdsResult<i16> {
-        if !self.do_we_have_enough_data(2) {
-            self.read_tds_packet().await?;
-        }
-        let result = LittleEndian::read_i16(&self.working_buffer[self.buffer_position..]);
-        self.consume_bytes(2)?;
-        Ok(result)
+        self.ensure(2).await?;
+        self.buffer.take_i16_le()
     }
 
     async fn read_uint16(&mut self) -> TdsResult<u16> {
-        if !self.do_we_have_enough_data(2) {
-            self.read_tds_packet().await?;
-        }
-        let result = LittleEndian::read_u16(&self.working_buffer[self.buffer_position..]);
-        self.consume_bytes(2)?;
-        Ok(result)
+        self.ensure(2).await?;
+        self.buffer.take_u16_le()
     }
 
     async fn read_uint24(&mut self) -> TdsResult<u32> {
-        if !self.do_we_have_enough_data(3) {
-            self.read_tds_packet().await?;
-        }
-        let result = LittleEndian::read_u24(&self.working_buffer[self.buffer_position..]);
-        self.consume_bytes(3)?;
-        Ok(result)
+        self.ensure(3).await?;
+        self.buffer.take_u24_le()
     }
 
     async fn read_int32(&mut self) -> TdsResult<i32> {
-        if !self.do_we_have_enough_data(4) {
-            self.read_tds_packet().await?;
-        }
-        let result = LittleEndian::read_i32(&self.working_buffer[self.buffer_position..]);
-        self.consume_bytes(4)?;
-        Ok(result)
+        self.ensure(4).await?;
+        self.buffer.take_i32_le()
     }
 
     async fn read_uint32(&mut self) -> TdsResult<u32> {
-        if !self.do_we_have_enough_data(4) {
-            self.read_tds_packet().await?;
-        }
-        let result = LittleEndian::read_u32(&self.working_buffer[self.buffer_position..]);
-        self.consume_bytes(4)?;
-        Ok(result)
+        self.ensure(4).await?;
+        self.buffer.take_u32_le()
     }
 
     async fn read_int64(&mut self) -> TdsResult<i64> {
-        if !self.do_we_have_enough_data(8) {
-            self.read_tds_packet().await?;
-        }
-        let result = LittleEndian::read_i64(&self.working_buffer[self.buffer_position..]);
-        self.consume_bytes(8)?;
-        Ok(result)
+        self.ensure(8).await?;
+        self.buffer.take_i64_le()
     }
 
     async fn read_uint64(&mut self) -> TdsResult<u64> {
-        if !self.do_we_have_enough_data(8) {
-            self.read_tds_packet().await?;
-        }
-        let result = LittleEndian::read_u64(&self.working_buffer[self.buffer_position..]);
-        self.consume_bytes(8)?;
-        Ok(result)
+        self.ensure(8).await?;
+        self.buffer.take_u64_le()
     }
 
     async fn read_bytes(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
         let mut total_read = 0;
-        let mut length_to_read = buffer.len();
-        let mut offset = 0;
-        while length_to_read > 0 {
-            if !self.do_we_have_enough_data(min(self.max_packet_size, length_to_read)) {
+        while total_read < buffer.len() {
+            if self.buffer.available() == 0 {
                 self.read_tds_packet().await?;
             }
-            let available = self.buffer_length - self.buffer_position;
-
-            // We can read the minimum of what is available, or the actual length needed or the packet size.
-            let to_read = min(available, min(length_to_read, self.max_packet_size - 8));
-
-            if to_read > 0 {
-                // Copy from self.working_buffer to buffer from self.buffer_position to offset.
-                buffer[offset..offset + to_read].copy_from_slice(
-                    &self.working_buffer[self.buffer_position..self.buffer_position + to_read],
-                );
-                offset += to_read;
-                length_to_read -= to_read;
-                total_read += to_read;
-
-                self.consume_bytes(to_read)?;
-            }
+            total_read += self.buffer.copy_out(&mut buffer[total_read..]);
         }
         Ok(total_read)
     }
@@ -476,20 +326,12 @@ impl TdsPacketReader for PacketReader<'_> {
 
     /// Skips a specified number of bytes in the packet stream.
     async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()> {
-        let mut length_to_read = skip_count;
-        while length_to_read > 0 {
-            if !self.do_we_have_enough_data(min(self.max_packet_size - 8, length_to_read)) {
+        let mut remaining = skip_count;
+        while remaining > 0 {
+            if self.buffer.available() == 0 {
                 self.read_tds_packet().await?;
             }
-            let available = self.buffer_length - self.buffer_position;
-
-            // We can read the minimum of what is available, or the actual length needed or the packet size.
-            let to_read = min(available, min(length_to_read, self.max_packet_size - 8));
-
-            if to_read > 0 {
-                length_to_read -= to_read;
-                self.consume_bytes(to_read)?;
-            }
+            remaining -= self.buffer.skip_available(remaining);
         }
         Ok(())
     }
@@ -601,7 +443,9 @@ pub(crate) mod tests {
     use crate::handler::handler_factory::SessionSettings;
     use crate::io::reader_writer::{NetworkReader, NetworkWriter};
     use async_trait::async_trait;
+    use byteorder::{BigEndian, ByteOrder, LittleEndian};
     use rand::Rng;
+    use std::cmp::min;
 
     //append_method!(append_i64, i64, 8, write_i64);
     macro_rules! append_method {
