@@ -9,8 +9,10 @@
 #
 # winget is the intended path, but it is not present on every Windows Server
 # image, so fall back to the MSI winget itself would download. Skipping the
-# install is deliberately not an option: it would silently downgrade the job to a
-# single-leg run, so every failure path throws.
+# install is deliberately not an option when the driver is absent: it would
+# silently downgrade the job to a single-leg run, so every install failure path
+# throws. A driver that is already registered at a different patch version is a
+# softer case (see below): it warns rather than throwing.
 #
 # The MSI URL and hash are pinned to the -Version default. Bumping -Version (via
 # the msodbcsqlVersion pipeline variable) without also updating -MsiUrl/-MsiSha256
@@ -43,9 +45,13 @@ if (Test-Path $key) {
     Write-Host "$name is already registered; verifying its version instead of installing."
     Get-ItemProperty -Path $key | Format-List | Out-String | Write-Host
 
-    # A pre-installed driver on a self-hosted/persistent agent could be a version
-    # other than the pinned one, which would silently change what the parity table
-    # compares against. Resolve the registered DLL and fail loudly on a mismatch.
+    # A pre-installed driver on a hosted/persistent agent (the Windows 1ES image
+    # ships 18.5.2.1) may be a version other than the pinned one, which changes
+    # what the parity table compares against. Resolve the registered DLL and warn
+    # loudly on a mismatch, but do not throw: the driver is present and usable, the
+    # reference leg runs fine against it, and the comparison itself is what gates
+    # the build. Hard-failing here would block every PR on an agent whose baked-in
+    # driver version is outside this repo's control.
     $dll = (Get-ItemProperty -Path $key -Name 'Driver' -ErrorAction SilentlyContinue).Driver
     if ($dll -and (Test-Path $dll)) {
         $info = (Get-Item $dll).VersionInfo
@@ -56,7 +62,7 @@ if (Test-Path $key) {
         if (-not $have) {
             Write-Warning "Could not read a ProductVersion from $dll; skipping the version check."
         } elseif ($have -ne $want) {
-            throw "Registered '$name' is version $($info.ProductVersion) (normalized $have) but the pipeline pins $Version (normalized $want). Uninstall the pre-installed driver, or update the msodbcsqlVersion variable and the pinned MSI in this script."
+            Write-Warning "Registered '$name' is version $($info.ProductVersion) (normalized $have) but the pipeline pins $Version (normalized $want). The comparison leg will run against the installed version. To close the gap, uninstall the pre-installed driver so this script installs the pinned MSI, or update the msodbcsqlVersion variable and the pinned MSI to match the agent."
         } else {
             Write-Host "Version check passed: registered driver matches the pinned $Version."
         }
