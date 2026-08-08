@@ -236,3 +236,162 @@ pub fn info(number: u32, severity: u8, message: &str) -> ScriptedToken {
         line_number: 1,
     }))
 }
+
+// ── Byte-level replay harness (test-only) ──────────────────────────────────
+//
+// Unlike [`TokenReplayTransport`], which replays pre-parsed [`Tokens`], this
+// transport runs raw TDS bytes through the real token parsers so `drain_stream`
+// exercises actual ROW decoding. It depends on the `cfg(test)`-only
+// `MockReader`, so it is gated behind `cfg(test)` and is unavailable to the
+// downstream `test-util` feature build.
+#[cfg(test)]
+pub(crate) mod byte_stream {
+    use super::*;
+    use crate::token::parsers::common::test_utils::MockReader;
+
+    struct ByteStreamTransport {
+        reader: MockReader,
+        registry: crate::io::token_stream::GenericTokenParserRegistry,
+    }
+
+    impl ByteStreamTransport {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                reader: MockReader::new(bytes),
+                registry: crate::io::token_stream::GenericTokenParserRegistry::default(),
+            }
+        }
+    }
+
+    impl std::fmt::Debug for ByteStreamTransport {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ByteStreamTransport").finish()
+        }
+    }
+
+    #[async_trait]
+    impl TdsTokenStreamReader for ByteStreamTransport {
+        async fn receive_token(
+            &mut self,
+            context: &ParserContext,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+        ) -> TdsResult<Tokens> {
+            crate::io::token_stream::receive_token_internal(
+                &mut self.reader,
+                &self.registry,
+                context,
+            )
+            .await
+        }
+
+        async fn receive_row_into(
+            &mut self,
+            context: &ParserContext,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+            writer: &mut (dyn RowWriter + Send),
+        ) -> TdsResult<RowReadResult> {
+            crate::io::token_stream::receive_row_into_internal(
+                &mut self.reader,
+                &self.registry,
+                context,
+                writer,
+            )
+            .await
+        }
+
+        async fn resume_row_into(
+            &mut self,
+            _pause_state: RowPauseState,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+            _writer: &mut (dyn RowWriter + Send),
+        ) -> TdsResult<RowReadResult> {
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+
+        async fn read_active_plp_bytes(
+            &mut self,
+            _plp_state: &mut PlpPauseState,
+            _remaining_request_timeout: Option<Duration>,
+            _cancel_handle: Option<&CancelHandle>,
+            _out: &mut [u8],
+        ) -> TdsResult<usize> {
+            Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl TransportSslHandler for ByteStreamTransport {
+        async fn enable_ssl(&mut self) -> TdsResult<()> {
+            Ok(())
+        }
+        async fn disable_ssl(&mut self) -> TdsResult<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl NetworkWriter for ByteStreamTransport {
+        async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
+            Ok(())
+        }
+        fn packet_size(&self) -> u32 {
+            4096
+        }
+        fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
+            NegotiatedEncryptionSetting::NoEncryption
+        }
+        fn set_reset_mode(&mut self, _mode: ResetConnectionMode) {}
+        fn take_reset_mode(&mut self) -> ResetConnectionMode {
+            ResetConnectionMode::None
+        }
+    }
+
+    #[async_trait]
+    impl NetworkReader for ByteStreamTransport {
+        async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
+            buffer.fill(0);
+            Ok(0)
+        }
+        fn packet_size(&self) -> u32 {
+            4096
+        }
+    }
+
+    #[async_trait]
+    impl TdsTransport for ByteStreamTransport {
+        fn as_writer(&mut self) -> &mut dyn NetworkWriter {
+            self
+        }
+        fn reset_reader(&mut self) {}
+        fn packet_size(&self) -> u32 {
+            4096
+        }
+        async fn close_transport(&mut self) -> TdsResult<()> {
+            Ok(())
+        }
+        async fn send_attention_with_timeout(&mut self, _timeout: Duration) -> TdsResult<bool> {
+            Ok(false)
+        }
+        fn is_connection_dead(&self) -> bool {
+            false
+        }
+    }
+
+    /// Builds a [`TdsClient`] whose transport replays raw TDS `bytes` through the
+    /// real token parsers.
+    pub(crate) fn tds_client_over_raw_bytes(bytes: Vec<u8>) -> TdsClient {
+        let transport = Box::new(ByteStreamTransport::new(bytes));
+        let negotiated_settings = create_test_negotiated_settings_internal();
+        let execution_context = ExecutionContext::new();
+        let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            client_context,
+        )
+    }
+}
