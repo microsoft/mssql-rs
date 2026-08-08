@@ -48,7 +48,21 @@ where
     D: SqlTypeDecode,
     T: TdsPacketReader + Send + Sync,
 {
-    let cipher = match decoder.decode(reader, metadata).await? {
+    let cipher = decoder.decode(reader, metadata).await?;
+    decrypt_cipher_value(metadata, decryptor, cipher)
+}
+
+/// Runs the synchronous cell decryptor over an already-decoded ciphertext cell.
+///
+/// The ciphertext arrives as a `varbinary` value; non-PLP ciphertext is decoded
+/// by the column-atomic sync step and PLP ciphertext by the async path, but both
+/// converge here for the (already synchronous) decrypt + plaintext production.
+pub(crate) fn decrypt_cipher_value(
+    metadata: &ColumnMetadata,
+    decryptor: &Arc<dyn CellDecryptor>,
+    cipher: ColumnValues,
+) -> TdsResult<ColumnValues> {
+    let cipher = match cipher {
         ColumnValues::Null => return Ok(ColumnValues::Null),
         ColumnValues::Bytes(bytes) => bytes,
         other => {

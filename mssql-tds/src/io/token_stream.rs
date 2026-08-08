@@ -2,8 +2,10 @@
 // Licensed under the MIT License.
 
 use crate::core::{CancelHandle, TdsResult};
-use crate::datatypes::decoder::{GenericDecoder, PlpColumnStream, decrypt_encrypted_column};
-use crate::datatypes::row_writer::{RowWriter, write_column_value};
+use crate::datatypes::decoder::{
+    GenericDecoder, PlpColumnStream, decrypt_cipher_value, decrypt_encrypted_column,
+};
+use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter, write_column_value};
 use crate::io::packet_reader::TdsPacketReader;
 use crate::query::metadata::ColumnMetadata;
 use crate::security::cell_decryptor::CellDecryptor;
@@ -459,8 +461,23 @@ async fn decode_or_decrypt_column<R: TdsPacketReader + Send + Sync>(
 ) -> TdsResult<()> {
     match (meta.crypto_metadata.is_some(), decryptor) {
         (true, Some(dec)) => {
-            let value = decrypt_encrypted_column(decoder, reader, meta, dec).await?;
-            write_column_value(writer, col, value);
+            if crate::datatypes::sync_decoder::is_supported(meta) {
+                // Non-PLP ciphertext: buffer + decode the cipher cell atomically
+                // via the shared sync step, then run the synchronous cell
+                // decryptor and write the plaintext. PLP ciphertext
+                // (varbinary(max)) falls through to the async path (L4b).
+                let mut cipher_cell = DefaultRowWriter::new(1);
+                reader.decode_column_into(meta, 0, &mut cipher_cell).await?;
+                let cipher = cipher_cell
+                    .take_row()
+                    .pop()
+                    .unwrap_or(crate::datatypes::column_values::ColumnValues::Null);
+                let value = decrypt_cipher_value(meta, dec, cipher)?;
+                write_column_value(writer, col, value);
+            } else {
+                let value = decrypt_encrypted_column(decoder, reader, meta, dec).await?;
+                write_column_value(writer, col, value);
+            }
         }
         (true, None) => {
             tracing::info!(
