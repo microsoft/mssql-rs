@@ -34,6 +34,10 @@ def load(path):
 # Verdicts describe only the observed outcome pairing, not a root cause: a
 # per-test PASS/FAIL divergence does not by itself establish which side is
 # wrong, and a shared failure does not prove the test is buggy.
+#
+# MIRROR: this classification is duplicated in the $verdict scriptblock in
+# run_e2e.ps1 (Windows has no Python dependency). Keep the two in lockstep —
+# any change to the ordering or the labels here must be made there too.
 def verdict(r, m):
     # Classify MISSING first: a test present in only one leg is a divergence,
     # even when its lone result is SKIP (otherwise the skip shortcut below would

@@ -25,12 +25,44 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Collapse zero-padded version segments (e.g. 18.06.0002.0001 -> 18.6.2.1) so a
+# DLL's ProductVersion can be compared to the semantic -Version regardless of
+# padding or ',' vs '.' separators.
+function Normalize-Version([string]$v) {
+    if (-not $v) { return '' }
+    (($v -split '[.,]') | ForEach-Object {
+        $n = 0
+        if ([int]::TryParse($_.Trim(), [ref]$n)) { $n } else { $_.Trim() }
+    }) -join '.'
+}
+
 $name = 'ODBC Driver 18 for SQL Server'
 $key  = "HKLM:\Software\ODBC\ODBCINST.INI\$name"
 
 if (Test-Path $key) {
-    Write-Host "$name is already registered; skipping install."
+    Write-Host "$name is already registered; verifying its version instead of installing."
     Get-ItemProperty -Path $key | Format-List | Out-String | Write-Host
+
+    # A pre-installed driver on a self-hosted/persistent agent could be a version
+    # other than the pinned one, which would silently change what the parity table
+    # compares against. Resolve the registered DLL and fail loudly on a mismatch.
+    $dll = (Get-ItemProperty -Path $key -Name 'Driver' -ErrorAction SilentlyContinue).Driver
+    if ($dll -and (Test-Path $dll)) {
+        $info = (Get-Item $dll).VersionInfo
+        Write-Host "Registered '$name' -> $dll (FileVersion=$($info.FileVersion), ProductVersion=$($info.ProductVersion))"
+
+        $want = Normalize-Version $Version
+        $have = Normalize-Version $info.ProductVersion
+        if (-not $have) {
+            Write-Warning "Could not read a ProductVersion from $dll; skipping the version check."
+        } elseif ($have -ne $want) {
+            throw "Registered '$name' is version $($info.ProductVersion) (normalized $have) but the pipeline pins $Version (normalized $want). Uninstall the pre-installed driver, or update the msodbcsqlVersion variable and the pinned MSI in this script."
+        } else {
+            Write-Host "Version check passed: registered driver matches the pinned $Version."
+        }
+    } else {
+        Write-Warning "'$name' is registered but its Driver DLL path could not be resolved; skipping the version check."
+    }
     exit 0
 }
 

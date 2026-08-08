@@ -98,6 +98,37 @@ Summary: 15 parity, 1 divergence(s), 0 shared failure(s), 0 skipped
 === Parity check FAILED (mssql-odbc rc=0, msodbcsql rc=0, parity rc=1) ===
 ```
 
+### Intentional divergence: `SKIP_IF_COMPARING_MSODBCSQL()`
+
+Some tests assert behavior that is deliberately stricter in the Rust driver than
+in msodbcsql — for example rejecting an invalid connection-attribute value with
+`HY024` where msodbcsql accepts it. Comparing those on the reference leg would
+always report a divergence and fail the run, even though the difference is
+intended.
+
+The escape hatch is `SKIP_IF_COMPARING_MSODBCSQL()` (defined in
+`include/odbc_test_fixture.h`). Each leg exports `ODBC_TEST_TARGET`
+(`mssql-odbc` on the Rust leg, `msodbcsql` on the reference leg); the macro
+`GTEST_SKIP()`s when it sees `msodbcsql`. The test still runs — and asserts — on
+the Rust leg, so its coverage is preserved; it is simply not run on the reference
+leg, so there is nothing to diverge.
+
+Prefer this over inline `if (ODBC_TEST_TARGET == ...)` guards around individual
+assertions. An inline guard that changes what a test asserts per leg still
+reports `PASS`/`PASS`, which hides the fact that the two drivers behaved
+differently at all. Skipping the whole case on the reference leg keeps the
+comparison honest; put a genuinely reference-incompatible case in its own test
+(as `DriverConnectLiveTest.InvalidConnectionAttributeValuesRejected` is) so the
+surrounding parity assertions still compare.
+
+**Granularity:** ctest compares at the *test-binary* level — each `*_test`
+executable is a single ctest case and the parity table is keyed on that binary
+name, not on individual gtest cases. A gtest skip is not a failure, so a case
+guarded by `SKIP_IF_COMPARING_MSODBCSQL()` leaves its binary passing on both
+legs: it shows up as `parity`, not `skipped`. The `skipped (not compared)`
+verdict only appears when an *entire* binary is skipped in one leg. Either way
+the divergent assertions never execute on the reference leg.
+
 CI runs this comparison on the Linux x64 PR build, which owns a SQL Server in
 docker. `.pipeline/scripts/containerized-odbc-e2e.sh` installs a pinned
 `msodbcsql18` from `packages.microsoft.com` when `ODBC_E2E_COMPARE=1`.

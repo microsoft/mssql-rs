@@ -37,10 +37,18 @@ compare_args=()
 case "$(printf '%s' "${ODBC_E2E_COMPARE:-0}" | tr '[:upper:]' '[:lower:]')" in
     1|true|yes)
         apt-get install -y --no-install-recommends curl gnupg ca-certificates
+        # Install the signing key into its own keyring and scope it to just the
+        # Microsoft repo via signed-by, rather than trusting it for every apt
+        # source on the box (a global trusted.gpg.d drop-in would do that).
+        install -d -m 0755 /usr/share/keyrings
         curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
-            -o /etc/apt/trusted.gpg.d/microsoft.asc
+            -o /usr/share/keyrings/microsoft.asc
         curl -fsSL "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release && echo "$VERSION_ID")/prod.list" \
             -o /etc/apt/sources.list.d/mssql-release.list
+        sed -i 's#^deb \[#deb [signed-by=/usr/share/keyrings/microsoft.asc #' \
+            /etc/apt/sources.list.d/mssql-release.list
+        grep -q 'signed-by=/usr/share/keyrings/microsoft.asc' /etc/apt/sources.list.d/mssql-release.list \
+            || { echo "Error: failed to scope the Microsoft apt key to its repo" >&2; exit 1; }
         apt-get update
         ACCEPT_EULA=Y apt-get install -y --no-install-recommends "msodbcsql18=$MSODBCSQL_VERSION"
         # msodbcsql18 registers itself as [ODBC Driver 18 for SQL Server] in

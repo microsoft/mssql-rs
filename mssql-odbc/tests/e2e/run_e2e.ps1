@@ -174,6 +174,9 @@ function Save-OriginalRegistration {
 # Register the Rust driver under its own name, alongside any installed
 # msodbcsql18. Both legs then run without swapping registrations.
 function Register-RustDriver([string]$DriverPath) {
+    # Arm cleanup before the first write: if any Set-ItemProperty/New-Item throws
+    # partway through, Restore-Registration still runs and unwinds the partial key.
+    $script:Registered = $true
     if (-not (Test-Path $RustDriverRegKey)) {
         New-Item -Path $RustDriverRegKey -Force | Out-Null
     }
@@ -185,7 +188,6 @@ function Register-RustDriver([string]$DriverPath) {
     }
     Set-ItemProperty -Path $DriversRegKey -Name $RustDriverName -Value "Installed"
 
-    $script:Registered = $true
     Write-Host "[  DRIVER ] Registered '$RustDriverName' in HKLM: $DriverPath"
 }
 
@@ -200,6 +202,8 @@ function Get-MsodbcsqlDriverPath {
 # snapshotting the installed Driver, Setup, and "ODBC Drivers" list values
 # independently so Restore-Registration can put each back exactly as it was.
 function Set-MsodbcsqlOverride([string]$DriverPath) {
+    # Arm cleanup before the first write, so a throw mid-registration still unwinds.
+    $script:MsodbcsqlOverridden = $true
     if (Test-Path $MsodbcsqlRegKey) {
         $script:HadMsodbcsqlKey = $true
         $d = Get-ItemProperty -Path $MsodbcsqlRegKey -Name "Driver" -ErrorAction SilentlyContinue
@@ -222,7 +226,6 @@ function Set-MsodbcsqlOverride([string]$DriverPath) {
         New-Item -Path $DriversRegKey -Force | Out-Null
     }
     Set-ItemProperty -Path $DriversRegKey -Name $MsodbcsqlName -Value "Installed"
-    $script:MsodbcsqlOverridden = $true
     Write-Host "[  DRIVER ] Overrode '$MsodbcsqlName' in HKLM: $DriverPath"
 }
 
@@ -384,6 +387,11 @@ function Write-ParityReport([string]$RustXml, [string]$MsXml) {
     # per-test PASS/FAIL divergence does not by itself establish which side is
     # wrong, and a shared failure does not prove the test is buggy. Flag both for
     # investigation rather than asserting blame.
+    #
+    # MIRROR: this classification is duplicated in verdict() in parity_report.py
+    # (the Linux/macOS runner shells out to Python; Windows stays dependency-free
+    # here). Keep the two in lockstep — any change to the ordering or the labels
+    # here must be made there too.
     $verdict = {
         param($r, $m)
         # Classify MISSING first: a test present in only one leg is a divergence,
@@ -524,7 +532,7 @@ function Initialize-DevSqlEnv {
             if (Test-Path $dotenv) {
                 $line = Get-Content -Path $dotenv | Where-Object { $_ -match '^SQL_PASSWORD=' } | Select-Object -First 1
                 if ($line) {
-                    $value = $line.Substring($line.IndexOf('=') + 1).Trim()
+                    $value = $line.Substring($line.IndexOf('=') + 1)
                     if ($value) { $env:ODBC_TEST_PWD = $value }
                 }
             }
@@ -632,6 +640,9 @@ try {
     if ($CompareWithMsodbcsql) {
         if ($env:ODBC_TEST_CONNSTR) {
             throw "ODBC_TEST_CONNSTR is set; it overrides the driver name and would pin both comparison legs to the same driver. Unset it to compare."
+        }
+        if ($env:ODBC_TEST_DSN) {
+            throw "ODBC_TEST_DSN is set; a DSN pins the connection to one driver, so both comparison legs would use the same driver. Unset it to compare."
         }
         if ($MsodbcsqlDll) {
             $RefDriverPath = $MsodbcsqlDll

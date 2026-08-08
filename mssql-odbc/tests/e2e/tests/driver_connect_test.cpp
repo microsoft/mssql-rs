@@ -77,6 +77,47 @@ protected:
             FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
         }
     }
+
+    // Outcome of one SQLDriverConnect probe. Each SQLSTATE flag is true when that
+    // state appears on ANY diagnostic record of the connection handle: a
+    // successful login interleaves the server's own 01000 info messages, and
+    // msodbcsql 18 appends its 01S00 parse warning AFTER them (record #3), so
+    // scanning only record #1 would miss it.
+    struct ConnResult {
+        SQLRETURN rc;
+        bool has01S00;
+        bool has28000;
+        bool hasHY024;
+    };
+
+    // Connect with |cs| through SQLDriverConnect and report the return code plus
+    // the SQLSTATEs the parity tests assert on. Shared by every parity test in
+    // this file so splitting one out never means copying the boilerplate again.
+    ConnResult TryConnect(const std::string& cs) {
+        SQLHDBC hdbc = SQL_NULL_HDBC;
+        SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
+        EXPECT_EQ(SQL_SUCCESS, rc);
+        if (rc != SQL_SUCCESS) return {rc, false, false, false};
+
+        SqlTString connstr = ODBCTestUtils::ToSqlTStr(cs);
+        SQLTCHAR outStr[1024] = {};
+        SQLSMALLINT outLen = 0;
+        rc = SQLDriverConnect(hdbc, nullptr,
+                              const_cast<SQLTCHAR*>(connstr.c_str()),
+                              static_cast<SQLSMALLINT>(connstr.size()),
+                              outStr, 1024, &outLen, SQL_DRIVER_NOPROMPT);
+
+        bool has01S00 = false, has28000 = false, hasHY024 = false;
+        if (rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR) {
+            has01S00 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "01S00");
+            has28000 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "28000");
+            hasHY024 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "HY024");
+        }
+
+        if (SQL_SUCCEEDED(rc)) SQLDisconnect(hdbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+        return {rc, has01S00, has28000, hasHY024};
+    }
 };
 
 // Connect, verify success, then disconnect.
@@ -236,66 +277,25 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
                        ";UID=" + cfg.Uid() +
                        ";PWD=" + cfg.Pwd() +
                        ";TrustServerCertificate=" + cfg.TrustCert();
-
-    struct ConnResult {
-        SQLRETURN rc;
-        bool has01S00;
-        bool has28000;
-    };
-
-    // Connect with |cs| and report the return code plus whether the parser's
-    // 01S00 warning and/or a 28000 login-failure SQLSTATE appear on ANY
-    // diagnostic record. We scan every record (not just record #1): a
-    // successful login interleaves the server's own 01000 info messages, and
-    // msodbcsql 18 appends its 01S00 parse warning AFTER them (record #3),
-    // whereas mssql-odbc posts it first. Reading only record #1 would miss it.
-    auto tryConnect = [&](const std::string& cs) -> ConnResult {
-        SQLHDBC hdbc = SQL_NULL_HDBC;
-        SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
-        EXPECT_EQ(SQL_SUCCESS, rc);
-        if (rc != SQL_SUCCESS) return {rc, false, false};
-
-        SqlTString connstr = ODBCTestUtils::ToSqlTStr(cs);
-        SQLTCHAR outStr[1024] = {};
-        SQLSMALLINT outLen = 0;
-
-        rc = SQLDriverConnect(hdbc, nullptr,
-                              const_cast<SQLTCHAR*>(connstr.c_str()),
-                              static_cast<SQLSMALLINT>(connstr.size()),
-                              outStr, 1024, &outLen,
-                              SQL_DRIVER_NOPROMPT);
-
-        bool has01S00 = false;
-        bool has28000 = false;
-        if (rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR) {
-            has01S00 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "01S00");
-            has28000 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "28000");
-        }
-
-        if (SQL_SUCCEEDED(rc)) SQLDisconnect(hdbc);
-        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
-        return {rc, has01S00, has28000};
-    };
-
     // A trailing token with no '=' is malformed: the key scan reaches
     // end-of-string without finding '=', so the parser posts 01S00 and keeps
     // whatever it parsed already. The connection still succeeds.
     {
-        auto r = tryConnect(base + ";garbage");
+        auto r = TryConnect(base + ";garbage");
         EXPECT_EQ(SQL_SUCCESS_WITH_INFO, r.rc);
         EXPECT_TRUE(r.has01S00);
     }
 
     // Empty key ("=value"): zero-length key name -> 01S00, connection proceeds.
     {
-        auto r = tryConnect(base + ";=orphan");
+        auto r = TryConnect(base + ";=orphan");
         EXPECT_EQ(SQL_SUCCESS_WITH_INFO, r.rc);
         EXPECT_TRUE(r.has01S00);
     }
 
     // Several malformed tokens after a complete, valid attribute set.
     {
-        auto r = tryConnect(base + ";garbage;=orphan;junk");
+        auto r = TryConnect(base + ";garbage;=orphan;junk");
         EXPECT_EQ(SQL_SUCCESS_WITH_INFO, r.rc);
         EXPECT_TRUE(r.has01S00);
     }
@@ -310,7 +310,7 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
     // parser now reproduces msodbcsql byte-for-byte, verified against ODBC
     // Driver 18.)
     {
-        auto r = tryConnect(
+        auto r = TryConnect(
             "Driver={" + cfg.Driver() + "}"
             ";Server=" + cfg.Server() +
             ";noequals;UID=" + cfg.Uid() +
@@ -332,7 +332,7 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
     // single trailing ';' emit no 01S00, but a trailing ';;'/';;;' does. Our
     // rewritten single-pass parser reproduces this exactly.
     {
-        auto r = tryConnect("Driver={" + cfg.Driver() + "}"
+        auto r = TryConnect("Driver={" + cfg.Driver() + "}"
             ";;;Server=" + cfg.Server() +
             ";;;UID=" + cfg.Uid() +
             ";;PWD=" + cfg.Pwd() +
@@ -357,7 +357,7 @@ TEST_F(DriverConnectLiveTest, MalformedTokenReturnsSuccessWithInfo) {
 
     // Unknown keys are ignored with a 01S00 warning; the connection succeeds.
     {
-        auto r = tryConnect(base + ";FooBar=xyz;Bogus=123");
+        auto r = TryConnect(base + ";FooBar=xyz;Bogus=123");
         EXPECT_EQ(SQL_SUCCESS_WITH_INFO, r.rc);
         EXPECT_TRUE(r.has01S00);
     }
@@ -379,47 +379,12 @@ TEST_F(DriverConnectLiveTest, ConnectionStringParserParityBehaviors) {
         GTEST_SKIP() << "Requires SQL auth (ODBC_TEST_SERVER + ODBC_TEST_UID + "
                         "ODBC_TEST_PWD); see follow-up issue for capability gating";
     }
-
-    struct ConnResult {
-        SQLRETURN rc;
-        bool has01S00;
-        bool has28000;
-    };
-
-    auto tryConnect = [&](const std::string& cs) -> ConnResult {
-        SQLHDBC hdbc = SQL_NULL_HDBC;
-        SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
-        EXPECT_EQ(SQL_SUCCESS, rc);
-        if (rc != SQL_SUCCESS) return {rc, false, false};
-
-        SqlTString connstr = ODBCTestUtils::ToSqlTStr(cs);
-        SQLTCHAR outStr[1024] = {};
-        SQLSMALLINT outLen = 0;
-
-        rc = SQLDriverConnect(hdbc, nullptr,
-                              const_cast<SQLTCHAR*>(connstr.c_str()),
-                              static_cast<SQLSMALLINT>(connstr.size()),
-                              outStr, 1024, &outLen,
-                              SQL_DRIVER_NOPROMPT);
-
-        bool has01S00 = false;
-        bool has28000 = false;
-        if (rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR) {
-            has01S00 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "01S00");
-            has28000 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "28000");
-        }
-
-        if (SQL_SUCCEEDED(rc)) SQLDisconnect(hdbc);
-        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
-        return {rc, has01S00, has28000};
-    };
-
     // Braced values: a leading '{' switches value scanning to "read until the
     // matching '}'", and the braces are stripped from the stored value. Wrapping
     // every value in braces must yield the same successful login as the plain
     // form, with no parse warning.
     {
-        auto r = tryConnect("Driver={" + cfg.Driver() + "}"
+        auto r = TryConnect("Driver={" + cfg.Driver() + "}"
             ";Server={" + cfg.Server() + "}"
             ";UID={" + cfg.Uid() + "}"
             ";PWD={" + cfg.Pwd() + "}"
@@ -439,7 +404,7 @@ TEST_F(DriverConnectLiveTest, ConnectionStringParserParityBehaviors) {
     // (duplicates_follow_first_wins, duplicate_recognized_key_first_wins,
     // auth_keys_follow_first_wins).
     {
-        auto r = tryConnect(
+        auto r = TryConnect(
             "Driver={" + cfg.Driver() + "}"
             ";Server=" + cfg.Server() +
             ";UID=" + cfg.Uid() +
@@ -464,7 +429,7 @@ TEST_F(DriverConnectLiveTest, ConnectionStringParserParityBehaviors) {
     // (first-wins) so the server rejects it -> 28000 on unixODBC; the Windows DM
     // keeps the valid trailing UID (last-wins) so the login succeeds.
     {
-        auto r = tryConnect(
+        auto r = TryConnect(
             "Driver={" + cfg.Driver() + "}"
             ";Server=" + cfg.Server() +
             ";UID=bogus_user_should_win" +
@@ -490,7 +455,7 @@ TEST_F(DriverConnectLiveTest, ConnectionStringParserParityBehaviors) {
     // empty user and the server rejects it -> 28000 (and the unknown key also
     // raises 01S00).
     {
-        auto r = tryConnect(
+        auto r = TryConnect(
             "Driver={" + cfg.Driver() + "}"
             ";Server=" + cfg.Server() +
             ";UID =" + cfg.Uid() +
@@ -514,41 +479,6 @@ TEST_F(DriverConnectLiveTest, NewConnectionAttributesParity) {
         GTEST_SKIP() << "Requires SQL auth (ODBC_TEST_SERVER + ODBC_TEST_UID + "
                         "ODBC_TEST_PWD); see follow-up issue for capability gating";
     }
-
-    struct ConnResult {
-        SQLRETURN rc;
-        bool has01S00;
-        bool hasHY024;
-    };
-
-    auto tryConnect = [&](const std::string& cs) -> ConnResult {
-        SQLHDBC hdbc = SQL_NULL_HDBC;
-        SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
-        EXPECT_EQ(SQL_SUCCESS, rc);
-        if (rc != SQL_SUCCESS) return {rc, false, false};
-
-        SqlTString connstr = ODBCTestUtils::ToSqlTStr(cs);
-        SQLTCHAR outStr[1024] = {};
-        SQLSMALLINT outLen = 0;
-
-        rc = SQLDriverConnect(hdbc, nullptr,
-                              const_cast<SQLTCHAR*>(connstr.c_str()),
-                              static_cast<SQLSMALLINT>(connstr.size()),
-                              outStr, 1024, &outLen,
-                              SQL_DRIVER_NOPROMPT);
-
-        bool has01S00 = false;
-        bool hasHY024 = false;
-        if (rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR) {
-            has01S00 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "01S00");
-            hasHY024 = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "HY024");
-        }
-
-        if (SQL_SUCCEEDED(rc)) SQLDisconnect(hdbc);
-        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
-        return {rc, has01S00, hasHY024};
-    };
-
     const std::string base =
         "Driver={" + cfg.Driver() + "}"
         ";Server=" + cfg.Server() +
@@ -559,7 +489,7 @@ TEST_F(DriverConnectLiveTest, NewConnectionAttributesParity) {
     // Recognized canonical attributes with valid values: login succeeds and the
     // parser raises no 01S00 (they are acted-on keys, not unknown ones).
     {
-        auto r = tryConnect(base +
+        auto r = TryConnect(base +
             ";ApplicationIntent=ReadOnly"
             ";MultiSubnetFailover=no"
             ";ConnectRetryCount=1"
@@ -577,7 +507,7 @@ TEST_F(DriverConnectLiveTest, NewConnectionAttributesParity) {
     // at connect time (msodbcsql parity), so the parser raises no error and the
     // connection succeeds without an 01S00 warning.
     {
-        auto r = tryConnect(base + ";IpAddressPreference=IPv7");
+        auto r = TryConnect(base + ";IpAddressPreference=IPv7");
         EXPECT_TRUE(SQL_SUCCEEDED(r.rc)) << "rc=" << r.rc;
         EXPECT_FALSE(r.has01S00);
     }
@@ -596,34 +526,6 @@ TEST_F(DriverConnectLiveTest, InvalidConnectionAttributeValuesRejected) {
         GTEST_SKIP() << "Requires SQL auth (ODBC_TEST_SERVER + ODBC_TEST_UID + "
                         "ODBC_TEST_PWD); see follow-up issue for capability gating";
     }
-
-    struct ConnResult {
-        SQLRETURN rc;
-        bool hasHY024;
-    };
-
-    auto tryConnect = [&](const std::string& cs) -> ConnResult {
-        SQLHDBC hdbc = SQL_NULL_HDBC;
-        SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
-        EXPECT_EQ(SQL_SUCCESS, rc);
-        if (rc != SQL_SUCCESS) return {rc, false};
-
-        SqlTString connstr = ODBCTestUtils::ToSqlTStr(cs);
-        SQLTCHAR outStr[1024] = {};
-        SQLSMALLINT outLen = 0;
-        rc = SQLDriverConnect(hdbc, nullptr,
-                              const_cast<SQLTCHAR*>(connstr.c_str()),
-                              static_cast<SQLSMALLINT>(connstr.size()),
-                              outStr, 1024, &outLen, SQL_DRIVER_NOPROMPT);
-
-        bool hasHY024 = (rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR) &&
-                        ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "HY024");
-
-        if (SQL_SUCCEEDED(rc)) SQLDisconnect(hdbc);
-        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
-        return {rc, hasHY024};
-    };
-
     const std::string base =
         "Driver={" + cfg.Driver() + "}"
         ";Server=" + cfg.Server() +
@@ -632,14 +534,14 @@ TEST_F(DriverConnectLiveTest, InvalidConnectionAttributeValuesRejected) {
 
     // Invalid enum value on a validated key -> E_FAIL -> HY024, connect fails.
     {
-        auto r = tryConnect(base + ";ApplicationIntent=sideways");
+        auto r = TryConnect(base + ";ApplicationIntent=sideways");
         EXPECT_EQ(SQL_ERROR, r.rc);
         EXPECT_TRUE(r.hasHY024);
     }
 
     // Non-numeric integer value -> HY024, connect fails.
     {
-        auto r = tryConnect(base + ";PacketSize=notanumber");
+        auto r = TryConnect(base + ";PacketSize=notanumber");
         EXPECT_EQ(SQL_ERROR, r.rc);
         EXPECT_TRUE(r.hasHY024);
     }

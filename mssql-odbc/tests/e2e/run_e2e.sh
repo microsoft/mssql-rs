@@ -85,7 +85,11 @@ print_failure_diagnostics() {
     done
     echo ""
     echo "--- test executables in $BUILD_DIR ---"
-    find "$BUILD_DIR" -type f -name '*_test' 2>/dev/null || echo "(none found)"
+    # `find` exits 0 even when it matches nothing, so `find || echo` never prints
+    # the fallback. Capture the output and test it explicitly instead.
+    local exes
+    exes="$(find "$BUILD_DIR" -type f -name '*_test' 2>/dev/null)"
+    if [ -n "$exes" ]; then echo "$exes"; else echo "(none found)"; fi
 }
 
 # A ctest run that executed nothing still exits 0 and prints "No tests were
@@ -292,14 +296,21 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
-# Step 4: Validate the msodbcsql odbcinst.ini for the comparison run
+# Step 4: Validate comparison-mode preconditions
 # ----------------------------------------------------------------------------
-validate_msodbcsql_ini() {
+validate_compare_preconditions() {
     # A full connection-string override ignores ODBC_TEST_DRIVER, which would
     # silently run both legs against whichever driver it names.
     if [ -n "${ODBC_TEST_CONNSTR:-}" ]; then
         echo "Error: ODBC_TEST_CONNSTR is set; it overrides the driver name and would" >&2
         echo "  pin both comparison legs to the same driver. Unset it to compare." >&2
+        exit 1
+    fi
+    # A DSN pins the connection to one driver just like a full connection string,
+    # so both legs would resolve to the same driver.
+    if [ -n "${ODBC_TEST_DSN:-}" ]; then
+        echo "Error: ODBC_TEST_DSN is set; a DSN pins the connection to one driver, so" >&2
+        echo "  both comparison legs would use the same driver. Unset it to compare." >&2
         exit 1
     fi
     if [ ! -f "$MSODBCSQL_INI" ]; then
@@ -478,7 +489,7 @@ main() {
     build_rust_driver
     register_rust_driver
     if [ "$COMPARE" -eq 1 ]; then
-        validate_msodbcsql_ini
+        validate_compare_preconditions
     fi
     configure_and_build_tests
 
