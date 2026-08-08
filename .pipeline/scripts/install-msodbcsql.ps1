@@ -9,10 +9,10 @@
 #
 # winget is the intended path, but it is not present on every Windows Server
 # image, so fall back to the MSI winget itself would download. Skipping the
-# install is deliberately not an option when the driver is absent: it would
-# silently downgrade the job to a single-leg run, so every install failure path
-# throws. A driver that is already registered at a different patch version is a
-# softer case (see below): it warns rather than throwing.
+# install is deliberately not an option: it would silently downgrade the job to a
+# single-leg run, so every install failure path throws. A driver already
+# registered at a different version is warned about and then upgraded to the
+# pinned version, and the post-install check throws if the upgrade did not take.
 #
 # The MSI URL and hash are pinned to the -Version default. Bumping -Version (via
 # the msodbcsqlVersion pipeline variable) without also updating -MsiUrl/-MsiSha256
@@ -42,16 +42,15 @@ $name = 'ODBC Driver 18 for SQL Server'
 $key  = "HKLM:\Software\ODBC\ODBCINST.INI\$name"
 
 if (Test-Path $key) {
-    Write-Host "$name is already registered; verifying its version instead of installing."
+    Write-Host "$name is already registered; checking its version before deciding whether to install."
     Get-ItemProperty -Path $key | Format-List | Out-String | Write-Host
 
     # A pre-installed driver on a hosted/persistent agent (the Windows 1ES image
     # ships 18.5.2.1) may be a version other than the pinned one, which changes
-    # what the parity table compares against. Resolve the registered DLL and warn
-    # loudly on a mismatch, but do not throw: the driver is present and usable, the
-    # reference leg runs fine against it, and the comparison itself is what gates
-    # the build. Hard-failing here would block every PR on an agent whose baked-in
-    # driver version is outside this repo's control.
+    # what the parity table compares against. Resolve the registered DLL: if it
+    # already matches the pin, skip the install; otherwise warn and fall through to
+    # upgrade it to the pinned version so the comparison always runs against a known
+    # driver.
     $dll = (Get-ItemProperty -Path $key -Name 'Driver' -ErrorAction SilentlyContinue).Driver
     if ($dll -and (Test-Path $dll)) {
         $info = (Get-Item $dll).VersionInfo
@@ -59,22 +58,24 @@ if (Test-Path $key) {
 
         $want = Normalize-Version $Version
         $have = Normalize-Version $info.ProductVersion
-        if (-not $have) {
-            Write-Warning "Could not read a ProductVersion from $dll; skipping the version check."
-        } elseif ($have -ne $want) {
-            Write-Warning "Registered '$name' is version $($info.ProductVersion) (normalized $have) but the pipeline pins $Version (normalized $want). The comparison leg will run against the installed version. To close the gap, uninstall the pre-installed driver so this script installs the pinned MSI, or update the msodbcsqlVersion variable and the pinned MSI to match the agent."
+        if ($have -and $have -eq $want) {
+            Write-Host "Version check passed: registered driver matches the pinned $Version; skipping install."
+            exit 0
+        } elseif ($have) {
+            Write-Warning "Registered '$name' is version $($info.ProductVersion) (normalized $have) but the pipeline pins $Version (normalized $want); upgrading the pre-installed driver to the pinned version."
         } else {
-            Write-Host "Version check passed: registered driver matches the pinned $Version."
+            Write-Warning "Could not read a ProductVersion from $dll; reinstalling the pinned $Version to be safe."
         }
     } else {
-        Write-Warning "'$name' is registered but its Driver DLL path could not be resolved; skipping the version check."
+        Write-Warning "'$name' is registered but its Driver DLL path could not be resolved; reinstalling the pinned $Version."
     }
-    exit 0
 }
 
 if (Get-Command winget -ErrorAction SilentlyContinue) {
     Write-Host "Installing msodbcsql $Version via winget..."
-    winget install --id Microsoft.msodbcsql.18 --version $Version --exact `
+    # --force so winget upgrades/reinstalls even when a different version is already
+    # present, rather than reporting "no applicable update" and leaving it in place.
+    winget install --id Microsoft.msodbcsql.18 --version $Version --exact --force `
         --silent --accept-package-agreements --accept-source-agreements `
         --disable-interactivity
     if ($LASTEXITCODE -ne 0) {
@@ -88,6 +89,7 @@ if (Get-Command winget -ErrorAction SilentlyContinue) {
     if ($actual -ne $MsiSha256) {
         throw "msodbcsql MSI hash mismatch: expected $MsiSha256, got $actual"
     }
+    # A same-UpgradeCode MSI performs a major upgrade over any pre-installed 18.x.
     $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
         '/i', "`"$msi`"", '/qn', '/norestart', 'IACCEPTMSODBCSQLLICENSETERMS=YES'
     )
@@ -99,4 +101,18 @@ if (Get-Command winget -ErrorAction SilentlyContinue) {
 if (-not (Test-Path $key)) {
     throw "Install reported success but '$name' is not registered under HKLM."
 }
-Write-Host "Installed and registered '$name'."
+
+# Confirm the install/upgrade actually produced the pinned version. Now that we
+# fall through and attempt an upgrade, a persistent mismatch is a real failure
+# (the upgrade did not take) rather than an uncontrollable pre-existing driver.
+$dll = (Get-ItemProperty -Path $key -Name 'Driver' -ErrorAction SilentlyContinue).Driver
+if ($dll -and (Test-Path $dll)) {
+    $info = (Get-Item $dll).VersionInfo
+    $want = Normalize-Version $Version
+    $have = Normalize-Version $info.ProductVersion
+    Write-Host "Post-install '$name' -> $dll (ProductVersion=$($info.ProductVersion))"
+    if ($have -and $have -ne $want) {
+        throw "After install/upgrade, '$name' is version $($info.ProductVersion) (normalized $have) but the pipeline pins $Version (normalized $want); the upgrade did not take effect."
+    }
+}
+Write-Host "Installed and registered '$name' ($Version)."
