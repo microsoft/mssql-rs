@@ -1178,11 +1178,12 @@ mod always_encrypted {
                 StatusFlags::NONE,
                 SqlType::Int(Some(555)),
             );
+            let mut drop_handle = None;
             h.client
                 .execute_sp_prepexec_raw(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
                     vec![param],
-                    None,
+                    &mut drop_handle,
                     (),
                 )
                 .await

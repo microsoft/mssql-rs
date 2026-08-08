@@ -536,8 +536,14 @@ mod rpc_results {
 
         let named_parameters = vec![database_id_param, compat_level_param];
 
+        let mut drop_handle = None;
         connection
-            .execute_sp_prepexec_raw(query.to_string(), named_parameters.clone(), None, ())
+            .execute_sp_prepexec_raw(
+                query.to_string(),
+                named_parameters.clone(),
+                &mut drop_handle,
+                (),
+            )
             .await
             .unwrap();
 
@@ -588,10 +594,10 @@ mod rpc_results {
     async fn prepexec_and_get_handle(
         connection: &mut mssql_tds::connection::tds_client::TdsClient,
         sql: &str,
-        drop_handle: Option<i32>,
+        mut drop_handle: Option<i32>,
     ) -> i32 {
         connection
-            .execute_sp_prepexec_raw(sql.to_string(), vec![], drop_handle, ())
+            .execute_sp_prepexec_raw(sql.to_string(), vec![], &mut drop_handle, ())
             .await
             .unwrap();
 

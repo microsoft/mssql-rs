@@ -62,7 +62,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
     let Execution {
         named_params,
         mut prepared,
-        orphaned,
+        mut orphaned,
     } = match stage_execution(stmt) {
         Ok(exec) => exec,
         Err(rc) => return rc,
@@ -94,15 +94,16 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
     let exec_result = dbc.runtime.block_on(client.execute_prepared(
         &mut prepared,
         named_params,
-        orphaned,
+        &mut orphaned,
         ExecuteOptions::default(),
     ));
 
-    // Write the (possibly re-prepared) statement back before anything else so a
-    // superseded handle is never retained; the fresh handle's `@handle`
-    // RETURNVALUE arrives after the result set and is captured at drain time.
+    // Write the statement back along with any orphan that was not consumed
+    // because execution failed before the prepexec send boundary. The fresh
+    // handle's RETURNVALUE arrives after the result set and is captured later.
     if let Ok(mut stmt_state) = stmt.inner.lock() {
         stmt_state.prepared_stmt = Some(prepared);
+        stmt_state.pending_unprepare = orphaned;
     }
 
     let stmt_result = match exec_result {

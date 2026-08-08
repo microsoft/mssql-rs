@@ -544,8 +544,14 @@ mod connectivity {
             );
 
             // Prepare + execute "SELECT @P1" and capture the server-side handle.
+            let mut drop_handle = None;
             client
-                .execute_sp_prepexec_raw("SELECT @P1".to_string(), vec![make_param()], None, ())
+                .execute_sp_prepexec_raw(
+                    "SELECT @P1".to_string(),
+                    vec![make_param()],
+                    &mut drop_handle,
+                    (),
+                )
                 .await?;
             while client.next_row().await?.is_some() {}
             client.advance().await?;
@@ -585,8 +591,14 @@ mod connectivity {
 
             // A fresh prepare on the recovered session works — the statement
             // remains usable once the caller re-prepares.
+            let mut drop_handle = None;
             client
-                .execute_sp_prepexec_raw("SELECT @P1".to_string(), vec![make_param()], None, ())
+                .execute_sp_prepexec_raw(
+                    "SELECT @P1".to_string(),
+                    vec![make_param()],
+                    &mut drop_handle,
+                    (),
+                )
                 .await?;
             let value = get_scalar_value(&mut client).await?;
             assert!(
