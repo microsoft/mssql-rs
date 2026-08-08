@@ -97,13 +97,31 @@ impl<'a> PacketReader<'a> {
         }
     }
 
-    /// Ensures at least `byte_count` bytes are readable, refilling once if not.
-    /// A scalar never exceeds one packet, so a single refill always suffices.
+    /// Async shell over the sync core: drives [`PacketBuffer::ensure`] in a loop,
+    /// refilling on `NeedBytes` and retrying until `byte_count` bytes are
+    /// readable. A scalar never exceeds one packet, so a single refill usually
+    /// suffices; the loop covers a value split across a packet boundary.
     async fn ensure(&mut self, byte_count: usize) -> TdsResult<()> {
-        if !self.buffer.has(byte_count) {
-            self.read_tds_packet().await?;
+        loop {
+            match self.buffer.ensure(byte_count) {
+                Ok(()) => return Ok(()),
+                Err(need) => {
+                    tracing::trace!(shortfall = need.shortfall, "refilling TDS read buffer");
+                    let before = self.buffer.available();
+                    self.read_tds_packet().await?;
+                    // Loop-termination invariant: a refill must expose at least
+                    // one new byte. If it does not, re-driving the read would
+                    // spin forever, so fail loudly instead of hanging.
+                    let progressed = self.buffer.available() > before;
+                    debug_assert!(progressed, "TDS refill made no forward progress");
+                    if !progressed {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "TDS packet refill made no progress while {byte_count} bytes were needed"
+                        )));
+                    }
+                }
+            }
         }
-        Ok(())
     }
 
     async fn read_tds_packet(&mut self) -> TdsResult<()> {
@@ -258,6 +276,11 @@ impl TdsPacketReader for PacketReader<'_> {
         while total_read < buffer.len() {
             if self.buffer.available() == 0 {
                 self.read_tds_packet().await?;
+                if self.buffer.available() == 0 {
+                    return Err(crate::error::Error::ProtocolError(
+                        "TDS packet refill made no progress while reading bytes".to_string(),
+                    ));
+                }
             }
             total_read += self.buffer.copy_out(&mut buffer[total_read..]);
         }
@@ -344,6 +367,11 @@ impl TdsPacketReader for PacketReader<'_> {
         while remaining > 0 {
             if self.buffer.available() == 0 {
                 self.read_tds_packet().await?;
+                if self.buffer.available() == 0 {
+                    return Err(crate::error::Error::ProtocolError(
+                        "TDS packet refill made no progress while skipping bytes".to_string(),
+                    ));
+                }
             }
             remaining -= self.buffer.skip_available(remaining);
         }
@@ -1015,5 +1043,45 @@ pub(crate) mod tests {
         let varchar = packet_reader.read_varchar_u8_length().await.unwrap();
         // assert_eq!(varchar, Some("ab".to_string()));
         assert_eq!(varchar, unicode_string.to_string());
+    }
+
+    /// A refill that returns a valid but empty (header-only) packet exposes zero
+    /// new payload bytes. The inverted reader's driver loop must detect the lack
+    /// of forward progress instead of spinning forever: in debug builds the
+    /// `debug_assert!` fires loudly (asserted here); release builds fall back to
+    /// a `ProtocolError` return covered by the runtime guard.
+    #[tokio::test]
+    #[should_panic(expected = "no forward progress")]
+    async fn empty_packet_refill_fails_without_spinning() {
+        // Header-only packet: valid framing, EOM set, zero payload bytes.
+        let empty_packet = TestPacketBuilder::new(PacketType::PreLogin).build();
+
+        let mut mock_reader = MockNetworkReaderWriter::new(empty_packet, 0);
+        let mut packet_reader = PacketReader::new(&mut mock_reader);
+
+        let _ = packet_reader.read_byte().await;
+    }
+
+    /// Reading exactly to the packet boundary must succeed; the next read then
+    /// drives a refill that hits end-of-stream and terminates with an error
+    /// rather than looping.
+    #[tokio::test]
+    async fn exact_packet_boundary_reads_then_terminates() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let builder = binding.append_byte(0xAB);
+        let mut mock_reader = MockNetworkReaderWriter::new(builder.build(), 0);
+        let mut packet_reader = PacketReader::new(&mut mock_reader);
+
+        // Consumes the sole payload byte, landing exactly on the boundary.
+        assert_eq!(packet_reader.read_byte().await.unwrap(), 0xAB);
+
+        // One byte past the boundary: the refill reaches end-of-stream and the
+        // loop must terminate with an error, never hang.
+        let err = packet_reader.read_byte().await.unwrap_err();
+        assert!(
+            err.to_string().contains("Connection closed")
+                || err.to_string().contains("no progress"),
+            "expected termination error, got: {err}"
+        );
     }
 }

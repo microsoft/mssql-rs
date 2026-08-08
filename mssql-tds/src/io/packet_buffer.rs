@@ -22,6 +22,20 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use crate::core::TdsResult;
 use crate::io::packet_writer::PacketWriter;
 
+/// Sans-I/O signal that a synchronous read needs more bytes than are currently
+/// buffered.
+///
+/// This is the one thing the sync core cannot resolve on its own. Returned by
+/// [`PacketBuffer::ensure`] without consuming anything, it tells the async shell
+/// exactly how many more bytes to pull off the wire before re-driving the read.
+/// Because the guard is a pure check, the paired `take_*` accessors stay atomic:
+/// they only advance the read position when the full width is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NeedBytes {
+    /// Additional bytes required beyond what is currently available.
+    pub(crate) shortfall: usize,
+}
+
 /// Synchronous, I/O-free buffer of reassembled TDS packet payload bytes.
 pub(crate) struct PacketBuffer {
     working_buffer: Vec<u8>,
@@ -57,6 +71,25 @@ impl PacketBuffer {
     /// Whether `byte_count` bytes can be read without a refill.
     pub(crate) fn has(&self, byte_count: usize) -> bool {
         self.available() >= byte_count
+    }
+
+    /// Sync-core guard for a fixed-width read: succeeds when `byte_count` bytes
+    /// can be taken without a refill, otherwise reports the [`NeedBytes`]
+    /// shortfall without consuming anything.
+    ///
+    /// This is the sole suspension point of the inverted read path. The async
+    /// shell drives it in a loop — refilling on `NeedBytes` and retrying — while
+    /// the paired atomic `take_*` accessors guarantee no partial advance, so a
+    /// read is always safe to re-drive after a refill.
+    pub(crate) fn ensure(&self, byte_count: usize) -> Result<(), NeedBytes> {
+        let available = self.available();
+        if available >= byte_count {
+            Ok(())
+        } else {
+            Err(NeedBytes {
+                shortfall: byte_count - available,
+            })
+        }
     }
 
     /// Readable bytes as a slice (from the current position to the filled end).
@@ -482,5 +515,36 @@ mod tests {
         buf.working_buffer_mut()[2] = 0x00;
         buf.working_buffer_mut()[3] = 0x40; // 64
         assert_eq!(buf.validate_packet_length(0).unwrap(), 64);
+    }
+
+    /// ensure() is a pure guard: it never consumes, reports the exact shortfall
+    /// on an empty/short buffer, and succeeds once enough bytes are present.
+    #[test]
+    fn ensure_reports_shortfall_without_consuming() {
+        let mut buf = PacketBuffer::with_packet_size(4096);
+
+        // Empty buffer: a 4-byte read is short by the full width.
+        assert_eq!(buf.ensure(4), Err(NeedBytes { shortfall: 4 }));
+        assert_eq!(buf.available(), 0);
+
+        // Expose exactly 2 payload bytes.
+        buf.working_buffer_mut()[8] = 0xDE;
+        buf.working_buffer_mut()[9] = 0xAD;
+        buf.set_positions_for_test(0, 0);
+        buf.strip_header(10);
+        assert_eq!(buf.available(), 2);
+
+        // Short read reports the remaining shortfall and consumes nothing.
+        assert_eq!(buf.ensure(4), Err(NeedBytes { shortfall: 2 }));
+        assert_eq!(buf.available(), 2);
+
+        // Exact-boundary read is allowed and still non-consuming.
+        assert_eq!(buf.ensure(2), Ok(()));
+        assert_eq!(buf.available(), 2);
+
+        // The atomic take advances only after a satisfied guard.
+        assert_eq!(buf.take_u16_le().unwrap(), 0xADDE);
+        assert_eq!(buf.available(), 0);
+        assert_eq!(buf.ensure(1), Err(NeedBytes { shortfall: 1 }));
     }
 }

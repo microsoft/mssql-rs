@@ -974,99 +974,36 @@ impl GenericDecoder {
         Ok(ColumnValues::Vector(vector))
     }
 
-    async fn read_plp_bytes<T>(reader: &mut T) -> TdsResult<Option<Vec<u8>>>
+    /// Reads an entire PLP value into one `Vec`, returning `None` for SQL NULL.
+    ///
+    /// The eager collect-all counterpart to [`PlpColumnStream`]: incremental
+    /// callers stream chunks on demand, while value decoders that materialize
+    /// the whole column funnel through here. All wire-level chunk framing and
+    /// size guards live in [`PlpChunkStreamReader`], so this stays a thin
+    /// accumulation loop over the shared streaming reader instead of a second
+    /// copy of the chunk-decoding logic.
+    async fn collect_plp<T>(reader: &mut T) -> TdsResult<Option<Vec<u8>>>
     where
         T: TdsPacketReader + Send + Sync,
     {
-        let long_len_i64 = reader.read_int64().await?;
-        let long_len = long_len_i64 as u64;
+        const COLLECT_CHUNK: usize = 8192;
 
-        // If the length is SQL_PLP_NULL, it means the value is NULL.
-        if long_len as usize == Self::SQL_PLP_NULL {
-            Ok(None)
-        } else {
-            // If the length is SQL_PLP_UNKNOWNLEN, it means the length is unknown and we have to
-            // gather all the chunks until we reach the end of the PLP data which is a zero length
-            // chunk.
-            let mut vector_capacity = if long_len as usize != Self::SQL_PLP_UNKNOWNLEN {
-                let capacity = long_len as usize;
-                // Check for overflow or excessively large values
-                // If long_len_i64 was negative, casting to u64 then usize can produce huge values
-                if long_len_i64 < 0 || capacity > MAX_PLP_SIZE {
-                    return Err(crate::error::Error::ProtocolError(format!(
-                        "PLP length {capacity} (raw i64: {long_len_i64}) exceeds maximum allowed size of {MAX_PLP_SIZE} bytes"
-                    )));
-                }
-                capacity
-            } else {
-                0
-            };
-            let mut plp_buffer = vec![0u8; vector_capacity];
-            let mut chunk_len = reader.read_uint32().await? as usize;
-            let mut offset: usize = 0;
-            let mut chunk_count = 0u32;
+        let reader: &mut (dyn TdsPacketReader + Send + Sync) = reader;
+        let mut stream = match PlpChunkStreamReader::begin(reader).await? {
+            None => return Ok(None),
+            Some(stream) => stream,
+        };
 
-            while chunk_len > 0 {
-                chunk_count += 1;
-
-                #[cfg(fuzzing)]
-                {
-                    eprintln!(
-                        "[ALLOC] read_plp_bytes: chunk #{chunk_count}, chunk_len={chunk_len}, total_capacity={vector_capacity}"
-                    );
-                }
-
-                if chunk_count > Self::MAX_PLP_CHUNKS {
-                    return Err(crate::error::Error::ProtocolError(format!(
-                        "Too many PLP chunks: {chunk_count} (max {})",
-                        Self::MAX_PLP_CHUNKS
-                    )));
-                }
-
-                // Limit individual chunk size
-                if chunk_len > Self::MAX_PLP_CHUNK_SIZE {
-                    return Err(crate::error::Error::ProtocolError(format!(
-                        "PLP chunk size {chunk_len} exceeds maximum allowed chunk size of {} bytes",
-                        Self::MAX_PLP_CHUNK_SIZE
-                    )));
-                }
-
-                if long_len as usize == Self::SQL_PLP_UNKNOWNLEN {
-                    // Use checked_add to prevent capacity overflow
-                    vector_capacity = vector_capacity.checked_add(chunk_len).ok_or_else(|| {
-                        crate::error::Error::ProtocolError(format!(
-                            "PLP chunk accumulation would overflow capacity: {vector_capacity} + {chunk_len}"
-                        ))
-                    })?;
-                    // Validate against MAX_PLP_SIZE after accumulation
-                    if vector_capacity > MAX_PLP_SIZE {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "PLP accumulated size {vector_capacity} exceeds maximum allowed size of {MAX_PLP_SIZE} bytes (SQL Server limit: 2GB)"
-                        )));
-                    }
-                    plp_buffer.resize(vector_capacity, 0);
-                } else {
-                    // For known length, validate that chunk fits within the allocated buffer
-                    let end_offset = offset.checked_add(chunk_len).ok_or_else(|| {
-                        crate::error::Error::ProtocolError(format!(
-                            "PLP chunk offset would overflow: {offset} + {chunk_len}"
-                        ))
-                    })?;
-                    if end_offset > plp_buffer.len() {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "PLP chunk exceeds declared length: offset={offset}, chunk_len={chunk_len}, buffer_len={}, declared_len={long_len}",
-                            plp_buffer.len()
-                        )));
-                    }
-                }
-                let chunk_size_read = reader
-                    .read_bytes(&mut plp_buffer[offset..offset + chunk_len])
-                    .await?;
-                offset += chunk_size_read;
-                chunk_len = reader.read_uint32().await? as usize;
+        let mut collected = Vec::new();
+        let mut chunk = [0u8; COLLECT_CHUNK];
+        while !stream.reached_end() {
+            let read = stream.read_into(reader, &mut chunk).await?;
+            if read == 0 {
+                break;
             }
-            Ok(Some(plp_buffer))
+            collected.extend_from_slice(&chunk[..read]);
         }
+        Ok(Some(collected))
     }
 
     /// Decodes a column value from the wire and writes it directly into a
@@ -1208,7 +1145,7 @@ impl GenericDecoder {
             }
             TdsDataType::BigVarBinary => {
                 if metadata.is_plp() {
-                    match GenericDecoder::read_plp_bytes(reader).await? {
+                    match GenericDecoder::collect_plp(reader).await? {
                         Some(bytes) => writer.write_bytes(col, bytes),
                         None => writer.write_null(col),
                     }
@@ -1452,7 +1389,7 @@ impl SqlTypeDecode for GenericDecoder {
             }
             TdsDataType::BigVarBinary => {
                 if metadata.is_plp() {
-                    let some_bytes = GenericDecoder::read_plp_bytes(reader).await?;
+                    let some_bytes = GenericDecoder::collect_plp(reader).await?;
                     match some_bytes {
                         Some(bytes) => ColumnValues::Bytes(bytes),
                         None => ColumnValues::Null,
@@ -1480,7 +1417,7 @@ impl SqlTypeDecode for GenericDecoder {
                         "XML column metadata is not partially-length-prefixed".to_string(),
                     ));
                 }
-                let some_bytes = GenericDecoder::read_plp_bytes(reader).await?;
+                let some_bytes = GenericDecoder::collect_plp(reader).await?;
                 match some_bytes {
                     Some(bytes) => ColumnValues::Xml(SqlXml { bytes }),
                     None => ColumnValues::Null,
@@ -1492,7 +1429,7 @@ impl SqlTypeDecode for GenericDecoder {
                         "JSON column metadata is not partially-length-prefixed".to_string(),
                     ));
                 }
-                let some_bytes = GenericDecoder::read_plp_bytes(reader).await?;
+                let some_bytes = GenericDecoder::collect_plp(reader).await?;
                 match some_bytes {
                     Some(bytes) => ColumnValues::Json(SqlJson::new(bytes)),
                     None => ColumnValues::Null,
@@ -1631,7 +1568,7 @@ impl SqlTypeDecode for GenericDecoder {
                         "UDT column metadata is not partially-length-prefixed".to_string(),
                     ));
                 }
-                let some_bytes = GenericDecoder::read_plp_bytes(reader).await?;
+                let some_bytes = GenericDecoder::collect_plp(reader).await?;
                 match some_bytes {
                     Some(bytes) => ColumnValues::Bytes(bytes),
                     None => ColumnValues::Null,
@@ -1700,7 +1637,7 @@ impl StringDecoder {
         let encoding_type = get_encoding_type(metadata);
 
         if metadata.is_plp() {
-            match GenericDecoder::read_plp_bytes(reader).await? {
+            match GenericDecoder::collect_plp(reader).await? {
                 Some(bytes) => writer.write_string(col, SqlString::new(bytes, encoding_type)),
                 None => writer.write_null(col),
             }
@@ -1755,7 +1692,7 @@ impl SqlTypeDecode for StringDecoder {
 
         // If Plp Column. (BIGVARCHARTYPE, BIGVARBINARYTYPE, NVARCHARTYPE with md.length == ushort.max)
         if metadata.is_plp() {
-            let some_bytes = GenericDecoder::read_plp_bytes(reader).await?;
+            let some_bytes = GenericDecoder::collect_plp(reader).await?;
             match some_bytes {
                 Some(bytes) => Ok(ColumnValues::String(SqlString::new(bytes, encoding_type))),
                 None => Ok(ColumnValues::Null),
@@ -4000,16 +3937,14 @@ mod test {
         }
 
         #[tokio::test]
-        async fn read_plp_bytes_rejects_oversized_chunk_in_existing_path() {
+        async fn collect_plp_rejects_oversized_chunk_in_existing_path() {
             let mut buf = Vec::new();
             buf.extend_from_slice(&0xFFFFFFFFFFFFFFFEu64.to_le_bytes());
             let oversized = (GenericDecoder::MAX_PLP_CHUNK_SIZE + 1) as u32;
             buf.extend_from_slice(&oversized.to_le_bytes());
 
             let mut reader = ByteReader::new(buf);
-            let err = GenericDecoder::read_plp_bytes(&mut reader)
-                .await
-                .unwrap_err();
+            let err = GenericDecoder::collect_plp(&mut reader).await.unwrap_err();
             assert!(
                 err.to_string()
                     .contains("exceeds maximum allowed chunk size"),

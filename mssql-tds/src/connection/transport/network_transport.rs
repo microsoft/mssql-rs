@@ -777,6 +777,33 @@ impl NetworkTransport {
         Ok(())
     }
 
+    /// Async shell over the sync core: drives [`PacketBuffer::ensure`] in a loop,
+    /// refilling on `NeedBytes` and retrying until `byte_count` bytes are
+    /// readable. The paired atomic `take_*` accessors never advance on a short
+    /// read, so re-driving after a refill is always safe.
+    async fn ensure_or_refill(&mut self, byte_count: usize) -> TdsResult<()> {
+        loop {
+            match self.tds_read_buffer.ensure(byte_count) {
+                Ok(()) => return Ok(()),
+                Err(need) => {
+                    tracing::trace!(shortfall = need.shortfall, "refilling TDS read buffer");
+                    let before = self.tds_read_buffer.available();
+                    self.read_tds_packet().await?;
+                    // Loop-termination invariant: a refill must expose at least
+                    // one new byte. Without this guard a zero-payload packet
+                    // would spin the driver forever, so fail loudly instead.
+                    let progressed = self.tds_read_buffer.available() > before;
+                    debug_assert!(progressed, "TDS refill made no forward progress");
+                    if !progressed {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "TDS packet refill made no progress while {byte_count} bytes were needed"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
     /// Reads a complete TDS packet from the network into the working buffer.
     ///
     /// This method handles the case where a single `read()` call returns data for multiple
@@ -1062,86 +1089,60 @@ impl TdsPacketReader for NetworkTransport {
     }
 
     async fn read_byte(&mut self) -> TdsResult<u8> {
-        if !self.tds_read_buffer.has(1) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(1).await?;
         self.tds_read_buffer.take_u8()
     }
 
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
-        if !self.tds_read_buffer.has(2) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(2).await?;
         self.tds_read_buffer.take_i16_be()
     }
     async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
-        if !self.tds_read_buffer.has(4) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(4).await?;
         self.tds_read_buffer.take_i32_be()
     }
 
     async fn read_uint40(&mut self) -> TdsResult<u64> {
-        if !self.tds_read_buffer.has(5) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(5).await?;
         self.tds_read_buffer.take_uint40_le()
     }
 
     async fn read_float32(&mut self) -> TdsResult<f32> {
-        if !self.tds_read_buffer.has(4) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(4).await?;
         self.tds_read_buffer.take_f32_le()
     }
     async fn read_float64(&mut self) -> TdsResult<f64> {
-        if !self.tds_read_buffer.has(8) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(8).await?;
         self.tds_read_buffer.take_f64_le()
     }
     async fn read_int16(&mut self) -> TdsResult<i16> {
-        if !self.tds_read_buffer.has(2) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(2).await?;
         self.tds_read_buffer.take_i16_le()
     }
     async fn read_uint16(&mut self) -> TdsResult<u16> {
-        if !self.tds_read_buffer.has(2) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(2).await?;
         self.tds_read_buffer.take_u16_le()
     }
     async fn read_uint24(&mut self) -> TdsResult<u32> {
-        if !self.tds_read_buffer.has(3) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(3).await?;
         self.tds_read_buffer.take_u24_le()
     }
 
     async fn read_int32(&mut self) -> TdsResult<i32> {
-        if !self.tds_read_buffer.has(4) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(4).await?;
         self.tds_read_buffer.take_i32_le()
     }
 
     async fn read_uint32(&mut self) -> TdsResult<u32> {
-        if !self.tds_read_buffer.has(4) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(4).await?;
         self.tds_read_buffer.take_u32_le()
     }
     async fn read_int64(&mut self) -> TdsResult<i64> {
-        if !self.tds_read_buffer.has(8) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(8).await?;
         self.tds_read_buffer.take_i64_le()
     }
     async fn read_uint64(&mut self) -> TdsResult<u64> {
-        if !self.tds_read_buffer.has(8) {
-            self.read_tds_packet().await?;
-        }
+        self.ensure_or_refill(8).await?;
         self.tds_read_buffer.take_u64_le()
     }
 
@@ -1150,6 +1151,11 @@ impl TdsPacketReader for NetworkTransport {
         while total_read < buffer.len() {
             if self.tds_read_buffer.available() == 0 {
                 self.read_tds_packet().await?;
+                if self.tds_read_buffer.available() == 0 {
+                    return Err(crate::error::Error::ProtocolError(
+                        "TDS packet refill made no progress while reading bytes".to_string(),
+                    ));
+                }
             }
             total_read += self.tds_read_buffer.copy_out(&mut buffer[total_read..]);
         }
@@ -1217,6 +1223,11 @@ impl TdsPacketReader for NetworkTransport {
         while remaining > 0 {
             if self.tds_read_buffer.available() == 0 {
                 self.read_tds_packet().await?;
+                if self.tds_read_buffer.available() == 0 {
+                    return Err(crate::error::Error::ProtocolError(
+                        "TDS packet refill made no progress while skipping bytes".to_string(),
+                    ));
+                }
             }
             remaining -= self.tds_read_buffer.skip_available(remaining);
         }
@@ -1272,10 +1283,10 @@ impl TdsTokenStreamReader for NetworkTransport {
         cancel_handle: Option<&CancelHandle>,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
-        let cancellable = CancelHandle::run_until_cancelled(
+        let cancellable = Box::pin(CancelHandle::run_until_cancelled(
             cancel_handle,
             receive_row_into_internal(self, &*PARSER_REGISTRY, context, writer),
-        );
+        ));
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {
                 Ok(r) => r,
@@ -1303,10 +1314,10 @@ impl TdsTokenStreamReader for NetworkTransport {
         cancel_handle: Option<&CancelHandle>,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
-        let cancellable = CancelHandle::run_until_cancelled(
+        let cancellable = Box::pin(CancelHandle::run_until_cancelled(
             cancel_handle,
             resume_row_into_internal(self, pause_state, writer),
-        );
+        ));
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {
                 Ok(r) => r,
