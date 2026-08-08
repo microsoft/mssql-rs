@@ -1732,12 +1732,21 @@ impl TdsClient {
     /// corrupt the connection for reuse.
     pub(in crate::connection) async fn drain_stream(&mut self) -> TdsResult<Vec<SqlErrorInfo>> {
         let mut collected_errors: Vec<SqlErrorInfo> = Vec::new();
+        // A COLMETADATA reached at the top level of the drain must be parsed with
+        // the same Always Encrypted awareness as advance_to_result_boundary: when
+        // column encryption is negotiated the token carries a CEK-table prefix
+        // (empty or not) before the first column, and reading it with
+        // ParserContext::None would misinterpret those bytes and desynchronize the
+        // stream — the very corruption this drain exists to prevent.
+        let parser_context = ParserContext::ColumnEncryption(
+            self.negotiated_settings.is_column_encryption_supported(),
+        );
         loop {
             let start = Instant::now();
             let token = self
                 .transport
                 .receive_token(
-                    &ParserContext::None(()),
+                    &parser_context,
                     self.remaining_request_timeout,
                     self.cancel_handle.as_ref(),
                 )
@@ -3750,6 +3759,7 @@ mod tests {
         ParserContext, RowPauseState, RowReadResult, TdsTokenStreamReader,
     };
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes as client_over_bytes;
+    use crate::test_client_support::byte_stream::tds_client_over_raw_bytes_with_column_encryption as client_over_bytes_with_ae;
     use crate::token::tokens::{
         ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
     };
@@ -5415,6 +5425,20 @@ mod tests {
         b
     }
 
+    /// A single-Int COLMETADATA as it appears on the wire when Always Encrypted
+    /// is negotiated: an (empty) CEK table — a `u16` count of 0 — sits between
+    /// the column count and the first column definition. The column itself is
+    /// not encrypted (flags = 0), so it carries no per-column crypto metadata.
+    /// Parsing these bytes without column-encryption awareness misreads the
+    /// CEK-table prefix as column data and desynchronizes the stream.
+    fn colmetadata_single_int_ae_bytes(name: &str) -> Vec<u8> {
+        let mut b = vec![crate::token::tokens::TokenType::ColMetadata as u8];
+        b.extend_from_slice(&1u16.to_le_bytes()); // column count
+        b.extend_from_slice(&0u16.to_le_bytes()); // empty CEK table
+        b.extend(int_column_bytes(name));
+        b
+    }
+
     fn colmetadata_two_int_bytes(first: &str, second: &str) -> Vec<u8> {
         let mut b = vec![crate::token::tokens::TokenType::ColMetadata as u8];
         b.extend_from_slice(&2u16.to_le_bytes()); // column count
@@ -5601,6 +5625,30 @@ mod tests {
             matches!(err, crate::error::Error::ProtocolError(_)),
             "expected a ProtocolError for COLMETADATA before DONE, got: {err:?}"
         );
+    }
+
+    /// Regression guard for the drain's Always Encrypted awareness: when column
+    /// encryption is negotiated, a trailing result set's COLMETADATA carries a
+    /// CEK-table prefix (empty here). The drain's top-level token read must use
+    /// the same ColumnEncryption context as the normal read path, or those two
+    /// prefix bytes are misread as column data and the stream desynchronizes —
+    /// exactly the corruption this drain exists to prevent. Reading with
+    /// `ParserContext::None` here surfaces a parse error instead of the SQL
+    /// error, so this test fails without the fix.
+    #[tokio::test]
+    async fn drain_parses_trailing_rowset_metadata_under_column_encryption() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "lock timeout"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_single_int_ae_bytes("a"));
+        stream.extend(row_int_bytes(7));
+        stream.extend(done_bytes(DONE_FINAL));
+
+        let mut client = client_over_bytes_with_ae(stream);
+        let err = client.advance_to_result_boundary().await.unwrap_err();
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
     }
 
     /// The drain's top-level loop must apply the side effects of the control

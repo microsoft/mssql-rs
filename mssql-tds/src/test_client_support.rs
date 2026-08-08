@@ -394,4 +394,30 @@ pub(crate) mod byte_stream {
             client_context,
         )
     }
+
+    /// Same as [`tds_client_over_raw_bytes`] but with Always Encrypted negotiated,
+    /// so COLMETADATA reads expect the CEK-table prefix. Used to prove the drain
+    /// parses trailing result sets with the same encryption awareness as the
+    /// normal read path.
+    pub(crate) fn tds_client_over_raw_bytes_with_column_encryption(bytes: Vec<u8>) -> TdsClient {
+        use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
+        use crate::message::login::Feature;
+
+        let transport = Box::new(ByteStreamTransport::new(bytes));
+        let mut negotiated_settings = create_test_negotiated_settings_internal();
+        let mut feature = AlwaysEncryptedFeature::default();
+        feature.set_acknowledged(true);
+        negotiated_settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+        let execution_context = ExecutionContext::new();
+        let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            client_context,
+        )
+    }
 }
