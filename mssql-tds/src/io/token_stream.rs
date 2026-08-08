@@ -1431,6 +1431,124 @@ mod tests {
         }
     }
 
+    /// Mandatory blocking test (L4a hybrid mid-row seam): a row that MIXES two
+    /// inverted non-PLP cells (fixed-width `int4` + variable-length `varchar`,
+    /// both driven by the new sync `step()`) followed by a not-yet-inverted PLP
+    /// `nvarchar(max)` cell (legacy async `decode_into`), all in ONE row. The
+    /// refill boundary is swept across every interior byte offset — including
+    /// the `int4 -> varchar` seam, inside the varchar's 2-byte USHORT length
+    /// prefix (peek-only re-drive), and the higher-risk `varchar -> PLP` seam
+    /// where an inverted cell hands off to the async path. Every split must
+    /// decode byte-identically to the single-packet baseline, proving the
+    /// inverted step and the async PLP path share ONE coherent row cursor
+    /// (`next_column_index`) no matter where the packet boundary lands.
+    #[tokio::test]
+    async fn mixed_row_inverted_then_plp_is_byte_identical_across_refill_boundary() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
+        use crate::message::messages::PacketType;
+
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let columns = vec![
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: "n".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::BigVarChar,
+                type_info: TypeInfo::var_len_string(TdsDataType::BigVarChar, 64, Some(collation))
+                    .unwrap(),
+                column_name: "v".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::NVarChar,
+                type_info: TypeInfo::partial_len(TdsDataType::NVarChar, 0xFFFF, Some(collation))
+                    .unwrap(),
+                column_name: "s".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+        ];
+
+        // ROW payload: [Row token][int4 = 42][varchar "ab"][nvarchar(max) PLP "Hi"].
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend_from_slice(&42_i32.to_le_bytes());
+        let ab = [0x61u8, 0x62]; // "ab"
+        payload.extend_from_slice(&(ab.len() as u16).to_le_bytes()); // USHORT length prefix
+        payload.extend_from_slice(&ab);
+        payload.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // SQL_PLP_UNKNOWNLEN
+        let hi_utf16 = [0x48u8, 0x00, 0x69, 0x00]; // "Hi"
+        payload.extend_from_slice(&(hi_utf16.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&hi_utf16);
+        payload.extend_from_slice(&0u32.to_le_bytes()); // PLP zero-length terminator
+
+        async fn decode(read_data: Vec<u8>, columns: &[ColumnMetadata]) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        fn one_packet(payload: &[u8]) -> Vec<u8> {
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            builder.append_bytes(payload).build()
+        }
+        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut first = first_builder.append_bytes(&payload[..split]).build();
+            first[1] = 0x00; // clear EOM so the buffer keeps reading into the second packet
+            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let second = second_builder.append_bytes(&payload[split..]).build();
+            [first, second].concat()
+        }
+
+        let baseline = decode(one_packet(&payload), &columns).await;
+        assert_eq!(baseline.len(), 3);
+        assert_eq!(baseline[0], ColumnValues::Int(42));
+        assert_ne!(baseline[1], ColumnValues::Null); // varchar "ab"
+        assert_ne!(baseline[2], ColumnValues::Null); // nvarchar(max) "Hi"
+
+        for split in 1..payload.len() {
+            let got = decode(two_packets(&payload, split), &columns).await;
+            assert_eq!(
+                got, baseline,
+                "mixed row decode diverged when the refill boundary landed at offset {split}"
+            );
+        }
+    }
+
     struct MockTokenParserRegistry {
         parsers: HashMap<TokenType, TokenParsers>,
     }
