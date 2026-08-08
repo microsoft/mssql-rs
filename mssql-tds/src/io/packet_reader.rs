@@ -722,6 +722,40 @@ pub(crate) mod tests {
         bytes
     }
 
+    // Regression guard for the refill spin loop: when the peer has no more bytes,
+    // the mock's `receive` returns `Ok(0)`. Without the zero-byte EOF guard the
+    // header/payload refill loops would re-poll a ready future forever and never
+    // make progress. Each of these must return `ConnectionClosed` deterministically
+    // (the test completing at all proves the loop terminates).
+    #[tokio::test]
+    async fn test_read_tds_packet_empty_input_returns_connection_closed() {
+        let mut mock_reader = MockNetworkReaderWriter::new(Vec::new(), 0);
+        let mut packet_reader = PacketReader::new(&mut mock_reader);
+
+        let result = packet_reader.read_tds_packet().await;
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ConnectionClosed(_))),
+            "empty input must surface ConnectionClosed, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_tds_packet_truncated_header_returns_connection_closed() {
+        // Fewer bytes than the 8-byte header forces a second `receive` that hits
+        // exhaustion (`Ok(0)`) mid-header — the exact packet-boundary edge case.
+        let partial_header = vec![0u8; PacketWriter::PACKET_HEADER_SIZE - 4];
+        let mut mock_reader = MockNetworkReaderWriter::new(partial_header, 0);
+        let mut packet_reader = PacketReader::new(&mut mock_reader);
+
+        let result = packet_reader.read_tds_packet().await;
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ConnectionClosed(_))),
+            "truncated header must surface ConnectionClosed, got: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_read_byte() {
         let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
