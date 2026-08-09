@@ -2829,8 +2829,6 @@ mod tests {
         use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
         use crate::message::messages::PacketType;
 
-        const BUFFER_CAPACITY: usize = 8192; // 2 x 4096 B negotiated packet
-
         let columns = vec![plp_varbinary_metadata("b", None)];
 
         // UNKNOWNLEN PLP value with many small chunks; total wire far exceeds the
@@ -2896,10 +2894,6 @@ mod tests {
         let plp = plp_value(500, 24);
         let mut payload = vec![TokenType::Row as u8];
         payload.extend_from_slice(&plp);
-        assert!(
-            payload.len() > BUFFER_CAPACITY,
-            "residency value must exceed buffer capacity"
-        );
 
         let reference = decode_oracle(frame_into(&payload, 2048), &columns).await;
         assert_ne!(reference[0], ColumnValues::Null);
@@ -2910,6 +2904,16 @@ mod tests {
         let mut mock = MockNetworkReaderWriter::new(wire, 0);
         let mut reader = PacketReader::new(&mut mock);
         reader.read_tds_packet_for_test().await.unwrap();
+
+        // Bind the residency ceiling to the ACTUAL in-test buffer capacity (the
+        // 2 x negotiated-packet working buffer), not a magic number.
+        let buffer_capacity = reader.row_buffer_mut().working_buffer().len();
+        assert!(
+            payload.len() > buffer_capacity,
+            "residency value ({}) must exceed the actual buffer capacity ({buffer_capacity})",
+            payload.len()
+        );
+
         let context = ParserContext::ColumnMetadata(
             Arc::new(ColMetadataToken {
                 column_count: columns.len() as u16,
@@ -2930,10 +2934,17 @@ mod tests {
             "eager-PLP LOB must decode byte-identically through the production driver"
         );
 
+        // The load-bearing CEILING: peak resident bytes must stay within one
+        // 2 x packet buffer. A collect-whole / NeedBytes(full-len) collapse would
+        // drive `length` toward the whole-LOB size across successive strip_header
+        // appends: on a growable buffer `peak` would exceed `buffer_capacity`
+        // (this assertion fails); on the fixed-cap buffer the forward-progress
+        // guard trips and the decode errors (the `.unwrap()` above panics). Either
+        // way the footgun regresses this test.
         let peak = reader.row_buffer_mut().peak_length();
         assert!(
-            peak <= BUFFER_CAPACITY,
-            "peak residency {peak} exceeded the buffer capacity {BUFFER_CAPACITY}: \
+            peak <= buffer_capacity,
+            "peak residency {peak} exceeded the buffer capacity {buffer_capacity}: \
              the driver held more than one buffer/chunk resident"
         );
         assert!(
