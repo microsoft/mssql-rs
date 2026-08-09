@@ -209,6 +209,62 @@ pub(crate) async fn assemble_tds_packet<S: ByteSource + ?Sized>(
     Ok(packet_size_from_header)
 }
 
+/// The blocking sibling of [`ByteSource`]: the sole primitive the *synchronous*
+/// TDS packet assembler needs from the outside world.
+///
+/// Pull up to `buffer.len()` more bytes into `buffer`, blocking the calling
+/// thread until at least one byte is available (or the peer is at EOF, signalled
+/// by `0`). Implementations own the R1 slice-poll edge policy — a bounded
+/// blocking read with an atomic cancel-check *between* slices — so timeout and
+/// cancellation ride the same edge the async [`ReceiveGuard`] does, at zero
+/// hot-path cost. At L3 there is no live blocking socket; the only implementor is
+/// the in-memory corpus feeder that drives the differential/residency tests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) trait BlockingByteSource {
+    fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize>;
+}
+
+/// Reads one complete TDS packet from a blocking `source` into `buffer`,
+/// returning the packet's declared length (header + payload).
+///
+/// This is [`assemble_tds_packet`] with the sole `.await` removed: the framing
+/// body is byte-source-agnostic, so it runs verbatim over a [`BlockingByteSource`]
+/// with the same split-header / coalesced-surplus handling. Only the refill edge
+/// differs (blocking `receive` vs `receive().await`); no framing logic is
+/// duplicated beyond the loop shell.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn assemble_tds_packet_blocking<S: BlockingByteSource + ?Sized>(
+    source: &mut S,
+    buffer: &mut PacketBuffer,
+) -> TdsResult<usize> {
+    let (base, already) = buffer.begin_refill()?;
+    let mut received = already;
+
+    while received < PacketWriter::PACKET_HEADER_SIZE {
+        let bytes_read = source.receive(buffer.refill_window(base, received))?;
+        if bytes_read == 0 {
+            return Err(crate::error::Error::ConnectionClosed(
+                "Connection closed by server while reading TDS packet header".to_string(),
+            ));
+        }
+        received += bytes_read;
+    }
+
+    let packet_size_from_header = buffer.validate_packet_length(base)?;
+    while received < packet_size_from_header {
+        let bytes_read = source.receive(buffer.refill_window(base, received))?;
+        if bytes_read == 0 {
+            return Err(crate::error::Error::ConnectionClosed(
+                "Connection closed by server while reading TDS packet payload".to_string(),
+            ));
+        }
+        received += bytes_read;
+    }
+
+    buffer.record_pending(base, packet_size_from_header, received);
+    Ok(packet_size_from_header)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

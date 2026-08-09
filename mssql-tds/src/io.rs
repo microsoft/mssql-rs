@@ -24,6 +24,7 @@
 //! Most users will not interact with this module directly. Instead, use the higher-level
 //! [`crate::connection`] APIs which handle packet I/O internally.
 
+pub(crate) mod blocking_reader;
 pub(crate) mod byte_source;
 pub(crate) mod packet_buffer;
 pub mod packet_reader;

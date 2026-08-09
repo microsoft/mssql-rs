@@ -3,9 +3,12 @@
 
 use crate::core::{CancelHandle, TdsResult};
 use crate::datatypes::decoder::{
-    GenericDecoder, PlpColumnStream, decrypt_cipher_value, decrypt_encrypted_column,
+    GenericDecoder, PlpChunkStreamReader, PlpColumnStream, decrypt_cipher_value,
+    decrypt_encrypted_column,
 };
 use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter, write_column_value};
+use crate::datatypes::sqldatatypes::TdsDataType;
+use crate::datatypes::sync_decoder::{PlpProgress, plp_collect_step};
 use crate::io::packet_buffer::PacketBuffer;
 use crate::io::packet_reader::TdsPacketReader;
 use crate::io::sync_token;
@@ -854,6 +857,199 @@ where
                     "refilling token buffer for step_token"
                 );
                 reader.refill_row_buffer().await?;
+            }
+        }
+    }
+}
+
+/// The blocking sibling of [`BufferedRowReader`]: the sole refill seam the
+/// *synchronous* row driver pulls through.
+///
+/// A [`BufferedRowReader`] minus the `async` — `row_buffer_mut` is identical, and
+/// `refill_row_buffer_blocking` blocks the calling thread for one more packet
+/// instead of awaiting it. The owned [`PacketBuffer`] and the parse body
+/// ([`TdsCore::step_row`]) are shared verbatim; only this edge differs.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) trait BlockingRowReader {
+    /// The owned reassembly buffer that `step_row` decodes over.
+    fn row_buffer_mut(&mut self) -> &mut PacketBuffer;
+
+    /// Blocks until one more TDS packet is resident, erroring (rather than
+    /// spinning) if the refill exposes no new bytes.
+    fn refill_row_buffer_blocking(&mut self) -> TdsResult<()>;
+}
+
+/// Blocking analog of [`crate::io::packet_reader::PacketReader::ensure`]: loops
+/// [`PacketBuffer::ensure`], blocking-refilling until `byte_count` bytes are
+/// readable. The forward-progress guard lives in `refill_row_buffer_blocking`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn ensure_blocking<R: BlockingRowReader>(reader: &mut R, byte_count: usize) -> TdsResult<()> {
+    loop {
+        if reader.row_buffer_mut().ensure(byte_count).is_ok() {
+            return Ok(());
+        }
+        reader.refill_row_buffer_blocking()?;
+    }
+}
+
+/// Blocking sibling of [`crate::io::packet_reader::PacketReader::collect_plp_bytes`].
+///
+/// Classifies the 8-byte PLP header, then drives the shared [`plp_collect_step`]
+/// leaf one chunk header / body slice at a time — refill lifted to
+/// [`ensure_blocking`]. Residency stays bounded to ~one packet: the whole
+/// (possibly multi-GB) value is never ensured into the buffer. The framing is the
+/// exact leaf the async collect uses; only the refill edge is blocking.
+#[cfg_attr(not(test), allow(dead_code))]
+fn collect_plp_bytes_blocking<R: BlockingRowReader>(reader: &mut R) -> TdsResult<Option<Vec<u8>>> {
+    ensure_blocking(reader, 8)?;
+    let raw = reader.row_buffer_mut().take_i64_le()?;
+    let mut plp = match PlpChunkStreamReader::classify_length(raw)? {
+        None => return Ok(None),
+        Some(len) => PlpChunkStreamReader::new(len),
+    };
+
+    let mut out = Vec::new();
+    loop {
+        match plp_collect_step(&mut plp, reader.row_buffer_mut(), &mut out)? {
+            PlpProgress::Done => return Ok(Some(out)),
+            PlpProgress::NeedMore(n) => ensure_blocking(reader, n)?,
+        }
+    }
+}
+
+/// Blocking sibling of [`resolve_header_token`].
+///
+/// Category-(a) bounded tokens are parsed in place by the pure-sync
+/// [`sync_token::parse_token_body`] body, blocking-refilling until the whole
+/// length-bounded token is resident. Value-carrying / login tokens live on the
+/// async [`dispatch_token`] seam, which the blocking L3 path cannot service yet;
+/// they surface as [`crate::error::Error::UnimplementedFeature`] (a genuine
+/// yield-to-driver refusal, never reached by the row-only differential corpus,
+/// which terminates in a bounded DONE token). L4 supplies the sync token seam.
+#[cfg_attr(not(test), allow(dead_code))]
+fn resolve_header_token_blocking<R: BlockingRowReader>(
+    reader: &mut R,
+    token_type: TokenType,
+    context: &ParserContext,
+) -> TdsResult<Tokens> {
+    if !sync_token::is_sync_token(&token_type) {
+        return Err(crate::error::Error::UnimplementedFeature {
+            feature: "blocking sync resolution of a value-carrying token".to_string(),
+            context: format!(
+                "token {token_type:?} is serviced by the async parser seam; the L3 blocking \
+                 driver has no sync token leaf for it yet"
+            ),
+        });
+    }
+    loop {
+        let total = match sync_token::body_len(reader.row_buffer_mut(), &token_type) {
+            Ok(total) => total,
+            Err(_) => {
+                reader.refill_row_buffer_blocking()?;
+                continue;
+            }
+        };
+        if reader.row_buffer_mut().ensure(total).is_err() {
+            reader.refill_row_buffer_blocking()?;
+            continue;
+        }
+        return sync_token::parse_token_body(reader.row_buffer_mut(), token_type, context);
+    }
+}
+
+/// Blocking sibling of [`decode_async_row_column`], restricted to the L3 scope.
+///
+/// Reproduces the eager PLP arm of [`decode_async_row_column`] /
+/// `GenericDecoder::decode_into` for a non-encrypted `BigVarBinary` (varbinary
+/// (max)) cell: collect the value chunk-streamed via [`collect_plp_bytes_blocking`]
+/// then `write_bytes` / `write_null`, followed by the same post-column pause
+/// check. This is the single mirror of `decode_into`'s `BigVarBinary` arm — one
+/// arm, no new decode machine. Every other async-seam reason (encrypted cells,
+/// PLP strings, legacy LOBs, rare fallback types) is out of the L3 blocking scope
+/// and refuses via [`crate::error::Error::UnimplementedFeature`]; the differential
+/// corpus never drives those through this path.
+#[cfg_attr(not(test), allow(dead_code))]
+fn decode_blocking_async_column<R: BlockingRowReader>(
+    reader: &mut R,
+    state: &RowPauseState,
+    col: usize,
+    writer: &mut (dyn RowWriter + Send),
+) -> TdsResult<AsyncColumnOutcome> {
+    let columns = &state.columns;
+    let meta = &columns[col];
+    let len = columns.len();
+
+    if meta.crypto_metadata.is_some() || meta.data_type != TdsDataType::BigVarBinary {
+        return Err(crate::error::Error::UnimplementedFeature {
+            feature: "blocking sync decode of an async-seam column".to_string(),
+            context: format!(
+                "column '{}' ({:?}) is not in the L3 blocking scope (non-encrypted \
+                 varbinary(max) only)",
+                meta.column_name, meta.data_type
+            ),
+        });
+    }
+
+    match collect_plp_bytes_blocking(reader)? {
+        Some(bytes) => writer.write_bytes(col, bytes),
+        None => writer.write_null(col),
+    }
+
+    if writer.pause_after_column(col) && col + 1 < len {
+        return Ok(AsyncColumnOutcome::Terminal(RowReadResult::RowPaused(
+            state.resume_at(col + 1),
+        )));
+    }
+    Ok(AsyncColumnOutcome::Continue)
+}
+
+/// Blocking row-fetch driver: the single *synchronous* shell over
+/// [`TdsCore::step_row`].
+///
+/// This is [`drive_row_over_buffer`] with every `.await` removed. It calls the
+/// identical `TdsCore::step_row` parse body and re-drives from the shared cursor;
+/// only the refill/AsyncColumn/Token edges block instead of awaiting. No parse
+/// machine is duplicated — the sole difference from the async driver is the edge.
+/// It returns the same [`RowReadResult`], so a differential test can feed one wire
+/// corpus to both drivers and assert byte-identical rows and identical underflow
+/// behavior. (No registry parameter: the blocking driver resolves only bounded
+/// sync tokens; value-carrying tokens refuse, so it never needs the async
+/// [`dispatch_token`] registry.)
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn drive_row_over_buffer_blocking<R: BlockingRowReader>(
+    reader: &mut R,
+    context: &ParserContext,
+    initial_resume: Option<RowPauseState>,
+    writer: &mut (dyn RowWriter + Send),
+) -> TdsResult<RowReadResult> {
+    let mut resume = initial_resume;
+    loop {
+        let step = TdsCore::step_row(reader.row_buffer_mut(), &mut resume, context, writer)?;
+        match step {
+            RowStep::RowWritten => return Ok(RowReadResult::RowWritten),
+            RowStep::RowPaused(state) => return Ok(RowReadResult::RowPaused(state)),
+            RowStep::Token(token_type) => {
+                let token = resolve_header_token_blocking(reader, token_type, context)?;
+                return Ok(RowReadResult::Token(token));
+            }
+            RowStep::NeedBytes(need) => {
+                tracing::trace!(
+                    shortfall = need.shortfall,
+                    "blocking refill of row buffer for step_row"
+                );
+                reader.refill_row_buffer_blocking()?;
+            }
+            RowStep::AsyncColumn { col } => {
+                let state = resume.as_ref().expect("row cursor set before AsyncColumn");
+                match decode_blocking_async_column(reader, state, col, writer)? {
+                    AsyncColumnOutcome::Continue => {
+                        resume
+                            .as_mut()
+                            .expect("row cursor set before AsyncColumn")
+                            .next_column_index = col + 1;
+                    }
+                    AsyncColumnOutcome::Terminal(result) => return Ok(result),
+                }
             }
         }
     }
@@ -3402,5 +3598,650 @@ mod tests {
             .unwrap();
         assert!(matches!(result, RowReadResult::RowWritten));
         assert_eq!(writer.take_row(), vec![ColumnValues::Int(7)]);
+    }
+
+    // ---- L3: blocking sync row driver — differential vs async oracle + residency ----
+    //
+    // These tests feed ONE wire corpus to BOTH the async production driver
+    // (`drive_row_over_buffer`, the oracle) and the new sync
+    // `drive_row_over_buffer_blocking`, and assert byte-identical decoded rows and
+    // identical underflow behavior. The sync driver reuses the ONE parse body
+    // (`TdsCore::step_row`) and the ONE PLP leaf (`plp_collect_step`) verbatim;
+    // only the refill edge blocks instead of awaiting, so any divergence would be
+    // a bug in the edge, not the parse.
+
+    use crate::datatypes::column_values::ColumnValues;
+    use crate::io::blocking_reader::BlockingPacketReader;
+    use crate::io::byte_source::BlockingByteSource;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// In-memory [`BlockingByteSource`] corpus feeder: hands back the pre-framed
+    /// wire in bounded `chunk`-sized slices so a single logical packet arrives
+    /// split across several `receive` calls, exercising the split-header /
+    /// coalesced-surplus paths of `assemble_tds_packet_blocking` at every offset.
+    /// The shared atomic `cancel` flag models the R1 between-slices cancel-check;
+    /// a set flag turns the next `receive` into a cooperative cancellation.
+    struct ChunkedBlockingSource {
+        data: Vec<u8>,
+        position: usize,
+        chunk: usize,
+        cancel: std::sync::Arc<AtomicBool>,
+    }
+
+    impl ChunkedBlockingSource {
+        fn new(data: Vec<u8>, chunk: usize) -> Self {
+            Self {
+                data,
+                position: 0,
+                chunk: chunk.max(1),
+                cancel: std::sync::Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl BlockingByteSource for ChunkedBlockingSource {
+        fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(crate::error::Error::ProtocolError(
+                    "blocking receive cancelled between slices".to_string(),
+                ));
+            }
+            let remaining = self.data.len() - self.position;
+            let to_read = buffer.len().min(self.chunk).min(remaining);
+            buffer[..to_read].copy_from_slice(&self.data[self.position..self.position + to_read]);
+            self.position += to_read;
+            Ok(to_read)
+        }
+    }
+
+    fn l3_one_packet(payload: &[u8]) -> Vec<u8> {
+        use crate::io::packet_reader::tests::TestPacketBuilder;
+        use crate::message::messages::PacketType;
+        let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+        builder.append_bytes(payload).build()
+    }
+
+    fn l3_two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+        use crate::io::packet_reader::tests::TestPacketBuilder;
+        use crate::message::messages::PacketType;
+        let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+        let mut first = first_builder.append_bytes(&payload[..split]).build();
+        first[1] = 0x00; // clear EOM: a second packet follows
+        let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+        let second = second_builder.append_bytes(&payload[split..]).build();
+        [first, second].concat()
+    }
+
+    fn l3_frame_into(payload: &[u8], piece: usize) -> Vec<u8> {
+        use crate::io::packet_reader::tests::TestPacketBuilder;
+        use crate::message::messages::PacketType;
+        let mut wire = Vec::new();
+        let mut offset = 0;
+        while offset < payload.len() {
+            let end = (offset + piece).min(payload.len());
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut packet = builder.append_bytes(&payload[offset..end]).build();
+            if end < payload.len() {
+                packet[1] = 0x00; // clear EOM: more packets follow
+            }
+            wire.extend_from_slice(&packet);
+            offset = end;
+        }
+        wire
+    }
+
+    fn l3_row_context(columns: &[ColumnMetadata]) -> ParserContext {
+        ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: columns.len() as u16,
+                columns: columns.to_vec(),
+                cek_table: vec![],
+            }),
+            None,
+        )
+    }
+
+    /// Decode one row through the ASYNC production driver (the oracle).
+    async fn l3_decode_async(
+        wire: Vec<u8>,
+        columns: &[ColumnMetadata],
+    ) -> TdsResult<Vec<ColumnValues>> {
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::MockNetworkReaderWriter;
+        let mut mock = MockNetworkReaderWriter::new(wire, 0);
+        let mut reader = PacketReader::new(&mut mock);
+        reader.read_tds_packet_for_test().await?;
+        let context = l3_row_context(columns);
+        let registry = GenericTokenParserRegistry::default();
+        let mut writer = DefaultRowWriter::new(columns.len());
+        let result =
+            drive_row_over_buffer(&mut reader, &registry, &context, None, &mut writer).await?;
+        assert!(matches!(result, RowReadResult::RowWritten));
+        Ok(writer.take_row())
+    }
+
+    /// Decode one row through the SYNC blocking driver over a chunked in-memory
+    /// source. No priming: the driver's first `step_row` underflows and pulls the
+    /// first packet through `refill_row_buffer_blocking`, mirroring the async path.
+    fn l3_decode_blocking(
+        wire: Vec<u8>,
+        columns: &[ColumnMetadata],
+        chunk: usize,
+    ) -> TdsResult<Vec<ColumnValues>> {
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        let source = ChunkedBlockingSource::new(wire, chunk);
+        let mut reader = BlockingPacketReader::new(source, 4096);
+        let context = l3_row_context(columns);
+        let mut writer = DefaultRowWriter::new(columns.len());
+        let result = drive_row_over_buffer_blocking(&mut reader, &context, None, &mut writer)?;
+        assert!(matches!(result, RowReadResult::RowWritten));
+        Ok(writer.take_row())
+    }
+
+    /// Gate 3 (differential, byte-identical): a mixed row — inline `int4`, inline
+    /// `varchar`, and a multi-chunk `varbinary(max)` PLP cell — decoded via BOTH
+    /// the async oracle and the blocking driver. The refill boundary is swept
+    /// across EVERY payload offset (including inside the PLP chunk stream); at each
+    /// split the blocking driver must equal the single-packet baseline and the
+    /// async oracle byte-for-byte, proving the sync refill edge preserves the
+    /// shared parse body.
+    #[tokio::test]
+    async fn blocking_driver_matches_async_oracle_across_refill_boundary() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let columns = vec![
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: "n".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::BigVarChar,
+                type_info: TypeInfo::var_len_string(TdsDataType::BigVarChar, 64, Some(collation))
+                    .unwrap(),
+                column_name: "v".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            plp_varbinary_metadata("b", None),
+        ];
+
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend_from_slice(&7_i32.to_le_bytes());
+        let ab = [0x61u8, 0x62]; // "ab"
+        payload.extend_from_slice(&(ab.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&ab);
+        payload.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // PLP UNKNOWNLEN
+        let c0: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+        let c1: [u8; 3] = [0x01, 0x02, 0x03];
+        payload.extend_from_slice(&(c0.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&c0);
+        payload.extend_from_slice(&(c1.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&c1);
+        payload.extend_from_slice(&0u32.to_le_bytes()); // PLP terminator
+
+        let baseline = l3_decode_async(l3_one_packet(&payload), &columns)
+            .await
+            .unwrap();
+        assert_eq!(baseline[0], ColumnValues::Int(7));
+        assert_ne!(baseline[1], ColumnValues::Null);
+        assert_eq!(
+            baseline[2],
+            ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03])
+        );
+
+        // The blocking single-packet decode must equal the async baseline.
+        assert_eq!(
+            l3_decode_blocking(l3_one_packet(&payload), &columns, 7).unwrap(),
+            baseline
+        );
+
+        for split in 1..payload.len() {
+            let wire = l3_two_packets(&payload, split);
+            let async_got = l3_decode_async(wire.clone(), &columns).await.unwrap();
+            let blocking_got = l3_decode_blocking(wire, &columns, 5).unwrap();
+            assert_eq!(
+                async_got, baseline,
+                "async oracle diverged at refill boundary offset {split}"
+            );
+            assert_eq!(
+                blocking_got, baseline,
+                "blocking driver diverged from oracle at refill boundary offset {split}"
+            );
+        }
+    }
+
+    /// Gate 3 (differential, NBCROW): an NBCROW with nine columns (forcing a
+    /// two-byte null bitmap) decoded via BOTH drivers, with the refill boundary
+    /// swept across every offset — landing inside the bitmap split (offset 1
+    /// token-from-bitmap, offset 2 between the two bitmap bytes). The blocking
+    /// driver's bitmap handling must stay byte-identical to the async oracle.
+    #[tokio::test]
+    async fn blocking_driver_nbcrow_matches_async_oracle_across_refill_boundary() {
+        let columns: Vec<ColumnMetadata> = (0..9)
+            .map(|i| ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: format!("c{i}"),
+                multi_part_name: None,
+                crypto_metadata: None,
+            })
+            .collect();
+
+        let null_cols = [0usize, 3, 8];
+        let present: [(usize, i32); 6] = [(1, 11), (2, 22), (4, 44), (5, 55), (6, 66), (7, 77)];
+        let mut bitmap = [0u8; 2];
+        for &c in &null_cols {
+            bitmap[c / 8] |= 1 << (c % 8);
+        }
+
+        let mut payload = vec![TokenType::NbcRow as u8];
+        payload.extend_from_slice(&bitmap);
+        for &(_, v) in &present {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let baseline = l3_decode_async(l3_one_packet(&payload), &columns)
+            .await
+            .unwrap();
+        for &c in &null_cols {
+            assert_eq!(baseline[c], ColumnValues::Null, "column {c} should be NULL");
+        }
+        for &(c, v) in &present {
+            assert_eq!(baseline[c], ColumnValues::Int(v), "column {c} value");
+        }
+        assert_eq!(
+            l3_decode_blocking(l3_one_packet(&payload), &columns, 3).unwrap(),
+            baseline
+        );
+
+        for split in 1..payload.len() {
+            let wire = l3_two_packets(&payload, split);
+            let async_got = l3_decode_async(wire.clone(), &columns).await.unwrap();
+            let blocking_got = l3_decode_blocking(wire, &columns, 3).unwrap();
+            assert_eq!(
+                async_got, baseline,
+                "async oracle NBCROW diverged at bitmap-split offset {split}"
+            );
+            assert_eq!(
+                blocking_got, baseline,
+                "blocking NBCROW driver diverged from oracle at bitmap-split offset {split}"
+            );
+        }
+    }
+
+    /// Gate 3 (differential, truncation/underflow parity): a corpus whose trailing
+    /// bytes are cut mid-row so the row decode underflows during refill. BOTH
+    /// drivers must fail, and with the IDENTICAL error (same `ConnectionClosed`
+    /// message from the shared assembly body), proving the blocking refill edge
+    /// reports underflow exactly as the async edge does.
+    #[tokio::test]
+    async fn blocking_driver_truncation_errors_identically_to_async_oracle() {
+        let columns = vec![plp_varbinary_metadata("b", None)];
+
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // PLP UNKNOWNLEN
+        let chunk: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        payload.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&chunk);
+        payload.extend_from_slice(&0u32.to_le_bytes()); // terminator
+
+        // Split mid-PLP so the row decode must refill packet 2, then cut packet 2
+        // short so that refill underflows (EOF before the declared packet length).
+        let split = payload.len() - 6;
+        let mut wire = l3_two_packets(&payload, split);
+        wire.truncate(wire.len() - 4);
+
+        let async_err = l3_decode_async(wire.clone(), &columns)
+            .await
+            .expect_err("async oracle must error on a truncated row");
+        let blocking_err = l3_decode_blocking(wire, &columns, 5)
+            .expect_err("blocking driver must error on a truncated row");
+
+        assert_eq!(
+            format!("{async_err}"),
+            format!("{blocking_err}"),
+            "blocking driver reported a different error than the async oracle on truncation"
+        );
+    }
+
+    /// Gate 4 (R-c residency, LOAD-BEARING): a multi-chunk `varbinary(max)` LOB
+    /// whose total wire far exceeds `2 x max_packet` (>16384 B) is decoded through
+    /// the blocking driver over small packet frames. It asserts BOTH (a)
+    /// byte-identical output vs the async oracle AND (b) a bounded residency
+    /// ceiling: peak `PacketBuffer` residency stays within one `2 x packet` buffer
+    /// and never approaches the whole-LOB size. A blocking path that passed
+    /// byte-identity but collect-whole'd the LOB would drive `peak_length` toward
+    /// the full LOB and FAIL this ceiling — the assertion is required, not
+    /// optional, to protect the L4b bounded-residency guarantee.
+    #[tokio::test]
+    async fn blocking_driver_multichunk_plp_residency_ceiling() {
+        let columns = vec![plp_varbinary_metadata("b", None)];
+
+        fn plp_value(chunk: usize, count: usize) -> Vec<u8> {
+            let mut plp = Vec::new();
+            plp.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // UNKNOWNLEN
+            let mut counter = 0u8;
+            for _ in 0..count {
+                plp.extend_from_slice(&(chunk as u32).to_le_bytes());
+                for _ in 0..chunk {
+                    plp.push(counter);
+                    counter = counter.wrapping_add(1);
+                }
+            }
+            plp.extend_from_slice(&0u32.to_le_bytes()); // zero-length terminator
+            plp
+        }
+
+        // 40 x 500 B chunks = 20000 B of value: > 2 x max_packet (8192) and
+        // > 16384, so it can never be whole-resident in the fixed 2 x packet buffer.
+        let plp = plp_value(500, 40);
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend_from_slice(&plp);
+
+        // Async reference over 2048 B frames.
+        let reference = l3_decode_async(l3_frame_into(&payload, 2048), &columns)
+            .await
+            .unwrap();
+        assert_ne!(reference[0], ColumnValues::Null);
+
+        // Blocking driver over 512 B packet frames, source dribbling 256 B/slice.
+        let source = ChunkedBlockingSource::new(l3_frame_into(&payload, 512), 256);
+        let mut reader = BlockingPacketReader::new(source, 4096);
+
+        // The residency ceiling is bound to the ACTUAL 2 x packet buffer capacity,
+        // allocated at construction, not a magic number.
+        let buffer_capacity = reader.row_buffer_mut().working_buffer().len();
+        assert!(
+            payload.len() > buffer_capacity,
+            "residency value ({}) must exceed the buffer capacity ({buffer_capacity})",
+            payload.len()
+        );
+        assert!(
+            payload.len() > 16384,
+            "the LOB must exceed 2 x max_packet (>16384 B) to prove bounded residency"
+        );
+
+        let context = l3_row_context(&columns);
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(columns.len());
+        let result =
+            drive_row_over_buffer_blocking(&mut reader, &context, None, &mut writer).unwrap();
+        assert!(matches!(result, RowReadResult::RowWritten));
+        assert_eq!(
+            writer.take_row(),
+            reference,
+            "blocking multi-chunk PLP LOB must decode byte-identically to the async oracle"
+        );
+
+        let peak = reader.row_buffer_mut().peak_length();
+        assert!(
+            peak <= buffer_capacity,
+            "peak residency {peak} exceeded the buffer capacity {buffer_capacity}: \
+             the blocking driver held more than one buffer/chunk resident"
+        );
+        assert!(
+            peak < payload.len(),
+            "peak residency {peak} reached the whole-LOB size {}: the blocking PLP path \
+             collect-whole'd the LOB, regressing bounded residency",
+            payload.len()
+        );
+    }
+
+    /// Gate 3 (differential, non-row TOKEN boundary): the row driver is handed a
+    /// wire that opens with a bounded DONE token instead of a row. `step_row`
+    /// consumes the token byte and returns `RowStep::Token`, so BOTH drivers must
+    /// resolve it through their header-token seam (`resolve_header_token` vs
+    /// `resolve_header_token_blocking`) and exit with an identical
+    /// `RowReadResult::Token(Tokens::Done(..))`. The refill boundary is swept over
+    /// every offset so the blocking seam's `body_len`-underflow -> refill loop is
+    /// exercised at each interior split.
+    #[tokio::test]
+    async fn blocking_driver_done_token_boundary_matches_async_oracle() {
+        use crate::datatypes::row_writer::DefaultRowWriter;
+
+        let columns = vec![ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            data_type: TdsDataType::Int4,
+            type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+            column_name: "n".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        }];
+        let payload = done_like_token(TokenType::Done as u8);
+
+        fn done_debug(result: RowReadResult) -> String {
+            match result {
+                RowReadResult::Token(token) => {
+                    assert!(
+                        matches!(token, Tokens::Done(_)),
+                        "row driver exited on a non-DONE token: {token:?}"
+                    );
+                    format!("{token:?}")
+                }
+                _ => panic!("expected RowReadResult::Token(Done) from the row driver"),
+            }
+        }
+
+        async fn drive_async(wire: Vec<u8>, columns: &[ColumnMetadata]) -> RowReadResult {
+            use crate::io::packet_reader::PacketReader;
+            use crate::io::packet_reader::tests::MockNetworkReaderWriter;
+            let mut mock = MockNetworkReaderWriter::new(wire, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = l3_row_context(columns);
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            drive_row_over_buffer(&mut reader, &registry, &context, None, &mut writer)
+                .await
+                .unwrap()
+        }
+
+        fn drive_blocking(
+            wire: Vec<u8>,
+            columns: &[ColumnMetadata],
+            chunk: usize,
+        ) -> RowReadResult {
+            let source = ChunkedBlockingSource::new(wire, chunk);
+            let mut reader = BlockingPacketReader::new(source, 4096);
+            let context = l3_row_context(columns);
+            let mut writer = DefaultRowWriter::new(columns.len());
+            drive_row_over_buffer_blocking(&mut reader, &context, None, &mut writer).unwrap()
+        }
+
+        let expected = done_debug(drive_async(l3_one_packet(&payload), &columns).await);
+        assert_eq!(
+            done_debug(drive_blocking(l3_one_packet(&payload), &columns, 3)),
+            expected,
+            "blocking DONE-token exit diverged from the async oracle at the baseline"
+        );
+
+        for split in 1..payload.len() {
+            let async_exit =
+                done_debug(drive_async(l3_two_packets(&payload, split), &columns).await);
+            let blocking_exit =
+                done_debug(drive_blocking(l3_two_packets(&payload, split), &columns, 3));
+            assert_eq!(
+                async_exit, expected,
+                "async DONE exit diverged at split {split}"
+            );
+            assert_eq!(
+                blocking_exit, expected,
+                "blocking DONE exit diverged at split {split}"
+            );
+        }
+    }
+
+    /// Gate 3 (differential, RowPaused yield + eager-PLP resume): proves the
+    /// blocking driver's pause *and* resume edges match the async oracle. Phase A
+    /// drives a full `[int4, varbinary(max)]` row with a writer that pauses after
+    /// the inline column; BOTH drivers must take the shared `RowStep::RowPaused`
+    /// arm and yield `RowReadResult::RowPaused` at the same `next_column_index`.
+    /// Phase B resumes a hand-built cursor positioned at the PLP column, feeding
+    /// only the resumed cell bytes, and asserts the eager multi-chunk PLP decode
+    /// is byte-identical between the async oracle and the blocking driver across
+    /// every refill split — covering the yield/resume cycle the plain
+    /// `RowWritten` tests never reach.
+    #[tokio::test]
+    async fn blocking_driver_rowpaused_yield_and_plp_resume_match_async_oracle() {
+        use crate::datatypes::row_writer::DefaultRowWriter;
+
+        let columns = vec![
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: "n".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            plp_varbinary_metadata("b", None),
+        ];
+
+        // ---- Phase A: pause-after-inline yields RowPaused in both drivers ----
+        let mut row = vec![TokenType::Row as u8];
+        row.extend_from_slice(&7_i32.to_le_bytes()); // col0 int4
+        row.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // col1 PLP (never consumed)
+        row.extend_from_slice(&2u32.to_le_bytes());
+        row.extend_from_slice(&[0xAA, 0xBB]);
+        row.extend_from_slice(&0u32.to_le_bytes());
+
+        let paused_index_async = {
+            use crate::io::packet_reader::PacketReader;
+            use crate::io::packet_reader::tests::MockNetworkReaderWriter;
+            let mut mock = MockNetworkReaderWriter::new(l3_one_packet(&row), 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = l3_row_context(&columns);
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = PauseAtColumnWriter { pause_at: 0 };
+            match drive_row_over_buffer(&mut reader, &registry, &context, None, &mut writer)
+                .await
+                .unwrap()
+            {
+                RowReadResult::RowPaused(state) => state.next_column_index,
+                _ => panic!("async oracle did not yield RowPaused after the inline column"),
+            }
+        };
+
+        let paused_index_blocking = {
+            let source = ChunkedBlockingSource::new(l3_one_packet(&row), 4);
+            let mut reader = BlockingPacketReader::new(source, 4096);
+            let context = l3_row_context(&columns);
+            let mut writer = PauseAtColumnWriter { pause_at: 0 };
+            match drive_row_over_buffer_blocking(&mut reader, &context, None, &mut writer).unwrap()
+            {
+                RowReadResult::RowPaused(state) => state.next_column_index,
+                _ => panic!("blocking driver did not yield RowPaused after the inline column"),
+            }
+        };
+        assert_eq!(paused_index_async, 1, "pause must land at the PLP column");
+        assert_eq!(
+            paused_index_blocking, paused_index_async,
+            "blocking pause column diverged from the async oracle"
+        );
+
+        // ---- Phase B: resume the PLP cursor; eager multi-chunk PLP byte-identity ----
+        // The resumed wire holds ONLY the PLP cell (no token byte, no bitmap),
+        // exactly as the transport resume path feeds a `RowPauseState` cursor.
+        let mut cell = Vec::new();
+        cell.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // UNKNOWNLEN
+        let c0: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+        let c1: [u8; 3] = [0x01, 0x02, 0x03];
+        cell.extend_from_slice(&(c0.len() as u32).to_le_bytes());
+        cell.extend_from_slice(&c0);
+        cell.extend_from_slice(&(c1.len() as u32).to_le_bytes());
+        cell.extend_from_slice(&c1);
+        cell.extend_from_slice(&0u32.to_le_bytes()); // terminator
+
+        fn plp_pause_state(columns: &[ColumnMetadata]) -> RowPauseState {
+            RowPauseState {
+                next_column_index: 1,
+                columns: columns.to_vec(),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            }
+        }
+
+        async fn resume_async(wire: Vec<u8>, columns: &[ColumnMetadata]) -> Vec<ColumnValues> {
+            use crate::io::packet_reader::PacketReader;
+            use crate::io::packet_reader::tests::MockNetworkReaderWriter;
+            let mut mock = MockNetworkReaderWriter::new(wire, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let registry = GenericTokenParserRegistry::default();
+            let context = ParserContext::None(());
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = drive_row_over_buffer(
+                &mut reader,
+                &registry,
+                &context,
+                Some(plp_pause_state(columns)),
+                &mut writer,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        fn resume_blocking(
+            wire: Vec<u8>,
+            columns: &[ColumnMetadata],
+            chunk: usize,
+        ) -> Vec<ColumnValues> {
+            let source = ChunkedBlockingSource::new(wire, chunk);
+            let mut reader = BlockingPacketReader::new(source, 4096);
+            let context = ParserContext::None(());
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = drive_row_over_buffer_blocking(
+                &mut reader,
+                &context,
+                Some(plp_pause_state(columns)),
+                &mut writer,
+            )
+            .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        let baseline = resume_async(l3_one_packet(&cell), &columns).await;
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(
+            baseline[0],
+            ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03])
+        );
+        assert_eq!(
+            resume_blocking(l3_one_packet(&cell), &columns, 5),
+            baseline,
+            "blocking eager-PLP resume diverged from the async oracle at the baseline"
+        );
+
+        for split in 1..cell.len() {
+            let async_row = resume_async(l3_two_packets(&cell, split), &columns).await;
+            let blocking_row = resume_blocking(l3_two_packets(&cell, split), &columns, 5);
+            assert_eq!(
+                async_row, baseline,
+                "async resume diverged at split {split}"
+            );
+            assert_eq!(
+                blocking_row, baseline,
+                "blocking resume diverged at split {split}"
+            );
+        }
     }
 }
