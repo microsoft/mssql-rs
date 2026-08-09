@@ -11,9 +11,8 @@ use crate::core::{
 };
 use crate::datatypes::row_writer::RowWriter;
 use crate::error::Error::{OperationCancelledError, TimeoutError};
-use crate::error::TimeoutErrorType;
 use crate::handler::handler_factory::SessionSettings;
-use crate::io::byte_source::{AsyncByteSource, assemble_tds_packet};
+use crate::io::byte_source::{AsyncByteSource, ReceiveGuard, assemble_tds_packet};
 use crate::io::packet_buffer::PacketBuffer;
 use crate::io::packet_reader::{PacketReader, TdsPacketReader};
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
@@ -515,6 +514,12 @@ pub(crate) struct NetworkTransport {
     /// closed or an I/O operation observes it broken. Surfaced by
     /// `connection_known_dead()` as a cheap, socket-free liveness check.
     known_dead: bool,
+    /// Receive-edge timeout+cancel for the in-flight token/row request. The
+    /// `TdsTokenStreamReader` shell sets it before each drive and resets it
+    /// after, and `get_new_tds_packet` threads it into `AsyncByteSource` so the
+    /// socket read enforces the same total-request deadline and cancel the
+    /// whole-future tokio wrap did before the lift.
+    receive_guard: ReceiveGuard,
 }
 
 impl std::fmt::Debug for NetworkTransport {
@@ -619,6 +624,7 @@ impl NetworkTransport {
             extractable_stream_handle: None,
             pending_reset: ResetConnectionMode::None,
             known_dead: false,
+            receive_guard: ReceiveGuard::default(),
         }
     }
 
@@ -886,12 +892,13 @@ impl NetworkTransport {
     ///
     /// The fix ensures all bytes from `read()` are accounted for, not just the first packet.
     async fn get_new_tds_packet(&mut self) -> TdsResult<usize> {
+        let guard = self.receive_guard.clone();
         let stream = self.stream.as_deref_mut().ok_or_else(|| {
             crate::error::Error::ConnectionClosed(
                 "Cannot read TDS packet: connection has been closed".to_string(),
             )
         })?;
-        let mut source = AsyncByteSource::new(stream, &mut self.known_dead);
+        let mut source = AsyncByteSource::new(stream, &mut self.known_dead, guard);
         assemble_tds_packet(&mut source, &mut self.tds_read_buffer).await
     }
 
@@ -1254,28 +1261,12 @@ impl TdsTokenStreamReader for NetworkTransport {
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Tokens> {
-        let cancellable_receive_token = CancelHandle::run_until_cancelled(
-            cancel_handle,
-            drive_token_over_buffer(self, &*PARSER_REGISTRY, context),
-        );
-        let token_result = match remaining_request_timeout.as_ref() {
-            Some(remaining_request_timeout) => {
-                match timeout(*remaining_request_timeout, cancellable_receive_token).await {
-                    Ok(result) => result,
-                    Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-                }
-            }
-            None => cancellable_receive_token.await,
-        };
+        self.receive_guard = ReceiveGuard::new(remaining_request_timeout, cancel_handle);
+        let token_result = drive_token_over_buffer(self, &*PARSER_REGISTRY, context).await;
+        self.receive_guard = ReceiveGuard::default();
 
-        match &token_result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
-                }
-                _ => {}
-            },
+        if let Err(OperationCancelledError(_) | TimeoutError(_)) = &token_result {
+            self.cancel_read_stream_and_wait().await?;
         }
         token_result
     }
@@ -1287,26 +1278,12 @@ impl TdsTokenStreamReader for NetworkTransport {
         cancel_handle: Option<&CancelHandle>,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
-        let cancellable = Box::pin(CancelHandle::run_until_cancelled(
-            cancel_handle,
-            drive_row_over_buffer(self, &*PARSER_REGISTRY, context, None, writer),
-        ));
-        let result = match remaining_request_timeout.as_ref() {
-            Some(t) => match timeout(*t, cancellable).await {
-                Ok(r) => r,
-                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-            },
-            None => cancellable.await,
-        };
+        self.receive_guard = ReceiveGuard::new(remaining_request_timeout, cancel_handle);
+        let result = drive_row_over_buffer(self, &*PARSER_REGISTRY, context, None, writer).await;
+        self.receive_guard = ReceiveGuard::default();
 
-        match &result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
-                }
-                _ => {}
-            },
+        if let Err(OperationCancelledError(_) | TimeoutError(_)) = &result {
+            self.cancel_read_stream_and_wait().await?;
         }
         result
     }
@@ -1321,32 +1298,19 @@ impl TdsTokenStreamReader for NetworkTransport {
         // The resume path never reads a token/header, so the registry and
         // context are inert; a `None` context satisfies the shared driver.
         let resume_context = ParserContext::None(());
-        let cancellable = Box::pin(CancelHandle::run_until_cancelled(
-            cancel_handle,
-            drive_row_over_buffer(
-                self,
-                &*PARSER_REGISTRY,
-                &resume_context,
-                Some(pause_state),
-                writer,
-            ),
-        ));
-        let result = match remaining_request_timeout.as_ref() {
-            Some(t) => match timeout(*t, cancellable).await {
-                Ok(r) => r,
-                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-            },
-            None => cancellable.await,
-        };
+        self.receive_guard = ReceiveGuard::new(remaining_request_timeout, cancel_handle);
+        let result = drive_row_over_buffer(
+            self,
+            &*PARSER_REGISTRY,
+            &resume_context,
+            Some(pause_state),
+            writer,
+        )
+        .await;
+        self.receive_guard = ReceiveGuard::default();
 
-        match &result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
-                }
-                _ => {}
-            },
+        if let Err(OperationCancelledError(_) | TimeoutError(_)) = &result {
+            self.cancel_read_stream_and_wait().await?;
         }
         result
     }
@@ -1358,26 +1322,12 @@ impl TdsTokenStreamReader for NetworkTransport {
         cancel_handle: Option<&CancelHandle>,
         out: &mut [u8],
     ) -> TdsResult<usize> {
-        let cancellable = CancelHandle::run_until_cancelled(
-            cancel_handle,
-            read_active_plp_bytes_internal(self, plp_state, out),
-        );
-        let result = match remaining_request_timeout.as_ref() {
-            Some(t) => match timeout(*t, cancellable).await {
-                Ok(r) => r,
-                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-            },
-            None => cancellable.await,
-        };
+        self.receive_guard = ReceiveGuard::new(remaining_request_timeout, cancel_handle);
+        let result = read_active_plp_bytes_internal(self, plp_state, out).await;
+        self.receive_guard = ReceiveGuard::default();
 
-        match &result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
-                }
-                _ => {}
-            },
+        if let Err(OperationCancelledError(_) | TimeoutError(_)) = &result {
+            self.cancel_read_stream_and_wait().await?;
         }
         result
     }
