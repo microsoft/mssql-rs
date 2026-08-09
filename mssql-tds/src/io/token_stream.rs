@@ -1626,6 +1626,366 @@ mod tests {
         }
     }
 
+    /// L4b blocking test 1: a single-chunk PLP `varbinary(max)` value decoded
+    /// through the buffer-owning `PacketReader` — the reader whose sync PLP
+    /// driver L4b inverts. The refill boundary is swept across EVERY interior
+    /// byte offset, including inside the 8-byte PLP length header and inside the
+    /// 4-byte chunk-length prefix, so mid-header, mid-prefix, and mid-chunk-body
+    /// resume are all exercised. Every split must decode byte-identically to the
+    /// single-packet baseline, proving the sync driver resumes exactly from the
+    /// resumable `PlpChunkStreamReader` state after each packet-boundary refill.
+    #[tokio::test]
+    async fn plp_single_chunk_mid_chunk_resume_is_byte_identical_across_refill_boundary() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
+        use crate::message::messages::PacketType;
+
+        let columns = vec![plp_varbinary_metadata("v", None)];
+
+        // ROW payload: [Row token][varbinary(max) PLP: UNKNOWNLEN, one 12-byte
+        // chunk, zero-length terminator].
+        let body: Vec<u8> = (0u8..12).collect();
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // SQL_PLP_UNKNOWNLEN
+        payload.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&body);
+        payload.extend_from_slice(&0u32.to_le_bytes()); // zero-length terminator
+
+        async fn decode(read_data: Vec<u8>, columns: &[ColumnMetadata]) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        fn one_packet(payload: &[u8]) -> Vec<u8> {
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            builder.append_bytes(payload).build()
+        }
+        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut first = first_builder.append_bytes(&payload[..split]).build();
+            first[1] = 0x00; // clear EOM so the buffer keeps reading into the second packet
+            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let second = second_builder.append_bytes(&payload[split..]).build();
+            [first, second].concat()
+        }
+
+        let baseline = decode(one_packet(&payload), &columns).await;
+        assert_eq!(baseline.len(), 1);
+        assert_ne!(baseline[0], ColumnValues::Null);
+
+        for split in 1..payload.len() {
+            let got = decode(two_packets(&payload, split), &columns).await;
+            assert_eq!(
+                got, baseline,
+                "single-chunk PLP decode diverged when the refill boundary landed at offset {split}"
+            );
+        }
+    }
+
+    /// L4b blocking test 2: a MULTI-chunk PLP `varbinary(max)` value spanning
+    /// MULTIPLE refills, terminating on the zero-length chunk. Two parts:
+    ///
+    /// (a) A small multi-chunk value swept across every interior refill offset —
+    /// boundaries land both BETWEEN chunks and MID-chunk-body — each byte-
+    /// identical to the single-packet baseline.
+    ///
+    /// (b) Residency (req-1): a LARGE multi-chunk value whose total wire size
+    /// exceeds the `PacketReader`'s 2-packet buffer capacity (8192 B) decodes
+    /// byte-identically to the async-default baseline when fed as many packet-
+    /// sized frames. This proves BY CONSTRUCTION that the sync driver keeps
+    /// `PacketBuffer` residency chunk-bounded and never ensures the whole value:
+    /// a whole-value `ensure` on a >8192 B value could never be satisfied by the
+    /// 8192 B buffer and would trip the forward-progress guard, so a successful
+    /// byte-identical decode is only possible with chunk-at-a-time `ensure`.
+    #[tokio::test]
+    async fn plp_multi_chunk_across_refills_is_byte_identical_with_bounded_residency() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
+        use crate::message::messages::PacketType;
+
+        let columns = vec![plp_varbinary_metadata("v", None)];
+
+        fn plp_value(chunk_sizes: &[usize]) -> Vec<u8> {
+            let mut plp = Vec::new();
+            plp.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // UNKNOWNLEN
+            let mut counter = 0u8;
+            for &n in chunk_sizes {
+                plp.extend_from_slice(&(n as u32).to_le_bytes());
+                for _ in 0..n {
+                    plp.push(counter);
+                    counter = counter.wrapping_add(1);
+                }
+            }
+            plp.extend_from_slice(&0u32.to_le_bytes()); // zero-length terminator
+            plp
+        }
+
+        // Row from a flat byte stream via the async-default seam (TestByteReader),
+        // exercising the trait's default `collect_plp_bytes` — the reference the
+        // sync driver must match byte-for-byte.
+        async fn decode_async_default(plp: &[u8], columns: &[ColumnMetadata]) -> Vec<ColumnValues> {
+            let mut flat = vec![TokenType::Row as u8];
+            flat.extend_from_slice(plp);
+            let mut reader = TestByteReader::new(flat);
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        // Row through the buffer-owning PacketReader (sync PLP driver) over a
+        // wire framed into `piece`-sized packets; EOM is set only on the last.
+        async fn decode_framed(
+            plp: &[u8],
+            columns: &[ColumnMetadata],
+            piece: usize,
+        ) -> Vec<ColumnValues> {
+            let mut payload = vec![TokenType::Row as u8];
+            payload.extend_from_slice(plp);
+            let mut wire = Vec::new();
+            let mut offset = 0;
+            while offset < payload.len() {
+                let end = (offset + piece).min(payload.len());
+                let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+                let mut packet = builder.append_bytes(&payload[offset..end]).build();
+                if end < payload.len() {
+                    packet[1] = 0x00; // clear EOM: more packets follow
+                }
+                wire.extend_from_slice(&packet);
+                offset = end;
+            }
+            let mut mock = MockNetworkReaderWriter::new(wire, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        fn one_packet(payload: &[u8]) -> Vec<u8> {
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            builder.append_bytes(payload).build()
+        }
+        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut first = first_builder.append_bytes(&payload[..split]).build();
+            first[1] = 0x00;
+            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let second = second_builder.append_bytes(&payload[split..]).build();
+            [first, second].concat()
+        }
+        async fn decode_pr(read_data: Vec<u8>, columns: &[ColumnMetadata]) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        // (a) Small multi-chunk value: three chunks, boundaries swept everywhere.
+        let small = plp_value(&[5, 7, 3]);
+        let mut small_payload = vec![TokenType::Row as u8];
+        small_payload.extend_from_slice(&small);
+        let baseline = decode_pr(one_packet(&small_payload), &columns).await;
+        assert_eq!(baseline.len(), 1);
+        assert_ne!(baseline[0], ColumnValues::Null);
+        assert_eq!(baseline, decode_async_default(&small, &columns).await);
+        for split in 1..small_payload.len() {
+            let got = decode_pr(two_packets(&small_payload, split), &columns).await;
+            assert_eq!(
+                got, baseline,
+                "multi-chunk PLP decode diverged when the refill boundary landed at offset {split}"
+            );
+        }
+
+        // (b) Large multi-chunk value: total wire far exceeds the 8192 B buffer
+        // capacity, so it can never be whole-resident. Fed as 2000-byte packet
+        // frames; must equal the async-default decode. Success proves the driver
+        // ensures one chunk at a time (bounded residency), never the whole value.
+        let large = plp_value(&[3000, 3000, 3000, 2500]);
+        assert!(
+            large.len() > 8192,
+            "residency value must exceed buffer capacity"
+        );
+        let large_ref = decode_async_default(&large, &columns).await;
+        assert_ne!(large_ref[0], ColumnValues::Null);
+        let large_framed = decode_framed(&large, &columns, 2000).await;
+        assert_eq!(
+            large_framed, large_ref,
+            "large multi-chunk PLP value must decode byte-identically under packet-sized refills"
+        );
+    }
+
+    /// L4b blocking test 3: a fully-synchronous mixed row
+    /// `[int4][varchar][varbinary(max) PLP]` decoded through the buffer-owning
+    /// `PacketReader`. After L4b every cell runs on the sync core: `int4` and
+    /// `varchar` via the L4a non-PLP step, and the `varbinary(max)` PLP cell via
+    /// the L4b sync PLP driver — no async decode remnant in the row. The refill
+    /// boundary is swept across every interior offset (including the
+    /// `varchar -> PLP` seam and inside the PLP header/chunk-prefix), and the
+    /// exact decoded values are asserted against the single-packet baseline,
+    /// proving the whole row is byte-identical no matter where the packet
+    /// boundary lands.
+    #[tokio::test]
+    async fn fully_sync_mixed_row_with_plp_is_byte_identical_across_refill_boundary() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
+        use crate::message::messages::PacketType;
+
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let columns = vec![
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: "n".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::BigVarChar,
+                type_info: TypeInfo::var_len_string(TdsDataType::BigVarChar, 64, Some(collation))
+                    .unwrap(),
+                column_name: "v".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            plp_varbinary_metadata("b", None),
+        ];
+
+        // ROW: [Row][int4 = 7][varchar "ab"][varbinary(max) PLP two chunks].
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend_from_slice(&7_i32.to_le_bytes());
+        let ab = [0x61u8, 0x62]; // "ab"
+        payload.extend_from_slice(&(ab.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&ab);
+        payload.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // UNKNOWNLEN
+        let c0: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+        let c1: [u8; 3] = [0x01, 0x02, 0x03];
+        payload.extend_from_slice(&(c0.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&c0);
+        payload.extend_from_slice(&(c1.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&c1);
+        payload.extend_from_slice(&0u32.to_le_bytes()); // zero-length terminator
+
+        async fn decode(read_data: Vec<u8>, columns: &[ColumnMetadata]) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        fn one_packet(payload: &[u8]) -> Vec<u8> {
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            builder.append_bytes(payload).build()
+        }
+        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut first = first_builder.append_bytes(&payload[..split]).build();
+            first[1] = 0x00;
+            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let second = second_builder.append_bytes(&payload[split..]).build();
+            [first, second].concat()
+        }
+
+        let baseline = decode(one_packet(&payload), &columns).await;
+        assert_eq!(baseline.len(), 3);
+        assert_eq!(baseline[0], ColumnValues::Int(7));
+        assert_ne!(baseline[1], ColumnValues::Null);
+        assert_eq!(
+            baseline[2],
+            ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03])
+        );
+
+        for split in 1..payload.len() {
+            let got = decode(two_packets(&payload, split), &columns).await;
+            assert_eq!(
+                got, baseline,
+                "fully-sync mixed row diverged when the refill boundary landed at offset {split}"
+            );
+        }
+    }
+
     struct MockTokenParserRegistry {
         parsers: HashMap<TokenType, TokenParsers>,
     }
