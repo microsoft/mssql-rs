@@ -2,8 +2,8 @@
 // Licensed under the MIT License.
 
 use async_trait::async_trait;
-use tracing::event;
 
+#[cfg(test)]
 use super::packet_writer::PacketWriter;
 use crate::core::TdsResult;
 use crate::datatypes::row_writer::RowWriter;
@@ -251,8 +251,11 @@ impl<'a> PacketReader<'a> {
     }
 
     async fn read_tds_packet(&mut self) -> TdsResult<()> {
-        let (base, already) = self.buffer.begin_refill()?;
-        let packet_len = self.receive_packet(base, already).await?;
+        let packet_len = crate::io::byte_source::assemble_tds_packet(
+            self.network_reader_writer,
+            &mut self.buffer,
+        )
+        .await?;
         self.buffer.strip_header(packet_len);
         Ok(())
     }
@@ -261,64 +264,6 @@ impl<'a> PacketReader<'a> {
     #[cfg(test)]
     pub(crate) async fn read_tds_packet_for_test(&mut self) -> TdsResult<()> {
         self.read_tds_packet().await
-    }
-
-    /// Reads one TDS packet into the buffer and returns that packet's declared
-    /// length (header + payload). A single socket read may pull bytes past this
-    /// packet; the surplus is carried forward via `record_pending` so the next
-    /// refill strips its header too, exactly as the production transport does.
-    async fn receive_packet(&mut self, base: usize, already: usize) -> TdsResult<usize> {
-        let mut received = already;
-
-        // The 8-byte header may arrive split across reads; keep reading until it
-        // is complete before trusting its declared length.
-        while received < PacketWriter::PACKET_HEADER_SIZE {
-            let bytes_read = self
-                .network_reader_writer
-                .receive(self.buffer.refill_window(base, received))
-                .await?;
-            if bytes_read == 0 {
-                return Err(crate::error::Error::ConnectionClosed(
-                    "Connection closed by server while reading TDS packet header".to_string(),
-                ));
-            }
-            received += bytes_read;
-        }
-
-        let packet_size_from_header = self.buffer.validate_packet_length(base)?;
-        while received < packet_size_from_header {
-            let bytes_read = self
-                .network_reader_writer
-                .receive(self.buffer.refill_window(base, received))
-                .await?;
-            if bytes_read == 0 {
-                return Err(crate::error::Error::ConnectionClosed(
-                    "Connection closed by server while reading TDS packet payload".to_string(),
-                ));
-            }
-            received += bytes_read;
-        }
-
-        // Bytes read past this packet belong to the next one; carry them forward.
-        self.buffer
-            .record_pending(base, packet_size_from_header, received);
-
-        event!(
-            tracing::Level::DEBUG,
-            "Received packet of size: {:?}",
-            packet_size_from_header
-        );
-
-        use pretty_hex::PrettyHex;
-        event!(
-            tracing::Level::DEBUG,
-            "Packet content: {:?}",
-            self.buffer
-                .raw_packet(base, packet_size_from_header)
-                .hex_dump()
-        );
-
-        Ok(packet_size_from_header)
     }
 }
 

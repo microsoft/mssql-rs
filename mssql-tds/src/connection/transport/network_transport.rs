@@ -13,9 +13,9 @@ use crate::datatypes::row_writer::RowWriter;
 use crate::error::Error::{OperationCancelledError, TimeoutError};
 use crate::error::TimeoutErrorType;
 use crate::handler::handler_factory::SessionSettings;
+use crate::io::byte_source::{AsyncByteSource, assemble_tds_packet};
 use crate::io::packet_buffer::PacketBuffer;
 use crate::io::packet_reader::{PacketReader, TdsPacketReader};
-use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
 use crate::io::token_stream::{
     ParserContext, PlpPauseState, RowPauseState, RowReadResult, TdsTokenStreamReader,
@@ -33,7 +33,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{self, TcpStream};
 use tokio::time::timeout;
-use tracing::{debug, error, event, info, trace};
+use tracing::{debug, error, info, trace};
 
 #[cfg(windows)]
 use crate::connection::transport::localdb::resolve_localdb_instance;
@@ -886,86 +886,13 @@ impl NetworkTransport {
     ///
     /// The fix ensures all bytes from `read()` are accounted for, not just the first packet.
     async fn get_new_tds_packet(&mut self) -> TdsResult<usize> {
-        // Compact readable bytes and replay any pending bytes from a prior
-        // multi-packet read; `base` is where this raw packet begins and
-        // `already` is how many of its bytes are already buffered.
-        let (base, already) = self.tds_read_buffer.begin_refill()?;
-        let mut bytes_available = already;
-
-        let stream = self.stream.as_mut().ok_or_else(|| {
+        let stream = self.stream.as_deref_mut().ok_or_else(|| {
             crate::error::Error::ConnectionClosed(
                 "Cannot read TDS packet: connection has been closed".to_string(),
             )
         })?;
-
-        // Read more data if we don't have enough for the header
-        while bytes_available < PacketWriter::PACKET_HEADER_SIZE {
-            let bytes_read = match stream
-                .read(self.tds_read_buffer.refill_window(base, bytes_available))
-                .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    // A read failure means the socket is broken; record it so the
-                    // cached liveness check reports the connection as dead.
-                    self.known_dead = true;
-                    return Err(e.into());
-                }
-            };
-            if bytes_read == 0 {
-                self.known_dead = true;
-                return Err(crate::error::Error::ConnectionClosed(
-                    "Connection closed by server while reading TDS packet header".to_string(),
-                ));
-            }
-            bytes_available += bytes_read;
-        }
-
-        // Validate the declared length (>= header, <= max packet size, fits in
-        // the buffer) before trusting it to bound the payload read.
-        let packet_size_from_header = self.tds_read_buffer.validate_packet_length(base)?;
-
-        // Keep reading until we have the complete packet in memory.
-        while bytes_available < packet_size_from_header {
-            let bytes_read = match stream
-                .read(self.tds_read_buffer.refill_window(base, bytes_available))
-                .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    self.known_dead = true;
-                    return Err(e.into());
-                }
-            };
-            if bytes_read == 0 {
-                self.known_dead = true;
-                return Err(crate::error::Error::ConnectionClosed(
-                    "Connection closed by server while reading TDS packet payload".to_string(),
-                ));
-            }
-            bytes_available += bytes_read;
-        }
-
-        // Bytes read past this packet belong to the next one; carry them forward.
-        self.tds_read_buffer
-            .record_pending(base, packet_size_from_header, bytes_available);
-
-        event!(
-            tracing::Level::DEBUG,
-            "Received packet of size: {:?}",
-            packet_size_from_header
-        );
-
-        use pretty_hex::PrettyHex;
-
-        event!(
-            tracing::Level::DEBUG,
-            "Packet content: {:?}",
-            self.tds_read_buffer
-                .raw_packet(base, packet_size_from_header)
-                .hex_dump()
-        );
-        Ok(packet_size_from_header)
+        let mut source = AsyncByteSource::new(stream, &mut self.known_dead);
+        assemble_tds_packet(&mut source, &mut self.tds_read_buffer).await
     }
 
     /// Tells the server to stop sending tokens for the token stream being read and waits for
