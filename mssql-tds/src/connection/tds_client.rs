@@ -1058,8 +1058,9 @@ impl TdsClient {
         // existing serialize path) and data-at-execution values (streamed later),
         // preserving order. Mirrors ODBC, where every parameter is bound and some
         // are flagged SQL_DATA_AT_EXEC.
-        let (streamed_params, materialized_params): (Vec<_>, Vec<_>) =
-            named_params.into_iter().partition(RpcParameter::is_data_at_exec);
+        let (streamed_params, materialized_params): (Vec<_>, Vec<_>) = named_params
+            .into_iter()
+            .partition(RpcParameter::is_data_at_exec);
 
         // No data-at-execution parameters: this is just an ordinary execution.
         if streamed_params.is_empty() {
@@ -1084,14 +1085,11 @@ impl TdsClient {
                 ));
             }
             if param.name.is_none() {
-                return Err(UsageError(
-                    "Streamed parameters must be named.".to_string(),
-                ));
+                return Err(UsageError("Streamed parameters must be named.".to_string()));
             }
         }
 
-        self.current_command_ce_setting =
-            ExecutionColumnEncryptionSetting::UseConnectionSetting;
+        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
 
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
@@ -1106,7 +1104,8 @@ impl TdsClient {
         // Always Encrypted is not supported when streaming parameter values.
         if self.should_encrypt_parameters() {
             return Err(UsageError(
-                "Streamed PLP parameter writes are not supported with Always Encrypted.".to_string(),
+                "Streamed PLP parameter writes are not supported with Always Encrypted."
+                    .to_string(),
             ));
         }
 
@@ -1161,7 +1160,12 @@ impl TdsClient {
         // materialized params, parked partway through.
         rpc.serialize_prefix(&mut packet_writer).await?;
         first
-            .serialize(&mut packet_writer, &database_collation, false, &GenericEncoder::new())
+            .serialize(
+                &mut packet_writer,
+                &database_collation,
+                false,
+                &GenericEncoder::new(),
+            )
             .await?;
         let message = packet_writer.suspend();
 
@@ -1202,7 +1206,8 @@ impl TdsClient {
             )));
         }
 
-        let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle) {
+        let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
+        {
             StreamedWriteState::Active(ctx) => ctx,
             StreamedWriteState::Idle => {
                 return Err(UsageError(
@@ -1224,14 +1229,43 @@ impl TdsClient {
         .await;
         let message = packet_writer.suspend();
 
-        // Re-park the message regardless of outcome so the state machine stays
-        // consistent; a write error fails the whole streamed operation.
-        self.streamed_write_state = StreamedWriteState::Active(Box::new(StreamedWriteContext {
-            message,
-            pending,
-            db_collation,
-        }));
-        result
+        match result {
+            Ok(()) => {
+                // Chunk framed cleanly: re-park the message so the next chunk or
+                // the terminator continues exactly where this one left off.
+                self.streamed_write_state =
+                    StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                        message,
+                        pending,
+                        db_collation,
+                    }));
+                Ok(())
+            }
+            Err(e) => {
+                // A partial value chunk is now on the wire, so this message can no
+                // longer be continued safely. Drop it and abort the streamed
+                // write rather than re-parking it as resumable.
+                drop(message);
+                self.abort_streamed_write();
+                Err(e)
+            }
+        }
+    }
+
+    /// Aborts an in-progress streamed PLP write after a mid-stream failure.
+    ///
+    /// The half-written RPC message is dropped rather than re-parked, so a
+    /// subsequent [`write_streamed_chunk`](Self::write_streamed_chunk) or
+    /// [`end_streamed_param`](Self::end_streamed_param) fails cleanly (no active
+    /// stream) instead of appending to a corrupt message, and the connection is
+    /// marked for reset so the desynced wire stream cannot leak into the next
+    /// command. Mirrors msodbcsql, which tears down data-at-execution state on a
+    /// failed DAE send (`FlushStmt` / `ClearNonBLOBDAEParam`) rather than leaving
+    /// the value resumable.
+    fn abort_streamed_write(&mut self) {
+        self.streamed_write_state = StreamedWriteState::Idle;
+        self.execution_context.set_has_open_batch(false);
+        self.prepare_reset_connection(false);
     }
 
     /// Closes the streamed parameter currently open for data by writing its PLP
@@ -1248,7 +1282,8 @@ impl TdsClient {
     /// Returns a usage error if no streamed parameter is currently open, or an
     /// I/O error if sending fails.
     pub async fn end_streamed_param(&mut self) -> TdsResult<StreamedParamStatus> {
-        let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle) {
+        let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
+        {
             StreamedWriteState::Active(ctx) => ctx,
             StreamedWriteState::Idle => {
                 return Err(UsageError(
@@ -1263,33 +1298,71 @@ impl TdsClient {
         } = *ctx;
 
         let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
-        packet_writer.write_u32_async(PLP_TERMINATOR).await?;
 
-        if let Some(next) = pending.pop_front() {
-            let next_name = next
-                .name
-                .clone()
-                .expect("streamed parameter names validated at begin");
-            next.serialize(&mut packet_writer, &db_collation, false, &GenericEncoder::new())
-                .await?;
-            let message = packet_writer.suspend();
-            self.streamed_write_state = StreamedWriteState::Active(Box::new(StreamedWriteContext {
-                message,
-                pending,
-                db_collation,
-            }));
-            return Ok(StreamedParamStatus::NeedData {
-                param_name: next_name,
-            });
+        // Close the current value with its terminator, then either open the next
+        // streamed parameter's header or (for the last one) finalize the send.
+        // Anything that fails mid-message aborts the whole streamed write.
+        let write_outcome = async {
+            packet_writer.write_u32_async(PLP_TERMINATOR).await?;
+            match pending.pop_front() {
+                Some(next) => {
+                    let next_name = next
+                        .name
+                        .clone()
+                        .expect("streamed parameter names validated at begin");
+                    next.serialize(
+                        &mut packet_writer,
+                        &db_collation,
+                        false,
+                        &GenericEncoder::new(),
+                    )
+                    .await?;
+                    Ok(Some(next_name))
+                }
+                None => {
+                    packet_writer.finalize().await?;
+                    Ok(None)
+                }
+            }
         }
+        .await;
 
-        // Last streamed parameter closed: send the message and consume the
-        // response exactly like execute_sp_executesql does.
-        packet_writer.finalize().await?;
-        drop(packet_writer);
-
-        self.position_on_first_result().await?;
-        Ok(StreamedParamStatus::Done)
+        match write_outcome {
+            // Another streamed parameter is now open for data.
+            Ok(Some(next_name)) => {
+                let message = packet_writer.suspend();
+                self.streamed_write_state =
+                    StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                        message,
+                        pending,
+                        db_collation,
+                    }));
+                Ok(StreamedParamStatus::NeedData {
+                    param_name: next_name,
+                })
+            }
+            // Last streamed parameter closed and the message was sent: consume
+            // the response exactly like execute_sp_executesql does. A failure
+            // reading the response also aborts (the request is already on the
+            // wire, so the connection must be reset before reuse).
+            Ok(None) => {
+                drop(packet_writer);
+                match self.position_on_first_result().await {
+                    Ok(_) => Ok(StreamedParamStatus::Done),
+                    Err(e) => {
+                        self.abort_streamed_write();
+                        Err(e)
+                    }
+                }
+            }
+            // Terminator or next-parameter header write failed mid-message: drop
+            // the half-written message and abort rather than leave it resumable.
+            Err(e) => {
+                drop(packet_writer);
+                self.abort_streamed_write();
+                Err(e)
+            }
+        }
     }
 
     /// Executes a bulk load operation using zero-copy streaming.
@@ -5092,6 +5165,9 @@ mod tests {
         /// `read_row_column` down a specific arm (e.g. a `PlpPaused` result that
         /// makes the cursor emit `CursorColumn::PlpStreaming`).
         resume_results: VecDeque<RowReadResult>,
+        /// When set, the next (and every subsequent) `send` fails, simulating a
+        /// mid-message wire failure. Shared so a test can flip it after setup.
+        send_should_fail: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl TestTransport {
@@ -5103,7 +5179,8 @@ mod tests {
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data: Vec::new(),
                 packet_pos: 0,
-                resume_results: VecDeque::new(),
+resume_results: VecDeque::new(),
+                send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -5115,7 +5192,8 @@ mod tests {
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data: Vec::new(),
                 packet_pos: 0,
-                resume_results: VecDeque::new(),
+resume_results: VecDeque::new(),
+                send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -5127,7 +5205,8 @@ mod tests {
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data,
                 packet_pos: 0,
-                resume_results: VecDeque::new(),
+resume_results: VecDeque::new(),
+                send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -5229,6 +5308,14 @@ mod tests {
     #[async_trait]
     impl NetworkWriter for TestTransport {
         async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
+            if self
+                .send_should_fail
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::error::Error::ConnectionClosed(
+                    "injected send failure".to_string(),
+                ));
+            }
             self.sent.lock().unwrap().extend_from_slice(data);
             Ok(())
         }
@@ -5460,6 +5547,27 @@ mod tests {
             client_context,
         );
         (client, sent)
+    }
+
+    /// Like [`create_capturing_client`], but also returns a shared flag that,
+    /// when set, makes the transport's next `send` fail — used to exercise the
+    /// mid-stream abort path of the streamed PLP write.
+    fn create_failing_capturing_client(
+        tokens: Vec<Tokens>,
+    ) -> (TdsClient, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let transport = Box::new(TestTransport::with_tokens(tokens));
+        let fail = std::sync::Arc::clone(&transport.send_should_fail);
+        let negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let execution_context = crate::connection::execution_context::ExecutionContext::new();
+        let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        let client = TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            client_context,
+        );
+        (client, fail)
     }
 
     fn done_no_more() -> Tokens {
@@ -7622,7 +7730,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
     // ── Raw TDS token byte builders (little-endian, matching the real parsers) ──
 
     fn message_token_bytes(
@@ -8097,7 +8204,8 @@ mod tests {
             1,
             "the RETURNVALUE must be surfaced as an output parameter"
         );
-=======
+    }
+
     // ── Streamed (data-at-execution) PLP parameter write ──
 
     /// Reassembles the TDS packet stream captured by the mock transport into the
@@ -8176,7 +8284,10 @@ mod tests {
         assert_eq!(after, expected.as_slice());
 
         // The lifecycle is complete: no streamed write remains parked.
-        assert!(matches!(client.streamed_write_state, StreamedWriteState::Idle));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
     }
 
     /// Multiple chunks are each length-prefixed independently and the value is
@@ -8329,11 +8440,113 @@ mod tests {
             .unwrap();
 
         assert!(matches!(status, StreamedParamStatus::Done));
-        assert!(matches!(client.streamed_write_state, StreamedWriteState::Idle));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
         assert!(
             !sent.lock().unwrap().is_empty(),
             "the atomic RPC should have been sent"
         );
+    }
+
+    /// A mid-value send failure aborts the streamed write: the error is
+    /// surfaced, the parked message is dropped (state returns to `Idle`, not left
+    /// `Active`/resumable), the connection is flagged for reset so the desynced
+    /// wire stream cannot leak into the next command, and further streamed calls
+    /// fail cleanly. Mirrors msodbcsql tearing down data-at-execution state on a
+    /// failed DAE send rather than leaving the value resumable.
+    #[tokio::test]
+    async fn streamed_write_chunk_send_failure_aborts_stream() {
+        let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Active(_)
+        ));
+
+        // Fail the next wire send; a chunk large enough to overflow the packet
+        // payload buffer forces a flush (and thus a `send`) inside
+        // write_streamed_chunk.
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let big = vec![0xABu8; 10_000];
+        let _err = client
+            .write_streamed_chunk(&big)
+            .await
+            .expect_err("a send failure must surface as an error");
+
+        // The streamed write is aborted, not left resumable.
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        // The connection is flagged for reset so the next command re-syncs.
+        assert!(matches!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::Reset
+        ));
+
+        // Further streamed calls now fail cleanly (no active stream) rather than
+        // appending to the corrupt message.
+        let followup = client
+            .write_streamed_chunk(&[0x00])
+            .await
+            .expect_err("no active streamed parameter after abort");
+        assert!(matches!(followup, UsageError(_)));
+        let end = client
+            .end_streamed_param()
+            .await
+            .expect_err("no active streamed parameter after abort");
+        assert!(matches!(end, UsageError(_)));
+    }
+
+    /// A send failure while finalizing the last streamed parameter (flushing the
+    /// terminator + message) aborts the same way: error surfaced, state `Idle`,
+    /// connection flagged for reset.
+    #[tokio::test]
+    async fn end_streamed_param_send_failure_aborts_stream() {
+        let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A small chunk stays buffered (fits one packet, no send yet).
+        client
+            .write_streamed_chunk(&[0x01, 0x02, 0x03])
+            .await
+            .unwrap();
+
+        // finalize() inside end_streamed_param flushes the message -> send fails.
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _err = client
+            .end_streamed_param()
+            .await
+            .expect_err("finalize send failure must surface");
+
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(matches!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::Reset
+        ));
     }
 
     /// Beginning a streamed execution while one is already active is rejected.
@@ -8381,7 +8594,10 @@ mod tests {
             .await
             .expect_err("non-max data-at-exec parameter must be rejected");
         assert!(matches!(err, UsageError(_)));
-        assert!(matches!(client.streamed_write_state, StreamedWriteState::Idle));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
     }
 
     /// An unnamed data-at-execution parameter is rejected: streamed values must
@@ -8390,8 +8606,8 @@ mod tests {
     async fn begin_rejects_unnamed_data_at_exec_param() {
         let mut client = create_test_client_with_tokens(vec![]);
 
-        let bad = RpcParameter::new(None, StatusFlags::NONE, SqlType::VarBinaryMax(None))
-            .data_at_exec();
+        let bad =
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::VarBinaryMax(None)).data_at_exec();
 
         let err = client
             .begin_sp_executesql(
@@ -8403,7 +8619,10 @@ mod tests {
             .await
             .expect_err("unnamed data-at-exec parameter must be rejected");
         assert!(matches!(err, UsageError(_)));
-        assert!(matches!(client.streamed_write_state, StreamedWriteState::Idle));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
     }
 
     /// `write_streamed_chunk` with no active streamed parameter is a usage error.
@@ -8483,7 +8702,10 @@ mod tests {
         expected.extend_from_slice(&(value.len() as u32).to_le_bytes());
         expected.extend_from_slice(&value);
         expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
-        assert_eq!(&payload[v_pos + PLP_UNKNOWN_LEN_BYTES.len()..], expected.as_slice());
+        assert_eq!(
+            &payload[v_pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
+        );
     }
 
     /// After `begin_sp_executesql` parks the message, the streamed state must
@@ -8557,7 +8779,9 @@ mod tests {
         expected.extend_from_slice(&(big.len() as u32).to_le_bytes());
         expected.extend_from_slice(&big);
         expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
-        assert_eq!(&payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..], expected.as_slice());
->>>>>>> 7e8c9eb0 (Add streamed PLP write test coverage)
+        assert_eq!(
+            &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
+        );
     }
 }

@@ -975,8 +975,8 @@ mod tests {
     /// place of the name, then the same status/TYPE_INFO/PLP_UNKNOWN_LEN sequence.
     #[test]
     fn serialize_data_at_exec_positional() {
-        let param = RpcParameter::new(None, StatusFlags::NONE, SqlType::VarBinaryMax(None))
-            .data_at_exec();
+        let param =
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::VarBinaryMax(None)).data_at_exec();
 
         let mut expected = vec![0x00]; // zero-length name (positional)
         expected.push(StatusFlags::NONE.bits());

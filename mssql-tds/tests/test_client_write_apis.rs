@@ -13,7 +13,7 @@ mod common;
 
 mod streamed_plp_write {
     use crate::common::{build_tcp_datasource, create_context, init_tracing};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, StreamedParamStatus};
+    use mssql_tds::connection::tds_client::{ResultSet, StreamedParamStatus};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::datatypes::sqltypes::SqlType;
@@ -38,8 +38,7 @@ mod streamed_plp_write {
         client
             .execute(
                 "CREATE TABLE #plp_nvm (id INT, val NVARCHAR(MAX))".to_string(),
-                None,
-                None,
+                (),
             )
             .await?;
         client.close_query().await?;
@@ -77,10 +76,10 @@ mod streamed_plp_write {
         client.close_query().await?;
 
         client
-            .execute("SELECT val FROM #plp_nvm WHERE id = 1".to_string(), None, None)
+            .execute("SELECT val FROM #plp_nvm WHERE id = 1".to_string(), ())
             .await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        {
+            let row = client.next_row().await?.expect("expected a row");
             match &row[0] {
                 ColumnValues::String(s) => {
                     let round_tripped = s.to_utf8_string();
@@ -89,8 +88,6 @@ mod streamed_plp_write {
                 }
                 other => panic!("Expected String for nvarchar(max), got {other:?}"),
             }
-        } else {
-            panic!("expected a result set");
         }
         client.close_query().await?;
         Ok(())
@@ -112,8 +109,7 @@ mod streamed_plp_write {
         client
             .execute(
                 "CREATE TABLE #plp_mix (id INT, val NVARCHAR(MAX))".to_string(),
-                None,
-                None,
+                (),
             )
             .await?;
         client.close_query().await?;
@@ -153,20 +149,14 @@ mod streamed_plp_write {
         client.close_query().await?;
 
         client
-            .execute(
-                "SELECT val FROM #plp_mix WHERE id = 7".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT val FROM #plp_mix WHERE id = 7".to_string(), ())
             .await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        {
+            let row = client.next_row().await?.expect("expected a row");
             match &row[0] {
                 ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), value),
                 other => panic!("Expected String for nvarchar(max), got {other:?}"),
             }
-        } else {
-            panic!("expected a result set");
         }
         client.close_query().await?;
         Ok(())
@@ -186,8 +176,7 @@ mod streamed_plp_write {
         client
             .execute(
                 "CREATE TABLE #plp_vbm (id INT, val VARBINARY(MAX))".to_string(),
-                None,
-                None,
+                (),
             )
             .await?;
         client.close_query().await?;
@@ -220,16 +209,14 @@ mod streamed_plp_write {
         client.close_query().await?;
 
         client
-            .execute("SELECT val FROM #plp_vbm WHERE id = 1".to_string(), None, None)
+            .execute("SELECT val FROM #plp_vbm WHERE id = 1".to_string(), ())
             .await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        {
+            let row = client.next_row().await?.expect("expected a row");
             match &row[0] {
                 ColumnValues::Bytes(b) => assert_eq!(b.as_slice(), value.as_slice()),
                 other => panic!("Expected Bytes for varbinary(max), got {other:?}"),
             }
-        } else {
-            panic!("expected a result set");
         }
         client.close_query().await?;
         Ok(())
@@ -249,8 +236,7 @@ mod streamed_plp_write {
         client
             .execute(
                 "CREATE TABLE #plp_two (id INT, a NVARCHAR(MAX), b NVARCHAR(MAX))".to_string(),
-                None,
-                None,
+                (),
             )
             .await?;
         client.close_query().await?;
@@ -299,15 +285,12 @@ mod streamed_plp_write {
         client
             .execute(
                 "SELECT LEN(a), LEN(b) FROM #plp_two WHERE id = 1".to_string(),
-                None,
-                None,
+                (),
             )
             .await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        {
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 2);
-        } else {
-            panic!("expected a result set");
         }
         client.close_query().await?;
         Ok(())
@@ -329,8 +312,7 @@ mod streamed_plp_write {
         client
             .execute(
                 "CREATE TABLE #plp_rows (id INT, val VARCHAR(MAX))".to_string(),
-                None,
-                None,
+                (),
             )
             .await?;
         client.close_query().await?;
@@ -370,20 +352,14 @@ mod streamed_plp_write {
 
         // Every streamed row must be present.
         client
-            .execute(
-                "SELECT COUNT(*) FROM #plp_rows".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #plp_rows".to_string(), ())
             .await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a count row");
+        {
+            let row = client.next_row().await?.expect("expected a count row");
             match &row[0] {
                 ColumnValues::Int(count) => assert_eq!(*count, ROW_COUNT),
                 other => panic!("Expected Int for COUNT(*), got {other:?}"),
             }
-        } else {
-            panic!("expected a result set");
         }
         client.close_query().await?;
 
@@ -391,20 +367,20 @@ mod streamed_plp_write {
         client
             .execute(
                 format!("SELECT val FROM #plp_rows WHERE id = {ROW_COUNT}"),
-                None,
-                None,
+                (),
             )
             .await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected the last row");
+        {
+            let row = client.next_row().await?.expect("expected the last row");
             match &row[0] {
                 ColumnValues::String(s) => {
-                    assert_eq!(s.to_utf8_string(), format!("row-{ROW_COUNT}-").repeat(3_000));
+                    assert_eq!(
+                        s.to_utf8_string(),
+                        format!("row-{ROW_COUNT}-").repeat(3_000)
+                    );
                 }
                 other => panic!("Expected String for varchar(max), got {other:?}"),
             }
-        } else {
-            panic!("expected a result set");
         }
         client.close_query().await?;
         Ok(())
@@ -426,8 +402,7 @@ mod streamed_plp_write {
         client
             .execute(
                 "CREATE TABLE #plp_null (id INT, val NVARCHAR(MAX))".to_string(),
-                None,
-                None,
+                (),
             )
             .await?;
         client.close_query().await?;
@@ -455,21 +430,191 @@ mod streamed_plp_write {
         client.close_query().await?;
 
         client
-            .execute(
-                "SELECT val FROM #plp_null WHERE id = 1".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT val FROM #plp_null WHERE id = 1".to_string(), ())
             .await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        {
+            let row = client.next_row().await?.expect("expected a row");
             assert!(
                 matches!(&row[0], ColumnValues::Null),
                 "expected SQL NULL, got {:?}",
                 &row[0]
             );
-        } else {
-            panic!("expected a result set");
+        }
+        client.close_query().await?;
+        Ok(())
+    }
+
+    /// Streaming zero chunks then ending yields an empty (non-NULL) value: the
+    /// value opener followed immediately by the terminator encodes a present,
+    /// zero-length value. Distinct from the NULL path
+    /// (`write_null_max_round_trips`).
+    #[tokio::test]
+    async fn stream_empty_value_round_trips() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute(
+                "CREATE TABLE #plp_empty (id INT, val NVARCHAR(MAX))".to_string(),
+                (),
+            )
+            .await?;
+        client.close_query().await?;
+
+        let streamed = RpcParameter::new(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(None),
+        )
+        .data_at_exec();
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO #plp_empty (id, val) VALUES (1, @v)".to_string(),
+                vec![streamed],
+                None,
+                None,
+            )
+            .await?;
+        assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+
+        // No chunks: close the value immediately.
+        let status = client.end_streamed_param().await?;
+        assert!(matches!(status, StreamedParamStatus::Done));
+        client.close_query().await?;
+
+        client
+            .execute("SELECT val FROM #plp_empty WHERE id = 1".to_string(), ())
+            .await?;
+        {
+            let row = client.next_row().await?.expect("expected a row");
+            match &row[0] {
+                ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), ""),
+                other => panic!("Expected empty String for nvarchar(max), got {other:?}"),
+            }
+        }
+        client.close_query().await?;
+        Ok(())
+    }
+
+    /// The same value split into many tiny (2-byte) chunks reassembles intact,
+    /// stressing per-chunk length-prefixing across a large call count. Each chunk
+    /// is one UTF-16 code unit, so the boundaries never split a code unit.
+    #[tokio::test]
+    async fn stream_nvarchar_max_many_small_chunks_round_trips() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute(
+                "CREATE TABLE #plp_small (id INT, val NVARCHAR(MAX))".to_string(),
+                (),
+            )
+            .await?;
+        client.close_query().await?;
+
+        let value = "abcd".repeat(2_000); // 8000 chars
+        let wire = utf16le(&value);
+
+        let streamed = RpcParameter::new(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(None),
+        )
+        .data_at_exec();
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO #plp_small (id, val) VALUES (1, @v)".to_string(),
+                vec![streamed],
+                None,
+                None,
+            )
+            .await?;
+        assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+
+        // One UTF-16 code unit (2 bytes) per chunk: 8000 chunks.
+        for chunk in wire.chunks(2) {
+            client.write_streamed_chunk(chunk).await?;
+        }
+
+        let status = client.end_streamed_param().await?;
+        assert!(matches!(status, StreamedParamStatus::Done));
+        client.close_query().await?;
+
+        client
+            .execute("SELECT val FROM #plp_small WHERE id = 1".to_string(), ())
+            .await?;
+        {
+            let row = client.next_row().await?.expect("expected a row");
+            match &row[0] {
+                ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), value),
+                other => panic!("Expected String for nvarchar(max), got {other:?}"),
+            }
+        }
+        client.close_query().await?;
+        Ok(())
+    }
+
+    /// After a streamed write completes, the same connection is reusable for an
+    /// ordinary query: the happy path leaves no desynced wire state behind. (The
+    /// failure path, which flags the connection for reset, is covered by the
+    /// offline abort unit tests.)
+    #[tokio::test]
+    async fn stream_then_normal_execute_reuses_connection() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute(
+                "CREATE TABLE #plp_reuse (id INT, val VARBINARY(MAX))".to_string(),
+                (),
+            )
+            .await?;
+        client.close_query().await?;
+
+        let value: Vec<u8> = (0..5_000u32).map(|i| (i % 256) as u8).collect();
+        let streamed = RpcParameter::new(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            SqlType::VarBinaryMax(None),
+        )
+        .data_at_exec();
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO #plp_reuse (id, val) VALUES (1, @v)".to_string(),
+                vec![streamed],
+                None,
+                None,
+            )
+            .await?;
+        assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+        client.write_streamed_chunk(&value).await?;
+        let status = client.end_streamed_param().await?;
+        assert!(matches!(status, StreamedParamStatus::Done));
+        client.close_query().await?;
+
+        // Reuse the same client for a plain query.
+        client.execute("SELECT 42".to_string(), ()).await?;
+        {
+            let row = client.next_row().await?.expect("expected a row");
+            match &row[0] {
+                ColumnValues::Int(v) => assert_eq!(*v, 42),
+                other => panic!("Expected Int, got {other:?}"),
+            }
         }
         client.close_query().await?;
         Ok(())
