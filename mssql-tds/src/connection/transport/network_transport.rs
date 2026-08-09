@@ -1474,6 +1474,73 @@ pub(crate) mod tests {
         )
     }
 
+    /// Layer 2 edge proof: with the request timeout lifted onto the
+    /// `ReceiveGuard`, a too-short deadline must still surface the same
+    /// `TimeoutError(Elapsed)` at the socket-read edge — and must not mark the
+    /// connection dead, because the timed-out read future is dropped without
+    /// completing.
+    #[tokio::test]
+    async fn receive_guard_deadline_elapses_with_timeout_error() {
+        use crate::io::byte_source::ByteSource;
+
+        // Peer is held open but never writes, so the read stays pending until
+        // the deadline elapses.
+        let (mut client_side, _server_side) = duplex(MAX_BUFFER_SIZE);
+        let mut known_dead = false;
+        let guard = ReceiveGuard::new(Some(Duration::from_millis(50)), None);
+        let mut source = AsyncByteSource::new(&mut client_side, &mut known_dead, guard);
+
+        let mut buffer = [0u8; 16];
+        let err = source
+            .receive(&mut buffer)
+            .await
+            .expect_err("a receive past the deadline must time out");
+
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::TimeoutError(crate::error::TimeoutErrorType::Elapsed(_))
+            ),
+            "expected TimeoutError(Elapsed), got {err:?}"
+        );
+        assert!(
+            !known_dead,
+            "a timeout drops the read future and must not mark the connection dead"
+        );
+    }
+
+    /// Layer 2 edge proof: an already-cancelled `CancelHandle` threaded through
+    /// the `ReceiveGuard` interrupts an in-flight receive with the same
+    /// `OperationCancelledError` the whole-future wrap produced before the lift,
+    /// again without marking the connection dead.
+    #[tokio::test]
+    async fn receive_guard_cancel_interrupts_with_operation_cancelled_error() {
+        use crate::io::byte_source::ByteSource;
+
+        let (mut client_side, _server_side) = duplex(MAX_BUFFER_SIZE);
+        let mut known_dead = false;
+
+        let handle = CancelHandle::new();
+        handle.cancel_token.cancel();
+        let guard = ReceiveGuard::new(None, Some(&handle));
+        let mut source = AsyncByteSource::new(&mut client_side, &mut known_dead, guard);
+
+        let mut buffer = [0u8; 16];
+        let err = source
+            .receive(&mut buffer)
+            .await
+            .expect_err("a cancelled request must interrupt the receive");
+
+        assert!(
+            matches!(err, crate::error::Error::OperationCancelledError(_)),
+            "expected OperationCancelledError, got {err:?}"
+        );
+        assert!(
+            !known_dead,
+            "a cancellation drops the read future and must not mark the connection dead"
+        );
+    }
+
     #[tokio::test]
     async fn test_network_transport_send() {
         let context = ClientContext {
