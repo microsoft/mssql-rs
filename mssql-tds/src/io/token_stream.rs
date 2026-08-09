@@ -164,6 +164,17 @@ impl PlpPauseState {
         self.plp_stream.reached_end()
     }
 
+    /// Declared total length of the whole PLP value in wire bytes when the
+    /// server sent a known-length header; `None` for unknown-length PLP.
+    pub(crate) fn known_len(&self) -> Option<u64> {
+        self.plp_stream.known_len()
+    }
+
+    /// Cumulative wire bytes consumed from this PLP value across all chunks.
+    pub(crate) fn total_read(&self) -> usize {
+        self.plp_stream.total_read()
+    }
+
     pub(crate) fn collation(&self) -> Option<crate::token::tokens::SqlCollation> {
         self.plp_stream.collation()
     }

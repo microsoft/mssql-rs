@@ -150,8 +150,28 @@ TEST_F(GetDataLiveTest, ColumnWiseAscending) {
 // backward retrieval, which this forward-only driver rejects (SQLSTATE 07009).
 // Re-requesting the column just retrieved is not backward movement, but its data
 // has already been consumed, so the driver reports end-of-data (SQL_NO_DATA)
-// rather than replaying the value.
+// rather than replaying the value. This is the spec-compliant result: the ODBC
+// SQLGetData contract permits a re-request of the same column (the ordering rule
+// requires Col_or_Param_Num to be non-decreasing) and mandates SQL_NO_DATA once
+// the column has no more data to return.
+//
+// The reference msodbcsql driver returns SQL_ERROR for the re-request instead of
+// SQL_NO_DATA. That deviation is incidental, not a deliberate contract, and it
+// only appears in this specific three-step sequence. In isolation the two
+// drivers agree: a bare "drain col 1, then re-request col 1" returns SQL_NO_DATA
+// on msodbcsql too. The difference here is the intervening rejected backward
+// GetData(col 1): on msodbcsql that failed call resets the "just finished a
+// column" state, so the col 2 re-request is no longer treated as an already-read
+// column (which would return SQL_NO_DATA) and is instead reported as a
+// backward-access error. Because that value is msodbcsql-specific (and
+// non-conformant), skip this assertion on the msodbcsql comparison leg.
+//
+// Scope: this covers only the *fully consumed* re-read (returns SQL_NO_DATA). A
+// *partially* consumed column must instead resume from where it stopped -- that
+// truncation-recovery path is covered by NonPlpChunkedReadAccumulatesFullValue,
+// not here.
 TEST_F(GetDataLiveTest, BackwardColumnRejectedRereadIsNoData) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT CAST(10 AS INT) AS c1, "
                       "CAST(20 AS INT) AS c2, "
@@ -459,8 +479,14 @@ TEST_F(GetDataLiveTest, PlpTinyBufferManyCalls) {
     SQLCloseCursor(stmt_);
 }
 
-// For a value larger than one wire pump (> 8 KiB), the indicator is SQL_NO_TOTAL.
-TEST_F(GetDataLiveTest, PlpLargeValueIndicatorNoTotal) {
+// A known-length PLP value (server sends the total up front) reports the
+// concrete bytes-still-available indicator on every SQLGetData call, counting
+// down as the value drains — never SQL_NO_TOTAL. On each call StrLen_or_Ind is
+// the bytes available *before* that call's copy, so it equals
+// `kTotal - bytes_consumed_by_prior_calls` for both the truncated
+// (SQL_SUCCESS_WITH_INFO) chunks and the final (SQL_SUCCESS) chunk. This matches
+// the reference msodbcsql driver, so the assertion runs on both legs.
+TEST_F(GetDataLiveTest, PlpKnownLengthIndicatorCountsDown) {
     const int kTotal = 20000;
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 20000) AS c1"),
@@ -468,27 +494,31 @@ TEST_F(GetDataLiveTest, PlpLargeValueIndicatorNoTotal) {
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
-    bool saw_no_total = false;
+    bool saw_success_with_info = false;
     std::string assembled;
     int guard = 0;
     while (true) {
+        const size_t consumed_before = assembled.size();
         SQLCHAR buf[4096] = {0};
         SQLLEN ind = 0;
         SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind);
         ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO)
             << "unexpected rc=" << rc;
+        EXPECT_NE(ind, SQL_NO_TOTAL)
+            << "a known-length value must report a concrete remaining count";
+        EXPECT_EQ(static_cast<SQLLEN>(kTotal - consumed_before), ind)
+            << "indicator must be bytes-available-before-this-call";
         assembled.append(reinterpret_cast<const char*>(buf));
-        if (ind == SQL_NO_TOTAL) {
-            saw_no_total = true;
-        }
-        if (rc == SQL_SUCCESS) {
+        if (rc == SQL_SUCCESS_WITH_INFO) {
+            saw_success_with_info = true;
+        } else {
             break;
         }
         ASSERT_LT(++guard, 1000) << "PLP stream did not terminate";
     }
 
-    EXPECT_TRUE(saw_no_total)
-        << "a >8 KiB streamed value should report SQL_NO_TOTAL before the wire drains";
+    EXPECT_TRUE(saw_success_with_info)
+        << "a 20 KB value must truncate at least once before draining";
     EXPECT_EQ(static_cast<size_t>(kTotal), assembled.size());
 
     SQLCloseCursor(stmt_);
@@ -715,11 +745,46 @@ TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAsciiRoundTrip) {
     SQLCloseCursor(stmt_);
 }
 
-// A PLP read into a buffer too small to hold even one character plus the null
-// terminator must fail deterministically with HY090 rather than spin forever
-// making zero-length reads. buffer_length 2 leaves no payload room for a
-// UTF-8/UTF-16 unit once the terminator is reserved.
+// Astral (non-BMP) content forces surrogate pairs, and a small buffer makes a
+// pair straddle a chunk boundary. U+1F600 is NCHAR(0xD83D) + NCHAR(0xDE00) on
+// the wire (two UTF-16 code units) and F0 9F 98 80 in UTF-8 (four bytes). With a
+// 16-byte SQL_C_CHAR buffer the transcode reads an odd number of code units per
+// chunk, so a high surrogate is left without its low half at the boundary; the
+// driver must carry it to the next chunk rather than emit U+FFFD. Any framing or
+// surrogate-carry defect shows up as replacement characters (EF BF BD) or a
+// wrong byte count. Codepage-neutral by construction, so it runs on both legs.
+TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAstralRoundTrip) {
+    const std::string emoji = "\xF0\x9F\x98\x80";       // U+1F600, 4 UTF-8 bytes
+    const std::string expected = RepeatToken(emoji, 500);  // 2000 bytes
+    ASSERT_SQL_OK(
+        ExecDirect(
+            "SELECT REPLICATE(NCHAR(0xD83D) + NCHAR(0xDE00), 500) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadCharDataInChunks(stmt_, 1, 16));
+
+    SQLCloseCursor(stmt_);
+}
+
+// A PLP read into a buffer too small to hold even one whole character plus the
+// null terminator must fail deterministically with HY090 rather than spin
+// forever making zero-length reads. buffer_length 2 leaves one payload byte
+// once the terminator is reserved, which cannot hold a complete multibyte unit.
+//
+// This is a truncate-vs-reject policy difference, not purely an encoding one:
+// on a UTF-8 client locale both drivers deliver SQL_C_CHAR as UTF-8, so both
+// face the same variable-width (1-4 byte) character problem. On a sub-minimal
+// buffer the reference msodbcsql driver returns SQL_SUCCESS_WITH_INFO/01004
+// (truncation) and expects the app to keep calling, whereas mssql-odbc rejects
+// with HY090 to guarantee forward progress and never split a multibyte unit.
+// TODO(convergence): mssql-odbc will eventually adopt the msodbcsql
+// truncate-and-continue contract for sub-minimal buffers (deliver whole bytes
+// that fit and carry the unflushed UTF-8 tail across calls), at which point this
+// HY090 rejection goes away and the assertion can run on both legs. Until then
+// it is mssql-odbc-specific — skip it on the msodbcsql comparison leg.
 TEST_F(GetDataLiveTest, PlpZeroCapacityBufferDoesNotSpin) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST(N'abcd' AS NVARCHAR(MAX)), 50) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -732,12 +797,37 @@ TEST_F(GetDataLiveTest, PlpZeroCapacityBufferDoesNotSpin) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY090");
 
     SQLCloseCursor(stmt_);
+
+    // buffer_length 1 (room for the NUL only) is the portable length-probe shape
+    // applications actually send, and it exercises the non-transcode PLP branch
+    // (varchar(max) -> SQL_C_CHAR) where max_read collapses to 0 directly rather
+    // than through the UTF-16 sizing above. It must also be rejected with HY090,
+    // never spun on.
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST('abc' AS VARCHAR(MAX)), 200) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR one[1] = {0};
+    SQLLEN ind1 = 0;
+    SQLRETURN rc1 = SQLGetData(stmt_, 1, SQL_C_CHAR, one, sizeof(one), &ind1);
+    EXPECT_EQ(SQL_ERROR, rc1);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY090");
+
+    SQLCloseCursor(stmt_);
 }
 
 // A non-PLP column whose type has no character conversion (e.g. DATETIME) must
 // fail with HYC00 and leave the column readable, so a retry with a compatible C
 // type still works. The reference msodbcsql driver converts DATETIME to
 // character data, so the HYC00 assertion is mssql-odbc-specific.
+//
+// Maintenance note: this relies on DATETIME having no column_value_to_text arm.
+// Once DATETIME becomes convertible the first SQLGetData will succeed and this
+// test will pass for the wrong reason (no HYC00 reached). At that point re-point
+// it at whatever column type is still unconvertible, or assert the recovery via
+// the target-type HYC00 path (an unsupported SQL_C target) with a type that will
+// stay unsupported.
 TEST_F(GetDataLiveTest, UnsupportedColumnTypeHyc00PreservesValue) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(

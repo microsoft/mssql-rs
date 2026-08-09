@@ -541,15 +541,13 @@ fn stream_active_plp_chunk(
         }
     }
 
-    let is_unicode_plp = {
+    let plp_encoding = {
         let Ok(ss) = stmt.inner.lock() else {
             return SQL_ERROR;
         };
-        matches!(
-            ss.active_plp.as_ref().map(|s| &s.encoding),
-            Some(PlpEncoding::Utf16Text)
-        )
+        ss.active_plp.as_ref().map(|s| s.encoding)
     };
+    let is_unicode_plp = matches!(plp_encoding, Some(PlpEncoding::Utf16Text));
     // SQL_C_CHAR delivery of a UTF-16 PLP column must transcode on the fly.
     let transcode_utf16_to_utf8 = target_type == SQL_C_CHAR && is_unicode_plp;
 
@@ -575,6 +573,18 @@ fn stream_active_plp_chunk(
     // A non-empty buffer too small to hold even one character plus the NUL is a
     // caller error (HY090). buffer_length == 0 is a legal length probe and must
     // fall through (PLP length is unknown, reported later as SQL_NO_TOTAL).
+    //
+    // TODO(convergence): msodbcsql does NOT reject the sub-minimal buffer here.
+    // Probed against ODBC Driver 18 with a 2-byte SQL_C_CHAR buffer over an
+    // nvarchar(max) column, it returns SQL_SUCCESS_WITH_INFO/01004 with
+    // indicator SQL_NO_TOTAL and delivers one payload byte per call (splitting a
+    // multibyte UTF-8 sequence across calls when necessary), so the stream still
+    // drains and reassembles. To converge, deliver whole *bytes* that fit (even
+    // 1) and carry the unflushed UTF-8 tail in ActivePlpStream (a pending_utf8
+    // buffer beside pending_byte/pending_high_surrogate), draining it first on
+    // the next call. That guarantees >=1 byte of forward progress and lets this
+    // HY090 guard be removed. Tracked by the skipped e2e test
+    // PlpZeroCapacityBufferDoesNotSpin.
     if max_read == 0 && buffer_length > 0 {
         if let Ok(mut s) = stmt.inner.lock() {
             post_sql_error(
@@ -628,7 +638,12 @@ fn stream_active_plp_chunk(
     dbc_state.active_stmt = Some(statement_handle);
     drop(dbc_state);
 
-    let PlpChunk { read, reached_end } = match read_result {
+    let PlpChunk {
+        read,
+        reached_end,
+        known_total,
+        total_read,
+    } = match read_result {
         Ok(chunk) => chunk,
         Err(e) => {
             if let Ok(mut s) = stmt.inner.lock() {
@@ -682,13 +697,39 @@ fn stream_active_plp_chunk(
             write_if_some(strlen_or_ind_ptr, utf8_bytes.len() as SqlLen);
         }
     } else {
-        unsafe {
+        // SQL_C_CHAR delivery of a non-UTF-16 text PLP column: the wire bytes are
+        // copied verbatim. `SingleByteText` and `Utf8Text` have identical bodies
+        // today because there is no codepage conversion on this path yet, but they
+        // are kept as separate arms so the divergence is recorded: `json`
+        // (`Utf8Text`) is UTF-8 and must NOT be folded into whatever codepage
+        // conversion later lands for `varchar(max)` (`SingleByteText`), or
+        // non-ASCII json silently corrupts.
+        let copy_verbatim = || unsafe {
             copy_with_nul(
                 target_value_ptr as *mut u8,
                 buffer_length as usize,
                 &payload[..read],
             );
             write_if_some(strlen_or_ind_ptr, read as SqlLen);
+        };
+        match plp_encoding {
+            // varchar(max)/char/text — single-byte / codepage text. Codepage
+            // conversion will attach here in a follow-up.
+            Some(PlpEncoding::SingleByteText) => copy_verbatim(),
+            // json — UTF-8 on the wire; delivered verbatim to SQL_C_CHAR. Must
+            // stay distinct from SingleByteText (see above).
+            Some(PlpEncoding::Utf8Text) => copy_verbatim(),
+            // Utf16Text/Binary/None never reach this branch: the compatibility
+            // gate rejects them or an earlier arm handles them. Assert the
+            // invariant in debug/tests; fall back to a verbatim copy in release
+            // rather than panicking across the FFI boundary (which would be UB).
+            other => {
+                debug_assert!(
+                    false,
+                    "SQL_C_CHAR PLP delivery reached with unexpected encoding {other:?}"
+                );
+                copy_verbatim();
+            }
         }
     }
 
@@ -704,7 +745,37 @@ fn stream_active_plp_chunk(
 
     // active_plp already holds this column's stream state; leave it in place so
     // the next SQLGetData call continues from where this one stopped.
-    unsafe { write_if_some(strlen_or_ind_ptr, SQL_NO_TOTAL) };
+    //
+    // StrLen_or_Ind reports the bytes still available *before* this call's copy,
+    // matching the reference msodbcsql driver: for a known-length PLP value the
+    // server sends the total up front, so each truncated chunk reports a concrete
+    // decreasing remaining count rather than SQL_NO_TOTAL. `total_read` already
+    // includes this read, so the remaining-before-this-call count is
+    // `known_total - (total_read - read)`.
+    //
+    // Two cases still report SQL_NO_TOTAL, and both match msodbcsql:
+    //   * unknown-length (streamed) PLP, where `known_total` is None; and
+    //   * the nvarchar->SQL_C_CHAR transcode path, where delivered UTF-8 bytes do
+    //     not equal wire UTF-16 bytes, so the wire-byte remaining count would be
+    //     the wrong unit. msodbcsql behaves identically here: its GetColData
+    //     length logic (sqlcdata.h) deliberately reports SQL_NO_TOTAL whenever the
+    //     source and destination C types differ in encoding (SQL_C_WCHAR<->
+    //     SQL_C_CHAR), because "we can't know the full size of the converted data
+    //     value until we have converted all of it ... as per spec." Its own tests
+    //     assert this (RegressionsODBC nvarchar->SQL_C_TCHAR under an ANSI client,
+    //     and SQLVariantODBC's "Mplat driver conversion to UTF8 results in
+    //     SQL_NO_TOTAL"). Only the same-encoding varchar->SQL_C_CHAR path, where
+    //     msodbcsql assumes a 1:1 ratio, gets a concrete count -- which is exactly
+    //     the `known_total` branch below. This path is therefore already converged.
+    let remaining_indicator = if transcode_utf16_to_utf8 {
+        SQL_NO_TOTAL
+    } else if let Some(total) = known_total {
+        let consumed_before = total_read.saturating_sub(read) as u64;
+        total.saturating_sub(consumed_before) as SqlLen
+    } else {
+        SQL_NO_TOTAL
+    };
+    unsafe { write_if_some(strlen_or_ind_ptr, remaining_indicator) };
     post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
 
     SQL_SUCCESS_WITH_INFO
@@ -989,6 +1060,125 @@ mod tests {
             s.diag_records.is_empty(),
             "SQL_NO_DATA must not post a diagnostic, got: {:?}",
             s.diag_records
+        );
+    }
+
+    /// Helper: transcode a full UTF-16LE buffer delivered in one chunk with no
+    /// carried state, asserting both carries end empty.
+    fn transcode_whole(bytes: &[u8]) -> String {
+        let mut pending_byte = None;
+        let mut pending_high = None;
+        let out = utf16le_chunk_to_utf8(bytes, true, &mut pending_byte, &mut pending_high);
+        assert!(pending_byte.is_none() && pending_high.is_none());
+        out
+    }
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    /// A single-chunk ASCII buffer transcodes verbatim with no leftover state.
+    #[test]
+    fn utf16_chunk_ascii_roundtrips() {
+        assert_eq!(transcode_whole(&utf16le("Hello")), "Hello");
+    }
+
+    /// A BMP code unit split across a chunk boundary is held in `pending_byte`
+    /// and completed by the next chunk — the character appears once, intact.
+    #[test]
+    fn utf16_chunk_splits_code_unit_across_boundary() {
+        // 'Z' = U+005A -> LE bytes [0x5A, 0x00]. Feed the low half, then the high.
+        let mut pb = None;
+        let mut ph = None;
+        let first = utf16le_chunk_to_utf8(&[0x5A], false, &mut pb, &mut ph);
+        assert_eq!(first, "");
+        assert_eq!(pb, Some(0x5A));
+        let second = utf16le_chunk_to_utf8(&[0x00], true, &mut pb, &mut ph);
+        assert_eq!(second, "Z");
+        assert!(pb.is_none() && ph.is_none());
+    }
+
+    /// A surrogate pair split across a chunk boundary is held in
+    /// `pending_high_surrogate` so it pairs with the low surrogate next chunk
+    /// instead of decoding to U+FFFD prematurely.
+    #[test]
+    fn utf16_chunk_splits_surrogate_pair_across_boundary() {
+        // U+1F600 (😀) = surrogate pair D83D DE00.
+        let full = utf16le("😀");
+        let (high, low) = full.split_at(2);
+        let mut pb = None;
+        let mut ph = None;
+        let first = utf16le_chunk_to_utf8(high, false, &mut pb, &mut ph);
+        assert_eq!(first, "", "lone high surrogate must not emit yet");
+        assert_eq!(ph, Some(0xD83D));
+        let second = utf16le_chunk_to_utf8(low, true, &mut pb, &mut ph);
+        assert_eq!(second, "😀");
+        assert!(pb.is_none() && ph.is_none());
+    }
+
+    /// A dangling half code unit at true end-of-stream is genuinely malformed
+    /// and becomes a single U+FFFD.
+    #[test]
+    fn utf16_chunk_trailing_odd_byte_at_end_is_replacement() {
+        let mut pb = None;
+        let mut ph = None;
+        let out = utf16le_chunk_to_utf8(&[0x41], true, &mut pb, &mut ph);
+        assert_eq!(out, "\u{FFFD}");
+        assert!(pb.is_none() && ph.is_none());
+    }
+
+    /// An unpaired high surrogate at true end-of-stream decodes to U+FFFD (the
+    /// end-of-stream guard skips the hold-back).
+    #[test]
+    fn utf16_chunk_lone_high_surrogate_at_end_is_replacement() {
+        let out = transcode_whole(&[0x3D, 0xD8]); // D83D, no low surrogate
+        assert_eq!(out, "\u{FFFD}");
+    }
+
+    /// `column_value_to_text` renders scalar column values as text and returns
+    /// `None` for types with no textual SQLGetData rendering.
+    #[test]
+    fn column_value_to_text_renders_scalars() {
+        use mssql_tds::datatypes::sql_string::SqlString;
+        assert_eq!(
+            column_value_to_text(&ColumnValues::TinyInt(7)).as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            column_value_to_text(&ColumnValues::SmallInt(-3)).as_deref(),
+            Some("-3")
+        );
+        assert_eq!(
+            column_value_to_text(&ColumnValues::Int(42)).as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            column_value_to_text(&ColumnValues::BigInt(-9)).as_deref(),
+            Some("-9")
+        );
+        assert_eq!(
+            column_value_to_text(&ColumnValues::Bit(true)).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            column_value_to_text(&ColumnValues::Bit(false)).as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            column_value_to_text(&ColumnValues::Null).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            column_value_to_text(&ColumnValues::String(SqlString::from_utf8_string(
+                "hi".into()
+            )))
+            .as_deref(),
+            Some("hi")
+        );
+        // A type with no textual rendering in this helper yields None.
+        assert_eq!(
+            column_value_to_text(&ColumnValues::Bytes(vec![1, 2, 3])),
+            None
         );
     }
 }

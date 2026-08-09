@@ -431,6 +431,14 @@ mod tests {
         let non_plp =
             create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
         assert_eq!(non_plp.plp_encoding(), None);
+
+        // A type somehow PLP-flagged but outside every classified arm falls
+        // through to opaque Binary rather than guessing a text codepage.
+        assert_eq!(
+            plp_column(TdsDataType::IntN).plp_encoding(),
+            Some(PlpEncoding::Binary),
+            "an unclassified PLP-flagged type should default to Binary"
+        );
     }
 
     #[test]

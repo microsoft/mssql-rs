@@ -99,6 +99,15 @@ pub struct PlpChunk {
     /// `true` once the PLP stream has been fully consumed; the caller should
     /// stop reading and resume the row cursor.
     pub reached_end: bool,
+    /// Declared total length of the whole PLP value in wire bytes when the
+    /// server sent a known-length PLP header; `None` for unknown-length
+    /// (streamed) PLP whose total is not known in advance. Lets a consumer
+    /// report the concrete bytes-remaining indicator instead of `SQL_NO_TOTAL`.
+    pub known_total: Option<u64>,
+    /// Cumulative wire bytes consumed from this PLP value across all chunks,
+    /// including this read. With `known_total`, the bytes still available
+    /// before this call are `known_total - (total_read - read)`.
+    pub total_read: usize,
 }
 
 /// Outcome of [`TdsClient::read_row_column`], the ODBC pull-cursor column fetch.
@@ -2847,6 +2856,25 @@ impl TdsClient {
         }
     }
 
+    /// Declared total length (wire bytes) of the active PLP value when the
+    /// server sent a known-length header; `None` when no PLP stream is active
+    /// or the value is unknown-length (streamed).
+    pub(crate) fn active_plp_known_len(&self) -> Option<u64> {
+        match &self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => plp_state.known_len(),
+            _ => None,
+        }
+    }
+
+    /// Cumulative wire bytes consumed from the active PLP value across all
+    /// chunks; `0` when no PLP stream is active.
+    pub(crate) fn active_plp_total_read(&self) -> usize {
+        match &self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => plp_state.total_read(),
+            _ => 0,
+        }
+    }
+
     pub(crate) async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
         let ActiveRowReadState::PlpPaused(plp_state) = &mut self.active_row_read_state else {
             // No active stream is a sequencing error, not EOF: returning `Ok(0)`
@@ -2895,6 +2923,8 @@ impl TdsClient {
         Ok(PlpChunk {
             read,
             reached_end: self.active_plp_reached_end(),
+            known_total: self.active_plp_known_len(),
+            total_read: self.active_plp_total_read(),
         })
     }
 
