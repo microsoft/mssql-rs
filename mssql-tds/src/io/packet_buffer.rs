@@ -47,6 +47,11 @@ pub(crate) struct PacketBuffer {
     pending_bytes: usize,
     /// Absolute offset of the pending bytes within `working_buffer`.
     pending_bytes_offset: usize,
+    /// Test-only high-water mark of `length` (resident payload bytes), used by
+    /// the eager-PLP residency-ceiling test to prove the driver never holds a
+    /// whole unbounded LOB resident. Never present in production builds.
+    #[cfg(test)]
+    peak_length: usize,
 }
 
 impl PacketBuffer {
@@ -60,6 +65,8 @@ impl PacketBuffer {
             max_packet_size,
             pending_bytes: 0,
             pending_bytes_offset: 0,
+            #[cfg(test)]
+            peak_length: 0,
         }
     }
 
@@ -127,6 +134,8 @@ impl PacketBuffer {
             max_packet_size: len.max(1),
             pending_bytes: 0,
             pending_bytes_offset: 0,
+            #[cfg(test)]
+            peak_length: len,
         }
     }
 
@@ -338,6 +347,10 @@ impl PacketBuffer {
             base,
         );
         self.length = base + packet_len - PacketWriter::PACKET_HEADER_SIZE;
+        #[cfg(test)]
+        {
+            self.peak_length = self.peak_length.max(self.length);
+        }
     }
 
     /// Resizes the buffer when the negotiated packet size changes, discarding
@@ -385,6 +398,14 @@ impl PacketBuffer {
     #[cfg(test)]
     pub(crate) fn length(&self) -> usize {
         self.length
+    }
+
+    /// Test-only high-water mark of resident payload bytes (`length`) tracked
+    /// since construction. Used to assert the eager-PLP residency ceiling on the
+    /// production driver.
+    #[cfg(test)]
+    pub(crate) fn peak_length(&self) -> usize {
+        self.peak_length
     }
 
     #[cfg(test)]

@@ -8,7 +8,8 @@ use crate::datatypes::decoder::{
 use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter, write_column_value};
 use crate::io::packet_buffer::PacketBuffer;
 use crate::io::packet_reader::TdsPacketReader;
-use crate::io::tds_core::{RowStep, TdsCore};
+use crate::io::sync_token;
+use crate::io::tds_core::{RowStep, TdsCore, TokenStep};
 use crate::query::metadata::ColumnMetadata;
 use crate::security::cell_decryptor::CellDecryptor;
 use crate::token::parsers::TokenParser;
@@ -320,6 +321,15 @@ pub(crate) async fn dispatch_token<R: TdsPacketReader + Send + Sync>(
     }
 }
 
+/// Test/fuzzing-only reference oracle for the non-row token receive path.
+///
+/// Production token consumption runs through the synchronous
+/// [`TdsCore::step_token`] body driven by [`drive_token_over_buffer`], which
+/// sync-parses the bounded category-(a) tokens in place and seams the
+/// value-carrying / login tokens through [`dispatch_token`]. This async
+/// whole-token read is retained solely as a differential byte-identity oracle
+/// for the refill-boundary tests; no production path reaches it.
+#[cfg(any(test, fuzzing))]
 pub(crate) async fn receive_token_internal<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
     registry: &impl TokenParserRegistry,
@@ -747,7 +757,7 @@ where
             RowStep::RowWritten => return Ok(RowReadResult::RowWritten),
             RowStep::RowPaused(state) => return Ok(RowReadResult::RowPaused(state)),
             RowStep::Token(token_type) => {
-                let token = dispatch_token(reader, registry, token_type, context).await?;
+                let token = resolve_header_token(reader, registry, token_type, context).await?;
                 return Ok(RowReadResult::Token(token));
             }
             RowStep::NeedBytes(need) => {
@@ -768,6 +778,82 @@ where
                     }
                     AsyncColumnOutcome::Terminal(result) => return Ok(result),
                 }
+            }
+        }
+    }
+}
+
+/// Resolves a non-row token whose token byte has already been consumed.
+///
+/// This is the shared terminal-token seam used by both the top-level non-row
+/// receive driver ([`drive_token_over_buffer`]) and the row driver's
+/// [`RowStep::Token`] arm: [`TdsCore::begin_row_header`] consumes the token byte
+/// then hands the classification back, and this helper decodes it.
+///
+/// Category-(a) bounded tokens are parsed in place by the pure-sync
+/// [`sync_token::parse_token_body`] body — refilling the buffer until the whole
+/// length-bounded token is resident, so the parse runs over a complete slice and
+/// never sees a partial buffer. Every other token (the value-carrying (b)
+/// tokens plus login/handshake tokens) stays on the async seam via the existing
+/// [`dispatch_token`] parser. This is the token-atomic analog of
+/// [`decode_async_row_column`] for the row path's `AsyncColumn`.
+async fn resolve_header_token<R, Reg>(
+    reader: &mut R,
+    registry: &Reg,
+    token_type: TokenType,
+    context: &ParserContext,
+) -> TdsResult<Tokens>
+where
+    R: BufferedRowReader,
+    Reg: TokenParserRegistry,
+{
+    if !sync_token::is_sync_token(&token_type) {
+        return dispatch_token(reader, registry, token_type, context).await;
+    }
+    loop {
+        let total = match sync_token::body_len(reader.row_buffer_mut(), &token_type) {
+            Ok(total) => total,
+            Err(_) => {
+                reader.refill_row_buffer().await?;
+                continue;
+            }
+        };
+        if reader.row_buffer_mut().ensure(total).is_err() {
+            reader.refill_row_buffer().await?;
+            continue;
+        }
+        return sync_token::parse_token_body(reader.row_buffer_mut(), token_type, context);
+    }
+}
+
+/// Production non-row receive driver: the single async shell over
+/// [`TdsCore::step_token`].
+///
+/// It owns the only `.await` on the non-row token path — refilling the buffer on
+/// [`TokenStep::NeedBytes`] and servicing a [`TokenStep::AsyncToken`] through the
+/// existing async [`dispatch_token`] seam — then re-drives the sync body from the
+/// shared cursor. This is the token-consume analog of [`drive_row_over_buffer`].
+pub(crate) async fn drive_token_over_buffer<R, Reg>(
+    reader: &mut R,
+    registry: &Reg,
+    context: &ParserContext,
+) -> TdsResult<Tokens>
+where
+    R: BufferedRowReader,
+    Reg: TokenParserRegistry,
+{
+    loop {
+        match TdsCore::step_token(reader.row_buffer_mut(), context)? {
+            TokenStep::Parsed(token) => return Ok(token),
+            TokenStep::AsyncToken(token_type) => {
+                return dispatch_token(reader, registry, token_type, context).await;
+            }
+            TokenStep::NeedBytes(need) => {
+                tracing::trace!(
+                    shortfall = need.shortfall,
+                    "refilling token buffer for step_token"
+                );
+                reader.refill_row_buffer().await?;
             }
         }
     }
@@ -2718,6 +2804,147 @@ mod tests {
         }
     }
 
+    /// P4b hardening (AD-2): a STRICT residency-CEILING assertion on the
+    /// PRODUCTION driver for an eager-PLP LOB. P4a's own eager-PLP residency
+    /// guarantee is asserted here, one layer up, rather than in #198, to keep the
+    /// frozen P4a tip stable.
+    ///
+    /// A single `varbinary(max)` PLP column carrying many small chunks whose total
+    /// wire EXCEEDS the 8192 B buffer capacity is decoded through
+    /// `drive_row_over_buffer` (the production driver), framed into sub-buffer
+    /// packets. The driver services the unbounded column via the `AsyncColumn`
+    /// seam chunk-at-a-time, so peak `PacketBuffer` residency must stay bounded
+    /// (≲ one buffer/chunk) and never approach the whole-LOB size.
+    ///
+    /// This is a CEILING, not a "decode still matches" check: if anyone ever
+    /// collapses `AsyncColumn` into a collect-whole / `NeedBytes(full-len)` path,
+    /// the driver would drive `length` toward the full LOB size and
+    /// `peak_length` would reach `>= large.len()`, FAILING the ceiling — robust
+    /// even if the buffer capacity later becomes growable.
+    #[tokio::test]
+    async fn tdscore_step_row_eager_plp_residency_ceiling_on_production_driver() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
+        use crate::message::messages::PacketType;
+
+        const BUFFER_CAPACITY: usize = 8192; // 2 x 4096 B negotiated packet
+
+        let columns = vec![plp_varbinary_metadata("b", None)];
+
+        // UNKNOWNLEN PLP value with many small chunks; total wire far exceeds the
+        // buffer capacity, so it can never be whole-resident.
+        fn plp_value(chunk: usize, count: usize) -> Vec<u8> {
+            let mut plp = Vec::new();
+            plp.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // UNKNOWNLEN
+            let mut counter = 0u8;
+            for _ in 0..count {
+                plp.extend_from_slice(&(chunk as u32).to_le_bytes());
+                for _ in 0..chunk {
+                    plp.push(counter);
+                    counter = counter.wrapping_add(1);
+                }
+            }
+            plp.extend_from_slice(&0u32.to_le_bytes()); // zero-length terminator
+            plp
+        }
+
+        // Frame the payload into `piece`-sized packets (EOM only on the last), so
+        // each refill exposes at most one small packet.
+        fn frame_into(payload: &[u8], piece: usize) -> Vec<u8> {
+            let mut wire = Vec::new();
+            let mut offset = 0;
+            while offset < payload.len() {
+                let end = (offset + piece).min(payload.len());
+                let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+                let mut packet = builder.append_bytes(&payload[offset..end]).build();
+                if end < payload.len() {
+                    packet[1] = 0x00; // clear EOM: more packets follow
+                }
+                wire.extend_from_slice(&packet);
+                offset = end;
+            }
+            wire
+        }
+
+        async fn decode_oracle(
+            read_data: Vec<u8>,
+            columns: &[ColumnMetadata],
+        ) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        // 24 x 500 B chunks = 12000 B of payload; comfortably over the buffer cap.
+        let plp = plp_value(500, 24);
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend_from_slice(&plp);
+        assert!(
+            payload.len() > BUFFER_CAPACITY,
+            "residency value must exceed buffer capacity"
+        );
+
+        let reference = decode_oracle(frame_into(&payload, 2048), &columns).await;
+        assert_ne!(reference[0], ColumnValues::Null);
+
+        // Drive the production driver over 512 B packet frames and capture peak
+        // residency from the shared buffer after a successful decode.
+        let wire = frame_into(&payload, 512);
+        let mut mock = MockNetworkReaderWriter::new(wire, 0);
+        let mut reader = PacketReader::new(&mut mock);
+        reader.read_tds_packet_for_test().await.unwrap();
+        let context = ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: columns.len() as u16,
+                columns: columns.to_vec(),
+                cek_table: vec![],
+            }),
+            None,
+        );
+        let registry = GenericTokenParserRegistry::default();
+        let mut writer = DefaultRowWriter::new(columns.len());
+        let result = drive_row_over_buffer(&mut reader, &registry, &context, None, &mut writer)
+            .await
+            .unwrap();
+        assert!(matches!(result, RowReadResult::RowWritten));
+        let decoded = writer.take_row();
+        assert_eq!(
+            decoded, reference,
+            "eager-PLP LOB must decode byte-identically through the production driver"
+        );
+
+        let peak = reader.row_buffer_mut().peak_length();
+        assert!(
+            peak <= BUFFER_CAPACITY,
+            "peak residency {peak} exceeded the buffer capacity {BUFFER_CAPACITY}: \
+             the driver held more than one buffer/chunk resident"
+        );
+        assert!(
+            peak < payload.len(),
+            "peak residency {peak} reached the whole-LOB size {}: AsyncColumn was \
+             collapsed into a collect-whole / NeedBytes(full-len) path, \
+             reintroducing whole-LOB residency",
+            payload.len()
+        );
+    }
+
     /// P4a blocking test 4: the resume-from-pause path. A `RowPauseState` positioned
     /// mid-row is driven both through the production `step_row` driver (with a
     /// `Some` cursor, which skips the header and decodes from `next_column_index`)
@@ -2924,5 +3151,245 @@ mod tests {
             .filter(|tt| registry.get_parser(tt).is_some())
             .count();
         assert_eq!(count, expected_count);
+    }
+
+    // ---- P4b: non-row token driver refill-boundary differential tests ----
+    //
+    // Each test feeds a canned token byte stream through the production
+    // `drive_token_over_buffer` (sync `TdsCore::step_token` body + the single
+    // refill `.await`) and the `#[cfg(any(test, fuzzing))]` `receive_token_internal`
+    // async oracle, sweeping the refill boundary across every interior byte. The
+    // driver result must be byte-identical to the oracle at every split, proving
+    // the sync inversion parses the bounded category-(a) tokens (DONE/DONEINPROC/
+    // DONEPROC, ERROR, INFO, ORDER, ENVCHANGE) identically and that the
+    // `AsyncToken` seam hands the value-carrying tokens (COLMETADATA) to the async
+    // parser across a refill without corruption.
+
+    fn token_one_packet(payload: &[u8]) -> Vec<u8> {
+        use crate::io::packet_reader::tests::TestPacketBuilder;
+        use crate::message::messages::PacketType;
+        let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+        builder.append_bytes(payload).build()
+    }
+
+    fn token_two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+        use crate::io::packet_reader::tests::TestPacketBuilder;
+        use crate::message::messages::PacketType;
+        let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+        let mut first = first_builder.append_bytes(&payload[..split]).build();
+        first[1] = 0x00; // clear EOM: more packets follow
+        let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+        let second = second_builder.append_bytes(&payload[split..]).build();
+        [first, second].concat()
+    }
+
+    async fn decode_token_via_driver(wire: Vec<u8>, context: &ParserContext) -> Tokens {
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::MockNetworkReaderWriter;
+        let mut mock = MockNetworkReaderWriter::new(wire, 0);
+        let mut reader = PacketReader::new(&mut mock);
+        reader.read_tds_packet_for_test().await.unwrap();
+        let registry = GenericTokenParserRegistry::default();
+        drive_token_over_buffer(&mut reader, &registry, context)
+            .await
+            .unwrap()
+    }
+
+    async fn decode_token_via_oracle(wire: Vec<u8>, context: &ParserContext) -> Tokens {
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::MockNetworkReaderWriter;
+        let mut mock = MockNetworkReaderWriter::new(wire, 0);
+        let mut reader = PacketReader::new(&mut mock);
+        reader.read_tds_packet_for_test().await.unwrap();
+        let registry = GenericTokenParserRegistry::default();
+        receive_token_internal(&mut reader, &registry, context)
+            .await
+            .unwrap()
+    }
+
+    /// Drives `token_bytes` through the production driver and the async oracle at
+    /// the whole-token baseline and at every interior split, asserting the driver
+    /// is byte-identical to the oracle (and both to the canonical decode) at each.
+    async fn assert_token_matches_oracle_at_every_split(
+        token_bytes: &[u8],
+        context: &ParserContext,
+    ) {
+        let canonical = format!(
+            "{:?}",
+            decode_token_via_oracle(token_one_packet(token_bytes), context).await
+        );
+        assert_eq!(
+            canonical,
+            format!(
+                "{:?}",
+                decode_token_via_driver(token_one_packet(token_bytes), context).await
+            ),
+            "driver whole-token decode diverged from the oracle"
+        );
+        for split in 1..token_bytes.len() {
+            let driver = format!(
+                "{:?}",
+                decode_token_via_driver(token_two_packets(token_bytes, split), context).await
+            );
+            let oracle = format!(
+                "{:?}",
+                decode_token_via_oracle(token_two_packets(token_bytes, split), context).await
+            );
+            assert_eq!(
+                driver, canonical,
+                "driver decode at split {split} diverged from canonical"
+            );
+            assert_eq!(
+                oracle, canonical,
+                "oracle decode at split {split} diverged from canonical"
+            );
+        }
+    }
+
+    fn done_like_token(token_byte: u8) -> Vec<u8> {
+        let mut v = vec![token_byte];
+        v.extend_from_slice(&0x0010_u16.to_le_bytes()); // status: DONE_COUNT
+        v.extend_from_slice(&0x00C1_u16.to_le_bytes()); // cur_cmd
+        v.extend_from_slice(&42_u64.to_le_bytes()); // row_count
+        v
+    }
+
+    fn ascii_utf16(s: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(s.len() * 2);
+        for b in s.bytes() {
+            out.push(b);
+            out.push(0);
+        }
+        out
+    }
+
+    /// Category-(a) fixed-body DONE family split across a refill boundary.
+    #[tokio::test]
+    async fn drive_token_done_family_split_matches_oracle() {
+        let context = ParserContext::None(());
+        for token_byte in [
+            TokenType::Done as u8,
+            TokenType::DoneInProc as u8,
+            TokenType::DoneProc as u8,
+        ] {
+            assert_token_matches_oracle_at_every_split(&done_like_token(token_byte), &context)
+                .await;
+        }
+    }
+
+    /// Category-(a) length-prefixed ERROR and INFO split across a refill boundary.
+    #[tokio::test]
+    async fn drive_token_error_info_split_matches_oracle() {
+        let context = ParserContext::None(());
+        for token_byte in [TokenType::Error as u8, TokenType::Info as u8] {
+            let mut body = Vec::new();
+            body.extend_from_slice(&14081_u32.to_le_bytes()); // number
+            body.push(1); // state
+            body.push(16); // severity
+            let message = ascii_utf16("hi there");
+            body.extend_from_slice(&((message.len() / 2) as u16).to_le_bytes());
+            body.extend_from_slice(&message);
+            let server = ascii_utf16("srv");
+            body.push((server.len() / 2) as u8);
+            body.extend_from_slice(&server);
+            body.push(0); // empty proc name
+            body.extend_from_slice(&7_u32.to_le_bytes()); // line number
+
+            let mut token = vec![token_byte];
+            token.extend_from_slice(&(body.len() as u16).to_le_bytes());
+            token.extend_from_slice(&body);
+            assert_token_matches_oracle_at_every_split(&token, &context).await;
+        }
+    }
+
+    /// Category-(a) ORDER split across a refill boundary.
+    #[tokio::test]
+    async fn drive_token_order_split_matches_oracle() {
+        let context = ParserContext::None(());
+        let cols = [1_u16, 2, 3];
+        let mut body = Vec::new();
+        for c in cols {
+            body.extend_from_slice(&c.to_le_bytes());
+        }
+        let mut token = vec![TokenType::Order as u8];
+        token.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        token.extend_from_slice(&body);
+        assert_token_matches_oracle_at_every_split(&token, &context).await;
+    }
+
+    /// Category-(a) ENVCHANGE (Database subtype) split across a refill boundary.
+    #[tokio::test]
+    async fn drive_token_envchange_split_matches_oracle() {
+        let context = ParserContext::None(());
+        let new_value = ascii_utf16("db_new");
+        let old_value = ascii_utf16("db_old");
+        let mut body = vec![0x01]; // subtype: Database
+        body.push((new_value.len() / 2) as u8);
+        body.extend_from_slice(&new_value);
+        body.push((old_value.len() / 2) as u8);
+        body.extend_from_slice(&old_value);
+        let mut token = vec![TokenType::EnvChange as u8];
+        token.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        token.extend_from_slice(&body);
+        assert_token_matches_oracle_at_every_split(&token, &context).await;
+    }
+
+    fn single_int_colmetadata_token() -> Vec<u8> {
+        let mut token = vec![TokenType::ColMetadata as u8];
+        token.extend_from_slice(&1_u16.to_le_bytes()); // column count
+        token.extend_from_slice(&0_u32.to_le_bytes()); // user type
+        token.extend_from_slice(&0_u16.to_le_bytes()); // flags
+        token.push(TdsDataType::Int4 as u8); // data type (no type info)
+        let name = ascii_utf16("id");
+        token.push((name.len() / 2) as u8);
+        token.extend_from_slice(&name);
+        token
+    }
+
+    /// COLMETADATA is a value-carrying category-(b) token that stays on the
+    /// `AsyncToken` seam. Splitting it across a refill boundary proves the seam
+    /// hands a token spanning a refill to the async parser byte-identically.
+    #[tokio::test]
+    async fn drive_token_colmetadata_split_matches_oracle() {
+        let context = ParserContext::default();
+        assert_token_matches_oracle_at_every_split(&single_int_colmetadata_token(), &context).await;
+    }
+
+    /// The seam boundary is new surface: after the driver yields COLMETADATA via
+    /// the `AsyncToken` seam, the next step must hand off to the row driver over
+    /// the same shared buffer and decode the following ROW.
+    #[tokio::test]
+    async fn drive_token_colmetadata_then_row_handoff() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::MockNetworkReaderWriter;
+
+        let mut payload = single_int_colmetadata_token();
+        payload.push(TokenType::Row as u8);
+        payload.extend_from_slice(&7_i32.to_le_bytes());
+
+        let mut mock = MockNetworkReaderWriter::new(token_one_packet(&payload), 0);
+        let mut reader = PacketReader::new(&mut mock);
+        reader.read_tds_packet_for_test().await.unwrap();
+        let registry = GenericTokenParserRegistry::default();
+
+        let meta_context = ParserContext::default();
+        let token = drive_token_over_buffer(&mut reader, &registry, &meta_context)
+            .await
+            .unwrap();
+        let colmeta = match token {
+            Tokens::ColMetadata(token) => token,
+            other => panic!("expected ColMetadata from the seam, got {other:?}"),
+        };
+        assert_eq!(colmeta.column_count, 1);
+
+        let row_context = ParserContext::ColumnMetadata(Arc::new(colmeta), None);
+        let mut writer = DefaultRowWriter::new(1);
+        let result = drive_row_over_buffer(&mut reader, &registry, &row_context, None, &mut writer)
+            .await
+            .unwrap();
+        assert!(matches!(result, RowReadResult::RowWritten));
+        assert_eq!(writer.take_row(), vec![ColumnValues::Int(7)]);
     }
 }

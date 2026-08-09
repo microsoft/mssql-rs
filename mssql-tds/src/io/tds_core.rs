@@ -17,13 +17,27 @@
 //! `AsyncColumn` through the existing L4 async seam, then re-drives `step_row`
 //! from the shared cursor. The async and sync (future P4c) drivers differ only
 //! in that refill step; the parse body here is shared.
+//!
+//! [`TdsCore::step_token`] is the non-row analog (P4b): it decodes the bounded,
+//! length-delimited non-row tokens (DONE family, RETURNSTATUS, ORDER, ERROR,
+//! INFO, ENVCHANGE) in place over the [`PacketBuffer`] via the pure-sync leaf in
+//! [`crate::io::sync_token`], returning [`TokenStep::NeedBytes`] on underflow at
+//! token entry (nothing consumed, restartable from the token byte). Tokens whose
+//! bodies are unbounded or carry embedded values/PLP — COLMETADATA, RETURNVALUE,
+//! SESSIONSTATE, FEATUREEXTACK — plus the login/handshake tokens are handed back
+//! as [`TokenStep::AsyncToken`] and serviced by the existing async parser on the
+//! seam. Their pure-sync inversion is **deferred** to a later, parent-gated layer
+//! that would introduce a sanctioned mid-token `TokenPauseState` cursor; after
+//! P4b the receive path is sync-parse for its bounded tokens and async-seamed for
+//! the unbounded ones, not fully sync.
 
 use crate::core::TdsResult;
 use crate::datatypes::row_writer::RowWriter;
 use crate::datatypes::sync_decoder;
 use crate::io::packet_buffer::{NeedBytes, PacketBuffer};
+use crate::io::sync_token;
 use crate::io::token_stream::{ParserContext, RowPauseState, extract_row_context};
-use crate::token::tokens::TokenType;
+use crate::token::tokens::{TokenType, Tokens};
 
 /// Zero-sized owner of the synchronous row-fetch parse body.
 pub(crate) struct TdsCore;
@@ -39,12 +53,45 @@ pub(crate) enum RowStep {
     RowPaused(RowPauseState),
     /// The cell at `col` must be decoded through the async seam (eager PLP,
     /// p7 PLP streaming pause, p4d legacy LOBs, rare fallback types, or the AE
-    /// fallback). Its refill stays in the L4b/L4-async seam by design: hoisting
-    /// mid-value LOB state into the sync core would require a new resumable
-    /// machine. The driver services it and re-drives `step_row` at `col + 1`.
+    /// fallback). The driver services it and re-drives `step_row` at `col + 1`.
+    ///
+    /// The two yield reasons are named for *why* they yield:
+    /// - [`RowStep::NeedBytes`]`{shortfall}` = this cell is **BOUNDED**; give it
+    ///   `N` more bytes and the whole cell fits, so the sync core will finish it.
+    /// - `AsyncColumn` = this column is **UNBOUNDED**; the driver owns its
+    ///   chunked I/O and streams it chunk-at-a-time through the shared
+    ///   `plp_collect_step` / `collect_plp_bytes` leaf.
+    ///
+    /// Do NOT collapse into NeedBytes — yielding the column preserves bounded
+    /// residency; forcing PLP through `ensure(full-len)` would materialize the
+    /// whole multi-GB VARCHAR(MAX) and reintroduce the footgun, and would need a
+    /// new mid-value resumable machine. This is an intentional sans-I/O shape,
+    /// not an unfinished inversion: it is what keeps L4b residency bounded to one
+    /// chunk while a LOB larger than the buffer streams past.
     AsyncColumn { col: usize },
     /// The buffer underflowed; the driver refills and re-drives with the same
     /// (unchanged) cursor. Nothing was consumed on this step.
+    NeedBytes(NeedBytes),
+}
+
+/// Outcome of one synchronous [`TdsCore::step_token`] call.
+///
+/// The non-row analog of [`RowStep`]. Bounded tokens are parsed whole in place
+/// and returned as [`TokenStep::Parsed`]; unbounded / value-carrying tokens are
+/// yielded to the async driver as [`TokenStep::AsyncToken`] (see the module-level
+/// note on the deferred sync inversion of those tokens).
+pub(crate) enum TokenStep {
+    /// The whole token body was decoded in place; the driver returns it.
+    Parsed(Tokens),
+    /// The token is COLMETADATA / RETURNVALUE / SESSIONSTATE / FEATUREEXTACK, a
+    /// login/handshake token, or an unrecognized-but-dispatchable token: its
+    /// body is not pure-sync yet, so the driver services it through the existing
+    /// async parser on the seam. A genuine yield-to-driver, never a hidden
+    /// `block_on` — this is the [`RowStep::AsyncColumn`] discipline for tokens,
+    /// leaving the seam shaped for a future P4c sync leaf/cursor underneath it.
+    AsyncToken(TokenType),
+    /// The buffer underflowed at token entry; nothing was consumed, so the
+    /// driver refills and re-drives, re-peeking the same token byte.
     NeedBytes(NeedBytes),
 }
 
@@ -162,5 +209,61 @@ impl TdsCore {
                 Ok(HeaderStep::Token(token_type))
             }
         }
+    }
+
+    /// Advances one non-row token-decode step over `buf` without performing I/O.
+    ///
+    /// Peeks the token byte and classifies it:
+    /// - Bounded tokens (DONE family, RETURNSTATUS, ORDER, ERROR, INFO,
+    ///   ENVCHANGE — see [`sync_token::is_sync_token`]) are decoded whole in
+    ///   place. The token byte is not consumed until the entire length-delimited
+    ///   body is resident, so a shortfall returns [`TokenStep::NeedBytes`] with
+    ///   the buffer position unchanged and the step is restartable from the token
+    ///   byte — the token-atomic analog of [`Self::begin_row_header`].
+    /// - Every other token (the value-carrying (b) tokens, login/handshake
+    ///   tokens, and any dispatchable token this core does not sync-parse) has
+    ///   its token byte consumed and is returned as [`TokenStep::AsyncToken`] for
+    ///   the driver to service through the existing async parser.
+    ///
+    /// A malformed token byte propagates the same `TryFrom` error the async path
+    /// raised; nothing is consumed on that error (only the byte was peeked).
+    pub(crate) fn step_token(
+        buf: &mut PacketBuffer,
+        context: &ParserContext,
+    ) -> TdsResult<TokenStep> {
+        let first = match buf.peek_bytes(1) {
+            Some(bytes) => bytes[0],
+            None => return Ok(TokenStep::NeedBytes(NeedBytes { shortfall: 1 })),
+        };
+        let token_type: TokenType = first.try_into()?;
+
+        if !sync_token::is_sync_token(&token_type) {
+            buf.take_u8()?;
+            return Ok(TokenStep::AsyncToken(token_type));
+        }
+
+        // Total on-wire size including the token byte. Fixed-width tokens are
+        // known outright; length-prefixed tokens carry a u16 body length at
+        // body offset 0 (just past the token byte), so the whole token is
+        // `1 + 2 + len`.
+        let total = match sync_token::fixed_body_len(&token_type) {
+            Some(body) => 1 + body,
+            None => {
+                if let Err(need) = buf.ensure(3) {
+                    return Ok(TokenStep::NeedBytes(need));
+                }
+                let prefix = buf.peek_bytes(3).expect("ensured 3 bytes");
+                1 + 2 + u16::from_le_bytes([prefix[1], prefix[2]]) as usize
+            }
+        };
+
+        if let Err(need) = buf.ensure(total) {
+            return Ok(TokenStep::NeedBytes(need));
+        }
+
+        buf.take_u8()?;
+        Ok(TokenStep::Parsed(sync_token::parse_token_body(
+            buf, token_type, context,
+        )?))
     }
 }

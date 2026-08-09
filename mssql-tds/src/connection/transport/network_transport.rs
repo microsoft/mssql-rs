@@ -19,7 +19,7 @@ use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
 use crate::io::token_stream::{
     ParserContext, PlpPauseState, RowPauseState, RowReadResult, TdsTokenStreamReader,
-    drive_row_over_buffer, read_active_plp_bytes_internal, receive_token_internal,
+    drive_row_over_buffer, drive_token_over_buffer, read_active_plp_bytes_internal,
 };
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
@@ -1013,7 +1013,7 @@ impl NetworkTransport {
                 let remaining = timeout_duration.saturating_sub(start.elapsed());
                 match timeout(
                     remaining,
-                    receive_token_internal(self, &*PARSER_REGISTRY, &dummy_context),
+                    drive_token_over_buffer(self, &*PARSER_REGISTRY, &dummy_context),
                 )
                 .await
                 {
@@ -1028,7 +1028,7 @@ impl NetworkTransport {
                 }
             } else {
                 // No timeout - wait indefinitely
-                receive_token_internal(self, &*PARSER_REGISTRY, &dummy_context).await
+                drive_token_over_buffer(self, &*PARSER_REGISTRY, &dummy_context).await
             };
 
             match token_result {
@@ -1329,7 +1329,7 @@ impl TdsTokenStreamReader for NetworkTransport {
     ) -> TdsResult<Tokens> {
         let cancellable_receive_token = CancelHandle::run_until_cancelled(
             cancel_handle,
-            receive_token_internal(self, &*PARSER_REGISTRY, context),
+            drive_token_over_buffer(self, &*PARSER_REGISTRY, context),
         );
         let token_result = match remaining_request_timeout.as_ref() {
             Some(remaining_request_timeout) => {
