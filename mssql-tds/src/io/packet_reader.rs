@@ -9,6 +9,7 @@ use crate::core::TdsResult;
 use crate::datatypes::row_writer::RowWriter;
 use crate::io::packet_buffer::PacketBuffer;
 use crate::io::reader_writer::NetworkReaderWriter;
+use crate::io::token_stream::BufferedRowReader;
 use crate::message::attention::AttentionRequest;
 use crate::message::messages::Request;
 use crate::query::metadata::ColumnMetadata;
@@ -85,6 +86,7 @@ pub(crate) trait TdsPacketReader {
     /// a [`PacketBuffer`]); buffer-owning readers override this to `ensure` the
     /// whole bitmap and take it atomically. Read once at row entry and carried in
     /// `RowPauseState.nbc_null_bitmap` across pauses, so it is never re-read.
+    #[allow(dead_code)]
     async fn read_null_bitmap(&mut self, bitmap_len: usize) -> TdsResult<Vec<u8>> {
         let mut bitmap = vec![0u8; bitmap_len];
         self.read_bytes(&mut bitmap).await?;
@@ -672,6 +674,24 @@ impl TdsPacketReader for Box<dyn TdsPacketReader + Send + Sync> {
 
     async fn read_null_bitmap(&mut self, bitmap_len: usize) -> TdsResult<Vec<u8>> {
         (**self).read_null_bitmap(bitmap_len).await
+    }
+}
+
+#[async_trait]
+impl BufferedRowReader for PacketReader<'_> {
+    fn row_buffer_mut(&mut self) -> &mut PacketBuffer {
+        &mut self.buffer
+    }
+
+    async fn refill_row_buffer(&mut self) -> TdsResult<()> {
+        let before = self.buffer.available();
+        self.read_tds_packet().await?;
+        if self.buffer.available() <= before {
+            return Err(crate::error::Error::ProtocolError(
+                "TDS packet refill made no progress during row decode".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 

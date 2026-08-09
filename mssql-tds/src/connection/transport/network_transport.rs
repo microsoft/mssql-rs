@@ -19,8 +19,7 @@ use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
 use crate::io::token_stream::{
     ParserContext, PlpPauseState, RowPauseState, RowReadResult, TdsTokenStreamReader,
-    read_active_plp_bytes_internal, receive_row_into_internal, receive_token_internal,
-    resume_row_into_internal,
+    drive_row_over_buffer, read_active_plp_bytes_internal, receive_token_internal,
 };
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
@@ -1303,6 +1302,24 @@ impl TdsPacketReader for NetworkTransport {
 }
 
 #[async_trait]
+impl crate::io::token_stream::BufferedRowReader for NetworkTransport {
+    fn row_buffer_mut(&mut self) -> &mut crate::io::packet_buffer::PacketBuffer {
+        &mut self.tds_read_buffer
+    }
+
+    async fn refill_row_buffer(&mut self) -> TdsResult<()> {
+        let before = self.tds_read_buffer.available();
+        self.read_tds_packet().await?;
+        if self.tds_read_buffer.available() <= before {
+            return Err(crate::error::Error::ProtocolError(
+                "TDS packet refill made no progress during row decode".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl TdsTokenStreamReader for NetworkTransport {
     async fn receive_token(
         &mut self,
@@ -1345,7 +1362,7 @@ impl TdsTokenStreamReader for NetworkTransport {
     ) -> TdsResult<RowReadResult> {
         let cancellable = Box::pin(CancelHandle::run_until_cancelled(
             cancel_handle,
-            receive_row_into_internal(self, &*PARSER_REGISTRY, context, writer),
+            drive_row_over_buffer(self, &*PARSER_REGISTRY, context, None, writer),
         ));
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {
@@ -1374,9 +1391,18 @@ impl TdsTokenStreamReader for NetworkTransport {
         cancel_handle: Option<&CancelHandle>,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
+        // The resume path never reads a token/header, so the registry and
+        // context are inert; a `None` context satisfies the shared driver.
+        let resume_context = ParserContext::None(());
         let cancellable = Box::pin(CancelHandle::run_until_cancelled(
             cancel_handle,
-            resume_row_into_internal(self, pause_state, writer),
+            drive_row_over_buffer(
+                self,
+                &*PARSER_REGISTRY,
+                &resume_context,
+                Some(pause_state),
+                writer,
+            ),
         ));
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {

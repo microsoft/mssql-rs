@@ -6,7 +6,9 @@ use crate::datatypes::decoder::{
     GenericDecoder, PlpColumnStream, decrypt_cipher_value, decrypt_encrypted_column,
 };
 use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter, write_column_value};
+use crate::io::packet_buffer::PacketBuffer;
 use crate::io::packet_reader::TdsPacketReader;
+use crate::io::tds_core::{RowStep, TdsCore};
 use crate::query::metadata::ColumnMetadata;
 use crate::security::cell_decryptor::CellDecryptor;
 use crate::token::parsers::TokenParser;
@@ -86,6 +88,20 @@ pub struct RowPauseState {
     pub columns: Vec<ColumnMetadata>,
     pub nbc_null_bitmap: Option<Vec<u8>>,
     pub decryptor: Option<Arc<dyn CellDecryptor>>,
+}
+
+impl RowPauseState {
+    /// Clones this cursor advanced to `next_column_index`, carrying the column
+    /// metadata, NBCROW bitmap, and AE decryptor forward. Mirrors the pause-state
+    /// construction in the async oracle so the resume cursor is byte-identical.
+    pub(crate) fn resume_at(&self, next_column_index: usize) -> RowPauseState {
+        RowPauseState {
+            next_column_index,
+            columns: self.columns.clone(),
+            nbc_null_bitmap: self.nbc_null_bitmap.clone(),
+            decryptor: self.decryptor.clone(),
+        }
+    }
 }
 
 /// Active PLP stream state captured when row decoding is paused at a PLP column.
@@ -253,7 +269,7 @@ impl ParserContext {
     }
 }
 
-fn extract_row_context(context: &ParserContext) -> TdsResult<RowDecodeContext<'_>> {
+pub(crate) fn extract_row_context(context: &ParserContext) -> TdsResult<RowDecodeContext<'_>> {
     match context {
         ParserContext::ColumnMetadata(metadata, decryptor) => {
             Ok((&metadata.columns, decryptor.as_ref()))
@@ -320,7 +336,11 @@ pub(crate) async fn receive_token_internal<R: TdsPacketReader + Send + Sync>(
 
 /// Decodes columns starting at `start_col` for a plain ROW token.
 ///
-/// Shared by both the initial ROW path and the resume-from-pause path.
+/// Test/fuzzing-only reference oracle. Production row decoding runs through the
+/// synchronous [`TdsCore::step_row`] body driven by [`drive_row_over_buffer`];
+/// this async framing is retained only to differentially cross-check that body
+/// (via the buffer-owning `PacketReader` and the bufferless `TestByteReader`).
+#[cfg(any(test, fuzzing))]
 async fn decode_row_columns<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
     columns: &[ColumnMetadata],
@@ -385,6 +405,9 @@ async fn decode_row_columns<R: TdsPacketReader + Send + Sync>(
 }
 
 /// Decodes columns starting at `start_col` for an NBCROW token.
+///
+/// Test/fuzzing-only reference oracle (see [`decode_row_columns`]).
+#[cfg(any(test, fuzzing))]
 async fn decode_nbcrow_columns<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
     columns: &[ColumnMetadata],
@@ -527,6 +550,14 @@ async fn decode_non_plp_column<R: TdsPacketReader + Send + Sync>(
     }
 }
 
+/// Test/fuzzing-only reference oracle for a fresh row read.
+///
+/// Production reads run through [`drive_row_over_buffer`] over the synchronous
+/// [`TdsCore::step_row`] body. This async framing is retained to differentially
+/// cross-check that body: it is exercised by the buffer-owning `PacketReader`
+/// tests and the bufferless `TestByteReader` async-default tests, and by the
+/// `fuzzing` token stream reader.
+#[cfg(any(test, fuzzing))]
 pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
     registry: &impl TokenParserRegistry,
@@ -558,6 +589,10 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
 /// Resumes a paused row decode from `pause_state.next_column_index`.
 ///
 /// Does not read a token-type byte — the token has already been consumed.
+///
+/// Test/fuzzing-only reference oracle (see [`receive_row_into_internal`]); the
+/// production resume path drives [`TdsCore::step_row`] with a `Some` cursor.
+#[cfg(any(test, fuzzing))]
 pub(crate) async fn resume_row_into_internal<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
     pause_state: RowPauseState,
@@ -601,6 +636,141 @@ pub(crate) async fn read_active_plp_bytes_internal<R: TdsPacketReader + Send + S
     out: &mut [u8],
 ) -> TdsResult<usize> {
     plp_state.plp_stream.read_into(reader, out).await
+}
+
+/// A [`TdsPacketReader`] that owns its reassembly [`PacketBuffer`], so the sync
+/// [`TdsCore::step_row`] body can decode cells in place and the driver can lift
+/// the sole refill `.await` out to the column boundary.
+#[async_trait]
+pub(crate) trait BufferedRowReader: TdsPacketReader + Send + Sync {
+    /// The owned reassembly buffer that `step_row` decodes over.
+    fn row_buffer_mut(&mut self) -> &mut PacketBuffer;
+
+    /// Pulls one more TDS packet into the buffer, erroring (rather than
+    /// spinning) if the refill exposes no new bytes.
+    async fn refill_row_buffer(&mut self) -> TdsResult<()>;
+}
+
+/// Outcome of servicing one async-seam column via [`decode_async_row_column`].
+enum AsyncColumnOutcome {
+    /// The column was decoded eagerly; continue the row at `col + 1`.
+    Continue,
+    /// The row read terminated (paused or completed) at this column.
+    Terminal(RowReadResult),
+}
+
+/// Decodes one non-null column whose byte pull lives in an async seam.
+///
+/// This reproduces exactly one iteration of the [`decode_row_columns`] /
+/// [`decode_nbcrow_columns`] non-null body: the pre-payload PLP streaming-pause
+/// block (p7) and the eager [`decode_or_decrypt_column`] call (eager PLP, p4d
+/// legacy LOBs, rare fallback types, AE fallback), plus the post-column pause
+/// check. Calling `decode_or_decrypt_column` verbatim keeps the decoded value
+/// and the resume cursor byte-identical to the reference oracle.
+async fn decode_async_row_column<R: BufferedRowReader>(
+    reader: &mut R,
+    state: &RowPauseState,
+    col: usize,
+    writer: &mut (dyn RowWriter + Send),
+) -> TdsResult<AsyncColumnOutcome> {
+    let decoder = GenericDecoder::default();
+    let columns = &state.columns;
+    let meta = &columns[col];
+    let decryptor = state.decryptor.as_ref();
+    let len = columns.len();
+
+    if meta.is_plp() && writer.pause_after_column(col) {
+        // TODO: Add AE-aware PLP streaming path for paused row reads.
+        // Until then, fail fast to avoid streaming ciphertext bytes to callers.
+        if meta.crypto_metadata.is_some() {
+            return Err(crate::error::Error::UnimplementedFeature {
+                feature: "Always Encrypted paused PLP streaming".to_string(),
+                context: format!(
+                    "Encrypted PLP column '{}' cannot be streamed via read_active_plp_bytes yet.",
+                    meta.column_name
+                ),
+            });
+        }
+        match PlpColumnStream::begin(meta, reader).await? {
+            None => {
+                writer.write_null(col);
+                if col + 1 < len {
+                    return Ok(AsyncColumnOutcome::Terminal(RowReadResult::RowPaused(
+                        state.resume_at(col + 1),
+                    )));
+                }
+                return Ok(AsyncColumnOutcome::Terminal(RowReadResult::RowWritten));
+            }
+            Some(plp_stream) => {
+                return Ok(AsyncColumnOutcome::Terminal(RowReadResult::PlpPaused(
+                    PlpPauseState {
+                        row_pause_state: state.resume_at(col + 1),
+                        plp_stream,
+                    },
+                )));
+            }
+        }
+    }
+
+    decode_or_decrypt_column(&decoder, reader, meta, decryptor, col, writer).await?;
+    if writer.pause_after_column(col) && col + 1 < len {
+        return Ok(AsyncColumnOutcome::Terminal(RowReadResult::RowPaused(
+            state.resume_at(col + 1),
+        )));
+    }
+    Ok(AsyncColumnOutcome::Continue)
+}
+
+/// Production row-fetch driver: the single async shell over [`TdsCore::step_row`].
+///
+/// It owns the only `.await` on the row path — refilling the buffer on
+/// [`RowStep::NeedBytes`] and servicing an [`RowStep::AsyncColumn`] through the
+/// existing async seam — then re-drives the sync body from the shared cursor.
+/// `initial_resume` is `None` for a fresh row (the header is consumed) and
+/// `Some` for a resume-from-pause (the header is skipped); `registry` and
+/// `context` are inert on the resume path.
+pub(crate) async fn drive_row_over_buffer<R, Reg>(
+    reader: &mut R,
+    registry: &Reg,
+    context: &ParserContext,
+    initial_resume: Option<RowPauseState>,
+    writer: &mut (dyn RowWriter + Send),
+) -> TdsResult<RowReadResult>
+where
+    R: BufferedRowReader,
+    Reg: TokenParserRegistry,
+{
+    let mut resume = initial_resume;
+    loop {
+        let step = TdsCore::step_row(reader.row_buffer_mut(), &mut resume, context, writer)?;
+        match step {
+            RowStep::RowWritten => return Ok(RowReadResult::RowWritten),
+            RowStep::RowPaused(state) => return Ok(RowReadResult::RowPaused(state)),
+            RowStep::Token(token_type) => {
+                let token = dispatch_token(reader, registry, token_type, context).await?;
+                return Ok(RowReadResult::Token(token));
+            }
+            RowStep::NeedBytes(need) => {
+                tracing::trace!(
+                    shortfall = need.shortfall,
+                    "refilling row buffer for step_row"
+                );
+                reader.refill_row_buffer().await?;
+            }
+            RowStep::AsyncColumn { col } => {
+                let state = resume.as_ref().expect("row cursor set before AsyncColumn");
+                match decode_async_row_column(reader, state, col, writer).await? {
+                    AsyncColumnOutcome::Continue => {
+                        resume
+                            .as_mut()
+                            .expect("row cursor set before AsyncColumn")
+                            .next_column_index = col + 1;
+                    }
+                    AsyncColumnOutcome::Terminal(result) => return Ok(result),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(fuzzing)]
@@ -2201,6 +2371,494 @@ mod tests {
             assert_eq!(
                 got, baseline,
                 "fully-sync NBCROW row diverged when the refill boundary landed at offset {split}"
+            );
+        }
+    }
+
+    /// P4a blocking test 1: a fully-synchronous non-PLP ROW decoded through the
+    /// production `TdsCore::step_row` driver (`drive_row_over_buffer`) over the
+    /// buffer-owning `PacketReader`. Sweeping the refill boundary across every
+    /// interior offset (including the token byte, mid-length-prefix, and mid-cell)
+    /// must decode byte-identically to the single-packet baseline, proving the
+    /// sync core re-drives from an unchanged buffer position on every `NeedBytes`.
+    #[tokio::test]
+    async fn tdscore_step_row_refill_boundary_swept_all_offsets_is_byte_identical() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
+        use crate::message::messages::PacketType;
+
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        // [int4][varchar(64)][int2] — all non-PLP, all `is_supported`, so every
+        // cell is decoded inline by `step_row` with no `AsyncColumn` yield.
+        let columns = vec![
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: "n".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::BigVarChar,
+                type_info: TypeInfo::var_len_string(TdsDataType::BigVarChar, 64, Some(collation))
+                    .unwrap(),
+                column_name: "v".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int2,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int2).unwrap(),
+                column_name: "s".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+        ];
+
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend_from_slice(&7_i32.to_le_bytes());
+        let abc = [0x61u8, 0x62, 0x63]; // "abc"
+        payload.extend_from_slice(&(abc.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&abc);
+        payload.extend_from_slice(&0x1234_i16.to_le_bytes());
+
+        async fn decode(read_data: Vec<u8>, columns: &[ColumnMetadata]) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = drive_row_over_buffer(&mut reader, &registry, &context, None, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        fn one_packet(payload: &[u8]) -> Vec<u8> {
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            builder.append_bytes(payload).build()
+        }
+        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut first = first_builder.append_bytes(&payload[..split]).build();
+            first[1] = 0x00;
+            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let second = second_builder.append_bytes(&payload[split..]).build();
+            [first, second].concat()
+        }
+
+        let baseline = decode(one_packet(&payload), &columns).await;
+        assert_eq!(baseline.len(), 3);
+        assert_eq!(baseline[0], ColumnValues::Int(7));
+        assert_ne!(baseline[1], ColumnValues::Null);
+        assert_eq!(baseline[2], ColumnValues::SmallInt(0x1234));
+
+        for split in 1..payload.len() {
+            let got = decode(two_packets(&payload, split), &columns).await;
+            assert_eq!(
+                got, baseline,
+                "TdsCore driver diverged when the refill boundary landed at offset {split}"
+            );
+        }
+    }
+
+    /// P4a blocking test 2: an NBCROW decoded through the production `step_row`
+    /// driver, with nine columns forcing a two-byte null bitmap. Sweeping the
+    /// refill boundary lands it INSIDE the bitmap (offset 2 splits the two bitmap
+    /// bytes, offset 1 splits token-from-bitmap). This exercises the atomic
+    /// row-header step: a `NeedBytes` at the bitmap leaves the token unconsumed,
+    /// so the re-drive re-peeks the same token byte — proving the binding
+    /// condition holds with zero new resumable state.
+    #[tokio::test]
+    async fn tdscore_step_row_nbcrow_bitmap_split_across_refill_is_byte_identical() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
+        use crate::message::messages::PacketType;
+
+        let columns: Vec<ColumnMetadata> = (0..9)
+            .map(|i| ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: format!("c{i}"),
+                multi_part_name: None,
+                crypto_metadata: None,
+            })
+            .collect();
+
+        let null_cols = [0usize, 3, 8];
+        let present: [(usize, i32); 6] = [(1, 11), (2, 22), (4, 44), (5, 55), (6, 66), (7, 77)];
+        let mut bitmap = [0u8; 2];
+        for &c in &null_cols {
+            bitmap[c / 8] |= 1 << (c % 8);
+        }
+
+        let mut payload = vec![TokenType::NbcRow as u8];
+        payload.extend_from_slice(&bitmap);
+        for &(_, v) in &present {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+
+        async fn decode(read_data: Vec<u8>, columns: &[ColumnMetadata]) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = drive_row_over_buffer(&mut reader, &registry, &context, None, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        fn one_packet(payload: &[u8]) -> Vec<u8> {
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            builder.append_bytes(payload).build()
+        }
+        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut first = first_builder.append_bytes(&payload[..split]).build();
+            first[1] = 0x00;
+            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let second = second_builder.append_bytes(&payload[split..]).build();
+            [first, second].concat()
+        }
+
+        let baseline = decode(one_packet(&payload), &columns).await;
+        assert_eq!(baseline.len(), 9);
+        for &c in &null_cols {
+            assert_eq!(baseline[c], ColumnValues::Null, "column {c} should be NULL");
+        }
+        for &(c, v) in &present {
+            assert_eq!(baseline[c], ColumnValues::Int(v), "column {c} value");
+        }
+
+        for split in 1..payload.len() {
+            let got = decode(two_packets(&payload, split), &columns).await;
+            assert_eq!(
+                got, baseline,
+                "TdsCore NBCROW driver diverged when the refill boundary landed at offset {split}"
+            );
+        }
+    }
+
+    /// P4a blocking test 3 (Fork A): a ROW mixing an inline sync cell and an eager
+    /// PLP `varbinary(max)` cell, decoded through the production `step_row` driver.
+    /// The PLP cell is not `is_supported`, so `step_row` yields `AsyncColumn` and
+    /// the driver services it via the existing `collect_plp_bytes().await` seam,
+    /// then re-drives at the next column. Sweeping the refill boundary (including
+    /// inside the PLP chunk stream) must equal both the single-packet baseline and
+    /// the async reference oracle, proving the yield/resume seam is byte-identical.
+    #[tokio::test]
+    async fn tdscore_step_row_eager_plp_yields_and_resumes_at_next_column() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
+        use crate::message::messages::PacketType;
+
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let columns = vec![
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: "n".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::BigVarChar,
+                type_info: TypeInfo::var_len_string(TdsDataType::BigVarChar, 64, Some(collation))
+                    .unwrap(),
+                column_name: "v".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            plp_varbinary_metadata("b", None),
+        ];
+
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend_from_slice(&7_i32.to_le_bytes());
+        let ab = [0x61u8, 0x62]; // "ab"
+        payload.extend_from_slice(&(ab.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&ab);
+        payload.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // UNKNOWNLEN
+        let c0: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+        let c1: [u8; 3] = [0x01, 0x02, 0x03];
+        payload.extend_from_slice(&(c0.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&c0);
+        payload.extend_from_slice(&(c1.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&c1);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+
+        async fn decode_driver(
+            read_data: Vec<u8>,
+            columns: &[ColumnMetadata],
+        ) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = drive_row_over_buffer(&mut reader, &registry, &context, None, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        async fn decode_oracle(
+            read_data: Vec<u8>,
+            columns: &[ColumnMetadata],
+        ) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        fn one_packet(payload: &[u8]) -> Vec<u8> {
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            builder.append_bytes(payload).build()
+        }
+        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut first = first_builder.append_bytes(&payload[..split]).build();
+            first[1] = 0x00;
+            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let second = second_builder.append_bytes(&payload[split..]).build();
+            [first, second].concat()
+        }
+
+        let baseline = decode_driver(one_packet(&payload), &columns).await;
+        assert_eq!(baseline.len(), 3);
+        assert_eq!(baseline[0], ColumnValues::Int(7));
+        assert_ne!(baseline[1], ColumnValues::Null);
+        assert_eq!(
+            baseline[2],
+            ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03])
+        );
+        // The driver's yield/resume must match the async reference oracle exactly.
+        assert_eq!(
+            baseline,
+            decode_oracle(one_packet(&payload), &columns).await
+        );
+
+        for split in 1..payload.len() {
+            let got = decode_driver(two_packets(&payload, split), &columns).await;
+            assert_eq!(
+                got, baseline,
+                "TdsCore eager-PLP driver diverged when the refill boundary landed at offset {split}"
+            );
+        }
+    }
+
+    /// P4a blocking test 4: the resume-from-pause path. A `RowPauseState` positioned
+    /// mid-row is driven both through the production `step_row` driver (with a
+    /// `Some` cursor, which skips the header and decodes from `next_column_index`)
+    /// and through the `resume_row_into_internal` reference oracle. Sweeping the
+    /// refill boundary across the resumed cells must produce byte-identical rows,
+    /// proving the unified resume path matches the oracle and keeping that oracle
+    /// exercised under `cargo test`.
+    #[tokio::test]
+    async fn tdscore_resume_from_pause_is_byte_identical_and_matches_oracle() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
+        use crate::message::messages::PacketType;
+
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let columns = vec![
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: "n".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::BigVarChar,
+                type_info: TypeInfo::var_len_string(TdsDataType::BigVarChar, 64, Some(collation))
+                    .unwrap(),
+                column_name: "v".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: "m".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+        ];
+
+        // Resume at column 1: the wire holds only columns 1 (varchar) and 2 (int4);
+        // no token byte and no bitmap, exactly as the transport resume path feeds it.
+        let mut payload = Vec::new();
+        let ab = [0x61u8, 0x62]; // "ab"
+        payload.extend_from_slice(&(ab.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&ab);
+        payload.extend_from_slice(&99_i32.to_le_bytes());
+
+        fn pause_state(columns: &[ColumnMetadata]) -> RowPauseState {
+            RowPauseState {
+                next_column_index: 1,
+                columns: columns.to_vec(),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            }
+        }
+
+        async fn decode_driver(
+            read_data: Vec<u8>,
+            columns: &[ColumnMetadata],
+        ) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let registry = GenericTokenParserRegistry::default();
+            let context = ParserContext::None(());
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = drive_row_over_buffer(
+                &mut reader,
+                &registry,
+                &context,
+                Some(pause_state(columns)),
+                &mut writer,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        async fn decode_oracle(
+            read_data: Vec<u8>,
+            columns: &[ColumnMetadata],
+        ) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = resume_row_into_internal(&mut reader, pause_state(columns), &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        fn one_packet(payload: &[u8]) -> Vec<u8> {
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            builder.append_bytes(payload).build()
+        }
+        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut first = first_builder.append_bytes(&payload[..split]).build();
+            first[1] = 0x00;
+            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let second = second_builder.append_bytes(&payload[split..]).build();
+            [first, second].concat()
+        }
+
+        // Resuming at column 1 decodes only columns 1 (varchar) and 2 (int4);
+        // column 0 was written before the pause, so the resumed row holds 2 cells.
+        let baseline = decode_driver(one_packet(&payload), &columns).await;
+        assert_eq!(baseline.len(), 2);
+        assert_ne!(baseline[0], ColumnValues::Null);
+        assert_eq!(baseline[1], ColumnValues::Int(99));
+        assert_eq!(
+            baseline,
+            decode_oracle(one_packet(&payload), &columns).await
+        );
+
+        for split in 1..payload.len() {
+            let got = decode_driver(two_packets(&payload, split), &columns).await;
+            assert_eq!(
+                got, baseline,
+                "TdsCore resume driver diverged when the refill boundary landed at offset {split}"
+            );
+            let oracle = decode_oracle(two_packets(&payload, split), &columns).await;
+            assert_eq!(
+                got, oracle,
+                "resume driver vs oracle diverged at offset {split}"
             );
         }
     }
