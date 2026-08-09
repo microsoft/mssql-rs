@@ -226,14 +226,14 @@ mod rpc_results {
         let named_parameters = vec![database_id_param, compat_level_param];
 
         let handle = connection
-            .execute_sp_prepare_raw(query.to_string(), named_parameters, ())
+            .execute_sp_prepare_for_test(query.to_string(), named_parameters, ())
             .await
             .unwrap();
 
         assert!(handle > 0);
 
         // This should simply complete and be successful.
-        let result = connection.execute_sp_unprepare_raw(handle, ()).await;
+        let result = connection.execute_sp_unprepare_for_test(handle, ()).await;
         assert!(result.is_ok());
     }
 
@@ -258,14 +258,14 @@ mod rpc_results {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
         let handle = connection
-            .execute_sp_prepare_raw(query.to_string(), vec![db_name_param], ())
+            .execute_sp_prepare_for_test(query.to_string(), vec![db_name_param], ())
             .await
             .expect("sp_prepare should succeed for an NVARCHAR-parameterized statement");
 
         assert!(handle > 0, "expected a positive prepared statement handle");
 
         connection
-            .execute_sp_unprepare_raw(handle, ())
+            .execute_sp_unprepare_for_test(handle, ())
             .await
             .expect("sp_unprepare should succeed");
     }
@@ -280,7 +280,7 @@ mod rpc_results {
     async fn test_sp_unprepare_surfaces_server_error_on_invalid_handle() {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
-        let res = connection.execute_sp_unprepare_raw(0, ()).await;
+        let res = connection.execute_sp_unprepare_for_test(0, ()).await;
 
         match res {
             Ok(()) => panic!("Expected sp_unprepare to fail for handle 0"),
@@ -314,7 +314,7 @@ mod rpc_results {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
         let res = connection
-            .execute_sp_prepare_raw(invalid_sql.to_string(), vec![], ())
+            .execute_sp_prepare_for_test(invalid_sql.to_string(), vec![], ())
             .await;
 
         match res {
@@ -481,7 +481,7 @@ mod rpc_results {
         let param = RpcParameter::new(Some(param_name.to_string()), StatusFlags::NONE, value);
 
         let handle = connection
-            .execute_sp_prepare_raw(sql.clone(), vec![param.clone()], ())
+            .execute_sp_prepare_for_test(sql.clone(), vec![param.clone()], ())
             .await
             .unwrap_or_else(|err| {
                 panic!("sp_prepare failed for column `{column}`: {err}");
@@ -492,7 +492,7 @@ mod rpc_results {
         );
 
         connection
-            .execute_sp_execute_raw(handle, None, Some(vec![param]), ())
+            .execute_sp_execute_for_test(handle, None, Some(vec![param]), ())
             .await
             .unwrap_or_else(|err| {
                 panic!("sp_execute failed for column `{column}`: {err}");
@@ -508,7 +508,7 @@ mod rpc_results {
         };
 
         connection
-            .execute_sp_unprepare_raw(handle, ())
+            .execute_sp_unprepare_for_test(handle, ())
             .await
             .unwrap_or_else(|err| {
                 panic!("sp_unprepare failed for column `{column}`: {err}");
@@ -538,7 +538,7 @@ mod rpc_results {
 
         let mut drop_handle = None;
         connection
-            .execute_sp_prepexec_raw(
+            .execute_sp_prepexec_for_test(
                 query.to_string(),
                 named_parameters.clone(),
                 &mut drop_handle,
@@ -570,7 +570,7 @@ mod rpc_results {
 
         // Execute the prepared statement again
         connection
-            .execute_sp_execute_raw(retrieved_handle, None, Some(named_parameters), ())
+            .execute_sp_execute_for_test(retrieved_handle, None, Some(named_parameters), ())
             .await
             .unwrap();
 
@@ -582,7 +582,7 @@ mod rpc_results {
         }
 
         let result = connection
-            .execute_sp_unprepare_raw(retrieved_handle, ())
+            .execute_sp_unprepare_for_test(retrieved_handle, ())
             .await;
         assert!(result.is_ok());
     }
@@ -597,7 +597,7 @@ mod rpc_results {
         mut drop_handle: Option<i32>,
     ) -> i32 {
         connection
-            .execute_sp_prepexec_raw(sql.to_string(), vec![], &mut drop_handle, ())
+            .execute_sp_prepexec_for_test(sql.to_string(), vec![], &mut drop_handle, ())
             .await
             .unwrap();
 
@@ -636,7 +636,7 @@ mod rpc_results {
 
         // The returned handle runs the NEW statement.
         connection
-            .execute_sp_execute_raw(h2, None, None, ())
+            .execute_sp_execute_for_test(h2, None, None, ())
             .await
             .unwrap();
         let scalar = get_scalar_value(&mut connection).await.unwrap();
@@ -645,7 +645,10 @@ mod rpc_results {
             "re-prepared handle should run SELECT 2, got {scalar:?}"
         );
 
-        connection.execute_sp_unprepare_raw(h2, ()).await.unwrap();
+        connection
+            .execute_sp_unprepare_for_test(h2, ())
+            .await
+            .unwrap();
     }
 
     // Executes the query and reads till the end of the result.

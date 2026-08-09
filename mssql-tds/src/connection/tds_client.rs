@@ -551,7 +551,7 @@ impl TdsClient {
     /// when the socket is dead but the session state forbids recovery (e.g. an
     /// open transaction), and propagates any error raised by the underlying
     /// `reconnect()` attempt (including a timed-out or cancelled reconnect).
-    pub async fn check_and_reconnect(
+    pub(crate) async fn check_and_reconnect(
         &mut self,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
@@ -603,6 +603,16 @@ impl TdsClient {
         let start = Instant::now();
         self.reconnect(reconnect_timeout, cancel_handle).await?;
         Ok(start.elapsed())
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn check_and_reconnect_for_test(
+        &mut self,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Duration> {
+        self.check_and_reconnect(timeout_sec, cancel_handle).await
     }
 
     /// Charges elapsed recovery time against a command-timeout budget.
@@ -1267,9 +1277,9 @@ impl TdsClient {
     /// server-side handle.
     ///
     /// The returned `i32` handle can be passed to
-    /// [`execute_sp_execute_raw()`](Self::execute_sp_execute_raw) for repeated
+    /// [`execute_sp_execute()`](Self::execute_sp_execute) for repeated
     /// execution without re-parsing. Call
-    /// [`execute_sp_unprepare_raw()`](Self::execute_sp_unprepare_raw) when the handle
+    /// [`execute_sp_unprepare()`](Self::execute_sp_unprepare) when the handle
     /// is no longer needed.
     ///
     /// Drains the token stream internally — no rows are returned.
@@ -1284,17 +1294,18 @@ impl TdsClient {
     ///   `@params` declaration string passed to `sp_prepare`; any values
     ///   carried by the entries are ignored. Supply the actual parameter
     ///   values later on the matching
-    ///   [`execute_sp_execute_raw()`](Self::execute_sp_execute_raw) call.
+    ///   [`execute_sp_execute()`](Self::execute_sp_execute) call.
     /// # Recovery
     ///
-    /// Unlike the other public `_raw` prepared RPCs, this method reconnects
+    /// Unlike the other prepared RPCs, this method reconnects
     /// before sending. This is safe because `sp_prepare` accepts no existing
     /// handle that recovery could invalidate; the returned handle belongs to
     /// the resulting live session. Callers still own the bare handle and must
     /// not reuse it after a later reconnect. Prefer the managed
     /// [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
+    #[allow(dead_code)]
     #[instrument(skip(self, named_params, options), level = "info")]
-    pub async fn execute_sp_prepare_raw<'a>(
+    async fn execute_sp_prepare<'a>(
         &mut self,
         sql: String,
         named_params: Vec<RpcParameter>,
@@ -1437,8 +1448,8 @@ impl TdsClient {
     /// Releases a prepared statement handle via `sp_unprepare`.
     ///
     /// Frees server-side resources associated with the handle returned by
-    /// [`execute_sp_prepare_raw()`](Self::execute_sp_prepare_raw) or
-    /// [`execute_sp_prepexec_raw()`](Self::execute_sp_prepexec_raw).
+    /// [`execute_sp_prepare()`](Self::execute_sp_prepare) or
+    /// [`execute_sp_prepexec()`](Self::execute_sp_prepexec).
     ///
     /// # Recovery
     ///
@@ -1450,10 +1461,10 @@ impl TdsClient {
     /// stale one; on a dead connection the send just fails and is ignored
     /// (best-effort). Forcing recovery, if ever wanted, is the caller's job (see
     /// [`check_and_reconnect`](Self::check_and_reconnect)).
-    /// `_raw`: a low-level wire call with caller-owned recovery — prefer the
+    /// A low-level wire call with caller-owned recovery — prefer the
     /// managed [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
     #[instrument(skip(self, options), level = "info")]
-    pub async fn execute_sp_unprepare_raw<'a>(
+    async fn execute_sp_unprepare<'a>(
         &mut self,
         handle: i32,
         options: impl Into<ExecuteOptions<'a>>,
@@ -1559,7 +1570,7 @@ impl TdsClient {
 
         match plan_prepared_execution(statement.session_handle, *orphaned, epoch) {
             PreparedPlan::Reuse { handle_id } => {
-                self.execute_sp_execute_raw(handle_id, None, Some(named_params), opts)
+                self.execute_sp_execute(handle_id, None, Some(named_params), opts)
                     .await
             }
             PreparedPlan::Reprepare { drop_id } => {
@@ -1568,7 +1579,7 @@ impl TdsClient {
                 statement.session_handle = None;
                 let mut pending_drop_id = drop_id;
                 let result = self
-                    .execute_sp_prepexec_raw(
+                    .execute_sp_prepexec(
                         statement.sql.clone(),
                         named_params,
                         &mut pending_drop_id,
@@ -1620,14 +1631,14 @@ impl TdsClient {
         if handle.session_epoch != self.connection_recovery_count() {
             return Ok(());
         }
-        self.execute_sp_unprepare_raw(handle.id, options).await
+        self.execute_sp_unprepare(handle.id, options).await
     }
 
     /// Prepares and executes a parameterized statement in a single round-trip
     /// via `sp_prepexec`.
     ///
-    /// Combines [`execute_sp_prepare_raw()`](Self::execute_sp_prepare_raw) and
-    /// [`execute_sp_execute_raw()`](Self::execute_sp_execute_raw). The prepared handle
+    /// Combines [`execute_sp_prepare()`](Self::execute_sp_prepare) and
+    /// [`execute_sp_execute()`](Self::execute_sp_execute). The prepared handle
     /// is stored internally and can be retrieved with
     /// [`get_return_values()`](Self::get_return_values).
     ///
@@ -1660,10 +1671,10 @@ impl TdsClient {
     /// `drop_handle` only if so), then (3) calls this. Because the decision is
     /// made just before the send and this method won't reconnect underneath it,
     /// it can't prepare against a session the caller didn't account for.
-    /// `_raw`: a low-level wire call with caller-owned recovery — prefer the
+    /// A low-level wire call with caller-owned recovery — prefer the
     /// managed [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
     #[instrument(skip(self, named_params, options), level = "info")]
-    pub async fn execute_sp_prepexec_raw<'a>(
+    async fn execute_sp_prepexec<'a>(
         &mut self,
         sql: String,
         mut named_params: Vec<RpcParameter>,
@@ -1793,8 +1804,8 @@ impl TdsClient {
     /// Executes a previously prepared statement by handle via `sp_execute`.
     ///
     /// Re-uses the execution plan from an earlier
-    /// [`execute_sp_prepare_raw()`](Self::execute_sp_prepare_raw) or
-    /// [`execute_sp_prepexec_raw()`](Self::execute_sp_prepexec_raw) call.
+    /// [`execute_sp_prepare()`](Self::execute_sp_prepare) or
+    /// [`execute_sp_prepexec()`](Self::execute_sp_prepexec) call.
     /// Supply fresh parameter values through `positional_parameters` and/or
     /// `named_parameters`.
     ///
@@ -1807,13 +1818,13 @@ impl TdsClient {
     /// `handle` still belongs to the live session, then (3) calls this. Because
     /// the decision is made just before the send and this method won't reconnect
     /// underneath it, `handle` can't go stale mid-call.
-    /// `_raw`: a low-level wire call with caller-owned recovery — prefer the
+    /// A low-level wire call with caller-owned recovery — prefer the
     /// managed [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
     #[instrument(
         skip(self, positional_parameters, named_parameters, options),
         level = "info"
     )]
-    pub async fn execute_sp_execute_raw<'a>(
+    async fn execute_sp_execute<'a>(
         &mut self,
         handle: i32,
         mut positional_parameters: Option<Vec<RpcParameter>>,
@@ -1917,6 +1928,53 @@ impl TdsClient {
         rpc.serialize(&mut packet_writer).await?;
 
         self.position_on_first_result().await
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn execute_sp_prepare_for_test<'a>(
+        &mut self,
+        sql: String,
+        named_params: Vec<RpcParameter>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<i32> {
+        self.execute_sp_prepare(sql, named_params, options).await
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn execute_sp_unprepare_for_test<'a>(
+        &mut self,
+        handle: i32,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<()> {
+        self.execute_sp_unprepare(handle, options).await
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn execute_sp_prepexec_for_test<'a>(
+        &mut self,
+        sql: String,
+        named_params: Vec<RpcParameter>,
+        drop_handle: &mut Option<i32>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StatementResult> {
+        self.execute_sp_prepexec(sql, named_params, drop_handle, options)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn execute_sp_execute_for_test<'a>(
+        &mut self,
+        handle: i32,
+        positional_parameters: Option<Vec<RpcParameter>>,
+        named_parameters: Option<Vec<RpcParameter>>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StatementResult> {
+        self.execute_sp_execute(handle, positional_parameters, named_parameters, options)
+            .await
     }
 
     /// Collects a return value, capturing the `sp_prepexec` `@handle`
@@ -4759,7 +4817,7 @@ mod tests {
             line_number: None,
         }]);
 
-        client.execute_sp_unprepare_raw(1, ()).await.unwrap();
+        client.execute_sp_unprepare_for_test(1, ()).await.unwrap();
 
         let msgs = client.info_messages();
         assert!(
@@ -5718,7 +5776,7 @@ mod tests {
     async fn execute_sp_prepexec_clears_stale_metadata_when_no_result_set() {
         assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
             let mut drop_handle = None;
-            c.execute_sp_prepexec_raw(
+            c.execute_sp_prepexec_for_test(
                 "UPDATE t SET v = 1".to_string(),
                 Vec::new(),
                 &mut drop_handle,
@@ -5743,7 +5801,7 @@ mod tests {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
         let mut drop_handle = Some(0x5152_5354);
         client
-            .execute_sp_prepexec_raw(
+            .execute_sp_prepexec_for_test(
                 "UPDATE t SET v = 1".to_string(),
                 Vec::new(),
                 &mut drop_handle,
@@ -5766,7 +5824,7 @@ mod tests {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
         let mut drop_handle = None;
         client
-            .execute_sp_prepexec_raw(
+            .execute_sp_prepexec_for_test(
                 "UPDATE t SET v = 1".to_string(),
                 Vec::new(),
                 &mut drop_handle,
@@ -5792,7 +5850,7 @@ mod tests {
         let mut drop_handle = Some(7);
 
         let result = client
-            .execute_sp_prepexec_raw("SELECT 1".to_string(), Vec::new(), &mut drop_handle, ())
+            .execute_sp_prepexec_for_test("SELECT 1".to_string(), Vec::new(), &mut drop_handle, ())
             .await;
 
         assert!(result.is_err());
@@ -5805,7 +5863,7 @@ mod tests {
         let mut drop_handle = Some(7);
 
         let result = client
-            .execute_sp_prepexec_raw("SELECT 1".to_string(), Vec::new(), &mut drop_handle, ())
+            .execute_sp_prepexec_for_test("SELECT 1".to_string(), Vec::new(), &mut drop_handle, ())
             .await;
 
         assert!(result.is_err());
@@ -5875,7 +5933,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sp_execute_clears_stale_metadata_when_no_result_set() {
         assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
-            c.execute_sp_execute_raw(42, None, None, ()).await
+            c.execute_sp_execute_for_test(42, None, None, ()).await
         })
         .await;
     }

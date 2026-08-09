@@ -546,7 +546,7 @@ mod connectivity {
             // Prepare + execute "SELECT @P1" and capture the server-side handle.
             let mut drop_handle = None;
             client
-                .execute_sp_prepexec_raw(
+                .execute_sp_prepexec_for_test(
                     "SELECT @P1".to_string(),
                     vec![make_param()],
                     &mut drop_handle,
@@ -569,7 +569,7 @@ mod connectivity {
             exec_and_drain(&mut killer, &format!("KILL {}", spid)).await?;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            client.check_and_reconnect(None, None).await?;
+            client.check_and_reconnect_for_test(None, None).await?;
             assert_eq!(
                 client.connection_recovery_count(),
                 1,
@@ -579,7 +579,7 @@ mod connectivity {
             // Reusing the pre-reconnect handle must fail: it lived in the dead
             // session, so the new session rejects it with error 8179.
             let reuse = client
-                .execute_sp_execute_raw(handle, None, Some(vec![make_param()]), ())
+                .execute_sp_execute_for_test(handle, None, Some(vec![make_param()]), ())
                 .await;
             let err = reuse.expect_err("sp_execute on a superseded-session handle must fail");
             assert!(
@@ -593,7 +593,7 @@ mod connectivity {
             // remains usable once the caller re-prepares.
             let mut drop_handle = None;
             client
-                .execute_sp_prepexec_raw(
+                .execute_sp_prepexec_for_test(
                     "SELECT @P1".to_string(),
                     vec![make_param()],
                     &mut drop_handle,

@@ -1180,7 +1180,7 @@ mod always_encrypted {
             );
             let mut drop_handle = None;
             h.client
-                .execute_sp_prepexec_raw(
+                .execute_sp_prepexec_for_test(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
                     vec![param],
                     &mut drop_handle,
@@ -1215,7 +1215,7 @@ mod always_encrypted {
             );
             let handle = h
                 .client
-                .execute_sp_prepare_raw(
+                .execute_sp_prepare_for_test(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
                     vec![decl],
                     (),
@@ -1230,7 +1230,7 @@ mod always_encrypted {
                     SqlType::Int(Some(v)),
                 );
                 h.client
-                    .execute_sp_execute_raw(handle, None, Some(vec![param]), ())
+                    .execute_sp_execute_for_test(handle, None, Some(vec![param]), ())
                     .await
                     .expect("sp_execute with encrypted named parameter");
                 while h.client.advance_to_rows().await.unwrap() {}
@@ -1238,7 +1238,7 @@ mod always_encrypted {
             }
 
             h.client
-                .execute_sp_unprepare_raw(handle, ())
+                .execute_sp_unprepare_for_test(handle, ())
                 .await
                 .expect("unprepare");
 
@@ -1272,7 +1272,7 @@ mod always_encrypted {
             );
             let handle = h
                 .client
-                .execute_sp_prepare_raw(
+                .execute_sp_prepare_for_test(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
                     vec![decl],
                     (),
@@ -1283,14 +1283,14 @@ mod always_encrypted {
             // Positional (unnamed) value, matched to the declared @val by ordinal.
             let param = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(999)));
             h.client
-                .execute_sp_execute_raw(handle, Some(vec![param]), None, ())
+                .execute_sp_execute_for_test(handle, Some(vec![param]), None, ())
                 .await
                 .expect("sp_execute with positional encrypted parameter");
             while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             h.client
-                .execute_sp_unprepare_raw(handle, ())
+                .execute_sp_unprepare_for_test(handle, ())
                 .await
                 .expect("unprepare");
 
@@ -1332,7 +1332,7 @@ mod always_encrypted {
             ];
             let handle = h
                 .client
-                .execute_sp_prepare_raw(
+                .execute_sp_prepare_for_test(
                     format!("INSERT INTO {table} (a, b) VALUES (@a, @b);"),
                     decls,
                     (),
@@ -1352,14 +1352,14 @@ mod always_encrypted {
                 SqlType::Int(Some(22)),
             )];
             h.client
-                .execute_sp_execute_raw(handle, Some(positional), Some(named), ())
+                .execute_sp_execute_for_test(handle, Some(positional), Some(named), ())
                 .await
                 .expect("sp_execute with mixed positional and named encrypted params");
             while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             h.client
-                .execute_sp_unprepare_raw(handle, ())
+                .execute_sp_unprepare_for_test(handle, ())
                 .await
                 .expect("unprepare");
 
@@ -1391,7 +1391,7 @@ mod always_encrypted {
             );
             let err = h
                 .client
-                .execute_sp_execute_raw(999_999, None, Some(vec![param]), ())
+                .execute_sp_execute_for_test(999_999, None, Some(vec![param]), ())
                 .await
                 .expect_err("sp_execute with an unprepared handle must error under AE");
             assert!(

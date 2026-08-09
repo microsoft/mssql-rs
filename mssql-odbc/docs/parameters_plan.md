@@ -1,7 +1,7 @@
 # Parameterized execution - `SQLBindParameter` / `SQLExecute` / `SQLExecDirect`
 
 Status, behavior, and known gaps for parameterized prepared-statement execution
-in the ODBC Driver 18 (Rust). Updated 2026-08-07.
+in the ODBC Driver 18 (Rust). Updated 2026-08-09.
 
 ---
 
@@ -63,11 +63,6 @@ transparent reconnects.
 - `execute_prepared` owns recovery, timeout deduction, live-handle reuse,
   stale-handle invalidation, reprepare, and live-orphan piggyback planning.
   `unprepare` sends `sp_unprepare` only for a handle from the current session.
-- The low-level RPC methods are named `execute_sp_*_raw`. They remain public for
-  protocol integration tests and the prepared-query benchmark, but their
-  contract makes callers responsible for bare-handle/session validation.
-  `execute_sp_prepare_raw` is the recovery exception: it can reconnect safely
-  because it accepts no existing handle.
 - `sp_prepexec` captures its `@handle` RETURNVALUE separately from user output
   parameters. Always Encrypted describe metadata is retained until capture and
   pinned under the returned handle, allowing the next managed `sp_execute` to
@@ -90,14 +85,6 @@ transparent reconnects.
   [ADO 46631](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46631).
   Enable `StaleHandleAfterReconnectIsInvalidatedAndReprepared` afterward under
   [ADO 47099](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47099).
-- **Raw API visibility:** changing the four raw methods to `pub(crate)` is
-  mechanically trivial but currently breaks 34 external-crate call sites: 29
-  in three `mssql-tds` integration-test files and 5 in the separate
-  `mssql-tds-bench` crate. A hard privacy boundary requires relocating or
-  reworking those protocol tests and deciding whether the raw prepared
-  benchmark is removed, changed to the managed API, or supported through a
-  deliberately unstable low-level surface. Treat this as separate breaking API
-  work, not part of the ODBC migration.
 
 ## Remaining work
 
