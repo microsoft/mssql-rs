@@ -464,14 +464,25 @@ async fn decode_or_decrypt_column<R: TdsPacketReader + Send + Sync>(
             if crate::datatypes::sync_decoder::is_supported(meta) {
                 // Non-PLP ciphertext: buffer + decode the cipher cell atomically
                 // via the shared sync step, then run the synchronous cell
-                // decryptor and write the plaintext. PLP ciphertext
-                // (varbinary(max)) falls through to the async path (L4b).
+                // decryptor and write the plaintext.
                 let mut cipher_cell = DefaultRowWriter::new(1);
                 reader.decode_column_into(meta, 0, &mut cipher_cell).await?;
                 let cipher = cipher_cell
                     .take_row()
                     .pop()
                     .unwrap_or(crate::datatypes::column_values::ColumnValues::Null);
+                let value = decrypt_cipher_value(meta, dec, cipher)?;
+                write_column_value(writer, col, value);
+            } else if meta.is_plp() {
+                // PLP ciphertext (varbinary(max)): collect the whole ciphertext
+                // via the sync PLP core, then run the synchronous decryptor.
+                // Whole-value materialization before decrypt is required (AE
+                // needs the full cipher block); only the byte pull is inverted
+                // to the sync buffer, mirroring the non-PLP AE fold above.
+                let cipher = match reader.collect_plp_bytes().await? {
+                    Some(bytes) => crate::datatypes::column_values::ColumnValues::Bytes(bytes),
+                    None => crate::datatypes::column_values::ColumnValues::Null,
+                };
                 let value = decrypt_cipher_value(meta, dec, cipher)?;
                 write_column_value(writer, col, value);
             } else {

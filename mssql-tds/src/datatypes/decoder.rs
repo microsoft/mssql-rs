@@ -197,7 +197,7 @@ pub(crate) struct PlpChunkStreamReader {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl PlpChunkStreamReader {
-    fn new(length: PlpChunkReadLength) -> Self {
+    pub(crate) fn new(length: PlpChunkReadLength) -> Self {
         Self {
             length,
             chunk_remaining: 0,
@@ -211,6 +211,18 @@ impl PlpChunkStreamReader {
         reader: &mut (dyn TdsPacketReader + Send + Sync),
     ) -> TdsResult<Option<Self>> {
         let raw_len_i64 = reader.read_int64().await?;
+        Ok(Self::classify_length(raw_len_i64)?.map(Self::new))
+    }
+
+    /// Classifies the 8-byte PLP length/sentinel header (already read) into a
+    /// [`PlpChunkReadLength`], or `None` for the SQL NULL sentinel.
+    ///
+    /// Byte-source-agnostic leaf shared by both refill drivers: the async
+    /// [`begin`](Self::begin) (over `read_int64().await`) and the synchronous
+    /// PLP driver (over `PacketBuffer::take_i64_le`). Keeping the sentinel and
+    /// declared-length validation here is what stops the framing from drifting
+    /// between the two drivers.
+    pub(crate) fn classify_length(raw_len_i64: i64) -> TdsResult<Option<PlpChunkReadLength>> {
         let raw_len = raw_len_i64 as u64;
         let raw_len_usize = raw_len as usize;
 
@@ -218,21 +230,19 @@ impl PlpChunkStreamReader {
             return Ok(None);
         }
 
-        let length = if raw_len_usize == GenericDecoder::SQL_PLP_UNKNOWNLEN
+        if raw_len_usize == GenericDecoder::SQL_PLP_UNKNOWNLEN
             || raw_len_usize == GenericDecoder::SQL_PLP_MAXLEN
         {
-            PlpChunkReadLength::Unknown
-        } else {
-            let declared_len = raw_len as usize;
-            if raw_len_i64 < 0 || declared_len > MAX_PLP_SIZE {
-                return Err(crate::error::Error::ProtocolError(format!(
-                    "PLP length {declared_len} (raw i64: {raw_len_i64}) exceeds maximum allowed size of {MAX_PLP_SIZE} bytes"
-                )));
-            }
-            PlpChunkReadLength::Known(raw_len)
-        };
+            return Ok(Some(PlpChunkReadLength::Unknown));
+        }
 
-        Ok(Some(Self::new(length)))
+        let declared_len = raw_len as usize;
+        if raw_len_i64 < 0 || declared_len > MAX_PLP_SIZE {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "PLP length {declared_len} (raw i64: {raw_len_i64}) exceeds maximum allowed size of {MAX_PLP_SIZE} bytes"
+            )));
+        }
+        Ok(Some(PlpChunkReadLength::Known(raw_len)))
     }
 
     pub(crate) fn total_read(&self) -> usize {
@@ -243,19 +253,21 @@ impl PlpChunkStreamReader {
         self.reached_end
     }
 
-    async fn ensure_active_chunk(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<bool> {
-        if self.reached_end {
-            return Ok(false);
-        }
+    /// Bytes still owed in the current chunk before its header must be re-read.
+    pub(crate) fn chunk_remaining(&self) -> usize {
+        self.chunk_remaining
+    }
 
-        if self.chunk_remaining > 0 {
-            return Ok(true);
-        }
-
-        let chunk_len = reader.read_uint32().await? as usize;
+    /// Applies a just-read 4-byte chunk-length prefix to the stream state.
+    ///
+    /// Byte-source-agnostic leaf shared by both refill drivers: the async
+    /// [`ensure_active_chunk`](Self::ensure_active_chunk) and the synchronous
+    /// PLP driver both read the raw `u32` their own way, then converge here for
+    /// the terminator handling and every guard (chunk count, chunk size,
+    /// accumulation overflow, `MAX_PLP_SIZE`, declared-length checks). Returns
+    /// `Ok(false)` for the zero-length terminator (marking the stream ended) and
+    /// `Ok(true)` once a non-empty chunk is armed.
+    pub(crate) fn on_chunk_header(&mut self, chunk_len: usize) -> TdsResult<bool> {
         if chunk_len == 0 {
             self.reached_end = true;
             if let PlpChunkReadLength::Known(known_len) = self.length
@@ -310,6 +322,30 @@ impl PlpChunkStreamReader {
         Ok(true)
     }
 
+    /// Advances the cursors after `n` payload bytes were copied out of the
+    /// current chunk. Shared leaf: both drivers pull chunk bytes their own way
+    /// (`read_bytes().await` vs `PacketBuffer::copy_out`) and account here.
+    pub(crate) fn note_read(&mut self, n: usize) {
+        self.chunk_remaining -= n;
+        self.total_read += n;
+    }
+
+    async fn ensure_active_chunk(
+        &mut self,
+        reader: &mut (dyn TdsPacketReader + Send + Sync),
+    ) -> TdsResult<bool> {
+        if self.reached_end {
+            return Ok(false);
+        }
+
+        if self.chunk_remaining > 0 {
+            return Ok(true);
+        }
+
+        let chunk_len = reader.read_uint32().await? as usize;
+        self.on_chunk_header(chunk_len)
+    }
+
     pub(crate) async fn read_into(
         &mut self,
         reader: &mut (dyn TdsPacketReader + Send + Sync),
@@ -338,8 +374,7 @@ impl PlpChunkStreamReader {
                 ));
             }
 
-            self.chunk_remaining -= bytes_read;
-            self.total_read += bytes_read;
+            self.note_read(bytes_read);
             written += bytes_read;
         }
 
@@ -358,9 +393,9 @@ impl PlpChunkStreamReader {
     ) -> TdsResult<()> {
         while self.ensure_active_chunk(reader).await? {
             if self.chunk_remaining > 0 {
-                reader.skip_bytes(self.chunk_remaining).await?;
-                self.total_read += self.chunk_remaining;
-                self.chunk_remaining = 0;
+                let n = self.chunk_remaining;
+                reader.skip_bytes(n).await?;
+                self.note_read(n);
             }
         }
         Ok(())
@@ -996,7 +1031,7 @@ impl GenericDecoder {
     /// size guards live in [`PlpChunkStreamReader`], so this stays a thin
     /// accumulation loop over the shared streaming reader instead of a second
     /// copy of the chunk-decoding logic.
-    async fn collect_plp<T>(reader: &mut T) -> TdsResult<Option<Vec<u8>>>
+    pub(crate) async fn collect_plp<T>(reader: &mut T) -> TdsResult<Option<Vec<u8>>>
     where
         T: TdsPacketReader + Send + Sync,
     {
@@ -1058,7 +1093,7 @@ impl GenericDecoder {
             }
 
             // === PLP binary (varbinary(max)); non-PLP binary uses the sync path. ===
-            TdsDataType::BigVarBinary => match GenericDecoder::collect_plp(reader).await? {
+            TdsDataType::BigVarBinary => match reader.collect_plp_bytes().await? {
                 Some(bytes) => writer.write_bytes(col, bytes),
                 None => writer.write_null(col),
             },
@@ -1171,7 +1206,7 @@ impl SqlTypeDecode for GenericDecoder {
             }
             TdsDataType::BigVarBinary => {
                 if metadata.is_plp() {
-                    let some_bytes = GenericDecoder::collect_plp(reader).await?;
+                    let some_bytes = reader.collect_plp_bytes().await?;
                     match some_bytes {
                         Some(bytes) => ColumnValues::Bytes(bytes),
                         None => ColumnValues::Null,
@@ -1199,7 +1234,7 @@ impl SqlTypeDecode for GenericDecoder {
                         "XML column metadata is not partially-length-prefixed".to_string(),
                     ));
                 }
-                let some_bytes = GenericDecoder::collect_plp(reader).await?;
+                let some_bytes = reader.collect_plp_bytes().await?;
                 match some_bytes {
                     Some(bytes) => ColumnValues::Xml(SqlXml { bytes }),
                     None => ColumnValues::Null,
@@ -1211,7 +1246,7 @@ impl SqlTypeDecode for GenericDecoder {
                         "JSON column metadata is not partially-length-prefixed".to_string(),
                     ));
                 }
-                let some_bytes = GenericDecoder::collect_plp(reader).await?;
+                let some_bytes = reader.collect_plp_bytes().await?;
                 match some_bytes {
                     Some(bytes) => ColumnValues::Json(SqlJson::new(bytes)),
                     None => ColumnValues::Null,
@@ -1350,7 +1385,7 @@ impl SqlTypeDecode for GenericDecoder {
                         "UDT column metadata is not partially-length-prefixed".to_string(),
                     ));
                 }
-                let some_bytes = GenericDecoder::collect_plp(reader).await?;
+                let some_bytes = reader.collect_plp_bytes().await?;
                 match some_bytes {
                     Some(bytes) => ColumnValues::Bytes(bytes),
                     None => ColumnValues::Null,
@@ -1419,7 +1454,7 @@ impl StringDecoder {
         let encoding_type = get_encoding_type(metadata);
 
         if metadata.is_plp() {
-            match GenericDecoder::collect_plp(reader).await? {
+            match reader.collect_plp_bytes().await? {
                 Some(bytes) => writer.write_string(col, SqlString::new(bytes, encoding_type)),
                 None => writer.write_null(col),
             }
@@ -1474,7 +1509,7 @@ impl SqlTypeDecode for StringDecoder {
 
         // If Plp Column. (BIGVARCHARTYPE, BIGVARBINARYTYPE, NVARCHARTYPE with md.length == ushort.max)
         if metadata.is_plp() {
-            let some_bytes = GenericDecoder::collect_plp(reader).await?;
+            let some_bytes = reader.collect_plp_bytes().await?;
             match some_bytes {
                 Some(bytes) => Ok(ColumnValues::String(SqlString::new(bytes, encoding_type))),
                 None => Ok(ColumnValues::Null),

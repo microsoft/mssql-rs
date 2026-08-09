@@ -1115,6 +1115,30 @@ impl TdsPacketReader for NetworkTransport {
         }
     }
 
+    async fn collect_plp_bytes(&mut self) -> TdsResult<Option<Vec<u8>>> {
+        use crate::datatypes::decoder::PlpChunkStreamReader;
+        use crate::datatypes::sync_decoder::{PlpProgress, plp_collect_step};
+
+        // Sync PLP driver over the owned read buffer: classify the 8-byte header,
+        // then pull one chunk header / body slice at a time. Residency stays
+        // bounded to ~one packet — the whole value is never ensured into the
+        // buffer. Refill is lifted to `ensure_or_refill`.
+        self.ensure_or_refill(8).await?;
+        let raw = self.tds_read_buffer.take_i64_le()?;
+        let mut plp = match PlpChunkStreamReader::classify_length(raw)? {
+            None => return Ok(None),
+            Some(len) => PlpChunkStreamReader::new(len),
+        };
+
+        let mut out = Vec::new();
+        loop {
+            match plp_collect_step(&mut plp, &mut self.tds_read_buffer, &mut out)? {
+                PlpProgress::Done => return Ok(Some(out)),
+                PlpProgress::NeedMore(n) => self.ensure_or_refill(n).await?,
+            }
+        }
+    }
+
     async fn read_byte(&mut self) -> TdsResult<u8> {
         self.ensure_or_refill(1).await?;
         self.tds_read_buffer.take_u8()

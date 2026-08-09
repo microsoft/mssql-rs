@@ -77,6 +77,21 @@ pub(crate) trait TdsPacketReader {
             cell.extend_from_slice(&extra);
         }
     }
+
+    /// Collects a whole PLP value into one `Vec`, returning `None` for SQL NULL.
+    ///
+    /// The eager PLP counterpart to [`decode_column_into`]. The default runs the
+    /// shared async framing (`GenericDecoder::collect_plp`) for readers that do
+    /// not own a [`PacketBuffer`]; buffer-owning readers override this to drive
+    /// the synchronous chunk-at-a-time PLP core in place. There is a single
+    /// framing body — the override differs only in pulling bytes via `take_*`
+    /// instead of `read_*().await`.
+    async fn collect_plp_bytes(&mut self) -> TdsResult<Option<Vec<u8>>>
+    where
+        Self: Sized + Send + Sync,
+    {
+        crate::datatypes::decoder::GenericDecoder::collect_plp(self).await
+    }
 }
 
 /// Low-level TDS packet reading operations (public under `fuzzing` cfg).
@@ -140,6 +155,21 @@ pub trait TdsPacketReader {
             self.read_bytes(&mut extra).await?;
             cell.extend_from_slice(&extra);
         }
+    }
+
+    /// Collects a whole PLP value into one `Vec`, returning `None` for SQL NULL.
+    ///
+    /// The eager PLP counterpart to [`decode_column_into`]. The default runs the
+    /// shared async framing (`GenericDecoder::collect_plp`) for readers that do
+    /// not own a [`PacketBuffer`]; buffer-owning readers override this to drive
+    /// the synchronous chunk-at-a-time PLP core in place. There is a single
+    /// framing body — the override differs only in pulling bytes via `take_*`
+    /// instead of `read_*().await`.
+    async fn collect_plp_bytes(&mut self) -> TdsResult<Option<Vec<u8>>>
+    where
+        Self: Sized + Send + Sync,
+    {
+        crate::datatypes::decoder::GenericDecoder::collect_plp(self).await
     }
 }
 
@@ -291,6 +321,31 @@ impl TdsPacketReader for PacketReader<'_> {
                     return sync_decoder::decode_column_body(&mut self.buffer, meta, col, writer);
                 }
                 Err(need) => self.ensure(need.shortfall).await?,
+            }
+        }
+    }
+
+    async fn collect_plp_bytes(&mut self) -> TdsResult<Option<Vec<u8>>> {
+        use crate::datatypes::decoder::PlpChunkStreamReader;
+        use crate::datatypes::sync_decoder::{PlpProgress, plp_collect_step};
+
+        // Sync PLP driver over the owned buffer: classify the 8-byte header, then
+        // pull one chunk header / body slice at a time. Residency stays bounded
+        // to ~one packet — the whole (possibly multi-GB) value is never ensured
+        // into the buffer. Refill is lifted to `ensure`, which carries the
+        // forward-progress debug_assert.
+        self.ensure(8).await?;
+        let raw = self.buffer.take_i64_le()?;
+        let mut plp = match PlpChunkStreamReader::classify_length(raw)? {
+            None => return Ok(None),
+            Some(len) => PlpChunkStreamReader::new(len),
+        };
+
+        let mut out = Vec::new();
+        loop {
+            match plp_collect_step(&mut plp, &mut self.buffer, &mut out)? {
+                PlpProgress::Done => return Ok(Some(out)),
+                PlpProgress::NeedMore(n) => self.ensure(n).await?,
             }
         }
     }

@@ -19,7 +19,7 @@ use crate::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime,
 };
-use crate::datatypes::decoder::{DecimalParts, MAX_ALLOC_SIZE};
+use crate::datatypes::decoder::{DecimalParts, MAX_ALLOC_SIZE, PlpChunkStreamReader};
 use crate::datatypes::row_writer::{RowWriter, write_column_value};
 use crate::datatypes::sql_string::{EncodingType, SqlString, get_encoding_type};
 use crate::datatypes::sqldatatypes::{FixedLengthTypes, TdsDataType, TypeInfoVariant};
@@ -330,6 +330,79 @@ pub(crate) fn decode_column_body(
         }
     }
     Ok(())
+}
+
+/// Outcome of one synchronous PLP collection step.
+pub(crate) enum PlpProgress {
+    /// The zero-length terminator was consumed; the value is fully collected.
+    Done,
+    /// The buffer was exhausted mid-header or mid-chunk. The driver must refill
+    /// at least `shortfall` more bytes and re-drive. All resume state lives in
+    /// the [`PlpChunkStreamReader`], so the re-drive continues exactly where it
+    /// left off with nothing lost.
+    NeedMore(usize),
+}
+
+/// Drains currently-buffered PLP bytes into `out`, advancing the resumable
+/// [`PlpChunkStreamReader`] one chunk at a time.
+///
+/// This is the synchronous refill-driver counterpart to the async
+/// [`PlpChunkStreamReader::read_into`] loop: it pulls bytes from an owned
+/// [`PacketBuffer`] via `take_*`/`copy_out` instead of `read_*().await`, sharing
+/// the exact framing leaves ([`PlpChunkStreamReader::on_chunk_header`],
+/// [`PlpChunkStreamReader::note_read`]) so no chunk-decoding logic is duplicated.
+///
+/// The atomic unit is the **chunk**: this `ensure`s only a 4-byte chunk-length
+/// prefix or a slice of the current chunk body — **never the whole value** — so
+/// `PacketBuffer` residency stays bounded to ~one packet regardless of total
+/// value size (a `varchar(max)` may be multi-GB). The chunk boundary is the
+/// natural yield point for a future streamed-LOB byte-budget cap (p7); L4b
+/// leaves the boundary visible but builds no budget policy.
+///
+/// Protocol/guard violations surface via `?` from the shared leaves. `out`
+/// accumulates the whole value (unchanged eager-collect behavior); only *where*
+/// the wire bytes are pulled changes.
+pub(crate) fn plp_collect_step(
+    plp: &mut PlpChunkStreamReader,
+    buf: &mut PacketBuffer,
+    out: &mut Vec<u8>,
+) -> TdsResult<PlpProgress> {
+    loop {
+        if plp.reached_end() {
+            return Ok(PlpProgress::Done);
+        }
+
+        if plp.chunk_remaining() == 0 {
+            // Need the next 4-byte chunk-length prefix before more body bytes.
+            // `NeedMore` carries the ABSOLUTE header width (not the buffer's
+            // delta shortfall) so the driver's `ensure(4)` refills whenever fewer
+            // than 4 bytes are buffered — including when the prefix straddles a
+            // packet boundary. A delta would let `ensure` no-op and spin.
+            if buf.ensure(4).is_err() {
+                return Ok(PlpProgress::NeedMore(4));
+            }
+            let chunk_len = buf.take_u32_le()? as usize;
+            if !plp.on_chunk_header(chunk_len)? {
+                return Ok(PlpProgress::Done);
+            }
+            continue;
+        }
+
+        let available = buf.available();
+        if available == 0 {
+            // Mid-chunk exhaustion: ask for one more byte. The refill exposes a
+            // whole packet, so residency stays chunk/packet-bounded rather than
+            // ballooning to the whole value.
+            return Ok(PlpProgress::NeedMore(1));
+        }
+
+        let take = plp.chunk_remaining().min(available);
+        let start = out.len();
+        out.resize(start + take, 0);
+        let copied = buf.copy_out(&mut out[start..]);
+        debug_assert_eq!(copied, take, "copy_out drained fewer bytes than available");
+        plp.note_read(copied);
+    }
 }
 
 fn scale_of(meta: &ColumnMetadata, type_name: &str) -> TdsResult<u8> {
