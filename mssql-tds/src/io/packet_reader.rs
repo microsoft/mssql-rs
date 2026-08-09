@@ -78,6 +78,19 @@ pub(crate) trait TdsPacketReader {
         }
     }
 
+    /// Reads the NBCROW fixed-width null-bitmap (`bitmap_len` bytes) at row entry.
+    ///
+    /// A fixed-width read like the scalar cells, not a resumable machine: the
+    /// default assembles the bitmap via `read_bytes` (for readers that do not own
+    /// a [`PacketBuffer`]); buffer-owning readers override this to `ensure` the
+    /// whole bitmap and take it atomically. Read once at row entry and carried in
+    /// `RowPauseState.nbc_null_bitmap` across pauses, so it is never re-read.
+    async fn read_null_bitmap(&mut self, bitmap_len: usize) -> TdsResult<Vec<u8>> {
+        let mut bitmap = vec![0u8; bitmap_len];
+        self.read_bytes(&mut bitmap).await?;
+        Ok(bitmap)
+    }
+
     /// Collects a whole PLP value into one `Vec`, returning `None` for SQL NULL.
     ///
     /// The eager PLP counterpart to [`decode_column_into`]. The default runs the
@@ -155,6 +168,19 @@ pub trait TdsPacketReader {
             self.read_bytes(&mut extra).await?;
             cell.extend_from_slice(&extra);
         }
+    }
+
+    /// Reads the NBCROW fixed-width null-bitmap (`bitmap_len` bytes) at row entry.
+    ///
+    /// A fixed-width read like the scalar cells, not a resumable machine: the
+    /// default assembles the bitmap via `read_bytes` (for readers that do not own
+    /// a [`PacketBuffer`]); buffer-owning readers override this to `ensure` the
+    /// whole bitmap and take it atomically. Read once at row entry and carried in
+    /// `RowPauseState.nbc_null_bitmap` across pauses, so it is never re-read.
+    async fn read_null_bitmap(&mut self, bitmap_len: usize) -> TdsResult<Vec<u8>> {
+        let mut bitmap = vec![0u8; bitmap_len];
+        self.read_bytes(&mut bitmap).await?;
+        Ok(bitmap)
     }
 
     /// Collects a whole PLP value into one `Vec`, returning `None` for SQL NULL.
@@ -356,6 +382,15 @@ impl TdsPacketReader for PacketReader<'_> {
             attention.create_packet_writer(self.network_reader_writer.as_writer(), None, None);
         attention.serialize(&mut packet_writer).await?;
         Ok(())
+    }
+
+    async fn read_null_bitmap(&mut self, bitmap_len: usize) -> TdsResult<Vec<u8>> {
+        // Fixed-width sync read over the owned buffer: ensure the whole bitmap is
+        // resident, then take it atomically. `ensure` loops the refill (carrying
+        // the forward-progress debug_assert); the take is all-or-nothing, so a
+        // short buffer re-drives from row entry with nothing partial copied.
+        self.ensure(bitmap_len).await?;
+        self.buffer.take_bytes(bitmap_len)
     }
 
     async fn read_byte(&mut self) -> TdsResult<u8> {
@@ -633,6 +668,10 @@ impl TdsPacketReader for Box<dyn TdsPacketReader + Send + Sync> {
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<()> {
         (**self).decode_column_into(meta, col, writer).await
+    }
+
+    async fn read_null_bitmap(&mut self, bitmap_len: usize) -> TdsResult<Vec<u8>> {
+        (**self).read_null_bitmap(bitmap_len).await
     }
 }
 

@@ -545,8 +545,7 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
         TokenType::NbcRow => {
             let (columns, decryptor) = extract_row_context(context)?;
             let bitmap_len = columns.len().div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_len];
-            reader.read_bytes(&mut bitmap).await?;
+            let bitmap = reader.read_null_bitmap(bitmap_len).await?;
             decode_nbcrow_columns(reader, columns, decryptor, &bitmap, 0, writer).await
         }
         _ => {
@@ -1982,6 +1981,226 @@ mod tests {
             assert_eq!(
                 got, baseline,
                 "fully-sync mixed row diverged when the refill boundary landed at offset {split}"
+            );
+        }
+    }
+
+    /// Mandatory blocking test (L4c A): the NBCROW fixed-width null-bitmap read
+    /// inverted to the sync `PacketBuffer` core. Nine columns force a two-byte
+    /// bitmap (`bitmap_len = 2`), so sweeping the refill boundary across every
+    /// interior offset lands it INSIDE the multi-byte bitmap (offset 2 splits the
+    /// two bitmap bytes). Every split must decode byte-identically to the
+    /// single-packet baseline, proving `read_null_bitmap` ensures/refills
+    /// mid-bitmap and takes the whole bitmap atomically before decoding columns.
+    #[tokio::test]
+    async fn nbcrow_bitmap_read_resumes_byte_identical_across_refill_boundary() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
+        use crate::message::messages::PacketType;
+
+        let columns: Vec<ColumnMetadata> = (0..9)
+            .map(|i| ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: format!("c{i}"),
+                multi_part_name: None,
+                crypto_metadata: None,
+            })
+            .collect();
+
+        // Columns 0, 3, 8 are NULL via the bitmap (bit set == NULL); the other
+        // six carry an int4 value in column order. bitmap_len = ceil(9/8) = 2.
+        let null_cols = [0usize, 3, 8];
+        let present: [(usize, i32); 6] = [(1, 11), (2, 22), (4, 44), (5, 55), (6, 66), (7, 77)];
+        let mut bitmap = [0u8; 2];
+        for &c in &null_cols {
+            bitmap[c / 8] |= 1 << (c % 8);
+        }
+
+        let mut payload = vec![TokenType::NbcRow as u8];
+        payload.extend_from_slice(&bitmap);
+        for &(_, v) in &present {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+
+        async fn decode(read_data: Vec<u8>, columns: &[ColumnMetadata]) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        fn one_packet(payload: &[u8]) -> Vec<u8> {
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            builder.append_bytes(payload).build()
+        }
+        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut first = first_builder.append_bytes(&payload[..split]).build();
+            first[1] = 0x00; // clear EOM so the buffer reads into the second packet
+            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let second = second_builder.append_bytes(&payload[split..]).build();
+            [first, second].concat()
+        }
+
+        let baseline = decode(one_packet(&payload), &columns).await;
+        assert_eq!(baseline.len(), 9);
+        for &c in &null_cols {
+            assert_eq!(baseline[c], ColumnValues::Null, "column {c} should be NULL");
+        }
+        for &(c, v) in &present {
+            assert_eq!(baseline[c], ColumnValues::Int(v), "column {c} value");
+        }
+
+        // Sweep the refill boundary across every interior offset. Offset 2 splits
+        // the two-byte bitmap; later offsets land between columns and mid-int4.
+        for split in 1..payload.len() {
+            let got = decode(two_packets(&payload, split), &columns).await;
+            assert_eq!(
+                got, baseline,
+                "NBCROW decode diverged when the refill boundary landed at offset {split}"
+            );
+        }
+    }
+
+    /// Mandatory blocking test (L4c B): a fully-sync NBCROW row mixing every cell
+    /// class — a column NULL'd via the bitmap, non-PLP inverted cells (`int4` +
+    /// `varchar(64)`, L4a sync step), and a PLP `varbinary(max)` (L4b sync collect)
+    /// — decoded through the buffer-owning `PacketReader`. After L4c the whole
+    /// NBCROW eager row is sync: bitmap (this layer) + non-PLP (L4a) + PLP (L4b).
+    /// The refill boundary is swept across every interior offset, including the
+    /// bitmap end, the column transitions, and inside the PLP chunk; every split
+    /// must decode byte-identically to the single-packet baseline.
+    #[tokio::test]
+    async fn fully_sync_nbcrow_mixed_row_is_byte_identical_across_refill_boundary() {
+        use crate::datatypes::column_values::ColumnValues;
+        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::io::packet_reader::PacketReader;
+        use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
+        use crate::message::messages::PacketType;
+
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        // [int4 present][int4 NULL via bitmap][varchar(64) present][varbinary(max) PLP present]
+        let columns = vec![
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: "n".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::Int4,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                column_name: "z".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::BigVarChar,
+                type_info: TypeInfo::var_len_string(TdsDataType::BigVarChar, 64, Some(collation))
+                    .unwrap(),
+                column_name: "v".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            },
+            plp_varbinary_metadata("b", None),
+        ];
+
+        // NBCROW: bitmap NULLs column 1; then int4=7, varchar "ab", varbinary(max)
+        // PLP two chunks. bitmap_len = ceil(4/8) = 1.
+        let mut payload = vec![TokenType::NbcRow as u8, 0b0000_0010];
+        payload.extend_from_slice(&7_i32.to_le_bytes());
+        let ab = [0x61u8, 0x62]; // "ab"
+        payload.extend_from_slice(&(ab.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&ab);
+        payload.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFE_u64.to_le_bytes()); // UNKNOWNLEN
+        let c0: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+        let c1: [u8; 3] = [0x01, 0x02, 0x03];
+        payload.extend_from_slice(&(c0.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&c0);
+        payload.extend_from_slice(&(c1.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&c1);
+        payload.extend_from_slice(&0u32.to_le_bytes()); // zero-length terminator
+
+        async fn decode(read_data: Vec<u8>, columns: &[ColumnMetadata]) -> Vec<ColumnValues> {
+            let mut mock = MockNetworkReaderWriter::new(read_data, 0);
+            let mut reader = PacketReader::new(&mut mock);
+            reader.read_tds_packet_for_test().await.unwrap();
+            let context = ParserContext::ColumnMetadata(
+                Arc::new(ColMetadataToken {
+                    column_count: columns.len() as u16,
+                    columns: columns.to_vec(),
+                    cek_table: vec![],
+                }),
+                None,
+            );
+            let registry = GenericTokenParserRegistry::default();
+            let mut writer = DefaultRowWriter::new(columns.len());
+            let result = receive_row_into_internal(&mut reader, &registry, &context, &mut writer)
+                .await
+                .unwrap();
+            assert!(matches!(result, RowReadResult::RowWritten));
+            writer.take_row()
+        }
+
+        fn one_packet(payload: &[u8]) -> Vec<u8> {
+            let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+            builder.append_bytes(payload).build()
+        }
+        fn two_packets(payload: &[u8], split: usize) -> Vec<u8> {
+            let mut first_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let mut first = first_builder.append_bytes(&payload[..split]).build();
+            first[1] = 0x00;
+            let mut second_builder = TestPacketBuilder::new(PacketType::PreLogin);
+            let second = second_builder.append_bytes(&payload[split..]).build();
+            [first, second].concat()
+        }
+
+        let baseline = decode(one_packet(&payload), &columns).await;
+        assert_eq!(baseline.len(), 4);
+        assert_eq!(baseline[0], ColumnValues::Int(7));
+        assert_eq!(baseline[1], ColumnValues::Null);
+        assert_ne!(baseline[2], ColumnValues::Null); // varchar "ab"
+        assert_eq!(
+            baseline[3],
+            ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03])
+        );
+
+        for split in 1..payload.len() {
+            let got = decode(two_packets(&payload, split), &columns).await;
+            assert_eq!(
+                got, baseline,
+                "fully-sync NBCROW row diverged when the refill boundary landed at offset {split}"
             );
         }
     }

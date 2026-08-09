@@ -1144,6 +1144,15 @@ impl TdsPacketReader for NetworkTransport {
         self.tds_read_buffer.take_u8()
     }
 
+    async fn read_null_bitmap(&mut self, bitmap_len: usize) -> TdsResult<Vec<u8>> {
+        // Fixed-width sync read over the owned read buffer: ensure the whole
+        // bitmap is resident, then take it atomically. Refill is lifted to
+        // `ensure_or_refill`; the take is all-or-nothing, so a short buffer
+        // re-drives from row entry with nothing partial copied.
+        self.ensure_or_refill(bitmap_len).await?;
+        self.tds_read_buffer.take_bytes(bitmap_len)
+    }
+
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
         self.ensure_or_refill(2).await?;
         self.tds_read_buffer.take_i16_be()

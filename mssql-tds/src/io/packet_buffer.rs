@@ -155,6 +155,15 @@ impl PacketBuffer {
         Ok(self.take(1)?[0])
     }
 
+    /// Atomically consumes and returns the next `n` readable bytes.
+    ///
+    /// The owned counterpart to the scalar `take_*` accessors: callers `ensure`
+    /// residency first, so a shortfall here is a logic error, not a request for
+    /// more data. The take is all-or-nothing — nothing is consumed on error.
+    pub(crate) fn take_bytes(&mut self, n: usize) -> TdsResult<Vec<u8>> {
+        Ok(self.take(n)?.to_vec())
+    }
+
     pub(crate) fn take_i16_be(&mut self) -> TdsResult<i16> {
         Ok(BigEndian::read_i16(self.take(2)?))
     }
