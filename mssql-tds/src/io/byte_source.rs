@@ -208,3 +208,161 @@ pub(crate) async fn assemble_tds_packet<S: ByteSource + ?Sized>(
 
     Ok(packet_size_from_header)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex};
+
+    /// A `Stream` over one half of a tokio duplex. When the paired peer never
+    /// writes, a read parks `Pending` forever, letting a test exercise the
+    /// receive-edge deadline and cancel policy in isolation.
+    struct MockStream {
+        inner: DuplexStream,
+    }
+
+    fn mock_stream() -> (MockStream, DuplexStream) {
+        let (client, server) = duplex(1024);
+        (MockStream { inner: client }, server)
+    }
+
+    impl AsyncRead for MockStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for MockStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, data)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl Stream for MockStream {
+        fn tls_handshake_starting(&mut self) {}
+        fn tls_handshake_completed(&mut self) {}
+    }
+
+    /// The lifted request deadline must still fire the same `TimeoutError(Elapsed)`
+    /// at the socket-read edge, and must leave the connection alive because the
+    /// timed-out read future is dropped rather than completing as EOF/error.
+    #[tokio::test]
+    async fn receive_deadline_elapsed_yields_timeout_and_keeps_connection_alive() {
+        // Paused clock: the read parks forever (peer never writes), so the
+        // runtime auto-advances to the deadline and fires it deterministically.
+        tokio::time::pause();
+        let (mut stream, _peer) = mock_stream();
+        let mut known_dead = false;
+        let guard = ReceiveGuard::new(Some(Duration::from_millis(50)), None);
+        let mut source = AsyncByteSource::new(&mut stream, &mut known_dead, guard);
+
+        let mut buffer = [0u8; 16];
+        let err = source
+            .receive(&mut buffer)
+            .await
+            .expect_err("a receive past the deadline must time out");
+
+        assert!(
+            matches!(err, TimeoutError(TimeoutErrorType::Elapsed(_))),
+            "expected TimeoutError(Elapsed), got {err:?}"
+        );
+        assert!(
+            !known_dead,
+            "a timeout drops the read future and must not mark the connection dead"
+        );
+    }
+
+    /// A cancel signalled through the `ReceiveGuard` must interrupt an in-flight
+    /// receive with the same `OperationCancelledError`, again without marking the
+    /// connection dead.
+    #[tokio::test]
+    async fn receive_cancelled_yields_operation_cancelled_and_keeps_connection_alive() {
+        let (mut stream, _peer) = mock_stream();
+        let mut known_dead = false;
+
+        let handle = CancelHandle::new();
+        handle.cancel_token.cancel();
+        let guard = ReceiveGuard::new(None, Some(&handle));
+        let mut source = AsyncByteSource::new(&mut stream, &mut known_dead, guard);
+
+        let mut buffer = [0u8; 16];
+        let err = source
+            .receive(&mut buffer)
+            .await
+            .expect_err("a cancelled request must interrupt the receive");
+
+        assert!(
+            matches!(err, crate::error::Error::OperationCancelledError(_)),
+            "expected OperationCancelledError, got {err:?}"
+        );
+        assert!(
+            !known_dead,
+            "a cancellation drops the read future and must not mark the connection dead"
+        );
+    }
+
+    /// With a far-future deadline and data ready, the guard is transparent: the
+    /// receive returns the bytes unchanged and leaves the connection alive.
+    #[tokio::test]
+    async fn receive_within_deadline_is_transparent() {
+        let (mut stream, mut peer) = mock_stream();
+        peer.write_all(&[1, 2, 3, 4]).await.unwrap();
+
+        let mut known_dead = false;
+        let guard = ReceiveGuard::new(Some(Duration::from_secs(3600)), None);
+        let mut source = AsyncByteSource::new(&mut stream, &mut known_dead, guard);
+
+        let mut buffer = [0u8; 16];
+        let n = source
+            .receive(&mut buffer)
+            .await
+            .expect("data available before the deadline reads Ok");
+
+        assert_eq!(n, 4);
+        assert_eq!(&buffer[..4], &[1, 2, 3, 4]);
+        assert!(!known_dead);
+    }
+
+    /// The guard wrap must not disturb the EOF path: a peer-closed read still
+    /// returns `Ok(0)` and marks the connection dead so the caller turns it into
+    /// a `ConnectionClosed`.
+    #[tokio::test]
+    async fn receive_eof_returns_zero_and_marks_connection_dead() {
+        let (mut stream, peer) = mock_stream();
+        drop(peer); // peer closed → the next read observes EOF
+
+        let mut known_dead = false;
+        let mut source =
+            AsyncByteSource::new(&mut stream, &mut known_dead, ReceiveGuard::default());
+
+        let mut buffer = [0u8; 16];
+        let n = source
+            .receive(&mut buffer)
+            .await
+            .expect("EOF is reported as Ok(0), not an error");
+
+        assert_eq!(n, 0);
+        assert!(known_dead, "EOF must mark the connection dead");
+    }
+}
