@@ -178,8 +178,9 @@ pub(super) fn flush_pending_unprepare(
     let Some(handle) = pending else {
         return;
     };
-    // `unprepare` is epoch-aware: a handle from a superseded session is already
-    // gone server-side, so it is dropped locally without an RPC.
+    // `unprepare` recovers a dead connection first, then drops the handle only
+    // if it still belongs to the (recovered) session — a superseded handle is
+    // already gone server-side and is skipped without an RPC.
     if let Err(e) = dbc.runtime.block_on(client.unprepare(handle, ())) {
         error!(%e, "{op}: sp_unprepare failed — handle leaked until disconnect");
     }

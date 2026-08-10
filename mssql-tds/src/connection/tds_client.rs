@@ -1463,25 +1463,32 @@ impl TdsClient {
     /// [`check_and_reconnect`](Self::check_and_reconnect)).
     /// A low-level wire call with caller-owned recovery — prefer the
     /// managed [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
+    ///
+    /// `command_started`: `true` when the caller already opened the command
+    /// boundary via `begin_command` (as `unprepare` does before recovery, so the
+    /// reconnect's info messages survive); `false` opens it here. It does not
+    /// affect recovery — this method never reconnects.
     #[instrument(skip(self, options), level = "info")]
     async fn execute_sp_unprepare<'a>(
         &mut self,
         handle: i32,
+        command_started: bool,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
-            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
-        };
+        if !command_started {
+            if self.execution_context.has_open_batch() {
+                return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+            }
+            self.begin_command();
+        }
+        // No reconnect here — recovery is caller-owned (see this method's
+        // `# Recovery` docs).
 
         let ExecuteOptions {
             timeout: timeout_sec,
             cancel: cancel_handle,
             ..
         } = options.into();
-
-        self.begin_command();
-        // No reconnect here — recovery is caller-owned (see this method's
-        // `# Recovery` docs).
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -1563,6 +1570,15 @@ impl TdsClient {
         orphaned: &mut Option<PreparedHandle>,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        // Open the command boundary before recovery so a transparent reconnect's
+        // login info messages land in this command's buffer; the inner RPC skips
+        // its own `begin_command` via `command_started`.
+        self.begin_command();
+
         let mut opts = options.into();
         let reconnect_elapsed = self.check_and_reconnect(opts.timeout, opts.cancel).await?;
         opts.timeout = Self::deduct_timeout(opts.timeout, reconnect_elapsed);
@@ -1570,7 +1586,7 @@ impl TdsClient {
 
         match plan_prepared_execution(statement.session_handle, *orphaned, epoch) {
             PreparedPlan::Reuse { handle_id } => {
-                self.execute_sp_execute(handle_id, None, Some(named_params), opts)
+                self.execute_sp_execute(handle_id, None, Some(named_params), true, opts)
                     .await
             }
             PreparedPlan::Reprepare { drop_id } => {
@@ -1583,6 +1599,7 @@ impl TdsClient {
                         statement.sql.clone(),
                         named_params,
                         &mut pending_drop_id,
+                        true,
                         opts,
                     )
                     .await;
@@ -1618,20 +1635,36 @@ impl TdsClient {
 
     /// Releases a prepared-statement `handle` via `sp_unprepare`.
     ///
-    /// A handle from a superseded session is already gone server-side, so it is
-    /// skipped (no RPC). Never reconnects — releasing a handle on a freshly
-    /// recovered session would hit error 8179. The caller extracts the handle
-    /// with [`PreparedStatement::take_session_handle`], so a statement with no
-    /// live handle never reaches here.
+    /// Recovers a dead connection first (charging the elapsed time against the
+    /// command budget), then releases the handle only if it still belongs to the
+    /// possibly recovered session. A handle from a superseded session is
+    /// already gone server-side, so it is skipped with no RPC. This mirrors
+    /// msodbcsql's `DropPrepHandle`, which recovers via `GetBatchCtxOrRecover`
+    /// and sends `sp_unprepare` only when the statement's connection id still
+    /// matches the recovered connection. The caller extracts the handle with
+    /// [`PreparedStatement::take_session_handle`], so a statement with no live
+    /// handle never reaches here.
     pub async fn unprepare<'a>(
         &mut self,
         handle: PreparedHandle,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<()> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        // Open the command boundary before recovery so a transparent reconnect's
+        // login info messages land in this command's buffer; the inner RPC skips
+        // its own `begin_command` via `command_started`.
+        self.begin_command();
+
+        let mut opts = options.into();
+        let reconnect_elapsed = self.check_and_reconnect(opts.timeout, opts.cancel).await?;
+        opts.timeout = Self::deduct_timeout(opts.timeout, reconnect_elapsed);
         if handle.session_epoch != self.connection_recovery_count() {
             return Ok(());
         }
-        self.execute_sp_unprepare(handle.id, options).await
+        self.execute_sp_unprepare(handle.id, true, opts).await
     }
 
     /// Prepares and executes a parameterized statement in a single round-trip
@@ -1673,17 +1706,28 @@ impl TdsClient {
     /// it can't prepare against a session the caller didn't account for.
     /// A low-level wire call with caller-owned recovery — prefer the
     /// managed [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
+    ///
+    /// `command_started`: `true` when the caller already opened the command
+    /// boundary via `begin_command` (as `execute_prepared` does before recovery,
+    /// so the reconnect's info messages survive); `false` opens it here. It does
+    /// not affect recovery — this method never reconnects.
     #[instrument(skip(self, named_params, options), level = "info")]
     async fn execute_sp_prepexec<'a>(
         &mut self,
         sql: String,
         mut named_params: Vec<RpcParameter>,
         drop_handle: &mut Option<i32>,
+        command_started: bool,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
-        if self.execution_context.has_open_batch() {
-            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
-        };
+        if !command_started {
+            if self.execution_context.has_open_batch() {
+                return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+            }
+            self.begin_command();
+        }
+        // No reconnect here — recovery is caller-owned (see this method's
+        // `# Recovery` docs).
 
         let ExecuteOptions {
             timeout: timeout_sec,
@@ -1691,10 +1735,6 @@ impl TdsClient {
             column_encryption,
         } = options.into();
         self.current_command_ce_setting = column_encryption;
-
-        self.begin_command();
-        // No reconnect here — recovery is caller-owned (see this method's
-        // `# Recovery` docs).
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -1820,6 +1860,11 @@ impl TdsClient {
     /// underneath it, `handle` can't go stale mid-call.
     /// A low-level wire call with caller-owned recovery — prefer the
     /// managed [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
+    ///
+    /// `command_started`: `true` when the caller already opened the command
+    /// boundary via `begin_command` (as `execute_prepared` does before recovery,
+    /// so the reconnect's info messages survive); `false` opens it here. It does
+    /// not affect recovery — this method never reconnects.
     #[instrument(
         skip(self, positional_parameters, named_parameters, options),
         level = "info"
@@ -1829,11 +1874,17 @@ impl TdsClient {
         handle: i32,
         mut positional_parameters: Option<Vec<RpcParameter>>,
         mut named_parameters: Option<Vec<RpcParameter>>,
+        command_started: bool,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
-        if self.execution_context.has_open_batch() {
-            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
-        };
+        if !command_started {
+            if self.execution_context.has_open_batch() {
+                return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+            }
+            self.begin_command();
+        }
+        // No reconnect here — recovery is caller-owned (see this method's
+        // `# Recovery` docs).
 
         let ExecuteOptions {
             timeout: timeout_sec,
@@ -1841,10 +1892,6 @@ impl TdsClient {
             column_encryption,
         } = options.into();
         self.current_command_ce_setting = column_encryption;
-
-        self.begin_command();
-        // No reconnect here — recovery is caller-owned (see this method's
-        // `# Recovery` docs).
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -1948,7 +1995,7 @@ impl TdsClient {
         handle: i32,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<()> {
-        self.execute_sp_unprepare(handle, options).await
+        self.execute_sp_unprepare(handle, false, options).await
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -1960,7 +2007,7 @@ impl TdsClient {
         drop_handle: &mut Option<i32>,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
-        self.execute_sp_prepexec(sql, named_params, drop_handle, options)
+        self.execute_sp_prepexec(sql, named_params, drop_handle, false, options)
             .await
     }
 
@@ -1973,8 +2020,14 @@ impl TdsClient {
         named_parameters: Option<Vec<RpcParameter>>,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
-        self.execute_sp_execute(handle, positional_parameters, named_parameters, options)
-            .await
+        self.execute_sp_execute(
+            handle,
+            positional_parameters,
+            named_parameters,
+            false,
+            options,
+        )
+        .await
     }
 
     /// Collects a return value, capturing the `sp_prepexec` `@handle`
@@ -5272,12 +5325,14 @@ mod tests {
             .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
             .await;
 
-        assert!(result.is_err());
+        // Re-entering with an open batch is the local usage error, reported
+        // before any recovery I/O, leaving the caller's orphan untouched.
+        assert!(matches!(result, Err(UsageError(_))));
         assert_eq!(orphaned, Some(handle(9, 0)));
     }
 
     #[tokio::test]
-    async fn execute_prepared_discards_stale_orphan_on_pre_send_error() {
+    async fn execute_prepared_open_batch_guard_is_epoch_agnostic() {
         let mut client = create_test_client();
         client.execution_context.set_has_open_batch(true);
         let mut statement = PreparedStatement::new("SELECT 1");
@@ -5287,8 +5342,10 @@ mod tests {
             .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
             .await;
 
-        assert!(result.is_err());
-        assert_eq!(orphaned, None);
+        // The guard rejects before planning, so the orphan's session epoch is
+        // irrelevant and its slot is left intact.
+        assert!(matches!(result, Err(UsageError(_))));
+        assert_eq!(orphaned, Some(handle(9, 1)));
     }
 
     // ── PreparedStatement lifecycle: unprepare / capture_prepared_handle_into ──
@@ -5339,6 +5396,33 @@ mod tests {
             bytes.windows(expected.len()).any(|w| w == expected),
             "a live handle must be released by sending sp_unprepare with its id on the wire"
         );
+    }
+
+    #[tokio::test]
+    async fn unprepare_open_batch_returns_usage_error_before_io() {
+        // Parity with execute_prepared: the open-batch guard is a local check
+        // reported before any recovery I/O.
+        let mut client = create_test_client();
+        client.execution_context.set_has_open_batch(true);
+
+        let result = client.unprepare(handle(5, 0), ()).await;
+
+        assert!(matches!(result, Err(UsageError(_))));
+    }
+
+    #[tokio::test]
+    async fn unprepare_propagates_reconnect_error_when_unrecoverable() {
+        // Recover-first parity with msodbcsql: a dead, unrecoverable connection
+        // (open transaction) fails recovery, so unprepare surfaces that error
+        // instead of sending sp_unprepare on a dead socket. The ODBC layer
+        // swallows it best-effort.
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        client.execution_context.set_transaction_descriptor(42);
+
+        let result = client.unprepare(handle(5, 0), ()).await;
+
+        assert!(result.is_err());
     }
 
     #[test]
