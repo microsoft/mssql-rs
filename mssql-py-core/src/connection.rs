@@ -6,14 +6,13 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::{path::PathBuf, sync::Arc};
 use tokio::runtime::Runtime;
-use tokio::sync::Mutex;
 
 use crate::odbc_auth::odbc_authentication_transformer::transform_auth;
 use crate::odbc_auth::odbc_authentication_validator::validate_auth;
+use crate::pyclient::{self, SharedClient};
 use crate::python_logger_adapter::scoped_tracing_bridge;
 use mssql_tds::{
     connection::client_context::{ClientContext, IPAddressPreference},
-    connection::tds_client::TdsClient,
     connection_provider::tds_connection_provider::TdsConnectionProvider,
     core::{EncryptionOptions, EncryptionSetting},
     message::login_options::ApplicationIntent,
@@ -26,7 +25,7 @@ const DEFAULT_LIBRARY_NAME: &str = "MS-PYTHON";
 pub struct PyCoreConnection {
     #[allow(dead_code)] // Used for async operations in cursor execute
     runtime: Runtime,
-    tds_client: Option<Arc<Mutex<TdsClient>>>,
+    tds_client: Option<SharedClient>,
     is_closed: bool,
 }
 
@@ -82,7 +81,7 @@ impl PyCoreConnection {
                 tracing::info!("Successfully connected to SQL Server");
                 Ok(PyCoreConnection {
                     runtime,
-                    tds_client: Some(Arc::new(Mutex::new(client))),
+                    tds_client: Some(pyclient::new_shared(client)),
                     is_closed: false,
                 })
             }
@@ -97,14 +96,13 @@ impl PyCoreConnection {
 
     fn close(&mut self) -> PyResult<()> {
         if !self.is_closed {
-            // Send TDS close to the server and shut down the TCP connection
-            if let Some(client) = self.tds_client.take() {
-                self.runtime.block_on(async {
-                    let mut guard = client.lock().await;
-                    if let Err(e) = guard.close_connection().await {
-                        tracing::warn!("Error closing connection: {}", e);
-                    }
-                });
+            // Send TDS close to the server and shut down the TCP connection.
+            // Revert any live sync edge to async first (control-plane op).
+            if let Some(cell) = self.tds_client.take() {
+                let handle = self.runtime.handle().clone();
+                if let Err(e) = pyclient::close_connection(&cell, &handle) {
+                    tracing::warn!("Error closing connection: {}", e);
+                }
             }
             self.is_closed = true;
         }
@@ -120,6 +118,22 @@ impl PyCoreConnection {
             // Pass runtime handle to cursor so it can use the same runtime
             let handle = self.runtime.handle().clone();
             Ok(crate::cursor::PyCoreCursor::new(client.clone(), handle))
+        } else {
+            Err(PyRuntimeError::new_err("No active connection"))
+        }
+    }
+
+    fn sync_cursor(&self) -> PyResult<crate::sync_cursor::PyCoreSyncCursor> {
+        if self.is_closed {
+            return Err(PyRuntimeError::new_err("Connection is closed"));
+        }
+
+        if let Some(client) = &self.tds_client {
+            let handle = self.runtime.handle().clone();
+            Ok(crate::sync_cursor::PyCoreSyncCursor::new(
+                client.clone(),
+                handle,
+            ))
         } else {
             Err(PyRuntimeError::new_err("No active connection"))
         }
