@@ -139,6 +139,22 @@ impl PyCoreConnection {
         }
     }
 
+    fn async_cursor(&self) -> PyResult<crate::async_cursor::PyCoreAsyncCursor> {
+        if self.is_closed {
+            return Err(PyRuntimeError::new_err("Connection is closed"));
+        }
+
+        if let Some(client) = &self.tds_client {
+            let handle = self.runtime.handle().clone();
+            Ok(crate::async_cursor::PyCoreAsyncCursor::new(
+                client.clone(),
+                handle,
+            ))
+        } else {
+            Err(PyRuntimeError::new_err("No active connection"))
+        }
+    }
+
     fn commit(&mut self) -> PyResult<()> {
         if self.is_closed {
             return Err(PyRuntimeError::new_err("Connection is closed"));

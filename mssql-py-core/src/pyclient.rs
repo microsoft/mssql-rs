@@ -8,7 +8,9 @@
 //! drives every control-plane op (connect, execute, COLMETADATA, advance,
 //! close, bulk copy). A sync cursor flips the cell to the reactor-free
 //! [`TdsSyncClient`] for its row-pull hot loop and reverts before the next
-//! control-plane op; the async cursor never flips and always uses the async arm.
+//! control-plane op; the default `block_on` cursor and the coroutine
+//! [`PyCoreAsyncCursor`](crate::async_cursor::PyCoreAsyncCursor) never flip and
+//! always use the async arm.
 //!
 //! The flip runs IN PLACE under the lock via [`std::mem::replace`], so the `Arc`
 //! clones each cursor holds keep pointing at the same cell. `into_sync`/
@@ -17,10 +19,12 @@
 //! the L6 structural blocker (live cursor clones) is sidestepped entirely.
 //!
 //! A [`std::sync::Mutex`] (not tokio) backs the cell so the sync arm acquires
-//! the lock with no `.await`, keeping its fetch path reactor-free. Async-arm ops
-//! still wrap their `.await` work in `block_on` while holding the guard on the
-//! current thread; `block_on` runs to completion on one thread, so the `!Send`
-//! guard held across it is sound.
+//! the lock with no `.await`, keeping its fetch path reactor-free. The default
+//! cursor's async-arm ops wrap their `.await` work in `block_on` while holding
+//! the guard on the current thread; `block_on` runs to completion on one thread,
+//! so the `!Send` guard held across it is sound. The coroutine cursor instead
+//! checks the owned client out of the cell (dropping the guard before any
+//! `.await`) via [`with_async_client`], so its path never calls `block_on`.
 
 use std::sync::{Arc, Mutex};
 
@@ -240,4 +244,66 @@ pub(crate) fn close_connection(cell: &SharedClient, handle: &Handle) -> Result<(
     with_async(cell, handle, |handle, client| {
         handle.block_on(async { client.close_connection().await.map_err(convert_tds_error) })
     })
+}
+
+/// Checks the async [`TdsClient`] out of the cell, runs an async op on it, then
+/// stores it back — used by the coroutine [`PyCoreAsyncCursor`](crate::async_cursor::PyCoreAsyncCursor).
+///
+/// This is the async analog of [`with_async`]. Because the cell is backed by a
+/// [`std::sync::Mutex`] (whose guard is `!Send`), an async task cannot hold the
+/// guard across `.await`. Instead this "checks out" the owned client via
+/// [`std::mem::replace`] (leaving [`PyClient::Transitioning`]), drops the guard,
+/// awaits `f` on the owned value (which is `Send`), then re-locks and stores it
+/// back as [`PyClient::Async`]. The store-back runs even when `f` errors, so a
+/// mid-fetch error leaves the connection usable (ruling 4) rather than poisoned.
+///
+/// `f` returns the client alongside its result so ownership round-trips cleanly.
+/// Must be polled inside a runtime context — the caller spawns it on the
+/// connection's runtime so `TdsClient`'s I/O is driven by its own reactor.
+pub(crate) async fn with_async_client<F, Fut, R>(cell: SharedClient, f: F) -> Result<R, PyErr>
+where
+    F: FnOnce(TdsClient) -> Fut,
+    Fut: std::future::Future<Output = (TdsClient, Result<R, PyErr>)>,
+{
+    let taken = {
+        let mut guard = cell.lock().map_err(|_| poisoned())?;
+        std::mem::replace(&mut *guard, PyClient::Transitioning)
+    };
+    let client = match taken {
+        PyClient::Async(c) => c,
+        // The async cursor never flips to sync, but a sync cursor sharing the
+        // cell may have left it on the sync edge; revert it here.
+        PyClient::Sync(s) => match s.into_async() {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = e.to_string();
+                if let Ok(mut guard) = cell.lock() {
+                    *guard = PyClient::Dead(msg.clone());
+                }
+                return Err(dead(&msg));
+            }
+        },
+        PyClient::Transitioning => {
+            let msg = "client left in a transitioning state";
+            if let Ok(mut guard) = cell.lock() {
+                *guard = PyClient::Dead(msg.to_string());
+            }
+            return Err(dead(msg));
+        }
+        PyClient::Dead(msg) => {
+            let err = dead(&msg);
+            if let Ok(mut guard) = cell.lock() {
+                *guard = PyClient::Dead(msg);
+            }
+            return Err(err);
+        }
+    };
+
+    let (client, result) = f(client).await;
+
+    {
+        let mut guard = cell.lock().map_err(|_| poisoned())?;
+        *guard = PyClient::Async(client);
+    }
+    result
 }

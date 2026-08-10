@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""L6 sync + async cursor tests against the mock TDS server.
+"""L6 sync + default cursor tests against the mock TDS server.
 
 These exercise the shared reactor-free sync core wiring without a live SQL
 Server:
@@ -9,10 +9,12 @@ Server:
 - The **sync** cursor (`conn.sync_cursor()`) flips the shared client cell to the
   reactor-free `TdsSyncClient` edge for its row-pull hot loop on a **plaintext**
   connection, then reverts to the async edge for control-plane work.
-- The **async** cursor (`conn.cursor()`) drives the async core via `block_on`
-  and never flips (regression guard — its public API is unchanged).
+- The **default** cursor (`conn.cursor()`) drives the async core via `block_on`
+  and never flips (regression guard — its public API is unchanged). It is a
+  blocking cursor; the genuine coroutine cursor is `conn.async_cursor()`
+  (`PyCoreAsyncCursor`), covered by the async-focused tests.
 - `rowcount` is an additive read-only property sourced identically on both
-  cursors, so sync == async by construction.
+  cursors, so sync == default by construction.
 - On a **TLS** connection the sync edge is `NotEligible`, so the sync cursor
   transparently falls back to the async `block_on` path (byte-identical rows).
 
@@ -118,7 +120,7 @@ def test_sync_cursor_fetchmany_plaintext(plaintext_server):
 
 
 # ---------------------------------------------------------------------------
-# Async cursor — unchanged public API (regression guard)
+# Default cursor — unchanged public API (regression guard)
 # ---------------------------------------------------------------------------
 
 
@@ -186,7 +188,7 @@ def test_rowcount_sync_equals_async_select(plaintext_server):
 
 
 def test_sync_then_async_reuse(plaintext_server):
-    """After a sync fetch, a control-plane op on the async cursor reverts the
+    """After a sync fetch, a control-plane op on the default cursor reverts the
     shared cell and succeeds (revert-before-control-plane)."""
     conn = _connect(_ctx(plaintext_server))
     try:
