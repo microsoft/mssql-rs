@@ -338,7 +338,11 @@ fn do_connect(
 
     let has_server_info = post_tds_info_messages(state, &info_messages);
 
-    state.client = Some(client);
+    // Cache the negotiated server version so SQLGetInfo(SQL_DBMS_VER) never has
+    // to touch the live client — it stays reportable even while a sync fetch
+    // cursor owns the connection.
+    state.server_version = client.server_version();
+    state.store_async(client);
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
 

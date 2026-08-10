@@ -19,6 +19,13 @@ pub(crate) const STMT_STATE_PREPARED: u32 = 0x0000_0200;
 pub(crate) const STMT_STATE_CURSOR_OPEN: u32 = 0x0000_0800;
 pub(crate) const STMT_STATE_EXEC_CONTEXT: u32 = 0x0000_1000;
 
+/// Default sync-edge prefetch batch size seeded into [`StmtState::max_rows`].
+/// `1` keeps each sync `SQLFetch` byte-identical to the async `next_row` it
+/// replaces (no prefetch INFO/SWI timing shift) — the clean "reactor removed"
+/// datapoint. The buffer machinery is batch-ready: raising the per-statement
+/// `max_rows` amortizes syscalls across a batch with no other code impact.
+pub(crate) const SYNC_FETCH_DEFAULT_MAX_ROWS: usize = 1;
+
 /// Statement handle
 ///
 /// Created by `SQLAllocHandle(SQL_HANDLE_STMT, hdbc, ...)`.
@@ -71,6 +78,29 @@ pub(crate) struct StmtState {
     pub(crate) pending_unprepare: Option<i32>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
+    /// Sync-edge prefetch buffer: rows pulled by `TdsSyncClient::fetch_rows_batch`
+    /// awaiting service to `current_row`, one per `SQLFetch`. Always empty on the
+    /// async fetch path (which pulls a single row at a time via `block_on`).
+    pub(crate) row_batch: VecDeque<Vec<ColumnValues>>,
+    /// Recycled row allocations handed back to `fetch_rows_batch` as its spare
+    /// pool, amortizing per-row `Vec` allocation across batch refills.
+    pub(crate) spare_rows: Vec<Vec<ColumnValues>>,
+    /// A fetch error captured mid-batch on the sync edge, deferred until every
+    /// row `fetch_rows_batch` buffered *before* it has been served. At
+    /// `max_rows > 1` a refill can return rows **and** an error in one call
+    /// (`fetch_rows_batch` pushes rows into `out` as it reads, then propagates
+    /// the failing row's error); serving the buffered rows first, then surfacing
+    /// the error on the following `SQLFetch`, reproduces the async arm's
+    /// row-then-error ordering byte-identically. Always `None` at `max_rows == 1`
+    /// (a failing refill fetches zero rows, so the error surfaces immediately).
+    pub(crate) pending_fetch_error: Option<mssql_tds::error::Error>,
+    /// Rows pulled per `TdsSyncClient::fetch_rows_batch` refill on the sync fetch
+    /// edge. Defaults to [`SYNC_FETCH_DEFAULT_MAX_ROWS`] (`1`) so each `SQLFetch`
+    /// on the sync path is byte-identical to the async `next_row` it replaces
+    /// (INFO/SWI surfaced per row, no prefetch timing shift). The buffer
+    /// machinery is batch-ready: raising this amortizes syscalls across a batch
+    /// (INFO for rows 2..N surfaces on the refill that fetched them — ODBC-legal).
+    pub(crate) max_rows: usize,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
     /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
@@ -110,6 +140,18 @@ impl StmtState {
 
     pub(crate) fn clear_state(&mut self, mask: u32) {
         self.state_flags &= !mask;
+    }
+
+    /// Clears the current row and the sync-edge prefetch buffer. Called at every
+    /// result-set boundary (execute, `SQLMoreResults`, cursor close) so a fresh
+    /// result set never serves rows buffered from a prior one. Within a single
+    /// result set the sync fetch arm recycles allocations through `spare_rows`;
+    /// across boundaries they are dropped to keep the pool bounded.
+    pub(crate) fn reset_fetch_state(&mut self) {
+        self.current_row = None;
+        self.row_batch.clear();
+        self.spare_rows.clear();
+        self.pending_fetch_error = None;
     }
 
     /// Moves the cached `prepared_handle` (if any) into `pending_unprepare` so
@@ -160,6 +202,10 @@ impl StmtHandle {
                 prepared_handle: None,
                 pending_unprepare: None,
                 current_row: None,
+                row_batch: VecDeque::new(),
+                spare_rows: Vec::new(),
+                pending_fetch_error: None,
+                max_rows: SYNC_FETCH_DEFAULT_MAX_ROWS,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
                 row_array_size: 1,

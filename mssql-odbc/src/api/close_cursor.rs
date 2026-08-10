@@ -131,7 +131,7 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
 /// Resets cursor state on the statement (cursor is no longer open, metadata cleared).
 pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
     stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);
-    stmt_state.current_row = None;
+    stmt_state.reset_fetch_state();
     stmt_state.column_metadata.clear();
     stmt_state.pending_row_counts.clear();
 }
@@ -167,7 +167,7 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
         dbc_state.client.take()
     };
 
-    let Some(mut client) = client else {
+    let Some(client) = client else {
         error!("drain_and_release: no TDS client to drain — this is a bug");
         if let Ok(mut ds) = dbc.inner.lock()
             && ds.active_stmt == Some(statement_handle)
@@ -175,6 +175,26 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
             ds.active_stmt = None;
         }
         return DrainOutcome::Failed;
+    };
+
+    // Cursor close is a control-plane drain: revert a sync fetch cursor to the
+    // async edge first (rule C) so `close_query` runs on the reactor and the
+    // `sp_prepexec` `@handle` capture below works. A no-op when already async; a
+    // revert failure poisons the connection.
+    let mut client = match client.into_async() {
+        Ok(client) => client,
+        Err(e) => {
+            error!(%e, "drain_and_release: reverting sync cursor to async failed — connection lost");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+            }
+            if let Ok(mut ds) = dbc.inner.lock()
+                && ds.active_stmt == Some(statement_handle)
+            {
+                ds.active_stmt = None;
+            }
+            return DrainOutcome::Failed;
+        }
     };
 
     if let Err(e) = dbc.runtime.block_on(client.close_query()) {
@@ -185,7 +205,7 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
         }
         if let Ok(mut ds) = dbc.inner.lock() {
-            ds.client = Some(client);
+            ds.store_async(client);
             if ds.active_stmt == Some(statement_handle) {
                 ds.active_stmt = None;
             }
@@ -203,7 +223,7 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
         Err(_) => {
             error!("drain_and_release: stmt mutex poisoned while posting info messages");
             if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
+                dbc_state.store_async(client);
                 if dbc_state.active_stmt == Some(statement_handle) {
                     dbc_state.active_stmt = None;
                 }
@@ -215,7 +235,7 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
     // Drain complete: return client and release busy claim atomically.
     super::exec_common::capture_prepared_handle(stmt, &mut client);
     if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
+        dbc_state.store_async(client);
         if dbc_state.active_stmt == Some(statement_handle) {
             dbc_state.active_stmt = None;
         }

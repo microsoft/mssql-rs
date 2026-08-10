@@ -106,7 +106,7 @@ fn sql_exec_direct_w_safe(
         // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.column_metadata.clear();
-        stmt_state.current_row = None;
+        stmt_state.reset_fetch_state();
         stmt_state.row_count = -1;
         stmt_state.pending_row_counts.clear();
         stmt_state.prepared_sql = None;
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn exec_direct_norow_statement_keeps_cursor_open_and_busy() {
         use crate::api::odbc_types::SQL_SUCCESS;
-        use crate::handles::dbc::DbcHandle;
+        use crate::handles::dbc::{DbcClient, DbcHandle};
         use mssql_tds::test_client_support::{
             col_metadata_empty, done_more_with_count, done_no_more, tds_client_from_tokens,
         };
@@ -285,7 +285,7 @@ mod tests {
         ]);
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
+            ds.client = Some(DbcClient::Async(client));
             // active_stmt stays None => connection idle and claimable.
         }
 
@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn exec_direct_norow_statement_with_message_returns_success_with_info() {
         use crate::api::odbc_types::SQL_SUCCESS_WITH_INFO;
-        use crate::handles::dbc::DbcHandle;
+        use crate::handles::dbc::{DbcClient, DbcHandle};
         use mssql_tds::test_client_support::{
             col_metadata_empty, done_more_with_count, done_no_more, info, tds_client_from_tokens,
         };
@@ -325,7 +325,7 @@ mod tests {
         ]);
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
+            ds.client = Some(DbcClient::Async(client));
         }
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };

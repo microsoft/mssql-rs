@@ -11,9 +11,12 @@ use crate::api::odbc_types::{
     SqlReturn,
 };
 use crate::error::free_errors;
+use crate::handles::dbc::{DbcClient, DbcHandle};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::ResultSet;
+use mssql_tds::connection::tds_sync_client::TdsSyncClient;
+use mssql_tds::datatypes::column_values::ColumnValues;
 
 /// Implements SQLFetch for the current forward-only result set.
 ///
@@ -58,7 +61,7 @@ fn sql_fetch_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
 fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
-    let mut client = {
+    let client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetch: dbc mutex poisoned");
             return SQL_ERROR;
@@ -130,6 +133,22 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         }
     }
 
+    // Dispatch on the connection edge. Plaintext raw-TCP cursors fetch on the
+    // reactor-free sync client; TLS / non-raw stay on the unchanged async path.
+    match client {
+        DbcClient::Async(client) => fetch_row_async(dbc, stmt, statement_handle, client),
+        DbcClient::Sync(sync) => fetch_row_sync(dbc, stmt, statement_handle, sync),
+    }
+}
+
+/// Async fetch arm: pulls one row via `block_on(next_row())`. Byte-identical to
+/// the pre-rewire path — the TLS / non-raw-transport fallback.
+fn fetch_row_async(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    mut client: mssql_tds::connection::tds_client::TdsClient,
+) -> SqlReturn {
     let fetch_result = dbc.runtime.block_on(client.next_row());
 
     match fetch_result {
@@ -137,7 +156,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLFetch: stmt mutex poisoned storing row");
                 if let Ok(mut ds) = dbc.inner.lock() {
-                    ds.client = Some(client);
+                    ds.store_async(client);
                     if ds.active_stmt == Some(statement_handle) {
                         ds.active_stmt = None;
                     }
@@ -152,7 +171,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             drop(stmt_state);
 
             if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
+                dbc_state.store_async(client);
                 dbc_state.active_stmt = Some(statement_handle);
             }
 
@@ -196,7 +215,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLFetch: stmt mutex poisoned at end of rowset");
                 if let Ok(mut ds) = dbc.inner.lock() {
-                    ds.client = Some(client);
+                    ds.store_async(client);
                 }
                 return SQL_ERROR;
             };
@@ -205,7 +224,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             // SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE).
             drop(stmt_state);
             if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
+                dbc_state.store_async(client);
             }
 
             debug!("SQLFetch: no more rows in current result set");
@@ -221,7 +240,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 post_tds_info_messages(&mut stmt_state, &info_messages);
             }
             if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
+                dbc_state.store_async(client);
                 if dbc_state.active_stmt == Some(statement_handle) {
                     dbc_state.active_stmt = None;
                 }
@@ -231,11 +250,182 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
     }
 }
 
+/// Sync fetch arm: serves rows from the statement-level prefetch buffer, refilling
+/// it via the reactor-free `TdsSyncClient::fetch_rows_batch` when empty. Row
+/// allocations are recycled through `spare_rows` across refills. At
+/// `StmtState::max_rows == 1` (the default) this is per-row and byte-identical to
+/// the async arm (INFO drained and surfaced on the same SQLFetch that serves the
+/// row).
+fn fetch_row_sync(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    mut sync: TdsSyncClient,
+) -> SqlReturn {
+    // Recycle the previously-served row (superseded by this fetch) into the spare
+    // pool, then decide whether the prefetch buffer needs a refill.
+    let need_refill = match stmt.inner.lock() {
+        Ok(mut ss) => {
+            if let Some(prev) = ss.current_row.take() {
+                ss.spare_rows.push(prev);
+            }
+            ss.row_batch.is_empty()
+        }
+        Err(_) => {
+            error!("SQLFetch: stmt mutex poisoned checking sync buffer");
+            if let Ok(mut ds) = dbc.inner.lock() {
+                ds.client = Some(DbcClient::Sync(sync));
+            }
+            return SQL_ERROR;
+        }
+    };
+
+    let has_server_info = if need_refill {
+        // A fetch error captured on a prior refill (with rows still buffered)
+        // surfaces now that the buffer is drained — mirroring the async arm,
+        // which returns each row then the error on the following SQLFetch.
+        let deferred = match stmt.inner.lock() {
+            Ok(mut ss) => ss.pending_fetch_error.take(),
+            Err(_) => None,
+        };
+        if let Some(e) = deferred {
+            error!(%e, "SQLFetch: surfacing deferred sync fetch error");
+            if let Ok(mut ss) = stmt.inner.lock() {
+                ss.current_row = None;
+                ss.clear_state(STMT_STATE_CURSOR_OPEN);
+                post_tds_error(&mut ss, &e, SQLSTATE_HY000);
+            }
+            if let Ok(mut ds) = dbc.inner.lock() {
+                ds.client = Some(DbcClient::Sync(sync));
+                if ds.active_stmt == Some(statement_handle) {
+                    ds.active_stmt = None;
+                }
+            }
+            return SQL_ERROR;
+        }
+
+        let (spare, max_rows) = match stmt.inner.lock() {
+            Ok(mut ss) => (std::mem::take(&mut ss.spare_rows), ss.max_rows),
+            Err(_) => (Vec::new(), 1),
+        };
+        let mut out: Vec<Vec<ColumnValues>> = Vec::new();
+        match sync.fetch_rows_batch(&mut out, spare, max_rows) {
+            Ok(0) => {
+                // End of current rowset — mirror the async Ok(None) contract:
+                // leave any INFO on the client for the boundary call, keep the
+                // cursor open, keep the connection busy on this statement.
+                // `current_row` was already cleared above.
+                if let Ok(mut ds) = dbc.inner.lock() {
+                    ds.client = Some(DbcClient::Sync(sync));
+                }
+                debug!("SQLFetch: no more rows in current result set (sync)");
+                return SQL_NO_DATA;
+            }
+            Ok(_n) => {
+                // Drain INFO now, attributed to this SQLFetch (which serves the
+                // first row of the batch).
+                let info_messages = sync.take_info_messages();
+                match stmt.inner.lock() {
+                    Ok(mut ss) => {
+                        ss.row_batch.extend(out.drain(..));
+                        post_tds_info_messages(&mut ss, &info_messages)
+                    }
+                    Err(_) => {
+                        error!("SQLFetch: stmt mutex poisoned storing sync batch");
+                        if let Ok(mut ds) = dbc.inner.lock() {
+                            ds.client = Some(DbcClient::Sync(sync));
+                            if ds.active_stmt == Some(statement_handle) {
+                                ds.active_stmt = None;
+                            }
+                        }
+                        return SQL_ERROR;
+                    }
+                }
+            }
+            Err(e) => {
+                // `fetch_rows_batch` pushes each row into `out` as it reads, so a
+                // mid-batch error (only possible at max_rows > 1) can arrive with
+                // rows already fetched. Buffer those rows and serve them first,
+                // deferring the error to the SQLFetch after the last one — the
+                // async arm's row-then-error ordering. When no rows were fetched
+                // (always the case at max_rows == 1), surface the error now.
+                error!(%e, "SQLFetch: row fetch failed (sync)");
+                let info_messages = sync.take_info_messages();
+                if out.is_empty() {
+                    if let Ok(mut ss) = stmt.inner.lock() {
+                        ss.current_row = None;
+                        ss.clear_state(STMT_STATE_CURSOR_OPEN);
+                        post_tds_error(&mut ss, &e, SQLSTATE_HY000);
+                        post_tds_info_messages(&mut ss, &info_messages);
+                    }
+                    if let Ok(mut ds) = dbc.inner.lock() {
+                        ds.client = Some(DbcClient::Sync(sync));
+                        if ds.active_stmt == Some(statement_handle) {
+                            ds.active_stmt = None;
+                        }
+                    }
+                    return SQL_ERROR;
+                }
+                match stmt.inner.lock() {
+                    Ok(mut ss) => {
+                        ss.row_batch.extend(out.drain(..));
+                        ss.pending_fetch_error = Some(e);
+                        post_tds_info_messages(&mut ss, &info_messages)
+                    }
+                    Err(_) => {
+                        error!("SQLFetch: stmt mutex poisoned deferring sync error");
+                        if let Ok(mut ds) = dbc.inner.lock() {
+                            ds.client = Some(DbcClient::Sync(sync));
+                            if ds.active_stmt == Some(statement_handle) {
+                                ds.active_stmt = None;
+                            }
+                        }
+                        return SQL_ERROR;
+                    }
+                }
+            }
+        }
+    } else {
+        // Served from an already-buffered batch (only reachable at MAX_ROWS > 1);
+        // its INFO was surfaced on the SQLFetch that refilled the buffer.
+        false
+    };
+
+    // Serve one row from the buffer into `current_row` (feeds SQLGetData).
+    match stmt.inner.lock() {
+        Ok(mut ss) => {
+            ss.current_row = ss.row_batch.pop_front();
+        }
+        Err(_) => {
+            error!("SQLFetch: stmt mutex poisoned serving sync row");
+            if let Ok(mut ds) = dbc.inner.lock() {
+                ds.client = Some(DbcClient::Sync(sync));
+                if ds.active_stmt == Some(statement_handle) {
+                    ds.active_stmt = None;
+                }
+            }
+            return SQL_ERROR;
+        }
+    }
+
+    if let Ok(mut dbc_state) = dbc.inner.lock() {
+        dbc_state.client = Some(DbcClient::Sync(sync));
+        dbc_state.active_stmt = Some(statement_handle);
+    }
+
+    debug!("SQLFetch: row fetched (sync)");
+    if has_server_info {
+        SQL_SUCCESS_WITH_INFO
+    } else {
+        SQL_SUCCESS
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::odbc_types::SQL_NULL_HANDLE;
-    use crate::handles::dbc::DbcHandle;
+    use crate::handles::dbc::{DbcClient, DbcHandle};
     use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
     use crate::test_support::TestHandles;
 
@@ -333,7 +523,7 @@ mod tests {
         let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut dbc_state = dbc_handle.inner.lock().unwrap();
-            dbc_state.client = Some(client);
+            dbc_state.client = Some(DbcClient::Async(client));
             dbc_state.active_stmt = Some(h.stmt);
         }
 

@@ -12,13 +12,14 @@ use tracing::error;
 use std::collections::VecDeque;
 
 use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
+use mssql_tds::connection::tds_sync_client::SyncConversion;
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn};
 use crate::error::post_sql_error;
-use crate::handles::dbc::ConnectionState;
+use crate::handles::dbc::{ConnectionState, DbcClient};
 use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
 };
@@ -82,15 +83,34 @@ pub(super) fn claim_connection(
         clear_exec_started(stmt);
         return Err(SQL_ERROR);
     };
+    drop(dbc_state);
 
-    Ok(client)
+    // Control-plane work runs on the async edge. Revert a sync fetch cursor that
+    // a prior execute may have left open on this statement (no-op when already
+    // async, no network I/O). A revert failure means the connection is poisoned.
+    match client.into_async() {
+        Ok(client) => Ok(client),
+        Err(e) => {
+            error!(%e, "{op}: reverting sync cursor to async failed — connection lost");
+            if let Ok(mut dbc_state) = dbc.inner.lock()
+                && dbc_state.active_stmt == Some(statement_handle)
+            {
+                dbc_state.active_stmt = None;
+            }
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+            }
+            clear_exec_started(stmt);
+            Err(SQL_ERROR)
+        }
+    }
 }
 
 /// Returns `client` to the DBC and releases the busy claim. Used on the
 /// DDL/DML success path and on error recovery.
 pub(super) fn return_client_idle(dbc: &DbcHandle, statement_handle: SqlHandle, client: TdsClient) {
     if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
+        dbc_state.store_async(client);
         if dbc_state.active_stmt == Some(statement_handle) {
             dbc_state.active_stmt = None;
         }
@@ -118,14 +138,29 @@ pub(super) fn try_claim_idle_client(
     }
     let client = dbc_state.client.take()?;
     dbc_state.active_stmt = Some(statement_handle);
-    Some(client)
+    drop(dbc_state);
+    // Best-effort internal claim: revert a sync cursor to async. A revert
+    // failure means the connection is poisoned; drop the busy claim and report
+    // no client (the dead client closes on drop).
+    match client.into_async() {
+        Ok(client) => Some(client),
+        Err(e) => {
+            error!(%e, "try_claim_idle_client: reverting sync cursor to async failed");
+            if let Ok(mut dbc_state) = dbc.inner.lock()
+                && dbc_state.active_stmt == Some(statement_handle)
+            {
+                dbc_state.active_stmt = None;
+            }
+            None
+        }
+    }
 }
 
 /// Returns `client` to the DBC but **keeps** the busy claim — used when a
 /// cursor is left open for `SQLFetch`.
 pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
     if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
+        dbc_state.store_async(client);
     }
 }
 
@@ -341,11 +376,68 @@ pub(super) fn finish_execute(
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
     drop(stmt_state);
-    return_client_busy(dbc, client);
+    // Rule C: metadata is snapshotted above; only NOW attempt the reactor-free
+    // flip so DescribeCol / NumResultCols (which read STMT state) are unaffected.
+    if let Err(rc) = flip_to_fetch_edge(dbc, stmt, statement_handle, client) {
+        return rc;
+    }
     if has_server_info {
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
+    }
+}
+
+/// Flips the just-executed async client to the reactor-free sync fetch edge when
+/// the transport is eligible (plaintext raw TCP), storing it busy for `SQLFetch`.
+/// TLS / non-raw transports are returned to the async edge **unchanged**, so
+/// fetch falls back to `block_on` byte-identically. A conversion failure poisons
+/// the connection: the open-cursor state the caller committed is rolled back and
+/// the error is surfaced.
+///
+/// `into_sync` captures `Handle::try_current()`, so it MUST run inside the
+/// runtime context — the bare ODBC thread has none, and a `None` capture would
+/// later poison `into_async`.
+///
+/// Shared by `finish_execute` (execute-time flip) and `SQLMoreResults` (re-flip
+/// when advancing onto the next row-returning result set). `active_stmt` is left
+/// untouched on success (the cursor stays open on the owning statement) and
+/// cleared only on a poisoning failure.
+pub(super) fn flip_to_fetch_edge(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    client: TdsClient,
+) -> Result<(), SqlReturn> {
+    let converted = {
+        let _runtime_guard = dbc.runtime.enter();
+        client.into_sync()
+    };
+    match converted {
+        SyncConversion::Converted(sync) => {
+            if let Ok(mut dbc_state) = dbc.inner.lock() {
+                dbc_state.client = Some(DbcClient::Sync(sync));
+            }
+            Ok(())
+        }
+        SyncConversion::NotEligible(client) => {
+            // TLS / non-raw transport: keep the untouched async fetch path.
+            return_client_busy(dbc, client);
+            Ok(())
+        }
+        SyncConversion::Failed(e) => {
+            error!(%e, "finish_execute: sync flip failed — connection lost");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);
+                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+            }
+            if let Ok(mut dbc_state) = dbc.inner.lock()
+                && dbc_state.active_stmt == Some(statement_handle)
+            {
+                dbc_state.active_stmt = None;
+            }
+            Err(SQL_ERROR)
+        }
     }
 }
 

@@ -73,7 +73,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
 
     // Take the client; keep active_stmt set so concurrent statements continue
     // to see the connection as busy throughout the advance.
-    let mut client = {
+    let client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLMoreResults: dbc mutex poisoned");
             return SQL_ERROR;
@@ -99,6 +99,27 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         client
     };
 
+    // Result-set boundary: revert a sync fetch cursor to the async edge before
+    // driving `advance()` (rule C — all control-plane wire ops stay async). This
+    // re-registers the fd with the reactor; a no-op when already async. A revert
+    // failure poisons the connection.
+    let mut client = match client.into_async() {
+        Ok(client) => client,
+        Err(e) => {
+            error!(%e, "SQLMoreResults: reverting sync cursor to async failed — connection lost");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                reset_cursor_state(&mut stmt_state);
+                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+            }
+            if let Ok(mut dbc_state) = dbc.inner.lock()
+                && dbc_state.active_stmt == Some(statement_handle)
+            {
+                dbc_state.active_stmt = None;
+            }
+            return SQL_ERROR;
+        }
+    };
+
     match dbc.runtime.block_on(client.advance()) {
         Ok(StatementResult::Rows) => {
             // Positioned on a new row-returning result set. Refresh metadata,
@@ -107,21 +128,25 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLMoreResults: stmt mutex poisoned advancing result set");
                 if let Ok(mut ds) = dbc.inner.lock() {
-                    ds.client = Some(client);
+                    ds.store_async(client);
                 }
                 return SQL_ERROR;
             };
             stmt_state.column_metadata = metadata;
             // Refresh the count for the newly-positioned result set (-1 for a SELECT).
             stmt_state.row_count = client.last_rows_affected();
-            stmt_state.current_row = None;
+            stmt_state.reset_fetch_state();
             // Drain INFO only after the lock is held.
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
-            if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
-                // active_stmt remains set — cursor still open on this statement.
+            // Re-flip to the sync fetch edge for this result set (rule C: the
+            // advance above ran async; fetch runs sync when eligible). Metadata is
+            // already snapshotted, so DescribeCol/NumResultCols are unaffected.
+            if let Err(rc) =
+                super::exec_common::flip_to_fetch_edge(dbc, stmt, statement_handle, client)
+            {
+                return rc;
             }
             debug!("SQLMoreResults: advanced to next result set");
             if has_server_info {
@@ -139,7 +164,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLMoreResults: stmt mutex poisoned on no-row result");
                 if let Ok(mut ds) = dbc.inner.lock() {
-                    ds.client = Some(client);
+                    ds.store_async(client);
                 }
                 return SQL_ERROR;
             };
@@ -147,12 +172,12 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // Surface this no-row statement's own affected-row count for
             // SQLRowCount now that we are positioned on it.
             stmt_state.row_count = client.last_rows_affected();
-            stmt_state.current_row = None;
+            stmt_state.reset_fetch_state();
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
             if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
+                dbc_state.store_async(client);
                 // active_stmt remains set — still positioned on this statement.
             }
             debug!("SQLMoreResults: advanced to a no-row statement result");
@@ -167,7 +192,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLMoreResults: stmt mutex poisoned at batch end");
                 if let Ok(mut ds) = dbc.inner.lock() {
-                    ds.client = Some(client);
+                    ds.store_async(client);
                     if ds.active_stmt == Some(statement_handle) {
                         ds.active_stmt = None;
                     }
@@ -186,7 +211,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // TODO: surface output-param availability here once output
             // params land.
             if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
+                dbc_state.store_async(client);
                 if dbc_state.active_stmt == Some(statement_handle) {
                     dbc_state.active_stmt = None;
                 }
@@ -204,7 +229,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 post_tds_info_messages(&mut stmt_state, &info_messages);
             }
             if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
+                dbc_state.store_async(client);
                 if dbc_state.active_stmt == Some(statement_handle) {
                     dbc_state.active_stmt = None;
                 }
@@ -222,7 +247,7 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO};
     use crate::api::sqlstate::ERR_NO_ACTIVE_TDS_CLIENT;
-    use crate::handles::dbc::DbcHandle;
+    use crate::handles::dbc::{DbcClient, DbcHandle};
     use crate::test_support::TestHandles;
     use mssql_tds::test_client_support::{
         ScriptedToken, col_metadata_empty, done_more, done_no_more, info, tds_client_from_tokens,
@@ -246,7 +271,7 @@ mod tests {
         }
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
+            ds.client = Some(DbcClient::Async(client));
             ds.active_stmt = Some(h.stmt);
         }
         first
