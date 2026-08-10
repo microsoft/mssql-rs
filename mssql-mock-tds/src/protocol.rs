@@ -853,18 +853,76 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
         result.extend_from_slice(&build_info_token(info));
     }
 
-    // Serialize each row
-    for row in &response.rows {
-        result.put_u8(TokenType::Row as u8);
-        for value in &row.values {
-            value.write_to_buffer(&mut result);
+    match &response.error_after {
+        Some(err) => {
+            // Stream the first `after_rows` rows, then an ERROR token and a
+            // terminal DONE (row count 0) — no trailing rows.
+            for row in response.rows.iter().take(err.after_rows) {
+                result.put_u8(TokenType::Row as u8);
+                for value in &row.values {
+                    value.write_to_buffer(&mut result);
+                }
+            }
+            result.extend_from_slice(&build_error_token(
+                err.number,
+                err.state,
+                err.severity,
+                &err.message,
+            ));
+            // INFO tokens emitted during the drain (after ERROR, before DONE).
+            for info in &err.drain_info {
+                result.extend_from_slice(&build_info_token(info));
+            }
+            result.extend_from_slice(&build_done_token(0));
+        }
+        None => {
+            // Serialize each row
+            for row in &response.rows {
+                result.put_u8(TokenType::Row as u8);
+                for value in &row.values {
+                    value.write_to_buffer(&mut result);
+                }
+            }
+
+            // DONE token
+            result.extend_from_slice(&build_done_token(response.rows.len() as u64));
         }
     }
 
-    // DONE token
-    result.extend_from_slice(&build_done_token(response.rows.len() as u64));
-
     wrap_in_packet(PacketType::TabularResult, result)
+}
+
+/// Build a bare ERROR token (0xAA) with no surrounding DONE or packet framing,
+/// for injecting mid-stream into a result set.
+fn build_error_token(number: u32, state: u8, severity: u8, message: &str) -> BytesMut {
+    let mut token = BytesMut::new();
+    token.put_u8(TokenType::Error as u8);
+
+    let length_pos = token.len();
+    token.put_u16_le(0); // Placeholder for length (little-endian on the wire)
+
+    token.put_u32_le(number);
+    token.put_u8(state);
+    token.put_u8(severity);
+
+    // Message (US_VARCHAR: u16 code-unit count + UTF-16LE)
+    token.put_u16_le(message.chars().count() as u16);
+    for ch in message.encode_utf16() {
+        token.put_u16_le(ch);
+    }
+
+    // Server name / procedure name (empty B_VARCHARs)
+    token.put_u8(0);
+    token.put_u8(0);
+
+    // Line number
+    token.put_u32_le(1);
+
+    let token_length = (token.len() - length_pos - 2) as u16;
+    let mut length_bytes = &mut token[length_pos..length_pos + 2];
+    length_bytes.put_u16_le(token_length);
+
+    token
 }
 
 /// Build an error response

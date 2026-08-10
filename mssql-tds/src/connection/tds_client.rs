@@ -78,6 +78,27 @@ enum ActiveRowReadState {
     PlpPaused(Box<PlpPauseState>),
 }
 
+/// Outcome of applying a single non-row token during row iteration.
+///
+/// [`TdsClient::apply_row_read_token`] performs every token side-effect and
+/// returns this so the async ([`TdsClient::handle_row_read_token`]) and sync
+/// ([`TdsSyncClient`](crate::connection::tds_sync_client::TdsSyncClient)) fetch
+/// shells share one authoritative handler — their per-token state mutations
+/// cannot drift. The only flavour-specific step is the ERROR drain, which each
+/// shell performs in its own edge before calling
+/// [`TdsClient::finalize_row_error`].
+#[derive(Debug)]
+pub(crate) enum TokenOutcome {
+    /// A non-terminal token was handled; keep reading the stream.
+    Continue,
+    /// A terminal DONE closed the result set; no row was produced.
+    Terminal,
+    /// An ERROR token was seen. The shell must drain the rest of the batch to
+    /// its terminal DONE in its own flavour, extend these errors with any
+    /// collected during the drain, then call [`TdsClient::finalize_row_error`].
+    DrainThenError(Vec<SqlErrorInfo>),
+}
+
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -2961,7 +2982,11 @@ impl TdsClient {
         }
     }
 
-    async fn handle_row_read_token(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
+    /// Applies one non-row token's side-effects to the connection state and
+    /// reports how the fetch shell should proceed. Shared verbatim by the async
+    /// and sync fetch paths (see [`TokenOutcome`]); contains no I/O, so it is a
+    /// plain synchronous method callable from either edge.
+    pub(crate) fn apply_row_read_token(&mut self, token: Tokens) -> TdsResult<TokenOutcome> {
         match token {
             Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
                 info!("done while get_next_row: {:?}", done);
@@ -2981,11 +3006,11 @@ impl TdsClient {
                     info!("No more rows for current command: {:?}", done.cur_cmd);
                     self.execution_context.set_has_open_batch(false);
                 }
-                Ok(Some(false))
+                Ok(TokenOutcome::Terminal)
             }
             Tokens::Order(order_token) => {
                 info!(?order_token);
-                Ok(None)
+                Ok(TokenOutcome::Continue)
             }
             Tokens::EnvChange(env_change) => {
                 info!(?env_change);
@@ -2994,31 +3019,23 @@ impl TdsClient {
                 }
                 self.execution_context
                     .capture_change_property(&env_change, &mut self.negotiated_settings)?;
-                Ok(None)
+                Ok(TokenOutcome::Continue)
             }
             Tokens::SessionState(session_state) => {
                 self.recovery_context
                     .process_session_state(&session_state)?;
-                Ok(None)
+                Ok(TokenOutcome::Continue)
             }
             Tokens::ReturnValue(return_value_token) => {
                 let return_value = self.finalize_return_value(return_value_token)?;
                 self.push_return_value(return_value);
-                Ok(None)
+                Ok(TokenOutcome::Continue)
             }
             Tokens::Error(error_token) => {
                 info!(?error_token);
-                let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
-                let drain_errors = self.drain_stream().await?;
-                all_errors.extend(drain_errors);
-                // The error drained the rest of the batch to its terminal
-                // DONE, so the connection is idle again. Clear the batch
-                // state so a subsequent `close_query` / `advance` does not
-                // block trying to read a stream that is already consumed.
-                self.execution_context.set_has_open_batch(false);
-                self.current_result_set_has_been_read_till_end = true;
-                self.current_metadata = None;
-                Err(crate::error::Error::from_sql_errors(all_errors))
+                Ok(TokenOutcome::DrainThenError(vec![SqlErrorInfo::from(
+                    &error_token,
+                )]))
             }
             Tokens::ColMetadata(_) => Err(crate::error::Error::UsageError(
                 "Unexpected ColMetadata token encountered while reading rows. \
@@ -3029,12 +3046,41 @@ impl TdsClient {
             Tokens::Info(info_token) => {
                 info!(?info_token);
                 self.capture_info_message(&info_token);
-                Ok(None)
+                Ok(TokenOutcome::Continue)
             }
-            Tokens::TabName | Tokens::ColInfo => Ok(None),
+            Tokens::TabName | Tokens::ColInfo => Ok(TokenOutcome::Continue),
             _ => Err(crate::error::Error::ProtocolError(format!(
                 "Unexpected token while finding the next row: {token:?}"
             ))),
+        }
+    }
+
+    /// Finalizes connection state after a fetch-time ERROR has been drained to
+    /// its terminal DONE, and builds the surfaced error. Shared by the async and
+    /// sync fetch shells so their post-error cleanup cannot drift.
+    pub(crate) fn finalize_row_error(
+        &mut self,
+        all_errors: Vec<SqlErrorInfo>,
+    ) -> crate::error::Error {
+        // The error drained the rest of the batch to its terminal DONE, so the
+        // connection is idle again. Clear the batch state so a subsequent
+        // `close_query` / `advance` does not block trying to read a stream that
+        // is already consumed.
+        self.execution_context.set_has_open_batch(false);
+        self.current_result_set_has_been_read_till_end = true;
+        self.current_metadata = None;
+        crate::error::Error::from_sql_errors(all_errors)
+    }
+
+    async fn handle_row_read_token(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
+        match self.apply_row_read_token(token)? {
+            TokenOutcome::Continue => Ok(None),
+            TokenOutcome::Terminal => Ok(Some(false)),
+            TokenOutcome::DrainThenError(mut all_errors) => {
+                let drain_errors = self.drain_stream().await?;
+                all_errors.extend(drain_errors);
+                Err(self.finalize_row_error(all_errors))
+            }
         }
     }
 
@@ -3452,6 +3498,56 @@ impl TdsClient {
 
         Ok(())
     }
+
+    /// Consumes this async client and flips its connection to the synchronous,
+    /// reactor-free fetch edge ([`TdsSyncClient`](crate::connection::tds_sync_client::TdsSyncClient)),
+    /// when the transport is a raw TCP socket that can be handed off as an owned
+    /// blocking stream.
+    ///
+    /// This is the owning half of the owning-reversible model: the returned
+    /// [`TdsSyncClient`](crate::connection::tds_sync_client::TdsSyncClient) holds
+    /// the connection by value, so the socket stays in blocking mode across an
+    /// entire result set (no per-row flip). Revert with
+    /// [`into_async`](crate::connection::tds_sync_client::TdsSyncClient::into_async)
+    /// to run control-plane work (execute/advance/close).
+    ///
+    /// - [`SyncConversion::Converted`](crate::connection::tds_sync_client::SyncConversion::Converted):
+    ///   raw TCP; the socket was flipped to std-blocking and any buffered residual
+    ///   bytes were carried over intact.
+    /// - [`SyncConversion::NotEligible`](crate::connection::tds_sync_client::SyncConversion::NotEligible):
+    ///   a TLS (or otherwise non-extractable) transport; the async client is
+    ///   returned **unchanged** so the caller keeps using `block_on` — not an error.
+    /// - [`SyncConversion::Failed`](crate::connection::tds_sync_client::SyncConversion::Failed):
+    ///   the flip was attempted but constructing the blocking edge failed.
+    pub fn into_sync(mut self) -> crate::connection::tds_sync_client::SyncConversion {
+        use crate::connection::tds_sync_client::{SyncConversion, TdsSyncClient};
+
+        let runtime_handle = tokio::runtime::Handle::try_current().ok();
+        let packet_size = self.transport.packet_size();
+        let cancel = self.cancel_handle.as_ref().map(|h| h.cancel_token.clone());
+        let request_timeout = self.remaining_request_timeout;
+
+        let (std_stream, residual) = match self.transport.take_blocking_parts() {
+            Some(parts) => parts,
+            None => return SyncConversion::NotEligible(self),
+        };
+
+        let source = match crate::io::std_byte_source::StdTcpByteSource::new(std_stream, cancel) {
+            Ok(source) => source,
+            Err(err) => return SyncConversion::Failed(err),
+        };
+        let reader = crate::io::blocking_reader::BlockingPacketReader::with_seeded_buffer(
+            source,
+            packet_size as usize,
+            &residual,
+        );
+        SyncConversion::Converted(TdsSyncClient::from_established(
+            self,
+            reader,
+            runtime_handle,
+            request_timeout,
+        ))
+    }
 }
 
 #[async_trait]
@@ -3662,7 +3758,7 @@ mod tests {
         ParserContext, RowPauseState, RowReadResult, TdsTokenStreamReader,
     };
     use crate::token::tokens::{
-        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
+        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, ErrorToken, InfoToken, Tokens,
     };
     use async_trait::async_trait;
     use std::collections::VecDeque;
@@ -4461,6 +4557,171 @@ mod tests {
         let token = ae_return_value_token("@out", ColumnValues::Int(7), None);
         let rv = client.finalize_return_value(token).unwrap();
         assert_eq!(rv.value, ColumnValues::Int(7));
+    }
+
+    // ── Characterization of the shared fetch-token handler ──
+    //
+    // These pin each side-effect that `apply_row_read_token` / `finalize_row_error`
+    // own, so the async and sync fetch shells (which both delegate to them) cannot
+    // drift. EnvChange / SessionState arms need wire-parsed container tokens to
+    // construct and are covered by the pre-existing async integration suite.
+
+    fn error_token(number: u32, severity: u8, message: &str) -> Tokens {
+        Tokens::Error(ErrorToken {
+            number,
+            state: 1,
+            severity,
+            message: message.to_string(),
+            server_name: "test-server".to_string(),
+            proc_name: String::new(),
+            line_number: 7,
+        })
+    }
+
+    #[test]
+    fn apply_row_read_token_done_terminal_accounts_and_closes_batch() {
+        let mut client = create_test_client();
+        client.execution_context.set_has_open_batch(true);
+
+        let outcome = client
+            .apply_row_read_token(done_count(CurrentCommand::Insert, 3, false))
+            .unwrap();
+
+        assert!(matches!(outcome, TokenOutcome::Terminal));
+        assert_eq!(client.count_map.get(&CurrentCommand::Insert), Some(&3));
+        assert!(client.current_result_set_has_been_read_till_end);
+        assert!(!client.execution_context.has_open_batch());
+    }
+
+    #[test]
+    fn apply_row_read_token_done_more_accumulates_and_keeps_batch_open() {
+        let mut client = create_test_client();
+        client.execution_context.set_has_open_batch(true);
+
+        // Two non-terminal DONE_COUNT tokens for the same command accumulate.
+        client
+            .apply_row_read_token(done_count(CurrentCommand::Insert, 2, true))
+            .unwrap();
+        let outcome = client
+            .apply_row_read_token(done_count(CurrentCommand::Insert, 5, true))
+            .unwrap();
+
+        assert!(matches!(outcome, TokenOutcome::Terminal));
+        assert_eq!(client.count_map.get(&CurrentCommand::Insert), Some(&7));
+        assert!(client.current_result_set_has_been_read_till_end);
+        // DONE_MORE => the batch stays open.
+        assert!(client.execution_context.has_open_batch());
+    }
+
+    #[test]
+    fn apply_row_read_token_done_with_error_flag_is_protocol_error() {
+        let mut client = create_test_client();
+        let done = Tokens::Done(DoneToken {
+            status: DoneStatus::FINAL | DoneStatus::ERROR,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        });
+        assert!(matches!(
+            client.apply_row_read_token(done),
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+    }
+
+    #[test]
+    fn apply_row_read_token_order_continues_without_side_effects() {
+        let mut client = create_test_client();
+        let outcome = client
+            .apply_row_read_token(Tokens::Order(crate::token::tokens::OrderToken {
+                _order_columns: vec![1],
+            }))
+            .unwrap();
+        assert!(matches!(outcome, TokenOutcome::Continue));
+        assert!(client.count_map.is_empty());
+        assert!(!client.current_result_set_has_been_read_till_end);
+    }
+
+    #[test]
+    fn apply_row_read_token_info_captures_message_and_continues() {
+        let mut client = create_test_client();
+        let outcome = client
+            .apply_row_read_token(info_token(50_000, 10, "print hello"))
+            .unwrap();
+        assert!(matches!(outcome, TokenOutcome::Continue));
+        assert_eq!(client.info_messages.len(), 1);
+        assert_eq!(client.info_messages[0].message, "print hello");
+    }
+
+    #[test]
+    fn apply_row_read_token_return_value_is_pushed_and_continues() {
+        let mut client = create_test_client();
+        let token = ae_return_value_token("@out", ColumnValues::Int(9), None);
+        let outcome = client
+            .apply_row_read_token(Tokens::ReturnValue(token))
+            .unwrap();
+        assert!(matches!(outcome, TokenOutcome::Continue));
+        let values = client.get_return_values();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].value, ColumnValues::Int(9));
+    }
+
+    #[test]
+    fn apply_row_read_token_error_defers_drain_without_mutation() {
+        let mut client = create_test_client();
+        client.execution_context.set_has_open_batch(true);
+
+        let outcome = client
+            .apply_row_read_token(error_token(208, 16, "invalid object name"))
+            .unwrap();
+
+        match outcome {
+            TokenOutcome::DrainThenError(errors) => {
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].number, 208);
+            }
+            other => panic!("expected DrainThenError, got {other:?}"),
+        }
+        // The Error arm defers all state mutation to the post-drain finalize.
+        assert!(client.count_map.is_empty());
+        assert!(!client.current_result_set_has_been_read_till_end);
+        assert!(client.execution_context.has_open_batch());
+    }
+
+    #[test]
+    fn apply_row_read_token_colmetadata_is_usage_error() {
+        let mut client = create_test_client();
+        assert!(matches!(
+            client.apply_row_read_token(empty_col_metadata()),
+            Err(crate::error::Error::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn finalize_row_error_clears_batch_state_and_builds_server_error() {
+        let mut client = create_test_client();
+        client.execution_context.set_has_open_batch(true);
+        client.current_metadata = Some(stale_metadata());
+
+        let errors = vec![SqlErrorInfo::from(&ErrorToken {
+            number: 2601,
+            state: 1,
+            severity: 14,
+            message: "duplicate key".to_string(),
+            server_name: "test-server".to_string(),
+            proc_name: String::new(),
+            line_number: 1,
+        })];
+        let err = client.finalize_row_error(errors);
+
+        assert!(!client.execution_context.has_open_batch());
+        assert!(client.current_result_set_has_been_read_till_end);
+        assert!(client.current_metadata.is_none());
+        match err {
+            crate::error::Error::SqlServerError { diagnostics } => {
+                assert_eq!(diagnostics.errors.len(), 1);
+                assert_eq!(diagnostics.errors[0].number, 2601);
+            }
+            other => panic!("expected SqlServerError, got {other:?}"),
+        }
     }
 
     #[test]

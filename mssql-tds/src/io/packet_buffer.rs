@@ -36,6 +36,25 @@ pub(crate) struct NeedBytes {
     pub(crate) shortfall: usize,
 }
 
+/// The unconsumed bytes carried by a [`PacketBuffer`] at an edge flip
+/// (async↔blocking), split into the two regions the framing body distinguishes.
+///
+/// `available` is already-stripped, ready-to-decode payload
+/// (`working_buffer[position..length]`); `pending` is raw, still-headered bytes
+/// of the *next* packet from a coalesced read
+/// (`working_buffer[pending_offset..+pending_bytes]`). Re-seeding both into a
+/// fresh buffer via [`PacketBuffer::seed_residual`] reproduces the exact state
+/// the parser would have continued from, so a flip mid-packet or mid-row-token
+/// is byte-identical to never flipping.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ResidualBytes {
+    /// Stripped payload bytes not yet consumed by the decoder.
+    pub(crate) available: Vec<u8>,
+    /// Raw (still-headered) surplus bytes belonging to the next packet.
+    pub(crate) pending: Vec<u8>,
+}
+
 /// Synchronous, I/O-free buffer of reassembled TDS packet payload bytes.
 pub(crate) struct PacketBuffer {
     working_buffer: Vec<u8>,
@@ -373,6 +392,61 @@ impl PacketBuffer {
     pub(crate) fn reset_to_length(&mut self, length: usize) {
         self.position = 0;
         self.length = length;
+    }
+
+    /// Extracts every unconsumed byte for handoff across an edge flip, leaving
+    /// the buffer drained.
+    ///
+    /// Splits into `available` (stripped payload `position..length`) and
+    /// `pending` (raw surplus of the next packet), the exact two regions
+    /// [`begin_refill`](Self::begin_refill) distinguishes, so
+    /// [`seed_residual`](Self::seed_residual) can rebuild an identical resume
+    /// state on the other edge.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn take_residual(&mut self) -> ResidualBytes {
+        let available = self.working_buffer[self.position..self.length].to_vec();
+        let pending = if self.pending_bytes > 0 {
+            let start = self.pending_bytes_offset;
+            self.working_buffer[start..start + self.pending_bytes].to_vec()
+        } else {
+            Vec::new()
+        };
+        self.position = 0;
+        self.length = 0;
+        self.pending_bytes = 0;
+        self.pending_bytes_offset = 0;
+        ResidualBytes { available, pending }
+    }
+
+    /// Seeds this (freshly constructed) buffer with residual bytes taken from the
+    /// other edge, reproducing the `available` + `pending` layout so the next
+    /// decode and refill continue byte-identically. The buffer grows if the
+    /// residual exceeds its two-packet working span (a straddle spanning more
+    /// than the negotiated packet size).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn seed_residual(&mut self, residual: &ResidualBytes) {
+        let available_len = residual.available.len();
+        let pending_len = residual.pending.len();
+        let needed = available_len + pending_len;
+        // Keep a full packet of headroom past the residual so the next
+        // `begin_refill`/`refill_window` always has room to read a whole packet,
+        // even when a large straddle fills most of the two-packet span.
+        let required_capacity = needed + self.max_packet_size;
+        if self.working_buffer.len() < required_capacity {
+            self.working_buffer.resize(required_capacity, 0);
+        }
+        self.working_buffer[..available_len].copy_from_slice(&residual.available);
+        self.position = 0;
+        self.length = available_len;
+        if pending_len > 0 {
+            self.working_buffer[available_len..available_len + pending_len]
+                .copy_from_slice(&residual.pending);
+            self.pending_bytes = pending_len;
+            self.pending_bytes_offset = available_len;
+        } else {
+            self.pending_bytes = 0;
+            self.pending_bytes_offset = 0;
+        }
     }
 
     /// Debug view of the raw bytes read for the packet at `base`.

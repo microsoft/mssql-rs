@@ -23,5 +23,7 @@ pub(crate) mod metadata_retriever;
 pub(crate) mod session_recovery;
 /// Primary client type and result set traits.
 pub mod tds_client;
+/// Synchronous, reactor-free row-fetch client over the blocking TDS edge.
+pub mod tds_sync_client;
 /// Transport layer (TCP, Named Pipes, Shared Memory).
 pub mod transport;

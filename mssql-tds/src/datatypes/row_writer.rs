@@ -119,6 +119,14 @@ impl DefaultRowWriter {
         }
     }
 
+    /// Creates a writer that reuses an existing (already-allocated) row buffer,
+    /// clearing it first. Lets batch fetchers recycle row allocations across a
+    /// result set instead of allocating one `Vec` per row.
+    pub fn from_recycled(mut row: Vec<ColumnValues>) -> Self {
+        row.clear();
+        Self { row }
+    }
+
     /// Takes the completed row, leaving the writer ready for reuse.
     pub fn take_row(&mut self) -> Vec<ColumnValues> {
         std::mem::take(&mut self.row)
