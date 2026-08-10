@@ -10,7 +10,7 @@ use crate::datatypes::encoder::GenericEncoder;
 use crate::datatypes::row_writer::{DefaultRowWriter, DiscardRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sqltypes::SqlType;
-use crate::datatypes::tds_value_serializer::PLP_TERMINATOR;
+use crate::datatypes::tds_value_serializer::{PLP_NULL, PLP_TERMINATOR, PLP_UNKNOWN_LEN};
 use crate::error::Error::UsageError;
 use crate::error::{SqlErrorInfo, SqlInfoMessage};
 use crate::io::packet_writer::{PacketWriter, SuspendedMessage, TdsPacketWriter};
@@ -218,13 +218,23 @@ enum StreamedWriteState {
 #[derive(Debug)]
 struct StreamedWriteContext {
     /// The parked outgoing RPC message. The parameter currently open for data
-    /// has already had its header + `PLP_UNKNOWN_LEN` written; the next bytes
-    /// appended are its value chunks.
+    /// has had its header (status byte + `TYPE_INFO`) written; the PLP length
+    /// field (the unknown-length opener, or `PLP_NULL`) and the value chunks are
+    /// appended afterwards by the streaming driver.
     message: SuspendedMessage,
     /// Streamed parameters whose headers have not yet been written, in order.
     pending: std::collections::VecDeque<RpcParameter>,
     /// Collation used to write `TYPE_INFO` for subsequent streamed parameters.
     db_collation: SqlCollation,
+    /// `true` once the unknown-length PLP opener (`PLP_UNKNOWN_LEN`) has been
+    /// written for the currently-open parameter — i.e. at least one value chunk
+    /// has been emitted. The opener is written lazily (on the first chunk) so a
+    /// parameter can still resolve to NULL before any data is sent.
+    value_opened: bool,
+    /// `true` when the caller has signalled the currently-open parameter is NULL
+    /// via [`TdsClient::write_streamed_null`]. Closing the parameter then writes
+    /// `PLP_NULL` instead of an opener + terminator, and no chunks may follow.
+    null_signaled: bool,
 }
 
 /// Active TDS connection to a SQL Server instance.
@@ -1173,6 +1183,8 @@ impl TdsClient {
             message,
             pending,
             db_collation: database_collation,
+            value_opened: false,
+            null_signaled: false,
         }));
 
         Ok(StreamedParamStatus::NeedData {
@@ -1191,9 +1203,10 @@ impl TdsClient {
     /// terminator, so it must never be emitted mid-value.
     ///
     /// # Errors
-    /// Returns a usage error if no streamed parameter is currently open, or if
-    /// `chunk` is longer than [`u32::MAX`] bytes (the PLP chunk-length field is
-    /// 32-bit).
+    /// Returns a usage error if no streamed parameter is currently open, if the
+    /// parameter was already marked NULL via
+    /// [`write_streamed_null`](Self::write_streamed_null), or if `chunk` is longer
+    /// than [`u32::MAX`] bytes (the PLP chunk-length field is 32-bit).
     pub async fn write_streamed_chunk(&mut self, chunk: &[u8]) -> TdsResult<()> {
         if chunk.is_empty() {
             return Ok(());
@@ -1219,10 +1232,35 @@ impl TdsClient {
             message,
             pending,
             db_collation,
+            value_opened,
+            null_signaled,
         } = *ctx;
+
+        // A parameter already signalled NULL cannot carry data. Re-park the
+        // (still-clean) message and reject; this is a caller sequencing error,
+        // not a wire failure, so the stream stays usable.
+        if null_signaled {
+            self.streamed_write_state =
+                StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                    message,
+                    pending,
+                    db_collation,
+                    value_opened,
+                    null_signaled,
+                }));
+            return Err(UsageError(
+                "write_streamed_chunk called after the parameter was marked NULL.".to_string(),
+            ));
+        }
 
         let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
         let result = async {
+            // Lazily write the unknown-length opener on the first chunk. Deferring
+            // it (rather than emitting it at header time) is what lets a streamed
+            // parameter still resolve to NULL before any data is sent.
+            if !value_opened {
+                packet_writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
+            }
             packet_writer.write_u32_async(chunk.len() as u32).await?;
             packet_writer.write_async(chunk).await
         }
@@ -1232,12 +1270,15 @@ impl TdsClient {
         match result {
             Ok(()) => {
                 // Chunk framed cleanly: re-park the message so the next chunk or
-                // the terminator continues exactly where this one left off.
+                // the terminator continues exactly where this one left off. The
+                // opener is now on the wire, so the value is committed as present.
                 self.streamed_write_state =
                     StreamedWriteState::Active(Box::new(StreamedWriteContext {
                         message,
                         pending,
                         db_collation,
+                        value_opened: true,
+                        null_signaled: false,
                     }));
                 Ok(())
             }
@@ -1268,8 +1309,73 @@ impl TdsClient {
         self.prepare_reset_connection(false);
     }
 
-    /// Closes the streamed parameter currently open for data by writing its PLP
-    /// terminator.
+    /// Marks the streamed parameter currently open for data as SQL NULL.
+    ///
+    /// Call this instead of [`write_streamed_chunk`](Self::write_streamed_chunk)
+    /// when a data-at-execution parameter resolves to NULL (the ODBC
+    /// `SQLPutData(SQL_NULL_DATA)` case). No bytes are written now; when the
+    /// parameter is closed with [`end_streamed_param`](Self::end_streamed_param)
+    /// the driver emits `PLP_NULL` instead of an unknown-length opener +
+    /// terminator. Mirrors msodbcsql, which writes `VARMAX_LENGTH_NULL` with no
+    /// chunks for a DAE parameter that resolves to NULL.
+    ///
+    /// # Errors
+    /// Returns a usage error if no streamed parameter is currently open, or if
+    /// value chunks have already been written for this parameter (a value that
+    /// has begun streaming cannot become NULL).
+    pub fn write_streamed_null(&mut self) -> TdsResult<()> {
+        let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
+        {
+            StreamedWriteState::Active(ctx) => ctx,
+            StreamedWriteState::Idle => {
+                return Err(UsageError(
+                    "write_streamed_null called with no active streamed parameter.".to_string(),
+                ));
+            }
+        };
+        let StreamedWriteContext {
+            message,
+            pending,
+            db_collation,
+            value_opened,
+            ..
+        } = *ctx;
+
+        if value_opened {
+            // Chunks are already on the wire; the value cannot become NULL. Re-park
+            // the (still-clean) message — this is a caller sequencing error.
+            self.streamed_write_state =
+                StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                    message,
+                    pending,
+                    db_collation,
+                    value_opened,
+                    null_signaled: false,
+                }));
+            return Err(UsageError(
+                "write_streamed_null called after value chunks were already written.".to_string(),
+            ));
+        }
+
+        self.streamed_write_state = StreamedWriteState::Active(Box::new(StreamedWriteContext {
+            message,
+            pending,
+            db_collation,
+            value_opened: false,
+            null_signaled: true,
+        }));
+        Ok(())
+    }
+
+    /// Closes the streamed parameter currently open for data.
+    /// Closes the streamed parameter currently open for data.
+    ///
+    /// The current parameter's value is closed on the wire:
+    /// - if it was marked NULL via [`write_streamed_null`](Self::write_streamed_null),
+    ///   `PLP_NULL` is written (no opener, no terminator);
+    /// - if one or more chunks were written, the `PLP_TERMINATOR` is written; and
+    /// - if neither (an untouched parameter), the unknown-length opener +
+    ///   terminator are written, encoding a present, zero-length value.
     ///
     /// If more streamed parameters remain, the next one's header is written and
     /// [`StreamedParamStatus::NeedData`] is returned (stream its chunks next).
@@ -1295,15 +1401,28 @@ impl TdsClient {
             message,
             mut pending,
             db_collation,
+            value_opened,
+            null_signaled,
         } = *ctx;
 
         let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
 
-        // Close the current value with its terminator, then either open the next
-        // streamed parameter's header or (for the last one) finalize the send.
-        // Anything that fails mid-message aborts the whole streamed write.
+        // Close the current value, then either open the next streamed parameter's
+        // header or (for the last one) finalize the send. Anything that fails
+        // mid-message aborts the whole streamed write.
         let write_outcome = async {
-            packet_writer.write_u32_async(PLP_TERMINATOR).await?;
+            if null_signaled {
+                // NULL: the length field is PLP_NULL and no chunks/terminator
+                // follow.
+                packet_writer.write_u64_async(PLP_NULL).await?;
+            } else {
+                // An untouched parameter never wrote its opener; write it now so
+                // the value is a present, zero-length value rather than absent.
+                if !value_opened {
+                    packet_writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
+                }
+                packet_writer.write_u32_async(PLP_TERMINATOR).await?;
+            }
             match pending.pop_front() {
                 Some(next) => {
                     let next_name = next
@@ -1336,6 +1455,10 @@ impl TdsClient {
                         message,
                         pending,
                         db_collation,
+                        // Fresh parameter: its opener has not been written and it
+                        // has not been marked NULL.
+                        value_opened: false,
+                        null_signaled: false,
                     }));
                 Ok(StreamedParamStatus::NeedData {
                     param_name: next_name,
@@ -5179,7 +5302,7 @@ mod tests {
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data: Vec::new(),
                 packet_pos: 0,
-resume_results: VecDeque::new(),
+                resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
@@ -5192,7 +5315,7 @@ resume_results: VecDeque::new(),
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data: Vec::new(),
                 packet_pos: 0,
-resume_results: VecDeque::new(),
+                resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
@@ -5205,7 +5328,7 @@ resume_results: VecDeque::new(),
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data,
                 packet_pos: 0,
-resume_results: VecDeque::new(),
+                resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
@@ -8226,6 +8349,9 @@ resume_results: VecDeque::new(),
     const PLP_UNKNOWN_LEN_BYTES: [u8; 8] = [0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
     /// The 4-byte PLP terminator (a zero-length chunk header) that closes a value.
     const PLP_TERMINATOR_BYTES: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+    /// The 8-byte little-endian `PLP_NULL` sentinel: a MAX-type value that is SQL
+    /// NULL. No chunks or terminator follow it.
+    const PLP_NULL_BYTES: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
 
     /// Index of the last occurrence of `needle` in `haystack`, if any.
     fn find_last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -8288,6 +8414,159 @@ resume_results: VecDeque::new(),
             client.streamed_write_state,
             StreamedWriteState::Idle
         ));
+    }
+
+    /// A streamed parameter marked NULL (before any chunk) is closed with
+    /// `PLP_NULL` — no unknown-length opener, no chunks, no terminator. Mirrors
+    /// msodbcsql's `VARMAX_LENGTH_NULL` for a data-at-execution NULL.
+    #[tokio::test]
+    async fn streamed_write_null_frames_plp_null() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        client.write_streamed_null().unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(matches!(status, StreamedParamStatus::Done));
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        // The streamed @v value's length field is PLP_NULL and nothing follows it
+        // (no chunks, no terminator), so it is the final value on the wire. Note
+        // the positional @statement/@params args are themselves nvarchar(max) and
+        // legitimately use PLP_UNKNOWN_LEN openers, so we assert on @v's PLP_NULL
+        // being last rather than the absence of any opener in the whole payload.
+        assert!(
+            payload.ends_with(&PLP_NULL_BYTES),
+            "a NULL streamed value must end the message with PLP_NULL and no terminator"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    /// Writing a chunk after marking the parameter NULL is a usage error, and the
+    /// stream stays usable (the message is not corrupted — nothing was written).
+    #[tokio::test]
+    async fn streamed_write_chunk_after_null_errors() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        client.write_streamed_null().unwrap();
+        let err = client
+            .write_streamed_chunk(&[0x01])
+            .await
+            .expect_err("cannot write data after NULL");
+        assert!(matches!(err, UsageError(_)));
+        // Still active: end can still close it as NULL.
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Active(_)
+        ));
+        assert!(matches!(
+            client.end_streamed_param().await.unwrap(),
+            StreamedParamStatus::Done
+        ));
+    }
+
+    /// Marking a parameter NULL after chunks were already written is a usage
+    /// error: a value that has begun streaming cannot become NULL.
+    #[tokio::test]
+    async fn streamed_null_after_chunk_errors() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        client.write_streamed_chunk(&[0x01, 0x02]).await.unwrap();
+        let err = client
+            .write_streamed_null()
+            .expect_err("cannot mark NULL after chunks were written");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// `write_streamed_null` with no active streamed parameter is a usage error.
+    #[tokio::test]
+    async fn streamed_null_without_active_stream_errors() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+        let err = client
+            .write_streamed_null()
+            .expect_err("no active streamed parameter");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// A NULL streamed parameter followed by a normal streamed parameter: the
+    /// first closes with `PLP_NULL`, the second frames its value normally, and the
+    /// lifecycle advances NeedData -> NeedData -> Done.
+    #[tokio::test]
+    async fn streamed_write_null_then_value_param() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(a, b) VALUES (@a, @b)".to_string(),
+                vec![streamed_varbinary("@a"), streamed_varbinary("@b")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // @a is NULL.
+        client.write_streamed_null().unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(
+            matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@b")
+        );
+
+        // @b carries a value.
+        let value = [0x7Au8; 5];
+        client.write_streamed_chunk(&value).await.unwrap();
+        assert!(matches!(
+            client.end_streamed_param().await.unwrap(),
+            StreamedParamStatus::Done
+        ));
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        // @b's value is framed after an unknown-length opener; @a contributed a
+        // PLP_NULL and no opener.
+        let b_pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected_b = Vec::new();
+        expected_b.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        expected_b.extend_from_slice(&value);
+        expected_b.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[b_pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected_b.as_slice()
+        );
+        assert!(
+            find_last(&payload[..b_pos], &PLP_NULL_BYTES).is_some(),
+            "@a must have emitted PLP_NULL before @b's value"
+        );
     }
 
     /// Multiple chunks are each length-prefixed independently and the value is

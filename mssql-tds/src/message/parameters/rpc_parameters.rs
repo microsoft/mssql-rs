@@ -7,7 +7,6 @@ use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
 use crate::datatypes::encoder::SqlValueEncoder;
 use crate::datatypes::sql_tvp::TvpTypeName;
 use crate::datatypes::sqltypes::SqlType;
-use crate::datatypes::tds_value_serializer::PLP_UNKNOWN_LEN;
 use crate::{
     core::TdsResult,
     datatypes::sqldatatypes::TdsDataType,
@@ -118,10 +117,11 @@ pub struct RpcParameter {
     /// When `true`, this parameter's value is supplied later, in chunks, via the
     /// data-at-execution path (ODBC `SQL_DATA_AT_EXEC`). During serialization the
     /// `value` is treated purely as a type template: [`serialize`](Self::serialize)
-    /// writes the parameter header and opens an unknown-length PLP value, then
-    /// stops. The value chunks and PLP terminator are written afterwards by the
-    /// streaming driver. Only the MAX (PLP) types are eligible. Never sent on the
-    /// wire as a flag.
+    /// writes the parameter header (status byte + `TYPE_INFO`) and stops *before*
+    /// the PLP length field. The length field (the unknown-length opener, or
+    /// `PLP_NULL`), the value chunks and the terminator are written afterwards by
+    /// the streaming driver. Only the MAX (PLP) types are eligible. Never sent on
+    /// the wire as a flag.
     data_at_exec: bool,
 }
 
@@ -327,11 +327,14 @@ impl RpcParameter {
         }
 
         // Data-at-execution: the value is streamed later in chunks. Reuse the
-        // exact opening the atomic PLP path emits — status byte, TYPE_INFO, then
-        // the unknown-total-length sentinel — and stop. The value chunks and PLP
-        // terminator are written afterwards by the streaming driver. This is the
-        // write analogue of the incremental read's pause point: the same
-        // serialize method, parked partway through the value.
+        // exact opening the atomic PLP path emits — status byte and TYPE_INFO —
+        // and stop *before* the PLP length field. The length field (the
+        // unknown-length opener `PLP_UNKNOWN_LEN`, or `PLP_NULL`), the value
+        // chunks and the terminator are written afterwards by the streaming
+        // driver. Deferring the length field is what lets a streamed parameter
+        // still resolve to NULL before any data is sent. This is the write
+        // analogue of the incremental read's pause point: the same serialize
+        // method, parked partway through the value.
         if self.data_at_exec {
             if !self.is_streamable_plp() {
                 return Err(Error::UsageError(format!(
@@ -349,7 +352,6 @@ impl RpcParameter {
             self.value
                 .write_type_info(packet_writer, db_collation, None, None)
                 .await?;
-            packet_writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
             return Ok(());
         }
 
@@ -930,10 +932,10 @@ mod tests {
         payload(&w)
     }
 
-    /// A named data-at-execution `nvarchar(max)` param serializes to: name
-    /// prefix, status-flags byte, the value's TYPE_INFO, then the 8-byte
-    /// `PLP_UNKNOWN_LEN` sentinel that opens the value. No value bytes or
-    /// terminator are written — those are streamed later.
+    /// A named data-at-execution `nvarchar(max)` param serializes to just the
+    /// header: name prefix, status-flags byte, then the value's TYPE_INFO. The
+    /// PLP length field (opener or NULL), value bytes and terminator are all
+    /// written later by the streaming driver, not here.
     #[test]
     fn serialize_data_at_exec_named() {
         let param = RpcParameter::new(
@@ -946,7 +948,6 @@ mod tests {
         let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
         expected.push(StatusFlags::NONE.bits()); // status flags
         expected.extend_from_slice(&type_info_bytes(&SqlType::NVarcharMax(None))); // TYPE_INFO
-        expected.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFEu64.to_le_bytes()); // PLP_UNKNOWN_LEN
 
         assert_eq!(streamed_header_bytes(&param, false), expected);
     }
@@ -966,13 +967,12 @@ mod tests {
         let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
         expected.push(StatusFlags::NONE.bits()); // status flags
         expected.extend_from_slice(&type_info_bytes(&SqlType::VarcharMax(None))); // TYPE_INFO
-        expected.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFEu64.to_le_bytes()); // PLP_UNKNOWN_LEN
 
         assert_eq!(streamed_header_bytes(&param, false), expected);
     }
 
     /// A positional data-at-execution param writes a zero-length name byte in
-    /// place of the name, then the same status/TYPE_INFO/PLP_UNKNOWN_LEN sequence.
+    /// place of the name, then the same status/TYPE_INFO header (no length field).
     #[test]
     fn serialize_data_at_exec_positional() {
         let param =
@@ -981,7 +981,6 @@ mod tests {
         let mut expected = vec![0x00]; // zero-length name (positional)
         expected.push(StatusFlags::NONE.bits());
         expected.extend_from_slice(&type_info_bytes(&SqlType::VarBinaryMax(None)));
-        expected.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFEu64.to_le_bytes());
 
         assert_eq!(streamed_header_bytes(&param, true), expected);
     }

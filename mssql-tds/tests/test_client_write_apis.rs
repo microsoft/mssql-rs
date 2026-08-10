@@ -444,10 +444,65 @@ mod streamed_plp_write {
         Ok(())
     }
 
-    /// Streaming zero chunks then ending yields an empty (non-NULL) value: the
-    /// value opener followed immediately by the terminator encodes a present,
-    /// zero-length value. Distinct from the NULL path
-    /// (`write_null_max_round_trips`).
+    /// A data-at-execution parameter that resolves to NULL: `begin` returns
+    /// `NeedData`, the caller signals NULL via `write_streamed_null` instead of
+    /// streaming chunks, and `end` closes it with `PLP_NULL`. Round-trips as SQL
+    /// NULL, and is distinct from the empty-value path. Mirrors msodbcsql's
+    /// `SQLPutData(SQL_NULL_DATA)` on a DAE-bound parameter.
+    #[tokio::test]
+    async fn stream_null_value_round_trips() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute(
+                "CREATE TABLE #plp_snull (id INT, val NVARCHAR(MAX))".to_string(),
+                (),
+            )
+            .await?;
+        client.close_query().await?;
+
+        let streamed = RpcParameter::new(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(None),
+        )
+        .data_at_exec();
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO #plp_snull (id, val) VALUES (1, @v)".to_string(),
+                vec![streamed],
+                None,
+                None,
+            )
+            .await?;
+        assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+
+        // Signal NULL instead of streaming chunks.
+        client.write_streamed_null()?;
+        let status = client.end_streamed_param().await?;
+        assert!(matches!(status, StreamedParamStatus::Done));
+        client.close_query().await?;
+
+        client
+            .execute("SELECT val FROM #plp_snull WHERE id = 1".to_string(), ())
+            .await?;
+        {
+            let row = client.next_row().await?.expect("expected a row");
+            assert!(
+                matches!(&row[0], ColumnValues::Null),
+                "expected SQL NULL from a streamed-NULL parameter, got {:?}",
+                &row[0]
+            );
+        }
+        client.close_query().await?;
+        Ok(())
+    }
     #[tokio::test]
     async fn stream_empty_value_round_trips() -> mssql_tds::core::TdsResult<()> {
         init_tracing();
