@@ -4,7 +4,6 @@
 use mssql_tds::connection::bulk_copy::{
     BulkCopy, ColumnMapping as TdsColumnMapping, ColumnMappingSource,
 };
-use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementResult, TdsClient};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use pyo3::prelude::*;
@@ -12,12 +11,13 @@ use pyo3::types::{PyDict, PyIterator, PyList, PyTuple};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
-use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use crate::arrow_bulkcopy::{ArrowBatchRowAdapter, ColumnPlan, build_column_plans};
 use crate::bulkcopy::PythonRowAdapter;
+use crate::pyclient::{self, SharedClient};
 use crate::python_logger_adapter::scoped_tracing_bridge;
+use crate::row_writer::PyRowWriter;
 use crate::utils::convert_tds_error;
 use arrow::array::{RecordBatch, StructArray};
 use arrow::datatypes::{Schema, SchemaRef};
@@ -26,9 +26,10 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
 /// Python Cursor class for Core TDS backend
 #[pyclass]
 pub struct PyCoreCursor {
-    tds_client: Arc<Mutex<TdsClient>>,
+    tds_client: SharedClient,
     runtime_handle: Handle,
     has_resultset: bool,
+    rowcount: i64,
 }
 
 #[pymethods]
@@ -43,66 +44,23 @@ impl PyCoreCursor {
     ) -> PyResult<()> {
         info!("execute: Executing query: {}", query);
 
-        let tds_client = self.tds_client.clone();
-        let runtime_handle = self.runtime_handle.clone();
+        let cell = self.tds_client.clone();
+        let handle = self.runtime_handle.clone();
 
-        // Execute query asynchronously
-        py.detach(|| {
-            runtime_handle.block_on(async {
-                let mut client = tds_client.lock().await;
-                info!("execute: Locked TDS client");
+        // Control-plane execute stays async so the rowcount oracle (DML count) is
+        // captured on the async client before any flip to the reactor-free sync
+        // edge (rule C).
+        let (rowcount, on_rows) = py.detach(|| pyclient::run_execute(&cell, &handle, query, 30))?;
 
-                // Close any open batch before executing a new query
-                if client.has_open_batch() {
-                    info!(" execute: Closing previous result set before new query");
-                    client.close_query().await.map_err(|e| {
-                        error!("execute: Failed to close previous result set: {}", e);
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "Failed to close previous result set: {}",
-                            e
-                        ))
-                    })?;
-                }
-
-                // Execute with 30 second timeout
-                let first = client
-                    .execute(
-                        query,
-                        ExecuteOptions {
-                            timeout: Some(30),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|e| {
-                        error!("execute: Failed to execute query: {}", e);
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "Query execution failed: {}",
-                            e
-                        ))
-                    })?;
-
-                // The unified execute stops on the first statement boundary,
-                // which may be a no-row statement (e.g. a leading DDL/DML in a
-                // multi-statement batch). This cursor exposes the first
-                // row-returning result set, so collapse forward to it — matching
-                // the pre-statement-wise behavior fetchone/fetchall expect.
-                if !matches!(first, StatementResult::Rows) {
-                    client.advance_to_rows().await.map_err(|e| {
-                        error!("execute: Failed to advance to first result set: {}", e);
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "Query execution failed: {}",
-                            e
-                        ))
-                    })?;
-                }
-
-                info!("execute: Query executed successfully");
-                Ok::<_, PyErr>(())
-            })
-        })?;
+        if on_rows {
+            // Flip to the reactor-free sync edge for the row-pull hot loop. A
+            // TLS/non-raw transport reports NotEligible and stays async; the fetch
+            // path then falls back to block_on transparently (byte-identical).
+            py.detach(|| pyclient::flip_to_sync(&cell, &handle))?;
+        }
 
         self.has_resultset = true;
+        self.rowcount = rowcount;
         Ok(())
     }
 
@@ -113,45 +71,36 @@ impl PyCoreCursor {
 
         info!("fetchone: Fetching one row");
 
-        let tds_client = self.tds_client.clone();
-        let runtime_handle = self.runtime_handle.clone();
+        let cell = self.tds_client.clone();
+        let handle = self.runtime_handle.clone();
 
-        // Fetch one row via next_row_into → PyRowWriter (bypasses RowToken)
-        let result = py.detach(|| {
-            runtime_handle.block_on(async {
-                let mut client = tds_client.lock().await;
-                info!("fetchone: Locked TDS client");
+        // Pull one row through the reactor-free sync edge (or the async edge via
+        // block_on when a TLS transport left the cell NotEligible). Both edges
+        // route the one shared parse body into PyRowWriter, so rows are
+        // byte-identical to the async path.
+        let result: Option<PyRowWriter> = py.detach(|| {
+            if !pyclient::is_on_rows(&cell)? {
+                return Ok::<_, PyErr>(None);
+            }
 
-                if client.on_rows() {
-                    info!("fetchone: Got resultset, fetching next row");
-                    let col_count = client.get_metadata().len();
-                    let mut writer = crate::row_writer::PyRowWriter::new(col_count);
-                    let has_row = client.next_row_into(&mut writer).await.map_err(|e| {
-                        error!("fetchone: Failed to fetch row: {}", e);
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "Failed to fetch row: {}",
-                            e
-                        ))
-                    })?;
-                    if has_row {
-                        info!("fetchone: Got row with {} columns", col_count);
-                        return Ok(Some(writer));
-                    } else {
-                        info!("No more rows, closing result set");
-                        client.close_query().await.map_err(|e| {
-                            error!("fetchone: Failed to close result set: {}", e);
-                            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                "Failed to close result set: {}",
-                                e
-                            ))
-                        })?;
-                        info!("Result set closed successfully");
-                    }
+            let col_count = pyclient::metadata_col_count(&cell)?;
+            let mut writer = PyRowWriter::new(col_count);
+
+            match pyclient::fetch_row_into(&cell, &handle, &mut writer) {
+                Ok(true) => Ok(Some(writer)),
+                Ok(false) => {
+                    // End of rows: revert to the async edge and close the result set.
+                    pyclient::close_resultset(&cell, &handle)?;
+                    Ok(None)
                 }
-
-                info!("fetchone: No more rows");
-                Ok::<_, PyErr>(None)
-            })
+                Err(e) => {
+                    error!("fetchone: fetch failed, reverting to async: {}", e);
+                    // Recover the shared cell onto a live async edge; surface the
+                    // original fetch error rather than poisoning silently (ruling 4).
+                    let _ = pyclient::revert_to_async(&cell);
+                    Err(e)
+                }
+            }
         })?;
 
         // Convert row to Python tuple (GIL re-acquired)
@@ -195,6 +144,11 @@ impl PyCoreCursor {
         }
 
         Ok(results)
+    }
+
+    #[getter]
+    fn rowcount(&self) -> i64 {
+        self.rowcount
     }
 
     fn close(&mut self) -> PyResult<()> {
@@ -275,6 +229,9 @@ impl PyCoreCursor {
     /// ```
     #[pyo3(signature = (table_name, data_source, batch_size=0, timeout=30, column_mappings=None, keep_identity=false, check_constraints=false, table_lock=false, keep_nulls=false, fire_triggers=false, use_internal_transaction=false, python_logger=None))]
     #[allow(clippy::too_many_arguments)]
+    // Std MutexGuard held across the `block_on` future's awaits by design (single
+    // thread, `!Send` guard never crosses threads).
+    #[allow(clippy::await_holding_lock)]
     fn bulkcopy(
         &mut self,
         py: Python,
@@ -331,13 +288,16 @@ impl PyCoreCursor {
         let runtime_handle = self.runtime_handle.clone();
         let result = runtime_handle.block_on(async {
             info!("bulkcopy: Inside async block, attempting to lock TDS client");
-            // Lock the TDS client
-            let mut client = tds_client.lock().await;
+            // Lock the TDS client (revert any sync edge before control-plane op)
+            let mut guard = tds_client.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("TDS client mutex was poisoned")
+            })?;
+            let client = pyclient::ensure_async(&mut guard)?;
             info!("bulkcopy: Successfully locked TDS client");
 
             // Create BulkCopy instance
             info!("bulkcopy: Creating BulkCopy instance");
-            let mut bulk_copy = BulkCopy::new(&mut client, table_name)
+            let mut bulk_copy = BulkCopy::new(&mut *client, table_name)
                 .batch_size(options.batch_size)
                 .timeout(options.timeout)
                 .check_constraints(options.check_constraints)
@@ -529,6 +489,9 @@ impl PyCoreCursor {
     /// Returns the same `dict` shape as `bulkcopy`. Errors mirror `bulkcopy`'s.
     #[pyo3(signature = (table_name, source, batch_size=0, timeout=30, column_mappings=None, keep_identity=false, check_constraints=false, table_lock=false, keep_nulls=false, fire_triggers=false, use_internal_transaction=false, python_logger=None))]
     #[allow(clippy::too_many_arguments)]
+    // Std MutexGuard held across the `block_on` future's awaits by design (single
+    // thread, `!Send` guard never crosses threads).
+    #[allow(clippy::await_holding_lock)]
     fn bulkcopy_arrow(
         &mut self,
         py: Python,
@@ -578,9 +541,12 @@ impl PyCoreCursor {
         // lets other Python threads run during the (potentially long) transfer.
         let result = py.detach(|| {
             runtime_handle.block_on(async {
-                let mut client = tds_client.lock().await;
+                let mut guard = tds_client.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("TDS client mutex was poisoned")
+                })?;
+                let client = pyclient::ensure_async(&mut guard)?;
 
-                let mut bulk_copy = BulkCopy::new(&mut client, table_name)
+                let mut bulk_copy = BulkCopy::new(&mut *client, table_name)
                     .batch_size(options.batch_size)
                     .timeout(options.timeout)
                     .check_constraints(options.check_constraints)
@@ -1222,11 +1188,12 @@ impl PyCoreCursor {
 }
 
 impl PyCoreCursor {
-    pub fn new(tds_client: Arc<Mutex<TdsClient>>, runtime_handle: Handle) -> Self {
+    pub(crate) fn new(tds_client: SharedClient, runtime_handle: Handle) -> Self {
         Self {
             tds_client,
             runtime_handle,
             has_resultset: false,
+            rowcount: -1,
         }
     }
 
