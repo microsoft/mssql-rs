@@ -4,7 +4,7 @@
 use mssql_tds::connection::bulk_copy::{
     BulkCopy, ColumnMapping as TdsColumnMapping, ColumnMappingSource,
 };
-use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementResult, TdsClient};
+use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementResult};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use pyo3::prelude::*;
@@ -12,11 +12,11 @@ use pyo3::types::{PyDict, PyIterator, PyList, PyTuple};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
-use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use crate::arrow_bulkcopy::{ArrowBatchRowAdapter, ColumnPlan, build_column_plans};
 use crate::bulkcopy::PythonRowAdapter;
+use crate::pyclient::{self, SharedClient};
 use crate::python_logger_adapter::scoped_tracing_bridge;
 use crate::utils::convert_tds_error;
 use arrow::array::{RecordBatch, StructArray};
@@ -26,15 +26,20 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
 /// Python Cursor class for Core TDS backend
 #[pyclass]
 pub struct PyCoreCursor {
-    tds_client: Arc<Mutex<TdsClient>>,
+    tds_client: SharedClient,
     runtime_handle: Handle,
     has_resultset: bool,
+    rowcount: i64,
 }
 
 #[pymethods]
 impl PyCoreCursor {
     #[pyo3(signature = (query, params=None))]
     #[allow(unused_variables)]
+    // The std MutexGuard is intentionally held across the `block_on` future's
+    // awaits: `block_on` drives that future to completion on this one thread, so
+    // the `!Send` guard never crosses threads and cannot deadlock the cell.
+    #[allow(clippy::await_holding_lock)]
     fn execute(
         &mut self,
         py: Python,
@@ -47,9 +52,13 @@ impl PyCoreCursor {
         let runtime_handle = self.runtime_handle.clone();
 
         // Execute query asynchronously
-        py.detach(|| {
+        let rowcount = py.detach(|| {
             runtime_handle.block_on(async {
-                let mut client = tds_client.lock().await;
+                let mut guard = tds_client.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("TDS client mutex was poisoned")
+                })?;
+                // Revert any live sync edge before the control-plane execute.
+                let client = pyclient::ensure_async(&mut guard)?;
                 info!("execute: Locked TDS client");
 
                 // Close any open batch before executing a new query
@@ -98,14 +107,19 @@ impl PyCoreCursor {
                 }
 
                 info!("execute: Query executed successfully");
-                Ok::<_, PyErr>(())
+                Ok::<_, PyErr>(client.last_rows_affected())
             })
         })?;
 
         self.has_resultset = true;
+        self.rowcount = rowcount;
         Ok(())
     }
 
+    // The std MutexGuard is held across the `block_on` future's awaits by design;
+    // `block_on` completes the future on this single thread, so the `!Send` guard
+    // never crosses threads.
+    #[allow(clippy::await_holding_lock)]
     fn fetchone(&mut self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         if !self.has_resultset {
             return Ok(None);
@@ -119,7 +133,10 @@ impl PyCoreCursor {
         // Fetch one row via next_row_into → PyRowWriter (bypasses RowToken)
         let result = py.detach(|| {
             runtime_handle.block_on(async {
-                let mut client = tds_client.lock().await;
+                let mut guard = tds_client.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("TDS client mutex was poisoned")
+                })?;
+                let client = pyclient::ensure_async(&mut guard)?;
                 info!("fetchone: Locked TDS client");
 
                 if client.on_rows() {
@@ -195,6 +212,11 @@ impl PyCoreCursor {
         }
 
         Ok(results)
+    }
+
+    #[getter]
+    fn rowcount(&self) -> i64 {
+        self.rowcount
     }
 
     fn close(&mut self) -> PyResult<()> {
@@ -275,6 +297,9 @@ impl PyCoreCursor {
     /// ```
     #[pyo3(signature = (table_name, data_source, batch_size=0, timeout=30, column_mappings=None, keep_identity=false, check_constraints=false, table_lock=false, keep_nulls=false, fire_triggers=false, use_internal_transaction=false, python_logger=None))]
     #[allow(clippy::too_many_arguments)]
+    // Std MutexGuard held across the `block_on` future's awaits by design (single
+    // thread, `!Send` guard never crosses threads).
+    #[allow(clippy::await_holding_lock)]
     fn bulkcopy(
         &mut self,
         py: Python,
@@ -331,13 +356,16 @@ impl PyCoreCursor {
         let runtime_handle = self.runtime_handle.clone();
         let result = runtime_handle.block_on(async {
             info!("bulkcopy: Inside async block, attempting to lock TDS client");
-            // Lock the TDS client
-            let mut client = tds_client.lock().await;
+            // Lock the TDS client (revert any sync edge before control-plane op)
+            let mut guard = tds_client.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("TDS client mutex was poisoned")
+            })?;
+            let client = pyclient::ensure_async(&mut guard)?;
             info!("bulkcopy: Successfully locked TDS client");
 
             // Create BulkCopy instance
             info!("bulkcopy: Creating BulkCopy instance");
-            let mut bulk_copy = BulkCopy::new(&mut client, table_name)
+            let mut bulk_copy = BulkCopy::new(&mut *client, table_name)
                 .batch_size(options.batch_size)
                 .timeout(options.timeout)
                 .check_constraints(options.check_constraints)
@@ -529,6 +557,9 @@ impl PyCoreCursor {
     /// Returns the same `dict` shape as `bulkcopy`. Errors mirror `bulkcopy`'s.
     #[pyo3(signature = (table_name, source, batch_size=0, timeout=30, column_mappings=None, keep_identity=false, check_constraints=false, table_lock=false, keep_nulls=false, fire_triggers=false, use_internal_transaction=false, python_logger=None))]
     #[allow(clippy::too_many_arguments)]
+    // Std MutexGuard held across the `block_on` future's awaits by design (single
+    // thread, `!Send` guard never crosses threads).
+    #[allow(clippy::await_holding_lock)]
     fn bulkcopy_arrow(
         &mut self,
         py: Python,
@@ -578,9 +609,12 @@ impl PyCoreCursor {
         // lets other Python threads run during the (potentially long) transfer.
         let result = py.detach(|| {
             runtime_handle.block_on(async {
-                let mut client = tds_client.lock().await;
+                let mut guard = tds_client.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("TDS client mutex was poisoned")
+                })?;
+                let client = pyclient::ensure_async(&mut guard)?;
 
-                let mut bulk_copy = BulkCopy::new(&mut client, table_name)
+                let mut bulk_copy = BulkCopy::new(&mut *client, table_name)
                     .batch_size(options.batch_size)
                     .timeout(options.timeout)
                     .check_constraints(options.check_constraints)
@@ -1222,11 +1256,12 @@ impl PyCoreCursor {
 }
 
 impl PyCoreCursor {
-    pub fn new(tds_client: Arc<Mutex<TdsClient>>, runtime_handle: Handle) -> Self {
+    pub(crate) fn new(tds_client: SharedClient, runtime_handle: Handle) -> Self {
         Self {
             tds_client,
             runtime_handle,
             has_resultset: false,
+            rowcount: -1,
         }
     }
 
