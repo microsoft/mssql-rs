@@ -674,13 +674,20 @@ pub fn build_login_ack() -> BytesMut {
 
 /// Build a DONE token
 pub fn build_done_token(row_count: u64) -> BytesMut {
+    build_done_token_with_status(0x0000, row_count)
+}
+
+/// DONE token with an explicit status word. `0x0000` is `DONE_FINAL` (the batch
+/// ends); `0x0001` is `DONE_MORE`, signalling that another result set follows in
+/// the same batch (what a multi-statement `SELECT …; SELECT …` produces).
+pub fn build_done_token_with_status(status: u16, row_count: u64) -> BytesMut {
     let mut token_data = BytesMut::new();
 
     // DONE token (0xFD)
     token_data.put_u8(TokenType::Done as u8);
 
-    // Status: DONE_FINAL (0x00) - little-endian
-    token_data.put_u16_le(0x0000);
+    // Status - little-endian
+    token_data.put_u16_le(status);
 
     // CurCmd: SELECT (0xC1) - little-endian
     token_data.put_u16_le(0x00C1);
@@ -822,6 +829,41 @@ pub fn build_info_token(info: &crate::query_response::InfoMessage) -> BytesMut {
 pub fn build_query_result(response: &crate::query_response::QueryResponse) -> BytesMut {
     let mut result = BytesMut::new();
 
+    // Flatten the primary set and any additional sets (recursively) into batch
+    // order. All but the last close with DONE_MORE so the client advances across
+    // the boundary; the last closes with DONE_FINAL. Single-set responses (the
+    // common case) have no additional sets and serialize byte-identically.
+    let mut sets = Vec::new();
+    collect_result_sets(response, &mut sets);
+    let last = sets.len() - 1;
+    for (idx, set) in sets.into_iter().enumerate() {
+        serialize_result_set(&mut result, set, idx == last);
+    }
+
+    wrap_in_packet(PacketType::TabularResult, result)
+}
+
+/// Flatten a response and its `additional_sets` (depth-first, in order) into a
+/// linear batch of result sets so their terminal DONE statuses can be assigned.
+fn collect_result_sets<'a>(
+    response: &'a crate::query_response::QueryResponse,
+    out: &mut Vec<&'a crate::query_response::QueryResponse>,
+) {
+    out.push(response);
+    for set in &response.additional_sets {
+        collect_result_sets(set, out);
+    }
+}
+
+/// Serialize one result set's tokens (ColMetadata, injected Info, rows, terminal
+/// DONE) into `result`. `is_last` selects the DONE status: the final set in a
+/// batch closes `DONE_FINAL`, earlier sets `DONE_MORE`. An `error_after` set is
+/// always terminal (its ERROR + DONE end the batch), so it ignores `is_last`.
+fn serialize_result_set(
+    result: &mut BytesMut,
+    response: &crate::query_response::QueryResponse,
+    is_last: bool,
+) {
     // ColMetadata token (0x81)
     result.put_u8(TokenType::ColMetadata as u8);
     result.put_u16_le(response.columns.len() as u16); // Column count
@@ -860,7 +902,7 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
             for row in response.rows.iter().take(err.after_rows) {
                 result.put_u8(TokenType::Row as u8);
                 for value in &row.values {
-                    value.write_to_buffer(&mut result);
+                    value.write_to_buffer(result);
                 }
             }
             result.extend_from_slice(&build_error_token(
@@ -880,16 +922,18 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
             for row in &response.rows {
                 result.put_u8(TokenType::Row as u8);
                 for value in &row.values {
-                    value.write_to_buffer(&mut result);
+                    value.write_to_buffer(result);
                 }
             }
 
-            // DONE token
-            result.extend_from_slice(&build_done_token(response.rows.len() as u64));
+            // DONE_MORE when another set follows, else terminal DONE_FINAL.
+            let status = if is_last { 0x0000 } else { 0x0001 };
+            result.extend_from_slice(&build_done_token_with_status(
+                status,
+                response.rows.len() as u64,
+            ));
         }
     }
-
-    wrap_in_packet(PacketType::TabularResult, result)
 }
 
 /// Build a bare ERROR token (0xAA) with no surrounding DONE or packet framing,

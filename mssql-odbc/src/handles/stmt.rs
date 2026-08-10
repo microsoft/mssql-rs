@@ -70,6 +70,7 @@ pub(crate) struct StmtState {
     /// execute, which flushes any pending drop first).
     pub(crate) pending_unprepare: Option<i32>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
+    /// The sync fetch arm recycles this allocation into its row writer.
     pub(crate) current_row: Option<Vec<ColumnValues>>,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
@@ -97,6 +98,52 @@ pub(crate) struct StmtState {
     pub(crate) row_bind_type: SqlULen,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
+    /// Active `SQLGetData` streaming cursor for the current row. Tracks how much
+    /// of a single column's value has already been handed back across successive
+    /// `SQLGetData` calls so large (LOB / `max`) values stream in buffer-sized
+    /// chunks that terminate in `SQL_NO_DATA`, instead of re-returning the same
+    /// truncated prefix every call. Reset at each `SQLFetch` and cursor close.
+    pub(crate) getdata: Option<GetDataProgress>,
+}
+
+/// Encoded, ready-to-serve units for an in-progress `SQLGetData` stream. The
+/// column value is converted and encoded once when a column becomes active, then
+/// served in chunks — keeping chunked retrieval O(n) total rather than
+/// re-encoding the whole value on every call.
+#[derive(Debug)]
+pub(crate) enum GetDataUnits {
+    /// `SQL_C_CHAR` payload (UTF-8 bytes).
+    Char(Vec<u8>),
+    /// `SQL_C_WCHAR` payload (UTF-16 code units).
+    WChar(Vec<u16>),
+    /// SQL `NULL`: one `SQL_NULL_DATA` delivery, then `SQL_NO_DATA`.
+    Null,
+}
+
+impl GetDataUnits {
+    /// True when this payload matches the requested C type, so an in-progress
+    /// stream can continue instead of being rebuilt. `NULL` matches either.
+    pub(crate) fn matches_wchar(&self, is_wchar: bool) -> bool {
+        match self {
+            GetDataUnits::Char(_) => !is_wchar,
+            GetDataUnits::WChar(_) => is_wchar,
+            GetDataUnits::Null => true,
+        }
+    }
+}
+
+/// Per-column streaming progress for `SQLGetData`.
+#[derive(Debug)]
+pub(crate) struct GetDataProgress {
+    /// 1-based column number the cursor is bound to.
+    pub(crate) column: SqlUSmallInt,
+    /// Cached encoded payload.
+    pub(crate) units: GetDataUnits,
+    /// Number of units already delivered.
+    pub(crate) offset: usize,
+    /// Set once the terminal chunk (or the sole NULL/empty delivery) has been
+    /// served; the next call on this column returns `SQL_NO_DATA`.
+    pub(crate) exhausted: bool,
 }
 
 impl StmtState {
@@ -110,6 +157,14 @@ impl StmtState {
 
     pub(crate) fn clear_state(&mut self, mask: u32) {
         self.state_flags &= !mask;
+    }
+
+    /// Clears the current row at every result-set boundary (execute,
+    /// `SQLMoreResults`, cursor close) so a fresh result set never serves a row
+    /// left over from a prior one.
+    pub(crate) fn reset_fetch_state(&mut self) {
+        self.current_row = None;
+        self.getdata = None;
     }
 
     /// Moves the cached `prepared_handle` (if any) into `pending_unprepare` so
@@ -167,6 +222,7 @@ impl StmtHandle {
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
                 state_flags: 0,
+                getdata: None,
             }),
         }
     }

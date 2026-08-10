@@ -46,5 +46,9 @@ windows = { version = "0.58", features = [
 # `TdsClient` driven by scripted TDS tokens (see `mssql_tds::test_client_support`)
 # to cover client-driven ODBC paths without a live server.
 mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
+# A real raw-TCP mock TDS peer for the sync-fetch integration tests: scripted
+# token clients are never `into_sync`-eligible (their transport yields no
+# blocking parts), so the sync arm can only be exercised over an actual socket.
+mssql-mock-tds = { path = "../mssql-mock-tds" }
 
 [build-dependencies]

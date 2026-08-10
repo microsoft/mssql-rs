@@ -187,6 +187,13 @@ pub struct QueryResponse {
     /// When set, only the first `after_rows` rows are streamed, then an ERROR
     /// token and a terminal DONE are emitted (no trailing rows).
     pub error_after: Option<MidStreamError>,
+    /// Further result sets streamed in the same batch after this one. When
+    /// non-empty, this set's terminal DONE carries `DONE_MORE` and each
+    /// subsequent set is emitted in turn (the last one closing with a terminal
+    /// `DONE_FINAL`) — the multi-result-set shape a `SELECT …; SELECT …` batch
+    /// produces, exercising `SQLMoreResults`/`advance()` across the boundary.
+    /// Empty by default, so single-set responses serialize byte-identically.
+    pub additional_sets: Vec<QueryResponse>,
 }
 
 impl QueryResponse {
@@ -197,6 +204,7 @@ impl QueryResponse {
             rows,
             info_tokens: Vec::new(),
             error_after: None,
+            additional_sets: Vec::new(),
         }
     }
 
@@ -211,6 +219,14 @@ impl QueryResponse {
         self
     }
 
+    /// Append another result set to this batch. The current terminal DONE
+    /// becomes `DONE_MORE`; `next` is streamed after it (recursively, if it too
+    /// carries additional sets), with the final set closing on `DONE_FINAL`.
+    pub fn with_additional_result_set(mut self, next: QueryResponse) -> Self {
+        self.additional_sets.push(next);
+        self
+    }
+
     /// Helper to create a response for SELECT 1
     pub fn select_one() -> Self {
         Self {
@@ -218,6 +234,7 @@ impl QueryResponse {
             rows: vec![Row::new(vec![ColumnValue::Int(1)])],
             info_tokens: Vec::new(),
             error_after: None,
+            additional_sets: Vec::new(),
         }
     }
 
@@ -236,6 +253,7 @@ impl QueryResponse {
             ])],
             info_tokens: Vec::new(),
             error_after: None,
+            additional_sets: Vec::new(),
         }
     }
 }

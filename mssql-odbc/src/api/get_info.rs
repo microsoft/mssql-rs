@@ -146,9 +146,7 @@ fn sql_get_info_w_safe(
             // Use the version negotiated at login; fall back to a neutral
             // placeholder when the connection has no reported version yet.
             let version = state
-                .client
-                .as_ref()
-                .and_then(|c| c.server_version())
+                .server_version
                 .map(|v| format!("{:02}.{:02}.{:04}", v.major, v.minor, v.build))
                 .unwrap_or_else(|| "00.00.0000".to_string());
             write_wide_str(

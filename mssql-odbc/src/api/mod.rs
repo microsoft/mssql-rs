@@ -35,3 +35,12 @@ pub(crate) mod util;
 // All `#[unsafe(no_mangle)] pub extern "C"` symbols are defined here.
 mod exports;
 pub use exports::*;
+
+// In-crate integration tests for the reactor-free sync fetch edge. Kept in the
+// crate (not `tests/`) because the driver is a `cdylib`: an external test crate
+// can neither link it nor reach the `pub(crate)` entry points and handle state
+// these tests drive. They stand up a real `mssql-mock-tds` peer over TCP so the
+// connection is sync-eligible (raw TCP), which the scripted-token unit tests
+// cannot be.
+#[cfg(test)]
+mod sync_fetch_tests;
