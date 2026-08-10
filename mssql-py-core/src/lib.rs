@@ -7,10 +7,12 @@ use std::sync::OnceLock;
 use mssql_tds::connection::client_context::DriverVersion;
 
 mod arrow_bulkcopy;
+mod async_cursor;
 mod bulkcopy;
 mod connection;
 mod cursor;
 mod odbc_auth;
+mod pyclient;
 mod python_entra_token_factory;
 mod python_logger_adapter;
 mod row_writer;
@@ -83,6 +85,7 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<connection::PyCoreConnection>()?;
     m.add_class::<cursor::PyCoreCursor>()?;
+    m.add_class::<async_cursor::PyCoreAsyncCursor>()?;
 
     // Test-only hook to drive PythonEntraIdTokenFactory::create_token from
     // Python tests. Underscore-prefixed to mark as internal/test-only.
