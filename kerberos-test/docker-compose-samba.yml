@@ -1,6 +1,7 @@
 services:
   # Samba AD Domain Controller
   dc:
+    image: ${KERBEROS_IMAGE_REGISTRY:-ghcr.io/microsoft/mssql-rs}/kerberos/samba-dc:${KERBEROS_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile.samba-dc
@@ -41,6 +42,7 @@ services:
 
   # SQL Server on Linux with SSSD/AD integration
   mssql:
+    image: ${KERBEROS_IMAGE_REGISTRY:-ghcr.io/microsoft/mssql-rs}/kerberos/mssql-ad:${KERBEROS_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile.mssql-ad

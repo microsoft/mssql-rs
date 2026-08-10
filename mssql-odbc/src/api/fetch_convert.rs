@@ -29,6 +29,18 @@ use super::odbc_types::{
 };
 use super::util::write_if_some;
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
+
+/// Decodes a character column without the panicking paths in
+/// `SqlString::to_utf8_string` (its UTF-8 branch unwraps); the UTF-16 and LCID
+/// branches decode through `encoding_rs`, which substitutes replacement
+/// characters rather than failing.
+pub(crate) fn sql_string_to_text(s: &SqlString) -> Option<String> {
+    match s.encoding_type() {
+        EncodingType::Utf8 => String::from_utf8(s.bytes.clone()).ok(),
+        _ => Some(s.to_utf8_string()),
+    }
+}
 
 /// Outcome of a successful conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -432,9 +444,14 @@ pub(crate) unsafe fn convert_datetime_c(
     target_value_ptr: SqlPointer,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> Result<ConvOk, ConvError> {
-    // A date/time C target was requested for a non-temporal column: illegal.
     let Some(p) = extract_datetime_parts(value) else {
-        return Err(ConvError::Restricted);
+        // Character sources are a legal date/time conversion per Appendix D and
+        // land in P1a; report "not implemented" rather than claiming the
+        // pairing is restricted. Everything else genuinely cannot convert.
+        return Err(match value {
+            ColumnValues::String(_) => ConvError::NotHandledHere,
+            _ => ConvError::Restricted,
+        });
     };
     let ret = match target_type {
         SQL_C_TYPE_DATE | SQL_C_DATE if p.has_date => {
@@ -450,7 +467,7 @@ pub(crate) unsafe fn convert_datetime_c(
                 )
             };
             // Dropping a non-zero time component is a truncation.
-            if p.has_time && (p.hour | p.minute | p.second) != 0 || p.fraction_ns != 0 {
+            if p.has_time && ((p.hour | p.minute | p.second) != 0 || p.fraction_ns != 0) {
                 ConvOk::Truncated
             } else {
                 written

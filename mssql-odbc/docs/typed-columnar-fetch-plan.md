@@ -124,14 +124,14 @@ Descriptor handles are not implemented in the crate yet, so `SQLGetStmtAttrW(SQL
 
 `SQLGetData` in P1 returns each value in a single call from the materialized `ColumnValues` that `TdsClient::next_row` produces, reporting truncation with `01004`. It does **not** advance a per-call offset, and it does not stream LOBs off the wire.
 
-Both of those belong to the fetch rework in [#153](https://github.com/microsoft/mssql-rs/pull/153) (column-wise fetch + incremental PLP support), which carries ODBC wire-stream state and builds on the PLP reader added in [#109](https://github.com/microsoft/mssql-rs/pull/109) (`PlpChunkStreamReader`, `receive_row_into` / `resume_row_into` / `read_active_plp_bytes`). Those primitives are `pub(crate)` to `mssql-tds`, and consuming them from the ODBC crate additionally requires a public `TdsClient` streaming API plus an ODBC connection-ownership change (today `SQLFetch` returns the TDS client to the DBC, whereas streaming requires the statement to hold it across `SQLGetData` calls). P1 therefore stays on the conversion layer and leaves the fetch mechanics to #153.
+Both of those landed with the fetch rework in [#153](https://github.com/microsoft/mssql-rs/pull/153) (column-wise fetch + incremental PLP support), which carries ODBC wire-stream state and builds on the PLP reader added in [#109](https://github.com/microsoft/mssql-rs/pull/109) (`PlpChunkStreamReader`, `receive_row_into` / `resume_row_into` / `read_active_plp_bytes`). Those primitives are `pub(crate)` to `mssql-tds`, and consuming them from the ODBC crate additionally requires a public `TdsClient` streaming API plus an ODBC connection-ownership change (today `SQLFetch` returns the TDS client to the DBC, whereas streaming requires the statement to hold it across `SQLGetData` calls). P1 therefore stays on the conversion layer and leaves the fetch mechanics to #153.
 
 ## Status
 
 | Phase | Task | State |
 | --- | --- | --- |
 | P0 — Prerequisites & plumbing | 46577 | Implemented (build + clippy clean, 332 tests pass) |
-| P1 — Typed SQLGetData | 46578 | Implemented (int/float/guid/date-time C targets + char/binary rendering; 491 tests pass). Chunked retrieval and incremental PLP streaming moved to #153; missing source-type conversions tracked as P1a; `sql_variant` underlying-type resolution deferred to P2. |
+| P1 — Typed SQLGetData | 46578 | Implemented (int/float/guid/date-time C targets + char/binary rendering; 491 tests pass). Chunked retrieval and incremental PLP streaming are owned by #153 (merged), on top of which the typed targets are dispatched; missing source-type conversions tracked as P1a; `sql_variant` underlying-type resolution deferred to P2. |
 | P1a — Mandatory source-type conversions | 47107 | Not started |
 | P2 — SQLColAttributeW | 46579 | Not started |
 | P3 — SQLBindCol + SQLFetchScroll | 46580 | Not started |

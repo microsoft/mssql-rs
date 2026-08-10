@@ -2258,109 +2258,6 @@ mod always_encrypted {
     #[tokio::test]
     async fn encrypted_plp_pause_streaming_fails_fast_under_ae() {
         ae_test!(|h| {
-            struct PauseAtFirstColumnWriter;
-
-            impl mssql_tds::datatypes::row_writer::RowWriter for PauseAtFirstColumnWriter {
-                fn pause_after_column(&self, col: usize) -> bool {
-                    col == 0
-                }
-
-                fn write_null(&mut self, _col: usize) {}
-                fn write_bool(&mut self, _col: usize, _val: bool) {}
-                fn write_u8(&mut self, _col: usize, _val: u8) {}
-                fn write_i16(&mut self, _col: usize, _val: i16) {}
-                fn write_i32(&mut self, _col: usize, _val: i32) {}
-                fn write_i64(&mut self, _col: usize, _val: i64) {}
-                fn write_f32(&mut self, _col: usize, _val: f32) {}
-                fn write_f64(&mut self, _col: usize, _val: f64) {}
-                fn write_string(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::sql_string::SqlString,
-                ) {
-                }
-                fn write_bytes(&mut self, _col: usize, _val: Vec<u8>) {}
-                fn write_decimal(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::decoder::DecimalParts,
-                ) {
-                }
-                fn write_numeric(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::decoder::DecimalParts,
-                ) {
-                }
-                fn write_date(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::column_values::SqlDate,
-                ) {
-                }
-                fn write_time(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::column_values::SqlTime,
-                ) {
-                }
-                fn write_datetime(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::column_values::SqlDateTime,
-                ) {
-                }
-                fn write_smalldatetime(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::column_values::SqlSmallDateTime,
-                ) {
-                }
-                fn write_datetime2(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::column_values::SqlDateTime2,
-                ) {
-                }
-                fn write_datetimeoffset(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::column_values::SqlDateTimeOffset,
-                ) {
-                }
-                fn write_money(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::column_values::SqlMoney,
-                ) {
-                }
-                fn write_smallmoney(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::column_values::SqlSmallMoney,
-                ) {
-                }
-                fn write_uuid(&mut self, _col: usize, _val: uuid::Uuid) {}
-                fn write_xml(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::column_values::SqlXml,
-                ) {
-                }
-                fn write_json(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::sql_json::SqlJson,
-                ) {
-                }
-                fn write_vector(
-                    &mut self,
-                    _col: usize,
-                    _val: mssql_tds::datatypes::sql_vector::SqlVector,
-                ) {
-                }
-                fn end_row(&mut self) {}
-            }
             let table = h
                 .create_encrypted_table("VARBINARY(MAX)", "RANDOMIZED")
                 .await;
@@ -2375,9 +2272,17 @@ mod always_encrypted {
 
             let err = {
                 assert!(h.client.on_rows(), "result set present");
-                let mut writer = PauseAtFirstColumnWriter;
+                assert!(
+                    h.client
+                        .next_row_cursor()
+                        .await
+                        .expect("position on encrypted row"),
+                    "row present"
+                );
+                // Pulling the encrypted PLP column must fail fast rather than
+                // stream ciphertext via read_active_plp_bytes.
                 h.client
-                    .next_row_into(&mut writer)
+                    .read_row_column(0)
                     .await
                     .expect_err("paused AE PLP streaming must fail fast")
             };

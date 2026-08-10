@@ -115,6 +115,35 @@ base images as the CI matrix (from `validation-pipeline.yml`).
 
 All images come from `tdslibrs.azurecr.io/import/` - the same ACR used by CI.
 
+### Pre-built images
+
+The DC, SQL+AD and per-distro client images are pre-built weekly by
+`.pipeline/sync-container-images.yml` and published to
+`ghcr.io/microsoft/mssql-rs/kerberos/*`. CI pulls them instead of rebuilding,
+which skips the Rust toolchain install, the distro dev packages and the
+Samba/SSSD stacks on every run.
+
+**CI never builds these images.** If a pull fails the stage fails, so a missing,
+unpublished or private image surfaces immediately instead of being masked by a
+slow rebuild. Changes to `Dockerfile.samba-dc`, `Dockerfile.mssql-ad` or
+`Dockerfile.client.matrix` therefore only take effect in CI once the sync
+pipeline has republished the images.
+
+Because `docker-compose-*.yml` declare both `image:` and `build:`, local
+workflows can still pull or build:
+
+```bash
+docker compose -f docker-compose-matrix.yml --profile ubuntu22 pull   # use pre-built
+docker compose -f docker-compose-matrix.yml --profile ubuntu22 build  # build locally
+```
+
+Override the source registry/tag with `KERBEROS_IMAGE_REGISTRY` and
+`KERBEROS_IMAGE_TAG`.
+
+The DC and SQL images run their init script from the mounted `./scripts`
+directory rather than a copy baked into the image, so edits to
+`scripts/init-*.sh` take effect without republishing the image.
+
 ### Test a Specific Distro
 
 ```bash

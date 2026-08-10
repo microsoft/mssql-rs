@@ -37,7 +37,6 @@ use mssql_tds::{
     },
     connection_provider::tds_connection_provider::TdsConnectionProvider,
     core::{EncryptionOptions, EncryptionSetting},
-    datatypes::column_values::ColumnValues,
 };
 
 /// Connection target resolved from the environment.
@@ -207,9 +206,9 @@ pub async fn drain(client: &mut TdsClient) -> u64 {
     rows
 }
 
-/// Like [`drain`], but captures the prepared-statement handle — the first
-/// integer return value carried by the response — before
-/// [`close_query`](TdsClient::close_query) clears the return-value buffer.
+/// Like [`drain`], but captures the prepared-statement handle the driver
+/// funnelled out of the `sp_prepexec` `@handle` RETURNVALUE, via
+/// [`take_prepared_statement_handle`](TdsClient::take_prepared_statement_handle).
 ///
 /// Used by the `sp_prepexec` benchmark to release the handle it just created so
 /// server-side prepared state does not accumulate across iterations (which would
@@ -225,14 +224,11 @@ pub async fn drain_capture_handle(client: &mut TdsClient) -> i32 {
             break;
         }
     }
+    // sp_prepexec funnels the @handle RETURNVALUE into a dedicated slot, read
+    // via take_prepared_statement_handle() rather than the return-value buffer.
     let handle = client
-        .get_return_values()
-        .into_iter()
-        .find_map(|rv| match rv.value {
-            ColumnValues::Int(h) => Some(h),
-            _ => None,
-        })
-        .expect("prepared handle not found in return values");
+        .take_prepared_statement_handle()
+        .expect("sp_prepexec did not capture a prepared handle");
     client.close_query().await.expect("close_query failed");
     handle
 }
