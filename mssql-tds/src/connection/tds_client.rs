@@ -1561,6 +1561,13 @@ impl TdsClient {
     /// invariant by moving the old handle to its pending slot only when it
     /// replaces the prepared statement.
     ///
+    /// # Precondition
+    ///
+    /// Pass `orphaned = Some` only when `statement` has no live handle. This is
+    /// the precondition `plan_prepared_execution` relies on to never both reuse a
+    /// live handle and consume an orphan — the property that keeps a live orphan
+    /// from being discarded on the `sp_execute` reuse path.
+    ///
     /// Returns positioned on the first result; drain rows with
     /// [`next_row`](ResultSet::next_row) / [`advance`](Self::advance).
     pub async fn execute_prepared<'a>(
@@ -1582,6 +1589,16 @@ impl TdsClient {
         let mut opts = options.into();
         let reconnect_elapsed = self.check_and_reconnect(opts.timeout, opts.cancel).await?;
         opts.timeout = Self::deduct_timeout(opts.timeout, reconnect_elapsed);
+        // `Some(0)` means recovery consumed the whole command budget; fail fast
+        // rather than fall through into the `0 == infinite` convention that
+        // `timeout_to_duration` applies downstream.
+        if opts.timeout == Some(0) {
+            return Err(crate::error::Error::TimeoutError(
+                crate::error::TimeoutErrorType::String(
+                    "command timeout exhausted by connection recovery".to_string(),
+                ),
+            ));
+        }
         let epoch = self.connection_recovery_count();
 
         match plan_prepared_execution(statement.session_handle, *orphaned, epoch) {
@@ -1663,6 +1680,15 @@ impl TdsClient {
         opts.timeout = Self::deduct_timeout(opts.timeout, reconnect_elapsed);
         if handle.session_epoch != self.connection_recovery_count() {
             return Ok(());
+        }
+        // `Some(0)` means the budget is spent — fail fast rather than fall
+        // through the `Some(0) == infinite` convention downstream.
+        if opts.timeout == Some(0) {
+            return Err(crate::error::Error::TimeoutError(
+                crate::error::TimeoutErrorType::String(
+                    "command timeout exhausted by connection recovery".to_string(),
+                ),
+            ));
         }
         self.execute_sp_unprepare(handle.id, true, opts).await
     }
@@ -5348,6 +5374,28 @@ mod tests {
         assert_eq!(orphaned, Some(handle(9, 1)));
     }
 
+    #[tokio::test]
+    async fn execute_prepared_errors_when_budget_exhausted_by_recovery() {
+        // A command budget fully consumed before execution — the same `Some(0)`
+        // state a reconnect that ate the whole timeout produces (see
+        // `deduct_timeout_saturates_at_zero`) — must fail fast rather than fall
+        // through `timeout_to_duration`'s `Some(0) == infinite` convention.
+        let mut client = create_test_client();
+        let mut statement = PreparedStatement::new("SELECT 1");
+        let mut orphaned = None;
+
+        let result = client
+            .execute_prepared(
+                &mut statement,
+                Vec::new(),
+                &mut orphaned,
+                ExecuteOptions::new().timeout_secs(0),
+            )
+            .await;
+
+        assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
+    }
+
     // ── PreparedStatement lifecycle: unprepare / capture_prepared_handle_into ──
 
     fn prepared_with_handle(id: i32, epoch: u32) -> PreparedStatement {
@@ -5423,6 +5471,20 @@ mod tests {
         let result = client.unprepare(handle(5, 0), ()).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn unprepare_errors_when_budget_exhausted_before_send() {
+        // A live handle (epoch matches) with a spent budget must fail fast rather
+        // than send sp_unprepare with a `Some(0)` that `timeout_to_duration`
+        // would reinterpret as infinite.
+        let mut client = create_test_client();
+
+        let result = client
+            .unprepare(handle(5, 0), ExecuteOptions::new().timeout_secs(0))
+            .await;
+
+        assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
     }
 
     #[test]

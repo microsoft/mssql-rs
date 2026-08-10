@@ -5,6 +5,8 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Mutex;
 
+use tracing::error;
+
 use mssql_tds::connection::tds_client::{PreparedHandle, PreparedStatement};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::ColumnMetadata;
@@ -52,15 +54,12 @@ pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
-    /// The logical prepared statement stored by `SQLPrepare` (SQL text plus the
-    /// server handle once materialized). The server-side prepare is deferred to
-    /// `SQLExecute`. `Some` marks the statement as prepared; its
-    /// [`session_handle`](PreparedStatement::session_handle) is filled after the
-    /// first execute.
-    pub(crate) prepared_stmt: Option<PreparedStatement>,
-    /// Number of parameter markers in `prepared_stmt`, computed once at prepare
-    /// so `SQLExecute` builds the `@P1..@Pn` list without re-scanning the SQL.
-    pub(crate) prepared_marker_count: usize,
+    /// The prepared statement (rewritten SQL + server handle once materialized)
+    /// stored by `SQLPrepare`, bundled with its `@P1..@Pn` marker count so the
+    /// two can only be set together. The server-side prepare is deferred to
+    /// `SQLExecute`. `Some` marks the statement as prepared; the handle is filled
+    /// after the first execute.
+    pub(crate) prepared: Option<PreparedPlan>,
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
     pub(crate) bound_params: Vec<Option<BoundParam>>,
@@ -69,7 +68,7 @@ pub(crate) struct StmtState {
     /// `sp_unprepare`. The drop is deferred to the next point that already
     /// holds the TDS client (execute / exec-direct) or to statement free, so
     /// bind/prepare stay I/O-free. Invariant: this is `None` whenever
-    /// `prepared_stmt` holds a live handle (a new handle can only be acquired by
+    /// `prepared` holds a live handle (a new handle can only be acquired by
     /// an execute, which flushes any pending drop first).
     pub(crate) pending_unprepare: Option<PreparedHandle>,
     /// Current fetched row, populated by SQLFetch for later SQLGetData support.
@@ -102,6 +101,17 @@ pub(crate) struct StmtState {
     pub(crate) state_flags: u32,
 }
 
+/// A prepared statement bundled with the marker count of its rewritten SQL, so
+/// the two can only be set together (the count is a property of the rewritten
+/// `@P1..@Pn` text and must always agree with it).
+#[derive(Debug)]
+pub(crate) struct PreparedPlan {
+    pub(crate) stmt: PreparedStatement,
+    /// Number of `@P1..@Pn` markers in `stmt`'s SQL, computed once at prepare so
+    /// `SQLExecute` builds the parameter list without re-scanning the text.
+    pub(crate) marker_count: usize,
+}
+
 impl StmtState {
     pub(crate) fn has_state(&self, mask: u32) -> bool {
         (self.state_flags & mask) != 0
@@ -116,24 +126,29 @@ impl StmtState {
     }
 
     /// Moves the current prepared statement's live server handle into
-    /// `pending_unprepare` (keeping its SQL in `prepared_stmt` so the next execute
+    /// `pending_unprepare` (keeping its SQL in `prepared` so the next execute
     /// re-prepares it) so the next execute / exec-direct — or statement free —
     /// releases it with `sp_unprepare`. Called by re-prepare, rebind, and
     /// `SQLExecDirect` when the current prepared plan is superseded. No network
     /// I/O.
     pub(crate) fn orphan_prepared_handle(&mut self) {
-        let Some(prepared) = self.prepared_stmt.as_mut() else {
+        let Some(plan) = self.prepared.as_mut() else {
             return;
         };
-        let Some(handle) = prepared.take_session_handle() else {
+        let Some(handle) = plan.stmt.take_session_handle() else {
             // No materialized handle to release; the statement stays in place.
             return;
         };
-        debug_assert!(
-            self.pending_unprepare.is_none(),
-            "orphan_prepared_handle: a pending unprepare already exists"
-        );
-        self.pending_unprepare = Some(handle);
+        if let Some(previous) = self.pending_unprepare.replace(handle) {
+            debug_assert!(
+                false,
+                "orphan_prepared_handle: a pending unprepare already exists"
+            );
+            error!(
+                id = previous.id(),
+                "orphan_prepared_handle: overwriting a pending unprepare — handle leaked until disconnect"
+            );
+        }
     }
 }
 
@@ -165,8 +180,7 @@ impl StmtHandle {
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
-                prepared_stmt: None,
-                prepared_marker_count: 0,
+                prepared: None,
                 bound_params: Vec::new(),
                 pending_unprepare: None,
                 current_row: None,

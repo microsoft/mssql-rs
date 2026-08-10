@@ -418,15 +418,16 @@ mod tests {
     fn rebind_invalidates_cached_prepared_handle() {
         use mssql_tds::connection::tds_client::PreparedStatement;
 
+        use crate::handles::stmt::PreparedPlan;
+
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.prepared_stmt = Some(PreparedStatement::materialized_for_test(
-                "SELECT @P1",
-                42,
-                3,
-            ));
+            state.prepared = Some(PreparedPlan {
+                stmt: PreparedStatement::materialized_for_test("SELECT @P1", 42, 3),
+                marker_count: 0,
+            });
         }
         let mut buf: Vec<u8> = b"abc\0".to_vec();
         let mut ind: SqlLen = crate::api::odbc_types::SQL_NTS as SqlLen;
@@ -448,12 +449,12 @@ mod tests {
         // The prepared text survives, but the server handle is orphaned for
         // release at the next execute, so that execute re-prepares.
         let state = stmt.inner.lock().unwrap();
-        assert!(state.prepared_stmt.is_some());
+        assert!(state.prepared.is_some());
         assert!(
             state
-                .prepared_stmt
+                .prepared
                 .as_ref()
-                .and_then(|p| p.session_handle())
+                .and_then(|p| p.stmt.session_handle())
                 .is_none()
         );
         let orphaned = state

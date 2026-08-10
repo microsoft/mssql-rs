@@ -112,8 +112,7 @@ fn sql_exec_direct_w_safe(
         // Superseding a prepared plan orphans its server handle; release it
         // (deferred) once we hold the client below.
         stmt_state.orphan_prepared_handle();
-        stmt_state.prepared_stmt = None;
-        stmt_state.prepared_marker_count = 0;
+        stmt_state.prepared = None;
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
         (named_params, rewritten_sql, marker_count)
@@ -217,11 +216,16 @@ mod tests {
     fn exec_direct_clears_stale_prepared_plan() {
         use mssql_tds::connection::tds_client::PreparedStatement;
 
+        use crate::handles::stmt::PreparedPlan;
+
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.prepared_stmt = Some(PreparedStatement::materialized_for_test("SELECT 1", 42, 0));
+            state.prepared = Some(PreparedPlan {
+                stmt: PreparedStatement::materialized_for_test("SELECT 1", 42, 0),
+                marker_count: 0,
+            });
             state.set_state(STMT_STATE_PREPARED);
         }
 
@@ -236,7 +240,7 @@ mod tests {
         );
 
         let state = stmt.inner.lock().unwrap();
-        assert!(state.prepared_stmt.is_none());
+        assert!(state.prepared.is_none());
         assert!(!state.has_state(STMT_STATE_PREPARED));
         // The superseded handle is queued for sp_unprepare. The flush never ran
         // here because the connection claim failed, so it remains pending.

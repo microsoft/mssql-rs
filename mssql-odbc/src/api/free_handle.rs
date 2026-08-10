@@ -215,7 +215,7 @@ fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &Dbc
 
     let (prepared, pending) = match stmt.inner.lock() {
         Ok(mut stmt_state) => (
-            stmt_state.prepared_stmt.take(),
+            stmt_state.prepared.take().map(|p| p.stmt),
             stmt_state.pending_unprepare.take(),
         ),
         Err(_) => return,

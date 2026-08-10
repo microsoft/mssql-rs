@@ -152,8 +152,7 @@ fn sql_get_type_info_w_safe(
         // A cached prepared plan is superseded; release its server handle
         // (deferred) once we hold the client below.
         stmt_state.orphan_prepared_handle();
-        stmt_state.prepared_stmt = None;
-        stmt_state.prepared_marker_count = 0;
+        stmt_state.prepared = None;
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
     }

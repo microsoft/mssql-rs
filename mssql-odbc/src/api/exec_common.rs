@@ -238,9 +238,9 @@ pub(super) unsafe fn build_named_params(
 /// prepared plan, and `sp_execute` re-runs don't re-issue it.
 pub(super) fn capture_prepared_handle(stmt: &StmtHandle, client: &mut TdsClient) {
     if let Ok(mut stmt_state) = stmt.inner.lock()
-        && let Some(prepared) = stmt_state.prepared_stmt.as_mut()
+        && let Some(plan) = stmt_state.prepared.as_mut()
     {
-        client.capture_prepared_handle_into(prepared);
+        client.capture_prepared_handle_into(&mut plan.stmt);
     }
 }
 

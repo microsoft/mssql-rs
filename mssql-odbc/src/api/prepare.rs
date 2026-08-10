@@ -16,7 +16,8 @@ use crate::api::odbc_types::{
 use crate::error::free_errors;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_PREPARED,
+    PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+    STMT_STATE_PREPARED,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -117,8 +118,10 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     // (after a reconnect) without re-scanning the SQL.
     let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
     stmt_state.orphan_prepared_handle();
-    stmt_state.prepared_stmt = Some(PreparedStatement::new(rewritten_sql));
-    stmt_state.prepared_marker_count = marker_count;
+    stmt_state.prepared = Some(PreparedPlan {
+        stmt: PreparedStatement::new(rewritten_sql),
+        marker_count,
+    });
     stmt_state.column_metadata.clear();
     stmt_state.current_row = None;
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
@@ -159,7 +162,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
         assert_eq!(
-            state.prepared_stmt.as_ref().map(|p| p.sql()),
+            state.prepared.as_ref().map(|p| p.stmt.sql()),
             Some("SELECT 1")
         );
         assert!(state.has_state(STMT_STATE_PREPARED));
@@ -173,7 +176,10 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.prepared_stmt = Some(PreparedStatement::materialized_for_test("SELECT 1", 42, 0));
+            state.prepared = Some(PreparedPlan {
+                stmt: PreparedStatement::materialized_for_test("SELECT 1", 42, 0),
+                marker_count: 0,
+            });
             state.set_state(STMT_STATE_PREPARED);
         }
 
@@ -189,14 +195,14 @@ mod tests {
         let state = stmt.inner.lock().unwrap();
         // The re-prepared statement holds the new SQL with no server handle yet.
         assert_eq!(
-            state.prepared_stmt.as_ref().map(|p| p.sql()),
+            state.prepared.as_ref().map(|p| p.stmt.sql()),
             Some("SELECT 2")
         );
         assert!(
             state
-                .prepared_stmt
+                .prepared
                 .as_ref()
-                .and_then(|p| p.session_handle())
+                .and_then(|p| p.stmt.session_handle())
                 .is_none()
         );
         // The old handle is queued for release at the next execute.

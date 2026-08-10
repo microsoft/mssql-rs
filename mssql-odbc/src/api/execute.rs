@@ -6,9 +6,7 @@
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::{
-    ExecuteOptions, PreparedHandle, PreparedStatement, StatementResult,
-};
+use mssql_tds::connection::tds_client::{ExecuteOptions, PreparedHandle, StatementResult};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{build_named_params, claim_connection, fail_with_tds, finish_execute};
@@ -16,7 +14,7 @@ use super::sqlstate::*;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
 use crate::error::free_errors;
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+    PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -48,9 +46,9 @@ unsafe fn sql_execute_impl(statement_handle: SqlHandle) -> SqlReturn {
 /// Values gathered under the STMT lock before any network I/O.
 struct Execution {
     named_params: Vec<RpcParameter>,
-    /// The prepared statement moved out of `StmtState` for the execute; written
+    /// The prepared plan moved out of `StmtState` for the execute; written
     /// back afterward (possibly re-prepared with a fresh handle).
-    prepared: PreparedStatement,
+    prepared: PreparedPlan,
     /// A prepared statement's still-live handle, superseded by a prior rebind /
     /// re-prepare, dropped by piggyback on this execute.
     orphaned: Option<PreparedHandle>,
@@ -76,7 +74,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // statement stays prepared and re-executable. `claim_connection`
             // already cleared `EXEC_STARTED`.
             if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.prepared_stmt = Some(prepared);
+                stmt_state.prepared = Some(prepared);
                 stmt_state.pending_unprepare = orphaned;
             }
             return rc;
@@ -92,7 +90,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
     // Command timeout (SQL_ATTR_QUERY_TIMEOUT) isn't wired up yet; the default
     // `ExecuteOptions` means no per-command limit.
     let exec_result = dbc.runtime.block_on(client.execute_prepared(
-        &mut prepared,
+        &mut prepared.stmt,
         named_params,
         &mut orphaned,
         ExecuteOptions::default(),
@@ -102,7 +100,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
     // because execution failed before the prepexec send boundary. The fresh
     // handle's RETURNVALUE arrives after the result set and is captured later.
     if let Ok(mut stmt_state) = stmt.inner.lock() {
-        stmt_state.prepared_stmt = Some(prepared);
+        stmt_state.prepared = Some(prepared);
         stmt_state.pending_unprepare = orphaned;
     }
 
@@ -145,10 +143,10 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
     // The release-path fallback still returns SQL_ERROR since we have no SQL
     // to run, but it can't be reached through a conforming Driver Manager.
     debug_assert!(
-        stmt_state.prepared_stmt.is_some(),
+        stmt_state.prepared.is_some(),
         "SQLExecute: statement not prepared — DM should have rejected this"
     );
-    if stmt_state.prepared_stmt.is_none() {
+    if stmt_state.prepared.is_none() {
         error!("SQLExecute: statement has not been prepared");
         return Err(SQL_ERROR);
     }
@@ -159,13 +157,17 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
         return Err(SQL_ERROR);
     }
 
-    let marker_count = stmt_state.prepared_marker_count;
+    let marker_count = stmt_state
+        .prepared
+        .as_ref()
+        .expect("prepared checked non-None above")
+        .marker_count;
     let named_params = unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
 
-    // All fallible validation passed: move the prepared statement out (written
+    // All fallible validation passed: move the prepared plan out (written
     // back after the execute) and take any orphaned handle for piggyback drop.
     let prepared = stmt_state
-        .prepared_stmt
+        .prepared
         .take()
         .expect("prepared checked non-None above");
     let orphaned = stmt_state.pending_unprepare.take();
@@ -189,13 +191,16 @@ mod tests {
     use crate::api::odbc_types::SQL_NULL_HANDLE;
     use crate::api::util::rewrite_param_markers;
     use crate::test_support::TestHandles;
+    use mssql_tds::connection::tds_client::PreparedStatement;
 
     fn set_prepared(stmt_raw: SqlHandle, sql: &str) {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_raw) };
         let (rewritten, marker_count) = rewrite_param_markers(sql);
         let mut state = stmt.inner.lock().unwrap();
-        state.prepared_stmt = Some(PreparedStatement::new(rewritten));
-        state.prepared_marker_count = marker_count;
+        state.prepared = Some(PreparedPlan {
+            stmt: PreparedStatement::new(rewritten),
+            marker_count,
+        });
     }
 
     #[test]
@@ -304,10 +309,10 @@ mod tests {
 
         let exec = stage_execution(stmt).expect("staging should succeed");
         assert_eq!(exec.orphaned, Some(orphan));
-        assert_eq!(exec.prepared.sql(), "SELECT 1");
+        assert_eq!(exec.prepared.stmt.sql(), "SELECT 1");
 
         let state = stmt.inner.lock().unwrap();
-        assert!(state.prepared_stmt.is_none(), "prepared moved out of state");
+        assert!(state.prepared.is_none(), "prepared moved out of state");
         assert!(state.pending_unprepare.is_none(), "orphan consumed");
         assert!(state.has_state(STMT_STATE_EXEC_STARTED));
     }
@@ -322,8 +327,8 @@ mod tests {
 
         let exec = stage_execution(stmt).expect("staging should succeed");
         assert_eq!(exec.orphaned, None);
-        assert_eq!(exec.prepared.sql(), "SELECT 1");
-        assert!(stmt.inner.lock().unwrap().prepared_stmt.is_none());
+        assert_eq!(exec.prepared.stmt.sql(), "SELECT 1");
+        assert!(stmt.inner.lock().unwrap().prepared.is_none());
     }
 
     #[test]
@@ -350,7 +355,7 @@ mod tests {
             ERR_CONNECTION_DOES_NOT_EXIST.state
         );
         assert_eq!(
-            state.prepared_stmt.as_ref().map(|p| p.sql()),
+            state.prepared.as_ref().map(|p| p.stmt.sql()),
             Some("SELECT 1"),
             "the prepared statement must be restored after a failed connection claim"
         );
