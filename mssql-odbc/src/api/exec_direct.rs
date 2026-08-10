@@ -106,7 +106,7 @@ fn sql_exec_direct_w_safe(
         // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.column_metadata.clear();
-        stmt_state.current_row = None;
+        stmt_state.reset_row_stream();
         stmt_state.row_count = -1;
         stmt_state.pending_row_counts.clear();
         stmt_state.prepared_sql = None;

@@ -26,12 +26,15 @@ use crate::connection::transport::network_transport::TransportSslHandler;
 use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult};
 use crate::datatypes::row_writer::RowWriter;
+use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
 use crate::handler::handler_factory::create_test_negotiated_settings_internal;
 use crate::io::reader_writer::{NetworkReader, NetworkWriter};
 use crate::io::token_stream::{
-    ParserContext, PlpPauseState, RowPauseState, RowReadResult, TdsTokenStreamReader,
+    ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
+    TdsTokenStreamReader,
 };
 use crate::message::messages::ResetConnectionMode;
+use crate::query::metadata::ColumnMetadata;
 use crate::token::tokens::{
     ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
 };
@@ -78,10 +81,26 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         _context: &ParserContext,
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
+        _plan: ColumnPolicy,
         _writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         if let Some(tok) = self.pending_tokens.pop_front() {
             return Ok(RowReadResult::Token(tok));
+        }
+        Err(crate::error::Error::ConnectionClosed("test".to_string()))
+    }
+
+    // The scripted transport surfaces every queued token as a control token and
+    // has no row bytes, so `receive_row_header` likewise only ever yields a
+    // `RowHeader::Token`, never `Positioned`.
+    async fn receive_row_header(
+        &mut self,
+        _context: &ParserContext,
+        _remaining_request_timeout: Option<Duration>,
+        _cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<RowHeader> {
+        if let Some(tok) = self.pending_tokens.pop_front() {
+            return Ok(RowHeader::Token(tok));
         }
         Err(crate::error::Error::ConnectionClosed("test".to_string()))
     }
@@ -94,6 +113,7 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         _pause_state: RowPauseState,
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
+        _plan: ColumnPolicy,
         _writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         Err(crate::error::Error::ConnectionClosed("test".to_string()))
@@ -193,6 +213,25 @@ pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
 /// An empty COLMETADATA token — a row-returning result set with zero columns.
 pub fn col_metadata_empty() -> ScriptedToken {
     ScriptedToken(Tokens::ColMetadata(ColMetadataToken::default()))
+}
+
+/// A `Vec<ColumnMetadata>` of `n` nullable `int` columns named `c1..=cn`.
+///
+/// For consumer-side tests (e.g. the ODBC `SQLGetData` column-range and
+/// forward-only guards) that only need a result set with a given column count;
+/// the type detail is irrelevant to those checks.
+pub fn int_columns(n: usize) -> Vec<ColumnMetadata> {
+    (1..=n)
+        .map(|i| ColumnMetadata {
+            user_type: 0,
+            flags: 0x01, // nullable
+            type_info: TypeInfo::fixed_len(TdsDataType::Int4).expect("Int4 is a fixed-length type"),
+            data_type: TdsDataType::Int4,
+            column_name: format!("c{i}"),
+            multi_part_name: None,
+            crypto_metadata: None,
+        })
+        .collect()
 }
 
 /// A DONE token with the MORE flag set (more results follow in the batch).
