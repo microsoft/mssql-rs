@@ -1065,8 +1065,17 @@ impl TdsClient {
                         ));
                     }
 
-                    // Accumulate row count from multiple DONE tokens
-                    rows_affected += done.row_count;
+                    // The bulk-load response reports its authoritative row count in
+                    // the DONE token(s) carrying the DONE_COUNT flag. A single INSERT
+                    // BULK yields one such count, but distributed engines (e.g. Fabric
+                    // Warehouse, EngineEdition 11) acknowledge the same load with more
+                    // than one DONE_COUNT token, each carrying the full count. Summing
+                    // them double-counts (issue #209). Take the last counted DONE, which
+                    // matches the authoritative "last DONE_COUNT wins" semantics used
+                    // for SQLRowCount elsewhere and is correct on every engine.
+                    if done.has_count() {
+                        rows_affected = done.row_count;
+                    }
 
                     // Stop when we receive a DONE token without the MORE flag
                     if !done.has_more() {
@@ -4719,6 +4728,47 @@ mod tests {
         let messages = client.take_info_messages();
         assert_eq!(messages.len(), 2);
         assert!(client.info_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn consume_done_token_takes_single_counted_done() {
+        // A normal (non-distributed) engine reports the bulk-load row count in a
+        // single DONE_COUNT token.
+        let mut client =
+            create_test_client_with_tokens(vec![done_count(CurrentCommand::Insert, 5000, false)]);
+
+        let rows_affected = client.consume_done_token().await.unwrap();
+
+        assert_eq!(rows_affected, 5000);
+    }
+
+    #[tokio::test]
+    async fn consume_done_token_does_not_double_count_distributed_dones() {
+        // Regression for #209: a distributed engine (Fabric Warehouse) acknowledges
+        // one bulk load with two DONE_COUNT tokens, each carrying the full count.
+        // Summing them would report 2x; the authoritative value is the count itself.
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Insert, 5000, true),
+            done_count(CurrentCommand::Insert, 5000, false),
+        ]);
+
+        let rows_affected = client.consume_done_token().await.unwrap();
+
+        assert_eq!(rows_affected, 5000);
+    }
+
+    #[tokio::test]
+    async fn consume_done_token_ignores_uncounted_dones() {
+        // DONE tokens without the COUNT flag carry a meaningless row_count and must
+        // not contribute to the total. Only the final DONE_COUNT value is reported.
+        let mut client = create_test_client_with_tokens(vec![
+            done_more(),
+            done_count(CurrentCommand::Insert, 3000, false),
+        ]);
+
+        let rows_affected = client.consume_done_token().await.unwrap();
+
+        assert_eq!(rows_affected, 3000);
     }
 
     #[test]

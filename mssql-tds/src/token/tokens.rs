@@ -926,6 +926,13 @@ impl DoneToken {
     pub fn has_error(&self) -> bool {
         self.status.contains(DoneStatus::ERROR)
     }
+
+    /// Whether the `DONE_COUNT` flag is set, meaning [`row_count`](Self::row_count)
+    /// carries a valid row count. When unset, `row_count` is meaningless and must
+    /// be ignored (DDL, `SET NOCOUNT ON`, control DONEs, etc.).
+    pub fn has_count(&self) -> bool {
+        self.status.contains(DoneStatus::COUNT)
+    }
 }
 
 /// RETURNSTATUS Token - Return value from a stored procedure
