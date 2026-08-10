@@ -448,6 +448,28 @@ pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + Sync {
     fn channel_binding_token(&self) -> Option<Vec<u8>> {
         None
     }
+
+    /// Whether this stream can be handed off to the synchronous blocking edge
+    /// (`TdsSyncClient`) as an owned `std::net::TcpStream`.
+    ///
+    /// Only a raw (plaintext) TCP stream qualifies: a TLS-wrapped stream owns
+    /// engine state that cannot be reconstructed from a bare socket, so it
+    /// reports `false` and the async client is kept for that connection. This is
+    /// a non-consuming probe so a caller can decline the flip without having
+    /// taken the stream.
+    fn supports_blocking_extraction(&self) -> bool {
+        false
+    }
+
+    /// Consumes the stream and yields its underlying blocking
+    /// `std::net::TcpStream`, or `None` when the stream is not a raw TCP socket
+    /// (e.g. TLS). Callers must gate on [`supports_blocking_extraction`] first so
+    /// a declined flip leaves the async stream intact.
+    ///
+    /// [`supports_blocking_extraction`]: Stream::supports_blocking_extraction
+    fn into_blocking_std(self: Box<Self>) -> Option<std::net::TcpStream> {
+        None
+    }
 }
 
 impl Stream for TcpStream {
@@ -476,6 +498,18 @@ impl Stream for TcpStream {
             Ok(_) => false,
         }
     }
+
+    fn supports_blocking_extraction(&self) -> bool {
+        true
+    }
+
+    fn into_blocking_std(self: Box<Self>) -> Option<std::net::TcpStream> {
+        let std_stream = (*self).into_std().ok()?;
+        // The synchronous edge drives blocking reads/writes; a tokio stream is
+        // registered non-blocking, so restore blocking mode for the std socket.
+        std_stream.set_nonblocking(false).ok()?;
+        Some(std_stream)
+    }
 }
 
 impl Stream for Box<dyn Stream> {
@@ -493,6 +527,14 @@ impl Stream for Box<dyn Stream> {
 
     fn channel_binding_token(&self) -> Option<Vec<u8>> {
         (**self).channel_binding_token()
+    }
+
+    fn supports_blocking_extraction(&self) -> bool {
+        (**self).supports_blocking_extraction()
+    }
+
+    fn into_blocking_std(self: Box<Self>) -> Option<std::net::TcpStream> {
+        (*self).into_blocking_std()
     }
 }
 
@@ -759,6 +801,12 @@ impl NetworkTransport {
             })?;
 
         info!("Successfully disabled TLS, reverting to unencrypted stream");
+        // TLS is now disabled and the reclaimed stream is a pure plaintext
+        // passthrough to the underlying socket. Mark the handshake complete so
+        // the `TlsOverTdsStream` reports itself in passthrough mode, which lets
+        // the connection expose its raw socket for the synchronous blocking edge.
+        let mut base_stream = base_stream;
+        base_stream.tls_handshake_completed();
         self.stream = Some(base_stream);
         Ok(())
     }
@@ -1390,6 +1438,43 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
 
     fn connection_known_dead(&self) -> bool {
         self.known_dead
+    }
+
+    fn take_blocking_parts(
+        &mut self,
+    ) -> Option<(std::net::TcpStream, crate::io::packet_buffer::ResidualBytes)> {
+        // Probe eligibility without consuming: a TLS stream cannot be flipped, so
+        // leave the transport untouched and let the caller keep the async client.
+        let eligible = self
+            .stream
+            .as_ref()
+            .is_some_and(|s| s.supports_blocking_extraction());
+        if !eligible {
+            return None;
+        }
+        let boxed = self.stream.take()?;
+        let std_stream = match boxed.into_blocking_std() {
+            Some(std_stream) => std_stream,
+            None => {
+                // Eligibility said raw TCP, so this is unreachable; if it ever
+                // fires the socket is already gone, so mark the connection dead
+                // rather than silently losing it.
+                self.known_dead = true;
+                return None;
+            }
+        };
+        let residual = self.tds_read_buffer.take_residual();
+        Some((std_stream, residual))
+    }
+
+    fn restore_blocking_parts(
+        &mut self,
+        stream: tokio::net::TcpStream,
+        residual: crate::io::packet_buffer::ResidualBytes,
+    ) -> TdsResult<()> {
+        self.stream = Some(Box::new(stream));
+        self.tds_read_buffer.seed_residual(&residual);
+        Ok(())
     }
 }
 

@@ -7,6 +7,7 @@ use crate::datatypes::decoder::{
     decrypt_encrypted_column,
 };
 use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter, write_column_value};
+use crate::datatypes::sql_string::{SqlString, get_encoding_type};
 use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::datatypes::sync_decoder::{PlpProgress, plp_collect_step};
 use crate::io::packet_buffer::PacketBuffer;
@@ -960,14 +961,15 @@ fn resolve_header_token_blocking<R: BlockingRowReader>(
 /// Blocking sibling of [`decode_async_row_column`], restricted to the L3 scope.
 ///
 /// Reproduces the eager PLP arm of [`decode_async_row_column`] /
-/// `GenericDecoder::decode_into` for a non-encrypted `BigVarBinary` (varbinary
-/// (max)) cell: collect the value chunk-streamed via [`collect_plp_bytes_blocking`]
-/// then `write_bytes` / `write_null`, followed by the same post-column pause
-/// check. This is the single mirror of `decode_into`'s `BigVarBinary` arm — one
-/// arm, no new decode machine. Every other async-seam reason (encrypted cells,
-/// PLP strings, legacy LOBs, rare fallback types) is out of the L3 blocking scope
-/// and refuses via [`crate::error::Error::UnimplementedFeature`]; the differential
-/// corpus never drives those through this path.
+/// `GenericDecoder::decode_into` for non-encrypted PLP (`max`) cells:
+/// `varbinary(max)` collects chunk-streamed bytes via
+/// [`collect_plp_bytes_blocking`] then `write_bytes`, while `varchar(max)` /
+/// `nvarchar(max)` collect the same way and `write_string` through
+/// [`SqlString::new`] with the column's [`get_encoding_type`], mirroring
+/// `StringDecoder::decode_string_into`'s PLP arm. Every remaining async-seam
+/// reason (encrypted cells, non-PLP Text/NText LOBs, rare fallback types) stays
+/// out of the L3 blocking scope and refuses via
+/// [`crate::error::Error::UnimplementedFeature`].
 #[cfg_attr(not(test), allow(dead_code))]
 fn decode_blocking_async_column<R: BlockingRowReader>(
     reader: &mut R,
@@ -979,18 +981,32 @@ fn decode_blocking_async_column<R: BlockingRowReader>(
     let meta = &columns[col];
     let len = columns.len();
 
-    if meta.crypto_metadata.is_some() || meta.data_type != TdsDataType::BigVarBinary {
+    let plp_string = meta.is_plp()
+        && matches!(
+            meta.data_type,
+            TdsDataType::NVarChar
+                | TdsDataType::BigVarChar
+                | TdsDataType::NChar
+                | TdsDataType::BigChar
+        );
+
+    if meta.crypto_metadata.is_some()
+        || (meta.data_type != TdsDataType::BigVarBinary && !plp_string)
+    {
         return Err(crate::error::Error::UnimplementedFeature {
             feature: "blocking sync decode of an async-seam column".to_string(),
             context: format!(
                 "column '{}' ({:?}) is not in the L3 blocking scope (non-encrypted \
-                 varbinary(max) only)",
+                 varbinary(max) / varchar(max) / nvarchar(max) only)",
                 meta.column_name, meta.data_type
             ),
         });
     }
 
     match collect_plp_bytes_blocking(reader)? {
+        Some(bytes) if plp_string => {
+            writer.write_string(col, SqlString::new(bytes, get_encoding_type(meta)))
+        }
         Some(bytes) => writer.write_bytes(col, bytes),
         None => writer.write_null(col),
     }

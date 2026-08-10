@@ -538,6 +538,23 @@ impl<S: Stream> Stream for TlsOverTdsStream<S> {
     fn is_connection_dead(&self) -> bool {
         self.wrapped_stream.is_connection_dead()
     }
+
+    fn supports_blocking_extraction(&self) -> bool {
+        // Once the handshake is complete this stream is a pure passthrough to
+        // the wrapped stream (see `poll_read`/`poll_write`). In "Login Only"
+        // encryption mode TLS is disabled after login, so the surviving
+        // `TlsOverTdsStream` wraps the original raw TCP socket. Delegate the
+        // blocking-extraction probe so such a connection can flip to the
+        // synchronous edge instead of being pinned to the async client.
+        self.has_completed_tls_handshake && self.wrapped_stream.supports_blocking_extraction()
+    }
+
+    fn into_blocking_std(self: Box<Self>) -> Option<std::net::TcpStream> {
+        if !self.has_completed_tls_handshake {
+            return None;
+        }
+        Box::new(self.wrapped_stream).into_blocking_std()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -554,6 +571,18 @@ impl Stream for BufferedTdsStream {
 
     fn is_connection_dead(&self) -> bool {
         self.tls_over_tds_stream.is_connection_dead()
+    }
+
+    fn supports_blocking_extraction(&self) -> bool {
+        self.buffer.as_ref().is_none_or(|b| b.is_empty())
+            && self.tls_over_tds_stream.supports_blocking_extraction()
+    }
+
+    fn into_blocking_std(self: Box<Self>) -> Option<std::net::TcpStream> {
+        if !self.buffer.as_ref().is_none_or(|b| b.is_empty()) {
+            return None;
+        }
+        Box::new(self.tls_over_tds_stream).into_blocking_std()
     }
 }
 

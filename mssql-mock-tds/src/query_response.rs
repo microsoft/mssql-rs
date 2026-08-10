@@ -162,12 +162,31 @@ impl InfoMessage {
     }
 }
 
+/// A server ERROR token injected partway through a result set, after
+/// `after_rows` rows have been streamed, followed by a terminal DONE. Used to
+/// exercise the fetch-time error/drain path.
+#[derive(Debug, Clone)]
+pub struct MidStreamError {
+    pub after_rows: usize,
+    pub number: u32,
+    pub state: u8,
+    pub severity: u8,
+    pub message: String,
+    /// INFO tokens emitted after the ERROR and before the terminal DONE, so the
+    /// fetch-time drain path (async `drain_stream` / sync blocking drain) is
+    /// exercised on Info capture, not just the happy pre-error stream.
+    pub drain_info: Vec<InfoMessage>,
+}
+
 /// A complete query response definition
 #[derive(Debug, Clone)]
 pub struct QueryResponse {
     pub columns: Vec<ColumnDefinition>,
     pub rows: Vec<Row>,
     pub info_tokens: Vec<InfoMessage>,
+    /// When set, only the first `after_rows` rows are streamed, then an ERROR
+    /// token and a terminal DONE are emitted (no trailing rows).
+    pub error_after: Option<MidStreamError>,
 }
 
 impl QueryResponse {
@@ -177,11 +196,18 @@ impl QueryResponse {
             columns,
             rows,
             info_tokens: Vec::new(),
+            error_after: None,
         }
     }
 
     pub fn with_info_tokens(mut self, info_tokens: Vec<InfoMessage>) -> Self {
         self.info_tokens = info_tokens;
+        self
+    }
+
+    /// Inject a mid-stream ERROR token after `after_rows` rows.
+    pub fn with_error_after(mut self, error_after: MidStreamError) -> Self {
+        self.error_after = Some(error_after);
         self
     }
 
@@ -191,6 +217,7 @@ impl QueryResponse {
             columns: vec![ColumnDefinition::new("", SqlDataType::Int)],
             rows: vec![Row::new(vec![ColumnValue::Int(1)])],
             info_tokens: Vec::new(),
+            error_after: None,
         }
     }
 
@@ -208,6 +235,7 @@ impl QueryResponse {
                 ColumnValue::Int(3),
             ])],
             info_tokens: Vec::new(),
+            error_after: None,
         }
     }
 }

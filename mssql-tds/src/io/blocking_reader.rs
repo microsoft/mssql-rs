@@ -47,6 +47,37 @@ impl<S: BlockingByteSource> BlockingPacketReader<S> {
         }
     }
 
+    /// Creates a reader seeded with `residual` bytes carried over from an
+    /// async→blocking edge flip, so the first decode/refill continues exactly
+    /// where the async parser paused (see
+    /// [`PacketBuffer::seed_residual`](crate::io::packet_buffer::PacketBuffer::seed_residual)).
+    pub(crate) fn with_seeded_buffer(
+        source: S,
+        packet_size: usize,
+        residual: &crate::io::packet_buffer::ResidualBytes,
+    ) -> Self {
+        let mut buffer = PacketBuffer::with_packet_size(packet_size);
+        buffer.seed_residual(residual);
+        Self { source, buffer }
+    }
+
+    /// Drains the unconsumed bytes for handoff back across a blocking→async flip.
+    pub(crate) fn take_residual(&mut self) -> crate::io::packet_buffer::ResidualBytes {
+        self.buffer.take_residual()
+    }
+
+    /// Consumes the reader and returns its byte source (to recover the owned
+    /// socket on revert).
+    pub(crate) fn into_source(self) -> S {
+        self.source
+    }
+
+    /// Mutable access to the byte source, so the owning client can refresh the
+    /// per-request cancel/deadline policy before each fetch.
+    pub(crate) fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
     /// Reads one complete TDS packet synchronously and strips its 8-byte header,
     /// exposing the payload. The forward-progress guard lives in
     /// [`BlockingRowReader::refill_row_buffer_blocking`].

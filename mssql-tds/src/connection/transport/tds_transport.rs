@@ -80,4 +80,34 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     fn connection_known_dead(&self) -> bool {
         false
     }
+
+    /// Detaches the raw blocking socket and any buffered residual bytes for the
+    /// synchronous fetch edge (`TdsSyncClient`), returning `None` when this
+    /// transport cannot be flipped (TLS, named pipes, mock). The probe is
+    /// non-consuming for ineligible transports: the caller's client stays intact
+    /// so it can keep using the async path.
+    ///
+    /// On `Some`, the stream is removed from this transport and the read buffer
+    /// is drained of its residual, so the transport must not be read again until
+    /// [`restore_blocking_parts`](TdsTransport::restore_blocking_parts) reinstates
+    /// both.
+    fn take_blocking_parts(
+        &mut self,
+    ) -> Option<(std::net::TcpStream, crate::io::packet_buffer::ResidualBytes)> {
+        None
+    }
+
+    /// Reinstates a previously detached socket (reverted to a tokio stream by the
+    /// synchronous edge) and reseeds the read buffer with the residual bytes that
+    /// straddled the flip, so the async path resumes byte-identically.
+    fn restore_blocking_parts(
+        &mut self,
+        _stream: tokio::net::TcpStream,
+        _residual: crate::io::packet_buffer::ResidualBytes,
+    ) -> TdsResult<()> {
+        Err(crate::error::Error::UnimplementedFeature {
+            feature: "blocking transport handoff".to_string(),
+            context: "this transport does not support synchronous blocking extraction".to_string(),
+        })
+    }
 }
