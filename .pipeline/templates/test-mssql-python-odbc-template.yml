@@ -239,6 +239,14 @@ steps:
 
     if [ "$rc" -ne 0 ]; then
       echo "##vso[task.logissue type=warning]mssql-python tests did not fully pass against mssql-odbc (exit $rc) - expected while the driver is in development"
+      # `logissue` only annotates the log - on its own the step still reports a
+      # green check, so an entirely red suite looks indistinguishable from a
+      # clean run. Set the result explicitly to surface the warning glyph.
+      #
+      # This marks the build "partially succeeded", which Azure Pipelines reports
+      # to GitHub as `success` (verified against build 166244 on PR #210), so the
+      # signal is visible without the job ever blocking a pull request.
+      echo "##vso[task.complete result=SucceededWithIssues;]"
     fi
     exit 0
   displayName: Run mssql-python tests against mssql-odbc

@@ -35,8 +35,10 @@
 #
 # Exit codes:
 #   0  every file passed.
-#   1  tests ran but did not fully pass (the expected baseline while the Rust
-#      driver is under development) - the calling step downgrades this to a warning.
+#   1  tests ran but the run was not clean - failures, crashes, timeouts, or
+#      files skipped because the time budget ran out. This is the expected
+#      baseline while the Rust driver is under development, so the calling step
+#      reports it as a warning (yellow) rather than failing the job.
 #   2  the harness itself could not run the tests (broken venv, missing
 #      interpreter) - the calling step turns this into a real pipeline error,
 #      since it says nothing about the driver.
@@ -229,12 +231,14 @@ echo "==============================================================="
 #   2 -> harness could not run the tests (environment defect)
 #   1 -> tests ran and did not fully pass (driver defect, advisory)
 #   0 -> everything passed
+# Files skipped because the aggregate budget ran out count as "not clean" too:
+# the result set is incomplete, which must not read as a clean pass.
 if [ "$harness_error" -gt 0 ]; then
     echo "##[error]$harness_error file(s) could not be executed - this indicates a broken test environment, not a driver defect"
     exit 2
 fi
 
-if [ "$failed" -gt 0 ] || [ "$crashed" -gt 0 ] || [ "$timedout" -gt 0 ]; then
-    echo "##[warning]mssql-python tests did not fully pass against the mssql-odbc driver (expected while the driver is in development)"
+if [ "$failed" -gt 0 ] || [ "$crashed" -gt 0 ] || [ "$timedout" -gt 0 ] || [ "$skipped" -gt 0 ]; then
+    echo "##[warning]mssql-python suite did not complete cleanly against the mssql-odbc driver (expected while the driver is in development)"
     exit 1
 fi
