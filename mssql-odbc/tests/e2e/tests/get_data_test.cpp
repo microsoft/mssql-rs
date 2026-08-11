@@ -750,10 +750,17 @@ TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAsciiRoundTrip) {
 // the wire (two UTF-16 code units) and F0 9F 98 80 in UTF-8 (four bytes). With a
 // 16-byte SQL_C_CHAR buffer the transcode reads an odd number of code units per
 // chunk, so a high surrogate is left without its low half at the boundary; the
-// driver must carry it to the next chunk rather than emit U+FFFD. Any framing or
-// surrogate-carry defect shows up as replacement characters (EF BF BD) or a
-// wrong byte count. Codepage-neutral by construction, so it runs on both legs.
+// driver must carry it to the next chunk rather than emit U+FFFD.
+//
+// This asserts mssql-odbc-specific behavior and is skipped on the msodbcsql
+// comparison leg: mssql-odbc delivers SQL_C_CHAR as UTF-8 (the emoji round-trips
+// as F0 9F 98 80), whereas msodbcsql on Windows converts SQL_C_CHAR to the
+// client's ANSI codepage, where U+1F600 has no representation and best-fits to
+// '?'. On Linux msodbcsql also delivers UTF-8, so the two agree there; the
+// divergence is Windows-only. This is the same intentional UTF-8-vs-ANSI
+// SQL_C_CHAR difference already documented for other tests in this file.
 TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAstralRoundTrip) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     const std::string emoji = "\xF0\x9F\x98\x80";       // U+1F600, 4 UTF-8 bytes
     const std::string expected = RepeatToken(emoji, 500);  // 2000 bytes
     ASSERT_SQL_OK(

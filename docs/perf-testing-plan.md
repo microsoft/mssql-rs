@@ -193,10 +193,16 @@ the same re-measure set, and the summary reports whether the win reproduced in a
 re-runs. Verifying both directions at the same magnitude matters because the measurements are
 recorded for run-over-run trend comparison: an anomalously slow *baseline* pass corrupts that
 record exactly as much as an anomalously slow candidate one, and since both directions share
-one re-measure set the extra confidence costs nothing per run. This never fails the run: it
+one re-measure set the extra confidence adds no extra *pass* — though each benchmark in the
+set does add its own re-run time, which is what the cap below bounds. This never fails the run: it
 exists so a one-off artifact is not reported as a real gain, and because a win that *does*
 reproduce is itself worth a look — an implausible speed-up can mean the candidate is doing
-less work rather than the same work faster.
+less work rather than the same work faster. Unlike regressions, improvements are **not
+self-limiting** — a PR that genuinely optimizes a hot path can turn many benchmarks green
+at once, and each one added to the set costs a full round of re-runs on both sides — so the
+set is capped at the largest apparent wins (`BENCH_IMPROVEMENT_VERIFY_MAX`, default 3).
+Benchmarks beyond the cap are still reported with their first-pass numbers, just not
+re-measured.
 
 **Compilation failures fail loudly.** Both runners compile the candidate and baseline
 bench binaries in an explicit `cargo bench --no-run` step with human-readable output
@@ -312,8 +318,8 @@ binaries keep the per-binary interleaving effective (see §2).
   costs dual code paths; reserve it for when a pre-break baseline is specifically needed.
   Building each side from its own bench source is *not* an option: it reintroduces the
   variable the harness exists to eliminate.) Bumping the baseline can also surface
-  *runtime* breaks that still compile — e.g. a value that moved from the generic
-  return-value buffer to a dedicated accessor.
+  *runtime* breaks that still compile — e.g. a value that stopped being pushed to the
+  generic return-value buffer, so the bench must now read it via its dedicated accessor.
 - Perf-lab pipeline runs on a **dedicated host VM** via the shared `PerfTest` lab
   `extends` template; the build happens on the VM (the lab's documented model).
 - Comparison is **interleaved per bench binary** (not two full passes), and the run
