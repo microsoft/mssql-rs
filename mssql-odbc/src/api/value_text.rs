@@ -11,6 +11,8 @@
 use mssql_tds::datatypes::column_values::{
     ColumnValues, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney, SqlSmallDateTime,
 };
+use std::borrow::Cow;
+use std::fmt::Write as _;
 
 /// Days between `0001-01-01` and the Unix epoch.
 const DAYS_0001_TO_UNIX: i64 = 719_162;
@@ -121,9 +123,74 @@ fn money_units(v: &SqlMoney) -> i64 {
 fn format_bytes_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        out.push_str(&format!("{b:02X}"));
+        let _ = write!(out, "{b:02X}");
     }
     out
+}
+
+/// Stack buffer that renders fixed-width values without touching the allocator.
+///
+/// 64 bytes clears every fixed-width form by a wide margin — the longest is a
+/// 36-character GUID — so the overflow path exists only for soundness.
+pub(super) struct TextScratch {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl TextScratch {
+    pub(super) fn new() -> Self {
+        Self {
+            buf: [0; 64],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.buf[..self.len]).ok()
+    }
+}
+
+impl std::fmt::Write for TextScratch {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        if end > self.buf.len() {
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// Allocation-free overlay on [`column_value_to_text`] for the types whose
+/// rendered length is bounded.
+///
+/// Every other type — and any fixed-width value that somehow overflows the
+/// scratch buffer — falls through to `column_value_to_text`, so the two agree
+/// by construction.
+pub(super) fn column_value_to_text_in<'s>(
+    v: &ColumnValues,
+    scratch: &'s mut TextScratch,
+) -> Option<Cow<'s, str>> {
+    scratch.len = 0;
+    let rendered = match v {
+        ColumnValues::TinyInt(x) => write!(scratch, "{x}"),
+        ColumnValues::SmallInt(x) => write!(scratch, "{x}"),
+        ColumnValues::Int(x) => write!(scratch, "{x}"),
+        ColumnValues::BigInt(x) => write!(scratch, "{x}"),
+        ColumnValues::Real(x) => write!(scratch, "{x}"),
+        ColumnValues::Float(x) => write!(scratch, "{x}"),
+        ColumnValues::Uuid(u) => write!(scratch, "{u}"),
+        ColumnValues::Bit(x) => return Some(Cow::Borrowed(if *x { "1" } else { "0" })),
+        ColumnValues::Null => return Some(Cow::Borrowed("")),
+        _ => return column_value_to_text(v).map(Cow::Owned),
+    };
+    if rendered.is_ok()
+        && let Some(s) = scratch.as_str()
+    {
+        return Some(Cow::Borrowed(s));
+    }
+    column_value_to_text(v).map(Cow::Owned)
 }
 
 /// Renders `v` in the character form ODBC defines for its SQL type, or `None`
