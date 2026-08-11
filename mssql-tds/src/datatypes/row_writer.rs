@@ -227,6 +227,40 @@ impl RowWriter for DefaultRowWriter {
     }
 }
 
+/// Row sink that discards every decoded value. Used by the drain-on-error path,
+/// which decodes trailing rows only to advance the wire position and never reads
+/// them back, so it avoids `DefaultRowWriter`'s per-row `Vec<ColumnValues>`
+/// allocation and keeps no decoded values alive.
+pub(crate) struct DrainRowWriter;
+
+impl RowWriter for DrainRowWriter {
+    fn write_null(&mut self, _col: usize) {}
+    fn write_bool(&mut self, _col: usize, _val: bool) {}
+    fn write_u8(&mut self, _col: usize, _val: u8) {}
+    fn write_i16(&mut self, _col: usize, _val: i16) {}
+    fn write_i32(&mut self, _col: usize, _val: i32) {}
+    fn write_i64(&mut self, _col: usize, _val: i64) {}
+    fn write_f32(&mut self, _col: usize, _val: f32) {}
+    fn write_f64(&mut self, _col: usize, _val: f64) {}
+    fn write_string(&mut self, _col: usize, _val: SqlString) {}
+    fn write_bytes(&mut self, _col: usize, _val: Vec<u8>) {}
+    fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
+    fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
+    fn write_date(&mut self, _col: usize, _val: SqlDate) {}
+    fn write_time(&mut self, _col: usize, _val: SqlTime) {}
+    fn write_datetime(&mut self, _col: usize, _val: SqlDateTime) {}
+    fn write_smalldatetime(&mut self, _col: usize, _val: SqlSmallDateTime) {}
+    fn write_datetime2(&mut self, _col: usize, _val: SqlDateTime2) {}
+    fn write_datetimeoffset(&mut self, _col: usize, _val: SqlDateTimeOffset) {}
+    fn write_money(&mut self, _col: usize, _val: SqlMoney) {}
+    fn write_smallmoney(&mut self, _col: usize, _val: SqlSmallMoney) {}
+    fn write_uuid(&mut self, _col: usize, _val: Uuid) {}
+    fn write_xml(&mut self, _col: usize, _val: SqlXml) {}
+    fn write_json(&mut self, _col: usize, _val: SqlJson) {}
+    fn write_vector(&mut self, _col: usize, _val: SqlVector) {}
+    fn end_row(&mut self) {}
+}
+
 /// Bridges a `ColumnValues` into a `RowWriter` call. Used as a fallback path
 /// when the decoder has already produced a `ColumnValues` (e.g. for rare types)
 /// and needs to forward it through a writer.

@@ -6,7 +6,7 @@ use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{ClientContext, ExecutionColumnEncryptionSetting};
 use crate::connection::session_recovery::RecoveryContext;
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
-use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
+use crate::datatypes::row_writer::{DefaultRowWriter, DrainRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sqltypes::SqlType;
 use crate::error::Error::UsageError;
@@ -1765,10 +1765,10 @@ impl TdsClient {
                     // A row-returning result set began. Consume its rows via the
                     // row-decoding path; the trailing DONE tells us whether the
                     // batch continues.
-                    if self
+                    let batch_ended = self
                         .drain_result_set_rows(Arc::new(colmetadata), &mut collected_errors)
-                        .await?
-                    {
+                        .await?;
+                    if batch_ended {
                         break;
                     }
                 }
@@ -1782,7 +1782,7 @@ impl TdsClient {
     /// `metadata`), discarding the decoded values, and returns `true` when the
     /// result set's DONE token terminates the batch (no MORE flag).
     ///
-    /// [`DefaultRowWriter`] never opts into [`RowWriter::pause_after_column`],
+    /// [`DrainRowWriter`] never opts into [`RowWriter::pause_after_column`],
     /// so `receive_row_into` fully consumes each row — including PLP payloads —
     /// and never yields a pause result here.
     async fn drain_result_set_rows(
@@ -1790,12 +1790,16 @@ impl TdsClient {
         metadata: Arc<ColMetadataToken>,
         collected_errors: &mut Vec<SqlErrorInfo>,
     ) -> TdsResult<bool> {
-        let col_count = metadata.columns.len();
-        let decryptor = self.resolve_cell_decryptor(&metadata).await?;
-        let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
+        // Rows are discarded, so no cell decryptor is resolved: an encrypted
+        // column is decoded as raw ciphertext varbinary, which consumes exactly
+        // the same wire bytes. Resolving a decryptor here would add key-store
+        // round trips and decryption failures — any of which returns `Err` and
+        // would mask the SQL error that this drain exists to surface — and would
+        // overwrite `self.current_decryptor` with a discarded set's metadata.
+        let parser_context = ParserContext::ColumnMetadata(metadata, None);
         loop {
             let start = Instant::now();
-            let mut writer = DefaultRowWriter::new(col_count);
+            let mut writer = DrainRowWriter;
             let result = self
                 .transport
                 .receive_row_into(
@@ -5439,6 +5443,39 @@ mod tests {
         b
     }
 
+    /// A single COLMETADATA under Always Encrypted whose one column is
+    /// `FLAG_ENCRYPTED` and carries `CryptoMetadata`, while the CEK table is
+    /// empty. This server anomaly makes `resolve_cell_decryptor` fail fast
+    /// (encrypted column, no keys to resolve). The outer (ciphertext) wire type
+    /// is modeled as Int4 so the row payload is a fixed 4 bytes; on the drain
+    /// path the column must be decoded as raw ciphertext without resolving any
+    /// decryptor, so this failure is never triggered.
+    fn colmetadata_single_encrypted_int_ae_bytes(name: &str) -> Vec<u8> {
+        use crate::token::parsers::common::test_utils::MockReader;
+        const FLAG_ENCRYPTED: u16 = 0x0800;
+        let int4 = crate::datatypes::sqldatatypes::TdsDataType::Int4 as u8;
+
+        let mut b = vec![crate::token::tokens::TokenType::ColMetadata as u8];
+        b.extend_from_slice(&1u16.to_le_bytes()); // column count
+        b.extend_from_slice(&0u16.to_le_bytes()); // empty CEK table
+
+        // Encrypted column definition.
+        b.extend_from_slice(&0u32.to_le_bytes()); // user_type
+        b.extend_from_slice(&FLAG_ENCRYPTED.to_le_bytes()); // flags
+        b.push(int4); // ciphertext wire type
+        // CryptoMetadata (has_cek_table = true, since AE is negotiated).
+        b.extend_from_slice(&0u16.to_le_bytes()); // cek_table_ordinal
+        b.extend_from_slice(&0u32.to_le_bytes()); // base user_type
+        b.push(int4); // base data type
+        b.push(2); // cipher_algorithm_id (non-custom: AEAD_AES_256_CBC_HMAC_SHA256)
+        b.push(1); // encryption_type (deterministic)
+        b.push(1); // normalization_rule_version
+        let name_bytes = MockReader::encode_utf16(name);
+        b.push((name_bytes.len() / 2) as u8);
+        b.extend_from_slice(&name_bytes);
+        b
+    }
+
     fn colmetadata_two_int_bytes(first: &str, second: &str) -> Vec<u8> {
         let mut b = vec![crate::token::tokens::TokenType::ColMetadata as u8];
         b.extend_from_slice(&2u16.to_le_bytes()); // column count
@@ -5645,6 +5682,34 @@ mod tests {
         stream.extend(done_bytes(DONE_FINAL));
 
         let mut client = client_over_bytes_with_ae(stream);
+        let err = client.advance_to_result_boundary().await.unwrap_err();
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+    }
+
+    /// Blocking-review regression guard: the drain must not resolve a cell
+    /// decryptor for a discarded result set. Here the trailing result set has a
+    /// `FLAG_ENCRYPTED` column whose CEK table is empty — an anomaly that makes
+    /// `resolve_cell_decryptor` fail fast. Resolving a decryptor on the drain
+    /// path would surface that `Err` and mask the real SQL error. The fix
+    /// decodes the encrypted column as raw ciphertext instead, so error 1222
+    /// still surfaces and the batch is fully drained.
+    #[tokio::test]
+    async fn drain_does_not_resolve_decryptor_for_discarded_encrypted_rowset() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "lock timeout"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_single_encrypted_int_ae_bytes("secret"));
+        stream.extend(row_int_bytes(0x1122_3344)); // 4 ciphertext bytes, discarded
+        stream.extend(done_bytes(DONE_FINAL));
+
+        let mut client = client_over_bytes_with_ae(stream);
+        // Enable column encryption for this command so the pre-fix drain would
+        // actually resolve a decryptor (and fail fast on the empty CEK table).
+        // With the fix, the drain ignores this and decodes raw ciphertext.
+        client.current_command_ce_setting =
+            crate::connection::client_context::ExecutionColumnEncryptionSetting::Enabled;
         let err = client.advance_to_result_boundary().await.unwrap_err();
 
         let diagnostics = expect_sql_error(err);

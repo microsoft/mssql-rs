@@ -833,8 +833,9 @@ pub fn build_leading_error_tokens(error: &crate::query_response::LeadingError) -
     buf.put_u8(1); // state
     buf.put_u8(error.severity);
 
-    buf.put_u16_le(error.message.encode_utf16().count() as u16);
-    for ch in error.message.encode_utf16() {
+    let message_utf16: Vec<u16> = error.message.encode_utf16().collect();
+    buf.put_u16_le(message_utf16.len() as u16);
+    for ch in message_utf16 {
         buf.put_u16_le(ch);
     }
 
