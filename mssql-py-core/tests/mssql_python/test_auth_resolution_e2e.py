@@ -400,23 +400,6 @@ class TestAuthTcClash:
         cs = _base(tc="Yes", auth="ActiveDirectoryIntegrated")
         _expect_connect_error(cs)
 
-    # #27 (ADInteractive) and ADDefault are intentionally NOT exercised here.
-    #
-    # The mssql-rs behavior (reject TC=Yes + an Authentication keyword) is
-    # asserted deterministically against py-core in the normal, mssql-python-
-    # decoupled suite:
-    #   tests/test_auth_resolution.py::TestAuthTcClashes::test_27_ad_interactive_tc
-    #   tests/test_auth_resolution.py::TestAuthTcClashesExtended::test_ad_default_tc
-    #
-    # An ODBC/mssql-python "parity" leg can't add signal for these two rows:
-    # mssql-python strips Trusted_Connection for token-bearing AD modes
-    # (Default and non-Windows Interactive go through the token factory, whose
-    # keys — including Trusted_Connection — are removed by remove_sensitive_params
-    # before ODBC sees them), so the driver never observes a clash. A test here
-    # could only "pass" by faulting elsewhere (stubbed/absent Entra infra),
-    # which is unfalsifiable. ODBC's own behavior for these modes is covered by
-    # mssql-python's suite.
-
     def test_row28_tc_yes_admsi(self):
         """#28  TC=Yes + ADMSI → ERROR."""
         cs = _base(tc="Yes", auth="ActiveDirectoryMSI")
