@@ -10,6 +10,7 @@ use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
 use crate::core::{
     CancelHandle, EncryptionOptions, EncryptionSetting, NegotiatedEncryptionSetting, TdsResult,
 };
+use crate::datatypes::decoder::GenericDecoder;
 use crate::datatypes::row_writer::RowWriter;
 use crate::error::Error::{OperationCancelledError, TimeoutError};
 use crate::error::TimeoutErrorType;
@@ -17,6 +18,7 @@ use crate::handler::handler_factory::SessionSettings;
 use crate::io::packet_reader::{PacketReader, TdsPacketReader};
 use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
+use crate::io::slice_reader::SliceReader;
 use crate::io::token_stream::{
     ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
     TdsTokenStreamReader, read_active_plp_bytes_internal, receive_row_header_internal,
@@ -25,6 +27,7 @@ use crate::io::token_stream::{
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
 use crate::message::messages::{Request, ResetConnectionMode};
+use crate::query::metadata::ColumnMetadata;
 use crate::token::tokens::{DoneStatus, Tokens};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
@@ -32,6 +35,7 @@ use std::cmp::min;
 use std::io::Error;
 use std::io::ErrorKind::{self, UnexpectedEof};
 use std::net::ToSocketAddrs;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{self, TcpStream};
@@ -1526,6 +1530,58 @@ impl TdsTokenStreamReader for NetworkTransport {
             },
         }
         result
+    }
+
+    fn try_decode_column_buffered(
+        &mut self,
+        metadata: &ColumnMetadata,
+        col: usize,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> bool {
+        // PLP columns must reach `drive_row_columns`, which pauses before the
+        // payload so the caller can stream it; decoding one here would swallow
+        // an arbitrarily large value into memory. Encrypted columns need the
+        // decryptor the async path threads through.
+        if metadata.is_plp() || metadata.crypto_metadata.is_some() {
+            return false;
+        }
+
+        let available = self.tds_read_buffer.get_remaining_byte_count();
+        if available == 0 {
+            return false;
+        }
+
+        // The decoder runs against a slice of the current packet. It never
+        // awaits, so the future is always ready on the first poll: either it
+        // decoded the column, or it ran off the end of the buffered bytes.
+        let consumed = {
+            let buffered = &self.tds_read_buffer.get_slice()[..available];
+            let mut reader = SliceReader::new(buffered);
+            let decoder = GenericDecoder::default();
+            // Boxed so the borrow of `reader` can be released explicitly below;
+            // a stack-pinned future would hold it until the end of this scope.
+            let mut decode = Box::pin(decoder.decode_into(&mut reader, metadata, col, writer));
+            let polled = decode
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
+            drop(decode);
+
+            match polled {
+                Poll::Ready(Ok(())) => Some(reader.consumed()),
+                // Both a short buffer and a real protocol error fall back. The
+                // async path re-reads this column from the untouched buffer and
+                // surfaces the error properly if it is genuine.
+                Poll::Ready(Err(_)) | Poll::Pending => None,
+            }
+        };
+
+        match consumed {
+            Some(count) => {
+                self.tds_read_buffer.consume_bytes(count);
+                true
+            }
+            None => false,
+        }
     }
 }
 

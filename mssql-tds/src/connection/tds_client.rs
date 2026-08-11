@@ -3126,14 +3126,14 @@ impl TdsClient {
         pause_state: RowPauseState,
         target: usize,
     ) -> TdsResult<CursorColumn> {
-        if target >= pause_state.columns.len() {
+        if target >= pause_state.columns().len() {
             // Out-of-range: decoding with ColumnPolicy::DecodeOne(target) would skip
             // every remaining column and report RowWritten, silently consuming
             // the row. Reject without touching the transport and keep the
             // cursor positioned so valid pulls still work. ODBC validates the
             // column index first, so this guards the public API against other
             // callers.
-            let column_count = pause_state.columns.len();
+            let column_count = pause_state.columns().len();
             self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
             return Err(UsageError(format!(
                 "read_row_column target column {target} is out of range (row has {column_count} columns)"
@@ -3145,6 +3145,42 @@ impl TdsClient {
             // cursor where it is so later (valid) pulls still work.
             self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
             return Ok(CursorColumn::AlreadyConsumed);
+        }
+
+        // Fast path: the target is the next column in order, the row carries no
+        // NBCROW null bitmap or Always Encrypted decryptor to consult, and the
+        // bytes are already in the transport's buffer. Decoding here skips the
+        // boxed `resume_row_into` future, the per-call cancellation/timeout
+        // composition, and — on the final column — the pause-state box.
+        if target == pause_state.next_column_index
+            && pause_state.nbc_null_bitmap.is_none()
+            && pause_state.decryptor.is_none()
+        {
+            let mut capture = DefaultRowWriter::new(1);
+            let decoded = {
+                let column = &pause_state.columns()[target];
+                self.transport
+                    .try_decode_column_buffered(column, target, &mut capture)
+            };
+
+            if decoded {
+                let value = capture.take_row().into_iter().next().ok_or_else(|| {
+                    crate::error::Error::ProtocolError(format!(
+                        "Decoder produced no value for non-null column {target}"
+                    ))
+                })?;
+                // Mirrors the `RowWritten` / `RowPaused` bookkeeping below.
+                if target + 1 == pause_state.columns().len() {
+                    self.active_row_read_state = ActiveRowReadState::Idle;
+                } else {
+                    self.active_row_read_state =
+                        ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+                            next_column_index: target + 1,
+                            ..pause_state
+                        }));
+                }
+                return Ok(CursorColumn::Value(value));
+            }
         }
 
         let mut capture = DefaultRowWriter::new(1);
@@ -4604,7 +4640,10 @@ mod tests {
             .unwrap();
         let inner_pause_state = RowPauseState {
             next_column_index: 1,
-            columns: vec![metadata.clone()],
+            metadata: Arc::new(ColMetadataToken {
+                columns: vec![metadata.clone()],
+                ..Default::default()
+            }),
             nbc_null_bitmap: None,
             decryptor: None,
         };
@@ -4622,7 +4661,10 @@ mod tests {
         let mut client = create_test_client_with_transport(transport);
         client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 0,
-            columns: vec![metadata],
+            metadata: Arc::new(ColMetadataToken {
+                columns: vec![metadata],
+                ..Default::default()
+            }),
             nbc_null_bitmap: None,
             decryptor: None,
         }));
@@ -4642,7 +4684,7 @@ mod tests {
         let mut client = create_test_client();
         client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 1,
-            columns: Vec::new(),
+            metadata: Arc::new(ColMetadataToken::default()),
             nbc_null_bitmap: None,
             decryptor: None,
         }));
@@ -4661,7 +4703,7 @@ mod tests {
         client.current_result_set_has_been_read_till_end = false;
         client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 1,
-            columns: Vec::new(),
+            metadata: Arc::new(ColMetadataToken::default()),
             nbc_null_bitmap: None,
             decryptor: None,
         }));
