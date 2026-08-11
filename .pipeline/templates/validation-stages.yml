@@ -529,9 +529,16 @@ stages:
   # replaced by the Rust mssql-odbc driver. Failures and crashes are expected
   # while the driver is in development, so the job is informational: its test
   # step is continueOnError and each test file runs in its own bounded process.
+  #
+  # The time bounds nest deliberately: the runner caps the whole test loop at
+  # pytestTotalBudget (110m), the test step backstops a wedged `docker exec` at
+  # 130m, and the job allows 240m so the ~110m left over covers setup and still
+  # guarantees the publish and cleanup steps run. A job cancelled by the server
+  # for timeout skips `condition: always()` steps, which would lose the report
+  # this job exists to produce.
   - job: Test_mssql_python_on_mssql_odbc
     displayName: mssql-python suite on mssql-odbc driver (cross-repo)
-    timeoutInMinutes: 180
+    timeoutInMinutes: 240
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:

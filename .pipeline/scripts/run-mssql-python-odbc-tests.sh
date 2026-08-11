@@ -178,13 +178,15 @@ for idx in "${!TEST_FILES[@]}"; do
             ;;
     esac
 
-    if [ ! -s "$report" ]; then
+    # A fully-deselected file still leaves a nonempty JUnit report holding zero
+    # test cases, which surfaces as nothing at all in the Tests tab. Overwrite it
+    # so every file has exactly one visible outcome.
+    if [ "$kind" = "skipped" ]; then
+        write_report_stub "$name" skipped "$status" "$report"
+        echo "$name: $status"
+    elif [ ! -s "$report" ]; then
         write_report_stub "$name" "$kind" "$status" "$report"
-        if [ "$kind" = "skipped" ]; then
-            echo "$name: $status"
-        else
-            echo "##[warning]$name: $status - no pytest report produced, wrote synthetic error report"
-        fi
+        echo "##[warning]$name: $status - no pytest report produced, wrote synthetic error report"
     else
         echo "$name: $status"
     fi

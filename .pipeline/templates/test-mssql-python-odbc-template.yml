@@ -151,6 +151,7 @@ steps:
       apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv python3-full python3-dev \
         cmake curl wget gnupg build-essential pybind11-dev \
+        unixodbc-dev \
         libssl3 libgssapi-krb5-2 libkrb5-3 ca-certificates
     '
   displayName: Create mssql-python test container
@@ -187,6 +188,19 @@ steps:
       ./eng/scripts/install-mssql-py-core.sh
     '
   displayName: Install mssql_py_core from NuGet
+
+# Upstream purges the ODBC build toolchain and the system libodbcinst before
+# testing, so the bundled copy next to the driver is what loads. Mirror it: the
+# only intended difference from an upstream run is the driver binary itself.
+- script: |
+    set -euo pipefail
+    docker exec mssql-python-odbc-tests bash -c '
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get remove --purge -y unixodbc-dev >/dev/null
+      rm -f /lib/x86_64-linux-gnu/libodbcinst.so.2 /usr/lib/x86_64-linux-gnu/libodbcinst.so.2
+      echo "Removed unixODBC development headers and system libodbcinst.so.2"
+    '
+  displayName: Strip build-time ODBC toolchain
 
 - script: |
     set -euo pipefail
