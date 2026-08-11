@@ -3268,8 +3268,14 @@ impl TdsClient {
     }
 
     /// Reads and discards all remaining bytes of an active PLP stream.
+    ///
+    /// The scratch buffer is heap-allocated rather than a stack array: this
+    /// future is awaited from `next_row_cursor` and `read_row_column`, so an
+    /// 8 KiB local live across an await would be folded into those hot state
+    /// machines and memcpy'd on every row. Abandoning a partially read PLP
+    /// column is rare and already network-bound, so the allocation is free.
     async fn drain_active_plp(&mut self, plp_state: &mut PlpPauseState) -> TdsResult<()> {
-        let mut buffer = [0u8; 8192];
+        let mut buffer = vec![0u8; 8192];
         while !plp_state.reached_end() {
             let start = Instant::now();
             let read = self
