@@ -41,7 +41,6 @@ pub(crate) trait NetworkWriter: Send + Sync + TransportSslHandler {
 
 #[async_trait]
 pub(crate) trait NetworkReader: Send {
-    async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize>;
     fn packet_size(&self) -> u32;
 }
 

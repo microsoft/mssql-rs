@@ -127,8 +127,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::packet_reader::PacketReader;
-    use crate::io::packet_reader::tests::MockNetworkReaderWriter;
+    use crate::connection::transport::network_transport::tests::create_network_transport_with_data;
     use crate::io::packet_reader::tests::TestPacketBuilder;
     use crate::message::messages::PacketType;
 
@@ -183,9 +182,7 @@ mod tests {
         // Line number
         builder.append_u32(1);
 
-        let mut mock_reader_writer = MockNetworkReaderWriter::new(builder.build(), 0);
-        let mut packet_reader = PacketReader::new(&mut mock_reader_writer);
-        packet_reader.read_tds_packet_for_test().await.unwrap();
+        let mut packet_reader = create_network_transport_with_data(&builder.build()).await;
 
         let parser = InfoTokenParser::default();
         let context = ParserContext::default();
@@ -237,9 +234,7 @@ mod tests {
 
         builder.append_u32(42); // line number
 
-        let mut mock_reader_writer = MockNetworkReaderWriter::new(builder.build(), 0);
-        let mut packet_reader = PacketReader::new(&mut mock_reader_writer);
-        packet_reader.read_tds_packet_for_test().await.unwrap();
+        let mut packet_reader = create_network_transport_with_data(&builder.build()).await;
 
         let parser = InfoTokenParser::default();
         let context = ParserContext::default();
@@ -285,9 +280,7 @@ mod tests {
         builder.append_byte(0); // empty proc name
         builder.append_u32(0);
 
-        let mut mock_reader_writer = MockNetworkReaderWriter::new(builder.build(), 0);
-        let mut packet_reader = PacketReader::new(&mut mock_reader_writer);
-        packet_reader.read_tds_packet_for_test().await.unwrap();
+        let mut packet_reader = create_network_transport_with_data(&builder.build()).await;
 
         let parser = InfoTokenParser::default();
         let context = ParserContext::default();

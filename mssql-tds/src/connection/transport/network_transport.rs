@@ -14,7 +14,7 @@ use crate::datatypes::row_writer::RowWriter;
 use crate::error::Error::{OperationCancelledError, TimeoutError};
 use crate::error::TimeoutErrorType;
 use crate::handler::handler_factory::SessionSettings;
-use crate::io::packet_reader::{PacketReader, TdsPacketReader};
+use crate::io::packet_reader::{LENGTH_NULL, TdsPacketReader};
 use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
 use crate::io::token_stream::{
@@ -551,10 +551,6 @@ impl NetworkReaderWriter for NetworkTransport {
 
 #[async_trait]
 impl NetworkReader for NetworkTransport {
-    async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
-        Ok(self.receive(buffer).await?)
-    }
-
     fn packet_size(&self) -> u32 {
         self.packet_size
     }
@@ -633,6 +629,10 @@ impl NetworkTransport {
         self.encryption = Some(encryption);
     }
 
+    /// Raw byte-level read. [`get_new_tds_packet`](Self::get_new_tds_packet)
+    /// reads straight into the working buffer instead, so this is exercised
+    /// only by tests and by [`NetworkReader`] consumers.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
         if buffer.is_empty() {
             return Err(crate::error::Error::UsageError(
@@ -1296,7 +1296,7 @@ impl TdsPacketReader for NetworkTransport {
 
     async fn read_varchar_u16_length(&mut self) -> TdsResult<Option<String>> {
         let length: u16 = self.read_uint16().await?;
-        if length == PacketReader::LENGTHNULL {
+        if length == LENGTH_NULL {
             return Ok(None);
         }
 
@@ -1596,6 +1596,8 @@ pub(crate) mod tests {
     use crate::connection::transport::network_transport::Stream;
     use crate::connection::transport::ssl_handler::SslHandler;
     use crate::core::EncryptionOptions;
+    use crate::io::packet_reader::tests::{TestPacketBuilder, encode_utf16_le};
+    use crate::message::messages::PacketType;
     use bytes::Bytes;
     use futures::SinkExt;
     use futures::StreamExt;
@@ -1636,6 +1638,28 @@ pub(crate) mod tests {
                 false,
             ),
             server_side,
+        )
+    }
+
+    /// Builds a `NetworkTransport` whose read side is pre-loaded with `data`.
+    /// The writer half is dropped, so reads observe EOF once `data` is drained.
+    pub(crate) async fn create_network_transport_with_data(data: &[u8]) -> NetworkTransport {
+        let (client_side, mut server_side) = duplex(data.len().max(1));
+        server_side
+            .write_all(data)
+            .await
+            .expect("failed to preload duplex stream");
+
+        let context = ClientContext::default();
+        NetworkTransport::new(
+            Box::new(client_side),
+            SslHandler {
+                server_host_name: context.transport_context.get_server_name().clone(),
+                encryption_options: context.encryption_options.clone(),
+            },
+            context.packet_size as u32,
+            context.encryption_options.mode,
+            false,
         )
     }
 
@@ -2529,5 +2553,207 @@ pub(crate) mod tests {
                 "payload EOF must mark the connection known-dead"
             );
         }
+    }
+
+    fn generate_random_bytes(length: usize) -> Vec<u8> {
+        let mut rng = rand::rng();
+        let mut bytes = vec![0u8; length];
+        rng.fill(&mut bytes[..]);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn test_read_byte() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let byte_value = rand::rng().random::<u8>();
+        let builder = binding.append_byte(byte_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(reader.read_byte().await.unwrap(), byte_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_int16() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let int16_value = rand::rng().random::<i16>();
+        let builder = binding.append_i16(int16_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(reader.read_int16().await.unwrap(), int16_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_uint16() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let uint16_value = rand::rng().random::<u16>();
+        let builder = binding.append_u16(uint16_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(reader.read_uint16().await.unwrap(), uint16_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_int32() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let int32_value = rand::rng().random::<i32>();
+        let builder = binding.append_i32(int32_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(reader.read_int32().await.unwrap(), int32_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_uint32() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let uint32_value = rand::rng().random::<u32>();
+        let builder = binding.append_u32(uint32_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(reader.read_uint32().await.unwrap(), uint32_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_int64() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let int64_value = rand::rng().random::<i64>();
+        let builder = binding.append_i64(int64_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(reader.read_int64().await.unwrap(), int64_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_uint64() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let uint64_value = rand::rng().random::<u64>();
+        let builder = binding.append_u64(uint64_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(reader.read_uint64().await.unwrap(), uint64_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_float32() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let float32_value = rand::rng().random::<f32>();
+        let builder = binding.append_f32(float32_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(reader.read_float32().await.unwrap(), float32_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_float64() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let float64_value = rand::rng().random::<f64>();
+        let builder = binding.append_f64(float64_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(reader.read_float64().await.unwrap(), float64_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_unicode() {
+        let unicode_string = "Hello, world";
+        let char_count = unicode_string.encode_utf16().count();
+
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let builder = binding.append_bytes(&encode_utf16_le(unicode_string));
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(
+            reader.read_unicode(char_count).await.unwrap(),
+            unicode_string
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_bytes() {
+        let bytes_len = 2000;
+        let bytes = generate_random_bytes(bytes_len);
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let builder = binding.append_bytes(&bytes);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        let mut buffer = vec![0; bytes_len];
+        assert_eq!(reader.read_bytes(&mut buffer).await.unwrap(), bytes_len);
+        assert_eq!(buffer, bytes);
+    }
+
+    #[tokio::test]
+    async fn test_read_u8_varbyte() {
+        let bytes_len: u8 = 200;
+        let data_bytes = generate_random_bytes(bytes_len as usize);
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        binding.append_byte(bytes_len);
+        let builder = binding.append_bytes(&data_bytes);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(reader.read_u8_varbyte().await.unwrap(), data_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_read_u16_varbyte() {
+        let bytes_len: u16 = 1000;
+        let data_bytes = generate_random_bytes(bytes_len as usize);
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        binding.append_u16(bytes_len);
+        let builder = binding.append_bytes(&data_bytes);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(reader.read_u16_varbyte().await.unwrap(), data_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_read_varchar_u16_length() {
+        let unicode_string = "Hello, world";
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        binding.append_u16(unicode_string.encode_utf16().count() as u16);
+        let builder = binding.append_bytes(&encode_utf16_le(unicode_string));
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(
+            reader.read_varchar_u16_length().await.unwrap(),
+            Some(unicode_string.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_varchar_u16_length_null() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let builder = binding.append_u16(LENGTH_NULL);
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(reader.read_varchar_u16_length().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_read_varchar_u8_length() {
+        let unicode_string = "Hello, world";
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        binding.append_byte(unicode_string.encode_utf16().count() as u8);
+        let builder = binding.append_bytes(&encode_utf16_le(unicode_string));
+
+        let mut reader = create_network_transport_with_data(&builder.build()).await;
+
+        assert_eq!(
+            reader.read_varchar_u8_length().await.unwrap(),
+            unicode_string
+        );
     }
 }
