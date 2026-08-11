@@ -91,6 +91,18 @@ A source with no interpretation for the requested target (binary, guid) is `0700
 
 Max-length character sources (`varchar(max)` / `nvarchar(max)`) into the numeric and date/time targets are **excluded** from P1a and tracked as Task [47238](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47238). They arrive as PLP, so parsing needs the ODBC layer to accumulate chunks, which inverts the "never buffer the full PLP payload" invariant that `stream_active_plp_chunk` documents. That work is sequenced after #204 and #215, which are both rewriting the same read path, and needs a bounded-prefix policy agreed first so a 2 GB column cannot be drained to produce a `SQL_C_SLONG`.
 
+#### Known divergences from msodbcsql
+
+These were found by reading `Sql/Ntdbms/sqlncli/odbc/sqlccnvt.cpp` while reviewing P1a. They are recorded here because `GetDataLiveTest` skips the msodbcsql comparison leg for these cases, so the parity run will not surface them.
+
+| Case | msodbcsql | mssql-odbc | Status |
+| --- | --- | --- | --- |
+| A UTC offset in a literal, for any target other than `SQL_C_SS_TIMESTAMPOFFSET` | shifts the value into the client's local zone (`ConvertOffsetToLocal`) | validates the offset, then delivers the wall-clock fields as written | **Deliberate.** Matching would make the returned value depend on the client machine's time zone. Locked in by `offset_is_ignored_for_non_offset_targets`. |
+| Character or decimal source into `SQL_C_TINYINT` above 127 | `22003` — the signed limit applies whenever the input type is not itself a tinyint C type | `Ok(200)` — the target is `u8`, matching a real `tinyint` column (0-255) and what mssql-python fetches | **Deliberate**, but P1a is what first opens these sources into that target, so the divergence starts here. |
+| `YYYY/MM/DD` and the ODBC escape literals `{d '...'}` / `{t '...'}` / `{ts '...'}` | accepted (`rgbECODE_DATE_SLASH` retry, and the `FindECode` branch) | `22018` | Gap — Task [47246](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47246). |
+| `T` separator, `HH:MM` without seconds, unpadded fields such as `2023-6-5` | rejected (fixed-length token grammar) | accepted | Permissive. Low risk, same task. |
+| A time-only value into `SQL_C_TYPE_TIMESTAMP` | fills in the current date and succeeds, per Appendix D | `22018` from a character source, `07006` from a `time` column | Gap — Task [47247](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47247). Needs a platform-specific local-date helper, so it is not a one-line fix. |
+
 ### P2 — SQLColAttributeW — Task [46579](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46579)
 
 - Required minimum: `SQL_CA_SS_VARIANT_TYPE` so the `sql_variant` underlying C type resolves after the `SQL_C_BINARY` probe.

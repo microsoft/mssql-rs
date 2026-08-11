@@ -229,22 +229,24 @@ fn numeric_source(value: &ColumnValues) -> Option<NumericSource> {
 }
 
 /// Interprets a column as a number, including character columns holding a
-/// numeric literal. `Err` distinguishes "not a numeric column" from "character
-/// column whose text is not a valid number" (`22018`).
+/// numeric literal. `Err` distinguishes "not a numeric column" (`07006`) from
+/// text that is not a number (`22018`) and digits that overflow (`22003`).
 fn numeric_source_or_parse(value: &ColumnValues) -> Result<NumericSource, ConvError> {
     if let ColumnValues::String(s) = value {
         let text = sql_string_to_text(s).ok_or(ConvError::InvalidCharacterValue)?;
-        return parse_decimal_literal(&text)
-            .or_else(|| {
-                // Rust accepts "inf"/"infinity"/"nan"; SQL Server has no such
-                // literal, so they are invalid text rather than values.
-                text.trim()
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|f| f.is_finite())
-                    .map(NumericSource::Float)
-            })
-            .ok_or(ConvError::InvalidCharacterValue);
+        if let Some(n) = parse_decimal_literal(&text) {
+            return Ok(n);
+        }
+        let t = text.trim();
+        return match t.parse::<f64>() {
+            Ok(f) if f.is_finite() => Ok(NumericSource::Float(f)),
+            // Rust folds overflow into `Ok(inf)`, but msodbcsql's `VarR8FromStr`
+            // reports DISP_E_OVERFLOW -> 22003 and keeps the cast error for text
+            // that is not a number at all. Digits present means it was numeric.
+            Ok(_) if t.bytes().any(|b| b.is_ascii_digit()) => Err(ConvError::OutOfRange),
+            // "inf" / "infinity" / "nan" parse in Rust but are not SQL literals.
+            _ => Err(ConvError::InvalidCharacterValue),
+        };
     }
     numeric_source(value).ok_or(ConvError::Restricted)
 }
@@ -422,9 +424,6 @@ pub(crate) struct DateTimeParts {
     pub has_date: bool,
     pub has_time: bool,
     pub has_tz: bool,
-    /// Set when a character literal carried more fractional digits than the
-    /// 100 ns resolution can keep, so the conversion reports `01S07`.
-    pub frac_truncated: bool,
 }
 
 /// (year, month, day) from a day count where day 0 = 0001-01-01, using Howard
@@ -616,10 +615,9 @@ fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
     Some((year, month, day))
 }
 
-/// Parses `HH:MM[:SS[.fffffff]]`, returning the components, the number of
-/// fractional digits kept (the effective scale), and whether digits past the
-/// 100 ns resolution were dropped.
-fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8, bool)> {
+/// Parses `HH:MM[:SS[.f{1,9}]]`, returning the components plus the number of
+/// fractional digits supplied (the effective scale).
+fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
     let mut it = s.split(':');
     let hour: u16 = it.next()?.parse().ok()?;
     let minute: u16 = it.next()?.parse().ok()?;
@@ -638,24 +636,21 @@ fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8, bool)> {
     if !frac_digits.is_empty() && !frac_digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    // Normalize the fraction to 100 ns resolution (7 digits).
-    let scale = frac_digits.len().min(7);
-    let mut hundred_ns: u32 = 0;
-    for i in 0..7 {
+    // `SQL_TIMESTAMP_STRUCT.fraction` is nanoseconds, so a character literal can
+    // carry 9 exact digits; msodbcsql rejects anything longer rather than
+    // truncating it, and a character source has no server-side scale to cap it.
+    if frac_digits.len() > 9 {
+        return None;
+    }
+    let mut nanos: u32 = 0;
+    for i in 0..9 {
         let digit = frac_digits
             .as_bytes()
             .get(i)
             .map_or(0, |b| u32::from(b - b'0'));
-        hundred_ns = hundred_ns * 10 + digit;
+        nanos = nanos * 10 + digit;
     }
-    Some((
-        hour,
-        minute,
-        second,
-        hundred_ns * 100,
-        scale as u8,
-        frac_digits.len() > 7,
-    ))
+    Some((hour, minute, second, nanos, frac_digits.len() as u8))
 }
 
 /// Parses the character forms of `date`, `time`, `datetime2` and
@@ -700,13 +695,12 @@ fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
         p.has_date = true;
     }
     if let Some(t) = time_str.filter(|t| !t.is_empty()) {
-        let (h, mi, sec, frac_ns, scale, frac_truncated) = parse_time_literal(t)?;
+        let (h, mi, sec, frac_ns, scale) = parse_time_literal(t)?;
         p.hour = h;
         p.minute = mi;
         p.second = sec;
         p.fraction_ns = frac_ns;
         p.scale = scale;
-        p.frac_truncated = frac_truncated;
         p.has_time = true;
     }
     if !p.has_date && !p.has_time {
@@ -824,10 +818,12 @@ pub(crate) unsafe fn convert_datetime_c(
                 strlen_or_ind_ptr,
             )
         },
-        // Reached when the value lacks the component the target needs (e.g. a
-        // `time` column into `SQL_C_TYPE_DATE`). For character input the pairing
-        // is legal and it is the text that is wrong for this target, so that
-        // stays 22018 rather than becoming 07006.
+        // Reached when the value lacks the component the target needs. Two
+        // cases land here: `time` into `SQL_C_TYPE_DATE`, which is correct, and
+        // `time` into `SQL_C_TYPE_TIMESTAMP`, which Appendix D says should fill
+        // in the current date instead (AB#47247). For character input the
+        // pairing is legal and it is the text that is wrong for this target, so
+        // that stays 22018 rather than becoming 07006.
         _ => {
             return Err(if from_character {
                 ConvError::InvalidCharacterValue
@@ -836,11 +832,7 @@ pub(crate) unsafe fn convert_datetime_c(
             });
         }
     };
-    Ok(if p.frac_truncated {
-        ConvOk::Truncated
-    } else {
-        ret
-    })
+    Ok(ret)
 }
 
 /// Formats a [`DateTimeParts`] as an ISO-8601-style string for character
@@ -1402,10 +1394,11 @@ mod tests {
         assert_eq!(err, ConvError::OutOfRange);
     }
 
-    /// Fractional digits past the 100 ns resolution are dropped, which is a
-    /// truncation and has to be reported like every other lossy path here.
+    /// `SQL_TIMESTAMP_STRUCT.fraction` is nanoseconds, so a character literal
+    /// carries 9 exact digits and anything longer is rejected rather than
+    /// silently truncated.
     #[test]
-    fn excess_fractional_digits_report_truncation() {
+    fn nine_fractional_digits_are_exact_and_more_is_rejected() {
         let mut out = SqlTimestampStruct::default();
         let mut ind: SqlLen = 0;
         let ok = unsafe {
@@ -1417,8 +1410,60 @@ mod tests {
             )
         }
         .unwrap();
-        assert_eq!(ok, ConvOk::Truncated);
-        assert_eq!(out.fraction, 123_456_700);
+        assert_eq!(ok, ConvOk::Exact);
+        assert_eq!(out.fraction, 123_456_789);
+
+        let err = unsafe {
+            convert_datetime_c(
+                &utf8_col("2023-06-15 12:34:56.12345678901"),
+                SQL_C_TYPE_TIMESTAMP,
+                (&mut out as *mut SqlTimestampStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, ConvError::InvalidCharacterValue);
+    }
+
+    /// Deliberate divergence: for every target except
+    /// `SQL_C_SS_TIMESTAMPOFFSET` the parsed offset is validated and then
+    /// ignored, so the wall-clock fields arrive as written. msodbcsql shifts
+    /// them into the client machine's local zone instead, which makes the value
+    /// depend on where the client runs.
+    #[test]
+    fn offset_is_ignored_for_non_offset_targets() {
+        let mut out = SqlTimestampStruct::default();
+        let mut ind: SqlLen = 0;
+        let ok = unsafe {
+            convert_datetime_c(
+                &utf8_col("2023-01-01 12:34:56+05:30"),
+                SQL_C_TYPE_TIMESTAMP,
+                (&mut out as *mut SqlTimestampStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(ok, ConvOk::Exact);
+        assert_eq!((out.year, out.month, out.day), (2023, 1, 1));
+        assert_eq!((out.hour, out.minute, out.second), (12, 34, 56));
+    }
+
+    /// Digits that overflow `f64` are out of range, not unparseable text.
+    /// `f64::from_str` folds both into `Ok(inf)`, so they have to be split.
+    #[test]
+    fn overflowing_numeric_text_is_out_of_range() {
+        let mut out: f64 = 0.0;
+        let mut ind: SqlLen = 0;
+        let err = unsafe {
+            convert_float_c(
+                &utf8_col("1e400"),
+                SQL_C_DOUBLE,
+                (&mut out as *mut f64).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
     }
 
     /// Character text that parses as a different temporal shape is bad text for
