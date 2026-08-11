@@ -32,8 +32,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::transport::network_transport::tests::create_network_transport_with_data;
-    use crate::io::packet_reader::tests::TestPacketBuilder;
+    use crate::io::packet_reader::tests::{TestPacketBuilder, create_network_transport_with_data};
     use crate::message::messages::PacketType;
 
     #[tokio::test]

@@ -169,8 +169,12 @@ impl TdsPacketReader for Box<dyn TdsPacketReader + Send + Sync> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::connection::client_context::ClientContext;
+    use crate::connection::transport::network_transport::NetworkTransport;
+    use crate::connection::transport::ssl_handler::SslHandler;
     use crate::message::messages::PacketType;
     use byteorder::{BigEndian, ByteOrder, LittleEndian};
+    use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
 
     macro_rules! append_method {
         ($name:ident, $type:ty, $size:expr_2021, $write_fn:ident) => {
@@ -178,7 +182,6 @@ pub(crate) mod tests {
                 let mut buffer = [0u8; $size];
                 LittleEndian::$write_fn(&mut buffer, number);
                 self.data.extend_from_slice(&buffer);
-                self.payload_length += $size as u16;
                 self
             }
         };
@@ -188,7 +191,6 @@ pub(crate) mod tests {
     /// big-endian length) followed by the appended payload bytes.
     pub(crate) struct TestPacketBuilder {
         data: Vec<u8>,
-        payload_length: u16,
     }
 
     impl TestPacketBuilder {
@@ -198,21 +200,16 @@ pub(crate) mod tests {
             data[1] = 0x1;
             data[0] = packet_type as u8;
 
-            TestPacketBuilder {
-                data,
-                payload_length: 0,
-            }
+            TestPacketBuilder { data }
         }
 
         pub(crate) fn append_byte(&mut self, byte: u8) -> &mut TestPacketBuilder {
             self.data.push(byte);
-            self.payload_length += 1;
             self
         }
 
         pub(crate) fn append_bytes(&mut self, bytes: &[u8]) -> &mut TestPacketBuilder {
             self.data.extend_from_slice(bytes);
-            self.payload_length += bytes.len() as u16;
             self
         }
 
@@ -225,8 +222,11 @@ pub(crate) mod tests {
         append_method!(append_i32, i32, 4, write_i32);
         append_method!(append_u64, u64, 8, write_u64);
 
+        /// Writes the total packet length (header + payload) into the header's
+        /// big-endian length field, per TDS.
         pub(crate) fn build(&mut self) -> Vec<u8> {
-            BigEndian::write_u16(&mut self.data[2..4], self.payload_length + 8);
+            let total = u16::try_from(self.data.len()).expect("test packet exceeds u16 length");
+            BigEndian::write_u16(&mut self.data[2..4], total);
             self.data.clone()
         }
     }
@@ -238,5 +238,82 @@ pub(crate) mod tests {
             .encode_utf16()
             .flat_map(|unit| unit.to_le_bytes())
             .collect()
+    }
+
+    fn build_duplex_transport(client_side: DuplexStream) -> NetworkTransport {
+        let context = ClientContext::default();
+        NetworkTransport::new(
+            Box::new(client_side),
+            SslHandler {
+                server_host_name: context.transport_context.get_server_name().clone(),
+                encryption_options: context.encryption_options.clone(),
+            },
+            context.packet_size as u32,
+            context.encryption_options.mode,
+            false,
+        )
+    }
+
+    /// Builds a `NetworkTransport` whose read side is pre-loaded with `data`.
+    /// The writer half is dropped, so reads observe EOF once `data` is drained.
+    ///
+    /// `data` is delivered in a single read, so this cannot express fragmented
+    /// reads — use [`create_network_transport_with_chunked_data`] for those.
+    /// Every TDS packet in `data` must be at most 8000 bytes in total (the
+    /// default negotiated packet size), or `get_new_tds_packet` rejects it.
+    pub(crate) async fn create_network_transport_with_data(data: &[u8]) -> NetworkTransport {
+        let (client_side, mut server_side) = duplex(data.len().max(1));
+        server_side
+            .write_all(data)
+            .await
+            .expect("failed to preload duplex stream");
+
+        build_duplex_transport(client_side)
+    }
+
+    /// Builds a `NetworkTransport` fed `data` in `chunk_size` pieces, so reads
+    /// observe the header and payload splits a real socket can produce.
+    ///
+    /// The duplex buffer is sized to one chunk, so the writer blocks until the
+    /// reader drains each piece. Supplying fewer bytes than a packet header
+    /// advertises leaves the reader at EOF mid-packet.
+    pub(crate) fn create_network_transport_with_chunked_data(
+        data: &[u8],
+        chunk_size: usize,
+    ) -> NetworkTransport {
+        let chunk_size = chunk_size.max(1);
+        let (client_side, mut server_side) = duplex(chunk_size);
+        let owned = data.to_vec();
+        tokio::spawn(async move {
+            for chunk in owned.chunks(chunk_size) {
+                if server_side.write_all(chunk).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        build_duplex_transport(client_side)
+    }
+
+    #[test]
+    fn test_packet_builder_writes_total_length_in_header() {
+        let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
+        builder.append_bytes(&[0u8; 12]);
+        let packet = builder.build();
+
+        assert_eq!(packet.len(), 20);
+        assert_eq!(
+            BigEndian::read_u16(&packet[2..4]),
+            20,
+            "header must carry total length, not payload length"
+        );
+    }
+
+    #[test]
+    fn test_packet_builder_empty_payload_length_is_header_only() {
+        let packet = TestPacketBuilder::new(PacketType::TabularResult).build();
+
+        assert_eq!(packet.len(), 8);
+        assert_eq!(BigEndian::read_u16(&packet[2..4]), 8);
     }
 }
