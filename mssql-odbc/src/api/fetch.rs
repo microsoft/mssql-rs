@@ -10,6 +10,7 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
     SqlReturn,
 };
+use crate::api::util::drive_read;
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -135,7 +136,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
     // `drain_active_row` in tds_client), so a failure here may originate from
     // the prior row rather than the new one. Columns of the new row are pulled
     // lazily by subsequent SQLGetData calls via `read_row_column`.
-    let fetch_result = dbc.runtime.block_on(client.next_row_cursor());
+    let fetch_result = drive_read(&dbc.runtime, client.next_row_cursor());
 
     match fetch_result {
         Ok(true) => {
@@ -334,7 +335,7 @@ mod tests {
 
         // A client must be present (the guard runs after it is claimed), but it
         // is never read because the guard returns first.
-        let client = tds_client_from_tokens(vec![done_no_more()]);
+        let client = Box::new(tds_client_from_tokens(vec![done_no_more()]));
         let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut dbc_state = dbc_handle.inner.lock().unwrap();

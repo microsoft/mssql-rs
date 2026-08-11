@@ -235,7 +235,7 @@ mod tests {
     fn position_first_and_inject(h: &TestHandles, tokens: Vec<ScriptedToken>) -> StatementResult {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let mut client = tds_client_from_tokens(tokens);
+        let mut client = Box::new(tds_client_from_tokens(tokens));
         let first = dbc
             .runtime
             .block_on(client.execute("SELECT 1;".to_string(), ()))

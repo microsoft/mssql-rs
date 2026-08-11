@@ -12,7 +12,8 @@ use super::odbc_types::{
 };
 use super::sqlstate::*;
 use crate::api::odbc_types::SqlWChar;
-use crate::api::util::{copy_with_nul, write_if_some};
+use crate::api::util::{copy_with_nul, drive_read, write_if_some};
+use crate::api::value_text::column_value_to_text;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -393,7 +394,7 @@ fn resume_row_to_column(
     };
 
     let target = column_number - 1; // 0-based
-    let cursor_result = dbc.runtime.block_on(client.read_row_column(target));
+    let cursor_result = drive_read(&dbc.runtime, client.read_row_column(target));
 
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("SQLGetData: dbc mutex poisoned after row resume");
@@ -626,9 +627,7 @@ fn stream_active_plp_chunk(
         client
     };
 
-    let read_result = dbc
-        .runtime
-        .block_on(client.read_active_plp_chunk(&mut payload));
+    let read_result = drive_read(&dbc.runtime, client.read_active_plp_chunk(&mut payload));
 
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("SQLGetData: dbc mutex poisoned after PLP read");
@@ -851,22 +850,6 @@ fn write_string_result<T: Copy + Default>(
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
-    }
-}
-
-fn column_value_to_text(v: &ColumnValues) -> Option<String> {
-    match v {
-        ColumnValues::TinyInt(x) => Some(x.to_string()),
-        ColumnValues::SmallInt(x) => Some(x.to_string()),
-        ColumnValues::Int(x) => Some(x.to_string()),
-        ColumnValues::BigInt(x) => Some(x.to_string()),
-        ColumnValues::Real(x) => Some(x.to_string()),
-        ColumnValues::Float(x) => Some(x.to_string()),
-        ColumnValues::Bit(x) => Some(if *x { "1".into() } else { "0".into() }),
-        ColumnValues::String(s) => Some(s.to_utf8_string()),
-        ColumnValues::Uuid(u) => Some(u.to_string()),
-        ColumnValues::Null => Some(String::new()),
-        _ => None,
     }
 }
 
@@ -1175,10 +1158,10 @@ mod tests {
             .as_deref(),
             Some("hi")
         );
-        // A type with no textual rendering in this helper yields None.
+        // Binary data converts to its uppercase hex literal (ODBC SQL_C_CHAR form).
         assert_eq!(
-            column_value_to_text(&ColumnValues::Bytes(vec![1, 2, 3])),
-            None
+            column_value_to_text(&ColumnValues::Bytes(vec![1, 2, 3])).as_deref(),
+            Some("010203")
         );
     }
 }

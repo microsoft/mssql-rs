@@ -1,9 +1,43 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::future::Future;
+use std::pin::pin;
 use std::slice;
+use std::task::{Context, Poll, Waker};
+
+use tokio::runtime::Runtime;
 
 use crate::api::odbc_types::{SQL_NTS, SqlSmallInt, SqlWChar};
+
+/// Drives `future` to completion, skipping the executor whenever it can.
+///
+/// The transport decodes rows out of a buffer that already holds a whole
+/// plaintext TDS packet, so a row or column read only suspends when it crosses
+/// a packet boundary — roughly once every few hundred narrow rows. Polling once
+/// resolves the common case on the calling thread, which keeps `SQLFetch` and
+/// `SQLGetData` off the executor entirely.
+///
+/// A `Pending` poll hands the *same* partially polled future to `block_on`, so
+/// bytes already taken from the buffer are never decoded twice. The first poll
+/// runs inside the runtime context because the read path registers timers and
+/// socket interest; the guard is dropped before `block_on`, which refuses to
+/// run while the thread is already inside the runtime.
+pub(crate) fn drive_read<F: Future>(runtime: &Runtime, future: F) -> F::Output {
+    let mut future = pin!(future);
+
+    let polled = {
+        let _guard = runtime.enter();
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+    };
+
+    match polled {
+        Poll::Ready(output) => output,
+        Poll::Pending => runtime.block_on(future),
+    }
+}
 
 /// Write `value` to `ptr` if non-null. Every ODBC out-parameter pointer may
 /// legitimately be null (caller opting out of that value), so the
