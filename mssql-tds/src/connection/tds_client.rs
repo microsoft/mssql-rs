@@ -6119,7 +6119,11 @@ mod tests {
     }
 
     /// A COLMETADATA arriving before the current result set's DONE is a protocol
-    /// violation and must be rejected rather than silently mis-parsed.
+    /// violation, so the drain aborts rather than silently mis-parsing it. The
+    /// abort is *contained*: the original statement error stays primary and the
+    /// client is left idle, so the caller sees the real SQL error (1222) instead
+    /// of the internal protocol detail, and a failed drain never leaves the
+    /// batch marked open.
     #[tokio::test]
     async fn drain_rejects_colmetadata_before_result_set_done() {
         let mut stream = Vec::new();
@@ -6134,9 +6138,15 @@ mod tests {
         let mut client = client_over_bytes(stream);
         let err = client.advance_to_result_boundary().await.unwrap_err();
 
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
         assert!(
-            matches!(err, crate::error::Error::ProtocolError(_)),
-            "expected a ProtocolError for COLMETADATA before DONE, got: {err:?}"
+            !client.maybe_has_unread_rows(),
+            "a contained drain failure must still clear the unread-rows guard"
+        );
+        assert!(
+            !client.has_open_batch(),
+            "a contained drain failure must still close the batch"
         );
     }
 
