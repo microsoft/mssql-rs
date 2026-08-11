@@ -6,7 +6,11 @@ publish = false
 
 [lib]
 name = "msodbcsql18"
-crate-type = ["cdylib"]
+# `cdylib` is the shipping artifact (the driver DLL). `rlib` additionally lets
+# in-repo benchmarks link the driver and call its exported entry points
+# in-process, so the ODBC layer can be measured without the Driver Manager in
+# the way. It does not affect the DLL.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 mssql-tds = { path = "../mssql-tds" }
@@ -46,5 +50,11 @@ windows = { version = "0.58", features = [
 # `TdsClient` driven by scripted TDS tokens (see `mssql_tds::test_client_support`)
 # to cover client-driven ODBC paths without a live server.
 mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
+criterion = "0.5"
+dotenv = "0.15"
+
+[[bench]]
+name = "odbc_glue"
+harness = false
 
 [build-dependencies]
