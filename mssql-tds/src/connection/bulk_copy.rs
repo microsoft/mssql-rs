@@ -41,7 +41,7 @@
 //!     .timeout(30);
 //!
 //! let result = bulk_copy.write_to_server(users.into_iter()).await?;
-//! println!("Inserted {} rows", result.rows_affected);
+//! println!("Copied {} rows", result.rows_affected);
 //! ```
 
 use crate::connection::bulk_copy_state::{ATTENTION_TIMEOUT_SECONDS, BulkCopyTimeoutState};
@@ -263,9 +263,9 @@ pub struct BulkCopyResult {
     /// Number of rows serialized to the wire by the client, matching
     /// `Microsoft.Data.SqlClient`'s `SqlBulkCopy.RowsCopied`. This is a
     /// client-side count, not a guarantee of the number of rows inserted on
-    /// the server (server-side triggers, for example, can change the row
-    /// count), and it is unaffected by distributed engines that acknowledge
-    /// one load with multiple DONE_COUNT tokens (issue #209).
+    /// the server: server-side triggers or an `IGNORE_DUP_KEY` index can make
+    /// the committed row count differ. It is unaffected by distributed engines
+    /// that acknowledge one load with multiple DONE_COUNT tokens (issue #209).
     pub rows_affected: u64,
     /// Time taken for the operation
     pub elapsed: Duration,
@@ -310,7 +310,7 @@ impl BulkCopyResult {
 ///
 /// let rows = vec![/* your data */];
 /// let result = bulk_copy.write_to_server(rows.into_iter()).await?;
-/// println!("Inserted {} rows in {:?}", result.rows_affected, result.elapsed);
+/// println!("Copied {} rows in {:?}", result.rows_affected, result.elapsed);
 /// ```
 pub struct BulkCopy<'a> {
     /// Reference to the TDS client connection

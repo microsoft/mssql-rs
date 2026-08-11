@@ -1031,22 +1031,20 @@ impl TdsClient {
         // STEP 4: End streaming (write DONE token and finalize)
         let rows_written = writer.end().await?;
 
-        // STEP 5: Consume the server response for error handling, INFO capture,
-        // and to drain the connection to an idle state. The count reported to
-        // callers is the client-side `rows_written` (the number of rows this
-        // client serialized to the wire), matching SqlClient's
-        // `SqlBulkCopy.RowsCopied` semantics. We deliberately do NOT use the
-        // server's DONE token row count: distributed engines (e.g. Fabric
-        // Warehouse, EngineEdition 11) acknowledge one bulk load with multiple
-        // DONE_COUNT tokens, each carrying the full count, which inflated the
-        // reported total (issue #209).
+        // STEP 5: Drain the server response for error handling and INFO capture.
+        // Its returned count is informational only; callers receive the client-side
+        // `rows_written` (see the `# Returns` doc and `consume_done_token`).
         self.consume_done_token().await?;
 
         Ok(rows_written)
     }
 
     /// Consumes response tokens until a DONE token is received.
-    /// Returns the row count from the DONE token.
+    ///
+    /// Returns the last counted DONE row count. This value is currently
+    /// informational: both call sites discard it, and the bulk-load path reports
+    /// the client-side rows written instead (issue #209). It is retained for
+    /// error/INFO draining and as defensive last-DONE_COUNT-wins hardening.
     ///
     /// This helper method implements the standard TDS response consumption pattern,
     /// handling INFO, ERROR, and DONE tokens appropriately.
@@ -1078,14 +1076,9 @@ impl TdsClient {
                         ));
                     }
 
-                    // The bulk-load response reports its authoritative row count in
-                    // the DONE token(s) carrying the DONE_COUNT flag. A single INSERT
-                    // BULK yields one such count, but distributed engines (e.g. Fabric
-                    // Warehouse, EngineEdition 11) acknowledge the same load with more
-                    // than one DONE_COUNT token, each carrying the full count. Summing
-                    // them double-counts (issue #209). Take the last counted DONE, which
-                    // matches the authoritative "last DONE_COUNT wins" semantics used
-                    // for SQLRowCount elsewhere and is correct on every engine.
+                    // Distributed engines send multiple DONE_COUNT tokens each
+                    // carrying the full count; summing them double-counts (#209).
+                    // Last counted DONE wins.
                     if done.has_count() {
                         rows_affected = done.row_count;
                     }
@@ -1137,7 +1130,8 @@ impl TdsClient {
     /// Sends a SQL batch and consumes the response without expecting column metadata.
     /// This is used for commands that don't return result sets (DML statements, etc.).
     ///
-    /// Returns the row count from the DONE token.
+    /// Returns the DONE token row count. Its only caller (the INSERT BULK preamble)
+    /// discards it; see `consume_done_token` for why the count is informational.
     async fn send_batch_and_consume_response(
         &mut self,
         sql_command: String,
@@ -4772,10 +4766,16 @@ mod tests {
 
     #[tokio::test]
     async fn consume_done_token_ignores_uncounted_dones() {
-        // DONE tokens without the COUNT flag carry a meaningless row_count and must
-        // not contribute to the total. Only the final DONE_COUNT value is reported.
+        // A DONE without the COUNT flag carries a meaningless row_count that must
+        // not contribute to the total. This uncounted token deliberately carries a
+        // non-zero row_count (7) so the pre-fix summing behavior would report 3007;
+        // reporting 3000 proves the has_count() guard, not an incidental zero.
         let mut client = create_test_client_with_tokens(vec![
-            done_more(),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Insert,
+                row_count: 7,
+            }),
             done_count(CurrentCommand::Insert, 3000, false),
         ]);
 

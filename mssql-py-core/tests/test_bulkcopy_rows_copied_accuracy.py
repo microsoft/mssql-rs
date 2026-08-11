@@ -3,13 +3,13 @@
 
 """Regression tests for bulkcopy row-count accuracy (issue #209).
 
-`rows_copied` must equal the number of rows actually inserted, and
-`batch_count` must equal the number of batches actually sent, on every engine.
-Distributed engines (Fabric Warehouse) acknowledge one load with multiple
-DONE_COUNT tokens; the core must not sum them into a doubled count.
+`rows_copied` must equal the client-side count of rows serialized to the wire,
+and `batch_count` must equal the number of batches derived from that count and
+the batch size, on every engine. Distributed engines (Fabric Warehouse)
+acknowledge one load with multiple DONE_COUNT tokens; the core must not sum them
+into a doubled count.
 """
 import pytest
-import mssql_py_core
 
 
 @pytest.mark.integration
@@ -23,10 +23,9 @@ import mssql_py_core
     ],
 )
 def test_bulkcopy_rows_copied_matches_actual(
-    client_context, row_count, batch_size, expected_batches
+    connection, row_count, batch_size, expected_batches
 ):
-    conn = mssql_py_core.PyCoreConnection(client_context)
-    cursor = conn.cursor()
+    cursor = connection.cursor()
 
     table_name = "#BulkCopyRowsCopiedAccuracy"
     cursor.execute(f"CREATE TABLE {table_name} (id BIGINT)")
@@ -44,15 +43,12 @@ def test_bulkcopy_rows_copied_matches_actual(
     assert result["rows_copied"] == actual
     assert result["batch_count"] == expected_batches
 
-    conn.close()
-
 
 @pytest.mark.integration
-def test_bulkcopy_arrow_rows_copied_matches_actual(client_context):
+def test_bulkcopy_arrow_rows_copied_matches_actual(connection):
     pa = pytest.importorskip("pyarrow")
 
-    conn = mssql_py_core.PyCoreConnection(client_context)
-    cursor = conn.cursor()
+    cursor = connection.cursor()
 
     table_name = "#BulkCopyArrowRowsCopiedAccuracy"
     cursor.execute(f"CREATE TABLE {table_name} (id BIGINT)")
@@ -70,5 +66,3 @@ def test_bulkcopy_arrow_rows_copied_matches_actual(client_context):
     assert actual == row_count
     assert result["rows_copied"] == actual
     assert result["batch_count"] == 5
-
-    conn.close()
