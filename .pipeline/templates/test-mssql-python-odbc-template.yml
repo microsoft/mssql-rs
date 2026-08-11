@@ -195,8 +195,9 @@ steps:
 - script: |
     set -euo pipefail
     docker exec mssql-python-odbc-tests bash -c '
+      set -euo pipefail
       export DEBIAN_FRONTEND=noninteractive
-      apt-get remove --purge -y unixodbc-dev >/dev/null
+      apt-get remove --purge -y unixodbc-dev
       rm -f /lib/x86_64-linux-gnu/libodbcinst.so.2 /usr/lib/x86_64-linux-gnu/libodbcinst.so.2
       echo "Removed unixODBC development headers and system libodbcinst.so.2"
     '
