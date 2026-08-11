@@ -263,6 +263,22 @@ pub(crate) trait TdsTokenStreamReader {
     ) -> bool {
         false
     }
+
+    /// Attempts to read the next row *header* using only bytes already buffered
+    /// by the transport, with no `await` and none of the per-call cancellation,
+    /// timeout, or boxed-future machinery the async path pays for.
+    ///
+    /// For a ROW token this reads a single byte, which is almost always already
+    /// buffered, so the async path was paying a boxed future and a cancellation
+    /// composition to hand over one byte from L1 cache.
+    ///
+    /// Returns `Some(RowHeader::Positioned(..))` when the cursor was positioned
+    /// on a row. Returns `None` without consuming anything — leaving the stream
+    /// byte-for-byte as it was — for any other token or when the bytes are not
+    /// buffered, so the caller falls back to [`Self::receive_row_header`].
+    fn try_receive_row_header_buffered(&mut self, _context: &ParserContext) -> Option<RowHeader> {
+        None
+    }
 }
 
 #[async_trait]
@@ -315,6 +331,10 @@ pub trait TdsTokenStreamReader {
         _writer: &mut (dyn RowWriter + Send),
     ) -> bool {
         false
+    }
+
+    fn try_receive_row_header_buffered(&mut self, _context: &ParserContext) -> Option<RowHeader> {
+        None
     }
 }
 
@@ -384,7 +404,7 @@ impl ParserContext {
     }
 }
 
-fn extract_row_context(context: &ParserContext) -> TdsResult<RowDecodeContext<'_>> {
+pub(crate) fn extract_row_context(context: &ParserContext) -> TdsResult<RowDecodeContext<'_>> {
     match context {
         ParserContext::ColumnMetadata(metadata, decryptor) => Ok((metadata, decryptor.as_ref())),
         _ => Err(crate::error::Error::ProtocolError(

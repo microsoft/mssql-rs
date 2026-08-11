@@ -21,20 +21,22 @@ use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter
 use crate::io::slice_reader::SliceReader;
 use crate::io::token_stream::{
     ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
-    TdsTokenStreamReader, read_active_plp_bytes_internal, receive_row_header_internal,
-    receive_row_into_internal, receive_token_internal, resume_row_into_internal,
+    TdsTokenStreamReader, extract_row_context, read_active_plp_bytes_internal,
+    receive_row_header_internal, receive_row_into_internal, receive_token_internal,
+    resume_row_into_internal,
 };
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
 use crate::message::messages::{Request, ResetConnectionMode};
 use crate::query::metadata::ColumnMetadata;
-use crate::token::tokens::{DoneStatus, Tokens};
+use crate::token::tokens::{DoneStatus, TokenType, Tokens};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use std::cmp::min;
 use std::io::Error;
 use std::io::ErrorKind::{self, UnexpectedEof};
 use std::net::ToSocketAddrs;
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -1582,6 +1584,39 @@ impl TdsTokenStreamReader for NetworkTransport {
             }
             None => false,
         }
+    }
+
+    fn try_receive_row_header_buffered(&mut self, context: &ParserContext) -> Option<RowHeader> {
+        let available = self.tds_read_buffer.get_remaining_byte_count();
+        if available == 0 {
+            return None;
+        }
+
+        let (metadata, decryptor) = extract_row_context(context).ok()?;
+        let token_type: TokenType = self.tds_read_buffer.get_slice()[0].try_into().ok()?;
+
+        // Only row tokens are served here. DONE and friends carry variable
+        // payloads and feed `handle_row_read_token`, so they go the async route.
+        let (consumed, nbc_null_bitmap) = match token_type {
+            TokenType::Row => (1, None),
+            TokenType::NbcRow => {
+                let bitmap_len = metadata.columns.len().div_ceil(8);
+                if available < 1 + bitmap_len {
+                    return None;
+                }
+                let bitmap = self.tds_read_buffer.get_slice()[1..1 + bitmap_len].to_vec();
+                (1 + bitmap_len, Some(bitmap))
+            }
+            _ => return None,
+        };
+
+        self.tds_read_buffer.consume_bytes(consumed);
+        Some(RowHeader::Positioned(RowPauseState {
+            next_column_index: 0,
+            metadata: Arc::clone(metadata),
+            nbc_null_bitmap,
+            decryptor: decryptor.cloned(),
+        }))
     }
 }
 

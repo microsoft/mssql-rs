@@ -3044,6 +3044,20 @@ impl TdsClient {
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
         let decryptor = self.resolve_cell_decryptor(&metadata).await?;
         let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
+
+        // Fast path: a ROW token is a single byte, and after the first packet
+        // refill it is essentially always already buffered. Reading it here
+        // skips the boxed `receive_row_header` future and the per-call
+        // cancellation/timeout composition. Anything else — a short buffer or a
+        // non-row token such as DONE — falls through with the stream untouched.
+        if let Some(RowHeader::Positioned(pause_state)) = self
+            .transport
+            .try_receive_row_header_buffered(&parser_context)
+        {
+            self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+            return Ok(true);
+        }
+
         loop {
             let start = Instant::now();
             let header = self

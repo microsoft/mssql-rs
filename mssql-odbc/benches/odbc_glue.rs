@@ -289,7 +289,12 @@ fn connect() -> Option<Handles> {
 /// Drains every row the way `perf_fixture::DrainRows` does: unbound `SQLFetch`,
 /// then one `SQLGetData` as `SQL_C_CHAR` per column. Returns the row count so a
 /// miscounted loop cannot silently pass.
-fn drain(stmt: *mut c_void, query: &[u16], buf: &mut [u8]) -> u64 {
+///
+/// `get_data == false` walks the same rows without materializing any column,
+/// which is what `SQLFetch` alone costs. Both variants drain the full rowset,
+/// so they differ only in column materialization — no confound from the cursor
+/// being closed with rows still on the wire.
+fn drain(stmt: *mut c_void, query: &[u16], buf: &mut [u8], get_data: bool) -> u64 {
     let mut rows = 0u64;
     unsafe {
         let rc = SQLExecDirectW(stmt, query.as_ptr(), SQL_NTS);
@@ -302,16 +307,18 @@ fn drain(stmt: *mut c_void, query: &[u16], buf: &mut [u8]) -> u64 {
             }
             assert!(ok(rc), "SQLFetch failed: {rc}");
 
-            let mut indicator: isize = 0;
-            let rc = SQLGetData(
-                stmt,
-                1,
-                SQL_C_CHAR,
-                buf.as_mut_ptr() as *mut c_void,
-                buf.len() as isize,
-                &mut indicator,
-            );
-            assert!(ok(rc), "SQLGetData failed: {rc}");
+            if get_data {
+                let mut indicator: isize = 0;
+                let rc = SQLGetData(
+                    stmt,
+                    1,
+                    SQL_C_CHAR,
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len() as isize,
+                    &mut indicator,
+                );
+                assert!(ok(rc), "SQLGetData failed: {rc}");
+            }
             rows += 1;
         }
 
@@ -333,7 +340,7 @@ fn odbc_glue(c: &mut Criterion<CpuTime>) {
     let mut buf = vec![0u8; 8192];
 
     // Fail loudly here rather than benchmarking an empty loop.
-    let rows = drain(handles.stmt, &query, &mut buf);
+    let rows = drain(handles.stmt, &query, &mut buf, true);
     assert_eq!(rows, ROWS, "expected {ROWS} rows, drained {rows}");
 
     let mut group = c.benchmark_group("odbc_glue");
@@ -344,8 +351,11 @@ fn odbc_glue(c: &mut Criterion<CpuTime>) {
             .and_then(|v| v.parse().ok())
             .unwrap_or(30),
     );
+    group.bench_function("fetch_only", |b| {
+        b.iter(|| drain(handles.stmt, &query, &mut buf, false));
+    });
     group.bench_function("fetch_getdata_int", |b| {
-        b.iter(|| drain(handles.stmt, &query, &mut buf));
+        b.iter(|| drain(handles.stmt, &query, &mut buf, true));
     });
     group.finish();
 }
