@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::core::TdsResult;
 use crate::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
@@ -10,7 +9,6 @@ use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sql_json::SqlJson;
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sql_vector::SqlVector;
-use crate::token::tokens::SqlCollation;
 use uuid::Uuid;
 
 /// Pluggable decode sink for TDS row data.
@@ -19,40 +17,6 @@ use uuid::Uuid;
 /// enabling consumers (Arrow writers, N-API binary encoders, etc.) to
 /// receive values without going through the intermediate `ColumnValues` enum.
 pub trait RowWriter {
-    /// Returns `true` to pause row decoding after reading column `col`.
-    ///
-    /// Writers that need incremental column fetch behavior (for example,
-    /// ODBC-oriented row writers) should override this method and return `true`
-    /// at the appropriate column boundaries.
-    fn pause_after_column(&self, _col: usize) -> bool {
-        false
-    }
-
-    /// Reads bytes from the currently active PLP stream owned by this writer.
-    ///
-    /// Writers that support incremental PLP reads (for example an ODBC-facing
-    /// writer serving `SQLGetData`) should override this and return the number
-    /// of bytes copied into `out`. The default hooks are forward-looking API
-    /// surface for incremental consumers and are not yet wired through a
-    /// concrete product writer in this crate.
-    fn read_active_plp_bytes(&mut self, _out: &mut [u8]) -> TdsResult<usize> {
-        Ok(0)
-    }
-
-    /// Returns `true` when the current active PLP stream has reached EOF.
-    ///
-    /// Writers that do not expose incremental PLP reads can keep the default.
-    fn active_plp_reached_end(&self) -> bool {
-        true
-    }
-
-    /// Returns the collation for the current active PLP stream, if any.
-    ///
-    /// For binary PLP values, this remains `None`.
-    fn active_plp_collation(&self) -> Option<SqlCollation> {
-        None
-    }
-
     /// Writes a SQL `NULL` for column `col`.
     fn write_null(&mut self, col: usize);
     /// Writes a `bit` value.
@@ -227,13 +191,16 @@ impl RowWriter for DefaultRowWriter {
     }
 }
 
-/// Row sink that discards every decoded value. Used by the drain-on-error path,
-/// which decodes trailing rows only to advance the wire position and never reads
-/// them back, so it avoids `DefaultRowWriter`'s per-row `Vec<ColumnValues>`
-/// allocation and keeps no decoded values alive.
-pub(crate) struct DrainRowWriter;
+/// A `RowWriter` that discards every value it receives.
+///
+/// Used by the decode driver's *skip* path (drain-to-end and skip-to-column):
+/// the wire bytes still have to be consumed so the stream stays aligned, but no
+/// `ColumnValues`, `String`, or `Vec` is retained. Fixed-width types allocate
+/// nothing at all; the transient value a variable-length decoder builds is
+/// dropped immediately instead of being pushed onto a row `Vec`.
+pub struct DiscardRowWriter;
 
-impl RowWriter for DrainRowWriter {
+impl RowWriter for DiscardRowWriter {
     fn write_null(&mut self, _col: usize) {}
     fn write_bool(&mut self, _col: usize, _val: bool) {}
     fn write_u8(&mut self, _col: usize, _val: u8) {}

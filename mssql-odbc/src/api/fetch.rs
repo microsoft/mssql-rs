@@ -13,7 +13,6 @@ use crate::api::odbc_types::{
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
-use mssql_tds::connection::tds_client::ResultSet;
 
 /// Implements SQLFetch for the current forward-only result set.
 ///
@@ -130,10 +129,16 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         }
     }
 
-    let fetch_result = dbc.runtime.block_on(client.next_row());
+    // Position the pull cursor on the next row without decoding any column
+    // (SQLFetch semantics). Any unread remainder of the previous row —
+    // including an in-flight PLP stream — is drained first (see
+    // `drain_active_row` in tds_client), so a failure here may originate from
+    // the prior row rather than the new one. Columns of the new row are pulled
+    // lazily by subsequent SQLGetData calls via `read_row_column`.
+    let fetch_result = dbc.runtime.block_on(client.next_row_cursor());
 
     match fetch_result {
-        Ok(Some(row)) => {
+        Ok(true) => {
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLFetch: stmt mutex poisoned storing row");
                 if let Ok(mut ds) = dbc.inner.lock() {
@@ -144,7 +149,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 }
                 return SQL_ERROR;
             };
-            stmt_state.current_row = Some(row);
+            stmt_state.begin_row(); // clears per-row state and marks positioned
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();
@@ -163,7 +168,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 SQL_SUCCESS
             }
         }
-        Ok(None) => {
+        Ok(false) => {
             // End of current rowset. SQLFetch must return SQL_NO_DATA here per the
             // cursor contract, and SQL_NO_DATA cannot be upgraded to
             // SQL_SUCCESS_WITH_INFO — so this call has no way to signal "there are
@@ -200,7 +205,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 }
                 return SQL_ERROR;
             };
-            stmt_state.current_row = None;
+            stmt_state.reset_row_stream();
             // Don't clear CURSOR_OPEN here: the cursor stays open until
             // SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE).
             drop(stmt_state);
@@ -214,7 +219,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         Err(e) => {
             error!(%e, "SQLFetch: row fetch failed");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.current_row = None;
+                stmt_state.reset_row_stream();
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
                 let info_messages = client.take_info_messages();

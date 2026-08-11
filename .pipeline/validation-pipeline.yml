@@ -36,6 +36,13 @@ parameters:
   type: string
   default: '2025-latest'
 
+variables:
+  # msodbcsql18 reference-driver version for the ODBC C++ e2e parity comparison.
+  # Pinned so an upstream release can't silently change what the parity table
+  # compares against. Consumed on Windows by install-msodbcsql.ps1 and on Linux
+  # by containerized-odbc-e2e.sh (which appends the Debian package revision).
+  msodbcsqlVersion: '18.6.2.1'
+
 stages:
 - template: templates/validation-stages.yml
   parameters:

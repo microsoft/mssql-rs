@@ -34,11 +34,17 @@
 #
 # With --compare-with-msodbcsql, the script reruns the same suite against
 # the Microsoft C++ driver registered in --msodbcsql-ini (default
-# /etc/odbcinst.ini) and prints a parity table. The script exits 0 only
-# if BOTH runs pass.
+# /etc/odbcinst.ini) and prints a parity table. The script exits 0 only if both
+# runs pass AND every test reaches the same verdict in both legs.
 #
-# Both INIs must register the driver under the same section name:
-#   [ODBC Driver 18 for SQL Server]
+# The two drivers register under distinct names, so they can be installed side
+# by side:
+#   Rust:      [ODBC Driver 18 for SQL Server (Rust)]
+#   reference: [ODBC Driver 18 for SQL Server]
+# Each leg selects its driver via ODBC_TEST_DRIVER, so the same test binaries
+# run unchanged against both. Setting ODBC_TEST_CONNSTR overrides the whole
+# connection string and would pin both legs to one driver; the script rejects
+# that in comparison mode.
 #
 # Rust driver logs are controlled by MSSQL_TDS_TRACE and
 # MSSQL_TDS_TRACE_LEVEL.
@@ -53,13 +59,66 @@
 
 set -euo pipefail
 
+# CI only controls how much diagnostic context is printed on failure; every
+# failure mode below is fatal locally too.
+IS_CI=0
+if [ -n "${TF_BUILD:-}" ] || [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ]; then
+    IS_CI=1
+fi
+
+# Dump the logs that explain a configure/build/test failure. CI has no working
+# copy to inspect afterwards, so the evidence has to be in the build log.
+print_failure_diagnostics() {
+    [ "$IS_CI" -eq 1 ] || return 0
+    local context="$1"
+    echo ""
+    echo "=== CI diagnostics: $context ==="
+    local log
+    for log in "$BUILD_DIR/CMakeFiles/CMakeOutput.log" \
+               "$BUILD_DIR/CMakeFiles/CMakeError.log" \
+               "$BUILD_DIR/Testing/Temporary/LastTest.log"; do
+        if [ -f "$log" ]; then
+            echo ""
+            echo "--- tail of $log ---"
+            tail -n 100 "$log"
+        fi
+    done
+    echo ""
+    echo "--- test executables in $BUILD_DIR ---"
+    # `find` exits 0 even when it matches nothing, so `find || echo` never prints
+    # the fallback. Capture the output and test it explicitly instead.
+    local exes
+    exes="$(find "$BUILD_DIR" -type f -name '*_test' 2>/dev/null)"
+    if [ -n "$exes" ]; then echo "$exes"; else echo "(none found)"; fi
+}
+
+# A ctest run that executed nothing still exits 0 and prints "No tests were
+# found!!!" — historically that turned a broken CMake configure into a green
+# build. Treat an empty JUnit as a hard failure.
+assert_tests_executed() {
+    local junit="$1" label="$2" count=0
+    if [ -f "$junit" ]; then
+        # -o counts occurrences rather than matching lines, so a JUnit file that
+        # puts several <testcase> elements on one line is still counted correctly.
+        count=$(grep -o '<testcase' "$junit" 2>/dev/null | wc -l) || count=0
+    fi
+    if [ "$count" -eq 0 ]; then
+        print_failure_diagnostics "no tests executed for '$label'"
+        echo "Error: no tests were executed for '$label'." >&2
+        echo "  The CMake project produced no ctest entries, or ctest failed to run them." >&2
+        exit 1
+    fi
+    echo "$label leg executed $count test(s)."
+}
+
 # ----------------------------------------------------------------------------
 # Globals
 # ----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ODBC_CRATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
-DRIVER_SECTION="ODBC Driver 18 for SQL Server"
+MSODBCSQL_DRIVER_SECTION="ODBC Driver 18 for SQL Server"
+RUST_DRIVER_SECTION="ODBC Driver 18 for SQL Server (Rust)"
 
 BUILD_TYPE="debug"
 VERBOSE=0
@@ -221,31 +280,46 @@ build_rust_driver() {
 }
 
 # ----------------------------------------------------------------------------
-# Step 3: Register the Rust driver in a temporary odbcinst.ini
+# Step 3: Register the Rust driver in a temporary odbcinst.ini under its own
+# section name, so it never collides with an installed msodbcsql18.
 # ----------------------------------------------------------------------------
 register_rust_driver() {
     RUST_INI_DIR="$(mktemp -d)"
     cat > "$RUST_INI_DIR/odbcinst.ini" <<EOF
-[$DRIVER_SECTION]
+[$RUST_DRIVER_SECTION]
 Description=Microsoft ODBC Driver 18 for SQL Server (Rust)
 Driver=$RUST_DRIVER_PATH
 UsageCount=1
 EOF
     echo "Rust driver registered at: $RUST_INI_DIR/odbcinst.ini"
+    echo "Rust driver name: $RUST_DRIVER_SECTION"
 }
 
 # ----------------------------------------------------------------------------
-# Step 4: Validate the msodbcsql odbcinst.ini for the comparison run
+# Step 4: Validate comparison-mode preconditions
 # ----------------------------------------------------------------------------
-validate_msodbcsql_ini() {
+validate_compare_preconditions() {
+    # A full connection-string override ignores ODBC_TEST_DRIVER, which would
+    # silently run both legs against whichever driver it names.
+    if [ -n "${ODBC_TEST_CONNSTR:-}" ]; then
+        echo "Error: ODBC_TEST_CONNSTR is set; it overrides the driver name and would" >&2
+        echo "  pin both comparison legs to the same driver. Unset it to compare." >&2
+        exit 1
+    fi
+    # A DSN pins the connection to one driver just like a full connection string,
+    # so both legs would resolve to the same driver.
+    if [ -n "${ODBC_TEST_DSN:-}" ]; then
+        echo "Error: ODBC_TEST_DSN is set; a DSN pins the connection to one driver, so" >&2
+        echo "  both comparison legs would use the same driver. Unset it to compare." >&2
+        exit 1
+    fi
     if [ ! -f "$MSODBCSQL_INI" ]; then
         echo "Error: msodbcsql odbcinst.ini not found: $MSODBCSQL_INI" >&2
         echo "  Pass --msodbcsql-ini=PATH or install the C++ driver." >&2
         exit 1
     fi
-    if ! grep -qE "^\[$DRIVER_SECTION\]" "$MSODBCSQL_INI"; then
-        echo "Error: $MSODBCSQL_INI does not contain a [$DRIVER_SECTION] section." >&2
-        echo "  Both INIs must register the driver under the same name." >&2
+    if ! grep -qE "^\[$MSODBCSQL_DRIVER_SECTION\]" "$MSODBCSQL_INI"; then
+        echo "Error: $MSODBCSQL_INI does not contain a [$MSODBCSQL_DRIVER_SECTION] section." >&2
         exit 1
     fi
     # Resolve to absolute path so subprocesses see the same file regardless of cwd.
@@ -324,13 +398,15 @@ configure_and_build_tests() {
 #   $1 = label (printed in headers)
 #   $2 = ODBCSYSINI directory
 #   $3 = absolute path to JUnit XML output
+#   $4 = odbcinst.ini section name the tests should connect through
 # Returns ctest's exit code (does not abort the script).
 # ----------------------------------------------------------------------------
 run_tests() {
-    local label="$1" ini_dir="$2" junit_out="$3"
+    local label="$1" ini_dir="$2" junit_out="$3" driver_name="$4"
     echo ""
     echo "=== Running e2e tests against $label ==="
     echo "ODBCSYSINI=$ini_dir"
+    echo "ODBC_TEST_DRIVER=$driver_name"
 
     local rc=0
     (
@@ -338,7 +414,9 @@ run_tests() {
         # ODBC_TEST_TARGET tells tests which driver implementation this leg runs
         # against ("mssql-odbc" or "msodbcsql") so mssql-odbc-specific tests can
         # SKIP_IF_COMPARING_MSODBCSQL() on the reference-driver leg.
-        ODBC_TEST_TARGET="$label" ODBCSYSINI="$ini_dir" ctest "${CTEST_ARGS[@]}" --output-junit "$junit_out"
+        # ODBC_TEST_DRIVER selects the driver by name in the connection string.
+        ODBC_TEST_TARGET="$label" ODBC_TEST_DRIVER="$driver_name" \
+            ODBCSYSINI="$ini_dir" ctest "${CTEST_ARGS[@]}" --output-junit "$junit_out"
     ) || rc=$?
     return $rc
 }
@@ -347,53 +425,11 @@ run_tests() {
 # Step 8: Parse two JUnit XMLs and print a parity table.
 #   $1 = mssql-odbc JUnit XML
 #   $2 = msodbcsql  JUnit XML
-# Always returns 0 — exit code is decided by the caller.
+# Returns non-zero when any test reached a different verdict in the two legs.
 # ----------------------------------------------------------------------------
 print_parity_report() {
     local rust_xml="$1" ms_xml="$2"
-    python3 - "$rust_xml" "$ms_xml" <<'PY'
-import sys, xml.etree.ElementTree as ET
-
-def load(path):
-    """Returns {test_name: 'PASS'|'FAIL'|'MISSING'}."""
-    out = {}
-    try:
-        root = ET.parse(path).getroot()
-    except (ET.ParseError, FileNotFoundError):
-        return out
-    # ctest --output-junit emits <testsuite><testcase name="..."> ...
-    for tc in root.iter("testcase"):
-        name = tc.get("name") or "<unnamed>"
-        failed = any(child.tag in ("failure", "error") for child in tc)
-        out[name] = "FAIL" if failed else "PASS"
-    return out
-
-rust = load(sys.argv[1])
-ms   = load(sys.argv[2])
-names = sorted(set(rust) | set(ms))
-
-def verdict(r, m):
-    if r == "PASS" and m == "PASS": return ("parity",          "ok")
-    if r == "FAIL" and m == "PASS": return ("FIX mssql-odbc",  "bug")
-    if r == "PASS" and m == "FAIL": return ("mssql-odbc bug, but test hides it (msodbcsql fails)", "warn")
-    if r == "FAIL" and m == "FAIL": return ("test bug (both fail)",       "warn")
-    return ("missing run", "warn")
-
-w = max((len(n) for n in names), default=4)
-print()
-print("=== Parity report (mssql-odbc vs msodbcsql) ===")
-print(f"{'Test'.ljust(w)}  {'mssql-odbc':<10}  {'msodbcsql':<10}  Verdict")
-print(f"{'-'*w}  {'-'*10}  {'-'*10}  {'-'*30}")
-counts = {"ok":0, "bug":0, "warn":0}
-for n in names:
-    r = rust.get(n, "MISSING")
-    m = ms.get(n, "MISSING")
-    v, kind = verdict(r, m)
-    counts[kind] += 1
-    print(f"{n.ljust(w)}  {r:<10}  {m:<10}  {v}")
-print()
-print(f"Summary: {counts['ok']} parity, {counts['bug']} mssql-odbc bug(s), {counts['warn']} test issue(s)")
-PY
+    python3 "$SCRIPT_DIR/parity_report.py" "$rust_xml" "$ms_xml"
 }
 
 # ----------------------------------------------------------------------------
@@ -453,7 +489,7 @@ main() {
     build_rust_driver
     register_rust_driver
     if [ "$COMPARE" -eq 1 ]; then
-        validate_msodbcsql_ini
+        validate_compare_preconditions
     fi
     configure_and_build_tests
 
@@ -461,7 +497,8 @@ main() {
     local ms_junit="$BUILD_DIR/junit-msodbcsql.xml"
     local rust_rc=0 ms_rc=0
 
-    run_tests "mssql-odbc" "$RUST_INI_DIR" "$rust_junit" || rust_rc=$?
+    run_tests "mssql-odbc" "$RUST_INI_DIR" "$rust_junit" "$RUST_DRIVER_SECTION" || rust_rc=$?
+    assert_tests_executed "$rust_junit" "mssql-odbc"
 
     # Report on the instrumented mssql-odbc leg before the (uninstrumented)
     # msodbcsql reference leg runs, so the profraw reflects our driver only.
@@ -471,6 +508,7 @@ main() {
 
     if [ "$COMPARE" -eq 0 ]; then
         if [ "$rust_rc" -ne 0 ]; then
+            print_failure_diagnostics "e2e tests failed"
             echo "=== e2e tests FAILED (mssql-odbc) ==="
             exit "$rust_rc"
         fi
@@ -482,15 +520,18 @@ main() {
     # Comparison mode: also run against the C++ driver, then print the table.
     local ms_ini_dir
     ms_ini_dir="$(dirname "$MSODBCSQL_INI")"
-    run_tests "msodbcsql"  "$ms_ini_dir"  "$ms_junit" || ms_rc=$?
+    run_tests "msodbcsql"  "$ms_ini_dir"  "$ms_junit" "$MSODBCSQL_DRIVER_SECTION" || ms_rc=$?
+    assert_tests_executed "$ms_junit" "msodbcsql"
 
-    print_parity_report "$rust_junit" "$ms_junit"
+    local parity_rc=0
+    print_parity_report "$rust_junit" "$ms_junit" || parity_rc=$?
 
-    if [ "$rust_rc" -eq 0 ] && [ "$ms_rc" -eq 0 ]; then
-        echo "=== Both runs passed ==="
+    if [ "$rust_rc" -eq 0 ] && [ "$ms_rc" -eq 0 ] && [ "$parity_rc" -eq 0 ]; then
+        echo "=== Both runs passed with full parity ==="
         exit 0
     fi
-    echo "=== Parity check FAILED (mssql-odbc rc=$rust_rc, msodbcsql rc=$ms_rc) ==="
+    print_failure_diagnostics "parity check failed"
+    echo "=== Parity check FAILED (mssql-odbc rc=$rust_rc, msodbcsql rc=$ms_rc, parity rc=$parity_rc) ==="
     exit 1
 }
 

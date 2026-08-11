@@ -194,6 +194,19 @@ steps:
 # mssql-tds). The report is unioned into the Merge Coverage stage so lines
 # reachable only via the ODBC surface count toward PR diff coverage.
 - ${{ if and(eq(parameters.osType, 'Windows'), eq(parameters.enableOdbcE2E, true)) }}:
+  # Reference driver for the parity comparison below, installed by
+  # install-msodbcsql.ps1. Pinned to the msodbcsqlVersion pipeline variable so a
+  # new upstream release can't silently change what the parity table compares
+  # against. It installs as "ODBC Driver 18 for SQL Server"; the Rust driver
+  # registers separately as "... (Rust)", so the two coexist.
+  - task: PowerShell@2
+    displayName: Install msodbcsql $(msodbcsqlVersion) (parity reference driver)
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    inputs:
+      pwsh: true
+      filePath: $(Build.SourcesDirectory)/.pipeline/scripts/install-msodbcsql.ps1
+      arguments: -Version '$(msodbcsqlVersion)'
+
   - pwsh: |
       $env:ODBC_TEST_SERVER   = 'localhost'
       $env:ODBC_TEST_UID      = 'sa'
@@ -201,9 +214,12 @@ steps:
       $env:ODBC_TEST_TRUST_CERT = 'Yes'
       # Explicit -CoverageOutput under $(Build.SourcesDirectory)/target keeps the
       # publish path deterministic regardless of the job's CARGO_TARGET_DIR.
+      # -CompareWithMsodbcsql reruns the suite against the driver installed
+      # above; the script fails on any parity divergence.
       ./mssql-odbc/tests/e2e/run_e2e.ps1 -Retries 3 -Coverage `
+        -CompareWithMsodbcsql `
         -CoverageOutput "$(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml"
-    displayName: Run ODBC C++ e2e tests (Windows) with coverage
+    displayName: Run ODBC C++ e2e tests (Windows) with coverage and msodbcsql parity comparison
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
@@ -216,6 +232,17 @@ steps:
       testResultsFormat: "JUnit"
       testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
       testRunTitle: $(System.PhaseName)-OdbcE2E
+
+  # Reference-driver leg. Published so a parity divergence can be triaged from
+  # the test tab rather than by reading the build log.
+  - task: PublishTestResults@2
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: "Publish ODBC e2e test results (Windows, msodbcsql reference)"
+    continueOnError: true
+    inputs:
+      testResultsFormat: "JUnit"
+      testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-msodbcsql.xml
+      testRunTitle: $(System.PhaseName)-OdbcE2E-msodbcsql
 
   # Best-effort (continueOnError) so a coverage hiccup never fails the build; the
   # Merge Coverage stage skips it if absent.
