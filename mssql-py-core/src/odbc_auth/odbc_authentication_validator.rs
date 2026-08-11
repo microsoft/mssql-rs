@@ -244,8 +244,8 @@ mod tests {
     // ---------------------------------------------------------------
 
     /// Durable, Python-free guard for the class of drift in #223: pins the exact
-    /// clash message across every Authentication mode (incl. the AD modes whose
-    /// Python e2e coverage was removed because mssql-python strips
+    /// clash message across all nine recognized Authentication modes (incl. the
+    /// AD modes whose Python e2e coverage was removed because mssql-python strips
     /// Trusted_Connection). Empty UID/PWD with SqlPassword also proves the TC
     /// clash is reported before the "Both User and Password" rule, covering
     /// ordering in `validate_auth`.
@@ -259,6 +259,8 @@ mod tests {
             "ActiveDirectoryDefault",
             "ActiveDirectoryMSI",
             "ActiveDirectoryServicePrincipal",
+            "ActiveDirectoryDeviceCodeFlow",
+            "ActiveDirectoryWorkloadIdentity",
         ] {
             let err = validate_auth(Some(auth), Some(true), "", "", None).unwrap_err();
             assert_eq!(
