@@ -106,10 +106,10 @@ fi
 echo "Replaced ${#SWAPPED_TARGETS[@]} bundled driver binaries with mssql-odbc"
 
 # Surface unresolved shared-library dependencies here rather than as an opaque
-# import failure inside the first test. Every swapped copy is byte-identical and
-# most sit in arch/libc slots this build could never be loaded from, so probe
-# only the copy under the importable package - the one the resolver dlopens -
-# and fall back to any swapped copy if the package dir could not be resolved.
+# import failure inside the first test. Every swapped copy is byte-identical, so
+# one probe is all the diagnostic value there is: prefer a copy under the
+# importable package - the one the resolver dlopens - and fall back to any
+# swapped copy if that directory could not be resolved.
 probed=0
 for target in "${SWAPPED_TARGETS[@]}"; do
     case "$target" in
@@ -117,6 +117,7 @@ for target in "${SWAPPED_TARGETS[@]}"; do
             echo "ldd $target"
             ldd "$target" || true
             probed=1
+            break
             ;;
     esac
 done

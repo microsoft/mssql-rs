@@ -12,9 +12,11 @@
 # system driver before testing.
 #
 # The Rust driver is incomplete, so failures and hard crashes are expected. The
-# test step is continueOnError and every test file runs in its own bounded
-# pytest process (run-mssql-python-odbc-tests.sh), so the job reports results
-# instead of stalling or losing the whole run to one segfault.
+# test step inspects the runner's exit code directly - test failures surface as
+# SucceededWithIssues (yellow) while a broken harness is a real error - and every
+# test file runs in its own bounded pytest process
+# (run-mssql-python-odbc-tests.sh), so the job reports results instead of
+# stalling or losing the whole run to one segfault.
 
 parameters:
   # SQL Server container image used as the test target.
