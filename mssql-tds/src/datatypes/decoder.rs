@@ -225,6 +225,16 @@ impl PlpChunkStreamReader {
         self.total_read
     }
 
+    /// Declared total length of the whole PLP value in wire bytes when the
+    /// server sent a known-length PLP header; `None` for unknown-length
+    /// (streamed) PLP where the total is not known up front.
+    pub(crate) fn known_len(&self) -> Option<u64> {
+        match self.length {
+            PlpChunkReadLength::Known(n) => Some(n),
+            PlpChunkReadLength::Unknown => None,
+        }
+    }
+
     pub(crate) fn reached_end(&self) -> bool {
         self.reached_end
     }
@@ -428,6 +438,12 @@ impl PlpColumnStream {
     /// Total payload bytes consumed so far across all chunks.
     pub(crate) fn total_read(&self) -> usize {
         self.inner.total_read()
+    }
+
+    /// Declared total length of the whole PLP value in wire bytes, when the
+    /// server sent a known-length PLP header; `None` for unknown-length PLP.
+    pub(crate) fn known_len(&self) -> Option<u64> {
+        self.inner.known_len()
     }
 
     /// `true` after the zero-length terminator chunk has been consumed.
