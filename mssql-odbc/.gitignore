@@ -16,6 +16,7 @@ tests/e2e/_deps/
 tests/perf/build/
 tests/perf/build_*/
 tests/perf/results/
+tests/perf/results-*/
 tests/perf/CMakeCache.txt
 tests/perf/CMakeFiles/
 tests/perf/cmake_install.cmake
