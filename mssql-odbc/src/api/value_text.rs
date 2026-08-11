@@ -163,15 +163,16 @@ impl std::fmt::Write for TextScratch {
 }
 
 /// Allocation-free overlay on [`column_value_to_text`] for the types whose
-/// rendered length is bounded.
+/// rendered length is bounded, plus character columns whose stored bytes are
+/// already valid UTF-8.
 ///
 /// Every other type — and any fixed-width value that somehow overflows the
 /// scratch buffer — falls through to `column_value_to_text`, so the two agree
 /// by construction.
-pub(super) fn column_value_to_text_in<'s>(
-    v: &ColumnValues,
-    scratch: &'s mut TextScratch,
-) -> Option<Cow<'s, str>> {
+pub(super) fn column_value_to_text_in<'a>(
+    v: &'a ColumnValues,
+    scratch: &'a mut TextScratch,
+) -> Option<Cow<'a, str>> {
     scratch.len = 0;
     let rendered = match v {
         ColumnValues::TinyInt(x) => write!(scratch, "{x}"),
@@ -181,6 +182,10 @@ pub(super) fn column_value_to_text_in<'s>(
         ColumnValues::Real(x) => write!(scratch, "{x}"),
         ColumnValues::Float(x) => write!(scratch, "{x}"),
         ColumnValues::Uuid(u) => write!(scratch, "{u}"),
+        ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => write!(scratch, "{d}"),
+        // Borrows the column's bytes outright when the collation's code page
+        // agrees with UTF-8 over this value; otherwise decodes onto the heap.
+        ColumnValues::String(s) => return Some(s.as_utf8_str()),
         ColumnValues::Bit(x) => return Some(Cow::Borrowed(if *x { "1" } else { "0" })),
         ColumnValues::Null => return Some(Cow::Borrowed("")),
         _ => return column_value_to_text(v).map(Cow::Owned),

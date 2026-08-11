@@ -3,6 +3,7 @@
 
 use crate::{query::metadata::ColumnMetadata, token::tokens::SqlCollation};
 use core::fmt;
+use std::borrow::Cow;
 use std::{fmt::Debug, fmt::Display};
 use tracing::warn;
 
@@ -54,14 +55,24 @@ impl SqlString {
 
     /// Decodes the stored bytes into a Rust `String` according to the encoding type.
     pub fn to_utf8_string(&self) -> String {
+        self.as_utf8_str().into_owned()
+    }
+
+    /// Decodes the stored bytes as UTF-8 text, borrowing them when the source
+    /// encoding already agrees with UTF-8 byte-for-byte.
+    ///
+    /// Single-byte collations backed by ASCII-compatible code pages decode
+    /// without copying for ASCII input, which is the common case for `varchar`
+    /// columns. UTF-16 always re-encodes.
+    pub fn as_utf8_str(&self) -> Cow<'_, str> {
         match self.encoding_type {
             // TODO: Investigation needed. When creating a Utf8 strings from the vector, the string is weirdly encoded.
             // UTF16 decode works better.
-            EncodingType::Utf8 => String::from_utf8(self.bytes.clone()).unwrap(),
+            EncodingType::Utf8 => Cow::Borrowed(std::str::from_utf8(&self.bytes).unwrap()),
             EncodingType::Utf16 => {
                 // Use encoding_rs for efficient UTF-16LE decoding without intermediate Vec<u16> allocation
                 let (decoded, _, _) = encoding_rs::UTF_16LE.decode(&self.bytes);
-                decoded.into_owned()
+                decoded
             }
             EncodingType::LcidBased(collation) => {
                 // Extract LCID from the lower 20 bits of collation.info
@@ -91,7 +102,7 @@ impl SqlString {
                     );
                 }
 
-                decoded.into_owned()
+                decoded
             }
             EncodingType::DelayedSet => {
                 // DelayedSet encoding is not defined, so we return the bytes as a UTF-8 string.

@@ -279,7 +279,51 @@ fn write_column_as_text(
     }
 
     let mut scratch = TextScratch::new();
-    let Some(as_text) = column_value_to_text_in(value, &mut scratch) else {
+    // `as_text` may borrow the captured value, so everything that needs the
+    // statement mutably has to happen after this block.
+    let outcome = match column_value_to_text_in(value, &mut scratch) {
+        None => None,
+        Some(as_text) => {
+            // Resume from where a prior truncated read of this column left off.
+            // The offset unit matches the target C type (bytes for CHAR, UTF-16
+            // code units for WCHAR); a single column's chunk loop uses one
+            // target type throughout.
+            let offset = stmt_state
+                .partial_text_offset
+                .filter(|(c, _)| *c == col_index)
+                .map(|(_, o)| o)
+                .unwrap_or(0);
+
+            Some(if target_type == SQL_C_WCHAR {
+                let utf16: Vec<u16> = as_text.encode_utf16().skip(offset).collect();
+                let consumed = buf_elements.saturating_sub(1).min(utf16.len());
+                let truncated = unsafe {
+                    copy_string_out(
+                        &utf16,
+                        target_value_ptr as *mut SqlWChar,
+                        buf_elements,
+                        strlen_or_ind_ptr,
+                    )
+                };
+                (truncated, offset, consumed, utf16.len())
+            } else {
+                let all = as_text.as_bytes();
+                let bytes = &all[offset.min(all.len())..];
+                let consumed = buf_elements.saturating_sub(1).min(bytes.len());
+                let truncated = unsafe {
+                    copy_string_out(
+                        bytes,
+                        target_value_ptr as *mut u8,
+                        buf_elements,
+                        strlen_or_ind_ptr,
+                    )
+                };
+                (truncated, offset, consumed, bytes.len())
+            })
+        }
+    };
+
+    let Some((truncated, offset, consumed, remaining)) = outcome else {
         // Unconvertible *column* type: HYC00 is a soft failure. Leave the value
         // in place (do not consume) so a retry with another C type can work.
         post_sql_error(
@@ -290,41 +334,7 @@ fn write_column_as_text(
         );
         return SQL_ERROR;
     };
-    // `value` borrow ends here — `as_text` borrows only the local scratch.
-
-    // Resume from where a prior truncated read of this column left off. The
-    // offset unit matches the target C type (bytes for CHAR, UTF-16 code units
-    // for WCHAR); a single column's chunk loop uses one target type throughout.
-    let offset = stmt_state
-        .partial_text_offset
-        .filter(|(c, _)| *c == col_index)
-        .map(|(_, o)| o)
-        .unwrap_or(0);
-
-    let (rc, consumed, remaining) = if target_type == SQL_C_WCHAR {
-        let utf16: Vec<u16> = as_text.encode_utf16().skip(offset).collect();
-        let consumed = buf_elements.saturating_sub(1).min(utf16.len());
-        let rc = write_string_result(
-            stmt_state,
-            &utf16,
-            target_value_ptr as *mut SqlWChar,
-            buf_elements,
-            strlen_or_ind_ptr,
-        );
-        (rc, consumed, utf16.len())
-    } else {
-        let all = as_text.as_bytes();
-        let bytes = &all[offset.min(all.len())..];
-        let consumed = buf_elements.saturating_sub(1).min(bytes.len());
-        let rc = write_string_result(
-            stmt_state,
-            bytes,
-            target_value_ptr as *mut u8,
-            buf_elements,
-            strlen_or_ind_ptr,
-        );
-        (rc, consumed, bytes.len())
-    };
+    let rc = finish_string_result(stmt_state, truncated);
 
     if rc == SQL_SUCCESS_WITH_INFO && consumed < remaining {
         // Truncated: remember where to resume and keep the column addressable —
@@ -840,16 +850,32 @@ fn utf16le_chunk_to_utf8(
     out
 }
 
-fn write_string_result<T: Copy + Default>(
-    stmt_state: &mut crate::handles::stmt::StmtState,
+/// Copies `src` into the caller's buffer and reports the untruncated byte
+/// length, returning whether the copy was truncated.
+///
+/// Split from [`write_string_result`] so the copy can run while the source
+/// still borrows the statement, leaving the diagnostic to be posted afterwards.
+///
+/// # Safety
+/// `target_value_ptr` must be valid for `buf_elements` writes of `T`, and
+/// `strlen_or_ind_ptr` must be null or valid for a `SqlLen` write.
+unsafe fn copy_string_out<T: Copy + Default>(
     src: &[T],
     target_value_ptr: *mut T,
     buf_elements: usize,
     strlen_or_ind_ptr: *mut SqlLen,
-) -> SqlReturn {
+) -> bool {
     let byte_len = std::mem::size_of_val(src) as SqlLen;
     unsafe { write_if_some(strlen_or_ind_ptr, byte_len) };
-    let truncated = unsafe { copy_with_nul(target_value_ptr, buf_elements, src) };
+    unsafe { copy_with_nul(target_value_ptr, buf_elements, src) }
+}
+
+/// Turns the outcome of [`copy_string_out`] into a return code, posting the
+/// truncation diagnostic when one is due.
+fn finish_string_result(
+    stmt_state: &mut crate::handles::stmt::StmtState,
+    truncated: bool,
+) -> SqlReturn {
     if truncated {
         post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION);
         SQL_SUCCESS_WITH_INFO
