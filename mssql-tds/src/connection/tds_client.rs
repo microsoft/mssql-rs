@@ -1024,12 +1024,20 @@ impl TdsClient {
         }
 
         // STEP 4: End streaming (write DONE token and finalize)
-        let _rows_written = writer.end().await?;
+        let rows_written = writer.end().await?;
 
-        // STEP 5: Read the final response with row count
-        let rows_affected = self.consume_done_token().await?;
+        // STEP 5: Consume the server response for error handling, INFO capture,
+        // and to drain the connection to an idle state. The count reported to
+        // callers is the client-side `rows_written` (the number of rows this
+        // client serialized to the wire), matching SqlClient's
+        // `SqlBulkCopy.RowsCopied` semantics. We deliberately do NOT use the
+        // server's DONE token row count: distributed engines (e.g. Fabric
+        // Warehouse, EngineEdition 11) acknowledge one bulk load with multiple
+        // DONE_COUNT tokens, each carrying the full count, which inflated the
+        // reported total (issue #209).
+        self.consume_done_token().await?;
 
-        Ok(rows_affected)
+        Ok(rows_written)
     }
 
     /// Consumes response tokens until a DONE token is received.
@@ -4769,6 +4777,76 @@ mod tests {
         let rows_affected = client.consume_done_token().await.unwrap();
 
         assert_eq!(rows_affected, 3000);
+    }
+
+    /// A single-INT-column row used to drive the streaming bulk-load path.
+    struct IntRow(i32);
+
+    #[async_trait]
+    impl BulkLoadRow for IntRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            use crate::datatypes::column_values::ColumnValues;
+            writer
+                .write_column_value(*column_index, &ColumnValues::Int(self.0))
+                .await?;
+            *column_index += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_load_reports_client_rows_not_server_done_count() {
+        // Regression for #209: the count reported to callers must be the number
+        // of rows the client streamed to the wire — matching
+        // `SqlBulkCopy.RowsCopied` and ODBC bcp (`llRowsCopiedInLastBCP`), both
+        // of which count outgoing rows client-side — and must never be derived
+        // from the server's DONE_COUNT. Distributed engines (Fabric Warehouse,
+        // EngineEdition 11) acknowledge one bulk load with more than one
+        // DONE_COUNT token, so trusting the server count double-counted.
+        //
+        // The mock server here returns a deliberately wrong count (999) in each
+        // DONE_COUNT token; the client wrote 3 rows and must report exactly 3,
+        // which is only possible if the reported value is the client-side count.
+        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+        use crate::datatypes::sqldatatypes::TdsDataType;
+
+        let mut client = create_test_client_with_tokens(vec![
+            // STEP 2: response to the INSERT BULK preamble command.
+            done_no_more(),
+            // STEP 5: distributed bulk-load acknowledgement — two DONE_COUNT
+            // tokens, each carrying a bogus (non-client) count.
+            done_count(CurrentCommand::Insert, 999, true),
+            done_count(CurrentCommand::BulkInsert, 999, false),
+        ]);
+
+        let column_metadata = vec![
+            BulkCopyColumnMetadata::new("id", SqlDbType::Int, TdsDataType::Int4 as u8)
+                .with_length(4, TypeLength::Fixed(4)),
+        ];
+
+        let rows = vec![IntRow(10), IntRow(20), IntRow(30)];
+
+        let reported = client
+            .execute_bulk_load_streaming_zerocopy(
+                "#t".to_string(),
+                column_metadata,
+                BulkCopyOptions::default(),
+                None,
+                None,
+                rows.into_iter(),
+                &[],
+            )
+            .await
+            .expect("bulk load should succeed against the mock transport");
+
+        assert_eq!(
+            reported, 3,
+            "must report the 3 client-written rows, not the server DONE_COUNT (999)"
+        );
     }
 
     #[test]
