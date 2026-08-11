@@ -243,7 +243,12 @@ impl PyCoreCursor {
     /// # Returns
     ///
     /// Dictionary containing:
-    /// - `rows_copied` (int): Number of rows successfully copied
+    /// - `rows_copied` (int): Number of rows serialized to the wire by the
+    ///   client, matching `Microsoft.Data.SqlClient`'s `SqlBulkCopy.RowsCopied`.
+    ///   This is a client-side count, not a guarantee of the number of rows
+    ///   inserted on the server (server-side triggers, for example, can change
+    ///   the row count). It is also unaffected by distributed engines that
+    ///   acknowledge one load with multiple DONE_COUNT tokens (issue #209).
     /// - `batch_count` (int): Number of batches sent
     /// - `elapsed_time` (float): Time taken in seconds
     /// - `rows_per_second` (float): Throughput in rows per second

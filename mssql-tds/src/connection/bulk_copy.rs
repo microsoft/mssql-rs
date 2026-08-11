@@ -260,7 +260,12 @@ impl BulkCopyProgress {
 /// Contains statistics about the completed operation.
 #[derive(Debug, Clone)]
 pub struct BulkCopyResult {
-    /// Number of rows successfully copied
+    /// Number of rows serialized to the wire by the client, matching
+    /// `Microsoft.Data.SqlClient`'s `SqlBulkCopy.RowsCopied`. This is a
+    /// client-side count, not a guarantee of the number of rows inserted on
+    /// the server (server-side triggers, for example, can change the row
+    /// count), and it is unaffected by distributed engines that acknowledge
+    /// one load with multiple DONE_COUNT tokens (issue #209).
     pub rows_affected: u64,
     /// Time taken for the operation
     pub elapsed: Duration,
