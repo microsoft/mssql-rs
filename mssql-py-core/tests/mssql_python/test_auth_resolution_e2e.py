@@ -379,11 +379,14 @@ class TestADServicePrincipal:
 
 
 # ═════════════════════════════════════════════════════════════════
-#  SECTION 10 — §3.3 Auth + TC clashes (#24–#29)
+#  SECTION 10 — §3.3 Auth + TC clashes (#24–#26, #28–#29)
 # ═════════════════════════════════════════════════════════════════
 
 class TestAuthTcClash:
-    """§3.3 #24–#29 — Auth keyword + TC=Yes is always an error."""
+    """§3.3 Auth keyword + TC=Yes is always an error (#24–#26, #28–#29).
+
+    #27 (ADInteractive) is covered by test_auth_resolution.py, not here.
+    """
 
     def test_row24_tc_yes_sqlpassword(self):
         """#24  TC=Yes + SqlPassword → ERROR."""
