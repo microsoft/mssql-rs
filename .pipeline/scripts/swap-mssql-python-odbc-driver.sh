@@ -106,9 +106,22 @@ fi
 echo "Replaced ${#SWAPPED_TARGETS[@]} bundled driver binaries with mssql-odbc"
 
 # Surface unresolved shared-library dependencies here rather than as an opaque
-# import failure inside the first test. Probe what was actually swapped so this
-# stays meaningful on any platform/arch layout.
+# import failure inside the first test. Every swapped copy is byte-identical and
+# most sit in arch/libc slots this build could never be loaded from, so probe
+# only the copy under the importable package - the one the resolver dlopens -
+# and fall back to any swapped copy if the package dir could not be resolved.
+probed=0
 for target in "${SWAPPED_TARGETS[@]}"; do
-    echo "ldd $target"
-    ldd "$target" || true
+    case "$target" in
+        "${PKG_DIR:-__unresolved__}"/*)
+            echo "ldd $target"
+            ldd "$target" || true
+            probed=1
+            ;;
+    esac
 done
+
+if [ "$probed" -eq 0 ]; then
+    echo "ldd ${SWAPPED_TARGETS[0]}"
+    ldd "${SWAPPED_TARGETS[0]}" || true
+fi

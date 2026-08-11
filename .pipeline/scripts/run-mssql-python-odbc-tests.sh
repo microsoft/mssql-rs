@@ -40,8 +40,9 @@
 #      baseline while the Rust driver is under development, so the calling step
 #      reports it as a warning (yellow) rather than failing the job.
 #   2  the harness itself could not run the tests (broken venv, missing
-#      interpreter) - the calling step turns this into a real pipeline error,
-#      since it says nothing about the driver.
+#      interpreter, or a run in which no file executed a single test) - the
+#      calling step turns this into a real pipeline error, since it says
+#      nothing about the driver.
 
 # No `set -e`: a failing or crashing test file must not abort the loop.
 set -uo pipefail
@@ -90,6 +91,15 @@ XML
     fi
 }
 
+# Reports are keyed by the path under tests/ rather than the basename, so two
+# same-named files in different directories cannot collapse onto a single report
+# and silently hide one of them.
+report_name() {
+    local n="${1#tests/}"
+    n="${n%.py}"
+    printf '%s' "${n//\//_}"
+}
+
 # Not depth-limited: upstream's tests/ is flat today, but a future subdirectory
 # would otherwise vanish from this job while the summary still looked complete.
 mapfile -t TEST_FILES < <(find tests -name 'test_*.py' -type f | sort)
@@ -130,7 +140,7 @@ harness_error=0
 
 for idx in "${!TEST_FILES[@]}"; do
     test_file="${TEST_FILES[$idx]}"
-    name="$(basename "$test_file" .py)"
+    name="$(report_name "$test_file")"
     report="$RESULTS_DIR/results-$name.xml"
 
     # Stop launching work that cannot finish inside the job's own timeout.
@@ -138,7 +148,7 @@ for idx in "${!TEST_FILES[@]}"; do
     if [ "$remaining" -le 30 ]; then
         for rest_idx in $(seq "$idx" $((${#TEST_FILES[@]} - 1))); do
             rest_file="${TEST_FILES[$rest_idx]}"
-            rest_name="$(basename "$rest_file" .py)"
+            rest_name="$(report_name "$rest_file")"
             reason="SKIPPED (total time budget of $PYTEST_TOTAL_BUDGET exhausted)"
             write_report_stub "$rest_name" "skipped" "$reason" "$RESULTS_DIR/results-$rest_name.xml"
             SUMMARY+=("$(printf '%-52s %s' "$rest_name" "$reason")")
@@ -235,6 +245,15 @@ echo "==============================================================="
 # the result set is incomplete, which must not read as a clean pass.
 if [ "$harness_error" -gt 0 ]; then
     echo "##[error]$harness_error file(s) could not be executed - this indicates a broken test environment, not a driver defect"
+    exit 2
+fi
+
+# A run where every file reported "no tests collected" leaves all the failure
+# counters at zero and would otherwise exit clean green having exercised nothing.
+# An upstream pytest.ini or addopts change is enough to cause it, so treat "the
+# suite never ran" as an environment defect rather than a silent pass.
+if [ "$((passed + failed + crashed + timedout))" -eq 0 ]; then
+    echo "##[error]No test file executed any tests (no tests: $empty, skipped: $skipped) - the suite was not exercised"
     exit 2
 fi
 

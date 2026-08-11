@@ -7,8 +7,10 @@
 # Branch selection defaults to main. A PR can retarget the clone by adding
 #   mssql-python-branch: feature/my-branch
 # to its description; the description is read back through the Azure DevOps CLI.
-# An unknown branch falls back to main so the job still produces signal instead
-# of failing on a typo.
+# That lookup only resolves Azure DevOps Repos pull requests - on the
+# GitHub-sourced builds this pipeline actually runs as, it is skipped and the
+# clone always tracks main. An unknown branch falls back to main so the job
+# still produces signal instead of failing on a typo.
 #
 # Env:
 #   MSSQL_PYTHON_CLONE_DIR   Clone destination (default: ../mssql-python).
@@ -19,8 +21,13 @@ set -euo pipefail
 CLONE_DIR="${MSSQL_PYTHON_CLONE_DIR:-../mssql-python}"
 MSSQL_PYTHON_BRANCH="main"
 
-if [ -n "${SYSTEM_PULLREQUEST_PULLREQUESTID:-}" ]; then
-  echo "PR build detected (PR #${SYSTEM_PULLREQUEST_PULLREQUESTID})"
+# `az repos pr show` can only resolve Azure DevOps Repos pull requests. On a
+# GitHub-sourced build SYSTEM_PULLREQUEST_PULLREQUESTID carries GitHub's internal
+# PR id rather than the PR number, so the lookup fails every time: it can never
+# honour an override, and only costs an `az extension add` plus a misleading
+# warning on every run of both cross-repo jobs.
+if [ "${BUILD_REPOSITORY_PROVIDER:-}" = "TfsGit" ] && [ -n "${SYSTEM_PULLREQUEST_PULLREQUESTID:-}" ]; then
+  echo "Azure DevOps Repos PR build detected (PR #${SYSTEM_PULLREQUEST_PULLREQUESTID})"
 
   echo "Installing azure-devops CLI extension..."
   az extension add --name azure-devops --yes --allow-preview true 2>/dev/null || echo "Extension may already be installed"
@@ -46,7 +53,7 @@ if [ -n "${SYSTEM_PULLREQUEST_PULLREQUESTID:-}" ]; then
     echo "PR description is empty or could not be retrieved"
   fi
 else
-  echo "Not a PR build (SYSTEM_PULLREQUEST_PULLREQUESTID not set)"
+  echo "No Azure DevOps Repos PR context - skipping branch-override lookup"
 fi
 
 echo "Cloning microsoft/mssql-python (branch: $MSSQL_PYTHON_BRANCH) into $CLONE_DIR..."

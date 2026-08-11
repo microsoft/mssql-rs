@@ -11,7 +11,8 @@
 # headers. Here only the Rust cdylib is wanted, which needs neither.
 #
 # Env:
-#   ODBC_DROP_DIR   Drop directory to stage into (default: /workspace/odbc-swap-drop).
+#   ODBC_DROP_DIR     Drop directory to stage into (default: /workspace/odbc-swap-drop).
+#   CARGO_TARGET_DIR  Cargo target directory, if the job overrides it.
 
 set -euo pipefail
 
@@ -26,5 +27,9 @@ mkdir -p "$DROP_DIR"
 
 cargo build --release -p mssql-odbc
 
-cp /workspace/target/release/libmsodbcsql18.so "$DROP_DIR/"
+# Honour CARGO_TARGET_DIR the way the sibling build jobs in this stage set it, so
+# adding it here later cannot break the copy after a full release build.
+TARGET_DIR="${CARGO_TARGET_DIR:-/workspace/target}"
+
+cp "$TARGET_DIR/release/libmsodbcsql18.so" "$DROP_DIR/"
 ls -la "$DROP_DIR"

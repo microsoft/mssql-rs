@@ -533,18 +533,20 @@ stages:
   # Deliberately always-on rather than behind an opt-in parameter like RunFuzz /
   # RunLongHaul: the point is a continuous compatibility signal for a driver
   # under active development, which an opt-in flag nobody remembers to set would
-  # not give. 240m is a ceiling for the pathological all-files-hang case, not the
-  # expected runtime - the runner's own 110m budget bounds the normal path.
+  # not give. The job timeout is a ceiling for the pathological all-files-hang
+  # case, not the expected runtime - the first full run took ~9m, and the
+  # runner's own 110m budget bounds the normal path.
   #
   # The time bounds nest deliberately: the runner caps the whole test loop at
   # pytestTotalBudget (110m), the test step backstops a wedged `docker exec` at
-  # 130m, and the job allows 240m so the ~110m left over covers setup and still
-  # guarantees the publish and cleanup steps run. A job cancelled by the server
-  # for timeout skips `condition: always()` steps, which would lose the report
-  # this job exists to produce.
+  # 130m, and the job allows 150m so the ~20m left over covers setup (image pull,
+  # apt, cargo build, pybind build) and still guarantees the publish and cleanup
+  # steps run. A job cancelled by the server for timeout skips
+  # `condition: always()` steps, which would lose the report this job exists to
+  # produce.
   - job: Test_mssql_python_on_mssql_odbc
     displayName: mssql-python suite on mssql-odbc driver (cross-repo)
-    timeoutInMinutes: 240
+    timeoutInMinutes: 150
     pool:
       name: RUST-1ES-POOL-WUS3
       demands:

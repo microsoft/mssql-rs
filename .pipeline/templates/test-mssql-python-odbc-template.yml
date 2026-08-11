@@ -197,7 +197,9 @@ steps:
       set -euo pipefail
       export DEBIAN_FRONTEND=noninteractive
       apt-get remove --purge -y unixodbc-dev
-      rm -f /lib/x86_64-linux-gnu/libodbcinst.so.2 /usr/lib/x86_64-linux-gnu/libodbcinst.so.2
+      # Globbed rather than hardcoded to x86_64 so this cannot silently no-op on
+      # an arm64 agent and leave the system libodbcinst in place.
+      rm -f /lib/*-linux-gnu/libodbcinst.so.2 /usr/lib/*-linux-gnu/libodbcinst.so.2
       echo "Removed unixODBC development headers and system libodbcinst.so.2"
     '
   displayName: Strip build-time ODBC toolchain
