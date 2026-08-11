@@ -204,6 +204,23 @@ fn int_query() -> String {
     )
 }
 
+/// Byte-for-byte the query behind `BM_Type_Varchar`.
+fn varchar_query() -> String {
+    format!(
+        "SELECT TOP ({ROWS}) CAST(REPLICATE('x', 100) AS VARCHAR(100)) AS v \
+         FROM sys.all_objects a CROSS JOIN sys.all_objects b"
+    )
+}
+
+/// Same column type and row count as [`varchar_query`] but a 1-byte payload,
+/// so the pair separates per-value decode cost from per-byte transport cost.
+fn varchar_short_query() -> String {
+    format!(
+        "SELECT TOP ({ROWS}) CAST('x' AS VARCHAR(100)) AS v \
+         FROM sys.all_objects a CROSS JOIN sys.all_objects b"
+    )
+}
+
 fn connection_string() -> Option<String> {
     dotenv::dotenv().ok();
     let server = env::var("ODBC_TEST_SERVER").ok()?;
@@ -413,6 +430,18 @@ fn odbc_glue(c: &mut Criterion<CpuTime>) {
         b.iter(|| drain(handles.stmt, &query, &mut buf, true));
     });
 
+    // Same shape as fetch_getdata_int but over a 100-char varchar, so the
+    // difference between the two isolates per-value string handling.
+    let vquery = wide(&varchar_query());
+    let rows = drain(handles.stmt, &vquery, &mut buf, true);
+    assert_eq!(rows, ROWS, "expected {ROWS} varchar rows, drained {rows}");
+    group.bench_function("fetch_only_varchar", |b| {
+        b.iter(|| drain(handles.stmt, &vquery, &mut buf, false));
+    });
+    group.bench_function("fetch_getdata_varchar", |b| {
+        b.iter(|| drain(handles.stmt, &vquery, &mut buf, true));
+    });
+
     let rt = tokio::runtime::Runtime::new().unwrap();
     if let Some(mut client) = connect_tds(&rt) {
         let tds_query = int_query();
@@ -424,6 +453,26 @@ fn odbc_glue(c: &mut Criterion<CpuTime>) {
         });
         group.bench_function("tds_fetch_column", |b| {
             b.iter(|| rt.block_on(drain_tds(&mut client, &tds_query, true)));
+        });
+
+        let tds_vquery = varchar_query();
+        let rows = rt.block_on(drain_tds(&mut client, &tds_vquery, true));
+        assert_eq!(
+            rows, ROWS,
+            "expected {ROWS} TDS varchar rows, drained {rows}"
+        );
+        group.bench_function("tds_fetch_column_varchar", |b| {
+            b.iter(|| rt.block_on(drain_tds(&mut client, &tds_vquery, true)));
+        });
+
+        let tds_svquery = varchar_short_query();
+        let rows = rt.block_on(drain_tds(&mut client, &tds_svquery, true));
+        assert_eq!(
+            rows, ROWS,
+            "expected {ROWS} short varchar rows, drained {rows}"
+        );
+        group.bench_function("tds_fetch_column_varchar_short", |b| {
+            b.iter(|| rt.block_on(drain_tds(&mut client, &tds_svquery, true)));
         });
     } else {
         eprintln!("odbc_glue: TDS-direct cases skipped — could not connect TdsClient");
