@@ -28,6 +28,10 @@ use msodbcsql18::api::{
     SQLAllocHandle, SQLCloseCursor, SQLDriverConnectW, SQLExecDirectW, SQLFetch, SQLFreeHandle,
     SQLGetData, SQLSetEnvAttr,
 };
+use mssql_tds::connection::client_context::ClientContext;
+use mssql_tds::connection::tds_client::{CursorColumn, TdsClient};
+use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
 
 /// Wall time is useless here. Each iteration executes a real query, so roughly
 /// 4 ms of the ~11 ms is spent waiting on the server, and that wait carries
@@ -327,6 +331,57 @@ fn drain(stmt: *mut c_void, query: &[u16], buf: &mut [u8], get_data: bool) -> u6
     rows
 }
 
+/// Connects a bare `TdsClient` using the same credentials the ODBC cases use,
+/// so the TDS and ODBC numbers in a run are directly subtractable.
+fn connect_tds(rt: &tokio::runtime::Runtime) -> Option<TdsClient> {
+    dotenv::dotenv().ok();
+    let server = env::var("ODBC_TEST_SERVER").ok()?;
+    let (host, port) = match server.split_once(',') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()?),
+        None => (server, 1433),
+    };
+
+    let mut context = ClientContext::default();
+    context.user_name = env::var("ODBC_TEST_UID").ok()?;
+    context.password = env::var("ODBC_TEST_PWD").ok()?;
+    context.database = env::var("ODBC_TEST_DATABASE").unwrap_or_default();
+    context.encryption_options = EncryptionOptions {
+        mode: EncryptionSetting::PreferOff,
+        trust_server_certificate: true,
+        host_name_in_cert: None,
+        server_certificate: None,
+    };
+
+    rt.block_on(async {
+        TdsConnectionProvider {}
+            .create_client(context, &format!("tcp:{host},{port}"), None)
+            .await
+            .ok()
+    })
+}
+
+/// TDS-side twin of [`drain`]: walks the same rows through `TdsClient` with no
+/// ODBC layer in between, so `drain` minus this is the ODBC glue cost.
+async fn drain_tds(client: &mut TdsClient, query: &str, get_data: bool) -> u64 {
+    client.execute(query.to_string(), ()).await.unwrap();
+    let mut rows = 0u64;
+    loop {
+        while client.next_row_cursor().await.unwrap() {
+            if get_data {
+                match client.read_row_column(0).await.unwrap() {
+                    CursorColumn::Value(_) => {}
+                    other => panic!("unexpected cursor column: {other:?}"),
+                }
+            }
+            rows += 1;
+        }
+        if !client.advance_to_rows().await.unwrap() {
+            break;
+        }
+    }
+    rows
+}
+
 fn odbc_glue(c: &mut Criterion<CpuTime>) {
     let Some(handles) = connect() else {
         eprintln!(
@@ -357,6 +412,23 @@ fn odbc_glue(c: &mut Criterion<CpuTime>) {
     group.bench_function("fetch_getdata_int", |b| {
         b.iter(|| drain(handles.stmt, &query, &mut buf, true));
     });
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    if let Some(mut client) = connect_tds(&rt) {
+        let tds_query = int_query();
+        let rows = rt.block_on(drain_tds(&mut client, &tds_query, true));
+        assert_eq!(rows, ROWS, "expected {ROWS} TDS rows, drained {rows}");
+
+        group.bench_function("tds_fetch_only", |b| {
+            b.iter(|| rt.block_on(drain_tds(&mut client, &tds_query, false)));
+        });
+        group.bench_function("tds_fetch_column", |b| {
+            b.iter(|| rt.block_on(drain_tds(&mut client, &tds_query, true)));
+        });
+    } else {
+        eprintln!("odbc_glue: TDS-direct cases skipped — could not connect TdsClient");
+    }
+
     group.finish();
 }
 

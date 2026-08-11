@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use std::future::Future;
-use std::pin::pin;
+use std::pin::Pin;
 use std::slice;
 use std::task::{Context, Poll, Waker};
 
@@ -23,9 +23,12 @@ use crate::api::odbc_types::{SQL_NTS, SqlSmallInt, SqlWChar};
 /// runs inside the runtime context because the read path registers timers and
 /// socket interest; the guard is dropped before `block_on`, which refuses to
 /// run while the thread is already inside the runtime.
-pub(crate) fn drive_read<F: Future>(runtime: &Runtime, future: F) -> F::Output {
-    let mut future = pin!(future);
-
+///
+/// The future arrives already pinned rather than by value: the row and column
+/// state machines are ~8.5 KB each, so taking one by value memcpy'd that much
+/// per row across the call boundary. Callers pin in their own frame with
+/// [`std::pin::pin!`] and pass a pointer instead.
+pub(crate) fn drive_read<F: Future>(runtime: &Runtime, mut future: Pin<&mut F>) -> F::Output {
     let polled = {
         let _guard = runtime.enter();
         future

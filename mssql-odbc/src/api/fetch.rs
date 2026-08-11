@@ -14,6 +14,7 @@ use crate::api::util::drive_read;
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use std::pin::pin;
 
 /// Implements SQLFetch for the current forward-only result set.
 ///
@@ -136,7 +137,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
     // `drain_active_row` in tds_client), so a failure here may originate from
     // the prior row rather than the new one. Columns of the new row are pulled
     // lazily by subsequent SQLGetData calls via `read_row_column`.
-    let fetch_result = drive_read(&dbc.runtime, client.next_row_cursor());
+    let fetch_result = drive_read(&dbc.runtime, pin!(client.next_row_cursor()));
 
     match fetch_result {
         Ok(true) => {

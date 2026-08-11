@@ -20,6 +20,7 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, PlpChunk};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::PlpEncoding;
+use std::pin::pin;
 
 /// Implements SQLGetData for current-row retrieval.
 ///
@@ -395,7 +396,7 @@ fn resume_row_to_column(
     };
 
     let target = column_number - 1; // 0-based
-    let cursor_result = drive_read(&dbc.runtime, client.read_row_column(target));
+    let cursor_result = drive_read(&dbc.runtime, pin!(client.read_row_column(target)));
 
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("SQLGetData: dbc mutex poisoned after row resume");
@@ -628,7 +629,10 @@ fn stream_active_plp_chunk(
         client
     };
 
-    let read_result = drive_read(&dbc.runtime, client.read_active_plp_chunk(&mut payload));
+    let read_result = drive_read(
+        &dbc.runtime,
+        pin!(client.read_active_plp_chunk(&mut payload)),
+    );
 
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("SQLGetData: dbc mutex poisoned after PLP read");
