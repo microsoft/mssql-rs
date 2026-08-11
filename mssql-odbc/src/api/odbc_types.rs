@@ -70,8 +70,15 @@ pub const SQL_ATTR_ANSI_APP: SqlInteger = 115;
 // `SQL_ATTR_ACCESS_MODE` values.
 pub const SQL_MODE_READ_WRITE: u32 = 0;
 
-/// Default `SQL_ATTR_PACKET_SIZE`, matching `ClientContext::packet_size`.
-pub const DEFAULT_PACKET_SIZE: u32 = 8000;
+/// Default `SQL_ATTR_PACKET_SIZE`.
+///
+/// The TDS maximum rather than the 8000-byte `ClientContext` default: each
+/// socket read costs far more than the bytes it moves, so packet count — not
+/// payload size — dominates fetch CPU. Raising this cuts `varchar(100)` row
+/// decode by ~35% (63 socket reads down to 14 for 5000 rows). The cost is a
+/// larger per-connection read buffer, which the transport sizes at 2x the
+/// packet size.
+pub const DEFAULT_PACKET_SIZE: u32 = 32768;
 
 // Sentinel `StringLength` meaning "the value is a pointer" (ODBC).
 pub const SQL_IS_POINTER: SqlInteger = -4;

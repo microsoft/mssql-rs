@@ -6,7 +6,7 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_DRIVER_NOPROMPT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS,
+    DEFAULT_PACKET_SIZE, SQL_DRIVER_NOPROMPT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS,
     SQL_SUCCESS_WITH_INFO, SqlHWnd, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
@@ -409,10 +409,9 @@ fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParam
             IPAddressPreference::IPv4First
         };
     }
-    if let Some(size) = params.packet_size {
-        context.packet_size =
-            u16::try_from(size.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE)).unwrap_or(u16::MAX);
-    }
+    let size = params.packet_size.unwrap_or(DEFAULT_PACKET_SIZE);
+    context.packet_size =
+        u16::try_from(size.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE)).unwrap_or(u16::MAX);
 }
 
 #[cfg(test)]
@@ -776,10 +775,10 @@ mod tests {
     #[test]
     fn apply_params_leaves_unset_fields_at_defaults() {
         let mut ctx = ClientContext::default();
-        let before_packet = ctx.packet_size;
         let before_retry = ctx.connect_retry_count;
         apply_connection_params(&mut ctx, &ConnectionParams::default());
-        assert_eq!(ctx.packet_size, before_packet);
+        // An unset `PacketSize` takes the driver default, not the TDS default.
+        assert_eq!(u32::from(ctx.packet_size), DEFAULT_PACKET_SIZE);
         assert_eq!(ctx.connect_retry_count, before_retry);
         assert_eq!(ctx.encryption_options.host_name_in_cert, None);
         assert_eq!(ctx.encryption_options.server_certificate, None);
