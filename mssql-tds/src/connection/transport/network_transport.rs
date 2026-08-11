@@ -36,6 +36,7 @@ use std::cmp::min;
 use std::io::Error;
 use std::io::ErrorKind::{self, UnexpectedEof};
 use std::net::ToSocketAddrs;
+use std::pin::pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -1559,14 +1560,17 @@ impl TdsTokenStreamReader for NetworkTransport {
         let consumed = {
             let buffered = &self.tds_read_buffer.get_slice()[..available];
             let mut reader = SliceReader::new(buffered);
-            let decoder = GenericDecoder::default();
-            // Boxed so the borrow of `reader` can be released explicitly below;
-            // a stack-pinned future would hold it until the end of this scope.
-            let mut decode = Box::pin(decoder.decode_into(&mut reader, metadata, col, writer));
-            let polled = decode
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()));
-            drop(decode);
+            // Scoped so the pinned future — and with it the borrow of `reader` —
+            // is dropped before `reader.consumed()` is read. Pinning on the stack
+            // keeps this path allocation-free; the future is small and never
+            // outlives the poll.
+            let polled = {
+                let decoder = GenericDecoder::default();
+                let mut decode = pin!(decoder.decode_into(&mut reader, metadata, col, writer));
+                decode
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+            };
 
             match polled {
                 Poll::Ready(Ok(())) => Some(reader.consumed()),

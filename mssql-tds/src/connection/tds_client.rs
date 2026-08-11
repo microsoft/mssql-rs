@@ -3025,7 +3025,6 @@ impl TdsClient {
     /// After this returns `true`, individual columns are pulled with
     /// [`read_row_column`](Self::read_row_column). Any previously positioned row
     /// is drained first (allocation-free).
-    #[instrument(skip(self), level = "info")]
     pub async fn next_row_cursor(&mut self) -> TdsResult<bool> {
         if self.current_metadata.is_none() {
             return Err(UsageError(
@@ -3121,7 +3120,6 @@ impl TdsClient {
     /// guarantee `read_row_column(0)` yields a value: a zero-column row is
     /// positioned with a column count of 0, so `read_row_column(0)` is
     /// out-of-range and returns `UsageError`.
-    #[instrument(skip(self), level = "info")]
     pub async fn read_row_column(&mut self, target: usize) -> TdsResult<CursorColumn> {
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
             ActiveRowReadState::Idle => Ok(CursorColumn::RowEnded),
@@ -3320,7 +3318,6 @@ impl TdsClient {
         match result {
             RowReadResult::RowWritten => {
                 writer.end_row();
-                info!("Row Received");
                 Ok(true)
             }
             RowReadResult::RowPaused(next_pause) => {
