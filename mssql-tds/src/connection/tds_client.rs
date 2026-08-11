@@ -149,6 +149,12 @@ pub struct TdsClient {
     /// the metadata it was built for so it is rebuilt when the result set
     /// changes. `None` until the first encrypted result set is seen.
     current_decryptor: Option<MemoizedCellDecryptor>,
+    /// Memoized row-loop [`ParserContext`] for `current_metadata`. Rebuilding it
+    /// per row costs an `Arc` clone/drop pair plus a `resolve_cell_decryptor`
+    /// await in the cursor hot path, and none of it changes within a result set.
+    /// Validated by `Arc::ptr_eq` against `current_metadata`, so every
+    /// reassignment of that field invalidates this automatically.
+    cached_row_parser_context: Option<ParserContext>,
     count_map: HashMap<CurrentCommand, u64>,
     /// Rows affected by the most recent statement; see [`last_rows_affected`](Self::last_rows_affected).
     last_rows_affected: i64,
@@ -247,6 +253,7 @@ impl TdsClient {
             recovery_context: Box::new(recovery_context),
             current_metadata: None,
             current_decryptor: None,
+            cached_row_parser_context: None,
             count_map: HashMap::new(),
             last_rows_affected: -1,
             dml_result_counts: Vec::new(),
@@ -3042,9 +3049,21 @@ impl TdsClient {
 
         self.drain_active_row().await?;
 
-        let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
-        let decryptor = self.resolve_cell_decryptor(&metadata).await?;
-        let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
+        // Rebuild only when the result set changed: `Arc::ptr_eq` against
+        // `current_metadata` means any reassignment of that field invalidates
+        // this, so the per-row path is a pointer compare instead of an `Arc`
+        // clone plus a `resolve_cell_decryptor` await.
+        let cache_hit = matches!(
+            (&self.cached_row_parser_context, &self.current_metadata),
+            (Some(ParserContext::ColumnMetadata(cached, _)), Some(current))
+                if Arc::ptr_eq(cached, current)
+        );
+        if !cache_hit {
+            let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
+            let decryptor = self.resolve_cell_decryptor(&metadata).await?;
+            self.cached_row_parser_context =
+                Some(ParserContext::ColumnMetadata(metadata, decryptor));
+        }
 
         // Fast path: a ROW token is a single byte, and after the first packet
         // refill it is essentially always already buffered. Reading it here
@@ -3053,7 +3072,7 @@ impl TdsClient {
         // non-row token such as DONE — falls through with the stream untouched.
         if let Some(RowHeader::Positioned(pause_state)) = self
             .transport
-            .try_receive_row_header_buffered(&parser_context)
+            .try_receive_row_header_buffered(self.cached_row_parser_context.as_ref().unwrap())
         {
             self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
             return Ok(true);
@@ -3064,7 +3083,7 @@ impl TdsClient {
             let header = self
                 .transport
                 .receive_row_header(
-                    &parser_context,
+                    self.cached_row_parser_context.as_ref().unwrap(),
                     self.remaining_request_timeout,
                     self.cancel_handle.as_ref(),
                 )
