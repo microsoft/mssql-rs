@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use std::cmp::min;
 use std::io::Error;
-use std::io::ErrorKind::{self, UnexpectedEof};
+use std::io::ErrorKind;
 use std::net::ToSocketAddrs;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -629,10 +629,10 @@ impl NetworkTransport {
         self.encryption = Some(encryption);
     }
 
-    /// Raw byte-level read. [`get_new_tds_packet`](Self::get_new_tds_packet)
-    /// reads straight into the working buffer instead, so this is exercised
-    /// only by tests and by [`NetworkReader`] consumers.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Raw byte-level read, used only by transport tests. The production read
+    /// path is [`get_new_tds_packet`](Self::get_new_tds_packet), which reads
+    /// straight into the working buffer.
+    #[cfg(test)]
     pub(crate) async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
         if buffer.is_empty() {
             return Err(crate::error::Error::UsageError(
@@ -660,7 +660,7 @@ impl NetworkTransport {
             // EOF — the server closed the connection.
             self.known_dead = true;
             Err(crate::error::Error::from(std::io::Error::from(
-                UnexpectedEof,
+                ErrorKind::UnexpectedEof,
             )))
         } else {
             Ok(bytes_read)
