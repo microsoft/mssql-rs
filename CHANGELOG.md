@@ -64,8 +64,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   value can span more than two packets (and a packet can carry fewer bytes than
   the value needs), so the read proceeded against a still-short buffer. The
   check is now a loop that reads until the whole value is buffered. Affects all
-  13 fixed-width readers (`read_uint16` … `read_double`, the date/time readers,
-  and the GUID reader).
+  13 fixed-width readers on `TdsPacketReader`.
 
 - `mssql-tds`: `read_varchar_u8_length` truncated strings of 128 characters or
   more, and `read_varchar_u16_length` strings of 32768 or more. The character
@@ -75,7 +74,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   now happens first (`(length as usize) << 1`).
 
 - `mssql-tds`: a payload-free TDS packet without the end-of-message flag is now
-  rejected as a protocol error instead of being consumed as a zero-length
-  packet, which a peer could stream indefinitely to keep a reader looping.
-  Empty end-of-message packets remain legal.
+  rejected as a protocol error. Such a packet is malformed — it neither carries
+  payload nor terminates a message — but was previously consumed as a
+  zero-length packet. Empty end-of-message packets remain legal.
 

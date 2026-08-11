@@ -910,10 +910,10 @@ impl NetworkTransport {
             )));
         }
 
-        // A payload-free packet that is not the end of its message advances
-        // nothing, so a peer streaming them would spin the callers' "read until
-        // we have enough data" loops forever. An empty EOM packet is legal (it
-        // terminates a message), so only non-EOM ones are rejected.
+        // A payload-free packet that is not the end of its message is
+        // malformed: it neither carries payload nor terminates a message. An
+        // empty EOM packet is legal (it terminates a message), so only non-EOM
+        // ones are rejected.
         let is_end_of_message = self.tds_read_buffer.working_buffer[base_offset + 1]
             & PacketStatusFlags::Eom as u8
             != 0;
@@ -2705,9 +2705,8 @@ pub(crate) mod tests {
         assert_eq!(reader.read_uint32().await.unwrap(), 0x4433_2211);
     }
 
-    /// A payload-free non-EOM packet advances the buffer by nothing, so without
-    /// a guard the readers' "keep reading until we have enough data" loops would
-    /// never terminate against a peer that streams them.
+    /// A payload-free non-EOM packet is malformed: it neither carries payload
+    /// nor terminates a message.
     #[tokio::test]
     async fn test_payload_free_non_eom_packet_is_rejected() {
         let mut packet = TestPacketBuilder::new(PacketType::TabularResult).build();
@@ -2723,16 +2722,16 @@ pub(crate) mod tests {
     }
 
     /// The same packet *with* EOM set is legal — an empty end-of-message packet
-    /// terminates a message — so it must be accepted and simply yield no payload.
+    /// terminates a message — so it is consumed and the reader carries on to
+    /// the payload of the next packet.
     #[tokio::test]
     async fn test_payload_free_eom_packet_is_accepted() {
-        let packet = TestPacketBuilder::new(PacketType::TabularResult).build();
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        let mut next = TestPacketBuilder::new(PacketType::TabularResult);
+        stream.extend_from_slice(&next.append_byte(0x7F).build());
 
-        let mut reader = create_network_transport_with_data(&packet);
+        let mut reader = create_network_transport_with_data(&stream);
 
-        assert!(!matches!(
-            reader.read_byte().await,
-            Err(crate::error::Error::ProtocolError(_))
-        ));
+        assert_eq!(reader.read_byte().await.unwrap(), 0x7F);
     }
 }
