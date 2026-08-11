@@ -302,8 +302,9 @@ fn write_captured_column(
     let as_text = match column_value_to_text(value) {
         Ok(t) => t,
         Err(TextError::Malformed) => {
-            // The server payload could not be decoded. Leave the value resident;
-            // a retry with SQL_C_BINARY can still read the raw bytes.
+            // Leave the value resident so the column stays re-readable. There is no
+            // raw-bytes fallback today: SQL_C_BINARY is rejected by the target gate
+            // above.
             error!("SQLGetData: column payload could not be decoded as text");
             post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE);
             return SQL_ERROR;
