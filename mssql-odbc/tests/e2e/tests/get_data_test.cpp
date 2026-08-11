@@ -752,8 +752,12 @@ TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAsciiRoundTrip) {
 // chunk, so a high surrogate is left without its low half at the boundary; the
 // driver must carry it to the next chunk rather than emit U+FFFD. Any framing or
 // surrogate-carry defect shows up as replacement characters (EF BF BD) or a
-// wrong byte count. Codepage-neutral by construction, so it runs on both legs.
+// wrong byte count. This asserts mssql-odbc-specific behavior: the reference
+// msodbcsql driver does not carry a split high surrogate across a sub-character
+// SQL_C_CHAR buffer boundary (it emits U+FFFD), so the assertion is skipped on
+// the msodbcsql comparison leg.
 TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAstralRoundTrip) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     const std::string emoji = "\xF0\x9F\x98\x80";       // U+1F600, 4 UTF-8 bytes
     const std::string expected = RepeatToken(emoji, 500);  // 2000 bytes
     ASSERT_SQL_OK(
