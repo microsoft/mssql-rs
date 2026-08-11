@@ -82,7 +82,7 @@ enum ActiveRowReadState {
     Idle,
     /// A row is positioned and partially read; `next_column_index` columns have
     /// been consumed and more remain on the wire.
-    RowPaused(Box<RowPauseState>),
+    RowPaused(RowPauseState),
     /// A row is positioned with an active PLP column stream mid-flight.
     PlpPaused(Box<PlpPauseState>),
 }
@@ -3056,7 +3056,7 @@ impl TdsClient {
             .transport
             .try_receive_row_header_buffered(&parser_context)
         {
-            self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+            self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
             return Ok(true);
         }
 
@@ -3077,8 +3077,7 @@ impl TdsClient {
                     // Positioned before column 0; columns are pulled lazily via
                     // `read_row_column`. A zero-column row parks here too and
                     // drains as a no-op on the next advance.
-                    self.active_row_read_state =
-                        ActiveRowReadState::RowPaused(Box::new(pause_state));
+                    self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
                     return Ok(true);
                 }
                 RowHeader::Token(token) => {
@@ -3127,7 +3126,7 @@ impl TdsClient {
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
             ActiveRowReadState::Idle => Ok(CursorColumn::RowEnded),
             ActiveRowReadState::RowPaused(pause_state) => {
-                self.resume_to_column(*pause_state, target).await
+                self.resume_to_column(pause_state, target).await
             }
             ActiveRowReadState::PlpPaused(mut plp_state) => {
                 self.drain_active_plp(&mut plp_state).await?;
@@ -3150,7 +3149,7 @@ impl TdsClient {
             // column index first, so this guards the public API against other
             // callers.
             let column_count = pause_state.columns().len();
-            self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+            self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
             return Err(UsageError(format!(
                 "read_row_column target column {target} is out of range (row has {column_count} columns)"
             )));
@@ -3159,7 +3158,7 @@ impl TdsClient {
         if target < pause_state.next_column_index {
             // Forward-only: the target column's bytes are already gone. Keep the
             // cursor where it is so later (valid) pulls still work.
-            self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+            self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
             return Ok(CursorColumn::AlreadyConsumed);
         }
 
@@ -3189,11 +3188,10 @@ impl TdsClient {
                 if target + 1 == pause_state.columns().len() {
                     self.active_row_read_state = ActiveRowReadState::Idle;
                 } else {
-                    self.active_row_read_state =
-                        ActiveRowReadState::RowPaused(Box::new(RowPauseState {
-                            next_column_index: target + 1,
-                            ..pause_state
-                        }));
+                    self.active_row_read_state = ActiveRowReadState::RowPaused(RowPauseState {
+                        next_column_index: target + 1,
+                        ..pause_state
+                    });
                 }
                 return Ok(CursorColumn::Value(value));
             }
@@ -3215,7 +3213,7 @@ impl TdsClient {
 
         match result {
             RowReadResult::RowPaused(next_pause) => {
-                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(next_pause));
+                self.active_row_read_state = ActiveRowReadState::RowPaused(next_pause);
                 let value = capture.take_value().ok_or_else(|| {
                     crate::error::Error::ProtocolError(format!(
                         "Decoder produced no value for non-null column {target}"
@@ -3255,7 +3253,7 @@ impl TdsClient {
             ActiveRowReadState::Idle => Ok(()),
             ActiveRowReadState::RowPaused(pause_state) => {
                 let mut sink = DiscardRowWriter;
-                self.resume_row_loop(*pause_state, ColumnPolicy::SkipAll, &mut sink)
+                self.resume_row_loop(pause_state, ColumnPolicy::SkipAll, &mut sink)
                     .await?;
                 Ok(())
             }
@@ -3320,7 +3318,7 @@ impl TdsClient {
                 Ok(true)
             }
             RowReadResult::RowPaused(next_pause) => {
-                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(next_pause));
+                self.active_row_read_state = ActiveRowReadState::RowPaused(next_pause);
                 Ok(true)
             }
             RowReadResult::PlpPaused(plp_state) => {
@@ -4675,7 +4673,7 @@ mod tests {
             }));
 
         let mut client = create_test_client_with_transport(transport);
-        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+        client.active_row_read_state = ActiveRowReadState::RowPaused(RowPauseState {
             next_column_index: 0,
             metadata: Arc::new(ColMetadataToken {
                 columns: vec![metadata],
@@ -4683,7 +4681,7 @@ mod tests {
             }),
             nbc_null_bitmap: None,
             decryptor: None,
-        }));
+        });
 
         let outcome = client.read_row_column(0).await.unwrap();
         assert_eq!(
@@ -4698,12 +4696,12 @@ mod tests {
     #[test]
     fn plp_helpers_treat_non_plp_row_pause_as_no_active_stream() {
         let mut client = create_test_client();
-        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+        client.active_row_read_state = ActiveRowReadState::RowPaused(RowPauseState {
             next_column_index: 1,
             metadata: Arc::new(ColMetadataToken::default()),
             nbc_null_bitmap: None,
             decryptor: None,
-        }));
+        });
 
         assert!(client.active_plp_reached_end());
     }
@@ -4717,12 +4715,12 @@ mod tests {
         let mut client = create_test_client();
         client.current_metadata = Some(stale_metadata());
         client.current_result_set_has_been_read_till_end = false;
-        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+        client.active_row_read_state = ActiveRowReadState::RowPaused(RowPauseState {
             next_column_index: 1,
             metadata: Arc::new(ColMetadataToken::default()),
             nbc_null_bitmap: None,
             decryptor: None,
-        }));
+        });
 
         let mut sink = DiscardRowWriter;
         let err = client
