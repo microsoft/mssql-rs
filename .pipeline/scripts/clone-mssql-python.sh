@@ -54,3 +54,7 @@ if ! git clone --depth 1 -b "$MSSQL_PYTHON_BRANCH" https://github.com/microsoft/
   echo "##[warning]Branch '$MSSQL_PYTHON_BRANCH' not found, falling back to main"
   git clone --depth 1 -b main https://github.com/microsoft/mssql-python.git "$CLONE_DIR"
 fi
+
+# `main` moves independently of this repo, so record the exact commit under test
+# to keep a run's results attributable after the fact.
+echo "##[section]mssql-python HEAD: $(git -C "$CLONE_DIR" rev-parse HEAD)"

@@ -527,8 +527,14 @@ stages:
 
   # Same upstream suite, but with mssql-python's bundled msodbcsql18 binary
   # replaced by the Rust mssql-odbc driver. Failures and crashes are expected
-  # while the driver is in development, so the job is informational: its test
-  # step is continueOnError and each test file runs in its own bounded process.
+  # while the driver is in development, so the job is informational: only a
+  # broken harness fails it, and each test file runs in its own bounded process.
+  #
+  # Deliberately always-on rather than behind an opt-in parameter like RunFuzz /
+  # RunLongHaul: the point is a continuous compatibility signal for a driver
+  # under active development, which an opt-in flag nobody remembers to set would
+  # not give. 240m is a ceiling for the pathological all-files-hang case, not the
+  # expected runtime - the runner's own 110m budget bounds the normal path.
   #
   # The time bounds nest deliberately: the runner caps the whole test loop at
   # pytestTotalBudget (110m), the test step backstops a wedged `docker exec` at

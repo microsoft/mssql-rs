@@ -71,7 +71,6 @@ steps:
 
 - script: |
     set -euo pipefail
-    rm -rf odbc-swap-drop && mkdir -p odbc-swap-drop
 
     bash .pipeline/scripts/docker-cargo-run.sh --rm \
       -v "$PWD:/workspace" \
@@ -79,16 +78,7 @@ steps:
       -v "$HOME/.cargo/git:/root/.cargo/git" \
       -w /workspace \
       ${{ parameters.buildImage }} \
-      bash -c '
-        set -euo pipefail
-        source ~/.cargo/env
-        cargo build --release -p mssql-odbc
-        cp /workspace/target/release/libmsodbcsql18.so /workspace/odbc-swap-drop/
-      '
-
-    # The build container runs as root, so the drop is root-owned on the agent.
-    # Only reading it is needed downstream, and the cleanup step uses sudo.
-    ls -la odbc-swap-drop
+      bash /workspace/.pipeline/scripts/containerized-odbc-swap-build.sh
   displayName: Build mssql-odbc driver
   env:
     CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
@@ -96,21 +86,30 @@ steps:
 
 - script: |
     set -euo pipefail
+
+    # A previous run cancelled mid-flight leaves its containers and network
+    # behind, and `docker run --name` / `network create` then fail outright.
+    docker rm -f mssql-python-odbc-tests || true
+    docker rm -f sqlserver-odbc-swap || true
+    docker network rm mssqlpy-odbc-net || true
+
     docker network create mssqlpy-odbc-net
 
+    # No host port published: the test container reaches SQL Server over the
+    # user-defined network, and binding 1433 on the agent would collide with the
+    # sibling mssql-python job scheduled onto the same pool.
     docker run -d \
       --name sqlserver-odbc-swap \
       --network mssqlpy-odbc-net \
       --network-alias sqlserver \
       -e ACCEPT_EULA=Y \
-      -e MSSQL_SA_PASSWORD="$(SQL_PASSWORD)" \
-      -p 1433:1433 \
+      -e MSSQL_SA_PASSWORD="$SQL_PASSWORD" \
       ${{ parameters.sqlImage }}
 
     echo "Waiting for SQL Server to accept connections..."
     for i in $(seq 1 60); do
       if docker exec sqlserver-odbc-swap /opt/mssql-tools18/bin/sqlcmd \
-          -S localhost -U SA -P "$(SQL_PASSWORD)" -C -Q "SELECT 1" >/dev/null 2>&1; then
+          -S localhost -U SA -P "$SQL_PASSWORD" -C -Q "SELECT 1" >/dev/null 2>&1; then
         echo "SQL Server is ready"
         break
       fi
@@ -124,7 +123,7 @@ steps:
 
     # mssql-python's own pipeline runs against a database named TestDB.
     docker exec sqlserver-odbc-swap /opt/mssql-tools18/bin/sqlcmd \
-      -S localhost -U SA -P "$(SQL_PASSWORD)" -C -Q "CREATE DATABASE TestDB"
+      -S localhost -U SA -P "$SQL_PASSWORD" -C -Q "CREATE DATABASE TestDB"
   displayName: Start SQL Server
   env:
     SQL_PASSWORD: $(SQL_PASSWORD)
@@ -213,23 +212,42 @@ steps:
   displayName: Replace bundled msodbcsql18 with mssql-odbc
 
 - script: |
+    # The connection string carries the SA password, so it is passed by name and
+    # supplied through the step's env block rather than being written into argv.
+    rc=0
     docker exec \
-      -e DB_CONNECTION_STRING="Server=sqlserver,1433;Database=TestDB;Uid=SA;Pwd=$(SQL_PASSWORD);TrustServerCertificate=yes" \
+      -e DB_CONNECTION_STRING \
       -e PYTEST_FILE_TIMEOUT="${{ parameters.pytestFileTimeout }}" \
       -e PYTEST_TOTAL_BUDGET="${{ parameters.pytestTotalBudget }}" \
       -e TEST_RESULTS_DIR=/workspace/test-results \
       mssql-python-odbc-tests bash -c '
         source /opt/venv/bin/activate
         bash /mssql-rs-scripts/run-mssql-python-odbc-tests.sh
-      '
+      ' || rc=$?
+
+    # Exit 2 means the harness could not run the tests at all, and docker's own
+    # 125/126/127 mean `docker exec` never launched it - both are broken
+    # environments, which say nothing about the driver and must be a real red.
+    # Anything else is the expected in-development baseline and stays advisory,
+    # so a genuine infrastructure break is never mistaken for it.
+    case "$rc" in
+      2|125|126|127)
+        echo "##vso[task.logissue type=error]mssql-python test harness could not run (exit $rc) - broken test environment, not a driver defect"
+        exit 1
+        ;;
+    esac
+
+    if [ "$rc" -ne 0 ]; then
+      echo "##vso[task.logissue type=warning]mssql-python tests did not fully pass against mssql-odbc (exit $rc) - expected while the driver is in development"
+    fi
+    exit 0
   displayName: Run mssql-python tests against mssql-odbc
   # The runner enforces its own budget; this only backstops a wedged `docker
   # exec`. It must stay below the job timeout so the publish and cleanup steps
   # below still run.
   timeoutInMinutes: 130
-  continueOnError: true
   env:
-    SQL_PASSWORD: $(SQL_PASSWORD)
+    DB_CONNECTION_STRING: "Server=sqlserver,1433;Database=TestDB;Uid=SA;Pwd=$(SQL_PASSWORD);TrustServerCertificate=yes"
 
 - script: |
     set -uo pipefail

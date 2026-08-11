@@ -33,8 +33,13 @@
 #   PYTEST_FILE_TIMEOUT      Per-file wall-clock budget (default: 10m).
 #   PYTEST_TOTAL_BUDGET      Wall-clock budget for the whole loop (default: 110m).
 #
-# Exits non-zero when any file failed, crashed, or timed out. The calling
-# pipeline step runs with continueOnError so that surfaces as a warning.
+# Exit codes:
+#   0  every file passed.
+#   1  tests ran but did not fully pass (the expected baseline while the Rust
+#      driver is under development) - the calling step downgrades this to a warning.
+#   2  the harness itself could not run the tests (broken venv, missing
+#      interpreter) - the calling step turns this into a real pipeline error,
+#      since it says nothing about the driver.
 
 # No `set -e`: a failing or crashing test file must not abort the loop.
 set -uo pipefail
@@ -44,7 +49,7 @@ RESULTS_DIR="${TEST_RESULTS_DIR:-$MSSQL_PYTHON_DIR/test-results}"
 PYTEST_FILE_TIMEOUT="${PYTEST_FILE_TIMEOUT:-10m}"
 PYTEST_TOTAL_BUDGET="${PYTEST_TOTAL_BUDGET:-110m}"
 
-cd "$MSSQL_PYTHON_DIR" || exit 1
+cd "$MSSQL_PYTHON_DIR" || exit 2
 mkdir -p "$RESULTS_DIR"
 rm -f "$RESULTS_DIR"/*.xml
 
@@ -55,14 +60,15 @@ xml_escape() {
 
 write_report_stub() {
     local name="$1" kind="$2" reason="$3" out="$4"
-    local safe_reason
+    local safe_reason safe_name
     safe_reason="$(xml_escape "$reason")"
+    safe_name="$(xml_escape "$name")"
     if [ "$kind" = "skipped" ]; then
         cat > "$out" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <testsuites>
-  <testsuite name="$name" tests="1" errors="0" failures="0" skipped="1" time="0">
-    <testcase classname="mssql_odbc_swap.$name" name="pytest_process" time="0">
+  <testsuite name="$safe_name" tests="1" errors="0" failures="0" skipped="1" time="0">
+    <testcase classname="mssql_odbc_swap.$safe_name" name="pytest_process" time="0">
       <skipped type="pytest.skip" message="$safe_reason"/>
     </testcase>
   </testsuite>
@@ -72,9 +78,9 @@ XML
         cat > "$out" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <testsuites>
-  <testsuite name="$name" tests="1" errors="1" failures="0" skipped="0" time="0">
-    <testcase classname="mssql_odbc_swap.$name" name="pytest_process" time="0">
-      <error type="ProcessTerminated" message="$safe_reason">The pytest process for $name terminated abnormally under the mssql-odbc driver, so no per-test results were produced for this file.</error>
+  <testsuite name="$safe_name" tests="1" errors="1" failures="0" skipped="0" time="0">
+    <testcase classname="mssql_odbc_swap.$safe_name" name="pytest_process" time="0">
+      <error type="ProcessTerminated" message="$safe_reason">The pytest process for $safe_name terminated abnormally under the mssql-odbc driver, so no per-test results were produced for this file.</error>
     </testcase>
   </testsuite>
 </testsuites>
@@ -82,11 +88,13 @@ XML
     fi
 }
 
-mapfile -t TEST_FILES < <(find tests -maxdepth 1 -name 'test_*.py' -type f | sort)
+# Not depth-limited: upstream's tests/ is flat today, but a future subdirectory
+# would otherwise vanish from this job while the summary still looked complete.
+mapfile -t TEST_FILES < <(find tests -name 'test_*.py' -type f | sort)
 
 if [ "${#TEST_FILES[@]}" -eq 0 ]; then
     echo "##[error]No test files found under $MSSQL_PYTHON_DIR/tests"
-    exit 1
+    exit 2
 fi
 
 # Convert a `timeout`-style duration (30, 45s, 10m, 2h) to seconds.
@@ -108,7 +116,7 @@ TOTAL_BUDGET_S="$(to_seconds "$PYTEST_TOTAL_BUDGET")"
 if ! python -m pytest --version >/dev/null 2>&1; then
     echo "##[error]python -m pytest is not usable in this environment - aborting before the suite runs"
     python -m pytest --version || true
-    exit 1
+    exit 2
 fi
 
 echo "Running ${#TEST_FILES[@]} mssql-python test files against the mssql-odbc driver"
@@ -139,12 +147,19 @@ for idx in "${!TEST_FILES[@]}"; do
         break
     fi
 
-    # Never let one file overrun what is left of the aggregate budget.
+    # Never let one file overrun what is left of the aggregate budget. A clamped
+    # slice is labelled so a short timeout reads as budget pressure, not a fast
+    # driver hang.
     slice="$FILE_BUDGET_S"
-    [ "$slice" -gt "$remaining" ] && slice="$remaining"
+    clamp_note=""
+    if [ "$slice" -gt "$remaining" ]; then
+        slice="$remaining"
+        clamp_note=", budget-clamped"
+    fi
 
     echo ""
     echo "##[group]$test_file"
+    file_start=$SECONDS
     # SIGKILL 60s after SIGTERM in case the driver wedges in an uninterruptible call.
     timeout --kill-after=60s "${slice}s" \
         python -m pytest "$test_file" -v \
@@ -152,6 +167,7 @@ for idx in "${!TEST_FILES[@]}"; do
         --capture=tee-sys \
         --cache-clear
     rc=$?
+    elapsed=$((SECONDS - file_start))
     echo "##[endgroup]"
 
     case "$rc" in
@@ -166,7 +182,10 @@ for idx in "${!TEST_FILES[@]}"; do
         # interpreter, not a driver defect. Do not report it as a crash.
         125|126|127)
             status="HARNESS ERROR (exit $rc)"; kind="error"; harness_error=$((harness_error + 1)) ;;
-        124|137) status="TIMED OUT after ${slice}s"; kind="error"; timedout=$((timedout + 1)) ;;
+        124) status="TIMED OUT after ${elapsed}s (limit ${slice}s${clamp_note})"; kind="error"; timedout=$((timedout + 1)) ;;
+        # 128+SIGKILL. Either `timeout --kill-after` finishing the job, or the
+        # kernel OOM killer - the elapsed time against the limit tells them apart.
+        137) status="KILLED by SIGKILL after ${elapsed}s (limit ${slice}s${clamp_note} - timeout or OOM)"; kind="error"; timedout=$((timedout + 1)) ;;
         *)
             if [ "$rc" -gt 128 ]; then
                 status="CRASHED (signal $((rc - 128)))"
@@ -182,7 +201,7 @@ for idx in "${!TEST_FILES[@]}"; do
     # test cases, which surfaces as nothing at all in the Tests tab. Overwrite it
     # so every file has exactly one visible outcome.
     if [ "$kind" = "skipped" ]; then
-        write_report_stub "$name" skipped "$status" "$report"
+        write_report_stub "$name" "skipped" "$status" "$report"
         echo "$name: $status"
     elif [ ! -s "$report" ]; then
         write_report_stub "$name" "$kind" "$status" "$report"
@@ -203,11 +222,19 @@ echo "==============================================================="
 echo "files: ${#TEST_FILES[@]} | passed: $passed | failed: $failed | crashed: $crashed | timed out: $timedout | no tests: $empty | skipped: $skipped | harness errors: $harness_error"
 echo "==============================================================="
 
+# The two failure modes need distinct exit codes: a broken environment must be a
+# loud, actionable red, while driver test failures are the expected baseline
+# while mssql-odbc is under development. Collapsing both into exit 1 under the
+# step's error handling makes them indistinguishable.
+#   2 -> harness could not run the tests (environment defect)
+#   1 -> tests ran and did not fully pass (driver defect, advisory)
+#   0 -> everything passed
 if [ "$harness_error" -gt 0 ]; then
     echo "##[error]$harness_error file(s) could not be executed - this indicates a broken test environment, not a driver defect"
+    exit 2
 fi
 
-if [ "$failed" -gt 0 ] || [ "$crashed" -gt 0 ] || [ "$timedout" -gt 0 ] || [ "$harness_error" -gt 0 ]; then
+if [ "$failed" -gt 0 ] || [ "$crashed" -gt 0 ] || [ "$timedout" -gt 0 ]; then
     echo "##[warning]mssql-python tests did not fully pass against the mssql-odbc driver (expected while the driver is in development)"
     exit 1
 fi
