@@ -20,9 +20,8 @@ Tests that need real Azure AD infra or Kerberos are skipped unless env vars are 
 
 import os
 import re
-from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 from dotenv import load_dotenv
@@ -133,78 +132,6 @@ def _expect_connect_error(conn_str, pattern=None):
             f"Expected pattern '{pattern}' in error: {exc_info.value}"
         )
     return exc_info
-
-
-@contextmanager
-def _no_real_entra_auth():
-    """Stub the azure-identity credential boundary so AD-mode connects never
-    trigger a real interactive/default/managed-identity flow in CI.
-
-    mssql_python.auth imports these credential classes lazily from
-    ``azure.identity`` inside its token method, so patching the public
-    ``azure.identity`` symbols is picked up at call time. We deliberately patch
-    this stable public boundary instead of any mssql-python-internal token
-    helper (the old ``auth.get_auth_token`` was renamed upstream), so this test
-    stays decoupled from mssql-python refactors.
-    """
-    try:
-        import azure.identity  # noqa: F401
-    except ImportError:
-        # azure-identity absent: the AD path fails on its own, still an error.
-        yield
-        return
-
-    patchers = []
-    for name in (
-        "InteractiveBrowserCredential",
-        "DefaultAzureCredential",
-        "DeviceCodeCredential",
-        "ManagedIdentityCredential",
-    ):
-        if hasattr(azure.identity, name):
-            stub = MagicMock()
-            stub.return_value.get_token.side_effect = RuntimeError(
-                "stubbed: no real Entra auth in CI"
-            )
-            patchers.append(patch(f"azure.identity.{name}", stub))
-    for p in patchers:
-        p.start()
-    try:
-        yield
-    finally:
-        for p in patchers:
-            p.stop()
-
-
-def _assert_tc_auth_clash(auth_mode):
-    """TC=Yes + an Authentication keyword is a clash that must be rejected.
-
-    Two independent legs:
-      1. py-core (the mssql-rs behavior): ``validate_auth`` rejects the clash at
-         ``PyCoreConnection`` construction, before any token acquisition. This
-         is deterministic and needs neither mssql-python nor Azure infra.
-      2. mssql-python/ODBC parity: with real Entra auth stubbed out, ``connect``
-         must still reject the combo rather than succeed or block.
-    """
-    # Leg 1 — py-core, fully decoupled from mssql-python.
-    import mssql_py_core
-
-    ctx = {
-        "server": _server(),
-        "database": _database(),
-        "trust_server_certificate": True,
-        "encryption": "Optional",
-        "trusted_connection": "Yes",
-        "authentication": auth_mode,
-    }
-    with pytest.raises(Exception) as exc_info:
-        mssql_py_core.PyCoreConnection(ctx)
-    assert "Cannot use Authentication with Trusted_Connection" in str(exc_info.value)
-
-    # Leg 2 — mssql-python/ODBC parity, decoupled from internal token symbols.
-    cs = _base(tc="Yes", auth=auth_mode)
-    with _no_real_entra_auth():
-        _expect_connect_error(cs)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -473,14 +400,22 @@ class TestAuthTcClash:
         cs = _base(tc="Yes", auth="ActiveDirectoryIntegrated")
         _expect_connect_error(cs)
 
-    def test_row27_tc_yes_ad_interactive(self):
-        """#27  TC=Yes + ADInteractive → ERROR.
-
-        py-core rejects the TC+Authentication clash at construction; the
-        mssql-python parity leg runs with Entra auth stubbed so no real
-        interactive browser login is attempted in CI.
-        """
-        _assert_tc_auth_clash("ActiveDirectoryInteractive")
+    # #27 (ADInteractive) and ADDefault are intentionally NOT exercised here.
+    #
+    # The mssql-rs behavior (reject TC=Yes + an Authentication keyword) is
+    # asserted deterministically against py-core in the normal, mssql-python-
+    # decoupled suite:
+    #   tests/test_auth_resolution.py::TestAuthTcClashes::test_27_ad_interactive_tc
+    #   tests/test_auth_resolution.py::TestAuthTcClashesExtended::test_ad_default_tc
+    #
+    # An ODBC/mssql-python "parity" leg can't add signal for these two rows:
+    # mssql-python strips Trusted_Connection for token-bearing AD modes
+    # (Default and non-Windows Interactive go through the token factory, whose
+    # keys — including Trusted_Connection — are removed by remove_sensitive_params
+    # before ODBC sees them), so the driver never observes a clash. A test here
+    # could only "pass" by faulting elsewhere (stubbed/absent Entra infra),
+    # which is unfalsifiable. ODBC's own behavior for these modes is covered by
+    # mssql-python's suite.
 
     def test_row28_tc_yes_admsi(self):
         """#28  TC=Yes + ADMSI → ERROR."""
@@ -491,16 +426,6 @@ class TestAuthTcClash:
         """#29  TC=Yes + ADSPA → ERROR."""
         cs = _base(tc="Yes", auth="ActiveDirectoryServicePrincipal", uid="c", pwd="s")
         _expect_connect_error(cs)
-
-    def test_tc_yes_ad_default(self):
-        """TC=Yes + ADDefault → ERROR (not in §3.3 — ADDefault is
-        mssql-python-specific).
-
-        py-core rejects the TC+Authentication clash at construction; the
-        mssql-python parity leg runs with Entra auth stubbed so the default
-        credential chain is not exercised in CI.
-        """
-        _assert_tc_auth_clash("ActiveDirectoryDefault")
 
 
 # ═════════════════════════════════════════════════════════════════
