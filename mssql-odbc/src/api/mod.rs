@@ -30,6 +30,7 @@ pub(crate) mod set_env_attr;
 pub(crate) mod set_stmt_attr;
 pub(crate) mod sqlstate;
 pub(crate) mod util;
+mod value_text;
 
 // Exported ODBC entry points — the driver's public API surface.
 // All `#[unsafe(no_mangle)] pub extern "C"` symbols are defined here.

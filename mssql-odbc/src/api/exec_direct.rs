@@ -278,11 +278,11 @@ mod tests {
         // Batch response: a DML statement (row count + MORE) then a trailing
         // SELECT. The first statement surfaces as a no-row result with the batch
         // still open.
-        let client = tds_client_from_tokens(vec![
+        let client = Box::new(tds_client_from_tokens(vec![
             done_more_with_count(5),
             col_metadata_empty(),
             done_no_more(),
-        ]);
+        ]));
         {
             let mut ds = dbc.inner.lock().unwrap();
             ds.client = Some(client);
@@ -317,12 +317,12 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let client = tds_client_from_tokens(vec![
+        let client = Box::new(tds_client_from_tokens(vec![
             info(0, 0, "print in batch"),
             done_more_with_count(1),
             col_metadata_empty(),
             done_no_more(),
-        ]);
+        ]));
         {
             let mut ds = dbc.inner.lock().unwrap();
             ds.client = Some(client);

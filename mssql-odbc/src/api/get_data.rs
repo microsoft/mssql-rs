@@ -12,13 +12,15 @@ use super::odbc_types::{
 };
 use super::sqlstate::*;
 use crate::api::odbc_types::SqlWChar;
-use crate::api::util::{copy_with_nul, write_if_some};
+use crate::api::util::{copy_with_nul, drive_read, write_if_some};
+use crate::api::value_text::{TextScratch, column_value_to_text_in};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, PlpChunk};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::PlpEncoding;
+use std::pin::pin;
 
 /// Implements SQLGetData for current-row retrieval.
 ///
@@ -276,7 +278,8 @@ fn write_column_as_text(
         return SQL_SUCCESS;
     }
 
-    let Some(as_text) = column_value_to_text(value) else {
+    let mut scratch = TextScratch::new();
+    let Some(as_text) = column_value_to_text_in(value, &mut scratch) else {
         // Unconvertible *column* type: HYC00 is a soft failure. Leave the value
         // in place (do not consume) so a retry with another C type can work.
         post_sql_error(
@@ -287,7 +290,7 @@ fn write_column_as_text(
         );
         return SQL_ERROR;
     };
-    // `value` borrow ends here — `as_text` is owned.
+    // `value` borrow ends here — `as_text` borrows only the local scratch.
 
     // Resume from where a prior truncated read of this column left off. The
     // offset unit matches the target C type (bytes for CHAR, UTF-16 code units
@@ -393,7 +396,7 @@ fn resume_row_to_column(
     };
 
     let target = column_number - 1; // 0-based
-    let cursor_result = dbc.runtime.block_on(client.read_row_column(target));
+    let cursor_result = drive_read(&dbc.runtime, pin!(client.read_row_column(target)));
 
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("SQLGetData: dbc mutex poisoned after row resume");
@@ -626,9 +629,10 @@ fn stream_active_plp_chunk(
         client
     };
 
-    let read_result = dbc
-        .runtime
-        .block_on(client.read_active_plp_chunk(&mut payload));
+    let read_result = drive_read(
+        &dbc.runtime,
+        pin!(client.read_active_plp_chunk(&mut payload)),
+    );
 
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("SQLGetData: dbc mutex poisoned after PLP read");
@@ -851,22 +855,6 @@ fn write_string_result<T: Copy + Default>(
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
-    }
-}
-
-fn column_value_to_text(v: &ColumnValues) -> Option<String> {
-    match v {
-        ColumnValues::TinyInt(x) => Some(x.to_string()),
-        ColumnValues::SmallInt(x) => Some(x.to_string()),
-        ColumnValues::Int(x) => Some(x.to_string()),
-        ColumnValues::BigInt(x) => Some(x.to_string()),
-        ColumnValues::Real(x) => Some(x.to_string()),
-        ColumnValues::Float(x) => Some(x.to_string()),
-        ColumnValues::Bit(x) => Some(if *x { "1".into() } else { "0".into() }),
-        ColumnValues::String(s) => Some(s.to_utf8_string()),
-        ColumnValues::Uuid(u) => Some(u.to_string()),
-        ColumnValues::Null => Some(String::new()),
-        _ => None,
     }
 }
 
@@ -1135,50 +1123,35 @@ mod tests {
         assert_eq!(out, "\u{FFFD}");
     }
 
-    /// `column_value_to_text` renders scalar column values as text and returns
-    /// `None` for types with no textual SQLGetData rendering.
+    /// `column_value_to_text_in` renders scalar column values as text and
+    /// returns `None` for types with no textual SQLGetData rendering. Driving
+    /// the production entry point covers both the scratch-buffer fast path and
+    /// the allocating fallback it delegates to.
     #[test]
     fn column_value_to_text_renders_scalars() {
         use mssql_tds::datatypes::sql_string::SqlString;
+        fn render(v: &ColumnValues) -> Option<String> {
+            let mut scratch = TextScratch::new();
+            column_value_to_text_in(v, &mut scratch).map(|t| t.into_owned())
+        }
+        assert_eq!(render(&ColumnValues::TinyInt(7)).as_deref(), Some("7"));
+        assert_eq!(render(&ColumnValues::SmallInt(-3)).as_deref(), Some("-3"));
+        assert_eq!(render(&ColumnValues::Int(42)).as_deref(), Some("42"));
+        assert_eq!(render(&ColumnValues::BigInt(-9)).as_deref(), Some("-9"));
+        assert_eq!(render(&ColumnValues::Bit(true)).as_deref(), Some("1"));
+        assert_eq!(render(&ColumnValues::Bit(false)).as_deref(), Some("0"));
+        assert_eq!(render(&ColumnValues::Null).as_deref(), Some(""));
         assert_eq!(
-            column_value_to_text(&ColumnValues::TinyInt(7)).as_deref(),
-            Some("7")
-        );
-        assert_eq!(
-            column_value_to_text(&ColumnValues::SmallInt(-3)).as_deref(),
-            Some("-3")
-        );
-        assert_eq!(
-            column_value_to_text(&ColumnValues::Int(42)).as_deref(),
-            Some("42")
-        );
-        assert_eq!(
-            column_value_to_text(&ColumnValues::BigInt(-9)).as_deref(),
-            Some("-9")
-        );
-        assert_eq!(
-            column_value_to_text(&ColumnValues::Bit(true)).as_deref(),
-            Some("1")
-        );
-        assert_eq!(
-            column_value_to_text(&ColumnValues::Bit(false)).as_deref(),
-            Some("0")
-        );
-        assert_eq!(
-            column_value_to_text(&ColumnValues::Null).as_deref(),
-            Some("")
-        );
-        assert_eq!(
-            column_value_to_text(&ColumnValues::String(SqlString::from_utf8_string(
+            render(&ColumnValues::String(SqlString::from_utf8_string(
                 "hi".into()
             )))
             .as_deref(),
             Some("hi")
         );
-        // A type with no textual rendering in this helper yields None.
+        // Binary data converts to its uppercase hex literal (ODBC SQL_C_CHAR form).
         assert_eq!(
-            column_value_to_text(&ColumnValues::Bytes(vec![1, 2, 3])),
-            None
+            render(&ColumnValues::Bytes(vec![1, 2, 3])).as_deref(),
+            Some("010203")
         );
     }
 }
