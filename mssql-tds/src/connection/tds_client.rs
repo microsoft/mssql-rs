@@ -856,7 +856,12 @@ impl TdsClient {
     ///
     /// # Returns
     ///
-    /// Returns the number of rows actually inserted by SQL Server.
+    /// Returns the number of rows this client serialized to the wire, matching
+    /// `Microsoft.Data.SqlClient`'s `SqlBulkCopy.RowsCopied` semantics. This is
+    /// a client-side count, not the server's DONE token row count, so it is not
+    /// affected by distributed engines that acknowledge one load with multiple
+    /// DONE_COUNT tokens (issue #209). It also does not reflect server-side row
+    /// count changes from triggers on the destination table.
     #[instrument(skip(self, rows), level = "info")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_bulk_load_streaming_zerocopy<R>(
@@ -1024,16 +1029,22 @@ impl TdsClient {
         }
 
         // STEP 4: End streaming (write DONE token and finalize)
-        let _rows_written = writer.end().await?;
+        let rows_written = writer.end().await?;
 
-        // STEP 5: Read the final response with row count
-        let rows_affected = self.consume_done_token().await?;
+        // STEP 5: Drain the server response for error handling and INFO capture.
+        // Its returned count is informational only; callers receive the client-side
+        // `rows_written` (see the `# Returns` doc and `consume_done_token`).
+        self.consume_done_token().await?;
 
-        Ok(rows_affected)
+        Ok(rows_written)
     }
 
     /// Consumes response tokens until a DONE token is received.
-    /// Returns the row count from the DONE token.
+    ///
+    /// Returns the last counted DONE row count. This value is currently
+    /// informational: both call sites discard it, and the bulk-load path reports
+    /// the client-side rows written instead (issue #209). It is retained for
+    /// error/INFO draining and as defensive last-DONE_COUNT-wins hardening.
     ///
     /// This helper method implements the standard TDS response consumption pattern,
     /// handling INFO, ERROR, and DONE tokens appropriately.
@@ -1065,8 +1076,12 @@ impl TdsClient {
                         ));
                     }
 
-                    // Accumulate row count from multiple DONE tokens
-                    rows_affected += done.row_count;
+                    // Distributed engines send multiple DONE_COUNT tokens each
+                    // carrying the full count; summing them double-counts (#209).
+                    // Last counted DONE wins.
+                    if done.has_count() {
+                        rows_affected = done.row_count;
+                    }
 
                     // Stop when we receive a DONE token without the MORE flag
                     if !done.has_more() {
@@ -1115,7 +1130,8 @@ impl TdsClient {
     /// Sends a SQL batch and consumes the response without expecting column metadata.
     /// This is used for commands that don't return result sets (DML statements, etc.).
     ///
-    /// Returns the row count from the DONE token.
+    /// Returns the DONE token row count. Its only caller (the INSERT BULK preamble)
+    /// discards it; see `consume_done_token` for why the count is informational.
     async fn send_batch_and_consume_response(
         &mut self,
         sql_command: String,
@@ -4719,6 +4735,123 @@ mod tests {
         let messages = client.take_info_messages();
         assert_eq!(messages.len(), 2);
         assert!(client.info_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn consume_done_token_takes_single_counted_done() {
+        // A normal (non-distributed) engine reports the bulk-load row count in a
+        // single DONE_COUNT token.
+        let mut client =
+            create_test_client_with_tokens(vec![done_count(CurrentCommand::Insert, 5000, false)]);
+
+        let rows_affected = client.consume_done_token().await.unwrap();
+
+        assert_eq!(rows_affected, 5000);
+    }
+
+    #[tokio::test]
+    async fn consume_done_token_does_not_double_count_distributed_dones() {
+        // Regression for #209: a distributed engine (Fabric Warehouse) acknowledges
+        // one bulk load with two DONE_COUNT tokens, each carrying the full count.
+        // Summing them would report 2x; the authoritative value is the count itself.
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Insert, 5000, true),
+            done_count(CurrentCommand::Insert, 5000, false),
+        ]);
+
+        let rows_affected = client.consume_done_token().await.unwrap();
+
+        assert_eq!(rows_affected, 5000);
+    }
+
+    #[tokio::test]
+    async fn consume_done_token_ignores_uncounted_dones() {
+        // A DONE without the COUNT flag carries a meaningless row_count that must
+        // not contribute to the total. This uncounted token deliberately carries a
+        // non-zero row_count (7) so the pre-fix summing behavior would report 3007;
+        // reporting 3000 proves the has_count() guard, not an incidental zero.
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Done(DoneToken {
+                status: DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Insert,
+                row_count: 7,
+            }),
+            done_count(CurrentCommand::Insert, 3000, false),
+        ]);
+
+        let rows_affected = client.consume_done_token().await.unwrap();
+
+        assert_eq!(rows_affected, 3000);
+    }
+
+    /// A single-INT-column row used to drive the streaming bulk-load path.
+    struct IntRow(i32);
+
+    #[async_trait]
+    impl BulkLoadRow for IntRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            use crate::datatypes::column_values::ColumnValues;
+            writer
+                .write_column_value(*column_index, &ColumnValues::Int(self.0))
+                .await?;
+            *column_index += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_load_reports_client_rows_not_server_done_count() {
+        // Regression for #209: the count reported to callers must be the number
+        // of rows the client streamed to the wire — matching
+        // `SqlBulkCopy.RowsCopied` and ODBC bcp (`llRowsCopiedInLastBCP`), both
+        // of which count outgoing rows client-side — and must never be derived
+        // from the server's DONE_COUNT. Distributed engines (Fabric Warehouse,
+        // EngineEdition 11) acknowledge one bulk load with more than one
+        // DONE_COUNT token, so trusting the server count double-counted.
+        //
+        // The mock server here returns a deliberately wrong count (999) in each
+        // DONE_COUNT token; the client wrote 3 rows and must report exactly 3,
+        // which is only possible if the reported value is the client-side count.
+        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+        use crate::datatypes::sqldatatypes::TdsDataType;
+
+        let mut client = create_test_client_with_tokens(vec![
+            // STEP 2: response to the INSERT BULK preamble command.
+            done_no_more(),
+            // STEP 5: distributed bulk-load acknowledgement — two DONE_COUNT
+            // tokens, each carrying a bogus (non-client) count.
+            done_count(CurrentCommand::Insert, 999, true),
+            done_count(CurrentCommand::BulkInsert, 999, false),
+        ]);
+
+        let column_metadata = vec![
+            BulkCopyColumnMetadata::new("id", SqlDbType::Int, TdsDataType::Int4 as u8)
+                .with_length(4, TypeLength::Fixed(4)),
+        ];
+
+        let rows = vec![IntRow(10), IntRow(20), IntRow(30)];
+
+        let reported = client
+            .execute_bulk_load_streaming_zerocopy(
+                "#t".to_string(),
+                column_metadata,
+                BulkCopyOptions::default(),
+                None,
+                None,
+                rows.into_iter(),
+                &[],
+            )
+            .await
+            .expect("bulk load should succeed against the mock transport");
+
+        assert_eq!(
+            reported, 3,
+            "must report the 3 client-written rows, not the server DONE_COUNT (999)"
+        );
     }
 
     #[test]
