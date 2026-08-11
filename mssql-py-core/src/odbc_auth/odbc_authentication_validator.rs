@@ -263,6 +263,25 @@ mod tests {
         assert!(err.to_string().contains("Trusted_Connection"));
     }
 
+    /// Durable, Python-free guard for the class of drift in #223: pins the exact
+    /// clash message across representative modes (incl. the AD modes whose Python
+    /// e2e coverage was removed because mssql-python strips Trusted_Connection).
+    #[test]
+    fn auth_plus_tc_rejected() {
+        for auth in [
+            "SqlPassword",
+            "ActiveDirectoryInteractive",
+            "ActiveDirectoryDefault",
+        ] {
+            let err = validate_auth(Some(auth), Some(true), "", "", None).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Cannot use Authentication with Trusted_Connection"),
+                "unexpected error for {auth}: {err}"
+            );
+        }
+    }
+
     // ---------------------------------------------------------------
     // SqlPassword requires UID + PWD
     // ---------------------------------------------------------------
