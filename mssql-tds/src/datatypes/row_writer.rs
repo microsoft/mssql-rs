@@ -191,6 +191,70 @@ impl RowWriter for DefaultRowWriter {
     }
 }
 
+/// A `RowWriter` that keeps a single value on the stack.
+///
+/// The pull cursor (`SQLGetData`) decodes exactly one column per call, so the
+/// `Vec` inside [`DefaultRowWriter`] costs a heap allocation and free per row
+/// to hold one value. This writer holds it inline instead.
+///
+/// Only the last value written survives, which matches the cursor's
+/// `ColumnPolicy::DecodeOne` contract — skipped columns write nothing.
+#[derive(Default)]
+pub struct SingleValueWriter {
+    value: Option<ColumnValues>,
+}
+
+impl SingleValueWriter {
+    /// Takes the decoded value, leaving the writer ready for reuse.
+    pub fn take_value(&mut self) -> Option<ColumnValues> {
+        self.value.take()
+    }
+}
+
+macro_rules! single_value_writes {
+    ($($method:ident($ty:ty) => $variant:ident),* $(,)?) => {
+        $(
+            fn $method(&mut self, _col: usize, val: $ty) {
+                self.value = Some(ColumnValues::$variant(val));
+            }
+        )*
+    };
+}
+
+impl RowWriter for SingleValueWriter {
+    fn write_null(&mut self, _col: usize) {
+        self.value = Some(ColumnValues::Null);
+    }
+
+    single_value_writes! {
+        write_bool(bool) => Bit,
+        write_u8(u8) => TinyInt,
+        write_i16(i16) => SmallInt,
+        write_i32(i32) => Int,
+        write_i64(i64) => BigInt,
+        write_f32(f32) => Real,
+        write_f64(f64) => Float,
+        write_string(SqlString) => String,
+        write_bytes(Vec<u8>) => Bytes,
+        write_decimal(DecimalParts) => Decimal,
+        write_numeric(DecimalParts) => Numeric,
+        write_date(SqlDate) => Date,
+        write_time(SqlTime) => Time,
+        write_datetime(SqlDateTime) => DateTime,
+        write_smalldatetime(SqlSmallDateTime) => SmallDateTime,
+        write_datetime2(SqlDateTime2) => DateTime2,
+        write_datetimeoffset(SqlDateTimeOffset) => DateTimeOffset,
+        write_money(SqlMoney) => Money,
+        write_smallmoney(SqlSmallMoney) => SmallMoney,
+        write_uuid(Uuid) => Uuid,
+        write_xml(SqlXml) => Xml,
+        write_json(SqlJson) => Json,
+        write_vector(SqlVector) => Vector,
+    }
+
+    fn end_row(&mut self) {}
+}
+
 /// A `RowWriter` that discards every value it receives.
 ///
 /// Used by the decode driver's *skip* path (drain-to-end and skip-to-column):

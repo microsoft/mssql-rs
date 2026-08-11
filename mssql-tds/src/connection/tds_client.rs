@@ -6,7 +6,9 @@ use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{ClientContext, ExecutionColumnEncryptionSetting};
 use crate::connection::session_recovery::RecoveryContext;
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
-use crate::datatypes::row_writer::{DefaultRowWriter, DiscardRowWriter, RowWriter};
+use crate::datatypes::row_writer::{
+    DefaultRowWriter, DiscardRowWriter, RowWriter, SingleValueWriter,
+};
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sqltypes::SqlType;
 use crate::error::Error::UsageError;
@@ -3170,7 +3172,7 @@ impl TdsClient {
             && pause_state.nbc_null_bitmap.is_none()
             && pause_state.decryptor.is_none()
         {
-            let mut capture = DefaultRowWriter::new(1);
+            let mut capture = SingleValueWriter::default();
             let decoded = {
                 let column = &pause_state.columns()[target];
                 self.transport
@@ -3178,7 +3180,7 @@ impl TdsClient {
             };
 
             if decoded {
-                let value = capture.take_row().into_iter().next().ok_or_else(|| {
+                let value = capture.take_value().ok_or_else(|| {
                     crate::error::Error::ProtocolError(format!(
                         "Decoder produced no value for non-null column {target}"
                     ))
@@ -3197,7 +3199,7 @@ impl TdsClient {
             }
         }
 
-        let mut capture = DefaultRowWriter::new(1);
+        let mut capture = SingleValueWriter::default();
         let start = Instant::now();
         let result = self
             .transport
@@ -3214,7 +3216,7 @@ impl TdsClient {
         match result {
             RowReadResult::RowPaused(next_pause) => {
                 self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(next_pause));
-                let value = capture.take_row().into_iter().next().ok_or_else(|| {
+                let value = capture.take_value().ok_or_else(|| {
                     crate::error::Error::ProtocolError(format!(
                         "Decoder produced no value for non-null column {target}"
                     ))
@@ -3227,7 +3229,7 @@ impl TdsClient {
                 // pull reports `RowEnded`. Callers needing to distinguish a
                 // rewind from "no row positioned" track the column themselves.
                 self.active_row_read_state = ActiveRowReadState::Idle;
-                let value = capture.take_row().into_iter().next().ok_or_else(|| {
+                let value = capture.take_value().ok_or_else(|| {
                     crate::error::Error::ProtocolError(format!(
                         "Decoder produced no value for non-null column {target}"
                     ))
