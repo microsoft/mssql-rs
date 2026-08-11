@@ -2114,7 +2114,14 @@ impl TdsClient {
                     let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
                     let mut drain_errors = self.drain_stream().await?;
                     all_errors.append(&mut drain_errors);
+                    // The error drained the rest of the batch to its terminal
+                    // DONE, so the connection is idle again. Clear the batch
+                    // state so a subsequent `next_row` / `advance` does not
+                    // pass the `maybe_has_unread_rows` guard and read a stream
+                    // that is already consumed (mirrors `handle_row_read_token`).
                     self.execution_context.set_has_open_batch(false);
+                    self.current_result_set_has_been_read_till_end = true;
+                    self.current_metadata = None;
                     return Err(crate::error::Error::from_sql_errors(all_errors));
                 }
                 Tokens::Info(info_token) => {
@@ -5930,6 +5937,37 @@ mod tests {
         assert_eq!(diagnostics.errors.len(), 1);
         assert_eq!(diagnostics.errors[0].number, 1222);
         assert_eq!(diagnostics.errors[0].message, "boom");
+    }
+
+    /// After the error path drains the batch to its terminal DONE, the client
+    /// must be left idle: `advance_to_result_boundary`'s `Error` branch resets
+    /// the result-set state so a caller that calls `next_row` after `execute`
+    /// returned `Err` does not pass the `maybe_has_unread_rows` guard and read a
+    /// stream that is already fully consumed.
+    #[tokio::test]
+    async fn drain_on_error_leaves_client_idle_for_next_row() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_single_int_bytes("n"));
+        stream.extend(row_int_bytes(1));
+        stream.extend(done_bytes(DONE_FINAL));
+
+        let mut client = client_over_bytes(stream);
+        client
+            .advance_to_result_boundary()
+            .await
+            .expect_err("a statement error must surface as an error");
+
+        assert!(
+            !client.maybe_has_unread_rows(),
+            "drained error path must clear the unread-rows guard"
+        );
+        assert!(!client.on_rows(), "drained error path must clear metadata");
+        assert!(
+            !client.has_open_batch(),
+            "drained error path must close the batch"
+        );
     }
 
     /// Control: the same statement error followed by a *no-row* statement drains
