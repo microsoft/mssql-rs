@@ -45,6 +45,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   fired via `fire_triggers`) remain retrievable via `info_messages()` after the
   operation completes. On a mid-stream failure the completed batches' INFO is
   preserved and remains retrievable alongside the returned error.
+- `mssql-tds`: `BulkCopyResult::rows_affected` now reports the number of rows the
+  client serialized to the wire (matching `SqlBulkCopy.RowsCopied`) instead of the
+  server's `DONE_COUNT`. Fixes a doubled count on distributed engines that
+  acknowledge one load with multiple `DONE_COUNT` tokens (issue #209).
 
 ### Removed
 
