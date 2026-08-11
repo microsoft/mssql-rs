@@ -1861,7 +1861,19 @@ pub struct DecimalParts {
 
 impl fmt::Display for DecimalParts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_decimal_string())
+        let magnitude = self.magnitude();
+        if !self.is_positive {
+            f.write_str("-")?;
+        }
+        let width = usize::from(self.scale);
+        if width == 0 {
+            return write!(f, "{magnitude}");
+        }
+        match 10u128.checked_pow(u32::from(self.scale)) {
+            Some(divisor) => write!(f, "{}.{:0width$}", magnitude / divisor, magnitude % divisor),
+            // A scale past u128's range leaves no integer digits.
+            None => write!(f, "0.{magnitude:0width$}"),
+        }
     }
 }
 
@@ -2006,52 +2018,18 @@ impl DecimalParts {
         Self::from_string(&s, precision, scale)
     }
 
-    /// Convert DecimalParts to a string representation suitable for Python Decimal.
-    /// Returns a string like "123.45", "-0.01", etc.
-    fn to_decimal_string(&self) -> String {
-        // Convert int_parts to u128
-        // int_parts[0] is the least significant, int_parts[n-1] is most significant
-        let u128_value = self
-            .int_parts
+    /// Reassembles the little-endian 32-bit parts into a single magnitude.
+    fn magnitude(&self) -> u128 {
+        self.int_parts
             .iter()
             .enumerate()
             .fold(0u128, |acc, (i, &part)| {
                 acc + ((part as u32 as u128) << (i * 32))
-            });
-
-        let value_str = u128_value.to_string();
-
-        // Insert decimal point at the correct position
-        let result = if self.scale == 0 {
-            value_str
-        } else {
-            let scale_pos = self.scale as usize;
-            if value_str.len() <= scale_pos {
-                // Need to pad with leading zeros
-                format!("0.{}{}", "0".repeat(scale_pos - value_str.len()), value_str)
-            } else {
-                let split_pos = value_str.len() - scale_pos;
-                format!("{}.{}", &value_str[..split_pos], &value_str[split_pos..])
-            }
-        };
-
-        if self.is_positive {
-            result
-        } else {
-            format!("-{}", result)
-        }
+            })
     }
 
     fn to_f64(&self) -> f64 {
-        let u128_value = self
-            .int_parts
-            .iter()
-            .enumerate()
-            .fold(0u128, |acc, (i, &part)| {
-                acc + ((part as u32 as u128) << (i * 32))
-            });
-
-        let mut d_ret: f64 = u128_value as f64;
+        let mut d_ret: f64 = self.magnitude() as f64;
 
         d_ret /= 10.0_f64.powi(self.scale as i32);
 
@@ -2770,7 +2748,7 @@ mod test {
         assert!(parts.is_positive);
         assert_eq!(parts.scale, 2);
         assert_eq!(parts.precision, 10);
-        assert_eq!(parts.to_decimal_string(), "123.45");
+        assert_eq!(parts.to_string(), "123.45");
     }
 
     #[test]
@@ -2781,7 +2759,7 @@ mod test {
         assert!(!parts.is_positive);
         assert_eq!(parts.scale, 2);
         assert_eq!(parts.precision, 10);
-        assert_eq!(parts.to_decimal_string(), "-123.45");
+        assert_eq!(parts.to_string(), "-123.45");
     }
 
     #[test]
@@ -2791,7 +2769,7 @@ mod test {
         let parts = result.unwrap();
         assert!(parts.is_positive);
         assert_eq!(parts.scale, 0);
-        assert_eq!(parts.to_decimal_string(), "12345");
+        assert_eq!(parts.to_string(), "12345");
     }
 
     #[test]
@@ -2799,7 +2777,7 @@ mod test {
         let result = DecimalParts::from_string("00123.45", 10, 2);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), "123.45");
+        assert_eq!(parts.to_string(), "123.45");
     }
 
     #[test]
@@ -2807,7 +2785,7 @@ mod test {
         let result = DecimalParts::from_string("0.01", 10, 2);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), "0.01");
+        assert_eq!(parts.to_string(), "0.01");
     }
 
     #[test]
@@ -2815,7 +2793,7 @@ mod test {
         let result = DecimalParts::from_string("0", 10, 0);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), "0");
+        assert_eq!(parts.to_string(), "0");
     }
 
     #[test]
@@ -2823,7 +2801,7 @@ mod test {
         let result = DecimalParts::from_string("0.00", 10, 2);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), "0.00");
+        assert_eq!(parts.to_string(), "0.00");
     }
 
     #[test]
@@ -2832,7 +2810,7 @@ mod test {
         let result = DecimalParts::from_string("1.5", 10, 3);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), "1.500");
+        assert_eq!(parts.to_string(), "1.500");
     }
 
     #[test]
@@ -2841,7 +2819,7 @@ mod test {
         let result = DecimalParts::from_string(value, 38, 0);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), value);
+        assert_eq!(parts.to_string(), value);
     }
 
     #[test]
@@ -2849,7 +2827,7 @@ mod test {
         let result = DecimalParts::from_string("123.456789", 10, 6);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), "123.456789");
+        assert_eq!(parts.to_string(), "123.456789");
     }
 
     #[test]
@@ -2858,7 +2836,7 @@ mod test {
         let result = DecimalParts::from_string("00001.00", 5, 2);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), "1.00");
+        assert_eq!(parts.to_string(), "1.00");
     }
 
     #[test]
@@ -2867,7 +2845,7 @@ mod test {
         assert!(result.is_ok());
         let parts = result.unwrap();
         assert!(parts.is_positive);
-        assert_eq!(parts.to_decimal_string(), "123.45");
+        assert_eq!(parts.to_string(), "123.45");
     }
 
     // Error cases
@@ -2936,7 +2914,7 @@ mod test {
         let result = DecimalParts::from_string("0000123", 3, 0);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), "123");
+        assert_eq!(parts.to_string(), "123");
     }
 
     #[test]
@@ -2944,7 +2922,7 @@ mod test {
         let result = DecimalParts::from_string("  123.45  ", 10, 2);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), "123.45");
+        assert_eq!(parts.to_string(), "123.45");
     }
 
     #[test]
@@ -2953,7 +2931,7 @@ mod test {
         assert!(result.is_ok());
         let parts = result.unwrap();
         assert!(!parts.is_positive);
-        assert_eq!(parts.to_decimal_string(), "-0");
+        assert_eq!(parts.to_string(), "-0");
     }
 
     #[test]
@@ -2961,7 +2939,7 @@ mod test {
         let result = DecimalParts::from_string("0.0", 10, 1);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), "0.0");
+        assert_eq!(parts.to_string(), "0.0");
     }
 
     #[test]
@@ -2970,7 +2948,7 @@ mod test {
         let result = DecimalParts::from_string("12345", 5, 0);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), "12345");
+        assert_eq!(parts.to_string(), "12345");
     }
 
     #[test]
@@ -2979,7 +2957,7 @@ mod test {
         let result = DecimalParts::from_string("123.45", 5, 2);
         assert!(result.is_ok());
         let parts = result.unwrap();
-        assert_eq!(parts.to_decimal_string(), "123.45");
+        assert_eq!(parts.to_string(), "123.45");
     }
 
     // Vector deserialization tests
