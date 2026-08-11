@@ -155,10 +155,10 @@ impl<D: SqlTypeDecode + Default + Send + Sync, P: TdsPacketReader + Send + Sync>
                 (true, None) => {
                     // Either AE is disabled for this command (expected) or it is
                     // enabled but misconfigured (e.g. no key-store provider
-                    // registered). Log at debug so the misconfigured case stays
-                    // observable without flooding info on a per-cell basis (e.g.
-                    // when draining a large trailing rowset on an error path),
-                    // then decode the raw ciphertext varbinary.
+                    // registered). Log at debug so a per-cell diagnostic does not
+                    // flood info on the normal AE-disabled read path, then decode
+                    // the raw ciphertext varbinary. Kept in sync with the same
+                    // message in `io::token_stream::decode_or_decrypt_column`.
                     debug!(
                         column = %metadata.column_name,
                         "Encrypted column has no column-encryption decryptor available \

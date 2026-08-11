@@ -39,7 +39,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     core::{CancelHandle, TdsResult},
@@ -1856,6 +1856,7 @@ impl TdsClient {
         // that this drain exists to surface — and would overwrite
         // `self.current_decryptor` with a discarded set's metadata.
         let parser_context = ParserContext::ColumnMetadata(metadata, None);
+        let mut discarded_rows: u64 = 0;
         loop {
             let start = Instant::now();
             let mut writer = DiscardRowWriter;
@@ -1873,7 +1874,7 @@ impl TdsClient {
 
             match result {
                 RowReadResult::RowWritten => {
-                    info!("Discarding row while draining result set");
+                    discarded_rows += 1;
                 }
                 RowReadResult::RowPaused(_) | RowReadResult::PlpPaused(_) => {
                     return Err(crate::error::Error::ProtocolError(
@@ -1882,7 +1883,10 @@ impl TdsClient {
                 }
                 RowReadResult::Token(token) => match token {
                     Tokens::Done(done) | Tokens::DoneProc(done) | Tokens::DoneInProc(done) => {
-                        info!(?done, "Draining DONE token ending result set");
+                        info!(
+                            ?done,
+                            discarded_rows, "Draining DONE token ending result set"
+                        );
                         return Ok(!done.has_more());
                     }
                     Tokens::ColMetadata(_) => {
@@ -2112,16 +2116,21 @@ impl TdsClient {
                 Tokens::Error(error_token) => {
                     info!(?error_token);
                     let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
-                    let mut drain_errors = self.drain_stream().await?;
-                    all_errors.append(&mut drain_errors);
-                    // The error drained the rest of the batch to its terminal
-                    // DONE, so the connection is idle again. Clear the batch
-                    // state so a subsequent `next_row` / `advance` does not
-                    // pass the `maybe_has_unread_rows` guard and read a stream
-                    // that is already consumed (mirrors `handle_row_read_token`).
+                    let drain_result = self.drain_stream().await;
+                    // Reset batch state before propagating: the error terminates
+                    // the batch regardless of whether the drain fully consumed
+                    // it, so a subsequent `next_row` / `advance` must not pass
+                    // the `maybe_has_unread_rows` guard and read a stream we have
+                    // given up on (mirrors `handle_row_read_token`).
                     self.execution_context.set_has_open_batch(false);
                     self.current_result_set_has_been_read_till_end = true;
                     self.current_metadata = None;
+                    match drain_result {
+                        Ok(mut drain_errors) => all_errors.append(&mut drain_errors),
+                        Err(e) => {
+                            warn!(error = ?e, "Drain after statement error failed; connection may not be reusable");
+                        }
+                    }
                     return Err(crate::error::Error::from_sql_errors(all_errors));
                 }
                 Tokens::Info(info_token) => {
@@ -3444,15 +3453,20 @@ impl TdsClient {
             Tokens::Error(error_token) => {
                 info!(?error_token);
                 let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
-                let drain_errors = self.drain_stream().await?;
-                all_errors.extend(drain_errors);
-                // The error drained the rest of the batch to its terminal
-                // DONE, so the connection is idle again. Clear the batch
-                // state so a subsequent `close_query` / `advance` does not
-                // block trying to read a stream that is already consumed.
+                let drain_result = self.drain_stream().await;
+                // Reset batch state before propagating: the error terminates the
+                // batch regardless of whether the drain fully consumed it, so a
+                // subsequent `close_query` / `advance` does not block trying to
+                // read a stream we have given up on.
                 self.execution_context.set_has_open_batch(false);
                 self.current_result_set_has_been_read_till_end = true;
                 self.current_metadata = None;
+                match drain_result {
+                    Ok(drain_errors) => all_errors.extend(drain_errors),
+                    Err(e) => {
+                        warn!(error = ?e, "Drain after statement error failed; connection may not be reusable");
+                    }
+                }
                 Err(crate::error::Error::from_sql_errors(all_errors))
             }
             Tokens::ColMetadata(_) => Err(crate::error::Error::UsageError(
@@ -5967,6 +5981,38 @@ mod tests {
         assert!(
             !client.has_open_batch(),
             "drained error path must close the batch"
+        );
+    }
+
+    /// When the trailing result set is truncated mid-drain (the stream ends
+    /// before the terminal DONE), the drain fails — but the original SQL error
+    /// must still surface as the primary error and the client must be left idle
+    /// so the failed drain does not leave the batch marked open. Covers the
+    /// `Err` arm of the drain in `advance_to_result_boundary`'s `Error` branch.
+    #[tokio::test]
+    async fn drain_on_error_truncated_stream_still_surfaces_sql_error() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_single_int_bytes("n"));
+        // Stream ends here: no ROW, no terminal DONE — the drain read fails.
+
+        let mut client = client_over_bytes(stream);
+        let err = client
+            .advance_to_result_boundary()
+            .await
+            .expect_err("a statement error must surface as an error");
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+        assert_eq!(diagnostics.errors[0].message, "boom");
+        assert!(
+            !client.maybe_has_unread_rows(),
+            "a failed drain must still clear the unread-rows guard"
+        );
+        assert!(
+            !client.has_open_batch(),
+            "a failed drain must still close the batch"
         );
     }
 
