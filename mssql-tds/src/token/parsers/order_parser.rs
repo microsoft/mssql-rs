@@ -35,8 +35,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::packet_reader::tests::{TestPacketBuilder, create_network_transport_with_data};
     use crate::message::messages::PacketType;
+    use crate::test_packet_support::{TestPacketBuilder, create_network_transport_with_data};
 
     #[tokio::test]
     async fn test_parse_order_single_column() {
@@ -45,7 +45,7 @@ mod tests {
         builder.append_u16(2); // length: 1 column * 2 bytes
         builder.append_u16(1); // column index 1
 
-        let mut packet_reader = create_network_transport_with_data(&builder.build()).await;
+        let mut packet_reader = create_network_transport_with_data(&builder.build());
 
         let parser = OrderTokenParser::default();
         let context = ParserContext::default();
@@ -69,7 +69,7 @@ mod tests {
         builder.append_u16(3); // column index 3
         builder.append_u16(2); // column index 2
 
-        let mut packet_reader = create_network_transport_with_data(&builder.build()).await;
+        let mut packet_reader = create_network_transport_with_data(&builder.build());
 
         let parser = OrderTokenParser::default();
         let context = ParserContext::default();
@@ -92,7 +92,7 @@ mod tests {
         let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
         builder.append_u16(0); // length: 0 columns
 
-        let mut packet_reader = create_network_transport_with_data(&builder.build()).await;
+        let mut packet_reader = create_network_transport_with_data(&builder.build());
 
         let parser = OrderTokenParser::default();
         let context = ParserContext::default();
@@ -117,7 +117,7 @@ mod tests {
             builder.append_u16(i);
         }
 
-        let mut packet_reader = create_network_transport_with_data(&builder.build()).await;
+        let mut packet_reader = create_network_transport_with_data(&builder.build());
 
         let parser = OrderTokenParser::default();
         let context = ParserContext::default();

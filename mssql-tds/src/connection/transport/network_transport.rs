@@ -24,7 +24,7 @@ use crate::io::token_stream::{
 };
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
-use crate::message::messages::{Request, ResetConnectionMode};
+use crate::message::messages::{PacketStatusFlags, Request, ResetConnectionMode};
 use crate::token::tokens::{DoneStatus, Tokens};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
@@ -629,44 +629,6 @@ impl NetworkTransport {
         self.encryption = Some(encryption);
     }
 
-    /// Raw byte-level read, used only by transport tests. The production read
-    /// path is [`get_new_tds_packet`](Self::get_new_tds_packet), which reads
-    /// straight into the working buffer.
-    #[cfg(test)]
-    pub(crate) async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
-        if buffer.is_empty() {
-            return Err(crate::error::Error::UsageError(
-                "Buffer length must be greater than 0".to_string(),
-            ));
-        }
-        let bytes_read = match self.stream.as_mut() {
-            Some(stream) => match stream.read(buffer).await {
-                Ok(n) => n,
-                Err(e) => {
-                    // A read failure means the socket is broken; record it so the
-                    // cached liveness check reports the connection as dead.
-                    self.known_dead = true;
-                    return Err(e.into());
-                }
-            },
-            None => {
-                self.known_dead = true;
-                return Err(crate::error::Error::ConnectionClosed(
-                    "Cannot receive: connection has been closed".to_string(),
-                ));
-            }
-        };
-        if bytes_read == 0 {
-            // EOF — the server closed the connection.
-            self.known_dead = true;
-            Err(crate::error::Error::from(std::io::Error::from(
-                ErrorKind::UnexpectedEof,
-            )))
-        } else {
-            Ok(bytes_read)
-        }
-    }
-
     async fn enable_ssl_internal(&mut self) -> TdsResult<()> {
         // Take ownership of the stream temporarily
         let base_stream = self.stream.take().expect("Stream already taken");
@@ -946,6 +908,19 @@ impl NetworkTransport {
                 packet_size_from_header,
                 PacketWriter::PACKET_HEADER_SIZE
             )));
+        }
+
+        // A payload-free packet that is not the end of its message advances
+        // nothing, so a peer streaming them would spin the callers' "read until
+        // we have enough data" loops forever. An empty EOM packet is legal (it
+        // terminates a message), so only non-EOM ones are rejected.
+        let is_end_of_message = self.tds_read_buffer.working_buffer[base_offset + 1]
+            & PacketStatusFlags::Eom as u8
+            != 0;
+        if packet_size_from_header == PacketWriter::PACKET_HEADER_SIZE && !is_end_of_message {
+            return Err(crate::error::Error::ProtocolError(
+                "Received a payload-free TDS packet that is not end-of-message".to_string(),
+            ));
         }
 
         if packet_size_from_header > self.tds_read_buffer.max_packet_size {
@@ -1596,11 +1571,11 @@ pub(crate) mod tests {
     use crate::connection::transport::network_transport::Stream;
     use crate::connection::transport::ssl_handler::SslHandler;
     use crate::core::EncryptionOptions;
-    use crate::io::packet_reader::tests::{
+    use crate::message::messages::PacketType;
+    use crate::test_packet_support::{
         TestPacketBuilder, create_network_transport_with_chunked_data,
         create_network_transport_with_data, encode_utf16_le,
     };
-    use crate::message::messages::PacketType;
     use bytes::Bytes;
     use futures::SinkExt;
     use futures::StreamExt;
@@ -1644,37 +1619,6 @@ pub(crate) mod tests {
         )
     }
 
-    pub(crate) fn create_client_server_network_transport(
-        context: &ClientContext,
-    ) -> (NetworkTransport, NetworkTransport) {
-        let (client_side, server_side) = duplex(MAX_BUFFER_SIZE);
-
-        let ssl_handler = SslHandler {
-            server_host_name: context.transport_context.get_server_name().clone(),
-            encryption_options: context.encryption_options.clone(),
-        };
-
-        (
-            NetworkTransport::new(
-                Box::new(client_side),
-                ssl_handler,
-                context.packet_size as u32,
-                context.encryption_options.mode,
-                false,
-            ),
-            NetworkTransport::new(
-                Box::new(server_side),
-                SslHandler {
-                    server_host_name: context.transport_context.get_server_name().clone(),
-                    encryption_options: context.encryption_options.clone(),
-                },
-                context.packet_size as u32,
-                context.encryption_options.mode,
-                false,
-            ),
-        )
-    }
-
     #[tokio::test]
     async fn test_network_transport_send() {
         let context = ClientContext {
@@ -1708,62 +1652,6 @@ pub(crate) mod tests {
             .expect("Decode error");
 
         assert_eq!(received.as_ref(), &data_vector[..]);
-    }
-
-    /// A basic test showing that `receive` can read data from the transport's reader.
-    #[tokio::test]
-    async fn test_network_transport_receive() -> TdsResult<()> {
-        // 1) Create an in-memory duplex stream (client_side, server_side).
-        // Data will be written on the server_side and the network transport will read from the client side.
-        let (client_side, server_side) = duplex(1024);
-
-        // Mocks and defaults.
-        let context = ClientContext {
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
-            ..Default::default()
-        };
-        let ssl_handler = SslHandler {
-            server_host_name: context.transport_context.get_server_name().clone(),
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
-        };
-
-        // Optionally, shut down the writer so the reader sees EOF if all data is read
-        // client_writer.shutdown().await?;
-
-        // Build our transport
-        let mut transport = NetworkTransport::new(
-            Box::new(client_side),
-            ssl_handler,
-            context.packet_size as u32,
-            context.encryption_options.mode,
-            false,
-        );
-
-        let mut rng = rand::rng();
-        let data_size = 128;
-        let data_written: Vec<u8> = (0..data_size).map(|_| rng.random()).collect();
-        let mut framed_writer = FramedWrite::new(server_side, BytesCodec::new());
-        framed_writer
-            .send(Bytes::copy_from_slice(&data_written[..]))
-            .await?;
-
-        // 5) Attempt to read from the transport into a buffer
-        let mut buffer = vec![0u8; data_size];
-        let bytes_read = transport.receive(&mut buffer).await?;
-
-        // Verify we read exactly `data_size` bytes and that they match what was written
-        assert_eq!(bytes_read, data_size);
-        assert_eq!(buffer, data_written);
-
-        Ok(())
     }
 
     /// Test that TdsTransport::reset_reader() properly resizes the buffer after packet size change.
@@ -2549,7 +2437,7 @@ pub(crate) mod tests {
         let byte_value = rand::rng().random::<u8>();
         let builder = binding.append_byte(byte_value);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(reader.read_byte().await.unwrap(), byte_value);
     }
@@ -2560,7 +2448,7 @@ pub(crate) mod tests {
         let int16_value = rand::rng().random::<i16>();
         let builder = binding.append_i16(int16_value);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(reader.read_int16().await.unwrap(), int16_value);
     }
@@ -2571,7 +2459,7 @@ pub(crate) mod tests {
         let uint16_value = rand::rng().random::<u16>();
         let builder = binding.append_u16(uint16_value);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(reader.read_uint16().await.unwrap(), uint16_value);
     }
@@ -2582,7 +2470,7 @@ pub(crate) mod tests {
         let int32_value = rand::rng().random::<i32>();
         let builder = binding.append_i32(int32_value);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(reader.read_int32().await.unwrap(), int32_value);
     }
@@ -2593,7 +2481,7 @@ pub(crate) mod tests {
         let uint32_value = rand::rng().random::<u32>();
         let builder = binding.append_u32(uint32_value);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(reader.read_uint32().await.unwrap(), uint32_value);
     }
@@ -2604,7 +2492,7 @@ pub(crate) mod tests {
         let int64_value = rand::rng().random::<i64>();
         let builder = binding.append_i64(int64_value);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(reader.read_int64().await.unwrap(), int64_value);
     }
@@ -2615,7 +2503,7 @@ pub(crate) mod tests {
         let uint64_value = rand::rng().random::<u64>();
         let builder = binding.append_u64(uint64_value);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(reader.read_uint64().await.unwrap(), uint64_value);
     }
@@ -2626,7 +2514,7 @@ pub(crate) mod tests {
         let float32_value = rand::rng().random::<f32>();
         let builder = binding.append_f32(float32_value);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(reader.read_float32().await.unwrap(), float32_value);
     }
@@ -2637,7 +2525,7 @@ pub(crate) mod tests {
         let float64_value = rand::rng().random::<f64>();
         let builder = binding.append_f64(float64_value);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(reader.read_float64().await.unwrap(), float64_value);
     }
@@ -2650,7 +2538,7 @@ pub(crate) mod tests {
         let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
         let builder = binding.append_bytes(&encode_utf16_le(unicode_string));
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(
             reader.read_unicode(char_count).await.unwrap(),
@@ -2665,7 +2553,7 @@ pub(crate) mod tests {
         let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
         let builder = binding.append_bytes(&bytes);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         let mut buffer = vec![0; bytes_len];
         assert_eq!(reader.read_bytes(&mut buffer).await.unwrap(), bytes_len);
@@ -2680,7 +2568,7 @@ pub(crate) mod tests {
         binding.append_byte(bytes_len);
         let builder = binding.append_bytes(&data_bytes);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(reader.read_u8_varbyte().await.unwrap(), data_bytes);
     }
@@ -2693,7 +2581,7 @@ pub(crate) mod tests {
         binding.append_u16(bytes_len);
         let builder = binding.append_bytes(&data_bytes);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(reader.read_u16_varbyte().await.unwrap(), data_bytes);
     }
@@ -2705,7 +2593,7 @@ pub(crate) mod tests {
         binding.append_u16(unicode_string.encode_utf16().count() as u16);
         let builder = binding.append_bytes(&encode_utf16_le(unicode_string));
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(
             reader.read_varchar_u16_length().await.unwrap(),
@@ -2718,7 +2606,7 @@ pub(crate) mod tests {
         let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
         let builder = binding.append_u16(LENGTH_NULL);
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(reader.read_varchar_u16_length().await.unwrap(), None);
     }
@@ -2730,7 +2618,7 @@ pub(crate) mod tests {
         binding.append_byte(unicode_string.encode_utf16().count() as u8);
         let builder = binding.append_bytes(&encode_utf16_le(unicode_string));
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(
             reader.read_varchar_u8_length().await.unwrap(),
@@ -2748,7 +2636,7 @@ pub(crate) mod tests {
         binding.append_byte(unicode_string.encode_utf16().count() as u8);
         let builder = binding.append_bytes(&encode_utf16_le(&unicode_string));
 
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         assert_eq!(
             reader.read_varchar_u8_length().await.unwrap(),
@@ -2775,14 +2663,16 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_truncated_packet_reports_error() {
         let mut binding = TestPacketBuilder::new(PacketType::TabularResult);
-        let mut packet = binding.append_bytes(&[0xAB; 92]).build();
+        let mut packet = binding
+            .append_bytes(&[0xAB; 100 - PacketWriter::PACKET_HEADER_SIZE])
+            .build();
         assert_eq!(packet.len(), 100);
 
         // Claim 200 bytes but supply only the 100 actually built, so the reader
         // hits EOF mid-packet.
         BigEndian::write_u16(&mut packet[2..4], 200);
 
-        let mut reader = create_network_transport_with_data(&packet).await;
+        let mut reader = create_network_transport_with_data(&packet);
 
         assert!(reader.read_byte().await.is_err());
     }
@@ -2798,7 +2688,7 @@ pub(crate) mod tests {
         let mut stream = first.append_bytes(&[0x11, 0x22]).build();
         stream.extend_from_slice(&second.append_bytes(&[0x33, 0x44]).build());
 
-        let mut reader = create_network_transport_with_data(&stream).await;
+        let mut reader = create_network_transport_with_data(&stream);
 
         assert_eq!(reader.read_uint32().await.unwrap(), 0x4433_2211);
     }
@@ -2813,5 +2703,36 @@ pub(crate) mod tests {
         let mut reader = create_network_transport_with_chunked_data(&stream, 3);
 
         assert_eq!(reader.read_uint32().await.unwrap(), 0x4433_2211);
+    }
+
+    /// A payload-free non-EOM packet advances the buffer by nothing, so without
+    /// a guard the readers' "keep reading until we have enough data" loops would
+    /// never terminate against a peer that streams them.
+    #[tokio::test]
+    async fn test_payload_free_non_eom_packet_is_rejected() {
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult).build();
+        assert_eq!(packet.len(), PacketWriter::PACKET_HEADER_SIZE);
+        packet[1] = 0x00; // clear EOM
+
+        let mut reader = create_network_transport_with_data(&packet);
+
+        assert!(matches!(
+            reader.read_byte().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+    }
+
+    /// The same packet *with* EOM set is legal — an empty end-of-message packet
+    /// terminates a message — so it must be accepted and simply yield no payload.
+    #[tokio::test]
+    async fn test_payload_free_eom_packet_is_accepted() {
+        let packet = TestPacketBuilder::new(PacketType::TabularResult).build();
+
+        let mut reader = create_network_transport_with_data(&packet);
+
+        assert!(!matches!(
+            reader.read_byte().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
     }
 }

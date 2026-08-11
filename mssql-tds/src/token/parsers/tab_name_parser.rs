@@ -32,14 +32,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::packet_reader::tests::{TestPacketBuilder, create_network_transport_with_data};
     use crate::message::messages::PacketType;
+    use crate::test_packet_support::{TestPacketBuilder, create_network_transport_with_data};
 
     #[tokio::test]
     async fn test_tab_name_empty_body() {
         let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
         builder.append_u16(0);
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         let parser = TabNameTokenParser;
         let token = parser
@@ -54,7 +54,7 @@ mod tests {
         let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
         builder.append_u16(4);
         builder.append_bytes(&[0xAA, 0xBB, 0xCC, 0xDD]);
-        let mut reader = create_network_transport_with_data(&builder.build()).await;
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         let parser = TabNameTokenParser;
         let token = parser

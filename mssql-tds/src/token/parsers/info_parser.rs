@@ -127,8 +127,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::packet_reader::tests::{TestPacketBuilder, create_network_transport_with_data};
     use crate::message::messages::PacketType;
+    use crate::test_packet_support::{TestPacketBuilder, create_network_transport_with_data};
 
     fn encode_utf16_string(s: &str) -> Vec<u8> {
         let utf16_units: Vec<u16> = s.encode_utf16().collect();
@@ -181,7 +181,7 @@ mod tests {
         // Line number
         builder.append_u32(1);
 
-        let mut packet_reader = create_network_transport_with_data(&builder.build()).await;
+        let mut packet_reader = create_network_transport_with_data(&builder.build());
 
         let parser = InfoTokenParser::default();
         let context = ParserContext::default();
@@ -233,7 +233,7 @@ mod tests {
 
         builder.append_u32(42); // line number
 
-        let mut packet_reader = create_network_transport_with_data(&builder.build()).await;
+        let mut packet_reader = create_network_transport_with_data(&builder.build());
 
         let parser = InfoTokenParser::default();
         let context = ParserContext::default();
@@ -279,7 +279,7 @@ mod tests {
         builder.append_byte(0); // empty proc name
         builder.append_u32(0);
 
-        let mut packet_reader = create_network_transport_with_data(&builder.build()).await;
+        let mut packet_reader = create_network_transport_with_data(&builder.build());
 
         let parser = InfoTokenParser::default();
         let context = ParserContext::default();
