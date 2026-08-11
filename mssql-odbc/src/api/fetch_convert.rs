@@ -131,6 +131,15 @@ impl NumericSource {
         }
     }
 
+    /// Sign of the value before any truncation toward zero.
+    fn is_negative(&self) -> bool {
+        match self {
+            NumericSource::Int(v) => *v < 0,
+            NumericSource::Scaled { mantissa, .. } => *mantissa < 0,
+            NumericSource::Float(f) => *f < 0.0,
+        }
+    }
+
     /// Value truncated toward zero plus whether a fractional part was dropped.
     /// `None` when the value cannot be represented as an integer at all.
     fn to_i128_truncating(self) -> Option<(i128, bool)> {
@@ -184,8 +193,8 @@ fn parse_decimal_literal(text: &str) -> Option<NumericSource> {
 }
 
 /// The `money` / `smallmoney` wire value as an integer scaled by 10^4.
-fn money_scaled(lsb: i32, msb: i32) -> i128 {
-    i128::from((i64::from(lsb) & 0xFFFF_FFFF) | (i64::from(msb) << 32))
+pub(crate) fn money_scaled(lsb: i32, msb: i32) -> i64 {
+    (i64::from(lsb) & 0xFFFF_FFFF) | (i64::from(msb) << 32)
 }
 
 /// Interprets a column as a number, or `None` when the column type has no
@@ -200,19 +209,21 @@ fn numeric_source(value: &ColumnValues) -> Option<NumericSource> {
         ColumnValues::Real(x) => Some(NumericSource::Float(f64::from(*x))),
         ColumnValues::Float(x) => Some(NumericSource::Float(*x)),
         // `DecimalParts` renders itself exactly; parse that back rather than
-        // reassembling its base-2^32 limbs.
+        // reassembling its base-2^32 limbs. The format-and-reparse allocates per
+        // value; accepted for now in exchange for exactness.
         ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
             parse_decimal_literal(&d.to_string())
         }
         ColumnValues::Money(m) => Some(NumericSource::Scaled {
-            mantissa: money_scaled(m.lsb_part, m.msb_part),
+            mantissa: i128::from(money_scaled(m.lsb_part, m.msb_part)),
             scale: 4,
         }),
         ColumnValues::SmallMoney(m) => Some(NumericSource::Scaled {
             mantissa: i128::from(m.int_val),
             scale: 4,
         }),
-        ColumnValues::String(_) => None,
+        // Character columns are handled by `numeric_source_or_parse`, which can
+        // distinguish bad text (22018) from a non-numeric column (07006).
         _ => None,
     }
 }
@@ -224,7 +235,15 @@ fn numeric_source_or_parse(value: &ColumnValues) -> Result<NumericSource, ConvEr
     if let ColumnValues::String(s) = value {
         let text = sql_string_to_text(s).ok_or(ConvError::InvalidCharacterValue)?;
         return parse_decimal_literal(&text)
-            .or_else(|| text.trim().parse::<f64>().ok().map(NumericSource::Float))
+            .or_else(|| {
+                // Rust accepts "inf"/"infinity"/"nan"; SQL Server has no such
+                // literal, so they are invalid text rather than values.
+                text.trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .map(NumericSource::Float)
+            })
             .ok_or(ConvError::InvalidCharacterValue);
     }
     numeric_source(value).ok_or(ConvError::Restricted)
@@ -286,6 +305,12 @@ pub(crate) unsafe fn convert_integer_c(
         SQL_C_UBIGINT => unsafe { write_fixed(target_value_ptr, narrow!(u64), strlen_or_ind_ptr) },
         // A bit target only accepts 0 or 1; any other value is out of range.
         SQL_C_BIT => {
+            // msodbcsql treats a negative value as out of range for BIT even when
+            // it truncates to zero (sqlccnvt.cpp: `!fUnsignedIn && CVT_FRACT_TRUNC
+            // && SQL_C_BIT` -> CVT_PREC, and `dTemp < 0 && SQL_C_BIT` -> CVT_PREC).
+            if source.is_negative() {
+                return Err(ConvError::OutOfRange);
+            }
             let b: u8 = match v {
                 0 => 0,
                 1 => 1,
@@ -293,6 +318,8 @@ pub(crate) unsafe fn convert_integer_c(
             };
             unsafe { write_fixed(target_value_ptr, b, strlen_or_ind_ptr) }
         }
+        // Unreachable: the `is_integer_c_target` gate above already rejected any
+        // other target. Kept as a backstop if the gate and this match diverge.
         _ => return Err(ConvError::NotHandledHere),
     };
     Ok(if truncated {
@@ -302,8 +329,6 @@ pub(crate) unsafe fn convert_integer_c(
     })
 }
 
-/// Widen a numeric column (integer or floating) to `f64`. Returns `None` for
-/// non-numeric sources.
 /// Returns `true` if `target_type` is one of the floating-point C types handled
 /// by [`convert_float_c`].
 pub(crate) fn is_float_c_target(target_type: SqlSmallInt) -> bool {
@@ -397,6 +422,9 @@ pub(crate) struct DateTimeParts {
     pub has_date: bool,
     pub has_time: bool,
     pub has_tz: bool,
+    /// Set when a character literal carried more fractional digits than the
+    /// 100 ns resolution can keep, so the conversion reports `01S07`.
+    pub frac_truncated: bool,
 }
 
 /// (year, month, day) from a day count where day 0 = 0001-01-01, using Howard
@@ -588,9 +616,10 @@ fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
     Some((year, month, day))
 }
 
-/// Parses `HH:MM[:SS[.fffffff]]`, returning the components plus the number of
-/// fractional digits written (the effective scale).
-fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
+/// Parses `HH:MM[:SS[.fffffff]]`, returning the components, the number of
+/// fractional digits kept (the effective scale), and whether digits past the
+/// 100 ns resolution were dropped.
+fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8, bool)> {
     let mut it = s.split(':');
     let hour: u16 = it.next()?.parse().ok()?;
     let minute: u16 = it.next()?.parse().ok()?;
@@ -619,7 +648,14 @@ fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
             .map_or(0, |b| u32::from(b - b'0'));
         hundred_ns = hundred_ns * 10 + digit;
     }
-    Some((hour, minute, second, hundred_ns * 100, scale as u8))
+    Some((
+        hour,
+        minute,
+        second,
+        hundred_ns * 100,
+        scale as u8,
+        frac_digits.len() > 7,
+    ))
 }
 
 /// Parses the character forms of `date`, `time`, `datetime2` and
@@ -630,21 +666,24 @@ fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
 
     // A trailing "+HH:MM" / "-HH:MM" is a UTC offset. Match it only in that
     // exact shape so the hyphens inside a date are never mistaken for one.
-    if s.len() >= 6 {
-        let tail = &s[s.len() - 6..];
-        let tb = tail.as_bytes();
-        if (tb[0] == b'+' || tb[0] == b'-') && tb[3] == b':' {
-            let sign: i16 = if tb[0] == b'+' { 1 } else { -1 };
-            let hh: i16 = tail[1..3].parse().ok()?;
-            let mm: i16 = tail[4..6].parse().ok()?;
-            if hh > 14 || mm > 59 {
-                return None;
-            }
-            p.tz_hour = sign * hh;
-            p.tz_minute = sign * mm;
-            p.has_tz = true;
-            s = s[..s.len() - 6].trim_end();
+    // Compared as bytes: slicing the `str` would panic when a multi-byte
+    // character straddles the boundary, and the payload is server data.
+    if let Some(tail) = s.len().checked_sub(6).and_then(|i| s.as_bytes().get(i..))
+        && (tail[0] == b'+' || tail[0] == b'-')
+        && tail[3] == b':'
+        && tail[1..3].iter().chain(&tail[4..6]).all(u8::is_ascii_digit)
+    {
+        let sign: i16 = if tail[0] == b'+' { 1 } else { -1 };
+        let hh = i16::from(tail[1] - b'0') * 10 + i16::from(tail[2] - b'0');
+        let mm = i16::from(tail[4] - b'0') * 10 + i16::from(tail[5] - b'0');
+        if hh > 14 || mm > 59 {
+            return None;
         }
+        p.tz_hour = sign * hh;
+        p.tz_minute = sign * mm;
+        p.has_tz = true;
+        // The matched tail is all ASCII, so this boundary is a char boundary.
+        s = s[..s.len() - 6].trim_end();
     }
 
     let (date_str, time_str) = match s.split_once(['T', ' ']) {
@@ -661,12 +700,13 @@ fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
         p.has_date = true;
     }
     if let Some(t) = time_str.filter(|t| !t.is_empty()) {
-        let (h, mi, sec, frac_ns, scale) = parse_time_literal(t)?;
+        let (h, mi, sec, frac_ns, scale, frac_truncated) = parse_time_literal(t)?;
         p.hour = h;
         p.minute = mi;
         p.second = sec;
         p.fraction_ns = frac_ns;
         p.scale = scale;
+        p.frac_truncated = frac_truncated;
         p.has_time = true;
     }
     if !p.has_date && !p.has_time {
@@ -796,7 +836,11 @@ pub(crate) unsafe fn convert_datetime_c(
             });
         }
     };
-    Ok(ret)
+    Ok(if p.frac_truncated {
+        ConvOk::Truncated
+    } else {
+        ret
+    })
 }
 
 /// Formats a [`DateTimeParts`] as an ISO-8601-style string for character
@@ -1297,6 +1341,84 @@ mod tests {
         }
         .unwrap();
         assert_eq!(out.day, 29);
+    }
+
+    /// Multi-byte input must not panic while probing for a trailing UTC offset:
+    /// the byte at `len - 6` can land inside a character, and a panic unwinding
+    /// through the ODBC `extern "C"` boundary would abort the process.
+    #[test]
+    fn non_ascii_character_input_does_not_panic() {
+        for target in [SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP] {
+            let mut out = [0u8; 64];
+            let mut ind: SqlLen = 0;
+            let err = unsafe {
+                convert_datetime_c(
+                    &utf8_col("日aaaa"),
+                    target,
+                    out.as_mut_ptr().cast(),
+                    &mut ind,
+                )
+            }
+            .unwrap_err();
+            assert_eq!(err, ConvError::InvalidCharacterValue, "target {target}");
+        }
+    }
+
+    /// Rust parses these but SQL Server has no such literal, so they are bad
+    /// text rather than values.
+    #[test]
+    fn non_finite_character_text_is_invalid_character_value() {
+        for text in ["inf", "-inf", "Infinity", "NaN", "nan"] {
+            let mut out: f64 = 0.0;
+            let mut ind: SqlLen = 0;
+            let err = unsafe {
+                convert_float_c(
+                    &utf8_col(text),
+                    SQL_C_DOUBLE,
+                    (&mut out as *mut f64).cast(),
+                    &mut ind,
+                )
+            }
+            .unwrap_err();
+            assert_eq!(err, ConvError::InvalidCharacterValue, "{text}");
+        }
+    }
+
+    /// msodbcsql reports a negative value into `SQL_C_BIT` as out of range even
+    /// when it would truncate to zero.
+    #[test]
+    fn negative_into_bit_target_is_out_of_range() {
+        let mut out: u8 = 9;
+        let mut ind: SqlLen = 0;
+        let err = unsafe {
+            convert_integer_c(
+                &utf8_col("-0.5"),
+                SQL_C_BIT,
+                (&mut out as *mut u8).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
+    }
+
+    /// Fractional digits past the 100 ns resolution are dropped, which is a
+    /// truncation and has to be reported like every other lossy path here.
+    #[test]
+    fn excess_fractional_digits_report_truncation() {
+        let mut out = SqlTimestampStruct::default();
+        let mut ind: SqlLen = 0;
+        let ok = unsafe {
+            convert_datetime_c(
+                &utf8_col("2023-06-15 12:34:56.123456789"),
+                SQL_C_TYPE_TIMESTAMP,
+                (&mut out as *mut SqlTimestampStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out.fraction, 123_456_700);
     }
 
     /// Character text that parses as a different temporal shape is bad text for
