@@ -105,17 +105,6 @@ unsafe fn write_fixed<T: Copy>(ptr: SqlPointer, value: T, ind: *mut SqlLen) -> C
     ConvOk::Exact
 }
 
-/// Converts an integer column value to a fixed-width integer C target,
-/// range-checking against the target type.
-///
-/// Returns [`ConvError::NotHandledHere`] when either the source is not an integer
-/// column or the target is not a fixed-width integer C type, letting the caller
-/// fall back to another conversion path.
-///
-/// # Safety
-/// `target_value_ptr`, when non-null, must be valid for a write of the target
-/// C type's size, and `strlen_or_ind_ptr` must be null or valid for a
-/// `SqlLen` write.
 /// A numeric column value in a form that keeps exact sources exact, so an
 /// integer target can report truncation instead of silently dropping a
 /// fraction.
@@ -148,7 +137,11 @@ impl NumericSource {
         match self {
             NumericSource::Int(v) => Some((v, false)),
             NumericSource::Scaled { mantissa, scale } => {
-                let divisor = 10i128.checked_pow(scale)?;
+                // Past 10^38 the divisor exceeds every representable mantissa, so
+                // the quotient is zero and the whole value is the dropped fraction.
+                let Some(divisor) = 10i128.checked_pow(scale) else {
+                    return Some((0, mantissa != 0));
+                };
                 Some((mantissa / divisor, mantissa % divisor != 0))
             }
             NumericSource::Float(f) => {
@@ -237,6 +230,23 @@ fn numeric_source_or_parse(value: &ColumnValues) -> Result<NumericSource, ConvEr
     numeric_source(value).ok_or(ConvError::Restricted)
 }
 
+/// Converts a numeric column value to a fixed-width integer C target,
+/// range-checking against the target type.
+///
+/// Accepts the integer columns, the exact-decimal columns (`decimal`,
+/// `numeric`, `money`, `smallmoney`), the floating-point columns, and character
+/// columns holding a numeric literal. A dropped fractional part is reported as
+/// [`ConvOk::Truncated`], text that is not a valid number as
+/// [`ConvError::InvalidCharacterValue`], and a column with no numeric
+/// interpretation as [`ConvError::Restricted`].
+///
+/// Returns [`ConvError::NotHandledHere`] when the target is not a fixed-width
+/// integer C type, letting the caller fall back to another conversion path.
+///
+/// # Safety
+/// `target_value_ptr`, when non-null, must be valid for a write of the target
+/// C type's size, and `strlen_or_ind_ptr` must be null or valid for a
+/// `SqlLen` write.
 pub(crate) unsafe fn convert_integer_c(
     value: &ColumnValues,
     target_type: SqlSmallInt,
@@ -540,11 +550,23 @@ pub(crate) fn is_datetime_c_target(target_type: SqlSmallInt) -> bool {
     )
 }
 
-/// Converts a date/time column value to the requested date/time C struct.
-///
-/// # Safety
-/// Same pointer contract as [`convert_integer_c`]; `target_value_ptr` must be
-/// valid for a write of the target struct's size.
+/// Days in `month` of `year` under the proleptic Gregorian leap rule.
+fn days_in_month(year: i16, month: u16) -> u16 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let y = i32::from(year);
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
 /// Parses `YYYY-MM-DD`.
 fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
     let mut it = s.split('-');
@@ -555,7 +577,12 @@ fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
     let year: i16 = y.parse().ok()?;
     let month: u16 = m.parse().ok()?;
     let day: u16 = d.parse().ok()?;
-    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    // Reject impossible days (2023-02-31, or 02-29 outside a leap year) rather
+    // than writing them into a date struct as a successful conversion.
+    if !(1..=days_in_month(year, month)).contains(&day) {
         return None;
     }
     Some((year, month, day))
@@ -652,12 +679,19 @@ fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
     Some(p)
 }
 
+/// Converts a date/time column value, or a character column holding a date/time
+/// literal, to the requested date/time C struct.
+///
+/// # Safety
+/// Same pointer contract as [`convert_integer_c`]; `target_value_ptr` must be
+/// valid for a write of the target struct's size.
 pub(crate) unsafe fn convert_datetime_c(
     value: &ColumnValues,
     target_type: SqlSmallInt,
     target_value_ptr: SqlPointer,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> Result<ConvOk, ConvError> {
+    let from_character = matches!(value, ColumnValues::String(_));
     let p = match value {
         // A character column must hold a valid literal for the target.
         ColumnValues::String(s) => {
@@ -751,8 +785,16 @@ pub(crate) unsafe fn convert_datetime_c(
             )
         },
         // Reached when the value lacks the component the target needs (e.g. a
-        // `time` column into `SQL_C_TYPE_DATE`).
-        _ => return Err(ConvError::Restricted),
+        // `time` column into `SQL_C_TYPE_DATE`). For character input the pairing
+        // is legal and it is the text that is wrong for this target, so that
+        // stays 22018 rather than becoming 07006.
+        _ => {
+            return Err(if from_character {
+                ConvError::InvalidCharacterValue
+            } else {
+                ConvError::Restricted
+            });
+        }
     };
     Ok(ret)
 }
@@ -1223,6 +1265,84 @@ mod tests {
                 day: 15
             }
         );
+    }
+
+    #[test]
+    fn impossible_calendar_dates_are_rejected() {
+        for bad in ["2023-02-31", "2023-02-29", "2023-04-31", "2023-13-01"] {
+            let mut out = SqlDateStruct::default();
+            let mut ind: SqlLen = 0;
+            let err = unsafe {
+                convert_datetime_c(
+                    &utf8_col(bad),
+                    SQL_C_TYPE_DATE,
+                    (&mut out as *mut SqlDateStruct).cast(),
+                    &mut ind,
+                )
+            }
+            .unwrap_err();
+            assert_eq!(err, ConvError::InvalidCharacterValue, "{bad} was accepted");
+        }
+
+        // The leap day itself is still valid in a leap year.
+        let mut out = SqlDateStruct::default();
+        let mut ind: SqlLen = 0;
+        unsafe {
+            convert_datetime_c(
+                &utf8_col("2024-02-29"),
+                SQL_C_TYPE_DATE,
+                (&mut out as *mut SqlDateStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(out.day, 29);
+    }
+
+    /// Character text that parses as a different temporal shape is bad text for
+    /// this target (22018), not an illegal source/target pairing (07006).
+    #[test]
+    fn character_time_into_date_target_is_invalid_character_value() {
+        let mut out = SqlDateStruct::default();
+        let mut ind: SqlLen = 0;
+        let err = unsafe {
+            convert_datetime_c(
+                &utf8_col("12:00"),
+                SQL_C_TYPE_DATE,
+                (&mut out as *mut SqlDateStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, ConvError::InvalidCharacterValue);
+    }
+
+    /// A scale larger than any `i128` power of ten still truncates to zero
+    /// rather than reporting the value as out of range.
+    #[test]
+    fn scale_beyond_i128_truncates_to_zero() {
+        assert_eq!(
+            NumericSource::Scaled {
+                mantissa: 1,
+                scale: 39
+            }
+            .to_i128_truncating(),
+            Some((0, true))
+        );
+
+        let mut out: i32 = -1;
+        let mut ind: SqlLen = 0;
+        let ok = unsafe {
+            convert_integer_c(
+                &utf8_col("0.000000000000000000000000000000000000001"),
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, 0);
     }
 
     #[test]

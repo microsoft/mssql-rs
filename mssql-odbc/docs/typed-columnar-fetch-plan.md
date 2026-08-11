@@ -80,14 +80,14 @@ Both paths must share one conversion core: `ColumnValues -> requested SQL_C_* ta
 
 ### P1a — Mandatory source-type conversions — Task [47107](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47107)
 
-ODBC Appendix D requires a driver to support conversions to **all** ODBC C types from every SQL type it supports. P1 implements the integer, floating-point, GUID and date/time targets, but only from a subset of sources. The following pairings still fail and must be added:
+ODBC Appendix D requires a driver to support conversions to **all** ODBC C types from every SQL type it supports. P1 implemented the integer, floating-point, GUID and date/time targets, but only from a subset of sources. P1a added the missing source types, delivered in PR #217:
 
-- `decimal` / `numeric` → the numeric C targets (`SQL_C_DOUBLE`, `SQL_C_FLOAT`, `SQL_C_SLONG`, `SQL_C_SBIGINT`, …). `numeric_source_as_f64` currently rejects the exact-decimal types.
-- `money` / `smallmoney` → the numeric C targets.
-- Character sources (`char` / `varchar` / `nchar` / `nvarchar`) → numeric and date/time C targets (e.g. `'123'` → `SQL_C_SLONG`, `'2023-06-15'` → `SQL_C_TYPE_DATE`), with `22018` when the text is not a valid literal for the target.
-- Lossy **numeric** conversions must report fractional truncation with `01S07` + `SQL_SUCCESS_WITH_INFO` (e.g. `float` `1234.99` → `SQL_C_SLONG` yields `1234` + `01S07`). The `01S07` diagnostic and the `ConvOk::Truncated` plumbing already exist (P1 uses them for date/time targets that discard a component); P1a extends them to the numeric conversions above.
+- `decimal` / `numeric` → the numeric C targets (`SQL_C_DOUBLE`, `SQL_C_FLOAT`, `SQL_C_SLONG`, `SQL_C_SBIGINT`, …). A `NumericSource` abstraction keeps the exact-decimal types exact instead of routing them through `f64`, so an integer target can report truncation rather than silently dropping a fraction.
+- `money` / `smallmoney` → the numeric C targets, from their 10^4-scaled wire value.
+- Character sources (`char` / `varchar` / `nchar` / `nvarchar`) → numeric and date/time C targets (`'123'` → `SQL_C_SLONG`, `'2023-06-15'` → `SQL_C_TYPE_DATE`). Decimal literals parse exactly, with an `f64` fallback for exponent forms; the `date` / `time` / `datetime2` / `datetimeoffset` character forms are all accepted. Text that is not a valid literal for the requested target returns `22018`, including a literal that parses as a different temporal shape (`'12:00'` into `SQL_C_TYPE_DATE`) and impossible calendar dates (`'2023-02-31'`).
+- Lossy **numeric** conversions report fractional truncation with `01S07` + `SQL_SUCCESS_WITH_INFO` (`float` `1234.99` → `SQL_C_SLONG` yields `1234` + `01S07`), reusing the `ConvOk::Truncated` plumbing P1 introduced for date/time targets that discard a component.
 
-Implemented in PR #217: a `NumericSource` abstraction keeps exact sources exact so integer targets report `01S07` truncation instead of silently dropping a fraction; character sources parse decimal literals exactly (falling back to `f64` for exponent forms) and the `date` / `time` / `datetime2` / `datetimeoffset` character forms; invalid text returns `22018`. A source with no interpretation for the requested target (binary, guid) is `07006`.
+A source with no interpretation for the requested target (binary, guid) is `07006`, since that pairing is illegal rather than unimplemented.
 
 Max-length character sources (`varchar(max)` / `nvarchar(max)`) into the numeric and date/time targets are **excluded** from P1a and tracked as Task [47238](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47238). They arrive as PLP, so parsing needs the ODBC layer to accumulate chunks, which inverts the "never buffer the full PLP payload" invariant that `stream_active_plp_chunk` documents. That work is sequenced after #204 and #215, which are both rewriting the same read path, and needs a bounded-prefix policy agreed first so a 2 GB column cannot be drained to produce a `SQL_C_SLONG`.
 
