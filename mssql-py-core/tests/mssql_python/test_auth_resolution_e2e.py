@@ -385,7 +385,12 @@ class TestADServicePrincipal:
 class TestAuthTcClash:
     """§3.3 Auth keyword + TC=Yes is always an error (#24–#26, #28–#29).
 
-    #27 (ADInteractive) is covered by test_auth_resolution.py, not here.
+    #27 (ADInteractive) and ADDefault are not testable at this layer:
+    mssql-python strips Trusted_Connection for token-bearing AD modes, so
+    ODBC never sees the clash. Covered in test_auth_resolution.py
+    (TestAuthTcClashes::test_27_ad_interactive_tc,
+    TestAuthTcClashesExtended::test_ad_default_tc) and in Rust
+    (odbc_authentication_validator::tests::auth_plus_tc_rejected).
     """
 
     def test_row24_tc_yes_sqlpassword(self):
