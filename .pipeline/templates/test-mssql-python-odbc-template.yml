@@ -32,7 +32,13 @@ parameters:
   # Per-test-file wall-clock budget, passed to `timeout`.
   - name: pytestFileTimeout
     type: string
-    default: '15m'
+    default: '10m'
+  # Wall-clock budget for the whole suite. Must leave headroom under the job's
+  # timeoutInMinutes: a job cancelled by the server skips `condition: always()`
+  # steps, which would lose the test results and leak the containers.
+  - name: pytestTotalBudget
+    type: string
+    default: '110m'
 
 steps:
 - template: generate-sql-password-template.yml
@@ -195,12 +201,17 @@ steps:
     docker exec \
       -e DB_CONNECTION_STRING="Server=sqlserver,1433;Database=TestDB;Uid=SA;Pwd=$(SQL_PASSWORD);TrustServerCertificate=yes" \
       -e PYTEST_FILE_TIMEOUT="${{ parameters.pytestFileTimeout }}" \
+      -e PYTEST_TOTAL_BUDGET="${{ parameters.pytestTotalBudget }}" \
       -e TEST_RESULTS_DIR=/workspace/test-results \
       mssql-python-odbc-tests bash -c '
         source /opt/venv/bin/activate
         bash /mssql-rs-scripts/run-mssql-python-odbc-tests.sh
       '
   displayName: Run mssql-python tests against mssql-odbc
+  # The runner enforces its own budget; this only backstops a wedged `docker
+  # exec`. It must stay below the job timeout so the publish and cleanup steps
+  # below still run.
+  timeoutInMinutes: 130
   continueOnError: true
   env:
     SQL_PASSWORD: $(SQL_PASSWORD)
