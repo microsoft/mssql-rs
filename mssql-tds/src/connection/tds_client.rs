@@ -856,7 +856,12 @@ impl TdsClient {
     ///
     /// # Returns
     ///
-    /// Returns the number of rows actually inserted by SQL Server.
+    /// Returns the number of rows this client serialized to the wire, matching
+    /// `Microsoft.Data.SqlClient`'s `SqlBulkCopy.RowsCopied` semantics. This is
+    /// a client-side count, not the server's DONE token row count, so it is not
+    /// affected by distributed engines that acknowledge one load with multiple
+    /// DONE_COUNT tokens (issue #209). It also does not reflect server-side row
+    /// count changes from triggers on the destination table.
     #[instrument(skip(self, rows), level = "info")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_bulk_load_streaming_zerocopy<R>(
