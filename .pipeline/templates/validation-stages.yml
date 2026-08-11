@@ -525,6 +525,20 @@ stages:
     steps:
       - template: test-mssql-python-macos-template.yml
 
+  # Same upstream suite, but with mssql-python's bundled msodbcsql18 binary
+  # replaced by the Rust mssql-odbc driver. Failures and crashes are expected
+  # while the driver is in development, so the job is informational: its test
+  # step is continueOnError and each test file runs in its own bounded process.
+  - job: Test_mssql_python_on_mssql_odbc
+    displayName: mssql-python suite on mssql-odbc driver (cross-repo)
+    timeoutInMinutes: 180
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+      - template: test-mssql-python-odbc-template.yml
+
 - stage: Test_alpine
   dependsOn: 
     - Build
