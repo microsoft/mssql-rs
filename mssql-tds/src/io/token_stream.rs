@@ -126,8 +126,8 @@ pub enum RowHeader {
 pub(crate) struct RowPauseState {
     /// Index of the first column that has not yet been decoded.
     pub(crate) next_column_index: usize,
-    /// Full column metadata for the row (shared with the ParserContext).
-    pub(crate) columns: Vec<ColumnMetadata>,
+    /// Column metadata for the row, shared with the ParserContext.
+    pub(crate) metadata: Arc<ColMetadataToken>,
     /// NBCROW null-bitmap (one bit per column, LSB-first).  `None` for plain ROW.
     pub(crate) nbc_null_bitmap: Option<Vec<u8>>,
     /// Optional AE decryptor needed to continue decrypting encrypted columns
@@ -139,9 +139,15 @@ pub(crate) struct RowPauseState {
 #[cfg(fuzzing)]
 pub struct RowPauseState {
     pub next_column_index: usize,
-    pub columns: Vec<ColumnMetadata>,
+    pub metadata: Arc<ColMetadataToken>,
     pub nbc_null_bitmap: Option<Vec<u8>>,
     pub decryptor: Option<Arc<dyn CellDecryptor>>,
+}
+
+impl RowPauseState {
+    pub(crate) fn columns(&self) -> &[ColumnMetadata] {
+        &self.metadata.columns
+    }
 }
 
 /// Active PLP stream state captured when row decoding is paused at a PLP column.
@@ -293,7 +299,10 @@ where
 ///
 /// Returned by [`extract_row_context`] so the ROW/NBCROW decode paths can both
 /// access the column layout and the Always Encrypted decryptor (if any).
-type RowDecodeContext<'a> = (&'a [ColumnMetadata], Option<&'a Arc<dyn CellDecryptor>>);
+type RowDecodeContext<'a> = (
+    &'a Arc<ColMetadataToken>,
+    Option<&'a Arc<dyn CellDecryptor>>,
+);
 
 /// `ParserContext` is used to add additional context, which can be leveraged by the token parsers.
 /// One of the usecase is passing the metadata for the columns, to the row parser and to the
@@ -344,9 +353,7 @@ impl ParserContext {
 
 fn extract_row_context(context: &ParserContext) -> TdsResult<RowDecodeContext<'_>> {
     match context {
-        ParserContext::ColumnMetadata(metadata, decryptor) => {
-            Ok((&metadata.columns, decryptor.as_ref()))
-        }
+        ParserContext::ColumnMetadata(metadata, decryptor) => Ok((metadata, decryptor.as_ref())),
         _ => Err(crate::error::Error::ProtocolError(
             "Expected ColumnMetadata in context for row decoding".to_string(),
         )),
@@ -441,14 +448,14 @@ async fn skip_column<R: TdsPacketReader + Send + Sync>(
 /// [`RowReadResult::RowWritten`] if `col` was the last column.
 fn pause_after_column(
     col: usize,
-    columns: &[ColumnMetadata],
+    metadata: &Arc<ColMetadataToken>,
     bitmap: Option<&[u8]>,
     decryptor: Option<&Arc<dyn CellDecryptor>>,
 ) -> RowReadResult {
-    if col + 1 < columns.len() {
+    if col + 1 < metadata.columns.len() {
         RowReadResult::RowPaused(RowPauseState {
             next_column_index: col + 1,
-            columns: columns.to_vec(),
+            metadata: Arc::clone(metadata),
             nbc_null_bitmap: bitmap.map(|b| b.to_vec()),
             decryptor: decryptor.cloned(),
         })
@@ -466,7 +473,7 @@ fn pause_after_column(
 /// `writer.pause_*` polling.
 async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
-    columns: &[ColumnMetadata],
+    metadata: &Arc<ColMetadataToken>,
     decryptor: Option<&Arc<dyn CellDecryptor>>,
     bitmap: Option<&[u8]>,
     start_col: usize,
@@ -474,6 +481,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
     writer: &mut (dyn RowWriter + Send),
 ) -> TdsResult<RowReadResult> {
     let decoder = GenericDecoder::default();
+    let columns = &metadata.columns;
     for (col, meta) in columns.iter().enumerate().skip(start_col) {
         let stop_here = matches!(plan, ColumnPolicy::DecodeOne(target) if target == col);
         let skip = match plan {
@@ -490,7 +498,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
                 writer.write_null(col);
             }
             if stop_here {
-                return Ok(pause_after_column(col, columns, bitmap, decryptor));
+                return Ok(pause_after_column(col, metadata, bitmap, decryptor));
             }
             continue;
         }
@@ -517,7 +525,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
             match PlpColumnStream::begin(meta, reader).await? {
                 None => {
                     writer.write_null(col);
-                    return Ok(pause_after_column(col, columns, bitmap, decryptor));
+                    return Ok(pause_after_column(col, metadata, bitmap, decryptor));
                 }
                 Some(plp_stream) => {
                     // `pause_after_column` reports `RowWritten` when `col` is the
@@ -529,7 +537,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
                     return Ok(RowReadResult::PlpPaused(PlpPauseState {
                         row_pause_state: RowPauseState {
                             next_column_index: col + 1,
-                            columns: columns.to_vec(),
+                            metadata: Arc::clone(metadata),
                             nbc_null_bitmap: bitmap.map(|b| b.to_vec()),
                             decryptor: decryptor.cloned(),
                         },
@@ -542,7 +550,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
         decode_or_decrypt_column(&decoder, reader, meta, decryptor, col, writer).await?;
 
         if stop_here {
-            return Ok(pause_after_column(col, columns, bitmap, decryptor));
+            return Ok(pause_after_column(col, metadata, bitmap, decryptor));
         }
     }
     Ok(RowReadResult::RowWritten)
@@ -590,15 +598,15 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
 
     match token_type {
         TokenType::Row => {
-            let (columns, decryptor) = extract_row_context(context)?;
-            drive_row_columns(reader, columns, decryptor, None, 0, plan, writer).await
+            let (metadata, decryptor) = extract_row_context(context)?;
+            drive_row_columns(reader, metadata, decryptor, None, 0, plan, writer).await
         }
         TokenType::NbcRow => {
-            let (columns, decryptor) = extract_row_context(context)?;
-            let bitmap_len = columns.len().div_ceil(8);
+            let (metadata, decryptor) = extract_row_context(context)?;
+            let bitmap_len = metadata.columns.len().div_ceil(8);
             let mut bitmap = vec![0u8; bitmap_len];
             reader.read_bytes(&mut bitmap).await?;
-            drive_row_columns(reader, columns, decryptor, Some(&bitmap), 0, plan, writer).await
+            drive_row_columns(reader, metadata, decryptor, Some(&bitmap), 0, plan, writer).await
         }
         _ => {
             let token = dispatch_token(reader, registry, token_type, context).await?;
@@ -622,22 +630,22 @@ pub(crate) async fn receive_row_header_internal<R: TdsPacketReader + Send + Sync
 
     match token_type {
         TokenType::Row => {
-            let (columns, decryptor) = extract_row_context(context)?;
+            let (metadata, decryptor) = extract_row_context(context)?;
             Ok(RowHeader::Positioned(RowPauseState {
                 next_column_index: 0,
-                columns: columns.to_vec(),
+                metadata: Arc::clone(metadata),
                 nbc_null_bitmap: None,
                 decryptor: decryptor.cloned(),
             }))
         }
         TokenType::NbcRow => {
-            let (columns, decryptor) = extract_row_context(context)?;
-            let bitmap_len = columns.len().div_ceil(8);
+            let (metadata, decryptor) = extract_row_context(context)?;
+            let bitmap_len = metadata.columns.len().div_ceil(8);
             let mut bitmap = vec![0u8; bitmap_len];
             reader.read_bytes(&mut bitmap).await?;
             Ok(RowHeader::Positioned(RowPauseState {
                 next_column_index: 0,
-                columns: columns.to_vec(),
+                metadata: Arc::clone(metadata),
                 nbc_null_bitmap: Some(bitmap),
                 decryptor: decryptor.cloned(),
             }))
@@ -661,14 +669,14 @@ pub(crate) async fn resume_row_into_internal<R: TdsPacketReader + Send + Sync>(
 ) -> TdsResult<RowReadResult> {
     let RowPauseState {
         next_column_index,
-        columns,
+        metadata,
         nbc_null_bitmap,
         decryptor,
     } = pause_state;
 
     drive_row_columns(
         reader,
-        &columns,
+        &metadata,
         decryptor.as_ref(),
         nbc_null_bitmap.as_deref(),
         next_column_index,
@@ -1309,14 +1317,12 @@ mod tests {
             multi_part_name: None,
             crypto_metadata: None,
         };
-        let context = ParserContext::ColumnMetadata(
-            Arc::new(ColMetadataToken {
-                column_count: 1,
-                columns: vec![metadata],
-                cek_table: vec![],
-            }),
-            None,
-        );
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![metadata],
+            cek_table: vec![],
+        });
+        let context = ParserContext::ColumnMetadata(Arc::clone(&metadata), None);
 
         let mut packet = vec![TokenType::Row as u8];
         packet.extend_from_slice(&(-2_i64).to_le_bytes());
@@ -1338,6 +1344,7 @@ mod tests {
             RowReadResult::PlpPaused(plp_state) => {
                 assert_eq!(plp_state.collation(), Some(collation));
                 assert!(!plp_state.reached_end());
+                assert!(Arc::ptr_eq(&metadata, &plp_state.row_pause_state.metadata));
             }
             _ => panic!("expected PlpPaused"),
         }

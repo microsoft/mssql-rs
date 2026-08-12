@@ -3259,14 +3259,14 @@ impl TdsClient {
         pause_state: RowPauseState,
         target: usize,
     ) -> TdsResult<CursorColumn> {
-        if target >= pause_state.columns.len() {
+        if target >= pause_state.columns().len() {
             // Out-of-range: decoding with ColumnPolicy::DecodeOne(target) would skip
             // every remaining column and report RowWritten, silently consuming
             // the row. Reject without touching the transport and keep the
             // cursor positioned so valid pulls still work. ODBC validates the
             // column index first, so this guards the public API against other
             // callers.
-            let column_count = pause_state.columns.len();
+            let column_count = pause_state.columns().len();
             self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
             return Err(UsageError(format!(
                 "read_row_column target column {target} is out of range (row has {column_count} columns)"
@@ -4739,9 +4739,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let row_metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![metadata.clone()],
+            cek_table: vec![],
+        });
         let inner_pause_state = RowPauseState {
             next_column_index: 1,
-            columns: vec![metadata.clone()],
+            metadata: Arc::clone(&row_metadata),
             nbc_null_bitmap: None,
             decryptor: None,
         };
@@ -4759,7 +4764,7 @@ mod tests {
         let mut client = create_test_client_with_transport(transport);
         client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 0,
-            columns: vec![metadata],
+            metadata: row_metadata,
             nbc_null_bitmap: None,
             decryptor: None,
         }));
@@ -4779,7 +4784,7 @@ mod tests {
         let mut client = create_test_client();
         client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 1,
-            columns: Vec::new(),
+            metadata: Arc::new(ColMetadataToken::default()),
             nbc_null_bitmap: None,
             decryptor: None,
         }));
@@ -4798,7 +4803,7 @@ mod tests {
         client.current_result_set_has_been_read_till_end = false;
         client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 1,
-            columns: Vec::new(),
+            metadata: Arc::new(ColMetadataToken::default()),
             nbc_null_bitmap: None,
             decryptor: None,
         }));
