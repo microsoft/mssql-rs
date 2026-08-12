@@ -32,17 +32,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::packet_reader::PacketReader;
-    use crate::io::packet_reader::tests::{MockNetworkReaderWriter, TestPacketBuilder};
     use crate::message::messages::PacketType;
+    use crate::test_packet_support::{TestPacketBuilder, create_network_transport_with_data};
 
     #[tokio::test]
     async fn test_col_info_empty_body() {
         let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
         builder.append_u16(0);
-        let mut mock = MockNetworkReaderWriter::new(builder.build(), 0);
-        let mut reader = PacketReader::new(&mut mock);
-        reader.read_tds_packet_for_test().await.unwrap();
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         let parser = ColInfoTokenParser;
         let token = parser
@@ -57,9 +54,7 @@ mod tests {
         let mut builder = TestPacketBuilder::new(PacketType::PreLogin);
         builder.append_u16(4);
         builder.append_bytes(&[0xAA, 0xBB, 0xCC, 0xDD]);
-        let mut mock = MockNetworkReaderWriter::new(builder.build(), 0);
-        let mut reader = PacketReader::new(&mut mock);
-        reader.read_tds_packet_for_test().await.unwrap();
+        let mut reader = create_network_transport_with_data(&builder.build());
 
         let parser = ColInfoTokenParser;
         let token = parser

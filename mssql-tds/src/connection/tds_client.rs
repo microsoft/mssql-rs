@@ -4281,10 +4281,6 @@ mod tests {
 
     #[async_trait]
     impl NetworkReader for TestTransport {
-        async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
-            buffer.fill(0);
-            Ok(0)
-        }
         fn packet_size(&self) -> u32 {
             4096
         }
