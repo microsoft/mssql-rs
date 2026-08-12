@@ -137,6 +137,7 @@ pub(crate) struct RowPauseState {
 
 #[derive(Debug)]
 #[cfg(fuzzing)]
+#[allow(private_interfaces)]
 pub struct RowPauseState {
     pub next_column_index: usize,
     pub metadata: Arc<ColMetadataToken>,
