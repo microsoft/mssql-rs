@@ -243,24 +243,32 @@ mod tests {
     // Authentication + TC mutual exclusion
     // ---------------------------------------------------------------
 
+    /// Durable, Python-free guard for the class of drift in #223: pins the exact
+    /// clash message across all nine recognized Authentication modes (incl. the
+    /// AD modes whose Python e2e coverage was removed because mssql-python strips
+    /// Trusted_Connection). Empty UID/PWD with SqlPassword also proves the TC
+    /// clash is reported before the "Both User and Password" rule, covering
+    /// ordering in `validate_auth`.
     #[test]
-    fn tc_plus_sqlpassword() {
-        let err = validate_auth(Some("SqlPassword"), Some(true), "sa", "secret", None).unwrap_err();
-        assert!(err.to_string().contains("Trusted_Connection"));
-    }
-
-    #[test]
-    fn tc_plus_ad_password() {
-        let err =
-            validate_auth(Some("ActiveDirectoryPassword"), Some(true), "u", "p", None).unwrap_err();
-        assert!(err.to_string().contains("Trusted_Connection"));
-    }
-
-    #[test]
-    fn tc_plus_ad_integrated() {
-        let err =
-            validate_auth(Some("ActiveDirectoryIntegrated"), Some(true), "", "", None).unwrap_err();
-        assert!(err.to_string().contains("Trusted_Connection"));
+    fn auth_plus_tc_rejected() {
+        for auth in [
+            "SqlPassword",
+            "ActiveDirectoryPassword",
+            "ActiveDirectoryIntegrated",
+            "ActiveDirectoryInteractive",
+            "ActiveDirectoryDefault",
+            "ActiveDirectoryMSI",
+            "ActiveDirectoryServicePrincipal",
+            "ActiveDirectoryDeviceCodeFlow",
+            "ActiveDirectoryWorkloadIdentity",
+        ] {
+            let err = validate_auth(Some(auth), Some(true), "", "", None).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Usage Error: Cannot use Authentication with Trusted_Connection.",
+                "unexpected error for {auth}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------

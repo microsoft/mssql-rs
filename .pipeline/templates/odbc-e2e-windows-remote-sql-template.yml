@@ -1,0 +1,162 @@
+# Template: odbc-e2e-windows-remote-sql-template.yml
+#
+# Runs the mssql-odbc C++ gtest e2e suite on a Windows agent that has no local
+# SQL Server, against the cross-pool x64 SQL host booted by sql-host-template.yml.
+#
+# The Windows ARM agent image ships no SQL Server (unlike RUST-Win22-Sql25-1P used
+# by Build_Windows), so the ARM job joins the same artifact-sentinel rendezvous the
+# Linux ARM jobs use: derive the shared SA password, poll for the sql-ready
+# endpoint sentinel, run the suite, then publish a teardown sentinel to release
+# the host. See sql-host-template.yml for the full contract.
+#
+# Caller contract:
+#   * The consuming job must NOT add `dependsOn` on the SQL host job.
+#   * `sentinelName` must be listed in that host's `expectedSentinels`.
+#   * The host is PR-only (jobCondition), so these steps are PR-only too.
+
+parameters:
+  - name: sqlReadyInstanceId
+    # instanceId of the sql-ready sentinel to consume.
+    type: string
+    default: 'build_arm'
+  - name: sentinelName
+    # Teardown sentinel this job publishes to release the SQL host.
+    type: string
+  - name: testRunTitle
+    type: string
+    default: 'ODBC e2e (Windows ARM)'
+  - name: retries
+    type: number
+    default: 3
+
+steps:
+  # Preflight: the ODBC e2e suite needs CMake and an ARM64 C++ toolchain, neither
+  # of which this job otherwise uses. Resolving them before we claim the shared SQL
+  # host turns a missing-toolchain image into an immediate, legible failure instead
+  # of a confusing error deep inside run_e2e.ps1 — and avoids occupying a SQL host
+  # this job could never have used.
+  - pwsh: |
+      $ErrorActionPreference = 'Continue'
+      Write-Host "PSVersion: $($PSVersionTable.PSVersion)  OSArchitecture: $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+
+      $problems = @()
+
+      $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+      Write-Host "Elevated: $admin"
+      if (-not $admin) {
+        $problems += 'The agent is not elevated; run_e2e.ps1 registers the driver under HKLM and will fail.'
+      }
+
+      # Mirror Initialize-CMake in run_e2e.ps1: PATH, then the VS-bundled copy, then
+      # a standalone install. Whatever that function would resolve, we must resolve too.
+      $vsRoot = $null
+      $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+      if (Test-Path $vswhere) {
+        $vsRoot = & $vswhere -latest -products '*' -property installationPath 2>$null | Select-Object -First 1
+      }
+      Write-Host "Visual Studio: $(if ($vsRoot) { $vsRoot } else { 'not found' })"
+
+      $cmakeExe = (Get-Command cmake -ErrorAction SilentlyContinue).Source
+      if (-not $cmakeExe) {
+        $cmakeCandidates = @()
+        if ($vsRoot) { $cmakeCandidates += Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe' }
+        $cmakeCandidates += 'C:\Program Files\CMake\bin\cmake.exe'
+        $cmakeCandidates += Join-Path ${env:ProgramFiles(x86)} 'CMake\bin\cmake.exe'
+        $cmakeExe = $cmakeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+      }
+      Write-Host "cmake: $(if ($cmakeExe) { $cmakeExe } else { 'not found' })"
+      if (-not $cmakeExe) {
+        $problems += 'No cmake found on PATH, in Visual Studio, or in a standalone install.'
+      }
+
+      # The gtest suite is built for arm64, so we need a compiler that targets arm64.
+      # Either a native arm64 host or an x64 host cross-compiler works.
+      $armCl = $null
+      if ($vsRoot) {
+        foreach ($ver in Get-ChildItem (Join-Path $vsRoot 'VC\Tools\MSVC') -ErrorAction SilentlyContinue) {
+          $native = Join-Path $ver.FullName 'bin\Hostarm64\arm64\cl.exe'
+          $cross = Join-Path $ver.FullName 'bin\Hostx64\arm64\cl.exe'
+          Write-Host "MSVC $($ver.Name): Hostarm64/arm64 cl=$(Test-Path $native) Hostx64/arm64 cl=$(Test-Path $cross)"
+          if (-not $armCl) {
+            $armCl = @($native, $cross) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+        }
+      }
+      Write-Host "arm64 cl.exe: $(if ($armCl) { $armCl } else { 'not found' })"
+      if (-not $armCl) {
+        $problems += 'No MSVC cl.exe targeting arm64 (Hostarm64/arm64 or Hostx64/arm64) was found.'
+      }
+
+      if ($problems) {
+        foreach ($p in $problems) { Write-Host "##vso[task.logissue type=error]$p" }
+        Write-Host '##vso[task.logissue type=error]Preflight failed; skipping the ODBC e2e suite rather than claiming the shared SQL host.'
+        exit 1
+      }
+      Write-Host 'Preflight OK.'
+    displayName: 'Preflight: CMake and C++ toolchain'
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
+  - pwsh: ./.pipeline/scripts/sql-host/New-SqlPassword.ps1
+    displayName: 'Derive shared SQL_PASSWORD from build context'
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      BUILD_BUILDID: $(Build.BuildId)
+      SYSTEM_COLLECTIONID: $(System.CollectionId)
+
+  - pwsh: ./.pipeline/scripts/sql-host/Wait-ForSqlEndpoint.ps1
+    displayName: 'Wait for SQL host endpoint sentinel'
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      ARTIFACT_NAME: 'sql-ready-${{ parameters.sqlReadyInstanceId }}-$(System.StageAttempt)'
+      BUILD_BUILDID: $(Build.BuildId)
+      SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+      SYSTEM_TEAMPROJECT: $(System.TeamProject)
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      SYSTEM_STAGEATTEMPT: $(System.StageAttempt)
+      AGENT_TEMPDIRECTORY: $(Agent.TempDirectory)
+
+  # No -Coverage here: the x64 Windows leg already publishes
+  # CoberturaCoverageOdbcE2E_Windows, and a second artifact under the same name
+  # would collide. This leg exists to prove the ARM64 driver binary works through
+  # the Windows Driver Manager.
+  - pwsh: |
+      $env:ODBC_TEST_SERVER     = "$($env:DB_HOST),$($env:DB_PORT)"
+      $env:ODBC_TEST_UID        = 'sa'
+      $env:ODBC_TEST_PWD        = $env:SQL_PASSWORD
+      $env:ODBC_TEST_TRUST_CERT = 'Yes'
+      ./mssql-odbc/tests/e2e/run_e2e.ps1 -Retries ${{ parameters.retries }}
+    displayName: 'Run ODBC C++ e2e tests'
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      DB_HOST: $(DB_HOST)
+      DB_PORT: $(DB_PORT)
+      SQL_PASSWORD: $(SQL_PASSWORD)
+      RUST_BACKTRACE: full
+
+  - task: PublishTestResults@2
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: 'Publish ODBC e2e test results'
+    inputs:
+      testResultsFormat: 'JUnit'
+      testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
+      testRunTitle: ${{ parameters.testRunTitle }}
+
+  # always() so a failure or cancellation still releases the SQL host instead of
+  # leaving it to burn its MAX_LIFETIME_MINUTES cap.
+  - pwsh: |
+      $dir = Join-Path $env:AGENT_TEMPDIRECTORY 'teardown-${{ parameters.sentinelName }}'
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+      "${{ parameters.sentinelName }} done at $([DateTime]::UtcNow.ToString('o'))" |
+        Set-Content -Path (Join-Path $dir 'done.txt')
+    displayName: 'Stage teardown sentinel'
+    condition: and(always(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      AGENT_TEMPDIRECTORY: $(Agent.TempDirectory)
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish teardown sentinel (release SQL host)'
+    condition: and(always(), eq(variables['Build.Reason'], 'PullRequest'))
+    inputs:
+      targetPath: '$(Agent.TempDirectory)/teardown-${{ parameters.sentinelName }}'
+      artifact: '${{ parameters.sentinelName }}-$(System.StageAttempt)'
+      publishLocation: 'pipeline'

@@ -41,7 +41,6 @@ pub(crate) trait NetworkWriter: Send + Sync + TransportSslHandler {
 
 #[async_trait]
 pub(crate) trait NetworkReader: Send {
-    async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize>;
     fn packet_size(&self) -> u32;
 }
 
@@ -56,9 +55,7 @@ pub(crate) trait NetworkReaderWriter: NetworkReader + NetworkWriter {
 mod tests {
     use crate::connection::client_context::ClientContext;
     use crate::connection::transport::network_transport::tests::MAX_BUFFER_SIZE;
-    use crate::connection::transport::network_transport::tests::{
-        create_client_server_network_transport, create_readable_network_transport,
-    };
+    use crate::connection::transport::network_transport::tests::create_readable_network_transport;
     use crate::io::reader_writer::NetworkWriter;
     use futures::StreamExt;
     use rand::Rng;
@@ -92,30 +89,5 @@ mod tests {
             .expect("Decode error");
 
         assert_eq!(received.as_ref(), &data_vector[..]);
-    }
-
-    #[tokio::test]
-    async fn test_send_recv() {
-        let context = ClientContext::default();
-        let (mut client_transport, mut server_transport) =
-            create_client_server_network_transport(&context);
-
-        // Fill data_to_send with random values
-        let mut rng = rand::rng();
-        let data_vector: Vec<u8> = (0..MAX_BUFFER_SIZE).map(|_| rng.random()).collect();
-
-        // Send the data.
-        let result = server_transport.send(&data_vector[..]).await;
-        match result {
-            Ok(_) => {}
-            Err(e) => panic!("Error sending data: {e}"),
-        }
-
-        let mut buffer = vec![0u8; MAX_BUFFER_SIZE];
-        let bytes_read = client_transport.receive(&mut buffer).await.unwrap();
-
-        // Verify we read exactly `data_size` bytes and that they match what was written
-        assert_eq!(bytes_read, MAX_BUFFER_SIZE);
-        assert_eq!(buffer, data_vector);
     }
 }

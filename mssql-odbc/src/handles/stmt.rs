@@ -5,13 +5,29 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use mssql_tds::datatypes::column_values::ColumnValues;
-use mssql_tds::query::metadata::ColumnMetadata;
-
-use super::{DbcHandle, HandleType, HasObjectType};
+use super::desc::{DescHandle, DescKind};
+use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
 use crate::api::odbc_types::{SqlULen, SqlUSmallInt};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
+use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
+
+/// State for a PLP column being streamed across repeated SQLGetData calls.
+#[derive(Debug)]
+pub(crate) struct ActivePlpStream {
+    /// 1-based column ordinal being streamed.
+    pub(crate) column: usize,
+    /// Wire encoding of the PLP column.
+    pub(crate) encoding: PlpEncoding,
+    /// Trailing odd wire byte from the previous read, awaiting its pair. Only
+    /// used on the UTF-16LE -> UTF-8 (`nvarchar(max)` -> `SQL_C_CHAR`) path,
+    /// where a chunk boundary can fall between the two bytes of a code unit.
+    pub(crate) pending_byte: Option<u8>,
+    /// High surrogate whose low half lands in the next chunk. Held back so the
+    /// pair is transcoded together instead of each half becoming U+FFFD.
+    pub(crate) pending_high_surrogate: Option<u16>,
+}
 
 pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
 pub(crate) const STMT_STATE_PREPARED: u32 = 0x0000_0200;
@@ -28,6 +44,19 @@ pub(crate) struct StmtHandle {
     /// the DBC owns the STMT's lifetime, not the other way around.
     /// Mirrors msodbcsql's statement→connection back-pointer.
     pub(crate) parent_dbc: *mut c_void,
+    /// The four automatically-allocated implicit descriptors (ARD/APD/IRD/IPD),
+    /// the permanent implicit allocations (cf. msodbcsql's embedded `lpstmt->ARD`
+    /// / `cmdp.APD`, `sqlcfunc.cpp`). Set once in `new()`, freed in `Drop`, never
+    /// reassigned — hence sound as plain fields outside `inner`, same set-once
+    /// rationale as `parent_dbc`. Do NOT repurpose them into the mutable *active*
+    /// ARD/APD association that `SQLSetStmtAttr(SQL_ATTR_APP_ROW_DESC / APP_PARAM_DESC)`
+    /// swaps (msodbcsql's separate `pARD`/`pAPD`); that path is still a stub, and
+    /// when implemented its active pointer belongs in `StmtState` behind `inner`
+    /// (concurrent set/get would otherwise race). IRD/IPD are never swappable.
+    pub(crate) ard: *mut c_void,
+    pub(crate) apd: *mut c_void,
+    pub(crate) ird: *mut c_void,
+    pub(crate) ipd: *mut c_void,
     pub(crate) inner: Mutex<StmtState>,
 }
 
@@ -55,8 +84,26 @@ pub(crate) struct StmtState {
     /// `prepared_handle` is `Some` (a new handle can only be acquired by an
     /// execute, which flushes any pending drop first).
     pub(crate) pending_unprepare: Option<i32>,
-    /// Current fetched row, populated by SQLFetch for later SQLGetData support.
-    pub(crate) current_row: Option<Vec<ColumnValues>>,
+    /// `true` when SQLFetch has positioned the cursor on a row ready for SQLGetData.
+    pub(crate) row_positioned: bool,
+    /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
+    pub(crate) last_captured: Option<(usize, ColumnValues)>,
+    /// `true` when the last resume consumed the row's final column
+    /// (`CursorColumn::RowEnded`). Distinguishes "row exhausted" from "decoder
+    /// paused at a PLP column" when `last_captured` is `None` (see
+    /// `get_data.rs` resume path).
+    pub(crate) row_exhausted: bool,
+    /// Active PLP stream state; `None` when no PLP stream is in progress.
+    pub(crate) active_plp: Option<ActivePlpStream>,
+    /// 1-based column number of the last successful SQLGetData call on this row.
+    /// Used to enforce forward-only column access (07009) and SQL_NO_DATA on re-read.
+    pub(crate) current_row_last_col: usize,
+    /// Byte/code-unit offset into the current non-PLP column's text, for
+    /// resumable `SQLGetData`. `(1-based column, offset)`; `None` when no
+    /// partial read is outstanding. The offset unit matches the target C type
+    /// the column is being read as (bytes for `SQL_C_CHAR`, UTF-16 code units
+    /// for `SQL_C_WCHAR`); a single column's chunk loop uses one target type.
+    pub(crate) partial_text_offset: Option<(usize, usize)>,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
     /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
@@ -98,6 +145,27 @@ impl StmtState {
         self.state_flags &= !mask;
     }
 
+    /// Clears all row-stream state (cursor invalidated, no PLP in progress).
+    pub(crate) fn reset_row_stream(&mut self) {
+        self.row_positioned = false;
+        self.last_captured = None;
+        self.row_exhausted = false;
+        self.active_plp = None;
+        self.current_row_last_col = 0;
+        self.partial_text_offset = None;
+    }
+
+    /// Positions the row stream on a freshly fetched row: clears all per-row
+    /// state, then marks the cursor as positioned for `SQLGetData`. This is the
+    /// "begin a new row" counterpart to `reset_row_stream`'s "invalidate"; both
+    /// clear the same fields, but keeping them named apart means a future
+    /// row-scoped field that must differ between the two cases can't silently
+    /// inherit the invalidate value.
+    pub(crate) fn begin_row(&mut self) {
+        self.reset_row_stream();
+        self.row_positioned = true;
+    }
+
     /// Moves the cached `prepared_handle` (if any) into `pending_unprepare` so
     /// the next execute / exec-direct (or statement free) releases it with
     /// `sp_unprepare`. Called by re-prepare, rebind, and `SQLExecDirect` when
@@ -134,6 +202,10 @@ impl StmtHandle {
         Self {
             object_type: HandleType::Stmt,
             parent_dbc,
+            ard: handle_to_raw(Box::new(DescHandle::new(DescKind::AppRow))),
+            apd: handle_to_raw(Box::new(DescHandle::new(DescKind::AppParam))),
+            ird: handle_to_raw(Box::new(DescHandle::new(DescKind::ImpRow))),
+            ipd: handle_to_raw(Box::new(DescHandle::new(DescKind::ImpParam))),
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
@@ -141,7 +213,12 @@ impl StmtHandle {
                 bound_params: Vec::new(),
                 prepared_handle: None,
                 pending_unprepare: None,
-                current_row: None,
+                row_positioned: false,
+                last_captured: None,
+                row_exhausted: false,
+                active_plp: None,
+                current_row_last_col: 0,
+                partial_text_offset: None,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
                 row_array_size: 1,
@@ -170,5 +247,18 @@ impl StmtHandle {
 impl HasObjectType for StmtHandle {
     fn object_type_mut(&mut self) -> &mut HandleType {
         &mut self.object_type
+    }
+}
+
+impl Drop for StmtHandle {
+    fn drop(&mut self) {
+        // Free the four implicit descriptors owned by this statement through the
+        // centralized deallocation path so each one's object type is stamped
+        // `Invalid` (use-after-free detection) rather than raw `Box::from_raw`.
+        // These are never handed to `SQLFreeHandle` (they are implicit), so
+        // dropping the statement is the single owner responsible for them.
+        for raw in [self.ard, self.apd, self.ird, self.ipd] {
+            unsafe { free_handle::<DescHandle>(raw) };
+        }
     }
 }

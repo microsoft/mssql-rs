@@ -10,9 +10,8 @@ the pipeline fail in seconds instead of building seven wheels and only hitting
 the duplicate-version rejection at ``twine upload``.
 
 The ``mssql-rs_Public`` feed allows anonymous reads, so the simple index URL is
-passed in directly (no credentials). For convenience an embedded-credential URL
-(``https://user:token@.../pypi/simple/``) is still accepted, as is a fallback to
-the ``PIP_INDEX_URL`` environment variable.
+passed in directly (no credentials). Authenticated simple index URLs are also
+accepted, as is a fallback to the ``PIP_INDEX_URL`` environment variable.
 
 Best-effort: if the feed cannot be reached or the index URL is missing, we WARN
 and exit 0. The duplicate-version rejection at upload time remains the

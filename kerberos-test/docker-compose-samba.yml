@@ -1,6 +1,7 @@
 services:
   # Samba AD Domain Controller
   dc:
+    image: ${KERBEROS_IMAGE_REGISTRY:-ghcr.io/microsoft/mssql-rs}/kerberos/samba-dc:${KERBEROS_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile.samba-dc
@@ -21,6 +22,7 @@ services:
       - KERBEROS_ADMIN_PASSWORD=${KERBEROS_ADMIN_PASSWORD}
     volumes:
       - samba-data:/var/lib/samba
+      - ./scripts:/scripts:ro
     networks:
       kerberos-net:
         ipv4_address: 172.20.0.10
@@ -40,6 +42,7 @@ services:
 
   # SQL Server on Linux with SSSD/AD integration
   mssql:
+    image: ${KERBEROS_IMAGE_REGISTRY:-ghcr.io/microsoft/mssql-rs}/kerberos/mssql-ad:${KERBEROS_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile.mssql-ad

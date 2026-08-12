@@ -11,11 +11,14 @@ pub(crate) const SQLSTATE_01000: [u8; 5] = *b"01000";
 pub(crate) const SQLSTATE_01004: [u8; 5] = *b"01004";
 pub(crate) const SQLSTATE_01S00: [u8; 5] = *b"01S00";
 pub(crate) const SQLSTATE_01S02: [u8; 5] = *b"01S02";
+pub(crate) const SQLSTATE_01S07: [u8; 5] = *b"01S07";
 pub(crate) const SQLSTATE_07002: [u8; 5] = *b"07002";
 pub(crate) const SQLSTATE_07006: [u8; 5] = *b"07006";
 pub(crate) const SQLSTATE_07009: [u8; 5] = *b"07009";
 pub(crate) const SQLSTATE_08001: [u8; 5] = *b"08001";
 pub(crate) const SQLSTATE_08003: [u8; 5] = *b"08003";
+pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
+pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
 pub(crate) const SQLSTATE_HY000: [u8; 5] = *b"HY000";
 pub(crate) const SQLSTATE_HY003: [u8; 5] = *b"HY003";
@@ -27,6 +30,7 @@ pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
 pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
+pub(crate) const SQLSTATE_HY096: [u8; 5] = *b"HY096";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
 
 // Driver-raised diagnostics: a fixed SQLSTATE paired with its canonical
@@ -88,6 +92,18 @@ pub(crate) const ERR_RESTRICTED_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_07006,
     text: "Restricted data type attribute violation",
 };
+pub(crate) const ERR_NUMERIC_OUT_OF_RANGE: DiagMsg = DiagMsg {
+    state: SQLSTATE_22003,
+    text: "Numeric value out of range",
+};
+pub(crate) const ERR_INVALID_CHARACTER_VALUE: DiagMsg = DiagMsg {
+    state: SQLSTATE_22018,
+    text: "Invalid character value for cast specification",
+};
+pub(crate) const WARN_FRACTIONAL_TRUNCATION: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S07,
+    text: "Fractional truncation",
+};
 pub(crate) const ERR_STRING_RIGHT_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01004,
     text: "String data, right truncation",
@@ -111,6 +127,28 @@ pub(crate) const ERR_INVALID_CONNECTION_STRING_ATTRIBUTE: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_STRING_OR_BUFFER_LENGTH: DiagMsg = DiagMsg {
     state: SQLSTATE_HY090,
     text: "Invalid string or buffer length",
+};
+pub(crate) const ERR_INVALID_INFO_TYPE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY096,
+    text: "Information type out of range",
+};
+/// Reported when a requested login timeout is larger than the driver accepts
+/// and is clamped. Mirrors msodbcsql's `IDS_01_S02_05` (`dll/res/local.rc:45`),
+/// which it posts from the same situation.
+pub(crate) const WARN_LOGIN_TIMEOUT_CHANGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S02,
+    text: "Login timeout changed",
+};
+/// The same clamp applied to `SQL_ATTR_CONNECTION_TIMEOUT`.
+///
+/// A deliberate divergence: msodbcsql handles both timeouts in one arm and
+/// posts `IDS_01_S02_05` — "Login timeout changed" — for either
+/// (`sqlcmisc.cpp:1733-1741`), naming the wrong attribute when the application
+/// set the connection timeout. The SQLSTATE is what applications branch on and
+/// it is unchanged; only the human-readable text is corrected.
+pub(crate) const WARN_CONNECTION_TIMEOUT_CHANGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S02,
+    text: "Connection timeout changed",
 };
 
 /// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with

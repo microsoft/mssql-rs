@@ -28,8 +28,8 @@ This directory contains a containerized Kerberos authentication test environment
 | `docker-compose-matrix.yml` | Docker Compose for multi-distro matrix testing |
 | `Dockerfile.client` | Default client container (based on .NET SDK) |
 | `Dockerfile.client.matrix` | Parameterized client for all distros (uses build args) |
-| `Dockerfile.samba-dc` | Samba AD Domain Controller |
-| `Dockerfile.mssql-ad` | SQL Server with AD integration |
+| `Dockerfile.samba-dc` | Samba AD Domain Controller (init script mounted from `scripts/`) |
+| `Dockerfile.mssql-ad` | SQL Server with AD integration (init script mounted from `scripts/`) |
 | `configure-kerberos.sh` | Script to configure Kerberos after containers start |
 | `run-kerberos-tests.sh` | Run tests on a specific distro |
 | `run-all-distros.sh` | Run tests on all distros in the matrix |
@@ -114,6 +114,35 @@ Test Kerberos authentication across multiple Linux distributions using the same
 base images as the CI matrix (from `validation-pipeline.yml`).
 
 All images come from `tdslibrs.azurecr.io/import/` - the same ACR used by CI.
+
+### Pre-built images
+
+The DC, SQL+AD and per-distro client images are pre-built weekly by
+`.pipeline/sync-container-images.yml` and published to
+`ghcr.io/microsoft/mssql-rs/kerberos/*`. CI pulls them instead of rebuilding,
+which skips the Rust toolchain install, the distro dev packages and the
+Samba/SSSD stacks on every run.
+
+**CI never builds these images.** If a pull fails the stage fails, so a missing,
+unpublished or private image surfaces immediately instead of being masked by a
+slow rebuild. Changes to `Dockerfile.samba-dc`, `Dockerfile.mssql-ad` or
+`Dockerfile.client.matrix` therefore only take effect in CI once the sync
+pipeline has republished the images.
+
+Because `docker-compose-*.yml` declare both `image:` and `build:`, local
+workflows can still pull or build:
+
+```bash
+docker compose -f docker-compose-matrix.yml --profile ubuntu22 pull   # use pre-built
+docker compose -f docker-compose-matrix.yml --profile ubuntu22 build  # build locally
+```
+
+Override the source registry/tag with `KERBEROS_IMAGE_REGISTRY` and
+`KERBEROS_IMAGE_TAG`.
+
+The DC and SQL images run their init script from the mounted `./scripts`
+directory rather than a copy baked into the image, so edits to
+`scripts/init-*.sh` take effect without republishing the image.
 
 ### Test a Specific Distro
 

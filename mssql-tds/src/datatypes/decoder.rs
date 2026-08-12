@@ -225,6 +225,16 @@ impl PlpChunkStreamReader {
         self.total_read
     }
 
+    /// Declared total length of the whole PLP value in wire bytes when the
+    /// server sent a known-length PLP header; `None` for unknown-length
+    /// (streamed) PLP where the total is not known up front.
+    pub(crate) fn known_len(&self) -> Option<u64> {
+        match self.length {
+            PlpChunkReadLength::Known(n) => Some(n),
+            PlpChunkReadLength::Unknown => None,
+        }
+    }
+
     pub(crate) fn reached_end(&self) -> bool {
         self.reached_end
     }
@@ -428,6 +438,12 @@ impl PlpColumnStream {
     /// Total payload bytes consumed so far across all chunks.
     pub(crate) fn total_read(&self) -> usize {
         self.inner.total_read()
+    }
+
+    /// Declared total length of the whole PLP value in wire bytes, when the
+    /// server sent a known-length PLP header; `None` for unknown-length PLP.
+    pub(crate) fn known_len(&self) -> Option<u64> {
+        self.inner.known_len()
     }
 
     /// `true` after the zero-length terminator chunk has been consumed.
@@ -1475,7 +1491,11 @@ impl SqlTypeDecode for GenericDecoder {
                 }
             }
             TdsDataType::Xml => {
-                assert!(metadata.is_plp());
+                if !metadata.is_plp() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "XML column metadata is not partially-length-prefixed".to_string(),
+                    ));
+                }
                 let some_bytes = GenericDecoder::read_plp_bytes(reader).await?;
                 match some_bytes {
                     Some(bytes) => ColumnValues::Xml(SqlXml { bytes }),
@@ -1483,7 +1503,11 @@ impl SqlTypeDecode for GenericDecoder {
                 }
             }
             TdsDataType::Json => {
-                assert!(metadata.is_plp());
+                if !metadata.is_plp() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "JSON column metadata is not partially-length-prefixed".to_string(),
+                    ));
+                }
                 let some_bytes = GenericDecoder::read_plp_bytes(reader).await?;
                 match some_bytes {
                     Some(bytes) => ColumnValues::Json(SqlJson::new(bytes)),
@@ -1618,7 +1642,11 @@ impl SqlTypeDecode for GenericDecoder {
                 }
             }
             TdsDataType::Udt => {
-                assert!(metadata.is_plp());
+                if !metadata.is_plp() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "UDT column metadata is not partially-length-prefixed".to_string(),
+                    ));
+                }
                 let some_bytes = GenericDecoder::read_plp_bytes(reader).await?;
                 match some_bytes {
                     Some(bytes) => ColumnValues::Bytes(bytes),
@@ -3862,6 +3890,45 @@ mod test {
             let err = PlpColumnStream::begin(&md, &mut reader).await.unwrap_err();
             assert!(
                 err.to_string().contains("is not a PLP type"),
+                "unexpected: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn decode_xml_rejects_non_plp_metadata() {
+            let md = varlen_metadata(TdsDataType::Xml, 100);
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(plp_wire(b"x"));
+            let err = decoder.decode(&mut reader, &md).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("XML column metadata is not partially-length-prefixed"),
+                "unexpected: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn decode_json_rejects_non_plp_metadata() {
+            let md = varlen_metadata(TdsDataType::Json, 100);
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(plp_wire(b"x"));
+            let err = decoder.decode(&mut reader, &md).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("JSON column metadata is not partially-length-prefixed"),
+                "unexpected: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn decode_udt_rejects_non_plp_metadata() {
+            let md = varlen_metadata(TdsDataType::Udt, 100);
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(plp_wire(b"x"));
+            let err = decoder.decode(&mut reader, &md).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("UDT column metadata is not partially-length-prefixed"),
                 "unexpected: {err}"
             );
         }

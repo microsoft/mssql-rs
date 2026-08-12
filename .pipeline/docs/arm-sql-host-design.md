@@ -100,18 +100,11 @@ must agree on the password without sharing a secret across jobs (artifacts
 are readable by anyone with build read access; we do not want to leak the
 SA password through the `sql-ready` artifact).
 
-`sql-host/derive-sql-password.sh` deterministically derives the SA password
-from build context:
-
-```
-SQL_PASSWORD = "Aa1!" || sha256(Build.BuildId "-" System.CollectionId "-" salt)[0:22]
-```
-
-Both the SQL host job and the test jobs invoke the same script, so they
-agree on the value without any cross-job transport. The `Aa1!` prefix
-guarantees all four character classes the SQL Server SA policy requires.
-The script uses the same `SQL_PASSWORD_GENERATED` marker as the random
-template so the two are interchangeable.
+Both the SQL host job and the test jobs invoke
+`sql-host/derive-sql-password.sh`, which deterministically produces the same
+policy-compliant value from build context without any cross-job transport.
+The script uses the same `SQL_PASSWORD_GENERATED` marker as the random template
+so the two are interchangeable.
 
 ### Shared TLS cert chain
 

@@ -77,9 +77,75 @@ the two drivers.
 ./run_e2e.sh --compare-with-msodbcsql --msodbcsql-ini=/opt/msodbcsql/odbcinst.ini
 ```
 
-Both INIs must register the driver under the same section name
-(`[ODBC Driver 18 for SQL Server]`). The script exits `0` only if **both**
-runs pass.
+The two drivers register under **different** names, so both can be installed
+side by side:
+
+| Leg | Driver name (`ODBC_TEST_DRIVER`) |
+|---|---|
+| `mssql-odbc` | `ODBC Driver 18 for SQL Server (Rust)` |
+| `msodbcsql` | `ODBC Driver 18 for SQL Server` |
+
+Each leg exports `ODBC_TEST_DRIVER` so the same test binaries connect through
+the right driver. Setting `ODBC_TEST_CONNSTR` overrides the whole connection
+string and would pin both legs to one driver, so comparison mode rejects it.
+
+The script exits `0` only if **both** runs pass *and* every test reaches the
+same verdict in both legs. A divergence, a shared failure, or a test that ran
+in only one leg fails the run:
+
+```
+Summary: 15 parity, 1 divergence(s), 0 shared failure(s), 0 skipped
+=== Parity check FAILED (mssql-odbc rc=0, msodbcsql rc=0, parity rc=1) ===
+```
+
+### Intentional divergence: `SKIP_IF_COMPARING_MSODBCSQL()`
+
+Some tests assert behavior that is deliberately stricter in the Rust driver than
+in msodbcsql — for example rejecting an invalid connection-attribute value with
+`HY024` where msodbcsql accepts it. Comparing those on the reference leg would
+always report a divergence and fail the run, even though the difference is
+intended.
+
+The escape hatch is `SKIP_IF_COMPARING_MSODBCSQL()` (defined in
+`include/odbc_test_fixture.h`). Each leg exports `ODBC_TEST_TARGET`
+(`mssql-odbc` on the Rust leg, `msodbcsql` on the reference leg); the macro
+`GTEST_SKIP()`s when it sees `msodbcsql`. The test still runs — and asserts — on
+the Rust leg, so its coverage is preserved; it is simply not run on the reference
+leg, so there is nothing to diverge.
+
+Prefer this over inline `if (ODBC_TEST_TARGET == ...)` guards around individual
+assertions. An inline guard that changes what a test asserts per leg still
+reports `PASS`/`PASS`, which hides the fact that the two drivers behaved
+differently at all. Skipping the whole case on the reference leg keeps the
+comparison honest; put a genuinely reference-incompatible case in its own test
+(as `DriverConnectLiveTest.InvalidConnectionAttributeValuesRejected` is) so the
+surrounding parity assertions still compare.
+
+**Granularity:** ctest compares at the *test-binary* level — each `*_test`
+executable is a single ctest case and the parity table is keyed on that binary
+name, not on individual gtest cases. A gtest skip is not a failure, so a case
+guarded by `SKIP_IF_COMPARING_MSODBCSQL()` leaves its binary passing on both
+legs: it shows up as `parity`, not `skipped`. The `skipped (not compared)`
+verdict only appears when an *entire* binary is skipped in one leg. Either way
+the divergent assertions never execute on the reference leg.
+
+CI runs this comparison on the Linux x64 PR build, which owns a SQL Server in
+docker. `.pipeline/scripts/containerized-odbc-e2e.sh` installs a pinned
+`msodbcsql18` from `packages.microsoft.com` when `ODBC_E2E_COMPARE=1`.
+
+### Failure modes that are never silently green
+
+Both runners abort — locally and in CI — when:
+
+- `cargo build` or either `cmake` invocation exits non-zero.
+- A ctest leg executes zero tests. ctest exits `0` and prints
+  `No tests were found!!!` in that case, which previously turned a broken CMake
+  configure into a passing run reporting `0 parity`.
+- Any test diverges between the two legs (comparison mode).
+
+In CI the scripts additionally dump `CMakeOutput.log`, `CMakeError.log`,
+`LastTest.log`, and the discovered test executables, since there is no working
+copy left to inspect afterwards.
 
 ### Collecting coverage
 
@@ -111,6 +177,57 @@ and the Merge Coverage stage unions it into the diff-coverage report.
 .\run_e2e.ps1
 ```
 
+Like `run_e2e.sh`, it can rerun the suite against msodbcsql 18 and print a
+parity table. The Rust driver registers under its own name, so no registry swap
+happens between the two legs, and the same parity gate applies: any divergence
+fails the run.
+```powershell
+# Use the installed "ODBC Driver 18 for SQL Server" registration as the reference
+.\run_e2e.ps1 -CompareWithMsodbcsql
+
+# Point at a specific reference driver
+.\run_e2e.ps1 -CompareWithMsodbcsql -MsodbcsqlDll 'C:\path\to\msodbcsql18.dll'
+```
+
+Install the reference driver with:
+
+```powershell
+winget install --id Microsoft.msodbcsql.18 --version 18.6.2.1 --exact
+```
+
+CI runs this comparison on the Windows x64 PR build (the leg with a local SQL
+Server), installing the same pinned version before the suite. The version is
+set once via the `msodbcsqlVersion` pipeline variable (in
+`.pipeline/validation-pipeline*.yml`) and consumed on Windows by
+`.pipeline/scripts/install-msodbcsql.ps1` and on Linux by
+`.pipeline/scripts/containerized-odbc-e2e.sh`.
+
+When `ODBC_TEST_SERVER` is unset, a dev SQL Server on `localhost:1433` is
+auto-detected — the password is taken from `ODBC_TEST_PWD`, then `SQL_PASSWORD`,
+then `SQL_PASSWORD=` in `mssql-tds\.env`, falling back to integrated auth. This
+matches `run_e2e.sh`.
+
+`run_e2e.ps1 -Coverage` builds the Rust driver with LLVM source-based
+instrumentation so the driver code exercised by the C++ tests — which load the
+DLL through the Windows Driver Manager as separate processes — is measured. It
+writes a Cobertura report for `mssql-tds` + `mssql-odbc` (the cdylib statically
+links `mssql-tds`, so both are covered).
+
+```powershell
+# Report to the default path: <repo>\target\cobertura-odbc-e2e.xml
+.\run_e2e.ps1 -Coverage
+
+# Custom output path
+.\run_e2e.ps1 -Coverage -CoverageOutput 'C:\tmp\odbc-e2e.xml'
+```
+
+This uses the same mechanism as `run_e2e.sh --coverage`: everything runs through
+`cargo llvm-cov` (`show-env` to instrument the build, `report` to emit the
+report), so the LLVM version that reads the `.profraw` always matches the rustc
+that produced the instrumented DLL. In CI, the Windows x64 PR build runs the
+suite with `-Coverage`, publishes the report as `CoberturaCoverageOdbcE2E_Windows`,
+and the Merge Coverage stage unions it into the diff-coverage report.
+
 Both scripts:
 1. Build the Rust cdylib (`cargo build` from `mssql-odbc/`)
 2. Register the driver with the platform's ODBC Driver Manager
@@ -127,31 +244,41 @@ infrastructure works (`runtests.c`).
 ### How the scripts register the driver
 
 - **Linux / macOS (`run_e2e.sh`)**: Creates a temp directory with an
-  `odbcinst.ini` file and sets `ODBCSYSINI` to point at it. The env var is
-  scoped to the script process, so the parent shell is never affected. A
-  `trap cleanup EXIT` ensures the temp directory is removed even on failure.
+  `odbcinst.ini` file registering the Rust driver as
+  `[ODBC Driver 18 for SQL Server (Rust)]`, and sets `ODBCSYSINI` to point at
+  it. The env var is scoped to the script process, so the parent shell is never
+  affected. A `trap cleanup EXIT` ensures the temp directory is removed even on
+  failure.
 
 - **Windows (`run_e2e.ps1`)**: Writes `Driver` and `Setup` values under
-  `HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server`. The
-  original values are saved beforehand and restored in a `try/finally` block,
-  so an existing production driver installation is not permanently overwritten.
+  `HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server (Rust)`, so an
+  installed msodbcsql18 registration is left untouched. Any pre-existing values
+  under that key are saved beforehand and restored in a `try/finally` block.
+  Only `-MsodbcsqlDll` temporarily repoints the reference registration, and it
+  too is restored on exit.
 
 ### Manual registration (without the scripts)
 
-If you prefer not to use the scripts, register the driver yourself:
+If you prefer not to use the scripts, register the driver yourself. You can use
+either name — the canonical `ODBC Driver 18 for SQL Server` (the default when
+`ODBC_TEST_DRIVER` is unset), or a distinct name such as
+`ODBC Driver 18 for SQL Server (Rust)` if you want it installed alongside
+msodbcsql18. With a distinct name, set `ODBC_TEST_DRIVER` to match before
+running the tests.
 
 - **Linux / macOS**: Either add an entry to `/etc/odbcinst.ini`, or create
   your own `odbcinst.ini` in any directory and set `ODBCSYSINI` env var to that
   directory before running the tests.
 
-- **Windows**: Add the following registry values (requires Administrator):
+- **Windows**: Add the following registry values (requires Administrator),
+  substituting your chosen driver name for `<driver name>`:
   ```
-  HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server
+  HKLM\Software\ODBC\ODBCINST.INI\<driver name>
       Driver = <path to msodbcsql18.dll>
       Setup  = <path to msodbcsql18.dll>
 
   HKLM\Software\ODBC\ODBCINST.INI\ODBC Drivers
-      ODBC Driver 18 for SQL Server = Installed
+      <driver name> = Installed
   ```
 
 ## Manual Build
@@ -177,15 +304,16 @@ then:
 ```cmd
 cd mssql-odbc && cargo build
 cd tests\e2e
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DODBC_E2E_FORCE_UNICODE=ON
 cmake --build build --config Debug
 cd build && ctest --output-on-failure -C Debug
 ```
 
 ## Running Connected Tests
 
-Tests that require a live SQL Server are automatically **skipped** when no
-connection is configured. Set environment variables to enable them:
+Tests that require a live SQL Server **fail** when no connection is configured,
+so an unconfigured environment is surfaced instead of silently passing. Set
+environment variables to enable them:
 
 ### Auto-detection
 
@@ -208,7 +336,7 @@ To bring up a local SQL Server in Docker:
 | `ODBC_TEST_UID` | Yes (for SQL auth) | *(none)* | SQL login username (e.g. `sa`) |
 | `ODBC_TEST_PWD` | Yes (for SQL auth) | *(none)* | SQL login password |
 | `ODBC_TEST_DATABASE` | No | `tempdb` | Database to connect to |
-| `ODBC_TEST_DRIVER` | No | `ODBC Driver 18 for SQL Server` | ODBC driver name |
+| `ODBC_TEST_DRIVER` | No | `ODBC Driver 18 for SQL Server` | ODBC driver name (the run scripts set this per leg) |
 | `ODBC_TEST_DSN` | No | *(none)* | Pre-configured DSN (overrides server/driver) |
 | `ODBC_TEST_CONNSTR` | No | *(none)* | Full connection string (overrides all above) |
 | `ODBC_TEST_TRUST_CERT` | No | `Yes` | Trust server certificate (`Yes`/`No`) |

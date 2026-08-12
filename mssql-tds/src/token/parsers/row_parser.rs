@@ -74,7 +74,7 @@
 use std::io::Error;
 
 use async_trait::async_trait;
-use tracing::{info, trace};
+use tracing::{debug, trace};
 
 use super::super::tokens::{RowToken, Tokens};
 use super::common::TokenParser;
@@ -155,9 +155,11 @@ impl<D: SqlTypeDecode + Default + Send + Sync, P: TdsPacketReader + Send + Sync>
                 (true, None) => {
                     // Either AE is disabled for this command (expected) or it is
                     // enabled but misconfigured (e.g. no key-store provider
-                    // registered). Log so the misconfigured case is observable,
-                    // then decode the raw ciphertext varbinary.
-                    info!(
+                    // registered). Log at debug so a per-cell diagnostic does not
+                    // flood info on the normal AE-disabled read path, then decode
+                    // the raw ciphertext varbinary. Kept in sync with the same
+                    // message in `io::token_stream::decode_or_decrypt_column`.
+                    debug!(
                         column = %metadata.column_name,
                         "Encrypted column has no column-encryption decryptor available \
                          (Always Encrypted disabled for this command, or no key-store \

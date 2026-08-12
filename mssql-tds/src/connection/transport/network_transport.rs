@@ -14,23 +14,23 @@ use crate::datatypes::row_writer::RowWriter;
 use crate::error::Error::{OperationCancelledError, TimeoutError};
 use crate::error::TimeoutErrorType;
 use crate::handler::handler_factory::SessionSettings;
-use crate::io::packet_reader::{PacketReader, TdsPacketReader};
+use crate::io::packet_reader::{LENGTH_NULL, TdsPacketReader};
 use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
 use crate::io::token_stream::{
-    ParserContext, PlpPauseState, RowPauseState, RowReadResult, TdsTokenStreamReader,
-    read_active_plp_bytes_internal, receive_row_into_internal, receive_token_internal,
-    resume_row_into_internal,
+    ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
+    TdsTokenStreamReader, read_active_plp_bytes_internal, receive_row_header_internal,
+    receive_row_into_internal, receive_token_internal, resume_row_into_internal,
 };
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
-use crate::message::messages::{Request, ResetConnectionMode};
+use crate::message::messages::{PacketStatusFlags, Request, ResetConnectionMode};
 use crate::token::tokens::{DoneStatus, Tokens};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use std::cmp::min;
 use std::io::Error;
-use std::io::ErrorKind::{self, UnexpectedEof};
+use std::io::ErrorKind;
 use std::net::ToSocketAddrs;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -551,10 +551,6 @@ impl NetworkReaderWriter for NetworkTransport {
 
 #[async_trait]
 impl NetworkReader for NetworkTransport {
-    async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
-        Ok(self.receive(buffer).await?)
-    }
-
     fn packet_size(&self) -> u32 {
         self.packet_size
     }
@@ -631,40 +627,6 @@ impl NetworkTransport {
     ) {
         assert!(self.encryption.is_none());
         self.encryption = Some(encryption);
-    }
-
-    pub(crate) async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
-        if buffer.is_empty() {
-            return Err(crate::error::Error::UsageError(
-                "Buffer length must be greater than 0".to_string(),
-            ));
-        }
-        let bytes_read = match self.stream.as_mut() {
-            Some(stream) => match stream.read(buffer).await {
-                Ok(n) => n,
-                Err(e) => {
-                    // A read failure means the socket is broken; record it so the
-                    // cached liveness check reports the connection as dead.
-                    self.known_dead = true;
-                    return Err(e.into());
-                }
-            },
-            None => {
-                self.known_dead = true;
-                return Err(crate::error::Error::ConnectionClosed(
-                    "Cannot receive: connection has been closed".to_string(),
-                ));
-            }
-        };
-        if bytes_read == 0 {
-            // EOF — the server closed the connection.
-            self.known_dead = true;
-            Err(crate::error::Error::from(std::io::Error::from(
-                UnexpectedEof,
-            )))
-        } else {
-            Ok(bytes_read)
-        }
     }
 
     async fn enable_ssl_internal(&mut self) -> TdsResult<()> {
@@ -948,6 +910,19 @@ impl NetworkTransport {
             )));
         }
 
+        // A payload-free packet that is not the end of its message is
+        // malformed: it neither carries payload nor terminates a message. An
+        // empty EOM packet is legal (it terminates a message), so only non-EOM
+        // ones are rejected.
+        let is_end_of_message = self.tds_read_buffer.working_buffer[base_offset + 1]
+            & PacketStatusFlags::Eom as u8
+            != 0;
+        if packet_size_from_header == PacketWriter::PACKET_HEADER_SIZE && !is_end_of_message {
+            return Err(crate::error::Error::ProtocolError(
+                "Received a payload-free TDS packet that is not end-of-message".to_string(),
+            ));
+        }
+
         if packet_size_from_header > self.tds_read_buffer.max_packet_size {
             return Err(crate::error::Error::ProtocolError(format!(
                 "TDS packet length {} exceeds negotiated max packet size {}",
@@ -1135,7 +1110,7 @@ impl TdsPacketReader for NetworkTransport {
     }
 
     async fn read_byte(&mut self) -> TdsResult<u8> {
-        if !self.tds_read_buffer.do_we_have_enough_data(1) {
+        while !self.tds_read_buffer.do_we_have_enough_data(1) {
             self.read_tds_packet().await?;
         }
         let result: u8 = self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position];
@@ -1144,7 +1119,7 @@ impl TdsPacketReader for NetworkTransport {
     }
 
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
-        if !self.tds_read_buffer.do_we_have_enough_data(2) {
+        while !self.tds_read_buffer.do_we_have_enough_data(2) {
             self.read_tds_packet().await?;
         }
         let result = BigEndian::read_i16(self.tds_read_buffer.get_slice());
@@ -1152,7 +1127,7 @@ impl TdsPacketReader for NetworkTransport {
         Ok(result)
     }
     async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
-        if !self.tds_read_buffer.do_we_have_enough_data(4) {
+        while !self.tds_read_buffer.do_we_have_enough_data(4) {
             self.read_tds_packet().await?;
         }
         let result = BigEndian::read_i32(self.tds_read_buffer.get_slice());
@@ -1161,7 +1136,7 @@ impl TdsPacketReader for NetworkTransport {
     }
 
     async fn read_uint40(&mut self) -> TdsResult<u64> {
-        if !self.tds_read_buffer.do_we_have_enough_data(5) {
+        while !self.tds_read_buffer.do_we_have_enough_data(5) {
             self.read_tds_packet().await?;
         }
 
@@ -1171,7 +1146,7 @@ impl TdsPacketReader for NetworkTransport {
     }
 
     async fn read_float32(&mut self) -> TdsResult<f32> {
-        if !self.tds_read_buffer.do_we_have_enough_data(4) {
+        while !self.tds_read_buffer.do_we_have_enough_data(4) {
             self.read_tds_packet().await?;
         }
         let result = LittleEndian::read_f32(self.tds_read_buffer.get_slice());
@@ -1179,7 +1154,7 @@ impl TdsPacketReader for NetworkTransport {
         Ok(result)
     }
     async fn read_float64(&mut self) -> TdsResult<f64> {
-        if !self.tds_read_buffer.do_we_have_enough_data(8) {
+        while !self.tds_read_buffer.do_we_have_enough_data(8) {
             self.read_tds_packet().await?;
         }
         let result = LittleEndian::read_f64(self.tds_read_buffer.get_slice());
@@ -1187,7 +1162,7 @@ impl TdsPacketReader for NetworkTransport {
         Ok(result)
     }
     async fn read_int16(&mut self) -> TdsResult<i16> {
-        if !self.tds_read_buffer.do_we_have_enough_data(2) {
+        while !self.tds_read_buffer.do_we_have_enough_data(2) {
             self.read_tds_packet().await?;
         }
         let result = LittleEndian::read_i16(self.tds_read_buffer.get_slice());
@@ -1195,7 +1170,7 @@ impl TdsPacketReader for NetworkTransport {
         Ok(result)
     }
     async fn read_uint16(&mut self) -> TdsResult<u16> {
-        if !self.tds_read_buffer.do_we_have_enough_data(2) {
+        while !self.tds_read_buffer.do_we_have_enough_data(2) {
             self.read_tds_packet().await?;
         }
         let result = LittleEndian::read_u16(self.tds_read_buffer.get_slice());
@@ -1203,7 +1178,7 @@ impl TdsPacketReader for NetworkTransport {
         Ok(result)
     }
     async fn read_uint24(&mut self) -> TdsResult<u32> {
-        if !self.tds_read_buffer.do_we_have_enough_data(3) {
+        while !self.tds_read_buffer.do_we_have_enough_data(3) {
             self.read_tds_packet().await?;
         }
         let result = LittleEndian::read_u24(self.tds_read_buffer.get_slice());
@@ -1212,7 +1187,7 @@ impl TdsPacketReader for NetworkTransport {
     }
 
     async fn read_int32(&mut self) -> TdsResult<i32> {
-        if !self.tds_read_buffer.do_we_have_enough_data(4) {
+        while !self.tds_read_buffer.do_we_have_enough_data(4) {
             self.read_tds_packet().await?;
         }
         let result = LittleEndian::read_i32(self.tds_read_buffer.get_slice());
@@ -1221,7 +1196,7 @@ impl TdsPacketReader for NetworkTransport {
     }
 
     async fn read_uint32(&mut self) -> TdsResult<u32> {
-        if !self.tds_read_buffer.do_we_have_enough_data(4) {
+        while !self.tds_read_buffer.do_we_have_enough_data(4) {
             self.read_tds_packet().await?;
         }
         let result = LittleEndian::read_u32(self.tds_read_buffer.get_slice());
@@ -1229,7 +1204,7 @@ impl TdsPacketReader for NetworkTransport {
         Ok(result)
     }
     async fn read_int64(&mut self) -> TdsResult<i64> {
-        if !self.tds_read_buffer.do_we_have_enough_data(8) {
+        while !self.tds_read_buffer.do_we_have_enough_data(8) {
             self.read_tds_packet().await?;
         }
         let result = LittleEndian::read_i64(self.tds_read_buffer.get_slice());
@@ -1237,7 +1212,7 @@ impl TdsPacketReader for NetworkTransport {
         Ok(result)
     }
     async fn read_uint64(&mut self) -> TdsResult<u64> {
-        if !self.tds_read_buffer.do_we_have_enough_data(8) {
+        while !self.tds_read_buffer.do_we_have_enough_data(8) {
             self.read_tds_packet().await?;
         }
         let result = LittleEndian::read_u64(self.tds_read_buffer.get_slice());
@@ -1296,12 +1271,12 @@ impl TdsPacketReader for NetworkTransport {
 
     async fn read_varchar_u16_length(&mut self) -> TdsResult<Option<String>> {
         let length: u16 = self.read_uint16().await?;
-        if length == PacketReader::LENGTHNULL {
+        if length == LENGTH_NULL {
             return Ok(None);
         }
 
         let string = self
-            .read_unicode_with_byte_length((length << 1) as usize)
+            .read_unicode_with_byte_length((length as usize) << 1)
             .await?;
         Ok(Some(string))
     }
@@ -1309,7 +1284,7 @@ impl TdsPacketReader for NetworkTransport {
     async fn read_varchar_u8_length(&mut self) -> TdsResult<String> {
         let length: u8 = self.read_byte().await?;
         let string = self
-            .read_unicode_with_byte_length((length << 1) as usize)
+            .read_unicode_with_byte_length((length as usize) << 1)
             .await?;
         Ok(string)
     }
@@ -1408,11 +1383,42 @@ impl TdsTokenStreamReader for NetworkTransport {
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
+        plan: ColumnPolicy,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         let cancellable = CancelHandle::run_until_cancelled(
             cancel_handle,
-            receive_row_into_internal(self, &*PARSER_REGISTRY, context, writer),
+            receive_row_into_internal(self, &*PARSER_REGISTRY, context, plan, writer),
+        );
+        let result = match remaining_request_timeout.as_ref() {
+            Some(t) => match timeout(*t, cancellable).await {
+                Ok(r) => r,
+                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
+            },
+            None => cancellable.await,
+        };
+
+        match &result {
+            Ok(_) => {}
+            Err(err) => match err {
+                OperationCancelledError(_) | TimeoutError(_) => {
+                    self.cancel_read_stream_and_wait().await?;
+                }
+                _ => {}
+            },
+        }
+        result
+    }
+
+    async fn receive_row_header(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<RowHeader> {
+        let cancellable = CancelHandle::run_until_cancelled(
+            cancel_handle,
+            receive_row_header_internal(self, &*PARSER_REGISTRY, context),
         );
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {
@@ -1439,11 +1445,12 @@ impl TdsTokenStreamReader for NetworkTransport {
         pause_state: RowPauseState,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
+        plan: ColumnPolicy,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         let cancellable = CancelHandle::run_until_cancelled(
             cancel_handle,
-            resume_row_into_internal(self, pause_state, writer),
+            resume_row_into_internal(self, pause_state, plan, writer),
         );
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {
@@ -1564,6 +1571,11 @@ pub(crate) mod tests {
     use crate::connection::transport::network_transport::Stream;
     use crate::connection::transport::ssl_handler::SslHandler;
     use crate::core::EncryptionOptions;
+    use crate::message::messages::PacketType;
+    use crate::test_packet_support::{
+        TestPacketBuilder, create_network_transport_with_chunked_data,
+        create_network_transport_with_data, encode_utf16_le,
+    };
     use bytes::Bytes;
     use futures::SinkExt;
     use futures::StreamExt;
@@ -1607,37 +1619,6 @@ pub(crate) mod tests {
         )
     }
 
-    pub(crate) fn create_client_server_network_transport(
-        context: &ClientContext,
-    ) -> (NetworkTransport, NetworkTransport) {
-        let (client_side, server_side) = duplex(MAX_BUFFER_SIZE);
-
-        let ssl_handler = SslHandler {
-            server_host_name: context.transport_context.get_server_name().clone(),
-            encryption_options: context.encryption_options.clone(),
-        };
-
-        (
-            NetworkTransport::new(
-                Box::new(client_side),
-                ssl_handler,
-                context.packet_size as u32,
-                context.encryption_options.mode,
-                false,
-            ),
-            NetworkTransport::new(
-                Box::new(server_side),
-                SslHandler {
-                    server_host_name: context.transport_context.get_server_name().clone(),
-                    encryption_options: context.encryption_options.clone(),
-                },
-                context.packet_size as u32,
-                context.encryption_options.mode,
-                false,
-            ),
-        )
-    }
-
     #[tokio::test]
     async fn test_network_transport_send() {
         let context = ClientContext {
@@ -1671,62 +1652,6 @@ pub(crate) mod tests {
             .expect("Decode error");
 
         assert_eq!(received.as_ref(), &data_vector[..]);
-    }
-
-    /// A basic test showing that `receive` can read data from the transport's reader.
-    #[tokio::test]
-    async fn test_network_transport_receive() -> TdsResult<()> {
-        // 1) Create an in-memory duplex stream (client_side, server_side).
-        // Data will be written on the server_side and the network transport will read from the client side.
-        let (client_side, server_side) = duplex(1024);
-
-        // Mocks and defaults.
-        let context = ClientContext {
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
-            ..Default::default()
-        };
-        let ssl_handler = SslHandler {
-            server_host_name: context.transport_context.get_server_name().clone(),
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
-        };
-
-        // Optionally, shut down the writer so the reader sees EOF if all data is read
-        // client_writer.shutdown().await?;
-
-        // Build our transport
-        let mut transport = NetworkTransport::new(
-            Box::new(client_side),
-            ssl_handler,
-            context.packet_size as u32,
-            context.encryption_options.mode,
-            false,
-        );
-
-        let mut rng = rand::rng();
-        let data_size = 128;
-        let data_written: Vec<u8> = (0..data_size).map(|_| rng.random()).collect();
-        let mut framed_writer = FramedWrite::new(server_side, BytesCodec::new());
-        framed_writer
-            .send(Bytes::copy_from_slice(&data_written[..]))
-            .await?;
-
-        // 5) Attempt to read from the transport into a buffer
-        let mut buffer = vec![0u8; data_size];
-        let bytes_read = transport.receive(&mut buffer).await?;
-
-        // Verify we read exactly `data_size` bytes and that they match what was written
-        assert_eq!(bytes_read, data_size);
-        assert_eq!(buffer, data_written);
-
-        Ok(())
     }
 
     /// Test that TdsTransport::reset_reader() properly resizes the buffer after packet size change.
@@ -2497,5 +2422,316 @@ pub(crate) mod tests {
                 "payload EOF must mark the connection known-dead"
             );
         }
+    }
+
+    fn generate_random_bytes(length: usize) -> Vec<u8> {
+        let mut rng = rand::rng();
+        let mut bytes = vec![0u8; length];
+        rng.fill(&mut bytes[..]);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn test_read_byte() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let byte_value = rand::rng().random::<u8>();
+        let builder = binding.append_byte(byte_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(reader.read_byte().await.unwrap(), byte_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_int16() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let int16_value = rand::rng().random::<i16>();
+        let builder = binding.append_i16(int16_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(reader.read_int16().await.unwrap(), int16_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_uint16() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let uint16_value = rand::rng().random::<u16>();
+        let builder = binding.append_u16(uint16_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(reader.read_uint16().await.unwrap(), uint16_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_int32() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let int32_value = rand::rng().random::<i32>();
+        let builder = binding.append_i32(int32_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(reader.read_int32().await.unwrap(), int32_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_uint32() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let uint32_value = rand::rng().random::<u32>();
+        let builder = binding.append_u32(uint32_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(reader.read_uint32().await.unwrap(), uint32_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_int64() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let int64_value = rand::rng().random::<i64>();
+        let builder = binding.append_i64(int64_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(reader.read_int64().await.unwrap(), int64_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_uint64() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let uint64_value = rand::rng().random::<u64>();
+        let builder = binding.append_u64(uint64_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(reader.read_uint64().await.unwrap(), uint64_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_float32() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let float32_value = rand::rng().random::<f32>();
+        let builder = binding.append_f32(float32_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(reader.read_float32().await.unwrap(), float32_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_float64() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let float64_value = rand::rng().random::<f64>();
+        let builder = binding.append_f64(float64_value);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(reader.read_float64().await.unwrap(), float64_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_unicode() {
+        let unicode_string = "Hello, world";
+        let char_count = unicode_string.encode_utf16().count();
+
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let builder = binding.append_bytes(&encode_utf16_le(unicode_string));
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(
+            reader.read_unicode(char_count).await.unwrap(),
+            unicode_string
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_bytes() {
+        let bytes_len = 2000;
+        let bytes = generate_random_bytes(bytes_len);
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let builder = binding.append_bytes(&bytes);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        let mut buffer = vec![0; bytes_len];
+        assert_eq!(reader.read_bytes(&mut buffer).await.unwrap(), bytes_len);
+        assert_eq!(buffer, bytes);
+    }
+
+    #[tokio::test]
+    async fn test_read_u8_varbyte() {
+        let bytes_len: u8 = 200;
+        let data_bytes = generate_random_bytes(bytes_len as usize);
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        binding.append_byte(bytes_len);
+        let builder = binding.append_bytes(&data_bytes);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(reader.read_u8_varbyte().await.unwrap(), data_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_read_u16_varbyte() {
+        let bytes_len: u16 = 1000;
+        let data_bytes = generate_random_bytes(bytes_len as usize);
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        binding.append_u16(bytes_len);
+        let builder = binding.append_bytes(&data_bytes);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(reader.read_u16_varbyte().await.unwrap(), data_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_read_varchar_u16_length() {
+        let unicode_string = "Hello, world";
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        binding.append_u16(unicode_string.encode_utf16().count() as u16);
+        let builder = binding.append_bytes(&encode_utf16_le(unicode_string));
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(
+            reader.read_varchar_u16_length().await.unwrap(),
+            Some(unicode_string.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_varchar_u16_length_null() {
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        let builder = binding.append_u16(LENGTH_NULL);
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(reader.read_varchar_u16_length().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_read_varchar_u8_length() {
+        let unicode_string = "Hello, world";
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        binding.append_byte(unicode_string.encode_utf16().count() as u8);
+        let builder = binding.append_bytes(&encode_utf16_le(unicode_string));
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(
+            reader.read_varchar_u8_length().await.unwrap(),
+            unicode_string
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_varchar_u8_length_long_string() {
+        // A length above 127 truncates if the shift is applied before widening
+        // to usize: `200u8 << 1 == 144`, which would read 144 bytes instead of
+        // 400 and desynchronize the stream.
+        let unicode_string = "a".repeat(200);
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        binding.append_byte(unicode_string.encode_utf16().count() as u8);
+        let builder = binding.append_bytes(&encode_utf16_le(&unicode_string));
+
+        let mut reader = create_network_transport_with_data(&builder.build());
+
+        assert_eq!(
+            reader.read_varchar_u8_length().await.unwrap(),
+            unicode_string
+        );
+    }
+
+    #[tokio::test]
+    async fn test_packet_header_split_across_reads() {
+        let unicode_string = "Hello, world";
+        let mut binding = TestPacketBuilder::new(PacketType::PreLogin);
+        binding.append_byte(unicode_string.encode_utf16().count() as u8);
+        let builder = binding.append_bytes(&encode_utf16_le(unicode_string));
+
+        // 3-byte chunks split the 8-byte header across three reads.
+        let mut reader = create_network_transport_with_chunked_data(&builder.build(), 3);
+
+        assert_eq!(
+            reader.read_varchar_u8_length().await.unwrap(),
+            unicode_string
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncated_packet_reports_error() {
+        let mut binding = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut packet = binding
+            .append_bytes(&[0xAB; 100 - PacketWriter::PACKET_HEADER_SIZE])
+            .build();
+        assert_eq!(packet.len(), 100);
+
+        // Claim 200 bytes but supply only the 100 actually built, so the reader
+        // hits EOF mid-packet.
+        BigEndian::write_u16(&mut packet[2..4], 200);
+
+        let mut reader = create_network_transport_with_data(&packet);
+
+        assert!(reader.read_byte().await.is_err());
+    }
+
+    /// Two packets, with a single `u32` split across the boundary. This is the
+    /// case the deleted reader mishandled: it returned the raw byte count from
+    /// the transport rather than the header length, so the second packet's
+    /// header leaked into the payload.
+    #[tokio::test]
+    async fn test_read_value_spanning_packet_boundary() {
+        let mut first = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut second = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut stream = first.append_bytes(&[0x11, 0x22]).build();
+        stream.extend_from_slice(&second.append_bytes(&[0x33, 0x44]).build());
+
+        let mut reader = create_network_transport_with_data(&stream);
+
+        assert_eq!(reader.read_uint32().await.unwrap(), 0x4433_2211);
+    }
+
+    #[tokio::test]
+    async fn test_read_value_spanning_packet_boundary_fragmented() {
+        let mut first = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut second = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut stream = first.append_bytes(&[0x11, 0x22]).build();
+        stream.extend_from_slice(&second.append_bytes(&[0x33, 0x44]).build());
+
+        let mut reader = create_network_transport_with_chunked_data(&stream, 3);
+
+        assert_eq!(reader.read_uint32().await.unwrap(), 0x4433_2211);
+    }
+
+    /// A payload-free non-EOM packet is malformed: it neither carries payload
+    /// nor terminates a message.
+    #[tokio::test]
+    async fn test_payload_free_non_eom_packet_is_rejected() {
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult).build();
+        assert_eq!(packet.len(), PacketWriter::PACKET_HEADER_SIZE);
+        packet[1] = 0x00; // clear EOM
+
+        let mut reader = create_network_transport_with_data(&packet);
+
+        assert!(matches!(
+            reader.read_byte().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+    }
+
+    /// The same packet *with* EOM set is legal — an empty end-of-message packet
+    /// terminates a message — so it is consumed and the reader carries on to
+    /// the payload of the next packet.
+    #[tokio::test]
+    async fn test_payload_free_eom_packet_is_accepted() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        let mut next = TestPacketBuilder::new(PacketType::TabularResult);
+        stream.extend_from_slice(&next.append_byte(0x7F).build());
+
+        let mut reader = create_network_transport_with_data(&stream);
+
+        assert_eq!(reader.read_byte().await.unwrap(), 0x7F);
     }
 }

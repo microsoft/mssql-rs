@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::core::TdsResult;
 use crate::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
@@ -10,7 +9,6 @@ use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sql_json::SqlJson;
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sql_vector::SqlVector;
-use crate::token::tokens::SqlCollation;
 use uuid::Uuid;
 
 /// Pluggable decode sink for TDS row data.
@@ -19,40 +17,6 @@ use uuid::Uuid;
 /// enabling consumers (Arrow writers, N-API binary encoders, etc.) to
 /// receive values without going through the intermediate `ColumnValues` enum.
 pub trait RowWriter {
-    /// Returns `true` to pause row decoding after reading column `col`.
-    ///
-    /// Writers that need incremental column fetch behavior (for example,
-    /// ODBC-oriented row writers) should override this method and return `true`
-    /// at the appropriate column boundaries.
-    fn pause_after_column(&self, _col: usize) -> bool {
-        false
-    }
-
-    /// Reads bytes from the currently active PLP stream owned by this writer.
-    ///
-    /// Writers that support incremental PLP reads (for example an ODBC-facing
-    /// writer serving `SQLGetData`) should override this and return the number
-    /// of bytes copied into `out`. The default hooks are forward-looking API
-    /// surface for incremental consumers and are not yet wired through a
-    /// concrete product writer in this crate.
-    fn read_active_plp_bytes(&mut self, _out: &mut [u8]) -> TdsResult<usize> {
-        Ok(0)
-    }
-
-    /// Returns `true` when the current active PLP stream has reached EOF.
-    ///
-    /// Writers that do not expose incremental PLP reads can keep the default.
-    fn active_plp_reached_end(&self) -> bool {
-        true
-    }
-
-    /// Returns the collation for the current active PLP stream, if any.
-    ///
-    /// For binary PLP values, this remains `None`.
-    fn active_plp_collation(&self) -> Option<SqlCollation> {
-        None
-    }
-
     /// Writes a SQL `NULL` for column `col`.
     fn write_null(&mut self, col: usize);
     /// Writes a `bit` value.
@@ -225,6 +189,43 @@ impl RowWriter for DefaultRowWriter {
     fn end_row(&mut self) {
         // No-op for DefaultRowWriter — row is taken via take_row().
     }
+}
+
+/// A `RowWriter` that discards every value it receives.
+///
+/// Used by the decode driver's *skip* path (drain-to-end and skip-to-column):
+/// the wire bytes still have to be consumed so the stream stays aligned, but no
+/// `ColumnValues`, `String`, or `Vec` is retained. Fixed-width types allocate
+/// nothing at all; the transient value a variable-length decoder builds is
+/// dropped immediately instead of being pushed onto a row `Vec`.
+pub struct DiscardRowWriter;
+
+impl RowWriter for DiscardRowWriter {
+    fn write_null(&mut self, _col: usize) {}
+    fn write_bool(&mut self, _col: usize, _val: bool) {}
+    fn write_u8(&mut self, _col: usize, _val: u8) {}
+    fn write_i16(&mut self, _col: usize, _val: i16) {}
+    fn write_i32(&mut self, _col: usize, _val: i32) {}
+    fn write_i64(&mut self, _col: usize, _val: i64) {}
+    fn write_f32(&mut self, _col: usize, _val: f32) {}
+    fn write_f64(&mut self, _col: usize, _val: f64) {}
+    fn write_string(&mut self, _col: usize, _val: SqlString) {}
+    fn write_bytes(&mut self, _col: usize, _val: Vec<u8>) {}
+    fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
+    fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
+    fn write_date(&mut self, _col: usize, _val: SqlDate) {}
+    fn write_time(&mut self, _col: usize, _val: SqlTime) {}
+    fn write_datetime(&mut self, _col: usize, _val: SqlDateTime) {}
+    fn write_smalldatetime(&mut self, _col: usize, _val: SqlSmallDateTime) {}
+    fn write_datetime2(&mut self, _col: usize, _val: SqlDateTime2) {}
+    fn write_datetimeoffset(&mut self, _col: usize, _val: SqlDateTimeOffset) {}
+    fn write_money(&mut self, _col: usize, _val: SqlMoney) {}
+    fn write_smallmoney(&mut self, _col: usize, _val: SqlSmallMoney) {}
+    fn write_uuid(&mut self, _col: usize, _val: Uuid) {}
+    fn write_xml(&mut self, _col: usize, _val: SqlXml) {}
+    fn write_json(&mut self, _col: usize, _val: SqlJson) {}
+    fn write_vector(&mut self, _col: usize, _val: SqlVector) {}
+    fn end_row(&mut self) {}
 }
 
 /// Bridges a `ColumnValues` into a `RowWriter` call. Used as a fallback path
