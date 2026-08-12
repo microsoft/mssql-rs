@@ -19,6 +19,7 @@ use crate::token::tokens::{ColMetadataToken, TokenType, Tokens};
 use async_trait::async_trait;
 use core::convert::From;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
@@ -121,7 +122,6 @@ pub enum RowHeader {
 ///
 /// Passed back to [`TdsTokenStreamReader::resume_row_into`] to continue
 /// decoding the rest of the row from where it paused.
-#[derive(Debug)]
 #[cfg(not(fuzzing))]
 pub(crate) struct RowPauseState {
     /// Index of the first column that has not yet been decoded.
@@ -135,7 +135,6 @@ pub(crate) struct RowPauseState {
     pub(crate) decryptor: Option<Arc<dyn CellDecryptor>>,
 }
 
-#[derive(Debug)]
 #[cfg(fuzzing)]
 #[allow(private_interfaces)]
 pub struct RowPauseState {
@@ -146,8 +145,24 @@ pub struct RowPauseState {
 }
 
 impl RowPauseState {
+    /// Borrows just the column layout so callers outside this module don't have
+    /// to reach through the shared token and its CEK table.
     pub(crate) fn columns(&self) -> &[ColumnMetadata] {
         &self.metadata.columns
+    }
+}
+
+impl fmt::Debug for RowPauseState {
+    /// Hand-written so the shared [`ColMetadataToken`] never reaches a log: its
+    /// `cek_table` carries encrypted CEK blobs and key-store paths (e.g. AKV
+    /// URIs), which a stray `{:?}` on this state would otherwise print.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RowPauseState")
+            .field("next_column_index", &self.next_column_index)
+            .field("column_count", &self.metadata.columns.len())
+            .field("nbc_null_bitmap", &self.nbc_null_bitmap)
+            .field("has_decryptor", &self.decryptor.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -1186,7 +1201,8 @@ mod tests {
         }
 
         async fn read_int32(&mut self) -> TdsResult<i32> {
-            unimplemented!("unused in test")
+            let raw = self.take(4)?;
+            Ok(i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
         }
 
         async fn read_uint32(&mut self) -> TdsResult<u32> {
@@ -1345,10 +1361,172 @@ mod tests {
             RowReadResult::PlpPaused(plp_state) => {
                 assert_eq!(plp_state.collation(), Some(collation));
                 assert!(!plp_state.reached_end());
+            }
+            _ => panic!("expected PlpPaused"),
+        }
+    }
+
+    fn int4_metadata(column_name: &str) -> ColumnMetadata {
+        ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            data_type: TdsDataType::Int4,
+            type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+            column_name: column_name.to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        }
+    }
+
+    fn two_int4_metadata() -> Arc<ColMetadataToken> {
+        Arc::new(ColMetadataToken {
+            column_count: 2,
+            columns: vec![int4_metadata("c1"), int4_metadata("c2")],
+            cek_table: vec![],
+        })
+    }
+
+    // The pause states below must borrow the ParserContext's metadata rather than
+    // deep-copy it: on the SQLGetData path a row pauses after every column pull,
+    // so a clone here is O(N) metadata allocations per pull.
+    #[tokio::test]
+    async fn row_pause_shares_result_metadata_arc() {
+        let metadata = two_int4_metadata();
+        let context = ParserContext::ColumnMetadata(Arc::clone(&metadata), None);
+
+        let mut packet = vec![TokenType::Row as u8];
+        packet.extend_from_slice(&1_i32.to_le_bytes());
+        let mut reader = TestByteReader::new(packet);
+        let registry = GenericTokenParserRegistry::default();
+        let mut writer = DiscardRowWriter;
+
+        let result = receive_row_into_internal(
+            &mut reader,
+            &registry,
+            &context,
+            ColumnPolicy::DecodeOne(0),
+            &mut writer,
+        )
+        .await
+        .unwrap();
+
+        match result {
+            RowReadResult::RowPaused(state) => {
+                assert!(Arc::ptr_eq(&metadata, &state.metadata));
+                assert_eq!(state.next_column_index, 1);
+            }
+            other => panic!("expected RowPaused, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn row_header_shares_result_metadata_arc() {
+        let metadata = two_int4_metadata();
+        let context = ParserContext::ColumnMetadata(Arc::clone(&metadata), None);
+
+        let mut reader = TestByteReader::new(vec![TokenType::Row as u8]);
+        let registry = GenericTokenParserRegistry::default();
+
+        match receive_row_header_internal(&mut reader, &registry, &context)
+            .await
+            .unwrap()
+        {
+            RowHeader::Positioned(state) => {
+                assert!(Arc::ptr_eq(&metadata, &state.metadata));
+                assert_eq!(state.next_column_index, 0);
+                assert!(state.nbc_null_bitmap.is_none());
+            }
+            RowHeader::Token(_) => panic!("expected Positioned, got Token"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nbcrow_header_shares_result_metadata_arc() {
+        let metadata = two_int4_metadata();
+        let context = ParserContext::ColumnMetadata(Arc::clone(&metadata), None);
+
+        let mut reader = TestByteReader::new(vec![TokenType::NbcRow as u8, 0b0000_0010]);
+        let registry = GenericTokenParserRegistry::default();
+
+        match receive_row_header_internal(&mut reader, &registry, &context)
+            .await
+            .unwrap()
+        {
+            RowHeader::Positioned(state) => {
+                assert!(Arc::ptr_eq(&metadata, &state.metadata));
+                assert_eq!(state.next_column_index, 0);
+                // bitmap_len still derives from the shared token's column count.
+                assert_eq!(state.nbc_null_bitmap.as_deref(), Some(&[0b0000_0010][..]));
+            }
+            RowHeader::Token(_) => panic!("expected Positioned, got Token"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plp_pause_shares_result_metadata_arc() {
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![plp_varbinary_metadata("c1", None)],
+            cek_table: vec![],
+        });
+        let context = ParserContext::ColumnMetadata(Arc::clone(&metadata), None);
+
+        let mut packet = vec![TokenType::Row as u8];
+        packet.extend_from_slice(&(-2_i64).to_le_bytes());
+        let mut reader = TestByteReader::new(packet);
+        let registry = GenericTokenParserRegistry::default();
+        let mut writer = DiscardRowWriter;
+
+        let result = receive_row_into_internal(
+            &mut reader,
+            &registry,
+            &context,
+            ColumnPolicy::DecodeOne(0),
+            &mut writer,
+        )
+        .await
+        .unwrap();
+
+        match result {
+            RowReadResult::PlpPaused(plp_state) => {
                 assert!(Arc::ptr_eq(&metadata, &plp_state.row_pause_state.metadata));
             }
             _ => panic!("expected PlpPaused"),
         }
+    }
+
+    #[test]
+    fn row_pause_state_debug_elides_cek_table() {
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![int4_metadata("c1")],
+            cek_table: vec![crate::query::metadata::CekTableEntry {
+                database_id: 1,
+                cek_id: 2,
+                cek_version: 3,
+                cek_md_version: [0u8; 8],
+                encrypted_cek_values: vec![crate::query::metadata::EncryptedCekValue {
+                    encrypted_key: vec![0xAB; 4],
+                    key_store_name: "AZURE_KEY_VAULT".to_string(),
+                    key_path: "https://vault.example/keys/cmk".to_string(),
+                    algorithm_name: "RSA_OAEP".to_string(),
+                }],
+            }],
+        });
+
+        let rendered = format!(
+            "{:?}",
+            RowPauseState {
+                next_column_index: 0,
+                metadata,
+                nbc_null_bitmap: None,
+                decryptor: None,
+            }
+        );
+
+        assert!(!rendered.contains("vault.example"));
+        assert!(!rendered.contains("AZURE_KEY_VAULT"));
+        assert!(rendered.contains("column_count: 1"));
     }
 
     #[tokio::test]
