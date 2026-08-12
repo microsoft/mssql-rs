@@ -19,7 +19,6 @@ use crate::token::tokens::{ColMetadataToken, TokenType, Tokens};
 use async_trait::async_trait;
 use core::convert::From;
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
@@ -122,6 +121,7 @@ pub enum RowHeader {
 ///
 /// Passed back to [`TdsTokenStreamReader::resume_row_into`] to continue
 /// decoding the rest of the row from where it paused.
+#[derive(Debug)]
 #[cfg(not(fuzzing))]
 pub(crate) struct RowPauseState {
     /// Index of the first column that has not yet been decoded.
@@ -135,6 +135,7 @@ pub(crate) struct RowPauseState {
     pub(crate) decryptor: Option<Arc<dyn CellDecryptor>>,
 }
 
+#[derive(Debug)]
 #[cfg(fuzzing)]
 #[allow(private_interfaces)]
 pub struct RowPauseState {
@@ -149,20 +150,6 @@ impl RowPauseState {
     /// to reach through the shared token and its CEK table.
     pub(crate) fn columns(&self) -> &[ColumnMetadata] {
         &self.metadata.columns
-    }
-}
-
-impl fmt::Debug for RowPauseState {
-    /// Hand-written so the shared [`ColMetadataToken`] never reaches a log: its
-    /// `cek_table` carries encrypted CEK blobs and key-store paths (e.g. AKV
-    /// URIs), which a stray `{:?}` on this state would otherwise print.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RowPauseState")
-            .field("next_column_index", &self.next_column_index)
-            .field("column_count", &self.metadata.columns.len())
-            .field("nbc_null_bitmap", &self.nbc_null_bitmap)
-            .field("has_decryptor", &self.decryptor.is_some())
-            .finish_non_exhaustive()
     }
 }
 
@@ -1496,7 +1483,8 @@ mod tests {
     }
 
     #[test]
-    fn row_pause_state_debug_elides_cek_table() {
+    fn row_pause_state_debug_redacts_cek_secrets() {
+        let encrypted_key = vec![0x2A; 4];
         let metadata = Arc::new(ColMetadataToken {
             column_count: 1,
             columns: vec![int4_metadata("c1")],
@@ -1506,7 +1494,7 @@ mod tests {
                 cek_version: 3,
                 cek_md_version: [0u8; 8],
                 encrypted_cek_values: vec![crate::query::metadata::EncryptedCekValue {
-                    encrypted_key: vec![0xAB; 4],
+                    encrypted_key: encrypted_key.clone(),
                     key_store_name: "AZURE_KEY_VAULT".to_string(),
                     key_path: "https://vault.example/keys/cmk".to_string(),
                     algorithm_name: "RSA_OAEP".to_string(),
@@ -1524,9 +1512,10 @@ mod tests {
             }
         );
 
+        assert!(!rendered.contains(&format!("{encrypted_key:?}")));
         assert!(!rendered.contains("vault.example"));
         assert!(!rendered.contains("AZURE_KEY_VAULT"));
-        assert!(rendered.contains("column_count: 1"));
+        assert!(rendered.contains("c1"));
     }
 
     #[tokio::test]

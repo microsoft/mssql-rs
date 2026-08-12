@@ -240,7 +240,7 @@ impl MultiPartName {
 /// A CEK may have more than one encrypted value (one per column master key that
 /// wraps it) to support key rotation; any one of them can be used to recover the
 /// plaintext CEK.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct EncryptedCekValue {
     /// The encrypted CEK bytes (ciphertext produced by the column master key).
     pub encrypted_key: Vec<u8>,
@@ -250,6 +250,20 @@ pub(crate) struct EncryptedCekValue {
     pub key_path: String,
     /// Name of the asymmetric algorithm used to encrypt the CEK (e.g. `RSA_OAEP`).
     pub algorithm_name: String,
+}
+
+impl fmt::Debug for EncryptedCekValue {
+    /// Redacts here rather than in each holder: this value is reachable by `{:?}`
+    /// from [`CekTableEntry`], `ColMetadataToken`, `Tokens`, and `ParserContext`,
+    /// including the row parsers' TRACE logging of the whole metadata token.
+    /// Deriving `Debug` would print the wrapped-key ciphertext and the column
+    /// master key path (e.g. an Azure Key Vault URI) at every one of those sites.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptedCekValue")
+            .field("encrypted_key_len", &self.encrypted_key.len())
+            .field("algorithm_name", &self.algorithm_name)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One entry in the COLMETADATA CEK table, describing a column encryption key
@@ -706,5 +720,24 @@ mod tests {
         let cloned = metadata.clone();
         assert_eq!(cloned.column_name, "test_column");
         assert_eq!(cloned.flags, 0x01);
+    }
+
+    #[test]
+    fn encrypted_cek_value_debug_redacts_key_material() {
+        let rendered = format!(
+            "{:?}",
+            EncryptedCekValue {
+                encrypted_key: vec![0x2A; 4],
+                key_store_name: "AZURE_KEY_VAULT".to_string(),
+                key_path: "https://vault.example/keys/cmk".to_string(),
+                algorithm_name: "RSA_OAEP".to_string(),
+            }
+        );
+
+        assert!(!rendered.contains("42"));
+        assert!(!rendered.contains("vault.example"));
+        assert!(!rendered.contains("AZURE_KEY_VAULT"));
+        assert!(rendered.contains("encrypted_key_len: 4"));
+        assert!(rendered.contains("RSA_OAEP"));
     }
 }
