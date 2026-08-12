@@ -293,6 +293,9 @@ drivers unless guarded by `SKIP_IF_COMPARING_MSODBCSQL()`.
 | 29 | `SQLEndTran` clears child statement diagnostics, as msodbcsql does (§7.2) | unit + e2e |
 | 30 | `SQL_COPT_SS_TXN_ISOLATION` carries `SQL_TXN_SS_SNAPSHOT` and reads back | unit + e2e |
 | 31 | Setting the isolation level already in effect is a no-op | unit + e2e |
+| 32 | `SQLEndTran` sweeps cursors even when no transaction was started (§7.1) | unit + e2e |
+| 33 | `SQLEndTran` on `SQL_HANDLE_ENV` posts a summary `HY000` when a connection fails | unit |
+| 34 | `SQLEndTran` on `SQL_HANDLE_ENV` leaves no diagnostic when every connection succeeds | unit |
 
 ### 7.1 What the Driver Manager decides for us
 
@@ -315,6 +318,19 @@ the e2e tests assert the observable result rather than the driver's own answer:
   after a commit. The shared part — the cursor is gone and the commit persisted —
   is asserted on both drivers; the divergence lives in its own
   `SKIP_IF_COMPARING_MSODBCSQL()` test.
+
+  The same divergence decides when the sweep runs. msodbcsql returns from
+  `CommitAbortTran` before its own sweep when no transaction was started
+  (`sqlctran.cpp:293` precedes `302-323`), which is safe for it because nothing
+  closes cursors on its behalf. mssql-odbc advertises `SQL_CB_CLOSE`, so the DM
+  *does* act on a successful return, and the sweep must run even on the no-op
+  path or the driver and the DM disagree about the cursor. The combination is
+  reachable: a cursor opened in autocommit mode survives a switch to manual
+  commit, which starts no transaction, so the next `SQLEndTran` finds
+  `local_tran_started` false with the row stream still open — leaving
+  `active_stmt` claimed and locking out every other statement on the connection.
+  `EndTranWithNoTransactionStartedStillClosesCursors` covers it and is skipped on
+  msodbcsql, which is wedged by the same sequence.
 
 ### 7.2 Statement diagnostics do not survive `SQLEndTran`
 

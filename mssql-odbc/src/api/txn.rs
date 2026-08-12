@@ -160,9 +160,10 @@ pub(super) fn close_all_cursors(dbc: &DbcHandle) -> SqlReturn {
 /// `SQLEndTran` and the autocommit OFF→ON transition.
 ///
 /// Reproduces `CommitAbortTran` (`sqlctran.cpp:276-375`): with no user
-/// transaction started this is a **silent success**, never a warning or error.
+/// transaction started there is no transaction-manager request and the result is
+/// a **silent success**, never a warning or error.
 pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlReturn {
-    {
+    let started = {
         let Ok(mut state) = dbc.inner.lock() else {
             error!("{op}: dbc mutex poisoned");
             return SQL_ERROR;
@@ -172,15 +173,32 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
             post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
             return SQL_ERROR;
         }
-        // msodbcsql `sqlctran.cpp:293`: nothing started, nothing to do.
-        if !state.local_tran_started {
-            debug!("{op}: no transaction started — no-op");
-            return SQL_SUCCESS;
-        }
-    }
+        state.local_tran_started
+    };
 
+    // The sweep runs on every successful `SQLEndTran`, including the
+    // no-transaction no-op, because this driver advertises `SQL_CB_CLOSE`
+    // unconditionally and the Driver Manager marks every statement on the
+    // connection cursor-closed on the strength of that. The combination is
+    // reachable: a cursor opened in autocommit mode survives a switch to manual
+    // commit, which starts no transaction of its own, so the next `SQLEndTran`
+    // finds `local_tran_started` false with the row stream still open. Skipping
+    // the sweep there left `active_stmt` claimed behind the DM's back and locked
+    // out every other statement on the connection.
+    //
+    // msodbcsql returns before its own sweep here (`sqlctran.cpp:293` precedes
+    // `302-323`) and is wedged by the same sequence, but it advertises
+    // `SQL_CB_PRESERVE`, so the DM never closes cursors on its behalf. Both
+    // drivers are internally consistent; they just report different truths about
+    // themselves.
     if close_all_cursors(dbc) == SQL_ERROR {
         return fail_cursor_close(dbc, op);
+    }
+
+    // msodbcsql `sqlctran.cpp:293`: nothing started, so no TM request.
+    if !started {
+        debug!("{op}: no transaction started — no server request needed");
+        return SQL_SUCCESS;
     }
 
     let mut client = match claim_dbc_client(dbc, op) {
@@ -234,12 +252,13 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
 
 /// Begins a transaction on an already-claimed client when the connection is in
 /// manual-commit mode and the server has none active, then marks the connection
-/// as holding user work.
+/// as holding user work. Called immediately before every statement execution;
+/// on failure the caller unwinds through `fail_with_tds`.
 ///
-/// Called immediately before every statement execution, mirroring msodbcsql's
-/// `CheckOptions` (`sqlccmd.cpp:10572-10585`). Running it per statement — rather
-/// than only at the autocommit switch — is what recovers from a transaction the
-/// server aborted or the application rolled back with raw T-SQL.
+/// Mirrors msodbcsql's `CheckOptions` (`sqlccmd.cpp:10572-10585`). Running it
+/// per statement — rather than only at the autocommit switch — is what recovers
+/// from a transaction the server aborted or the application rolled back with
+/// raw T-SQL.
 ///
 /// The transaction-manager request carries `NoChange` so it inherits the
 /// session isolation level already applied by `SET TRANSACTION ISOLATION LEVEL`.
@@ -404,9 +423,11 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
 /// optimization, and it is not free: it costs a round trip at the switch and
 /// leaves an empty transaction pinning the log and version store until the
 /// application commits, rolls back, or disconnects. On a pooled connection that
-/// can be the life of the pool entry. `sql_end_tran`, `set_txn_isolation` and
-/// `rollback_before_disconnect` all treat an open transaction with
-/// `local_tran_started == false` as empty and disposable for this reason.
+/// can be the life of the pool entry. `set_txn_isolation` and
+/// `rollback_before_disconnect` dispose of an open transaction with
+/// `local_tran_started == false` for this reason; `end_transaction` leaves it
+/// in place, since msodbcsql issues no transaction-manager request when nothing
+/// was started.
 fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     if close_all_cursors(dbc) == SQL_ERROR {
         return fail_cursor_close(dbc, op);
@@ -442,19 +463,32 @@ fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
 pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
     const OP: &str = "SQLSetConnectAttrW(SQL_ATTR_TXN_ISOLATION)";
 
-    let tsql = {
+    let (level, tsql) = {
         let Ok(mut state) = dbc.inner.lock() else {
             error!("{OP}: dbc mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut state);
 
-        let level = u32::try_from(value).ok();
-        let Some(tsql) = level.and_then(txn_isolation_to_tsql) else {
+        let Some((level, tsql)) = u32::try_from(value)
+            .ok()
+            .and_then(|level| txn_isolation_to_tsql(level).map(|tsql| (level, tsql)))
+        else {
             error!(value, "{OP}: unsupported isolation level");
             post_diag(&mut state, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
             return SQL_ERROR;
         };
+        // Setting the level already in effect is a no-op, matching the
+        // same-value short-circuit `SetCommitModeOption` uses for autocommit
+        // (`sqlcmisc.cpp:1720`). Checked before the open-transaction rejection
+        // below so that asking for no change never fails: an application that
+        // explicitly selects the default READ COMMITTED at startup pays neither
+        // an error inside a transaction nor a cursor sweep and round trip
+        // outside one.
+        if level == state.txn_isolation {
+            debug!(value, "{OP}: already at this isolation level");
+            return SQL_SUCCESS;
+        }
         // Changing isolation mid-transaction would silently apply to the next
         // one instead of this one, so msodbcsql refuses it outright.
         if state.local_tran_started {
@@ -462,21 +496,12 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
             post_diag(&mut state, ERR_ATTRIBUTE_CANNOT_BE_SET_NOW);
             return SQL_ERROR;
         }
-        // Setting the level already in effect is a no-op, matching the
-        // same-value short-circuit `SetCommitModeOption` uses for autocommit
-        // (`sqlcmisc.cpp:1720`). Without this, an application that explicitly
-        // selects the default READ COMMITTED at startup would pay a cursor
-        // sweep and a round trip for nothing.
-        if level == Some(state.txn_isolation) {
-            debug!(value, "{OP}: already at this isolation level");
-            return SQL_SUCCESS;
-        }
         if state.connection_state != ConnectionState::Connected {
-            state.txn_isolation = level.unwrap_or(SQL_TXN_READ_COMMITTED);
+            state.txn_isolation = level;
             debug!(value, "{OP}: stored for next connect");
             return SQL_SUCCESS;
         }
-        tsql
+        (level, tsql)
     };
 
     if close_all_cursors(dbc) == SQL_ERROR {
@@ -491,8 +516,9 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // begun by the driver at the autocommit switch and carries no user work.
     // SQL Server rejects SET TRANSACTION ISOLATION LEVEL SNAPSHOT inside an
     // active transaction, so close the empty one, apply the change, and reopen
-    // it to preserve the manual-commit invariant that a transaction is always
-    // pending. Rolling back loses nothing because there is nothing in it.
+    // it so manual-commit mode is left with a transaction pending, the state
+    // the autocommit switch establishes. Rolling back loses nothing because
+    // there is nothing in it.
     let reopen = client.has_active_transaction();
     let mut result = if reopen {
         debug!("{OP}: rolling back empty driver-begun transaction to apply isolation");
@@ -520,8 +546,8 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         post_tds_error(&mut state, &e, SQLSTATE_HY000);
         return SQL_ERROR;
     }
-    // `value` already round-tripped through `u32::try_from` above.
-    state.txn_isolation = value as u32;
+    // `value` was validated into `level` above.
+    state.txn_isolation = level;
     debug!(tsql, "{OP}: isolation level applied");
     SQL_SUCCESS
 }
@@ -586,7 +612,17 @@ pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
 
     let mut client = match claim_dbc_client(dbc, OP) {
         Ok(c) => c,
-        Err(_) => return SQL_SUCCESS,
+        Err(_) => {
+            // Unreachable right after a successful login, but the claim posts
+            // its own error record before failing. The connect itself
+            // succeeded, so returning SQL_SUCCESS with that record still on the
+            // handle would show an application a connect failure that never
+            // happened.
+            if let Ok(mut state) = dbc.inner.lock() {
+                free_errors(&mut state);
+            }
+            return SQL_SUCCESS;
+        }
     };
 
     let mut failure: Option<String> = None;
@@ -687,6 +723,36 @@ mod tests {
         assert!(
             stmt.inner.lock().unwrap().diag_records().is_empty(),
             "the cursor sweep must clear diagnostics on child statements, as msodbcsql does"
+        );
+    }
+
+    #[test]
+    fn end_tran_sweeps_cursors_even_with_no_transaction_started() {
+        // This driver advertises SQL_CB_CLOSE unconditionally, so the Driver
+        // Manager marks every statement cursor-closed after a successful
+        // SQLEndTran — including the autocommit no-op, where
+        // `local_tran_started` is never true. If the sweep were skipped there,
+        // the driver and the DM would disagree about the cursor and the
+        // application would be wedged. Clearing the statement's diagnostics is
+        // the observable side effect of the sweep having run.
+        use crate::test_support::TestHandles;
+        use crate::{error::HasDiagnostics, handles::StmtHandle};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut stmt_state = stmt.inner.lock().unwrap();
+            post_sql_error(&mut stmt_state, SQLSTATE_HY000, 0, "statement failed");
+        }
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(!dbc.inner.lock().unwrap().local_tran_started);
+        assert_eq!(end_transaction(dbc, true, "test"), SQL_SUCCESS);
+
+        assert!(
+            stmt.inner.lock().unwrap().diag_records().is_empty(),
+            "the no-transaction path must still sweep cursors"
         );
     }
 }

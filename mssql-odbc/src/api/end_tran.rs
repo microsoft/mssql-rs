@@ -9,9 +9,9 @@ use super::odbc_types::{
     SQL_COMMIT, SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_INVALID_HANDLE, SQL_ROLLBACK,
     SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
 };
-use super::sqlstate::{ERR_INVALID_TRANSACTION_OPERATION_CODE, post_diag};
+use super::sqlstate::{ERR_INVALID_TRANSACTION_OPERATION_CODE, SQLSTATE_HY000, post_diag};
 use super::txn::end_transaction;
-use crate::error::free_errors;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, EnvHandle, HandleType, handle_from_raw};
 
@@ -119,6 +119,7 @@ unsafe fn sql_end_tran_env_safe(env: &EnvHandle, completion_type: SqlSmallInt) -
     drop(env_state);
 
     let mut worst = SQL_SUCCESS;
+    let mut failed = 0usize;
     for dbc_ptr in connections {
         // SAFETY: pointers in `connections` came from `handle_to_raw::<DbcHandle>`
         // and are owned by this ENV. A concurrent
@@ -133,10 +134,20 @@ unsafe fn sql_end_tran_env_safe(env: &EnvHandle, completion_type: SqlSmallInt) -
         // that environment. Connections that are not active do not affect the
         // transaction." Without this, one allocated-but-unconnected DBC would
         // post 08003 and fail the whole environment-wide commit.
-        let connected = matches!(
-            dbc.inner.lock().map(|state| state.connection_state),
-            Ok(ConnectionState::Connected)
-        );
+        //
+        // A poisoned connection is not an inactive one: its transaction state
+        // is unknown and it may well be holding an open transaction, so it
+        // counts as a failure instead of being silently dropped from the
+        // fan-out.
+        let connected = match dbc.inner.lock() {
+            Ok(state) => state.connection_state == ConnectionState::Connected,
+            Err(_) => {
+                error!(?dbc_ptr, "SQLEndTran: dbc mutex poisoned");
+                worst = SQL_ERROR;
+                failed += 1;
+                continue;
+            }
+        };
         if !connected {
             debug!(
                 ?dbc_ptr,
@@ -151,10 +162,32 @@ unsafe fn sql_end_tran_env_safe(env: &EnvHandle, completion_type: SqlSmallInt) -
         // failed commit is reported to the app as a warning.
         if ret == SQL_ERROR {
             worst = SQL_ERROR;
+            failed += 1;
         } else if ret != SQL_SUCCESS && worst == SQL_SUCCESS {
             worst = ret;
         }
     }
+
+    // The detail for each failure is on the connection that produced it, but an
+    // application that called `SQLEndTran` on the environment handle looks for
+    // diagnostics there. Without this summary it would get `SQL_ERROR` and a
+    // bare `SQL_NO_DATA` from `SQLGetDiagRec(SQL_HANDLE_ENV, ...)`, with no way
+    // to learn how many connections failed or where to look.
+    if failed > 0
+        && let Ok(mut env_state) = env.inner.lock()
+    {
+        post_sql_error(
+            &mut env_state,
+            SQLSTATE_HY000,
+            0,
+            format!(
+                "The transaction request failed on {failed} of the connections \
+                 on this environment. See the diagnostic records on the \
+                 individual connection handles for details."
+            ),
+        );
+    }
+
     worst
 }
 
@@ -254,7 +287,24 @@ mod tests {
         dbc.inner.lock().unwrap().local_tran_started = true;
         let ret = unsafe { sql_end_tran(SQL_HANDLE_ENV, h.env, SQL_COMMIT) };
         assert_eq!(ret, SQL_ERROR);
+        // The per-connection detail lives on the DBC, but an application that
+        // called SQLEndTran on the environment reads diagnostics from the ENV.
+        assert_eq!(&env_state(h.env), b"HY000");
+        assert!(
+            !dbc.inner.lock().unwrap().diag_records().is_empty(),
+            "the failing connection must keep its own detail record"
+        );
         dbc.inner.lock().unwrap().local_tran_started = false;
+    }
+
+    #[test]
+    fn end_tran_on_env_leaves_no_diagnostic_when_every_connection_succeeds() {
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let ret = unsafe { sql_end_tran(SQL_HANDLE_ENV, h.env, SQL_COMMIT) };
+        assert_eq!(ret, SQL_SUCCESS);
+        let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
+        assert!(env.inner.lock().unwrap().diag_records().is_empty());
     }
 
     #[test]

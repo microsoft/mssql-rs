@@ -9,10 +9,9 @@ use tracing::{debug, error};
 use mssql_tds::connection::tds_client::StatementResult;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
-use super::exec_common::{
-    build_named_params, claim_connection, ensure_transaction, fail_with_tds, finish_execute,
-};
+use super::exec_common::{build_named_params, claim_connection, fail_with_tds, finish_execute};
 use super::sqlstate::*;
+use super::txn::begin_transaction_if_manual;
 use super::util::rewrite_param_markers;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
 use crate::error::free_errors;
@@ -69,7 +68,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
         Err(rc) => return rc,
     };
 
-    if let Err(e) = ensure_transaction(dbc, &mut client, "SQLExecute") {
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecute") {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 

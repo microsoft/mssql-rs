@@ -16,7 +16,6 @@ use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::sqlstate::*;
-use super::txn::begin_transaction_if_manual;
 use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn};
 use crate::error::post_sql_error;
 use crate::handles::dbc::ConnectionState;
@@ -150,17 +149,6 @@ pub(super) fn fail_with_tds(
     }
     clear_exec_started(stmt);
     SQL_ERROR
-}
-
-/// Opens the implicit transaction that manual-commit mode requires, before the
-/// statement runs. No-op in autocommit mode or when a transaction is already
-/// active; on failure the caller unwinds through [`fail_with_tds`].
-pub(super) fn ensure_transaction(
-    dbc: &DbcHandle,
-    client: &mut TdsClient,
-    op: &str,
-) -> Result<(), TdsError> {
-    begin_transaction_if_manual(dbc, client, op)
 }
 
 /// Releases a statement's pending orphaned prepared handle (from a re-prepare,
