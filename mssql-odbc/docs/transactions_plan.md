@@ -213,7 +213,7 @@ free child statements; drop client; state = Disconnected
 | Condition | SQLSTATE | Return |
 |---|---|---|
 | `SQLEndTran` bad completion type | `HY012` | `SQL_ERROR` |
-| `SQLEndTran` bad handle type | `HY092` | `SQL_ERROR` |
+| `SQLEndTran` bad handle type | — | `SQL_INVALID_HANDLE` |
 | `SQLEndTran`, no transaction open | — | `SQL_SUCCESS` |
 | `SQLEndTran` on disconnected DBC | `08003` | `SQL_ERROR` |
 | `SQL_ATTR_TXN_ISOLATION` invalid value | `HYC00` | `SQL_ERROR` |
@@ -261,7 +261,7 @@ drivers unless guarded by `SKIP_IF_COMPARING_MSODBCSQL()`.
 | 7 | Autocommit ON → insert is immediately durable | e2e |
 | 8 | `SQLEndTran` with no open txn → `SQL_SUCCESS` | unit + e2e |
 | 9 | `SQLEndTran` invalid completion type → `HY012` | unit + e2e |
-| 10 | `SQLEndTran` invalid handle type → `HY092` | unit |
+| 10 | `SQLEndTran` invalid handle type → `SQL_INVALID_HANDLE` | unit |
 | 11 | `SQLEndTran` on `SQL_HANDLE_ENV` fans out | e2e |
 | 12 | `SQLEndTran` on disconnected DBC → `08003` | unit |
 | 13 | `SQLEndTran` null handle → `SQL_INVALID_HANDLE` | unit |

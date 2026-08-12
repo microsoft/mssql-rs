@@ -513,6 +513,9 @@ TEST_F(TransactionLiveTest, DisconnectWithOpenTransactionIsRefused) {
 // A T-SQL ROLLBACK issued by the application ends the driver's transaction.
 // The next statement must start a fresh one instead of running unprotected
 // (`CheckOptions`, sqlccmd.cpp).
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the transaction-manager
+// BEGIN that precedes the second INSERT.
 TEST_F(TransactionLiveTest, TransactionIsReopenedAfterServerSideRollback) {
     Exec("CREATE TABLE #reopen_t(i int)");
     ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
@@ -527,8 +530,38 @@ TEST_F(TransactionLiveTest, TransactionIsReopenedAfterServerSideRollback) {
     EXPECT_EQ(0, RowCountOf("#reopen_t"));
 }
 
+// Same recovery path, but the ROLLBACK is hidden inside a stored procedure so
+// the driver cannot see it in the batch text it sent. Recovery must therefore
+// come from the server's transaction state, not from inspecting SQL.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert that the driver sends
+// a fresh transaction-manager BEGIN before the second INSERT rather than
+// inferring it from row counts.
+TEST_F(TransactionLiveTest, TransactionIsReopenedAfterRollbackInsideStoredProcedure) {
+    Exec("CREATE TABLE #proc_t(i int)");
+    Exec("CREATE PROCEDURE #rollback_proc AS BEGIN SET NOCOUNT ON; ROLLBACK TRANSACTION; END");
+    ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
+
+    Exec("INSERT INTO #proc_t VALUES (1)");
+
+    // SQL Server raises error 266 because the procedure leaves @@TRANCOUNT
+    // lower than it found it. Either outcome is fine; the rollback still
+    // happened, which is what the driver has to notice.
+    Run(stmt_, "EXEC #rollback_proc");
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+    EXPECT_EQ(0, RowCountOf("#proc_t")) << "the procedure's ROLLBACK undid the insert";
+
+    // The next write must be protected by a newly opened transaction.
+    Exec("INSERT INTO #proc_t VALUES (2)");
+    ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK), SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(0, RowCountOf("#proc_t")) << "the driver reopened a transaction after the procedure";
+}
+
 // XACT_ABORT aborts the transaction on the first error; the connection stays
 // usable and the next statement gets a fresh transaction.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the driver observes the
+// server's transaction-ended notification rather than tracking state blindly.
 TEST_F(TransactionLiveTest, TransactionIsReopenedAfterXactAbort) {
     Exec("CREATE TABLE #abort_t(i int)");
     ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);

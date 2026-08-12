@@ -24,9 +24,9 @@ use super::odbc_types::{
 use super::sqlstate::{
     ERR_ATTRIBUTE_CANNOT_BE_SET_NOW, ERR_CONNECTION_BUSY, ERR_CONNECTION_DOES_NOT_EXIST,
     ERR_INVALID_ATTRIBUTE_VALUE, ERR_NO_ACTIVE_TDS_CLIENT, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED,
-    SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED, post_diag, post_tds_error,
+    SQLSTATE_01000, SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED, post_diag, post_tds_error,
 };
-use crate::error::free_errors;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::DbcHandle;
 use crate::handles::dbc::ConnectionState;
 
@@ -42,6 +42,25 @@ pub(super) fn txn_isolation_to_tsql(level: u32) -> Option<&'static str> {
         SQL_TXN_SS_SNAPSHOT => Some("SET TRANSACTION ISOLATION LEVEL SNAPSHOT"),
         _ => None,
     }
+}
+
+/// Reports a cursor that could not be closed ahead of a connection-scoped
+/// transaction operation. The per-statement diagnostic already went to its own
+/// STMT handle, which the application is not looking at here, so restate it on
+/// the DBC.
+fn fail_cursor_close(dbc: &DbcHandle, op: &str) -> SqlReturn {
+    error!("{op}: could not close open cursors");
+    let Ok(mut state) = dbc.inner.lock() else {
+        return SQL_ERROR;
+    };
+    post_sql_error(
+        &mut state,
+        SQLSTATE_HY000,
+        0,
+        "An open cursor on this connection could not be closed, so the \
+         transaction request could not be sent.",
+    );
+    SQL_ERROR
 }
 
 /// Claims the connection's TDS client for a connection-scoped operation that no
@@ -100,19 +119,35 @@ pub(super) fn exec_batch(
 /// `SQLFreeStmt(SQL_CLOSE)` sweep in `CommitAbortTran` (`sqlctran.cpp:302-323`)
 /// and honoring the `SQL_CB_CLOSE` this driver advertises. Statements without an
 /// open cursor are untouched, so this is cheap in the common case.
-pub(super) fn close_all_cursors(dbc: &DbcHandle) {
+///
+/// Returns `SQL_ERROR` if any cursor could not be closed. Callers must not
+/// proceed in that case: a statement whose result stream did not drain leaves
+/// the connection mid-batch, and the transaction-manager request that follows
+/// would fail with a usage error.
+#[must_use]
+pub(super) fn close_all_cursors(dbc: &DbcHandle) -> SqlReturn {
     let statements = match dbc.inner.lock() {
         Ok(state) => state.statements.clone(),
         Err(_) => {
             error!("close_all_cursors: dbc mutex poisoned");
-            return;
+            return SQL_ERROR;
         }
     };
+    let mut worst = SQL_SUCCESS;
     for stmt_ptr in statements {
         // SAFETY: every pointer in `statements` came from
-        // `handle_to_raw::<StmtHandle>` and stays live until the DBC frees it.
-        unsafe { sql_free_stmt_close(stmt_ptr) };
+        // `handle_to_raw::<StmtHandle>` and is owned by this DBC.
+        // A concurrent `SQLFreeHandle(SQL_HANDLE_STMT)` could still free it
+        // between the clone above and this call — the same handle-lifetime gap
+        // `SQLDisconnect` documents (see the TODO in `disconnect.rs`), which
+        // refcounted handles will close for the whole driver at once.
+        let ret = unsafe { sql_free_stmt_close(stmt_ptr) };
+        if ret == SQL_ERROR {
+            error!(?stmt_ptr, "close_all_cursors: could not close cursor");
+            worst = SQL_ERROR;
+        }
     }
+    worst
 }
 
 /// Commits or rolls back the connection's transaction — the shared core of
@@ -138,7 +173,9 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
         }
     }
 
-    close_all_cursors(dbc);
+    if close_all_cursors(dbc) == SQL_ERROR {
+        return fail_cursor_close(dbc, op);
+    }
 
     let mut client = match claim_dbc_client(dbc, op) {
         Ok(c) => c,
@@ -204,7 +241,9 @@ pub(super) fn begin_transaction_if_manual(
         Ok(state) => state.autocommit,
         Err(_) => {
             error!("{op}: dbc mutex poisoned reading autocommit");
-            return Ok(());
+            return Err(mssql_tds::error::Error::ImplementationError(
+                "connection state is poisoned".to_string(),
+            ));
         }
     };
     if autocommit {
@@ -217,9 +256,15 @@ pub(super) fn begin_transaction_if_manual(
             .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None))?;
     }
 
-    if let Ok(mut state) = dbc.inner.lock() {
-        state.local_tran_started = true;
-    }
+    // The transaction is open on the server at this point; failing to record it
+    // would leak it past commit/rollback and past disconnect.
+    let Ok(mut state) = dbc.inner.lock() else {
+        error!("{op}: dbc mutex poisoned recording transaction state");
+        return Err(mssql_tds::error::Error::ImplementationError(
+            "connection state is poisoned".to_string(),
+        ));
+    };
+    state.local_tran_started = true;
     Ok(())
 }
 
@@ -299,7 +344,9 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
         return SQL_SUCCESS_WITH_INFO;
     }
 
-    close_all_cursors(dbc);
+    if close_all_cursors(dbc) == SQL_ERROR {
+        return fail_cursor_close(dbc, op);
+    }
     let mut client = match claim_dbc_client(dbc, op) {
         Ok(c) => c,
         Err(ret) => return ret,
@@ -331,7 +378,9 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
 /// reflects the new mode without waiting for a statement (`sqlcconn.cpp:3692`).
 /// The transaction carries no user work yet, so `local_tran_started` stays false.
 fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
-    close_all_cursors(dbc);
+    if close_all_cursors(dbc) == SQL_ERROR {
+        return fail_cursor_close(dbc, op);
+    }
     let mut client = match claim_dbc_client(dbc, op) {
         Ok(c) => c,
         Err(ret) => return ret,
@@ -390,7 +439,9 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         tsql
     };
 
-    close_all_cursors(dbc);
+    if close_all_cursors(dbc) == SQL_ERROR {
+        return fail_cursor_close(dbc, OP);
+    }
     let mut client = match claim_dbc_client(dbc, OP) {
         Ok(c) => c,
         Err(ret) => return ret,
@@ -420,7 +471,13 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
 pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
     const OP: &str = "SQLDisconnect(rollback)";
 
-    close_all_cursors(dbc);
+    // A cursor that will not close leaves the connection mid-batch, so the
+    // rollback below cannot be sent. Disconnecting anyway is still correct:
+    // the server rolls the transaction back when the socket closes.
+    if close_all_cursors(dbc) == SQL_ERROR {
+        error!("{OP}: could not close all cursors; the server will roll back on disconnect");
+        return;
+    }
 
     let client = match dbc.inner.lock() {
         Ok(mut state) => state.client.take(),
@@ -445,32 +502,42 @@ pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
 /// Applies transaction attributes that were set before `SQLDriverConnect` and so
 /// could not reach the server. Called once the login completes.
 ///
-/// Best-effort: a failure here is logged but does not fail the connection, since
-/// the session simply keeps SQL Server's defaults, which already match ours.
-pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) {
+/// A failure does not fail the connection — the session is usable — but it must
+/// not pass unnoticed either: an unapplied isolation level would leave
+/// `SQLGetConnectAttr` reporting a level the server is not actually running at.
+/// Returns `SQL_SUCCESS_WITH_INFO` with a diagnostic posted in that case, which
+/// the caller promotes into the `SQLDriverConnect` result.
+#[must_use]
+pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
     const OP: &str = "SQLDriverConnectW(transaction settings)";
 
     let (autocommit, isolation) = match dbc.inner.lock() {
         Ok(state) => (state.autocommit, state.txn_isolation),
         Err(_) => {
             error!("{OP}: dbc mutex poisoned");
-            return;
+            return SQL_SUCCESS;
         }
     };
     if autocommit && isolation == SQL_TXN_READ_COMMITTED {
-        return;
+        return SQL_SUCCESS;
     }
 
     let mut client = match claim_dbc_client(dbc, OP) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return SQL_SUCCESS,
     };
+
+    let mut failure: Option<String> = None;
 
     if isolation != SQL_TXN_READ_COMMITTED
         && let Some(tsql) = txn_isolation_to_tsql(isolation)
         && let Err(e) = exec_batch(dbc, &mut client, tsql)
     {
         error!(%e, "{OP}: could not apply pre-connect isolation level");
+        failure = Some(format!(
+            "The transaction isolation level set before connecting could not be \
+             applied to the session: {e}"
+        ));
     }
 
     if !autocommit
@@ -480,9 +547,22 @@ pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) {
             .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None))
     {
         error!(%e, "{OP}: could not begin transaction for manual-commit mode");
+        failure.get_or_insert_with(|| {
+            format!("The manual-commit transaction could not be started: {e}")
+        });
     }
 
     release_dbc_client(dbc, client);
+
+    let Some(message) = failure else {
+        return SQL_SUCCESS;
+    };
+    let Ok(mut state) = dbc.inner.lock() else {
+        error!("{OP}: dbc mutex poisoned");
+        return SQL_SUCCESS;
+    };
+    post_sql_error(&mut state, SQLSTATE_01000, 0, &message);
+    SQL_SUCCESS_WITH_INFO
 }
 
 #[cfg(test)]

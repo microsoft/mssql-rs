@@ -120,7 +120,11 @@ unsafe fn sql_end_tran_env_safe(env: &EnvHandle, completion_type: SqlSmallInt) -
     let mut worst = SQL_SUCCESS;
     for dbc_ptr in connections {
         // SAFETY: pointers in `connections` came from `handle_to_raw::<DbcHandle>`
-        // and stay live until `SQLFreeHandle(SQL_HANDLE_DBC)` removes them.
+        // and are owned by this ENV. A concurrent
+        // `SQLFreeHandle(SQL_HANDLE_DBC)` could still free one between the clone
+        // above and this call — the same handle-lifetime gap `SQLDisconnect`
+        // documents (see the TODO in `disconnect.rs`), which refcounted handles
+        // will close for the whole driver at once.
         let dbc = unsafe { handle_from_raw::<DbcHandle>(dbc_ptr) };
         let ret = sql_end_tran_dbc_safe(dbc, completion_type);
         // msodbcsql `PromoteRetcode`: the worst outcome wins.
