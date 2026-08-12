@@ -208,17 +208,11 @@ fn numeric_source(value: &ColumnValues) -> Option<NumericSource> {
         ColumnValues::Bit(b) => Some(NumericSource::Int(i128::from(*b))),
         ColumnValues::Real(x) => Some(NumericSource::Float(f64::from(*x))),
         ColumnValues::Float(x) => Some(NumericSource::Float(*x)),
-        // `DecimalParts` stores a base-2^32 little-endian magnitude; reassemble
-        // it directly. 38 digits fit in 4 limbs, and the wire decoder admits up
-        // to 64, so reject longer payloads rather than shifting past 128 bits.
+        // `DecimalParts` stores a base-2^32 little-endian magnitude. 38 digits
+        // fit in 4 words, and `magnitude` returns `None` for a wider (malformed)
+        // value rather than shifting past 128 bits.
         ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
-            if d.int_parts.len() > 4 {
-                return None;
-            }
-            let mag = d.int_parts.iter().enumerate().fold(0u128, |acc, (i, &p)| {
-                acc | (u128::from(p as u32) << (i * 32))
-            });
-            let m = i128::try_from(mag).ok()?;
+            let m = i128::try_from(d.magnitude()?).ok()?;
             Some(NumericSource::Scaled {
                 mantissa: if d.is_positive { m } else { -m },
                 scale: u32::from(d.scale),

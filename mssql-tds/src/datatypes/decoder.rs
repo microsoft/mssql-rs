@@ -2062,10 +2062,11 @@ impl DecimalParts {
     /// Reassembles `int_parts` into the unsigned magnitude.
     ///
     /// `int_parts[0]` is the least significant word. Returns `None` when the
-    /// value carries more words than a `u128` holds, which only a malformed
-    /// payload or a hand-built [`DecimalParts`] can do; callers fall back to
-    /// [`Self::magnitude_big`] instead of shifting past the accumulator width.
-    fn magnitude(&self) -> Option<u128> {
+    /// value carries more words than a `u128` holds. A valid `decimal`/`numeric`
+    /// (precision <= 38) fits in four words, so only a malformed payload or a
+    /// hand-built [`DecimalParts`] can exceed that; the alternative would be to
+    /// shift past the width of the accumulator.
+    pub fn magnitude(&self) -> Option<u128> {
         if self.int_parts.len() > MAX_DECIMAL_INT_PARTS {
             return None;
         }
