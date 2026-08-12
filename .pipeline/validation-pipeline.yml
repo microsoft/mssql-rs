@@ -20,7 +20,7 @@ parameters:
 - name: x64Pool
   displayName: x64 agent pool under test
   type: string
-  default: RUST-SKUTEST-X64-D4
+  default: RUST-SKUTEST-X64-D8
   values:
   - RUST-SKUTEST-X64-D4
   - RUST-SKUTEST-X64-D8
