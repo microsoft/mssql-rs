@@ -378,8 +378,8 @@ pub(crate) async fn write_tvp_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::packet_reader::tests::MockNetworkReaderWriter;
     use crate::io::packet_writer::PacketWriter;
+    use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::messages::PacketType;
 
     fn default_collation() -> SqlCollation {
@@ -395,22 +395,22 @@ mod tests {
     /// bytes that follow the TDS packet header.
     async fn serialize_payload(value: &SqlType) -> Vec<u8> {
         let collation = default_collation();
-        let mut mock = MockNetworkReaderWriter::default();
+        let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
         value.serialize(&mut writer, &collation).await.unwrap();
         writer.finalize().await.unwrap();
-        let payload = mock.get_written_data();
+        let payload = mock.data;
         payload[PacketWriter::PACKET_HEADER_SIZE..].to_vec()
     }
 
     #[tokio::test]
     async fn test_write_tvp_type_name_bytes() {
         let name = TvpTypeName::new(Some("dbo".to_string()), "MyType".to_string());
-        let mut mock = MockNetworkReaderWriter::default();
+        let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
         write_tvp_type_name(&mut writer, &name).await.unwrap();
         writer.finalize().await.unwrap();
-        let payload = mock.get_written_data();
+        let payload = mock.data;
         let bytes = &payload[PacketWriter::PACKET_HEADER_SIZE..];
 
         let expected: Vec<u8> = vec![
@@ -476,13 +476,13 @@ mod tests {
     /// Captures the bytes written by [`write_tvp_order_unique`] for the given
     /// hints (no surrounding TVP framing).
     async fn order_unique_bytes(order_hints: &[TvpOrderHint]) -> Vec<u8> {
-        let mut mock = MockNetworkReaderWriter::default();
+        let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
         write_tvp_order_unique(&mut writer, order_hints)
             .await
             .unwrap();
         writer.finalize().await.unwrap();
-        let payload = mock.get_written_data();
+        let payload = mock.data;
         payload[PacketWriter::PACKET_HEADER_SIZE..].to_vec()
     }
 
@@ -611,7 +611,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_tvp_type_name_part_too_long_rejected() {
         let name = TvpTypeName::new(Some("dbo".to_string()), "a".repeat(256));
-        let mut mock = MockNetworkReaderWriter::default();
+        let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
         let result = write_tvp_type_name(&mut writer, &name).await;
         assert!(matches!(result, Err(Error::UsageError(_))));
@@ -624,7 +624,7 @@ mod tests {
         let columns: Vec<TvpColumnDef> = (0..=u16::MAX as usize)
             .map(|_| TvpColumnDef::new(SqlType::Int(None)))
             .collect();
-        let mut mock = MockNetworkReaderWriter::default();
+        let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
         let result = write_tvp_column_metadata(&mut writer, &columns, &default_collation()).await;
         assert!(matches!(result, Err(Error::UsageError(_))));
@@ -635,7 +635,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_tvp_column_metadata_lob_column_rejected() {
         let columns = vec![TvpColumnDef::new(SqlType::Text(None))];
-        let mut mock = MockNetworkReaderWriter::default();
+        let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
         let result = write_tvp_column_metadata(&mut writer, &columns, &default_collation()).await;
         assert!(matches!(result, Err(Error::UsageError(_))));
@@ -650,7 +650,7 @@ mod tests {
             TvpColumnDef::new(SqlType::Int(None)),
         ];
         let rows = vec![vec![SqlType::Int(Some(1))]];
-        let mut mock = MockNetworkReaderWriter::default();
+        let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
         let result = write_tvp_rows(&mut writer, &columns, &rows, &default_collation()).await;
         assert!(matches!(result, Err(Error::UsageError(_))));
@@ -664,7 +664,7 @@ mod tests {
             TvpTypeName::new(Some("dbo".to_string()), "MyType".to_string()),
             None,
         );
-        let mut mock = MockNetworkReaderWriter::default();
+        let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
         let result = value
             .write_type_info(&mut writer, &default_collation(), None, None)

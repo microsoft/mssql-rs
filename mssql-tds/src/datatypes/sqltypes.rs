@@ -1185,10 +1185,7 @@ mod json_tests {
             sqldatatypes::TdsDataType,
             sqltypes::{PLP_NULL, PLP_UNKNOWN_LENGTH, SqlType},
         },
-        io::{
-            packet_reader::tests::MockNetworkReaderWriter,
-            packet_writer::{PacketWriter, TdsPacketWriter},
-        },
+        io::packet_writer::{PacketWriter, TdsPacketWriter, tests::MockNetworkWriter},
         message::messages::PacketType,
     };
 
@@ -1206,7 +1203,7 @@ mod json_tests {
         let val = Some(sqljson);
         let sqltypejson = SqlType::Json(val.clone());
 
-        let mut mock_reader_writer = MockNetworkReaderWriter::default();
+        let mut mock_reader_writer = MockNetworkWriter::new(4096);
 
         let mut packet_writer = PacketWriter::new(
             PacketType::TabularResult,
@@ -1221,7 +1218,7 @@ mod json_tests {
             .unwrap();
         packet_writer.finalize().await.unwrap();
 
-        let payload = mock_reader_writer.get_written_data();
+        let payload = mock_reader_writer.data;
         let mut test_cursor = Cursor::new(payload);
         test_cursor.set_position(PacketWriter::PACKET_HEADER_SIZE as u64);
         assert_eq!(test_cursor.get_u8(), TdsDataType::Json as u8); // Valdate tds type
@@ -1236,7 +1233,7 @@ mod json_tests {
     async fn test_write_null_json() {
         let sqltypejson = SqlType::Json(None);
 
-        let mut mock_reader_writer = MockNetworkReaderWriter::default();
+        let mut mock_reader_writer = MockNetworkWriter::new(4096);
 
         let mut packet_writer = PacketWriter::new(
             PacketType::TabularResult,
@@ -1251,7 +1248,7 @@ mod json_tests {
             .unwrap();
         packet_writer.finalize().await.unwrap();
 
-        let payload = mock_reader_writer.get_written_data();
+        let payload = mock_reader_writer.data;
         let mut test_cursor = Cursor::new(payload);
         test_cursor.set_position(PacketWriter::PACKET_HEADER_SIZE as u64);
         assert_eq!(test_cursor.get_u8(), TdsDataType::Json as u8); // Valdate tds type
@@ -1272,10 +1269,7 @@ mod variant_tests {
             sqltypes::{SQL_VARIANT_MAX_LENGTH, SqlType},
         },
         error::Error,
-        io::{
-            packet_reader::tests::MockNetworkReaderWriter,
-            packet_writer::{PacketWriter, TdsPacketWriter},
-        },
+        io::packet_writer::{PacketWriter, TdsPacketWriter, tests::MockNetworkWriter},
         message::messages::PacketType,
         token::tokens::SqlCollation,
     };
@@ -1290,7 +1284,7 @@ mod variant_tests {
     }
 
     async fn serialize_to_bytes(sql_type: &SqlType) -> Vec<u8> {
-        let mut mock_reader_writer = MockNetworkReaderWriter::default();
+        let mut mock_reader_writer = MockNetworkWriter::new(4096);
         let mut packet_writer = PacketWriter::new(
             PacketType::TabularResult,
             &mut mock_reader_writer,
@@ -1302,7 +1296,7 @@ mod variant_tests {
             .await
             .unwrap();
         packet_writer.finalize().await.unwrap();
-        let payload = mock_reader_writer.get_written_data();
+        let payload = mock_reader_writer.data;
         payload[PacketWriter::PACKET_HEADER_SIZE..].to_vec()
     }
 
@@ -1396,7 +1390,7 @@ mod variant_tests {
             SqlType::VarBinary(None, 8001),
         ];
         for inner in unsupported {
-            let mut mock_reader_writer = MockNetworkReaderWriter::default();
+            let mut mock_reader_writer = MockNetworkWriter::new(4096);
             let mut packet_writer = PacketWriter::new(
                 PacketType::TabularResult,
                 &mut mock_reader_writer,
