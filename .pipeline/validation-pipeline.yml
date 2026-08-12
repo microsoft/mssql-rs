@@ -1,9 +1,38 @@
-# CI trigger only on development. Main-branch builds are produced by the
-# Official pipeline (OneBranch/OfficialPythonWheelsBuild.yml) on merge.
-trigger:
-- development
+# =============================================================================
+# TEMPORARY - x64 SKU A/B experiment (D4ads_v6 vs D8ads_v6). DO NOT MERGE.
+#
+# Runs ONLY Build Windows + Build Linux, against the single pool named by the
+# x64Pool parameter. Both pools are identical except sku.name, so the job
+# duration difference isolates the SKU. Flip the x64Pool default, push, and
+# compare median job durations across interleaved runs.
+#
+# One variant per run (not both in one run) because the coverage/wheel publish
+# steps are gated on Build.Reason == PullRequest and their artifact names are
+# hardcoded - duplicating the jobs in a single PR run would collide on artifact
+# names. Interleaving runs + taking medians controls for drift instead.
+#
+# The original entry point is preserved at the bottom of this file.
+# =============================================================================
+
+trigger: none
 
 parameters:
+- name: x64Pool
+  displayName: x64 agent pool under test
+  type: string
+  default: RUST-SKUTEST-X64-D4
+  values:
+  - RUST-SKUTEST-X64-D4
+  - RUST-SKUTEST-X64-D8
+
+- name: windowsImage
+  type: string
+  default: RUST-Win22-Sql25-1P-NVME
+
+- name: linuxImage
+  type: string
+  default: RUST-1ES-UBUSLIM-NVME
+
 - name: buildType
   displayName: Type of the build to produce
   type: string
@@ -13,44 +42,193 @@ parameters:
   - Release
   default: Both
 
-- name: RunFuzz
-  displayName: Run Fuzz Tests (30 min)
-  type: boolean
-  default: false
-
-- name: RunLongHaul
-  displayName: Run Long-Haul BCP Test (30 min)
-  type: boolean
-  default: false
-
-- name: sqlInstanceMode
-  displayName: SQL host cardinality for ARM test stages
-  type: string
-  values:
-  - shared
-  - per-job
-  default: shared
-
-- name: sqlImageTag
-  displayName: SQL Server docker image tag for ARM test stages
-  type: string
-  default: '2025-latest'
-
-variables:
-  # msodbcsql18 reference-driver version for the ODBC C++ e2e parity comparison.
-  # Pinned so an upstream release can't silently change what the parity table
-  # compares against. Consumed on Windows by install-msodbcsql.ps1 and on Linux
-  # by containerized-odbc-e2e.sh (which appends the Debian package revision).
-  msodbcsqlVersion: '18.6.2.1'
-
 stages:
-- template: templates/validation-stages.yml
-  parameters:
-    buildType: ${{ parameters.buildType }}
-    RunFuzz: ${{ parameters.RunFuzz }}
-    RunLongHaul: ${{ parameters.RunLongHaul }}
-    sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
-    sqlImageTag: ${{ parameters.sqlImageTag }}
-    # PR validation for internal ADO and GitHub PRs. GitHub PRs run in the public
-    # project, which lacks 'Magnitude Test', so exclude the infra stages here.
-    includeInfraStages: false
+- stage: Build
+  displayName: SKU A/B Build (${{ parameters.x64Pool }})
+  jobs:
+  - job: Build_Windows
+    displayName: Build Windows
+    pool:
+      name: ${{ parameters.x64Pool }}
+      demands:
+        - imageOverride -equals ${{ parameters.windowsImage }}
+    variables:
+      # For details on this CARGO_TARGET_DIR setting, see https://eng.ms/docs/more/rust/topics/onebranch-workaround
+      CARGO_TARGET_DIR: C:\cargo_target_dir
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+      - template: sql-setup-template.yml
+        parameters:
+          buildTarget: Windows
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Windows
+      - template: install-dependencies.yml
+        parameters:
+          osType: Windows
+      - template: build-template.yml
+        parameters:
+          osType: Windows
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E "not (test(connectivity))"
+          enableOdbcE2E: true
+      # Extended Protection (EPA) channel-binding test.
+      # Runs AFTER the main test pass. Runs the same integrated-auth encrypted
+      # login test under two server configurations, expecting success in both:
+      #   1. EPA = Off      -- baseline (channel binding not enforced).
+      #   2. EPA = Required -- the server rejects any login lacking a valid
+      #      channel binding, so a successful login proves we send a real,
+      #      server-validated tls-unique token.
+      # Reverts EPA to Off in `finally` so a failure still restores the
+      # instance. Each registry change requires a SQL service restart, handled
+      # by the script.
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          $spns = @("MSSQLSvc/localhost:1433", "MSSQLSvc/$($env:COMPUTERNAME):1433")
+          $configured = $false
+          try {
+            foreach ($level in @('Off', 'Required')) {
+              ./.pipeline/scripts/Configure-ExtendedProtection.ps1 `
+                -InstanceName 'MSSQLSERVER' -Level $level -ForceEncryption 'Yes' `
+                -AcceptedNtlmSpns $spns -RestartService $true
+              $configured = $true
+
+              Write-Host "Running EPA channel-binding test with Extended Protection = $level"
+              cargo nextest run --frozen --package mssql-tds `
+                -E 'test(epa_channel_binding)' --no-fail-fast --profile ci
+              if ($LASTEXITCODE -ne 0) { throw "EPA channel-binding test failed with EPA=$level (exit $LASTEXITCODE)" }
+            }
+          }
+          finally {
+            if ($configured) {
+              Write-Host 'Reverting Extended Protection to Off...'
+              ./.pipeline/scripts/Configure-ExtendedProtection.ps1 `
+                -InstanceName 'MSSQLSERVER' -Level 'Off' -ForceEncryption 'No' -RestartService $true
+            }
+          }
+        displayName: 'Extended Protection (EPA) channel-binding test'
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+        env:
+          EPA_TEST: '1'
+          SSPI_TEST: '1'
+          SQL_PASSWORD: $(SQL_PASSWORD)
+          RUST_BACKTRACE: full
+      - task: PublishTestResults@2
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+        displayName: 'Publish EPA test results'
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
+          testRunTitle: 'Extended Protection (EPA)'
+      - template: build-python-wheels-template.yml
+        parameters:
+          osType: Windows
+          architecture: x64
+  - job: Build_Linux
+    displayName: Build Linux
+    pool:
+      name: ${{ parameters.x64Pool }}
+      demands:
+        - imageOverride -equals ${{ parameters.linuxImage }}
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: build-template-container.yml
+        parameters:
+          architecture: x64
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+          enableJsBuild: true
+          enableJsTest: true
+          additionalPythonTestArgs: '--coverage'
+          collectPythonCoverage: true
+          collectRustCoverage: true
+      - template: build-template-alpine.yml
+        parameters:
+          osType: Linux
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+      - template: build-python-wheels-template.yml
+        parameters:
+          osType: Linux
+          architecture: x64
+      - template: build-python-wheels-template.yml
+        parameters:
+          osType: Alpine
+          architecture: x64
+      - template: build-odbc-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_Linux_x64'
+      - template: build-odbc-alpine-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_Musl_x64'
+      - template: build-odbc-glibc228-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_glibc228_x64'
+
+# =============================================================================
+# ORIGINAL ENTRY POINT (restore this file from origin/main to un-hijack):
+#
+# # CI trigger only on development. Main-branch builds are produced by the
+# # Official pipeline (OneBranch/OfficialPythonWheelsBuild.yml) on merge.
+# trigger:
+# - development
+# 
+# parameters:
+# - name: buildType
+#   displayName: Type of the build to produce
+#   type: string
+#   values:
+#   - Both
+#   - Debug
+#   - Release
+#   default: Both
+# 
+# - name: RunFuzz
+#   displayName: Run Fuzz Tests (30 min)
+#   type: boolean
+#   default: false
+# 
+# - name: RunLongHaul
+#   displayName: Run Long-Haul BCP Test (30 min)
+#   type: boolean
+#   default: false
+# 
+# - name: sqlInstanceMode
+#   displayName: SQL host cardinality for ARM test stages
+#   type: string
+#   values:
+#   - shared
+#   - per-job
+#   default: shared
+# 
+# - name: sqlImageTag
+#   displayName: SQL Server docker image tag for ARM test stages
+#   type: string
+#   default: '2025-latest'
+# 
+# variables:
+#   # msodbcsql18 reference-driver version for the ODBC C++ e2e parity comparison.
+#   # Pinned so an upstream release can't silently change what the parity table
+#   # compares against. Consumed on Windows by install-msodbcsql.ps1 and on Linux
+#   # by containerized-odbc-e2e.sh (which appends the Debian package revision).
+#   msodbcsqlVersion: '18.6.2.1'
+# 
+# stages:
+# - template: templates/validation-stages.yml
+#   parameters:
+#     buildType: ${{ parameters.buildType }}
+#     RunFuzz: ${{ parameters.RunFuzz }}
+#     RunLongHaul: ${{ parameters.RunLongHaul }}
+#     sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
+#     sqlImageTag: ${{ parameters.sqlImageTag }}
+#     # PR validation for internal ADO and GitHub PRs. GitHub PRs run in the public
+#     # project, which lacks 'Magnitude Test', so exclude the infra stages here.
+#     includeInfraStages: false# =============================================================================
