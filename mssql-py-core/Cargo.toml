@@ -28,11 +28,3 @@ arrow = { version = "55", default-features = false, features = ["ffi"] }
 
 [build-dependencies]
 pyo3-build-config = "0.29.0"
-
-[features]
-# `async-preview` gates the entire asynchronous surface (`PyAsyncConnection`,
-# `PyAsyncCursor`, and the shared Tokio runtime that backs them). Disabled by
-# default: production wheels expose only the stable synchronous API. Downstream
-# packagers opt in explicitly by building with `--features async-preview`.
-default = []
-async-preview = []

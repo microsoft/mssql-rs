@@ -16,7 +16,7 @@
 
 use std::sync::Once;
 
-use tokio::runtime::{Builder, Handle};
+use tokio::runtime::Builder;
 
 const THREAD_NAME: &str = "mssql-py-core";
 
@@ -29,17 +29,4 @@ pub(crate) fn init() {
         builder.enable_all().thread_name(THREAD_NAME);
         pyo3_async_runtimes::tokio::init(builder);
     });
-}
-
-/// Returns a cloned [`Handle`] to the shared runtime. Cheap; clones an `Arc`.
-///
-/// Callers using this from a synchronous `#[pyfunction]` / `#[pymethods]` path
-/// should wrap the `block_on` call in `py.detach(...)` so the GIL is released
-/// while I/O runs.
-#[allow(dead_code)] // Consumed by upcoming async cursor paths.
-pub(crate) fn handle() -> Handle {
-    // `get_runtime()` lazily materializes the runtime using the builder passed
-    // to `init`. It is safe to call before `init` — the crate falls back to a
-    // default builder — but `init` guarantees the tuned configuration is used.
-    pyo3_async_runtimes::tokio::get_runtime().handle().clone()
 }

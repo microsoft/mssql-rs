@@ -5,11 +5,10 @@
 //!
 //! # ⚠️ Preview API — unstable
 //!
-//! The types and methods in this module are gated behind the `async-preview`
-//! Cargo feature and are **not** part of the stable `mssql-py-core` surface.
-//! Signatures, error behavior, and internal semantics may change without
-//! notice in any release. First use in a Python process emits a
-//! [`FutureWarning`] via `warnings.warn`.
+//! The types and methods in this module are **not** part of the stable
+//! `mssql-py-core` surface. Signatures, error behavior, and internal
+//! semantics may change without notice in any release. First use in a
+//! Python process emits a [`FutureWarning`] via `warnings.warn`.
 //!
 //! Sibling of `connection.rs` (the synchronous surface). Every type defined
 //! here submits its I/O to the shared process-wide Tokio runtime via
@@ -63,9 +62,9 @@ fn emit_preview_warning(py: Python<'_>) {
 ///
 /// # ⚠️ Preview API — unstable
 ///
-/// This class is part of the `async-preview` surface. The API, method
-/// signatures, error behavior, and internal semantics may change without
-/// notice in minor releases. Do not depend on it from production code.
+/// Preview surface: API, method signatures, error behavior, and internal
+/// semantics may change without notice in minor releases. Do not depend on
+/// it from production code.
 ///
 /// Instances are created via [`PyAsyncConnection::connect`], which returns a
 /// Python awaitable. The awaitable resolves on the caller's `asyncio` loop
@@ -99,8 +98,7 @@ impl PyAsyncConnection {
         let py = cls.py();
 
         // Preview API: emit a one-shot FutureWarning so callers see the
-        // instability signal even if they somehow got a wheel built with
-        // `--features async-preview` without reading the release notes.
+        // instability signal at runtime.
         emit_preview_warning(py);
 
         tracing::info!("PyAsyncConnection::connect: extracting client context");
@@ -197,10 +195,10 @@ impl PyAsyncConnection {
     /// If no transaction is currently open on the server, the commit will
     /// fail with the server's own error (SQL Server 3902 — "The COMMIT
     /// TRANSACTION request has no corresponding BEGIN TRANSACTION").
-    fn commit<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         // Clone the Arc synchronously so the future is `'static + Send`
-        // without borrowing `self`. The `&mut self` borrow is released as
-        // soon as this method returns.
+        // without borrowing `self`. Only a shared borrow is required —
+        // nothing on `self` is mutated here.
         let client = self
             .tds_client
             .as_ref()
@@ -232,10 +230,10 @@ impl PyAsyncConnection {
     /// If no transaction is currently open on the server, the rollback will
     /// fail with the server's own error (SQL Server 3903 — "The ROLLBACK
     /// TRANSACTION request has no corresponding BEGIN TRANSACTION").
-    fn rollback<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         // Clone the Arc synchronously so the future is `'static + Send`
-        // without borrowing `self`. The `&mut self` borrow is released as
-        // soon as this method returns.
+        // without borrowing `self`. Only a shared borrow is required —
+        // nothing on `self` is mutated here.
         let client = self
             .tds_client
             .as_ref()
