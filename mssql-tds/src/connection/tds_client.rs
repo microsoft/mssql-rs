@@ -3038,7 +3038,9 @@ impl TdsClient {
     ///
     /// After this returns `true`, individual columns are pulled with
     /// [`read_row_column`](Self::read_row_column). Any previously positioned row
-    /// is drained first (allocation-free).
+    /// is drained first without materializing column values. That drain is
+    /// allocation-free unless it abandons a partially read PLP column, which
+    /// allocates a single scratch buffer to skip the remaining bytes.
     #[instrument(skip(self), level = "info")]
     pub async fn next_row_cursor(&mut self) -> TdsResult<bool> {
         if self.current_metadata.is_none() {
@@ -3240,7 +3242,7 @@ impl TdsClient {
     /// future and propagate into every caller that awaits it — `read_row_column`
     /// directly, plus `drain_rows`, `get_next_row_into` and `next_row_cursor` via
     /// `drain_active_row`. Abandoning a partially read PLP column is rare and
-    /// already network-bound, so the allocation is free here while an 8 KiB
+    /// already network-bound, so one allocation there is negligible; an 8 KiB
     /// per-row state machine is not.
     async fn drain_active_plp(&mut self, plp_state: &mut PlpPauseState) -> TdsResult<()> {
         let mut buffer = vec![0u8; 8192];
