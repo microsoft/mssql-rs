@@ -22,7 +22,7 @@
 //! [`FutureWarning`]: https://docs.python.org/3/library/exceptions.html#FutureWarning
 
 use std::sync::Arc;
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pyo3::exceptions::{PyFutureWarning, PyRuntimeError};
 use pyo3::prelude::*;
@@ -37,25 +37,22 @@ use crate::connection::PyCoreConnection;
 
 /// Emit a `FutureWarning` the first time any async API is exercised in this
 /// process. Silenceable by callers via `warnings.filterwarnings(...)`.
-static PREVIEW_WARNED: Once = Once::new();
+static PREVIEW_WARNED: AtomicBool = AtomicBool::new(false);
 
-fn emit_preview_warning(py: Python<'_>) {
-    PREVIEW_WARNED.call_once(|| {
-        let category = py.get_type::<PyFutureWarning>();
-        // stacklevel=2 attributes the warning to the caller's `await` site
-        // rather than to this Rust helper.
-        if let Err(e) = PyErr::warn(
-            py,
-            &category,
-            c"mssql_py_core async API is a preview and subject to breaking changes without notice; do not depend on it from production code.",
-            2,
-        ) {
-            tracing::warn!(
-                "PyAsyncConnection: failed to emit preview FutureWarning: {}",
-                e
-            );
-        }
-    });
+fn emit_preview_warning(py: Python<'_>) -> PyResult<()> {
+    if PREVIEW_WARNED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let category = py.get_type::<PyFutureWarning>();
+    // stacklevel=1: native methods have no Python frame, so 1 lands on the caller's `connect(...)`.
+    PyErr::warn(
+        py,
+        &category,
+        c"mssql_py_core async API is a preview and subject to breaking changes without notice; do not depend on it from production code.",
+        1,
+    )?;
+    PREVIEW_WARNED.store(true, Ordering::Release);
+    Ok(())
 }
 
 /// Asynchronous Python connection backed by the Core TDS client.
@@ -70,6 +67,15 @@ fn emit_preview_warning(py: Python<'_>) {
 /// Python awaitable. The awaitable resolves on the caller's `asyncio` loop
 /// once the TCP + TLS + login handshake has completed on the shared Tokio
 /// runtime.
+///
+/// TODO(User Story 47180 [mssql-python] Cancel API and Cancellation Bridge):
+/// cancellation of a suspended `commit`, `rollback`, or `close` future can
+/// desync the TDS byte stream (bytes written, response not yet read), so a
+/// subsequent operation on the same connection may read a stale response
+/// and corrupt the wire. Callers must not cancel these awaitables against a
+/// connection they intend to keep using. Cancellation-safe semantics are
+/// tracked at
+/// <https://sqlclientdrivers.visualstudio.com/mssql-python/_workitems/edit/47180>.
 #[pyclass]
 pub struct PyAsyncConnection {
     /// Wrapped in `Option` so `close()` can take ownership and drop the
@@ -99,7 +105,7 @@ impl PyAsyncConnection {
 
         // Preview API: emit a one-shot FutureWarning so callers see the
         // instability signal at runtime.
-        emit_preview_warning(py);
+        emit_preview_warning(py)?;
 
         tracing::info!("PyAsyncConnection::connect: extracting client context");
         let context = PyCoreConnection::dict_to_client_context(client_context_dict)?;
