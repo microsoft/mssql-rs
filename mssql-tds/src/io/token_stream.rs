@@ -562,7 +562,7 @@ async fn decode_or_decrypt_column<R: TdsPacketReader + Send + Sync>(
             write_column_value(writer, col, value);
         }
         (true, None) => {
-            tracing::info!(
+            tracing::debug!(
                 column = %meta.column_name,
                 "Encrypted column has no column-encryption decryptor available \
                  (Always Encrypted disabled for this command, or no key-store \
