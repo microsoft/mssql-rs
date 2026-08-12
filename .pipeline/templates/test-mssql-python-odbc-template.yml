@@ -1,0 +1,296 @@
+# Run the microsoft/mssql-python test suite against the Rust mssql-odbc driver.
+#
+# This is the driver-swap counterpart to test-mssql-python-template.yml. That
+# template validates fresh mssql-py-core bindings while keeping the shipped
+# Microsoft ODBC Driver 18; this one keeps mssql-python exactly as released
+# (mssql_py_core from NuGet, pybind bindings built from its own source) and
+# swaps only the bundled libmsodbcsql binary for the one mssql-odbc produces.
+# The delta between the two jobs is therefore attributable to our driver.
+#
+# mssql-python source is never modified - the swap overwrites one packaged
+# binary, which is what its own pipeline effectively does when it uninstalls the
+# system driver before testing.
+#
+# The Rust driver is incomplete, so failures and hard crashes are expected. The
+# test step inspects the runner's exit code directly - test failures surface as
+# SucceededWithIssues (yellow) while a broken harness is a real error - and every
+# test file runs in its own bounded pytest process
+# (run-mssql-python-odbc-tests.sh), so the job reports results instead of
+# stalling or losing the whole run to one segfault.
+
+parameters:
+  # SQL Server container image used as the test target.
+  - name: sqlImage
+    type: string
+    default: 'mcr.microsoft.com/mssql/server:2025-latest'
+  # Distro the mssql-python suite runs in - matches the upstream Ubuntu leg.
+  - name: testImage
+    type: string
+    default: 'ubuntu:24.04'
+  # Build container for the Rust driver.
+  - name: buildImage
+    type: string
+    default: 'ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04'
+  # Per-test-file wall-clock budget, passed to `timeout`.
+  - name: pytestFileTimeout
+    type: string
+    default: '10m'
+  # Wall-clock budget for the whole suite. Must leave headroom under the job's
+  # timeoutInMinutes: a job cancelled by the server skips `condition: always()`
+  # steps, which would lose the test results and leak the containers.
+  - name: pytestTotalBudget
+    type: string
+    default: '110m'
+
+steps:
+- template: generate-sql-password-template.yml
+  parameters:
+    osType: Linux
+
+- task: DockerInstaller@0
+  inputs:
+    dockerVersion: '29.0.0'
+  displayName: Install Docker
+
+- template: install-ubuntu-dependency.yaml
+  parameters:
+    installAzCli: false
+    installDocker: true
+
+- script: |
+    set -euo pipefail
+    docker pull ${{ parameters.buildImage }}
+    docker pull ${{ parameters.testImage }}
+    docker pull ${{ parameters.sqlImage }}
+  displayName: Pull container images
+
+- script: |
+    set -euo pipefail
+    bash .pipeline/scripts/clone-mssql-python.sh
+  displayName: Clone mssql-python
+  env:
+    AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+- script: |
+    set -euo pipefail
+
+    bash .pipeline/scripts/docker-cargo-run.sh --rm \
+      -v "$PWD:/workspace" \
+      -v "$HOME/.cargo/registry:/root/.cargo/registry" \
+      -v "$HOME/.cargo/git:/root/.cargo/git" \
+      -w /workspace \
+      ${{ parameters.buildImage }} \
+      bash /workspace/.pipeline/scripts/containerized-odbc-swap-build.sh
+  displayName: Build mssql-odbc driver
+  env:
+    CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+    CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+- script: |
+    set -euo pipefail
+
+    # A previous run cancelled mid-flight leaves its containers and network
+    # behind, and `docker run --name` / `network create` then fail outright.
+    docker rm -f mssql-python-odbc-tests || true
+    docker rm -f sqlserver-odbc-swap || true
+    docker network rm mssqlpy-odbc-net || true
+
+    docker network create mssqlpy-odbc-net
+
+    # No host port published: the test container reaches SQL Server over the
+    # user-defined network, and binding 1433 on the agent would collide with the
+    # sibling mssql-python job scheduled onto the same pool.
+    docker run -d \
+      --name sqlserver-odbc-swap \
+      --network mssqlpy-odbc-net \
+      --network-alias sqlserver \
+      -e ACCEPT_EULA=Y \
+      -e MSSQL_SA_PASSWORD="$SQL_PASSWORD" \
+      ${{ parameters.sqlImage }}
+
+    echo "Waiting for SQL Server to accept connections..."
+    for i in $(seq 1 60); do
+      if docker exec sqlserver-odbc-swap /opt/mssql-tools18/bin/sqlcmd \
+          -S localhost -U SA -P "$SQL_PASSWORD" -C -Q "SELECT 1" >/dev/null 2>&1; then
+        echo "SQL Server is ready"
+        break
+      fi
+      if [ "$i" -eq 60 ]; then
+        echo "##[error]SQL Server did not become ready in time"
+        docker logs sqlserver-odbc-swap || true
+        exit 1
+      fi
+      sleep 2
+    done
+
+    # mssql-python's own pipeline runs against a database named TestDB.
+    docker exec sqlserver-odbc-swap /opt/mssql-tools18/bin/sqlcmd \
+      -S localhost -U SA -P "$SQL_PASSWORD" -C -Q "CREATE DATABASE TestDB"
+  displayName: Start SQL Server
+  env:
+    SQL_PASSWORD: $(SQL_PASSWORD)
+
+- script: |
+    set -euo pipefail
+    docker run -d \
+      --name mssql-python-odbc-tests \
+      --network mssqlpy-odbc-net \
+      -v "$PWD/../mssql-python:/workspace" \
+      -v "$PWD/.pipeline/scripts:/mssql-rs-scripts:ro" \
+      -v "$PWD/odbc-swap-drop:/mssql-odbc:ro" \
+      -w /workspace \
+      ${{ parameters.testImage }} \
+      tail -f /dev/null
+
+    docker exec mssql-python-odbc-tests bash -c '
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive TZ=UTC
+      ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+      apt-get update
+      # Same set the upstream Ubuntu leg installs, plus the runtime libraries the
+      # Rust driver links against (TLS via OpenSSL, Kerberos via GSSAPI).
+      apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv python3-full python3-dev \
+        cmake curl wget gnupg build-essential pybind11-dev \
+        unixodbc-dev \
+        libssl3 libgssapi-krb5-2 libkrb5-3 ca-certificates
+    '
+  displayName: Create mssql-python test container
+
+- script: |
+    set -euo pipefail
+    docker exec mssql-python-odbc-tests bash -c '
+      set -euo pipefail
+      python3 -m venv /opt/venv
+      source /opt/venv/bin/activate
+      python -m pip install --upgrade pip
+      python -m pip install -r requirements.txt
+    '
+  displayName: Install mssql-python Python dependencies
+
+- script: |
+    set -euo pipefail
+    docker exec mssql-python-odbc-tests bash -c '
+      set -euo pipefail
+      source /opt/venv/bin/activate
+      cd mssql_python/pybind
+      chmod +x build.sh
+      ./build.sh
+    '
+  displayName: Build mssql-python pybind bindings
+
+# Released mssql_py_core, so the only variable under test is the ODBC driver.
+- script: |
+    set -euo pipefail
+    docker exec mssql-python-odbc-tests bash -c '
+      set -euo pipefail
+      source /opt/venv/bin/activate
+      chmod +x eng/scripts/install-mssql-py-core.sh
+      ./eng/scripts/install-mssql-py-core.sh
+    '
+  displayName: Install mssql_py_core from NuGet
+
+# Upstream purges the ODBC build toolchain and the system libodbcinst before
+# testing, so the bundled copy next to the driver is what loads. Mirror it: the
+# only intended difference from an upstream run is the driver binary itself.
+- script: |
+    set -euo pipefail
+    docker exec mssql-python-odbc-tests bash -c '
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get remove --purge -y unixodbc-dev
+      # Globbed rather than hardcoded to x86_64 so this cannot silently no-op on
+      # an arm64 agent and leave the system libodbcinst in place.
+      rm -f /lib/*-linux-gnu/libodbcinst.so.2 /usr/lib/*-linux-gnu/libodbcinst.so.2
+      echo "Removed unixODBC development headers and system libodbcinst.so.2"
+    '
+  displayName: Strip build-time ODBC toolchain
+
+- script: |
+    set -euo pipefail
+    docker exec mssql-python-odbc-tests bash -c '
+      source /opt/venv/bin/activate
+      MSSQL_ODBC_DRIVER=/mssql-odbc/libmsodbcsql18.so \
+        bash /mssql-rs-scripts/swap-mssql-python-odbc-driver.sh
+    '
+  displayName: Replace bundled msodbcsql18 with mssql-odbc
+
+- script: |
+    # The connection string carries the SA password, so it is passed by name and
+    # supplied through the step's env block rather than being written into argv.
+    rc=0
+    docker exec \
+      -e DB_CONNECTION_STRING \
+      -e PYTEST_FILE_TIMEOUT="${{ parameters.pytestFileTimeout }}" \
+      -e PYTEST_TOTAL_BUDGET="${{ parameters.pytestTotalBudget }}" \
+      -e TEST_RESULTS_DIR=/workspace/test-results \
+      mssql-python-odbc-tests bash -c '
+        source /opt/venv/bin/activate
+        bash /mssql-rs-scripts/run-mssql-python-odbc-tests.sh
+      ' || rc=$?
+
+    # Exit 2 means the harness could not run the tests at all, and docker's own
+    # 125/126/127 mean `docker exec` never launched it - both are broken
+    # environments, which say nothing about the driver and must be a real red.
+    # Anything else is the expected in-development baseline and stays advisory,
+    # so a genuine infrastructure break is never mistaken for it.
+    case "$rc" in
+      2|125|126|127)
+        echo "##vso[task.logissue type=error]mssql-python test harness could not run (exit $rc) - broken test environment, not a driver defect"
+        exit 1
+        ;;
+    esac
+
+    if [ "$rc" -ne 0 ]; then
+      echo "##vso[task.logissue type=warning]mssql-python tests did not fully pass against mssql-odbc (exit $rc) - expected while the driver is in development"
+      # `logissue` only annotates the log - on its own the step still reports a
+      # green check, so an entirely red suite looks indistinguishable from a
+      # clean run. Set the result explicitly to surface the warning glyph.
+      #
+      # This marks the build "partially succeeded", which Azure Pipelines reports
+      # to GitHub as `success` (verified against build 166244 on PR #210), so the
+      # signal is visible without the job ever blocking a pull request.
+      echo "##vso[task.complete result=SucceededWithIssues;]"
+    fi
+    exit 0
+  displayName: Run mssql-python tests against mssql-odbc
+  # The runner enforces its own budget; this only backstops a wedged `docker
+  # exec`. It must stay below the job timeout so the publish and cleanup steps
+  # below still run.
+  timeoutInMinutes: 130
+  env:
+    DB_CONNECTION_STRING: "Server=sqlserver,1433;Database=TestDB;Uid=SA;Pwd=$(SQL_PASSWORD);TrustServerCertificate=yes"
+
+- script: |
+    set -uo pipefail
+    # Stage the JUnit reports under the sources dir: PublishTestResults globs
+    # relative to a search folder, so keeping the pattern free of '..' avoids
+    # any ambiguity about where it resolves.
+    mkdir -p mssql-python-odbc-test-results
+    cp ../mssql-python/test-results/*.xml mssql-python-odbc-test-results/ 2>/dev/null || true
+    ls -la mssql-python-odbc-test-results || true
+  displayName: Collect test results
+  condition: always()
+  continueOnError: true
+
+- task: PublishTestResults@2
+  displayName: Publish mssql-python (mssql-odbc driver) test results
+  condition: always()
+  continueOnError: true
+  inputs:
+    testResultsFormat: JUnit
+    searchFolder: '$(Build.SourcesDirectory)/mssql-python-odbc-test-results'
+    testResultsFiles: '*.xml'
+    testRunTitle: 'mssql-python suite on mssql-odbc driver'
+    mergeTestResults: true
+    failTaskOnFailedTests: false
+    publishRunAttachments: true
+
+- script: |
+    docker rm -f mssql-python-odbc-tests || true
+    docker rm -f sqlserver-odbc-swap || true
+    docker network rm mssqlpy-odbc-net || true
+    sudo rm -rf ../mssql-python || true
+    sudo rm -rf odbc-swap-drop mssql-python-odbc-test-results || true
+  displayName: Cleanup
+  condition: always()
