@@ -57,16 +57,16 @@ stages:
       CARGO_TARGET_DIR: C:\cargo_target_dir
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
     steps:
-      - template: sql-setup-template.yml
+      - template: templates/sql-setup-template.yml
         parameters:
           buildTarget: Windows
-      - template: cargo-authenticate-template.yml
+      - template: templates/cargo-authenticate-template.yml
         parameters:
           osType: Windows
-      - template: install-dependencies.yml
+      - template: templates/install-dependencies.yml
         parameters:
           osType: Windows
-      - template: build-template.yml
+      - template: templates/build-template.yml
         parameters:
           osType: Windows
           buildType: ${{ parameters.buildType }}
@@ -120,7 +120,7 @@ stages:
           testResultsFormat: 'JUnit'
           testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
           testRunTitle: 'Extended Protection (EPA)'
-      - template: build-python-wheels-template.yml
+      - template: templates/build-python-wheels-template.yml
         parameters:
           osType: Windows
           architecture: x64
@@ -134,10 +134,10 @@ stages:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
     steps:
-      - template: cargo-authenticate-template.yml
+      - template: templates/cargo-authenticate-template.yml
         parameters:
           osType: Linux
-      - template: build-template-container.yml
+      - template: templates/build-template-container.yml
         parameters:
           architecture: x64
           buildType: ${{ parameters.buildType }}
@@ -147,28 +147,28 @@ stages:
           additionalPythonTestArgs: '--coverage'
           collectPythonCoverage: true
           collectRustCoverage: true
-      - template: build-template-alpine.yml
+      - template: templates/build-template-alpine.yml
         parameters:
           osType: Linux
           buildType: ${{ parameters.buildType }}
           testFilter: -E 'not (test(connectivity))'
-      - template: build-python-wheels-template.yml
+      - template: templates/build-python-wheels-template.yml
         parameters:
           osType: Linux
           architecture: x64
-      - template: build-python-wheels-template.yml
+      - template: templates/build-python-wheels-template.yml
         parameters:
           osType: Alpine
           architecture: x64
-      - template: build-odbc-template.yml
+      - template: templates/build-odbc-template.yml
         parameters:
           architecture: x64
           artifactName: 'Odbc_Linux_x64'
-      - template: build-odbc-alpine-template.yml
+      - template: templates/build-odbc-alpine-template.yml
         parameters:
           architecture: x64
           artifactName: 'Odbc_Musl_x64'
-      - template: build-odbc-glibc228-template.yml
+      - template: templates/build-odbc-glibc228-template.yml
         parameters:
           architecture: x64
           artifactName: 'Odbc_glibc228_x64'
