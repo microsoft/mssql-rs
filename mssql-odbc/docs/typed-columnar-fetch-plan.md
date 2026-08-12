@@ -102,6 +102,7 @@ These were found by reading `Sql/Ntdbms/sqlncli/odbc/sqlccnvt.cpp` while reviewi
 | `YYYY/MM/DD` and the ODBC escape literals `{d '...'}` / `{t '...'}` / `{ts '...'}` | accepted (`rgbECODE_DATE_SLASH` retry, and the `FindECode` branch) | `22018` | Gap — Task [47246](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47246). |
 | `T` separator, `HH:MM` without seconds, unpadded fields such as `2023-6-5` | rejected (fixed-length token grammar) | accepted | Permissive. Low risk, same task. |
 | A time-only value into `SQL_C_TYPE_TIMESTAMP` | fills in the current date and succeeds, per Appendix D | `22018` from a character source, `07006` from a `time` column | Gap — Task [47247](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47247). Needs a platform-specific local-date helper, so it is not a one-line fix. |
+| Any source into `SQL_C_NUMERIC` | converts, per Appendix D | `HYC00` | **Deliberate, and permanent.** Decimal is delivered as character data, which is what mssql-python requests, so `SQL_NUMERIC_STRUCT` is not scheduled to become supported. Anchored by `UnsupportedCTypeReturnsHyc00ThenValueReadable`. |
 
 ### P2 — SQLColAttributeW — Task [46579](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46579)
 

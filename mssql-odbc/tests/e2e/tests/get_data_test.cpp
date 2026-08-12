@@ -549,10 +549,13 @@ TEST_F(GetDataLiveTest, NvarcharMaxWideRoundTrip) {
 // supported type still returns the value. Before the P1a source-type
 // conversions this pairing was simply unimplemented and reported HYC00.
 //
-// Still skipped on the msodbcsql leg: msodbcsql implements this conversion and
-// its CVT_CAST_ERROR carries the "Invalid character value for cast
-// specification" message, so it very likely agrees, but the constant is spelled
-// IDS_22_005 in its source and that has not been confirmed against a live run.
+// TODO(convergence): this skip is temporary. msodbcsql implements this
+// conversion and its CVT_CAST_ERROR carries the "Invalid character value for
+// cast specification" message, so it very likely agrees, but the constant is
+// spelled IDS_22_005 in its source and that has not been confirmed against a
+// live run. Confirm against a live msodbcsql run, then drop the skip so this
+// compares on both legs; if the two do not agree, record the difference in the
+// "Known divergences from msodbcsql" table in docs/typed-columnar-fetch-plan.md.
 TEST_F(GetDataLiveTest, InvalidCharacterForNumericTargetIs22018ThenValueReadable) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS c1"),
@@ -576,9 +579,9 @@ TEST_F(GetDataLiveTest, InvalidCharacterForNumericTargetIs22018ThenValueReadable
 
 // An unsupported C target type is rejected with HYC00 and does not consume the
 // column. SQL_C_NUMERIC is the durable anchor for this: emitting the
-// SQL_NUMERIC_STRUCT is an explicit non-goal (decimal is delivered as character
-// data, which is what mssql-python requests), so unlike the other C targets it
-// is not scheduled to become supported.
+// SQL_NUMERIC_STRUCT is a permanent non-goal, recorded in the "Known divergences
+// from msodbcsql" table in docs/typed-columnar-fetch-plan.md, so unlike the
+// other C targets it is not scheduled to become supported.
 TEST_F(GetDataLiveTest, UnsupportedCTypeReturnsHyc00ThenValueReadable) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS c1"),

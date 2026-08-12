@@ -208,11 +208,21 @@ fn numeric_source(value: &ColumnValues) -> Option<NumericSource> {
         ColumnValues::Bit(b) => Some(NumericSource::Int(i128::from(*b))),
         ColumnValues::Real(x) => Some(NumericSource::Float(f64::from(*x))),
         ColumnValues::Float(x) => Some(NumericSource::Float(*x)),
-        // `DecimalParts` renders itself exactly; parse that back rather than
-        // reassembling its base-2^32 limbs. The format-and-reparse allocates per
-        // value; accepted for now in exchange for exactness.
+        // `DecimalParts` stores a base-2^32 little-endian magnitude; reassemble
+        // it directly. 38 digits fit in 4 limbs, and the wire decoder admits up
+        // to 64, so reject longer payloads rather than shifting past 128 bits.
         ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
-            parse_decimal_literal(&d.to_string())
+            if d.int_parts.len() > 4 {
+                return None;
+            }
+            let mag = d.int_parts.iter().enumerate().fold(0u128, |acc, (i, &p)| {
+                acc | (u128::from(p as u32) << (i * 32))
+            });
+            let m = i128::try_from(mag).ok()?;
+            Some(NumericSource::Scaled {
+                mantissa: if d.is_positive { m } else { -m },
+                scale: u32::from(d.scale),
+            })
         }
         ColumnValues::Money(m) => Some(NumericSource::Scaled {
             mantissa: i128::from(money_scaled(m.lsb_part, m.msb_part)),
@@ -601,6 +611,16 @@ fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
     if it.next().is_some() || y.len() != 4 {
         return None;
     }
+    // `str::parse` accepts a leading `+`, which would make `+123-01-01` a valid
+    // date; require plain digits.
+    if !y
+        .bytes()
+        .chain(m.bytes())
+        .chain(d.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
     let year: i16 = y.parse().ok()?;
     let month: u16 = m.parse().ok()?;
     let day: u16 = d.parse().ok()?;
@@ -619,8 +639,8 @@ fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
 /// fractional digits supplied (the effective scale).
 fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
     let mut it = s.split(':');
-    let hour: u16 = it.next()?.parse().ok()?;
-    let minute: u16 = it.next()?.parse().ok()?;
+    let hour_s = it.next()?;
+    let minute_s = it.next()?;
     let sec_part = it.next().unwrap_or("0");
     if it.next().is_some() {
         return None;
@@ -629,6 +649,18 @@ fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
         Some((a, b)) => (a, b),
         None => (sec_part, ""),
     };
+    // `str::parse` accepts a leading `+`, which would make `+1:00:00` a valid
+    // time; require plain digits.
+    if !hour_s
+        .bytes()
+        .chain(minute_s.bytes())
+        .chain(sec_digits.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let hour: u16 = hour_s.parse().ok()?;
+    let minute: u16 = minute_s.parse().ok()?;
     let second: u16 = sec_digits.parse().ok()?;
     if hour > 23 || minute > 59 || second > 59 {
         return None;
@@ -1333,6 +1365,94 @@ mod tests {
         }
         .unwrap();
         assert_eq!(out.day, 29);
+    }
+
+    /// `str::parse` accepts a leading `+`, which would admit components with no
+    /// meaning (`+123` as a year, `+5` as a month).
+    #[test]
+    fn leading_plus_in_date_or_time_component_is_rejected() {
+        for bad in ["+123-01-01", "2023-+5-01", "2023-01-+5"] {
+            let mut out = SqlDateStruct::default();
+            let mut ind: SqlLen = 0;
+            let err = unsafe {
+                convert_datetime_c(
+                    &utf8_col(bad),
+                    SQL_C_TYPE_DATE,
+                    (&mut out as *mut SqlDateStruct).cast(),
+                    &mut ind,
+                )
+            }
+            .unwrap_err();
+            assert_eq!(err, ConvError::InvalidCharacterValue, "{bad} was accepted");
+        }
+        for bad in ["+1:00:00", "01:+5:00", "01:00:+5"] {
+            let mut out = SqlTimeStruct::default();
+            let mut ind: SqlLen = 0;
+            let err = unsafe {
+                convert_datetime_c(
+                    &utf8_col(bad),
+                    SQL_C_TYPE_TIME,
+                    (&mut out as *mut SqlTimeStruct).cast(),
+                    &mut ind,
+                )
+            }
+            .unwrap_err();
+            assert_eq!(err, ConvError::InvalidCharacterValue, "{bad} was accepted");
+        }
+    }
+
+    /// The limbs are reassembled directly, and a payload with more limbs than
+    /// 128 bits can hold is refused instead of shifting past the width. The wire
+    /// decoder admits up to 64 limbs, so this is reachable from a bad payload.
+    #[test]
+    fn decimal_limbs_are_reassembled_and_bounded() {
+        use mssql_tds::datatypes::decoder::DecimalParts;
+
+        let decimal = |is_positive, scale, int_parts: Vec<i32>| {
+            ColumnValues::Decimal(DecimalParts {
+                is_positive,
+                scale,
+                precision: 38,
+                int_parts,
+            })
+        };
+
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        // 12345 scaled by 10^2 is 123.45, which truncates to 123.
+        let ok = unsafe {
+            convert_integer_c(
+                &decimal(true, 2, vec![12345]),
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, 123);
+
+        unsafe {
+            convert_integer_c(
+                &decimal(false, 2, vec![12345]),
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(out, -123);
+
+        let err = unsafe {
+            convert_integer_c(
+                &decimal(true, 0, vec![1, 0, 0, 0, 1]),
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, ConvError::Restricted);
     }
 
     /// Multi-byte input must not panic while probing for a trailing UTC offset:
