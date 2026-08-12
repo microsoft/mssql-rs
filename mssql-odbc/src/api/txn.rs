@@ -27,7 +27,7 @@ use super::sqlstate::{
     SQLSTATE_01000, SQLSTATE_08007, SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED, post_diag,
     post_tds_error,
 };
-use crate::error::{free_errors, post_sql_error};
+use crate::error::{HasDiagnostics, free_errors, post_sql_error};
 use crate::handles::DbcHandle;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{StmtHandle, handle_from_raw};
@@ -180,11 +180,10 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
     // no-transaction no-op, because this driver advertises `SQL_CB_CLOSE`
     // unconditionally and the Driver Manager marks every statement on the
     // connection cursor-closed on the strength of that. The combination is
-    // reachable: a cursor opened in autocommit mode survives a switch to manual
-    // commit, which starts no transaction of its own, so the next `SQLEndTran`
-    // finds `local_tran_started` false with the row stream still open. Skipping
-    // the sweep there left `active_stmt` claimed behind the DM's back and locked
-    // out every other statement on the connection.
+    // reachable in plain autocommit mode: nothing there ever sets
+    // `local_tran_started`, and no other path sweeps, so a cursor left open
+    // across `SQLEndTran` would keep `active_stmt` claimed behind the DM's back
+    // and lock out every other statement on the connection.
     //
     // msodbcsql returns before its own sweep here (`sqlctran.cpp:293` precedes
     // `302-323`) and is wedged by the same sequence, but it advertises
@@ -599,8 +598,12 @@ pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
 pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
     const OP: &str = "SQLDriverConnectW(transaction settings)";
 
-    let (autocommit, isolation) = match dbc.inner.lock() {
-        Ok(state) => (state.autocommit, state.txn_isolation),
+    let (autocommit, isolation, diag_len) = match dbc.inner.lock() {
+        Ok(state) => (
+            state.autocommit,
+            state.txn_isolation,
+            state.diag_records().len(),
+        ),
         Err(_) => {
             error!("{OP}: dbc mutex poisoned");
             return SQL_SUCCESS;
@@ -617,9 +620,10 @@ pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
             // its own error record before failing. The connect itself
             // succeeded, so returning SQL_SUCCESS with that record still on the
             // handle would show an application a connect failure that never
-            // happened.
+            // happened. Truncating rather than clearing keeps the server's
+            // login INFO messages, which a SQL_SUCCESS_WITH_INFO result needs.
             if let Ok(mut state) = dbc.inner.lock() {
-                free_errors(&mut state);
+                state.diag_records_mut().truncate(diag_len);
             }
             return SQL_SUCCESS;
         }

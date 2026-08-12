@@ -400,36 +400,27 @@ TEST_F(TransactionLiveTest, StatementIsReusableAfterCommitWithoutClosingCursor) 
     EXPECT_EQ(3, RowCountOf("#reuse_t"));
 }
 
-// This driver advertises SQL_CB_CLOSE unconditionally, so a successful
-// SQLEndTran must leave every statement without a cursor even when it commits
-// nothing. In autocommit mode no transaction is ever started, and skipping the
-// sweep on that path left the row stream open and the connection claimed, so
-// every other statement on the connection was locked out.
-// A cursor opened in autocommit mode outlives a switch to manual commit, and
-// the switch itself starts no transaction. The first SQLEndTran therefore
-// commits nothing — but this driver advertises SQL_CB_CLOSE, so the Driver
-// Manager still marks every statement cursor-closed on the strength of that
-// return. Skipping the sweep on the no-transaction path left the row stream
-// open and the connection claimed behind the DM's back, locking out every other
-// statement on the connection.
+// A successful SQLEndTran must leave every statement without a cursor, so the
+// connection is free for other work the moment it returns. Skipping the sweep
+// left the row stream open and the connection claimed behind the Driver
+// Manager's back, locking out every other statement.
 //
-// msodbcsql returns before its own sweep here (`sqlctran.cpp:293` precedes
-// `302-323`) and fails this with a busy connection, but it advertises
-// SQL_CB_PRESERVE, so nothing closes cursors on its behalf and it stays
-// internally consistent. Same SQL_CURSOR_COMMIT_BEHAVIOR divergence as
-// GetInfoReportsCursorCommitBehavior (non-goal N11).
-TEST_F(TransactionLiveTest, EndTranWithNoTransactionStartedStillClosesCursors) {
-    SKIP_IF_COMPARING_MSODBCSQL();
-
+// This is the reachable half of the sweep contract. The no-transaction-started
+// half cannot be driven from here: in manual-commit mode every cursor-opening
+// entry point (SQLExecute, SQLExecDirect, SQLGetTypeInfo) starts a transaction
+// first, and in autocommit mode the Driver Manager answers SQLEndTran itself
+// without ever calling the driver. That path is covered by the unit test
+// txn::tests::end_tran_sweeps_cursors_even_with_no_transaction_started, which
+// calls end_transaction directly.
+TEST_F(TransactionLiveTest, EndTranClosesCursorsAndFreesTheConnection) {
     Exec("CREATE TABLE #ac_close_t(i int)");
     Exec("INSERT INTO #ac_close_t VALUES (1), (2), (3)");
-    ASSERT_EQ(static_cast<SQLUINTEGER>(SQL_AUTOCOMMIT_ON), GetAutocommit(dbc_));
+    ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
 
+    // Leaves a cursor open mid-stream, so the connection is claimed.
     ASSERT_SQL_OK(Run(stmt_, "SELECT i FROM #ac_close_t ORDER BY i"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
-    // No transaction is started by the switch, so the commit below is a no-op.
-    ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
     ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_COMMIT), SQL_HANDLE_DBC, dbc_);
 
     // The sweep released the row stream, so the connection is free for other work.
