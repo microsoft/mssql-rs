@@ -1443,6 +1443,21 @@ mod tests {
         .unwrap();
         assert_eq!(out, -123);
 
+        // Two limbs, the low one negative as `i32`: the shift, the `|` and the
+        // `as u32` reinterpretation all have to be right to land on 123456.322.
+        // Same wire vector `mssql-tds` pins in `test_f64_conversion`.
+        let ok = unsafe {
+            convert_integer_c(
+                &decimal(true, 5, vec![-539_269_688, 2]),
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, 123_456);
+
         let err = unsafe {
             convert_integer_c(
                 &decimal(true, 0, vec![1, 0, 0, 0, 1]),
