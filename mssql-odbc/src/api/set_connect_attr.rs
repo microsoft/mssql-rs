@@ -15,8 +15,8 @@ use super::txn::{set_autocommit, set_txn_isolation};
 use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT,
     SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN,
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger,
-    SqlPointer, SqlReturn,
+    SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
@@ -80,7 +80,12 @@ unsafe fn sql_set_connect_attr_w_impl(
     // the DBC mutex is held, so they manage their own locking.
     match attribute {
         SQL_ATTR_AUTOCOMMIT => return set_autocommit(dbc, value_ptr as usize as u64),
-        SQL_ATTR_TXN_ISOLATION => return set_txn_isolation(dbc, value_ptr as usize as u64),
+        // Both spellings drive the same session setting. The vendor attribute is
+        // the only one that can carry SQL_TXN_SS_SNAPSHOT, because the Driver
+        // Manager screens SQL_ATTR_TXN_ISOLATION down to the four standard bits.
+        SQL_ATTR_TXN_ISOLATION | SQL_COPT_SS_TXN_ISOLATION => {
+            return set_txn_isolation(dbc, value_ptr as usize as u64);
+        }
         _ => {}
     }
 
@@ -589,6 +594,49 @@ mod tests {
             assert_eq!(ret, SQL_SUCCESS, "level {level:#x}");
             assert_eq!(dbc.inner.lock().unwrap().txn_isolation, level);
         }
+    }
+
+    #[test]
+    fn vendor_isolation_attribute_is_accepted_and_reads_back() {
+        // SQL_COPT_SS_TXN_ISOLATION is the only route to SNAPSHOT: the Driver
+        // Manager screens SQL_ATTR_TXN_ISOLATION down to the four standard bits
+        // before the driver is called.
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_COPT_SS_TXN_ISOLATION,
+                SQL_TXN_SS_SNAPSHOT as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(dbc.inner.lock().unwrap().txn_isolation, SQL_TXN_SS_SNAPSHOT);
+    }
+
+    #[test]
+    fn setting_the_current_isolation_level_again_is_a_no_op() {
+        // Matches the same-value short-circuit autocommit uses
+        // (`sqlcmisc.cpp:1720`): no cursor sweep and no round trip.
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        h.mark_dbc_connected();
+        assert_eq!(
+            dbc.inner.lock().unwrap().txn_isolation,
+            SQL_TXN_READ_COMMITTED
+        );
+        // Connected with no TDS client: reaching the server would fail, so
+        // SQL_SUCCESS proves the short-circuit fired.
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_TXN_ISOLATION,
+                SQL_TXN_READ_COMMITTED as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
     }
 
     #[test]

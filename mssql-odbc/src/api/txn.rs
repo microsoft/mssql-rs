@@ -15,7 +15,7 @@ use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
 use tracing::{debug, error};
 
-use super::close_cursor::sql_free_stmt_close;
+use super::close_cursor::close_cursor_for_connection_op;
 use super::odbc_types::{
     SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_ERROR, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
     SQL_TXN_READ_COMMITTED, SQL_TXN_READ_UNCOMMITTED, SQL_TXN_REPEATABLE_READ,
@@ -24,11 +24,13 @@ use super::odbc_types::{
 use super::sqlstate::{
     ERR_ATTRIBUTE_CANNOT_BE_SET_NOW, ERR_CONNECTION_BUSY, ERR_CONNECTION_DOES_NOT_EXIST,
     ERR_INVALID_ATTRIBUTE_VALUE, ERR_NO_ACTIVE_TDS_CLIENT, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED,
-    SQLSTATE_01000, SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED, post_diag, post_tds_error,
+    SQLSTATE_01000, SQLSTATE_08007, SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED, post_diag,
+    post_tds_error,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::DbcHandle;
 use crate::handles::dbc::ConnectionState;
+use crate::handles::{StmtHandle, handle_from_raw};
 
 /// Maps an ODBC `SQL_TXN_*` bit to the T-SQL clause msodbcsql emits for it
 /// (`sqlcstr.cpp:56-60`). `None` for any value outside the accepted set, which
@@ -117,8 +119,12 @@ pub(super) fn exec_batch(
 
 /// Closes every open cursor on the connection, mirroring msodbcsql's
 /// `SQLFreeStmt(SQL_CLOSE)` sweep in `CommitAbortTran` (`sqlctran.cpp:302-323`)
-/// and honoring the `SQL_CB_CLOSE` this driver advertises. Statements without an
-/// open cursor are untouched, so this is cheap in the common case.
+/// and honoring the `SQL_CB_CLOSE` this driver advertises.
+///
+/// Routes through [`close_cursor_for_connection_op`] rather than the public
+/// `SQLFreeStmt(SQL_CLOSE)`: this is a connection-scoped operation, so it must
+/// not clear the diagnostics belonging to child statement handles. Statements
+/// with no open cursor cost a single lock, which is the common case.
 ///
 /// Returns `SQL_ERROR` if any cursor could not be closed. Callers must not
 /// proceed in that case: a statement whose result stream did not drain leaves
@@ -141,8 +147,8 @@ pub(super) fn close_all_cursors(dbc: &DbcHandle) -> SqlReturn {
         // between the clone above and this call — the same handle-lifetime gap
         // `SQLDisconnect` documents (see the TODO in `disconnect.rs`), which
         // refcounted handles will close for the whole driver at once.
-        let ret = unsafe { sql_free_stmt_close(stmt_ptr) };
-        if ret == SQL_ERROR {
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_ptr) };
+        if close_cursor_for_connection_op(stmt, stmt_ptr) == SQL_ERROR {
             error!(?stmt_ptr, "close_all_cursors: could not close cursor");
             worst = SQL_ERROR;
         }
@@ -210,7 +216,12 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
 
     if let Err(e) = result {
         error!(%e, "{op}: transaction-manager request failed");
-        post_tds_error(&mut state, &e, SQLSTATE_HY000);
+        // 08007 is ODBC's specific state for "connection failure during
+        // transaction": the commit or rollback did not reach the server, so its
+        // outcome is unknown to the application. Neither 08007 nor HY000 puts
+        // the connection into the suspended state, so this is a strictly more
+        // precise diagnostic, not a behavioural change.
+        post_tds_error(&mut state, &e, SQLSTATE_08007);
         return SQL_ERROR;
     }
 
@@ -232,13 +243,18 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
 ///
 /// The transaction-manager request carries `NoChange` so it inherits the
 /// session isolation level already applied by `SET TRANSACTION ISOLATION LEVEL`.
+///
+/// This runs before every statement, so it is a hot path: both steady states
+/// (autocommit on, and manual-commit with a transaction already open and
+/// recorded) cost exactly one lock and no network round trip. The DBC lock is
+/// never held across the `begin_transaction` await.
 pub(super) fn begin_transaction_if_manual(
     dbc: &DbcHandle,
     client: &mut TdsClient,
     op: &str,
 ) -> Result<(), mssql_tds::error::Error> {
-    let autocommit = match dbc.inner.lock() {
-        Ok(state) => state.autocommit,
+    let (autocommit, already_recorded) = match dbc.inner.lock() {
+        Ok(state) => (state.autocommit, state.local_tran_started),
         Err(_) => {
             error!("{op}: dbc mutex poisoned reading autocommit");
             return Err(mssql_tds::error::Error::ImplementationError(
@@ -250,7 +266,13 @@ pub(super) fn begin_transaction_if_manual(
         return Ok(());
     }
 
-    if !client.has_active_transaction() {
+    if client.has_active_transaction() {
+        // Steady state: transaction already open and already recorded, so there
+        // is nothing to write back and no reason to retake the lock.
+        if already_recorded {
+            return Ok(());
+        }
+    } else {
         debug!("{op}: manual-commit mode with no active transaction — beginning one");
         dbc.runtime
             .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None))?;
@@ -377,6 +399,14 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
 /// Autocommit → manual-commit. Opens a transaction immediately so `@@TRANCOUNT`
 /// reflects the new mode without waiting for a statement (`sqlcconn.cpp:3692`).
 /// The transaction carries no user work yet, so `local_tran_started` stays false.
+///
+/// The eager begin is deliberate parity with msodbcsql rather than an
+/// optimization, and it is not free: it costs a round trip at the switch and
+/// leaves an empty transaction pinning the log and version store until the
+/// application commits, rolls back, or disconnects. On a pooled connection that
+/// can be the life of the pool entry. `sql_end_tran`, `set_txn_isolation` and
+/// `rollback_before_disconnect` all treat an open transaction with
+/// `local_tran_started == false` as empty and disposable for this reason.
 fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     if close_all_cursors(dbc) == SQL_ERROR {
         return fail_cursor_close(dbc, op);
@@ -407,7 +437,8 @@ fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     SQL_SUCCESS
 }
 
-/// Applies `SQL_ATTR_TXN_ISOLATION` (msodbcsql `sqlcmisc.cpp:1754-1827`).
+/// Applies `SQL_ATTR_TXN_ISOLATION` (msodbcsql `sqlcmisc.cpp:1754-1827`), and
+/// its vendor spelling `SQL_COPT_SS_TXN_ISOLATION`.
 pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
     const OP: &str = "SQLSetConnectAttrW(SQL_ATTR_TXN_ISOLATION)";
 
@@ -431,6 +462,15 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
             post_diag(&mut state, ERR_ATTRIBUTE_CANNOT_BE_SET_NOW);
             return SQL_ERROR;
         }
+        // Setting the level already in effect is a no-op, matching the
+        // same-value short-circuit `SetCommitModeOption` uses for autocommit
+        // (`sqlcmisc.cpp:1720`). Without this, an application that explicitly
+        // selects the default READ COMMITTED at startup would pay a cursor
+        // sweep and a round trip for nothing.
+        if level == Some(state.txn_isolation) {
+            debug!(value, "{OP}: already at this isolation level");
+            return SQL_SUCCESS;
+        }
         if state.connection_state != ConnectionState::Connected {
             state.txn_isolation = level.unwrap_or(SQL_TXN_READ_COMMITTED);
             debug!(value, "{OP}: stored for next connect");
@@ -446,7 +486,29 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         Ok(c) => c,
         Err(ret) => return ret,
     };
-    let result = exec_batch(dbc, &mut client, tsql);
+
+    // `local_tran_started` was false above, so any transaction open here was
+    // begun by the driver at the autocommit switch and carries no user work.
+    // SQL Server rejects SET TRANSACTION ISOLATION LEVEL SNAPSHOT inside an
+    // active transaction, so close the empty one, apply the change, and reopen
+    // it to preserve the manual-commit invariant that a transaction is always
+    // pending. Rolling back loses nothing because there is nothing in it.
+    let reopen = client.has_active_transaction();
+    let mut result = if reopen {
+        debug!("{OP}: rolling back empty driver-begun transaction to apply isolation");
+        dbc.runtime
+            .block_on(client.rollback_transaction(None, None))
+    } else {
+        Ok(())
+    };
+    if result.is_ok() {
+        result = exec_batch(dbc, &mut client, tsql);
+    }
+    if result.is_ok() && reopen {
+        result = dbc
+            .runtime
+            .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None));
+    }
     release_dbc_client(dbc, client);
 
     let Ok(mut state) = dbc.inner.lock() else {
@@ -600,5 +662,32 @@ mod tests {
         for level in [0, 3, 5, 0x10, 0x40, u32::MAX] {
             assert_eq!(txn_isolation_to_tsql(level), None, "level {level:#x}");
         }
+    }
+
+    #[test]
+    fn closing_cursors_preserves_statement_diagnostics() {
+        // ODBC clears diagnostics on the handle the function was called on. A
+        // connection-scoped operation must therefore leave child statement
+        // diagnostics alone, or an application that rolls back after a failed
+        // statement can no longer read why the statement failed.
+        use crate::test_support::TestHandles;
+        use crate::{error::HasDiagnostics, handles::StmtHandle};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut stmt_state = stmt.inner.lock().unwrap();
+            post_sql_error(&mut stmt_state, SQLSTATE_HY000, 0, "statement failed");
+            assert_eq!(stmt_state.diag_records().len(), 1);
+        }
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(close_all_cursors(dbc), SQL_SUCCESS);
+
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records().len(),
+            1,
+            "the cursor sweep must not clear diagnostics on child statements"
+        );
     }
 }

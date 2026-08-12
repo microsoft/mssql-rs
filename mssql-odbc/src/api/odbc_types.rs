@@ -78,13 +78,23 @@ pub const SQL_AUTOCOMMIT_OFF: u32 = 0;
 pub const SQL_AUTOCOMMIT_ON: u32 = 1;
 
 // `SQL_ATTR_TXN_ISOLATION` values. These are ODBC *bitmask* bits, distinct from
-// the dense TDS `TransactionIsolationLevel` bytes — see `txn_isolation_to_tds`.
+// the T-SQL `SET TRANSACTION ISOLATION LEVEL` text they map to — see
+// `txn::txn_isolation_to_tsql`.
 pub const SQL_TXN_READ_UNCOMMITTED: u32 = 0x0000_0001;
 pub const SQL_TXN_READ_COMMITTED: u32 = 0x0000_0002;
 pub const SQL_TXN_REPEATABLE_READ: u32 = 0x0000_0004;
 pub const SQL_TXN_SERIALIZABLE: u32 = 0x0000_0008;
 /// SQL Server extension (`msodbcsql.h:465`).
 pub const SQL_TXN_SS_SNAPSHOT: u32 = 0x0000_0020;
+
+/// SQL Server-specific connection attribute for isolation level
+/// (`msodbcsql.h:200`).
+///
+/// The Windows Driver Manager screens `SQL_ATTR_TXN_ISOLATION` against the four
+/// standard ODBC bits and rejects anything else with HY024 before the driver is
+/// ever called, so this vendor attribute is the only route by which an
+/// application can select `SQL_TXN_SS_SNAPSHOT`.
+pub const SQL_COPT_SS_TXN_ISOLATION: SqlInteger = 1227;
 
 // `SQLEndTran` completion types.
 pub const SQL_COMMIT: SqlSmallInt = 0;

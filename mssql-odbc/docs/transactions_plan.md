@@ -48,9 +48,17 @@ Accepts `READ UNCOMMITTED` / `READ COMMITTED` / `REPEATABLE READ` /
 Applied by emitting `SET TRANSACTION ISOLATION LEVEL <level>`
 (`sqlcstr.cpp:56-60`). Readable back via `SQLGetConnectAttr`.
 
-`SQL_TXN_SS_SNAPSHOT` is implemented for msodbcsql parity but is unreachable
-through the Windows Driver Manager, which screens the attribute value itself —
-see §7.1.
+`SQL_TXN_SS_SNAPSHOT` cannot be reached through `SQL_ATTR_TXN_ISOLATION` on
+Windows: the Driver Manager screens the attribute value itself (see §7.1). The
+driver therefore also accepts the vendor attribute `SQL_COPT_SS_TXN_ISOLATION`
+(1227), which the DM passes through untouched, so the SNAPSHOT level this driver
+advertises in `SQL_TXN_ISOLATION_OPTION` is actually selectable. Both spellings
+drive the same code path and are readable back through `SQLGetConnectAttr`.
+
+Setting the level already in effect is a no-op, mirroring the same-value
+short-circuit `SetCommitModeOption` uses for autocommit (`sqlcmisc.cpp:1720`), so
+an application that explicitly selects the default at startup does not pay a
+cursor sweep and a round trip.
 
 ### G4 — Transaction-safe disconnect
 
@@ -280,6 +288,11 @@ drivers unless guarded by `SKIP_IF_COMPARING_MSODBCSQL()`.
 | 24 | Rollback after server-side `BEGIN TRAN` in a proc | e2e |
 | 25 | All six `SQLGetInfo` values | unit + e2e |
 | 26 | `SQLGetFunctions` reports `SQL_API_SQLENDTRAN` and `SQL_API_SQLGETCONNECTATTR` | unit + e2e |
+| 27 | `SQLEndTran` on `SQL_HANDLE_ENV` skips connections that are not connected | unit + e2e |
+| 28 | `SQLEndTran` on `SQL_HANDLE_ENV` surfaces a failing connection's error | unit |
+| 29 | `SQLEndTran` leaves child statement diagnostics intact (§7.2) | unit + e2e |
+| 30 | `SQL_COPT_SS_TXN_ISOLATION` carries `SQL_TXN_SS_SNAPSHOT` and reads back | unit + e2e |
+| 31 | Setting the isolation level already in effect is a no-op | unit + e2e |
 
 ### 7.1 What the Driver Manager decides for us
 
@@ -292,8 +305,8 @@ the e2e tests assert the observable result rather than the driver's own answer:
   `SQL_TXN_SS_SNAPSHOT`, and including on msodbcsql. The driver's own `HYC00`
   (msodbcsql's answer in `SetTxnIsolation`, `sqlcmisc.cpp`) is therefore asserted
   by unit tests, which have no DM in the path. Applications reach SNAPSHOT
-  through `SQL_COPT_SS_TXN_ISOLATION` or `SET TRANSACTION ISOLATION LEVEL`, both
-  out of scope here.
+  through `SQL_COPT_SS_TXN_ISOLATION` (1227), which the DM passes through
+  untouched and which this driver implements for exactly that reason (G3).
 - **`SQL_CURSOR_COMMIT_BEHAVIOR` is cached by the DM.** msodbcsql answers
   `SQL_CB_PRESERVE` to the DM's first query (`sqlcinfo.cpp`) so the DM will not
   close cursors on its behalf; the DM then rejects the next statement with
@@ -302,3 +315,23 @@ the e2e tests assert the observable result rather than the driver's own answer:
   after a commit. The shared part — the cursor is gone and the commit persisted —
   is asserted on both drivers; the divergence lives in its own
   `SKIP_IF_COMPARING_MSODBCSQL()` test.
+
+### 7.2 Deliberate divergence: statement diagnostics survive `SQLEndTran`
+
+ODBC clears diagnostics on the handle a function was called on, so
+`SQLEndTran(SQL_HANDLE_DBC, …)` should clear the *connection's* records and leave
+its statements' records alone. msodbcsql does not: its commit path sweeps child
+cursors through `SQLFreeStmt(SQL_CLOSE)`, and that clears each statement's
+diagnostics as a side effect. An application whose statement fails and which then
+rolls back before reading `SQLGetDiagRec` gets `SQL_NO_DATA` and can no longer
+report why it failed.
+
+mssql-odbc closes those cursors through an internal path that does not touch
+statement diagnostics (`close_cursor_for_connection_op`), so the records survive.
+This is strictly more useful and cannot break an application that does not look,
+so it is kept rather than matched. The e2e assertion is
+`SKIP_IF_COMPARING_MSODBCSQL()`; the unit test
+`txn::tests::closing_cursors_preserves_statement_diagnostics` guards it.
+
+The same path is what keeps the per-statement sweep cheap: statements with no
+open cursor return after a single lock, with no FFI entry and no drain.

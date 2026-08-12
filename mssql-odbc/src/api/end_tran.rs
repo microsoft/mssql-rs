@@ -12,6 +12,7 @@ use super::odbc_types::{
 use super::sqlstate::{ERR_INVALID_TRANSACTION_OPERATION_CODE, post_diag};
 use super::txn::end_transaction;
 use crate::error::free_errors;
+use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, EnvHandle, HandleType, handle_from_raw};
 
 /// Implementation of `SQLEndTran`.
@@ -126,9 +127,31 @@ unsafe fn sql_end_tran_env_safe(env: &EnvHandle, completion_type: SqlSmallInt) -
         // documents (see the TODO in `disconnect.rs`), which refcounted handles
         // will close for the whole driver at once.
         let dbc = unsafe { handle_from_raw::<DbcHandle>(dbc_ptr) };
+
+        // SQLEndTran: "the driver will attempt to commit or roll back
+        // transactions ... on all connections that are in a connected state on
+        // that environment. Connections that are not active do not affect the
+        // transaction." Without this, one allocated-but-unconnected DBC would
+        // post 08003 and fail the whole environment-wide commit.
+        let connected = matches!(
+            dbc.inner.lock().map(|state| state.connection_state),
+            Ok(ConnectionState::Connected)
+        );
+        if !connected {
+            debug!(
+                ?dbc_ptr,
+                "SQLEndTran: skipping connection that is not active"
+            );
+            continue;
+        }
+
         let ret = sql_end_tran_dbc_safe(dbc, completion_type);
-        // msodbcsql `PromoteRetcode`: the worst outcome wins.
-        if ret != SQL_SUCCESS {
+        // msodbcsql `PromoteRetcode`: the worst outcome wins. SQL_ERROR on any
+        // connection must survive a later SQL_SUCCESS_WITH_INFO, otherwise a
+        // failed commit is reported to the app as a warning.
+        if ret == SQL_ERROR {
+            worst = SQL_ERROR;
+        } else if ret != SQL_SUCCESS && worst == SQL_SUCCESS {
             worst = ret;
         }
     }
@@ -205,13 +228,33 @@ mod tests {
     }
 
     #[test]
-    fn end_tran_on_env_promotes_worst_return_code() {
-        // The child DBC is left disconnected, so its leg fails with 08003 and
-        // the fan-out must surface SQL_ERROR rather than the initial SUCCESS.
+    fn end_tran_on_env_skips_connections_that_are_not_active() {
+        // SQLEndTran: "Connections that are not active do not affect the
+        // transaction." The child DBC is allocated but never connected, so the
+        // fan-out must skip it rather than failing the whole environment with
+        // 08003.
         let h = TestHandles::with_env_dbc();
         let ret = unsafe { sql_end_tran(SQL_HANDLE_ENV, h.env, SQL_COMMIT) };
+        assert_eq!(ret, SQL_SUCCESS);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(
+            dbc.inner.lock().unwrap().diag_records().is_empty(),
+            "a skipped connection must not be given a diagnostic"
+        );
+    }
+
+    #[test]
+    fn end_tran_on_env_surfaces_failure_from_an_active_connection() {
+        // Marked connected with a transaction recorded, but with no TDS client,
+        // so its leg genuinely fails and the environment-wide result must be
+        // SQL_ERROR rather than the initial SUCCESS.
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().local_tran_started = true;
+        let ret = unsafe { sql_end_tran(SQL_HANDLE_ENV, h.env, SQL_COMMIT) };
         assert_eq!(ret, SQL_ERROR);
-        assert_eq!(&dbc_state(h.dbc), b"08003");
+        dbc.inner.lock().unwrap().local_tran_started = false;
     }
 
     #[test]

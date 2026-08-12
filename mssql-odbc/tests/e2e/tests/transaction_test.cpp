@@ -18,6 +18,14 @@
 #define SQL_TXN_SS_SNAPSHOT 0x00000020L
 #endif
 
+// SQL Server's vendor isolation attribute, also from msodbcsql.h. This is the
+// only route to SNAPSHOT: the Driver Manager screens SQL_ATTR_TXN_ISOLATION
+// against the four standard ODBC bits and rejects anything else with HY024
+// before the driver is called.
+#ifndef SQL_COPT_SS_TXN_ISOLATION
+#define SQL_COPT_SS_TXN_ISOLATION 1227
+#endif
+
 // ===================================================================
 // Tests that don't need a server connection
 // ===================================================================
@@ -263,6 +271,81 @@ TEST_F(TransactionLiveTest, EndTranOnEnvironmentFansOutToConnections) {
     ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_ENV, env_, SQL_COMMIT), SQL_HANDLE_ENV, env_);
     ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK), SQL_HANDLE_DBC, dbc_);
     EXPECT_EQ(1, RowCountOf("#env_t"));
+}
+
+// A connection allocated but never connected takes no part in an
+// environment-wide transaction. SQLEndTran: "Connections that are not active do
+// not affect the transaction."
+TEST_F(TransactionLiveTest, EndTranOnEnvironmentSkipsUnconnectedConnections) {
+    SQLHDBC spare = SQL_NULL_HDBC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &spare), SQL_HANDLE_ENV, env_);
+    ASSERT_NE(nullptr, spare);
+
+    Exec("CREATE TABLE #env_skip_t(i int)");
+    ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
+    Exec("INSERT INTO #env_skip_t VALUES (1)");
+
+    // The spare connection must be skipped rather than failing the fan-out.
+    EXPECT_SQL_OK(SQLEndTran(SQL_HANDLE_ENV, env_, SQL_COMMIT), SQL_HANDLE_ENV, env_);
+    EXPECT_EQ(1, RowCountOf("#env_skip_t"));
+
+    SQLFreeHandle(SQL_HANDLE_DBC, spare);
+}
+
+// ODBC clears diagnostics on the handle a function was called on. SQLEndTran
+// against a connection must therefore leave its statements' diagnostics intact,
+// so an application that rolls back after a failure can still report why.
+//
+// Deliberate divergence from msodbcsql, which fails this assertion: its
+// SQLEndTran sweeps child cursors through SQLFreeStmt(SQL_CLOSE), and that
+// clears each statement's diagnostic records as a side effect. Preserving them
+// is strictly more useful to applications and cannot break one that does not
+// look, so mssql-odbc keeps the records. See the unit test
+// `txn::tests::closing_cursors_preserves_statement_diagnostics`.
+TEST_F(TransactionLiveTest, EndTranPreservesStatementDiagnostics) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
+
+    SQLRETURN rc = Run(stmt_, "SELECT * FROM this_table_does_not_exist_xyz");
+    ASSERT_EQ(SQL_ERROR, rc) << "the statement was expected to fail";
+
+    ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK), SQL_HANDLE_DBC, dbc_);
+
+    SQLTCHAR state[6] = {};
+    SQLINTEGER native = 0;
+    SQLTCHAR message[1024] = {};
+    SQLSMALLINT length = 0;
+    rc = SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native, message,
+                       static_cast<SQLSMALLINT>(std::size(message)), &length);
+    EXPECT_NE(SQL_NO_DATA, rc)
+        << "the rollback erased the statement's diagnostic record; the application "
+           "can no longer discover why its statement failed";
+}
+
+// The vendor isolation attribute is accepted and reads back, including SNAPSHOT
+// — the level no application can reach through SQL_ATTR_TXN_ISOLATION.
+TEST_F(TransactionLiveTest, VendorIsolationAttributeCarriesSnapshot) {
+    SQLRETURN rc = SQLSetConnectAttr(
+        dbc_, SQL_COPT_SS_TXN_ISOLATION,
+        reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(SQL_TXN_SS_SNAPSHOT)), SQL_IS_UINTEGER);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_DBC, dbc_);
+
+    SQLUINTEGER value = 0xDEAD;
+    rc = SQLGetConnectAttr(dbc_, SQL_COPT_SS_TXN_ISOLATION, &value, SQL_IS_UINTEGER, nullptr);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_TXN_SS_SNAPSHOT), value);
+
+    // Restore the default so teardown and any later test start clean.
+    SQLSetConnectAttr(dbc_, SQL_COPT_SS_TXN_ISOLATION,
+                      reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(SQL_TXN_READ_COMMITTED)),
+                      SQL_IS_UINTEGER);
+}
+
+// Selecting the level already in effect is accepted and changes nothing.
+TEST_F(TransactionLiveTest, SettingCurrentIsolationLevelAgainSucceeds) {
+    ASSERT_EQ(static_cast<SQLUINTEGER>(SQL_TXN_READ_COMMITTED), GetIsolation(dbc_));
+    ASSERT_SQL_OK(SetIsolation(dbc_, SQL_TXN_READ_COMMITTED), SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_TXN_READ_COMMITTED), GetIsolation(dbc_));
 }
 
 // One transaction spans however many statements the application runs.

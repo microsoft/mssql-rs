@@ -128,6 +128,40 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
     }
 }
 
+/// Closes the cursor on a statement as part of a *connection*-scoped operation
+/// (`SQLEndTran`, an autocommit switch, an isolation change, disconnect).
+///
+/// Deliberately not routed through the public `SQLFreeStmt(SQL_CLOSE)` entry
+/// point. ODBC clears diagnostics on the handle the function was called on, so a
+/// `SQLEndTran` against a DBC must leave every child STMT's diagnostics intact —
+/// an application whose statement failed and which then rolls back before
+/// reading `SQLGetDiagRec` must still find its error. Going through
+/// `SQLFreeStmt(SQL_CLOSE)` would call [`free_errors`] on every statement and
+/// erase exactly that record.
+///
+/// Statements with no open cursor return immediately, before any drain work, so
+/// the common case costs one lock and nothing else.
+pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandle) -> SqlReturn {
+    {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("close_cursor_for_connection_op: stmt mutex poisoned");
+            return SQL_ERROR;
+        };
+        if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
+            return SQL_SUCCESS;
+        }
+        reset_cursor_state(&mut stmt_state);
+    }
+
+    match drain_and_release(stmt, handle) {
+        DrainOutcome::Failed => {
+            error!("close_cursor_for_connection_op: failed to drain TDS stream");
+            SQL_ERROR
+        }
+        DrainOutcome::InfoPosted | DrainOutcome::Clean => SQL_SUCCESS,
+    }
+}
+
 /// Resets cursor state on the statement (cursor is no longer open, metadata cleared).
 pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
     stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);

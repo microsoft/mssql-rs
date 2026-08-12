@@ -15,8 +15,9 @@ use tracing::{debug, error};
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT,
-    SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_ERROR,
-    SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
+    SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
+    SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
@@ -116,7 +117,8 @@ fn sql_get_connect_attr_w_safe(
         | SQL_ATTR_CONNECTION_TIMEOUT
         | SQL_ATTR_PACKET_SIZE
         | SQL_ATTR_AUTOCOMMIT
-        | SQL_ATTR_TXN_ISOLATION => {
+        | SQL_ATTR_TXN_ISOLATION
+        | SQL_COPT_SS_TXN_ISOLATION => {
             if value_ptr.is_null() {
                 error!(attribute, "SQLGetConnectAttrW: value pointer is null");
                 post_diag(&mut state, ERR_INVALID_NULL_POINTER);
@@ -135,7 +137,7 @@ fn sql_get_connect_attr_w_safe(
                         SQL_AUTOCOMMIT_OFF
                     }
                 }
-                SQL_ATTR_TXN_ISOLATION => state.txn_isolation,
+                SQL_ATTR_TXN_ISOLATION | SQL_COPT_SS_TXN_ISOLATION => state.txn_isolation,
                 _ => state.packet_size,
             };
             unsafe { write_if_some(value_ptr as *mut u32, value) };
