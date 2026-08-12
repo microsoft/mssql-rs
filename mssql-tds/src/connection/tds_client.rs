@@ -3038,9 +3038,8 @@ impl TdsClient {
     ///
     /// After this returns `true`, individual columns are pulled with
     /// [`read_row_column`](Self::read_row_column). Any previously positioned row
-    /// is drained first without materializing column values. That drain is
-    /// allocation-free unless it abandons a partially read PLP column, which
-    /// allocates a single scratch buffer to skip the remaining bytes.
+    /// is drained first; its remaining column bytes are read and discarded rather
+    /// than returned to the caller.
     #[instrument(skip(self), level = "info")]
     pub async fn next_row_cursor(&mut self) -> TdsResult<bool> {
         if self.current_metadata.is_none() {
