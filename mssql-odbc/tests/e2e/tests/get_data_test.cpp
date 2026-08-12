@@ -750,10 +750,17 @@ TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAsciiRoundTrip) {
 // the wire (two UTF-16 code units) and F0 9F 98 80 in UTF-8 (four bytes). With a
 // 16-byte SQL_C_CHAR buffer the transcode reads an odd number of code units per
 // chunk, so a high surrogate is left without its low half at the boundary; the
-// driver must carry it to the next chunk rather than emit U+FFFD. Any framing or
-// surrogate-carry defect shows up as replacement characters (EF BF BD) or a
-// wrong byte count. Codepage-neutral by construction, so it runs on both legs.
+// driver must carry it to the next chunk rather than emit U+FFFD.
+//
+// This asserts mssql-odbc-specific behavior and is skipped on the msodbcsql
+// comparison leg: mssql-odbc delivers SQL_C_CHAR as UTF-8 (the emoji round-trips
+// as F0 9F 98 80), whereas msodbcsql on Windows converts SQL_C_CHAR to the
+// client's ANSI codepage, where U+1F600 has no representation and best-fits to
+// '?'. On Linux msodbcsql also delivers UTF-8, so the two agree there; the
+// divergence is Windows-only. This is the same intentional UTF-8-vs-ANSI
+// SQL_C_CHAR difference already documented for other tests in this file.
 TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAstralRoundTrip) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     const std::string emoji = "\xF0\x9F\x98\x80";       // U+1F600, 4 UTF-8 bytes
     const std::string expected = RepeatToken(emoji, 500);  // 2000 bytes
     ASSERT_SQL_OK(
@@ -817,21 +824,62 @@ TEST_F(GetDataLiveTest, PlpZeroCapacityBufferDoesNotSpin) {
     SQLCloseCursor(stmt_);
 }
 
-// A non-PLP column whose type has no character conversion (e.g. DATETIME) must
-// fail with HYC00 and leave the column readable, so a retry with a compatible C
-// type still works. The reference msodbcsql driver converts DATETIME to
-// character data, so the HYC00 assertion is mssql-odbc-specific.
+// An integer column delivered to its natural fixed-width C target, rather than
+// being rendered as text.
+TEST_F(GetDataLiveTest, IntColumnToSlongTarget) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(-2000000 AS INT) AS c1"), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER value = 0;
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-2000000, value);
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), ind);
+
+    SQLCloseCursor(stmt_);
+}
+
+// DATETIME2(7) into SQL_C_TYPE_TIMESTAMP. The fractional field is the guard
+// against a units mismatch in the wire value (it is carried in 100 ns ticks, not
+// nanoseconds), which no unit test that builds SqlTime by hand can catch.
+TEST_F(GetDataLiveTest, Datetime2ToTimestampTargetKeepsFraction) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST('2023-06-15 12:34:56.1234567' AS DATETIME2(7)) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQL_TIMESTAMP_STRUCT ts{};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_TYPE_TIMESTAMP, &ts, sizeof(ts), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2023, ts.year);
+    EXPECT_EQ(6, ts.month);
+    EXPECT_EQ(15, ts.day);
+    EXPECT_EQ(12, ts.hour);
+    EXPECT_EQ(34, ts.minute);
+    EXPECT_EQ(56, ts.second);
+    EXPECT_EQ(123456700u, ts.fraction);
+
+    SQLCloseCursor(stmt_);
+}
+
+// A non-PLP column whose type has no character conversion (e.g. a short
+// VARBINARY) must fail with HYC00 and leave the column readable, so a retry with
+// a compatible C type still works. The reference msodbcsql driver renders binary
+// as hex, so the HYC00 assertion is mssql-odbc-specific.
 //
-// Maintenance note: this relies on DATETIME having no column_value_to_text arm.
-// Once DATETIME becomes convertible the first SQLGetData will succeed and this
-// test will pass for the wrong reason (no HYC00 reached). At that point re-point
-// it at whatever column type is still unconvertible, or assert the recovery via
-// the target-type HYC00 path (an unsupported SQL_C target) with a type that will
-// stay unsupported.
+// Maintenance note: this relies on the column type having no
+// column_value_to_text arm. It was originally anchored on DATETIME, which became
+// convertible when the typed conversion core landed; binary is the remaining
+// non-PLP type with no character rendering. If binary→hex is ever implemented,
+// re-point this again, or assert the recovery via the target-type HYC00 path (an
+// unsupported SQL_C target) with a type that will stay unsupported.
 TEST_F(GetDataLiveTest, UnsupportedColumnTypeHyc00PreservesValue) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(
-        ExecDirect("SELECT CAST('2020-01-02T03:04:05' AS DATETIME) AS c1"),
+        ExecDirect("SELECT CAST(0x4142434445464748 AS VARBINARY(8)) AS c1"),
         SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 

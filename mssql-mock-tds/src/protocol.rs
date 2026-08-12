@@ -818,9 +818,53 @@ pub fn build_info_token(info: &crate::query_response::InfoMessage) -> BytesMut {
     buf
 }
 
+/// Build a raw ERROR token (0xAA) followed by a DONE token carrying the MORE
+/// and ERROR flags. Models a statement-scoped error inside a multi-statement
+/// batch: the batch is not aborted, so the server keeps streaming afterward.
+/// The returned bytes are raw tokens (no packet wrapper).
+pub fn build_leading_error_tokens(error: &crate::query_response::LeadingError) -> BytesMut {
+    let mut buf = BytesMut::new();
+
+    buf.put_u8(TokenType::Error as u8);
+    let length_pos = buf.len();
+    buf.put_u16_le(0); // placeholder for token length
+
+    buf.put_u32_le(error.number);
+    buf.put_u8(1); // state
+    buf.put_u8(error.severity);
+
+    let message_utf16: Vec<u16> = error.message.encode_utf16().collect();
+    buf.put_u16_le(message_utf16.len() as u16);
+    for ch in message_utf16 {
+        buf.put_u16_le(ch);
+    }
+
+    buf.put_u8(0); // server name (empty)
+    buf.put_u8(0); // procedure name (empty)
+    buf.put_u32_le(1); // line number
+
+    let token_length = (buf.len() - length_pos - 2) as u16;
+    let mut length_bytes = &mut buf[length_pos..length_pos + 2];
+    length_bytes.put_u16_le(token_length);
+
+    // DONE with DONE_MORE (0x01) | DONE_ERROR (0x02): the batch continues.
+    buf.put_u8(TokenType::Done as u8);
+    buf.put_u16_le(0x0003);
+    buf.put_u16_le(0x00C1); // CurCmd: SELECT
+    buf.put_u64_le(0); // row count
+
+    buf
+}
+
 /// Build a query result from a QueryResponse
 pub fn build_query_result(response: &crate::query_response::QueryResponse) -> BytesMut {
     let mut result = BytesMut::new();
+
+    // A statement-scoped error preceding the result set: emit the ERROR token
+    // and its DONE (MORE) before the ColMetadata so the row set still streams.
+    if let Some(leading_error) = &response.leading_error {
+        result.extend_from_slice(&build_leading_error_tokens(leading_error));
+    }
 
     // ColMetadata token (0x81)
     result.put_u8(TokenType::ColMetadata as u8);
@@ -1233,5 +1277,48 @@ mod tests {
         // An unrecognized request type yields just a Done token (no EnvChange).
         let tokens = build_transaction_manager_response(0);
         assert_eq!(tokens[0], TokenType::Done as u8);
+    }
+
+    #[test]
+    fn test_build_leading_error_tokens_layout() {
+        use crate::query_response::LeadingError;
+        let tokens = build_leading_error_tokens(&LeadingError::new(1222, 16, "lock timeout"));
+
+        // Starts with an ERROR token carrying the supplied error number.
+        assert_eq!(tokens[0], TokenType::Error as u8);
+        let number = u32::from_le_bytes([tokens[3], tokens[4], tokens[5], tokens[6]]);
+        assert_eq!(number, 1222);
+
+        // Ends with a DONE token whose status carries DONE_MORE | DONE_ERROR,
+        // signalling the batch continues after the statement-scoped error.
+        let done_pos = tokens.len() - 13;
+        assert_eq!(tokens[done_pos], TokenType::Done as u8);
+        let status = u16::from_le_bytes([tokens[done_pos + 1], tokens[done_pos + 2]]);
+        assert_eq!(status, 0x0003);
+    }
+
+    #[test]
+    fn test_build_query_result_prepends_leading_error() {
+        use crate::query_response::{
+            ColumnDefinition, ColumnValue, LeadingError, QueryResponse, Row, SqlDataType,
+        };
+        let response = QueryResponse::new(
+            vec![ColumnDefinition::new("id", SqlDataType::Int)],
+            vec![Row::new(vec![ColumnValue::Int(10)])],
+        )
+        .with_leading_error(LeadingError::new(1222, 16, "lock timeout"));
+
+        let with_error = build_query_result(&response);
+        // First token after the packet header is the ERROR token, not ColMetadata.
+        assert_eq!(with_error[PACKET_HEADER_SIZE], TokenType::Error as u8);
+
+        // Without a leading error the same response starts with ColMetadata.
+        let mut plain = response.clone();
+        plain.leading_error = None;
+        let without_error = build_query_result(&plain);
+        assert_eq!(
+            without_error[PACKET_HEADER_SIZE],
+            TokenType::ColMetadata as u8
+        );
     }
 }

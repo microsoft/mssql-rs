@@ -45,6 +45,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   fired via `fire_triggers`) remain retrievable via `info_messages()` after the
   operation completes. On a mid-stream failure the completed batches' INFO is
   preserved and remains retrievable alongside the returned error.
+- `mssql-tds`: `BulkCopyResult::rows_affected` now reports the number of rows the
+  client serialized to the wire (matching `SqlBulkCopy.RowsCopied`) instead of the
+  server's `DONE_COUNT`. Fixes a doubled count on distributed engines that
+  acknowledge one load with multiple `DONE_COUNT` tokens (issue #209).
 
 ### Removed
 
@@ -55,3 +59,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   binding (`mssql-odbc` and `mssql-py-core`); `mssql-tds` retains only the
   `TdsAuthenticationMethod` seam and takes (or asks for) a token for the
   federated-auth flows.
+
+### Fixed
+
+- `mssql-tds`: reading a fixed-width value that straddles a TDS packet boundary
+  could return bytes from the wrong place or panic. The readers checked for
+  sufficient buffered data with an `if` and read a single further packet, but a
+  value can span more than two packets (and a packet can carry fewer bytes than
+  the value needs), so the read proceeded against a still-short buffer. The
+  check is now a loop that reads until the whole value is buffered. Affects all
+  13 fixed-width readers on `TdsPacketReader`.
+
+- `mssql-tds`: `read_varchar_u8_length` truncated strings of 128 characters or
+  more, and `read_varchar_u16_length` strings of 32768 or more. The character
+  count was doubled to a byte count *before* being widened to `usize`
+  (`(length << 1) as usize`), so the shift overflowed the narrow type and
+  silently wrapped — a 200-character string asked for 144 bytes. The widening
+  now happens first (`(length as usize) << 1`).
+
+- `mssql-tds`: a payload-free TDS packet without the end-of-message flag is now
+  rejected as a protocol error. Such a packet is malformed — it neither carries
+  payload nor terminates a message — but was previously consumed as a
+  zero-length packet. Empty end-of-message packets remain legal.
+

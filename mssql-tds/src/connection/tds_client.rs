@@ -39,7 +39,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     core::{CancelHandle, TdsResult},
@@ -935,7 +935,12 @@ impl TdsClient {
     ///
     /// # Returns
     ///
-    /// Returns the number of rows actually inserted by SQL Server.
+    /// Returns the number of rows this client serialized to the wire, matching
+    /// `Microsoft.Data.SqlClient`'s `SqlBulkCopy.RowsCopied` semantics. This is
+    /// a client-side count, not the server's DONE token row count, so it is not
+    /// affected by distributed engines that acknowledge one load with multiple
+    /// DONE_COUNT tokens (issue #209). It also does not reflect server-side row
+    /// count changes from triggers on the destination table.
     #[instrument(skip(self, rows), level = "info")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_bulk_load_streaming_zerocopy<R>(
@@ -1103,16 +1108,22 @@ impl TdsClient {
         }
 
         // STEP 4: End streaming (write DONE token and finalize)
-        let _rows_written = writer.end().await?;
+        let rows_written = writer.end().await?;
 
-        // STEP 5: Read the final response with row count
-        let rows_affected = self.consume_done_token().await?;
+        // STEP 5: Drain the server response for error handling and INFO capture.
+        // Its returned count is informational only; callers receive the client-side
+        // `rows_written` (see the `# Returns` doc and `consume_done_token`).
+        self.consume_done_token().await?;
 
-        Ok(rows_affected)
+        Ok(rows_written)
     }
 
     /// Consumes response tokens until a DONE token is received.
-    /// Returns the row count from the DONE token.
+    ///
+    /// Returns the last counted DONE row count. This value is currently
+    /// informational: both call sites discard it, and the bulk-load path reports
+    /// the client-side rows written instead (issue #209). It is retained for
+    /// error/INFO draining and as defensive last-DONE_COUNT-wins hardening.
     ///
     /// This helper method implements the standard TDS response consumption pattern,
     /// handling INFO, ERROR, and DONE tokens appropriately.
@@ -1144,8 +1155,12 @@ impl TdsClient {
                         ));
                     }
 
-                    // Accumulate row count from multiple DONE tokens
-                    rows_affected += done.row_count;
+                    // Distributed engines send multiple DONE_COUNT tokens each
+                    // carrying the full count; summing them double-counts (#209).
+                    // Last counted DONE wins.
+                    if done.has_count() {
+                        rows_affected = done.row_count;
+                    }
 
                     // Stop when we receive a DONE token without the MORE flag
                     if !done.has_more() {
@@ -1194,7 +1209,8 @@ impl TdsClient {
     /// Sends a SQL batch and consumes the response without expecting column metadata.
     /// This is used for commands that don't return result sets (DML statements, etc.).
     ///
-    /// Returns the row count from the DONE token.
+    /// Returns the DONE token row count. Its only caller (the INSERT BULK preamble)
+    /// discards it; see `consume_done_token` for why the count is informational.
     async fn send_batch_and_consume_response(
         &mut self,
         sql_command: String,
@@ -2173,14 +2189,31 @@ impl TdsClient {
 
     /// Drains all remaining tokens from the stream until a terminal DONE token.
     /// Collects any ERROR tokens encountered and returns them.
+    ///
+    /// A statement-scoped error (for example lock timeout 1222) does not abort
+    /// the batch, so the server keeps streaming any result sets that follow it.
+    /// A trailing row-returning result set must therefore be consumed through
+    /// the row-decoding path: ROW/NBCROW tokens carry no length prefix and can
+    /// only be parsed with the preceding COLMETADATA in the parser context.
+    /// Skipping that step would leave unparsed row bytes in the transport and
+    /// corrupt the connection for reuse.
     pub(in crate::connection) async fn drain_stream(&mut self) -> TdsResult<Vec<SqlErrorInfo>> {
         let mut collected_errors: Vec<SqlErrorInfo> = Vec::new();
+        // A COLMETADATA reached at the top level of the drain must be parsed with
+        // the same Always Encrypted awareness as advance_to_result_boundary: when
+        // column encryption is negotiated the token carries a CEK-table prefix
+        // (empty or not) before the first column, and reading it with
+        // ParserContext::None would misinterpret those bytes and desynchronize the
+        // stream — the very corruption this drain exists to prevent.
+        let parser_context = ParserContext::ColumnEncryption(
+            self.negotiated_settings.is_column_encryption_supported(),
+        );
         loop {
             let start = Instant::now();
             let token = self
                 .transport
                 .receive_token(
-                    &ParserContext::None(()),
+                    &parser_context,
                     self.remaining_request_timeout,
                     self.cancel_handle.as_ref(),
                 )
@@ -2198,39 +2231,127 @@ impl TdsClient {
                         break;
                     }
                 }
-                Tokens::Error(error_token) => {
-                    info!(?error_token, "Draining ERROR token from stream");
-                    collected_errors.push(SqlErrorInfo::from(&error_token));
-                }
-                Tokens::Info(info_token) => {
-                    info!(?info_token, "Draining INFO token from stream");
-                    self.capture_info_message(&info_token);
-                }
-                Tokens::EnvChange(t1) => {
-                    if t1.sub_type == EnvChangeTokenSubType::ResetConnection {
-                        self.recovery_context.session_state_table.reset();
+                Tokens::ColMetadata(colmetadata) => {
+                    // A row-returning result set began. Consume its rows via the
+                    // row-decoding path; the trailing DONE tells us whether the
+                    // batch continues.
+                    let batch_ended = self
+                        .drain_result_set_rows(Arc::new(colmetadata), &mut collected_errors)
+                        .await?;
+                    if batch_ended {
+                        break;
                     }
-                    self.execution_context
-                        .capture_change_property(&t1, &mut self.negotiated_settings)?;
                 }
-                Tokens::SessionState(session_state) => {
-                    self.recovery_context
-                        .process_session_state(&session_state)?;
-                }
-                Tokens::ReturnValue(return_value_token) => {
-                    let return_value = self.finalize_return_value(return_value_token)?;
-                    self.push_return_value(return_value);
-                }
-                Tokens::ReturnStatus(return_status) => {
-                    self.last_return_status = ReturnStatus::Received(return_status.value);
-                    info!(?return_status);
-                }
-                _ => {
-                    info!(?token);
-                }
+                other => self.apply_drain_side_effect(other, &mut collected_errors)?,
             }
         }
         Ok(collected_errors)
+    }
+
+    /// Consumes every ROW/NBCROW token of one result set (given its
+    /// `metadata`), discarding the decoded values, and returns `true` when the
+    /// result set's DONE token terminates the batch (no MORE flag).
+    ///
+    /// Rows are read with [`ColumnPolicy::SkipAll`] into a [`DiscardRowWriter`],
+    /// so `receive_row_into` fully consumes each row — including PLP payloads —
+    /// without materializing any column and never yields a pause result here.
+    async fn drain_result_set_rows(
+        &mut self,
+        metadata: Arc<ColMetadataToken>,
+        collected_errors: &mut Vec<SqlErrorInfo>,
+    ) -> TdsResult<bool> {
+        // Rows are skipped, so no cell decryptor is resolved: encrypted columns
+        // are consumed as raw ciphertext bytes without decoding. Resolving a
+        // decryptor here would add key-store round trips and decryption
+        // failures — any of which returns `Err` and would mask the SQL error
+        // that this drain exists to surface — and would overwrite
+        // `self.current_decryptor` with a discarded set's metadata.
+        let parser_context = ParserContext::ColumnMetadata(metadata, None);
+        let mut discarded_rows: u64 = 0;
+        loop {
+            let start = Instant::now();
+            let mut writer = DiscardRowWriter;
+            let result = self
+                .transport
+                .receive_row_into(
+                    &parser_context,
+                    self.remaining_request_timeout,
+                    self.cancel_handle.as_ref(),
+                    ColumnPolicy::SkipAll,
+                    &mut writer,
+                )
+                .await?;
+            self.update_remaining_timeout(start);
+
+            match result {
+                RowReadResult::RowWritten => {
+                    discarded_rows += 1;
+                }
+                RowReadResult::RowPaused(_) | RowReadResult::PlpPaused(_) => {
+                    return Err(crate::error::Error::ProtocolError(
+                        "Row read paused while draining a result set; the drain writer never requests a pause".to_string(),
+                    ));
+                }
+                RowReadResult::Token(token) => match token {
+                    Tokens::Done(done) | Tokens::DoneProc(done) | Tokens::DoneInProc(done) => {
+                        info!(
+                            ?done,
+                            discarded_rows, "Draining DONE token ending result set"
+                        );
+                        return Ok(!done.has_more());
+                    }
+                    Tokens::ColMetadata(_) => {
+                        return Err(crate::error::Error::ProtocolError(
+                            "Unexpected COLMETADATA token before the previous result set's DONE while draining".to_string(),
+                        ));
+                    }
+                    other => self.apply_drain_side_effect(other, collected_errors)?,
+                },
+            }
+        }
+    }
+
+    /// Applies the side effects of a non-terminal control token seen while
+    /// draining. DONE and COLMETADATA are handled by the callers because they
+    /// steer the drain loop; everything else is either recorded or skipped.
+    fn apply_drain_side_effect(
+        &mut self,
+        token: Tokens,
+        collected_errors: &mut Vec<SqlErrorInfo>,
+    ) -> TdsResult<()> {
+        match token {
+            Tokens::Error(error_token) => {
+                info!(?error_token, "Draining ERROR token from stream");
+                collected_errors.push(SqlErrorInfo::from(&error_token));
+            }
+            Tokens::Info(info_token) => {
+                info!(?info_token, "Draining INFO token from stream");
+                self.capture_info_message(&info_token);
+            }
+            Tokens::EnvChange(t1) => {
+                if t1.sub_type == EnvChangeTokenSubType::ResetConnection {
+                    self.recovery_context.session_state_table.reset();
+                }
+                self.execution_context
+                    .capture_change_property(&t1, &mut self.negotiated_settings)?;
+            }
+            Tokens::SessionState(session_state) => {
+                self.recovery_context
+                    .process_session_state(&session_state)?;
+            }
+            Tokens::ReturnValue(return_value_token) => {
+                let return_value = self.finalize_return_value(return_value_token)?;
+                self.push_return_value(return_value);
+            }
+            Tokens::ReturnStatus(return_status) => {
+                self.last_return_status = ReturnStatus::Received(return_status.value);
+                info!(?return_status);
+            }
+            other => {
+                info!(?other);
+            }
+        }
+        Ok(())
     }
 
     /// Reads tokens up to the next result boundary in the response stream.
@@ -2406,9 +2527,21 @@ impl TdsClient {
                 Tokens::Error(error_token) => {
                     info!(?error_token);
                     let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
-                    let mut drain_errors = self.drain_stream().await?;
-                    all_errors.append(&mut drain_errors);
+                    let drain_result = self.drain_stream().await;
+                    // Reset batch state before propagating: the error terminates
+                    // the batch regardless of whether the drain fully consumed
+                    // it, so a subsequent `next_row` / `advance` must not pass
+                    // the `maybe_has_unread_rows` guard and read a stream we have
+                    // given up on (mirrors `handle_row_read_token`).
                     self.execution_context.set_has_open_batch(false);
+                    self.current_result_set_has_been_read_till_end = true;
+                    self.current_metadata = None;
+                    match drain_result {
+                        Ok(mut drain_errors) => all_errors.append(&mut drain_errors),
+                        Err(e) => {
+                            warn!(error = ?e, "Drain after statement error failed; connection may not be reusable");
+                        }
+                    }
                     return Err(crate::error::Error::from_sql_errors(all_errors));
                 }
                 Tokens::Info(info_token) => {
@@ -3751,15 +3884,20 @@ impl TdsClient {
             Tokens::Error(error_token) => {
                 info!(?error_token);
                 let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
-                let drain_errors = self.drain_stream().await?;
-                all_errors.extend(drain_errors);
-                // The error drained the rest of the batch to its terminal
-                // DONE, so the connection is idle again. Clear the batch
-                // state so a subsequent `close_query` / `advance` does not
-                // block trying to read a stream that is already consumed.
+                let drain_result = self.drain_stream().await;
+                // Reset batch state before propagating: the error terminates the
+                // batch regardless of whether the drain fully consumed it, so a
+                // subsequent `close_query` / `advance` does not block trying to
+                // read a stream we have given up on.
                 self.execution_context.set_has_open_batch(false);
                 self.current_result_set_has_been_read_till_end = true;
                 self.current_metadata = None;
+                match drain_result {
+                    Ok(drain_errors) => all_errors.extend(drain_errors),
+                    Err(e) => {
+                        warn!(error = ?e, "Drain after statement error failed; connection may not be reusable");
+                    }
+                }
                 Err(crate::error::Error::from_sql_errors(all_errors))
             }
             Tokens::ColMetadata(_) => Err(crate::error::Error::UsageError(
@@ -4280,7 +4418,10 @@ impl StatementId {
 /// epochs. If the connection reconnects, the next
 /// [`execute_prepared`](TdsClient::execute_prepared) transparently re-prepares
 /// against the new session.
-#[derive(Debug, Clone)]
+///
+// Not `Clone`: clones would share one id, so unpreparing either would silently
+// unmaterialize the other.
+#[derive(Debug)]
 pub struct PreparedStatement {
     sql: String,
     id: Option<StatementId>,
@@ -4414,6 +4555,7 @@ pub enum StatementResult {
 /// Internal boundary kind produced by
 /// [`advance_to_result_boundary`](TdsClient::advance_to_result_boundary),
 /// before it is mapped to the public [`StatementResult`].
+#[derive(Debug)]
 enum ResultBoundaryKind {
     /// A row-returning result set; carries its column metadata.
     RowSet(Arc<ColMetadataToken>),
@@ -4469,6 +4611,8 @@ mod tests {
     use crate::io::token_stream::{
         ColumnPolicy, ParserContext, RowHeader, RowPauseState, RowReadResult, TdsTokenStreamReader,
     };
+    use crate::test_client_support::byte_stream::tds_client_over_raw_bytes as client_over_bytes;
+    use crate::test_client_support::byte_stream::tds_client_over_raw_bytes_with_column_encryption as client_over_bytes_with_ae;
     use crate::token::tokens::{
         ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
     };
@@ -4647,10 +4791,6 @@ mod tests {
 
     #[async_trait]
     impl NetworkReader for TestTransport {
-        async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
-            buffer.fill(0);
-            Ok(0)
-        }
         fn packet_size(&self) -> u32 {
             4096
         }
@@ -5226,6 +5366,123 @@ mod tests {
         let messages = client.take_info_messages();
         assert_eq!(messages.len(), 2);
         assert!(client.info_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn consume_done_token_takes_single_counted_done() {
+        // A normal (non-distributed) engine reports the bulk-load row count in a
+        // single DONE_COUNT token.
+        let mut client =
+            create_test_client_with_tokens(vec![done_count(CurrentCommand::Insert, 5000, false)]);
+
+        let rows_affected = client.consume_done_token().await.unwrap();
+
+        assert_eq!(rows_affected, 5000);
+    }
+
+    #[tokio::test]
+    async fn consume_done_token_does_not_double_count_distributed_dones() {
+        // Regression for #209: a distributed engine (Fabric Warehouse) acknowledges
+        // one bulk load with two DONE_COUNT tokens, each carrying the full count.
+        // Summing them would report 2x; the authoritative value is the count itself.
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Insert, 5000, true),
+            done_count(CurrentCommand::Insert, 5000, false),
+        ]);
+
+        let rows_affected = client.consume_done_token().await.unwrap();
+
+        assert_eq!(rows_affected, 5000);
+    }
+
+    #[tokio::test]
+    async fn consume_done_token_ignores_uncounted_dones() {
+        // A DONE without the COUNT flag carries a meaningless row_count that must
+        // not contribute to the total. This uncounted token deliberately carries a
+        // non-zero row_count (7) so the pre-fix summing behavior would report 3007;
+        // reporting 3000 proves the has_count() guard, not an incidental zero.
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Done(DoneToken {
+                status: DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Insert,
+                row_count: 7,
+            }),
+            done_count(CurrentCommand::Insert, 3000, false),
+        ]);
+
+        let rows_affected = client.consume_done_token().await.unwrap();
+
+        assert_eq!(rows_affected, 3000);
+    }
+
+    /// A single-INT-column row used to drive the streaming bulk-load path.
+    struct IntRow(i32);
+
+    #[async_trait]
+    impl BulkLoadRow for IntRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            use crate::datatypes::column_values::ColumnValues;
+            writer
+                .write_column_value(*column_index, &ColumnValues::Int(self.0))
+                .await?;
+            *column_index += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_load_reports_client_rows_not_server_done_count() {
+        // Regression for #209: the count reported to callers must be the number
+        // of rows the client streamed to the wire — matching
+        // `SqlBulkCopy.RowsCopied` and ODBC bcp (`llRowsCopiedInLastBCP`), both
+        // of which count outgoing rows client-side — and must never be derived
+        // from the server's DONE_COUNT. Distributed engines (Fabric Warehouse,
+        // EngineEdition 11) acknowledge one bulk load with more than one
+        // DONE_COUNT token, so trusting the server count double-counted.
+        //
+        // The mock server here returns a deliberately wrong count (999) in each
+        // DONE_COUNT token; the client wrote 3 rows and must report exactly 3,
+        // which is only possible if the reported value is the client-side count.
+        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+        use crate::datatypes::sqldatatypes::TdsDataType;
+
+        let mut client = create_test_client_with_tokens(vec![
+            // STEP 2: response to the INSERT BULK preamble command.
+            done_no_more(),
+            // STEP 5: distributed bulk-load acknowledgement — two DONE_COUNT
+            // tokens, each carrying a bogus (non-client) count.
+            done_count(CurrentCommand::Insert, 999, true),
+            done_count(CurrentCommand::BulkInsert, 999, false),
+        ]);
+
+        let column_metadata = vec![
+            BulkCopyColumnMetadata::new("id", SqlDbType::Int, TdsDataType::Int4 as u8)
+                .with_length(4, TypeLength::Fixed(4)),
+        ];
+
+        let rows = vec![IntRow(10), IntRow(20), IntRow(30)];
+
+        let reported = client
+            .execute_bulk_load_streaming_zerocopy(
+                "#t".to_string(),
+                column_metadata,
+                BulkCopyOptions::default(),
+                None,
+                None,
+                rows.into_iter(),
+                &[],
+            )
+            .await
+            .expect("bulk load should succeed against the mock transport");
+
+        assert_eq!(
+            reported, 3,
+            "must report the 3 client-written rows, not the server DONE_COUNT (999)"
+        );
     }
 
     #[test]
@@ -6708,6 +6965,482 @@ mod tests {
         assert!(
             matches!(&err, crate::error::Error::ColumnEncryptionError(message) if message.contains("ForceColumnEncryption")),
             "expected a ForceColumnEncryption column-encryption error, got: {err}"
+        );
+    }
+
+    // ── Raw TDS token byte builders (little-endian, matching the real parsers) ──
+
+    fn message_token_bytes(
+        token: crate::token::tokens::TokenType,
+        number: u32,
+        message: &str,
+    ) -> Vec<u8> {
+        use crate::token::parsers::common::test_utils::MockReader;
+        let mut b = vec![token as u8];
+        b.extend_from_slice(&0u16.to_le_bytes()); // token length (ignored by parser)
+        b.extend_from_slice(&number.to_le_bytes());
+        b.push(1); // state
+        b.push(16); // severity
+        let msg = MockReader::encode_utf16(message);
+        b.extend_from_slice(&((msg.len() / 2) as u16).to_le_bytes()); // US_VARCHAR char count
+        b.extend_from_slice(&msg);
+        b.push(0); // server_name (B_VARCHAR, 0 chars)
+        b.push(0); // proc_name (B_VARCHAR, 0 chars)
+        b.extend_from_slice(&1u32.to_le_bytes()); // line number
+        b
+    }
+
+    fn error_token_bytes(number: u32, _severity: u8, message: &str) -> Vec<u8> {
+        message_token_bytes(crate::token::tokens::TokenType::Error, number, message)
+    }
+
+    fn info_token_bytes(number: u32, message: &str) -> Vec<u8> {
+        message_token_bytes(crate::token::tokens::TokenType::Info, number, message)
+    }
+
+    fn done_bytes(status: u16) -> Vec<u8> {
+        let mut b = vec![crate::token::tokens::TokenType::Done as u8];
+        b.extend_from_slice(&status.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes()); // cur_cmd
+        b.extend_from_slice(&0u64.to_le_bytes()); // row_count
+        b
+    }
+
+    fn int_column_bytes(name: &str) -> Vec<u8> {
+        use crate::token::parsers::common::test_utils::MockReader;
+        let mut b = Vec::new();
+        b.extend_from_slice(&0u32.to_le_bytes()); // user_type
+        b.extend_from_slice(&0u16.to_le_bytes()); // flags (not nullable)
+        b.push(crate::datatypes::sqldatatypes::TdsDataType::Int4 as u8);
+        let name_bytes = MockReader::encode_utf16(name);
+        b.push((name_bytes.len() / 2) as u8); // name length in chars
+        b.extend_from_slice(&name_bytes);
+        b
+    }
+
+    fn colmetadata_single_int_bytes(name: &str) -> Vec<u8> {
+        let mut b = vec![crate::token::tokens::TokenType::ColMetadata as u8];
+        b.extend_from_slice(&1u16.to_le_bytes()); // column count
+        b.extend(int_column_bytes(name));
+        b
+    }
+
+    /// A single-Int COLMETADATA as it appears on the wire when Always Encrypted
+    /// is negotiated: an (empty) CEK table — a `u16` count of 0 — sits between
+    /// the column count and the first column definition. The column itself is
+    /// not encrypted (flags = 0), so it carries no per-column crypto metadata.
+    /// Parsing these bytes without column-encryption awareness misreads the
+    /// CEK-table prefix as column data and desynchronizes the stream.
+    fn colmetadata_single_int_ae_bytes(name: &str) -> Vec<u8> {
+        let mut b = vec![crate::token::tokens::TokenType::ColMetadata as u8];
+        b.extend_from_slice(&1u16.to_le_bytes()); // column count
+        b.extend_from_slice(&0u16.to_le_bytes()); // empty CEK table
+        b.extend(int_column_bytes(name));
+        b
+    }
+
+    /// A single COLMETADATA under Always Encrypted whose one column is
+    /// `FLAG_ENCRYPTED` and carries `CryptoMetadata`, while the CEK table is
+    /// empty. This server anomaly makes `resolve_cell_decryptor` fail fast
+    /// (encrypted column, no keys to resolve). The outer (ciphertext) wire type
+    /// is modeled as Int4 so the row payload is a fixed 4 bytes; on the drain
+    /// path the column must be decoded as raw ciphertext without resolving any
+    /// decryptor, so this failure is never triggered.
+    fn colmetadata_single_encrypted_int_ae_bytes(name: &str) -> Vec<u8> {
+        use crate::token::parsers::common::test_utils::MockReader;
+        const FLAG_ENCRYPTED: u16 = 0x0800;
+        let int4 = crate::datatypes::sqldatatypes::TdsDataType::Int4 as u8;
+
+        let mut b = vec![crate::token::tokens::TokenType::ColMetadata as u8];
+        b.extend_from_slice(&1u16.to_le_bytes()); // column count
+        b.extend_from_slice(&0u16.to_le_bytes()); // empty CEK table
+
+        // Encrypted column definition.
+        b.extend_from_slice(&0u32.to_le_bytes()); // user_type
+        b.extend_from_slice(&FLAG_ENCRYPTED.to_le_bytes()); // flags
+        b.push(int4); // ciphertext wire type
+        // CryptoMetadata (has_cek_table = true, since AE is negotiated).
+        b.extend_from_slice(&0u16.to_le_bytes()); // cek_table_ordinal
+        b.extend_from_slice(&0u32.to_le_bytes()); // base user_type
+        b.push(int4); // base data type
+        b.push(2); // cipher_algorithm_id (non-custom: AEAD_AES_256_CBC_HMAC_SHA256)
+        b.push(1); // encryption_type (deterministic)
+        b.push(1); // normalization_rule_version
+        let name_bytes = MockReader::encode_utf16(name);
+        b.push((name_bytes.len() / 2) as u8);
+        b.extend_from_slice(&name_bytes);
+        b
+    }
+
+    fn colmetadata_two_int_bytes(first: &str, second: &str) -> Vec<u8> {
+        let mut b = vec![crate::token::tokens::TokenType::ColMetadata as u8];
+        b.extend_from_slice(&2u16.to_le_bytes()); // column count
+        b.extend(int_column_bytes(first));
+        b.extend(int_column_bytes(second));
+        b
+    }
+
+    fn row_int_bytes(value: i32) -> Vec<u8> {
+        let mut b = vec![crate::token::tokens::TokenType::Row as u8];
+        b.extend_from_slice(&value.to_le_bytes()); // non-nullable Int4: 4 raw LE bytes
+        b
+    }
+
+    fn row_two_int_bytes(a: i32, b_val: i32) -> Vec<u8> {
+        let mut b = vec![crate::token::tokens::TokenType::Row as u8];
+        b.extend_from_slice(&a.to_le_bytes());
+        b.extend_from_slice(&b_val.to_le_bytes());
+        b
+    }
+
+    /// NBCROW (0xD2) for a single Int4 column whose only value is NULL. The
+    /// 1-byte null bitmap has bit 0 set, so no value bytes follow.
+    fn nbcrow_single_null_bytes() -> Vec<u8> {
+        vec![crate::token::tokens::TokenType::NbcRow as u8, 0b0000_0001]
+    }
+
+    const DONE_MORE_ERROR: u16 = 0x0003; // DONE_MORE | DONE_ERROR
+    const DONE_FINAL: u16 = 0x0000;
+
+    fn expect_sql_error(err: crate::error::Error) -> crate::error::SqlServerDiagnostics {
+        match err {
+            crate::error::Error::SqlServerError { diagnostics } => diagnostics,
+            other => panic!("expected a SqlServerError, got: {other:?}"),
+        }
+    }
+
+    /// Parity with go-mssqldb #410: a statement-scoped error (`RAISERROR`)
+    /// followed by a row-returning statement (`SELECT ...`) in the same batch.
+    /// On the ERROR token, `advance_to_result_boundary` drains the remainder of
+    /// the batch via `drain_stream`. The drain must carry the trailing result
+    /// set's COLMETADATA into the row-decoding path so the ROW tokens are fully
+    /// consumed, letting the real SQL error surface instead of a parse failure.
+    #[tokio::test]
+    async fn drain_on_error_consumes_trailing_rowset_and_surfaces_sql_error() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom")); // RAISERROR('boom', 16, 1)
+        stream.extend(done_bytes(DONE_MORE_ERROR)); // stmt 1 done, batch continues
+        stream.extend(colmetadata_single_int_bytes("n")); // SELECT n ...
+        stream.extend(row_int_bytes(1)); // one row
+        stream.extend(done_bytes(DONE_FINAL)); // end of batch
+
+        let mut client = client_over_bytes(stream);
+        let err = client
+            .advance_to_result_boundary()
+            .await
+            .expect_err("a statement error must surface as an error");
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors.len(), 1);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+        assert_eq!(diagnostics.errors[0].message, "boom");
+    }
+
+    /// After the error path drains the batch to its terminal DONE, the client
+    /// must be left idle: `advance_to_result_boundary`'s `Error` branch resets
+    /// the result-set state so a caller that calls `next_row` after `execute`
+    /// returned `Err` does not pass the `maybe_has_unread_rows` guard and read a
+    /// stream that is already fully consumed.
+    #[tokio::test]
+    async fn drain_on_error_leaves_client_idle_for_next_row() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_single_int_bytes("n"));
+        stream.extend(row_int_bytes(1));
+        stream.extend(done_bytes(DONE_FINAL));
+
+        let mut client = client_over_bytes(stream);
+        client
+            .advance_to_result_boundary()
+            .await
+            .expect_err("a statement error must surface as an error");
+
+        assert!(
+            !client.maybe_has_unread_rows(),
+            "drained error path must clear the unread-rows guard"
+        );
+        assert!(!client.on_rows(), "drained error path must clear metadata");
+        assert!(
+            !client.has_open_batch(),
+            "drained error path must close the batch"
+        );
+    }
+
+    /// When the trailing result set is truncated mid-drain (the stream ends
+    /// before the terminal DONE), the drain fails — but the original SQL error
+    /// must still surface as the primary error and the client must be left idle
+    /// so the failed drain does not leave the batch marked open. Covers the
+    /// `Err` arm of the drain in `advance_to_result_boundary`'s `Error` branch.
+    #[tokio::test]
+    async fn drain_on_error_truncated_stream_still_surfaces_sql_error() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_single_int_bytes("n"));
+        // Stream ends here: no ROW, no terminal DONE — the drain read fails.
+
+        let mut client = client_over_bytes(stream);
+        let err = client
+            .advance_to_result_boundary()
+            .await
+            .expect_err("a statement error must surface as an error");
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+        assert_eq!(diagnostics.errors[0].message, "boom");
+        assert!(
+            !client.maybe_has_unread_rows(),
+            "a failed drain must still clear the unread-rows guard"
+        );
+        assert!(
+            !client.has_open_batch(),
+            "a failed drain must still close the batch"
+        );
+    }
+
+    /// Control: the same statement error followed by a *no-row* statement drains
+    /// cleanly and surfaces the real SQL error.
+    #[tokio::test]
+    async fn drain_on_error_surfaces_sql_error_without_trailing_rowset() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(done_bytes(DONE_FINAL));
+
+        let mut client = client_over_bytes(stream);
+        let err = client
+            .advance_to_result_boundary()
+            .await
+            .expect_err("a statement error must surface as an error");
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+    }
+
+    /// The trailing result set can carry multiple multi-column rows; every ROW
+    /// must be consumed before the terminal DONE is reached.
+    #[tokio::test]
+    async fn drain_on_error_consumes_multi_row_multi_column_rowset() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1205, 16, "deadlock"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_two_int_bytes("a", "b"));
+        stream.extend(row_two_int_bytes(1, 2));
+        stream.extend(row_two_int_bytes(3, 4));
+        stream.extend(row_two_int_bytes(5, 6));
+        stream.extend(done_bytes(DONE_FINAL));
+
+        let mut client = client_over_bytes(stream);
+        let err = client.advance_to_result_boundary().await.unwrap_err();
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1205);
+    }
+
+    /// NBCROW rows (null-bitmap-compressed) in the trailing result set are
+    /// consumed through the same row-decoding path.
+    #[tokio::test]
+    async fn drain_on_error_consumes_nbcrow_rows() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_single_int_bytes("n"));
+        stream.extend(nbcrow_single_null_bytes());
+        stream.extend(row_int_bytes(7));
+        stream.extend(done_bytes(DONE_FINAL));
+
+        let mut client = client_over_bytes(stream);
+        let err = client.advance_to_result_boundary().await.unwrap_err();
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+    }
+
+    /// Multiple trailing result sets after the error (each COLMETADATA / ROWs /
+    /// DONE-with-more) are drained one after another until the final DONE.
+    #[tokio::test]
+    async fn drain_on_error_consumes_multiple_trailing_rowsets() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_single_int_bytes("a"));
+        stream.extend(row_int_bytes(1));
+        stream.extend(done_bytes(0x0001)); // DONE_MORE, result set 1 ends
+        stream.extend(colmetadata_single_int_bytes("b"));
+        stream.extend(row_int_bytes(2));
+        stream.extend(row_int_bytes(3));
+        stream.extend(done_bytes(DONE_FINAL));
+
+        let mut client = client_over_bytes(stream);
+        let err = client.advance_to_result_boundary().await.unwrap_err();
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+    }
+
+    /// An ERROR token that appears *inside* the trailing result set (after its
+    /// rows) is collected alongside the first error, and INFO tokens are
+    /// captured as informational messages.
+    #[tokio::test]
+    async fn drain_collects_secondary_error_and_info_tokens() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "first"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_single_int_bytes("n"));
+        stream.extend(row_int_bytes(1));
+        stream.extend(info_token_bytes(50000, "just fyi"));
+        stream.extend(error_token_bytes(50001, 16, "second"));
+        stream.extend(done_bytes(DONE_FINAL));
+
+        let mut client = client_over_bytes(stream);
+        let err = client.advance_to_result_boundary().await.unwrap_err();
+
+        let diagnostics = expect_sql_error(err);
+        let numbers: Vec<u32> = diagnostics.errors.iter().map(|e| e.number).collect();
+        assert_eq!(numbers, vec![1222, 50001]);
+    }
+
+    /// A COLMETADATA arriving before the current result set's DONE is a protocol
+    /// violation, so the drain aborts rather than silently mis-parsing it. The
+    /// abort is *contained*: the original statement error stays primary and the
+    /// client is left idle, so the caller sees the real SQL error (1222) instead
+    /// of the internal protocol detail, and a failed drain never leaves the
+    /// batch marked open.
+    #[tokio::test]
+    async fn drain_rejects_colmetadata_before_result_set_done() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_single_int_bytes("a"));
+        stream.extend(row_int_bytes(1));
+        stream.extend(colmetadata_single_int_bytes("b")); // no DONE before new metadata
+        stream.extend(row_int_bytes(2));
+        stream.extend(done_bytes(DONE_FINAL));
+
+        let mut client = client_over_bytes(stream);
+        let err = client.advance_to_result_boundary().await.unwrap_err();
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+        assert!(
+            !client.maybe_has_unread_rows(),
+            "a contained drain failure must still clear the unread-rows guard"
+        );
+        assert!(
+            !client.has_open_batch(),
+            "a contained drain failure must still close the batch"
+        );
+    }
+
+    /// Regression guard for the drain's Always Encrypted awareness: when column
+    /// encryption is negotiated, a trailing result set's COLMETADATA carries a
+    /// CEK-table prefix (empty here). The drain's top-level token read must use
+    /// the same ColumnEncryption context as the normal read path, or those two
+    /// prefix bytes are misread as column data and the stream desynchronizes —
+    /// exactly the corruption this drain exists to prevent. Reading with
+    /// `ParserContext::None` here surfaces a parse error instead of the SQL
+    /// error, so this test fails without the fix.
+    #[tokio::test]
+    async fn drain_parses_trailing_rowset_metadata_under_column_encryption() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "lock timeout"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_single_int_ae_bytes("a"));
+        stream.extend(row_int_bytes(7));
+        stream.extend(done_bytes(DONE_FINAL));
+
+        let mut client = client_over_bytes_with_ae(stream);
+        let err = client.advance_to_result_boundary().await.unwrap_err();
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+    }
+
+    /// Blocking-review regression guard: the drain must not resolve a cell
+    /// decryptor for a discarded result set. Here the trailing result set has a
+    /// `FLAG_ENCRYPTED` column whose CEK table is empty — an anomaly that makes
+    /// `resolve_cell_decryptor` fail fast. Resolving a decryptor on the drain
+    /// path would surface that `Err` and mask the real SQL error. The fix
+    /// decodes the encrypted column as raw ciphertext instead, so error 1222
+    /// still surfaces and the batch is fully drained.
+    #[tokio::test]
+    async fn drain_does_not_resolve_decryptor_for_discarded_encrypted_rowset() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "lock timeout"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        stream.extend(colmetadata_single_encrypted_int_ae_bytes("secret"));
+        stream.extend(row_int_bytes(0x1122_3344)); // 4 ciphertext bytes, discarded
+        stream.extend(done_bytes(DONE_FINAL));
+
+        let mut client = client_over_bytes_with_ae(stream);
+        // Enable column encryption for this command so the pre-fix drain would
+        // actually resolve a decryptor (and fail fast on the empty CEK table).
+        // With the fix, the drain ignores this and decodes raw ciphertext.
+        client.current_command_ce_setting =
+            crate::connection::client_context::ExecutionColumnEncryptionSetting::Enabled;
+        let err = client.advance_to_result_boundary().await.unwrap_err();
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+    }
+
+    /// The drain's top-level loop must apply the side effects of the control
+    /// tokens it walks past — collecting ERROR diagnostics, recording INFO
+    /// messages, applying ENVCHANGE, session-state and return-value/status
+    /// tokens — before the terminal DONE ends the batch. This exercises the
+    /// `apply_drain_side_effect` dispatch reached from `drain_stream` directly
+    /// (no trailing row set), complementing the byte-level row-drain tests.
+    #[tokio::test]
+    async fn drain_applies_side_effects_of_control_tokens() {
+        use crate::token::tokens::{
+            EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, ErrorToken, OrderToken,
+            ReturnStatusToken, SessionStateToken,
+        };
+
+        let tokens = vec![
+            Tokens::Error(ErrorToken {
+                number: 1205,
+                state: 51,
+                severity: 13,
+                message: "deadlock victim".to_string(),
+                server_name: "test-server".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            info_token(50_000, 10, "printed message"),
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            Tokens::SessionState(SessionStateToken {
+                sequence_number: u32::MAX,
+                status: 0,
+                states: Vec::new(),
+            }),
+            Tokens::ReturnValue(ae_return_value_token("@out", ColumnValues::Int(7), None)),
+            Tokens::ReturnStatus(ReturnStatusToken { value: 3 }),
+            // A token the drain neither steers on nor records: exercised only to
+            // prove it is skipped without aborting the drain.
+            Tokens::Order(OrderToken {
+                _order_columns: Vec::new(),
+            }),
+            done_no_more(),
+        ];
+
+        let mut client = create_test_client_with_tokens(tokens);
+        let errors = client.drain_stream().await.unwrap();
+
+        assert_eq!(errors.len(), 1, "the ERROR token must be collected");
+        assert_eq!(errors[0].number, 1205);
+        assert!(matches!(
+            client.last_return_status,
+            ReturnStatus::Received(3)
+        ));
+        assert_eq!(
+            client.return_values.len(),
+            1,
+            "the RETURNVALUE must be surfaced as an output parameter"
         );
     }
 }

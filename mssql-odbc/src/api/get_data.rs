@@ -6,7 +6,7 @@
 use tracing::{debug, error};
 
 use super::odbc_types::{
-    SQL_C_CHAR, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_TOTAL,
+    SQL_C_CHAR, SQL_C_GUID, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_TOTAL,
     SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer, SqlReturn,
     SqlSmallInt, SqlUSmallInt,
 };
@@ -17,6 +17,12 @@ use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, PlpChunk};
+
+use super::fetch_convert::{
+    ConvError, ConvOk, convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c,
+    extract_datetime_parts, format_datetime_parts, is_datetime_c_target, is_float_c_target,
+    is_integer_c_target, sql_string_to_text,
+};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::PlpEncoding;
 
@@ -171,7 +177,7 @@ fn sql_get_data_safe(
         .is_some_and(|(c, _)| *c == col_index);
 
     if already_captured {
-        return write_column_as_text(
+        return write_captured_column(
             &mut stmt_state,
             col_index,
             target_type,
@@ -205,7 +211,7 @@ fn sql_get_data_safe(
             true,
         );
     }
-    write_column_as_text(
+    write_captured_column(
         &mut reopened_stmt_state,
         col_index,
         target_type,
@@ -215,7 +221,7 @@ fn sql_get_data_safe(
     )
 }
 
-fn write_column_as_text(
+fn write_captured_column(
     stmt_state: &mut crate::handles::stmt::StmtState,
     col_index: usize,
     target_type: SqlSmallInt,
@@ -229,7 +235,8 @@ fn write_column_as_text(
     // native); callers that need ANSI must transcode. SQL_C_WCHAR is UTF-16LE on
     // both drivers.
     // Check target type first — an unsupported type must not consume last_captured so the app can retry.
-    if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
+    let typed_target = is_typed_c_target(target_type);
+    if !typed_target && target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
         post_sql_error(
             stmt_state,
             SQLSTATE_HYC00,
@@ -261,11 +268,13 @@ fn write_column_as_text(
 
     if matches!(value, ColumnValues::Null) {
         unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
+        // Only character targets get a terminator; a fixed-width target's
+        // buffer is left untouched on NULL.
         if target_type == SQL_C_WCHAR {
             unsafe {
                 copy_with_nul(target_value_ptr as *mut SqlWChar, buf_elements, &[]);
             }
-        } else {
+        } else if target_type == SQL_C_CHAR {
             unsafe {
                 copy_with_nul(target_value_ptr as *mut u8, buf_elements, &[]);
             }
@@ -276,16 +285,40 @@ fn write_column_as_text(
         return SQL_SUCCESS;
     }
 
-    let Some(as_text) = column_value_to_text(value) else {
-        // Unconvertible *column* type: HYC00 is a soft failure. Leave the value
-        // in place (do not consume) so a retry with another C type can work.
-        post_sql_error(
-            stmt_state,
-            SQLSTATE_HYC00,
-            0,
-            "Column type conversion not yet implemented",
-        );
-        return SQL_ERROR;
+    // Fixed / typed C targets deliver the whole value in one call through the
+    // shared conversion core; only the character targets chunk.
+    if typed_target {
+        let converted =
+            unsafe { convert_typed_c(value, target_type, target_value_ptr, strlen_or_ind_ptr) };
+        let rc = finish_typed_conv(stmt_state, converted);
+        if rc != SQL_ERROR {
+            stmt_state.current_row_last_col = col_index;
+            stmt_state.last_captured = None;
+            stmt_state.partial_text_offset = None;
+        }
+        return rc;
+    }
+
+    let as_text = match column_value_to_text(value) {
+        Ok(t) => t,
+        Err(TextError::Malformed) => {
+            // The server payload could not be decoded. Leave the value resident;
+            // a retry with SQL_C_BINARY can still read the raw bytes.
+            error!("SQLGetData: column payload could not be decoded as text");
+            post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE);
+            return SQL_ERROR;
+        }
+        Err(TextError::Unsupported) => {
+            // Unconvertible *column* type: HYC00 is a soft failure. Leave the value
+            // in place (do not consume) so a retry with another C type can work.
+            post_sql_error(
+                stmt_state,
+                SQLSTATE_HYC00,
+                0,
+                "Column type conversion not yet implemented",
+            );
+            return SQL_ERROR;
+        }
     };
     // `value` borrow ends here — `as_text` is owned.
 
@@ -854,25 +887,163 @@ fn write_string_result<T: Copy + Default>(
     }
 }
 
-fn column_value_to_text(v: &ColumnValues) -> Option<String> {
+/// Why a column value could not be rendered as text.
+enum TextError {
+    /// No text rendering is defined for this column type.
+    Unsupported,
+    /// The server payload could not be decoded (bad UTF-8/UTF-16 or a truncated
+    /// UTF-16 code unit).
+    Malformed,
+}
+
+/// `true` for the C targets served by the shared conversion core in one call.
+fn is_typed_c_target(target_type: SqlSmallInt) -> bool {
+    is_integer_c_target(target_type)
+        || is_float_c_target(target_type)
+        || target_type == SQL_C_GUID
+        || is_datetime_c_target(target_type)
+}
+
+/// Routes a captured value to the matching converter.
+///
+/// # Safety
+/// `target_value_ptr` must be valid for the target C type's size when non-null,
+/// and `strlen_or_ind_ptr` null or valid for a `SqlLen` write.
+unsafe fn convert_typed_c(
+    value: &ColumnValues,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> Result<ConvOk, ConvError> {
+    unsafe {
+        if is_integer_c_target(target_type) {
+            convert_integer_c(value, target_type, target_value_ptr, strlen_or_ind_ptr)
+        } else if is_float_c_target(target_type) {
+            convert_float_c(value, target_type, target_value_ptr, strlen_or_ind_ptr)
+        } else if target_type == SQL_C_GUID {
+            convert_guid_c(value, target_type, target_value_ptr, strlen_or_ind_ptr)
+        } else {
+            convert_datetime_c(value, target_type, target_value_ptr, strlen_or_ind_ptr)
+        }
+    }
+}
+
+/// Maps a conversion outcome to an ODBC return code, posting the matching
+/// diagnostic on the statement.
+fn finish_typed_conv(
+    stmt_state: &mut crate::handles::stmt::StmtState,
+    r: Result<ConvOk, ConvError>,
+) -> SqlReturn {
+    match r {
+        Ok(ConvOk::Exact) => SQL_SUCCESS,
+        Ok(ConvOk::Truncated) => {
+            post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION);
+            SQL_SUCCESS_WITH_INFO
+        }
+        Err(ConvError::OutOfRange) => {
+            post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE);
+            SQL_ERROR
+        }
+        Err(ConvError::Restricted) => {
+            post_diag(stmt_state, ERR_RESTRICTED_DATA_TYPE);
+            SQL_ERROR
+        }
+        Err(ConvError::NotHandledHere) => {
+            post_sql_error(
+                stmt_state,
+                SQLSTATE_HYC00,
+                0,
+                "Column type conversion not yet implemented",
+            );
+            SQL_ERROR
+        }
+    }
+}
+
+/// Formats a SQL Server `money` / `smallmoney` value (an integer scaled by
+/// 10^4) as a fixed 4-decimal string, without the precision loss of an
+/// intermediate `f64`.
+fn money_scaled_to_string(scaled: i64) -> String {
+    let neg = scaled < 0;
+    let abs = scaled.unsigned_abs();
+    format!(
+        "{}{}.{:04}",
+        if neg { "-" } else { "" },
+        abs / 10_000,
+        abs % 10_000
+    )
+}
+
+/// Formats a SQL Server `vector` as a JSON-style array of its float elements.
+fn format_vector(v: &mssql_tds::datatypes::sql_vector::SqlVector) -> String {
+    use mssql_tds::datatypes::sql_vector::VectorData;
+    let floats = match &v.data {
+        VectorData::Float32(xs) | VectorData::Float16(xs) => xs,
+    };
+    let mut s = String::from("[");
+    for (i, f) in floats.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&f.to_string());
+    }
+    s.push(']');
+    s
+}
+
+/// Decodes UTF-16LE `xml` bytes without the panicking indexing/unwrap in
+/// `SqlXml::as_string`.
+fn xml_to_text(bytes: &[u8]) -> Result<String, TextError> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(TextError::Malformed);
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16(&units).map_err(|_| TextError::Malformed)
+}
+
+fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError> {
     match v {
-        ColumnValues::TinyInt(x) => Some(x.to_string()),
-        ColumnValues::SmallInt(x) => Some(x.to_string()),
-        ColumnValues::Int(x) => Some(x.to_string()),
-        ColumnValues::BigInt(x) => Some(x.to_string()),
-        ColumnValues::Real(x) => Some(x.to_string()),
-        ColumnValues::Float(x) => Some(x.to_string()),
-        ColumnValues::Bit(x) => Some(if *x { "1".into() } else { "0".into() }),
-        ColumnValues::String(s) => Some(s.to_utf8_string()),
-        ColumnValues::Uuid(u) => Some(u.to_string()),
-        ColumnValues::Null => Some(String::new()),
-        _ => None,
+        ColumnValues::TinyInt(x) => Ok(x.to_string()),
+        ColumnValues::SmallInt(x) => Ok(x.to_string()),
+        ColumnValues::Int(x) => Ok(x.to_string()),
+        ColumnValues::BigInt(x) => Ok(x.to_string()),
+        ColumnValues::Real(x) => Ok(x.to_string()),
+        ColumnValues::Float(x) => Ok(x.to_string()),
+        ColumnValues::Bit(x) => Ok(if *x { "1".into() } else { "0".into() }),
+        ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => Ok(d.to_string()),
+        ColumnValues::Money(m) => Ok(money_scaled_to_string(
+            (i64::from(m.lsb_part) & 0xFFFF_FFFF) | (i64::from(m.msb_part) << 32),
+        )),
+        ColumnValues::SmallMoney(m) => Ok(money_scaled_to_string(i64::from(m.int_val))),
+        // `SqlString::to_utf8_string` unwraps on its UTF-8 branch; decode fallibly.
+        ColumnValues::String(s) => sql_string_to_text(s).ok_or(TextError::Malformed),
+        ColumnValues::Xml(x) => xml_to_text(&x.bytes),
+        // `SqlJson::as_string` unwraps; decode fallibly.
+        ColumnValues::Json(j) => {
+            String::from_utf8(j.bytes.clone()).map_err(|_| TextError::Malformed)
+        }
+        ColumnValues::Uuid(u) => Ok(u.to_string()),
+        ColumnValues::Vector(vec) => Ok(format_vector(vec)),
+        ColumnValues::Date(_)
+        | ColumnValues::Time(_)
+        | ColumnValues::DateTime(_)
+        | ColumnValues::DateTime2(_)
+        | ColumnValues::DateTimeOffset(_)
+        | ColumnValues::SmallDateTime(_) => extract_datetime_parts(v)
+            .map(|p| format_datetime_parts(&p))
+            .ok_or(TextError::Unsupported),
+        ColumnValues::Null => Ok(String::new()),
+        _ => Err(TextError::Unsupported),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::odbc_types::{SQL_C_SLONG, SQL_C_TYPE_TIMESTAMP};
     use crate::api::odbc_types::{SQL_NO_DATA, SQL_NULL_HANDLE};
     use crate::error::diag::DiagRecord;
     use crate::test_support::TestHandles;
@@ -1135,41 +1306,47 @@ mod tests {
         assert_eq!(out, "\u{FFFD}");
     }
 
+    /// Option-returning shim so these tests read the same as before the
+    /// conversion core started distinguishing malformed payloads.
+    fn column_value_to_text_opt(v: &ColumnValues) -> Option<String> {
+        column_value_to_text(v).ok()
+    }
+
     /// `column_value_to_text` renders scalar column values as text and returns
     /// `None` for types with no textual SQLGetData rendering.
     #[test]
     fn column_value_to_text_renders_scalars() {
         use mssql_tds::datatypes::sql_string::SqlString;
         assert_eq!(
-            column_value_to_text(&ColumnValues::TinyInt(7)).as_deref(),
+            column_value_to_text_opt(&ColumnValues::TinyInt(7)).as_deref(),
             Some("7")
         );
         assert_eq!(
-            column_value_to_text(&ColumnValues::SmallInt(-3)).as_deref(),
+            column_value_to_text_opt(&ColumnValues::SmallInt(-3)).as_deref(),
             Some("-3")
         );
         assert_eq!(
-            column_value_to_text(&ColumnValues::Int(42)).as_deref(),
+            column_value_to_text_opt(&ColumnValues::Int(42)).as_deref(),
             Some("42")
         );
         assert_eq!(
-            column_value_to_text(&ColumnValues::BigInt(-9)).as_deref(),
+            column_value_to_text_opt(&ColumnValues::BigInt(-9)).as_deref(),
             Some("-9")
         );
         assert_eq!(
-            column_value_to_text(&ColumnValues::Bit(true)).as_deref(),
+            column_value_to_text_opt(&ColumnValues::Bit(true)).as_deref(),
             Some("1")
         );
         assert_eq!(
-            column_value_to_text(&ColumnValues::Bit(false)).as_deref(),
+            column_value_to_text_opt(&ColumnValues::Bit(false)).as_deref(),
             Some("0")
         );
         assert_eq!(
-            column_value_to_text(&ColumnValues::Null).as_deref(),
+            column_value_to_text_opt(&ColumnValues::Null).as_deref(),
             Some("")
         );
         assert_eq!(
-            column_value_to_text(&ColumnValues::String(SqlString::from_utf8_string(
+            column_value_to_text_opt(&ColumnValues::String(SqlString::from_utf8_string(
                 "hi".into()
             )))
             .as_deref(),
@@ -1177,8 +1354,216 @@ mod tests {
         );
         // A type with no textual rendering in this helper yields None.
         assert_eq!(
-            column_value_to_text(&ColumnValues::Bytes(vec![1, 2, 3])),
+            column_value_to_text_opt(&ColumnValues::Bytes(vec![1, 2, 3])),
             None
         );
+    }
+
+    /// Seeds a statement as positioned on a row with `value` already captured
+    /// for column 1, which is the state `SQLGetData` sees after the row decoder
+    /// has resumed to that column.
+    fn stmt_with_captured(h: &TestHandles, value: ColumnValues) {
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut s = stmt_handle.inner.lock().unwrap();
+        s.set_state(STMT_STATE_CURSOR_OPEN);
+        s.column_metadata = int_columns(2);
+        s.row_positioned = true;
+        s.last_captured = Some((1, value));
+    }
+
+    #[test]
+    fn get_data_typed_integer_target() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Int(-2_000_000));
+
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                std::mem::size_of::<i32>() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, -2_000_000);
+        assert_eq!(ind, std::mem::size_of::<i32>() as SqlLen);
+    }
+
+    #[test]
+    fn get_data_typed_timestamp_target() {
+        use crate::api::odbc_types::SqlTimestampStruct;
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlTime};
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(
+            &h,
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 738_685, // 2023-06-15
+                time: SqlTime {
+                    time_nanoseconds: ((12 * 3600 + 34 * 60 + 56) as u64) * 10_000_000,
+                    scale: 7,
+                },
+            }),
+        );
+
+        let mut out = SqlTimestampStruct::default();
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_TYPE_TIMESTAMP,
+                (&mut out as *mut SqlTimestampStruct).cast(),
+                std::mem::size_of::<SqlTimestampStruct>() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!((out.year, out.month, out.day), (2023, 6, 15));
+        assert_eq!((out.hour, out.minute, out.second), (12, 34, 56));
+    }
+
+    #[test]
+    fn get_data_typed_out_of_range_reports_22003() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::BigInt(i64::from(i32::MAX) + 1));
+
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                4,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let s = unsafe { handle_from_raw::<StmtHandle>(h.stmt) }
+            .inner
+            .lock()
+            .unwrap();
+        assert_last_diag(&s.diag_records, ERR_NUMERIC_OUT_OF_RANGE);
+    }
+
+    #[test]
+    fn get_data_non_temporal_into_timestamp_is_restricted() {
+        use crate::api::odbc_types::SqlTimestampStruct;
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Int(42));
+
+        let mut out = SqlTimestampStruct::default();
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_TYPE_TIMESTAMP,
+                (&mut out as *mut SqlTimestampStruct).cast(),
+                std::mem::size_of::<SqlTimestampStruct>() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let s = unsafe { handle_from_raw::<StmtHandle>(h.stmt) }
+            .inner
+            .lock()
+            .unwrap();
+        assert_last_diag(&s.diag_records, ERR_RESTRICTED_DATA_TYPE);
+    }
+
+    #[test]
+    fn get_data_decimal_renders_as_text() {
+        use mssql_tds::datatypes::decoder::DecimalParts;
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(
+            &h,
+            ColumnValues::Numeric(DecimalParts::from_string("123.45", 5, 2).unwrap()),
+        );
+
+        let mut buf = [0u8; 16];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(&buf[..ind as usize], b"123.45");
+    }
+
+    #[test]
+    fn get_data_malformed_payload_reports_22018() {
+        use mssql_tds::datatypes::column_values::SqlXml;
+        let h = TestHandles::with_env_dbc_stmt();
+        // Odd byte count: not a whole number of UTF-16 code units.
+        stmt_with_captured(
+            &h,
+            ColumnValues::Xml(SqlXml {
+                bytes: vec![0x41, 0x00, 0x42],
+            }),
+        );
+
+        let mut buf = [0u8; 32];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let s = unsafe { handle_from_raw::<StmtHandle>(h.stmt) }
+            .inner
+            .lock()
+            .unwrap();
+        assert_last_diag(&s.diag_records, ERR_INVALID_CHARACTER_VALUE);
+    }
+
+    /// Character into a date/time target is legal per Appendix D and lands in
+    /// P1a, so it must report "not implemented" rather than claiming 07006.
+    #[test]
+    fn get_data_character_into_date_target_is_not_implemented() {
+        use crate::api::odbc_types::SqlDateStruct;
+        use mssql_tds::datatypes::sql_string::SqlString;
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(
+            &h,
+            ColumnValues::String(SqlString::from_utf8_string("2023-06-15".to_string())),
+        );
+
+        let mut out = SqlDateStruct::default();
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                crate::api::odbc_types::SQL_C_TYPE_DATE,
+                (&mut out as *mut SqlDateStruct).cast(),
+                std::mem::size_of::<SqlDateStruct>() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let s = unsafe { handle_from_raw::<StmtHandle>(h.stmt) }
+            .inner
+            .lock()
+            .unwrap();
+        let last = s.diag_records.last().unwrap();
+        assert_eq!(&last.sql_state, b"HYC00");
     }
 }

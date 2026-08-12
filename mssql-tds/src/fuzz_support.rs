@@ -466,11 +466,6 @@ impl MockTransport {
 
 #[async_trait]
 impl NetworkReader for MockTransport {
-    async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
-        buffer.fill(0);
-        Ok(buffer.len())
-    }
-
     fn packet_size(&self) -> u32 {
         self.packet_size
     }
