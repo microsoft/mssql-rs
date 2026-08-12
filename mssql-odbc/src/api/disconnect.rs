@@ -6,7 +6,10 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
-use crate::api::sqlstate::{ERR_CONNECTION_DOES_NOT_EXIST, post_diag};
+use crate::api::sqlstate::{
+    ERR_CONNECTION_DOES_NOT_EXIST, ERR_INVALID_TRANSACTION_STATE, post_diag,
+};
+use crate::api::txn::rollback_before_disconnect;
 use crate::error::free_errors;
 use crate::handles::DbcHandle;
 use crate::handles::StmtHandle;
@@ -39,20 +42,41 @@ unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
 }
 
 fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
+    // Validate under a short lock; the rollback that may follow needs network
+    // I/O and must not run while the mutex is held.
+    {
+        let Ok(mut state) = dbc.inner.lock() else {
+            error!("SQLDisconnect: dbc mutex poisoned");
+            return SQL_ERROR;
+        };
+        free_errors(&mut state);
+
+        if state.connection_state != ConnectionState::Connected {
+            error!("SQLDisconnect: not connected");
+            post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
+            return SQL_ERROR;
+        }
+
+        // msodbcsql refuses to disconnect while a transaction holds user work
+        // (`sqlcconn.cpp:1169-1239`) rather than guessing commit or rollback;
+        // the application must call SQLEndTran first.
+        if state.local_tran_started {
+            error!("SQLDisconnect: a transaction is still open");
+            post_diag(&mut state, ERR_INVALID_TRANSACTION_STATE);
+            return SQL_ERROR;
+        }
+    }
+
+    // Manual-commit mode leaves a driver-begun transaction open between
+    // statements. It holds no user work, so roll it back explicitly instead of
+    // relying on the server's cleanup when the socket closes.
+    rollback_before_disconnect(dbc);
+
     let Ok(mut state) = dbc.inner.lock() else {
         error!("SQLDisconnect: dbc mutex poisoned");
         return SQL_ERROR;
     };
 
-    free_errors(&mut state);
-
-    if state.connection_state != ConnectionState::Connected {
-        error!("SQLDisconnect: not connected");
-        post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
-        return SQL_ERROR;
-    }
-
-    // TODO: check for active local transaction → post SQLSTATE 25000
     // TODO: free user-allocated descriptors (once descriptor support is added)
 
     // Drop all child STMT handles.

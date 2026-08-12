@@ -17,7 +17,7 @@ use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 
 use super::exec_common::{
-    claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
+    claim_connection, ensure_transaction, fail_with_tds, finish_execute, flush_pending_unprepare,
 };
 use super::sqlstate::*;
 use crate::api::odbc_types::{
@@ -182,6 +182,10 @@ fn sql_get_type_info_w_safe(
 
     // Release any handle orphaned by the reset above before running the RPC.
     flush_pending_unprepare(dbc, stmt, &mut client, "SQLGetTypeInfoW");
+
+    if let Err(e) = ensure_transaction(dbc, &mut client, "SQLGetTypeInfoW") {
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
 
     let exec_result = dbc.runtime.block_on(client.execute_stored_procedure(
         DATATYPE_INFO_PROC.to_string(),
