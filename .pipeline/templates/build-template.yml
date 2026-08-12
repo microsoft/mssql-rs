@@ -108,9 +108,18 @@ steps:
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
 - ${{ if eq(parameters.enableTests, true) }}:
-  - script: cargo install cargo-llvm-cov --version 0.6.16 --locked && cargo install cargo-nextest --version 0.9.99 --locked
-    displayName: Install llvm-cov and nextest 
-    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+  # Downloads the pinned prebuilt binaries. `cargo install` compiled both tools
+  # from source, which took up to ~10 minutes on the hosted macOS agent and was a
+  # recurring cause of job timeouts.
+  - ${{ if eq(parameters.osType, 'Windows') }}:
+    - pwsh: ./.pipeline/scripts/install-coverage-tools.ps1
+      displayName: Install llvm-cov and nextest
+      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
+  - ${{ if ne(parameters.osType, 'Windows') }}:
+    - script: ./.pipeline/scripts/install-coverage-tools.sh
+      displayName: Install llvm-cov and nextest
+      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
   # Generate test certificates for mock TDS server TLS tests
   - ${{ if eq(parameters.osType, 'Windows') }}:
@@ -128,7 +137,7 @@ steps:
   - ${{ if eq(parameters.osType, 'Linux') }}:
     - script: |
         echo "##vso[task.setvariable variable=ARCHIVE_NAME;isOutput=false]tdslib-nextest.tar.zst"   
-        cargo install cargo-nextest  --version 0.9.99 --locked
+        ./.pipeline/scripts/install-coverage-tools.sh
         cd mssql-tds && cargo nextest archive --archive-file tdslib-nextest.tar.zst && cp tdslib-nextest.tar.zst $(Build.ArtifactStagingDirectory) && mv tdslib-nextest.tar.zst ../ 
       displayName: Archive nextest results
       condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
