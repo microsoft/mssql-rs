@@ -407,9 +407,6 @@ pub(crate) mod byte_stream {
 
     #[async_trait]
     impl NetworkReader for ByteStreamTransport {
-        async fn receive(&mut self, _buffer: &mut [u8]) -> TdsResult<usize> {
-            Ok(0)
-        }
         fn packet_size(&self) -> u32 {
             4096
         }
