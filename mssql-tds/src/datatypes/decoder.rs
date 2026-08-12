@@ -90,7 +90,7 @@ const MAX_PLP_SIZE: usize = i32::MAX as usize;
 /// magnitude. SQL Server's maximum precision of 38 digits fits in 128 bits, and
 /// the widest value the TDS wire format carries is 17 bytes (sign byte plus four
 /// words), so anything longer is malformed.
-const MAX_DECIMAL_INT_PARTS: u8 = 4;
+const MAX_DECIMAL_INT_PARTS: usize = 4;
 
 // Helper function to validate allocation size before allocating
 #[inline]
@@ -667,7 +667,12 @@ impl GenericDecoder {
         let sign = reader.read_byte().await?;
         let is_positive = sign == 1;
 
-        let number_of_int_parts = (length - 1) >> 2;
+        // Round up: a declared length that does not cover whole 32-bit words
+        // still has to be consumed, or the leftover bytes desynchronize the
+        // stream for the next field. A trailing partial word is zero-padded,
+        // which matches the length-tolerant reader on the Always Encrypted path.
+        let magnitude_len = (length - 1) as usize;
+        let number_of_int_parts = magnitude_len.div_ceil(4);
 
         if number_of_int_parts > MAX_DECIMAL_INT_PARTS {
             return Err(crate::error::Error::ProtocolError(format!(
@@ -675,12 +680,18 @@ impl GenericDecoder {
             )));
         }
 
-        let int_parts_len = number_of_int_parts as usize;
-        validate_alloc_size(int_parts_len * 4, "read_decimal int_parts")?;
-        let mut int_parts = vec![0i32; int_parts_len];
-        for part_index in 0..number_of_int_parts {
-            int_parts[part_index as usize] = reader.read_int32().await?;
-        }
+        validate_alloc_size(number_of_int_parts * 4, "read_decimal int_parts")?;
+        let mut magnitude = vec![0u8; number_of_int_parts * 4];
+        reader.read_bytes(&mut magnitude[..magnitude_len]).await?;
+
+        let int_parts = magnitude
+            .chunks_exact(4)
+            .map(|chunk| {
+                let mut word = [0u8; 4];
+                word.copy_from_slice(chunk);
+                i32::from_le_bytes(word)
+            })
+            .collect();
 
         Ok(Some(DecimalParts {
             is_positive,
@@ -2055,7 +2066,7 @@ impl DecimalParts {
     /// payload or a hand-built [`DecimalParts`] can do; callers fall back to
     /// [`Self::magnitude_big`] instead of shifting past the accumulator width.
     fn magnitude(&self) -> Option<u128> {
-        if self.int_parts.len() > MAX_DECIMAL_INT_PARTS as usize {
+        if self.int_parts.len() > MAX_DECIMAL_INT_PARTS {
             return None;
         }
         Some(
@@ -4343,7 +4354,7 @@ mod test {
         #[tokio::test]
         async fn decimal_large_valid() {
             let md = precision_scale_metadata(TdsDataType::DecimalN, 17, 38, 0);
-            // length=17 → (17-1)>>2 = 4 int parts, the widest valid decimal
+            // length=17 → 16 magnitude bytes = 4 int parts, the widest valid decimal
             let mut buf = vec![17u8, 1u8]; // length=17, sign=positive
             for _ in 0..4 {
                 buf.extend_from_slice(&1i32.to_le_bytes());
@@ -4355,12 +4366,45 @@ mod test {
         #[tokio::test]
         async fn decimal_too_many_int_parts_rejected() {
             let md = precision_scale_metadata(TdsDataType::DecimalN, 21, 38, 0);
-            // length=21 → (21-1)>>2 = 5 int parts, which no valid decimal produces
+            // length=21 → 20 magnitude bytes = 5 int parts, which no valid decimal produces
             let mut buf = vec![21u8, 1u8];
             for _ in 0..5 {
                 buf.extend_from_slice(&1i32.to_le_bytes());
             }
             assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn decimal_oversized_partial_word_length_rejected() {
+            let md = precision_scale_metadata(TdsDataType::DecimalN, 18, 38, 0);
+            // length=18 → 17 magnitude bytes, one byte past the 128-bit limit.
+            // Rounding down would have accepted this as 4 parts and left the
+            // trailing byte unread.
+            let mut buf = vec![18u8, 1u8];
+            buf.extend_from_slice(&[1u8; 17]);
+            assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn decimal_partial_trailing_word_is_fully_consumed() {
+            let md = precision_scale_metadata(TdsDataType::DecimalN, 9, 18, 2);
+            // length=7 → 6 magnitude bytes: a full word plus a 2-byte partial
+            // word that must be zero-padded and consumed, leaving the reader
+            // positioned on the following field rather than mid-value.
+            let mut buf = vec![7u8, 1u8];
+            buf.extend_from_slice(&12345i32.to_le_bytes());
+            buf.extend_from_slice(&[0u8, 0u8]);
+            let trailing = 0x5A5A_5A5Ai32;
+            buf.extend_from_slice(&trailing.to_le_bytes());
+
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(buf);
+            let val = decoder.decode(&mut reader, &md).await.unwrap();
+            match val {
+                ColumnValues::Decimal(parts) => assert_eq!(parts.to_string(), "123.45"),
+                other => panic!("expected Decimal, got {other:?}"),
+            }
+            assert_eq!(reader.read_int32().await.unwrap(), trailing);
         }
 
         // ── Time scale branches ────────────────────────────────────────
