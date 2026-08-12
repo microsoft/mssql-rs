@@ -161,7 +161,7 @@ fn sql_describe_col_w_safe(
     }
 }
 
-fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallInt {
+pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallInt {
     match meta.data_type {
         TdsDataType::Int1 => SQL_TINYINT,
         TdsDataType::Int2 => SQL_SMALLINT,
@@ -215,7 +215,7 @@ fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallI
     }
 }
 
-fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
+pub(crate) fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
     // PLP / `*(max)` / xml / json: ColumnSize is "unbounded". Report 0 per ODBC spec
     if meta.is_plp() {
         return 0;
@@ -282,7 +282,7 @@ fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
     }
 }
 
-fn decimal_digits(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallInt {
+pub(crate) fn decimal_digits(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallInt {
     match meta.data_type {
         // T-SQL `money` and `smallmoney` both have a fixed scale of 4. They are stored
         // as FixedLen/VarLen variants without a scale field, so `get_scale()` returns

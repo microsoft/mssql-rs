@@ -344,6 +344,48 @@ pub const SQL_C_SS_TIMESTAMPOFFSET: SqlSmallInt = SQL_C_TYPES_EXTENDED + 1; // 0
 // sql_variant probe.
 pub const SQL_CA_SS_VARIANT_TYPE: SqlUSmallInt = 1215;
 
+// ---- SQLColAttribute field identifiers --------------------------------------
+// The low-numbered ids are the ODBC 3.x descriptor fields that double as the
+// ODBC 2.x `SQL_COLUMN_*` ids; the 100x block is descriptor-header/record only.
+pub const SQL_DESC_CONCISE_TYPE: SqlUSmallInt = 2;
+pub const SQL_DESC_DISPLAY_SIZE: SqlUSmallInt = 6;
+pub const SQL_DESC_UNSIGNED: SqlUSmallInt = 8;
+pub const SQL_DESC_FIXED_PREC_SCALE: SqlUSmallInt = 9;
+pub const SQL_DESC_UPDATABLE: SqlUSmallInt = 10;
+pub const SQL_DESC_AUTO_UNIQUE_VALUE: SqlUSmallInt = 11;
+pub const SQL_DESC_CASE_SENSITIVE: SqlUSmallInt = 12;
+pub const SQL_DESC_SEARCHABLE: SqlUSmallInt = 13;
+pub const SQL_DESC_TYPE_NAME: SqlUSmallInt = 14;
+pub const SQL_DESC_TABLE_NAME: SqlUSmallInt = 15;
+pub const SQL_DESC_SCHEMA_NAME: SqlUSmallInt = 16;
+pub const SQL_DESC_CATALOG_NAME: SqlUSmallInt = 17;
+pub const SQL_DESC_LABEL: SqlUSmallInt = 18;
+pub const SQL_DESC_BASE_COLUMN_NAME: SqlUSmallInt = 22;
+pub const SQL_DESC_BASE_TABLE_NAME: SqlUSmallInt = 23;
+pub const SQL_DESC_NUM_PREC_RADIX: SqlUSmallInt = 32;
+pub const SQL_DESC_COUNT: SqlUSmallInt = 1001;
+pub const SQL_DESC_TYPE: SqlUSmallInt = 1002;
+pub const SQL_DESC_LENGTH: SqlUSmallInt = 1003;
+pub const SQL_DESC_PRECISION: SqlUSmallInt = 1005;
+pub const SQL_DESC_SCALE: SqlUSmallInt = 1006;
+pub const SQL_DESC_NULLABLE: SqlUSmallInt = 1008;
+pub const SQL_DESC_NAME: SqlUSmallInt = 1011;
+pub const SQL_DESC_UNNAMED: SqlUSmallInt = 1012;
+pub const SQL_DESC_OCTET_LENGTH: SqlUSmallInt = 1013;
+
+// ---- SQLColAttribute value constants ----------------------------------------
+pub const SQL_NULLABLE_UNKNOWN: SqlLen = 2;
+pub const SQL_NAMED: SqlLen = 0;
+pub const SQL_UNNAMED: SqlLen = 1;
+// SQL_DESC_SEARCHABLE
+pub const SQL_PRED_NONE: SqlLen = 0;
+pub const SQL_PRED_CHAR: SqlLen = 1;
+pub const SQL_PRED_BASIC: SqlLen = 2;
+pub const SQL_PRED_SEARCHABLE: SqlLen = 3;
+// SQL_DESC_UPDATABLE
+pub const SQL_ATTR_READONLY: SqlLen = 0;
+pub const SQL_ATTR_READWRITE_UNKNOWN: SqlLen = 2;
+
 // ---- Statement attribute identifiers (SQLSetStmtAttr / SQLGetStmtAttr) ------
 pub const SQL_ATTR_ROW_BIND_TYPE: SqlInteger = 5;
 pub const SQL_ATTR_CURSOR_TYPE: SqlInteger = 6;

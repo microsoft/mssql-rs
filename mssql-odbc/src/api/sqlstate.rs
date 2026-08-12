@@ -34,6 +34,7 @@ pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
 pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
 pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
+pub(crate) const SQLSTATE_HY091: [u8; 5] = *b"HY091";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
 pub(crate) const SQLSTATE_HY096: [u8; 5] = *b"HY096";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
@@ -76,6 +77,10 @@ pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_DESCRIPTOR_INDEX: DiagMsg = DiagMsg {
     state: SQLSTATE_07009,
     text: "Invalid descriptor index",
+};
+pub(crate) const ERR_INVALID_DESCRIPTOR_FIELD: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY091,
+    text: "Invalid descriptor field identifier",
 };
 pub(crate) const ERR_UNBOUND_PARAMETER: DiagMsg = DiagMsg {
     state: SQLSTATE_07002,
