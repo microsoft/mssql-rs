@@ -7,7 +7,7 @@ use crate::datatypes::column_values::{
 };
 use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sql_json::SqlJson;
-use crate::datatypes::sql_string::SqlString;
+use crate::datatypes::sql_string::{EncodingType, SqlString};
 use crate::datatypes::sql_vector::SqlVector;
 use uuid::Uuid;
 
@@ -35,8 +35,38 @@ pub trait RowWriter {
     fn write_f64(&mut self, col: usize, val: f64);
     /// Writes a character string value.
     fn write_string(&mut self, col: usize, val: SqlString);
+    /// Writes packet-backed encoded string bytes before the packet buffer is reused.
+    fn write_string_ref(&mut self, col: usize, bytes: &[u8], encoding_type: &EncodingType) {
+        self.write_string(col, SqlString::new(bytes.to_vec(), encoding_type.clone()));
+    }
     /// Writes a binary value.
     fn write_bytes(&mut self, col: usize, val: Vec<u8>);
+    /// Writes packet-backed binary bytes before the packet buffer is reused.
+    fn write_bytes_ref(&mut self, col: usize, bytes: &[u8]) {
+        self.write_bytes(col, bytes.to_vec());
+    }
+    /// Returns a destination for a known-length binary value, when the consumer
+    /// can allocate its final representation before the decoder reads the bytes.
+    fn bytes_destination(&mut self, _col: usize, _length: usize) -> Option<&mut [u8]> {
+        None
+    }
+    /// Completes or abandons a destination returned by [`Self::bytes_destination`].
+    fn finish_bytes_destination(&mut self, _col: usize, _success: bool) {}
+    /// Returns a destination for a known-length character value, when the consumer
+    /// can allocate its final representation before the decoder reads the bytes.
+    ///
+    /// `length` counts encoded bytes on the wire, not characters, so a consumer
+    /// whose storage differs in length under `encoding_type` returns `None`.
+    fn string_destination(
+        &mut self,
+        _col: usize,
+        _length: usize,
+        _encoding_type: &EncodingType,
+    ) -> Option<&mut [u8]> {
+        None
+    }
+    /// Completes or abandons a destination returned by [`Self::string_destination`].
+    fn finish_string_destination(&mut self, _col: usize, _success: bool) {}
     /// Writes a `decimal` value.
     fn write_decimal(&mut self, col: usize, val: DecimalParts);
     /// Writes a `numeric` value.

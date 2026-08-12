@@ -2,9 +2,12 @@
 // Licensed under the MIT License.
 
 use crate::core::{CancelHandle, TdsResult};
-use crate::datatypes::decoder::{GenericDecoder, PlpColumnStream, decrypt_encrypted_column};
+use crate::datatypes::column_values::{SqlDate, SqlDateTime2, SqlTime};
+use crate::datatypes::decoder::{
+    DecimalParts, GenericDecoder, PlpColumnStream, decrypt_encrypted_column,
+};
 use crate::datatypes::row_writer::{DiscardRowWriter, RowWriter, write_column_value};
-use crate::io::packet_reader::TdsPacketReader;
+use crate::io::packet_reader::{TdsPacketReader, read_byte_buffered};
 use crate::query::metadata::ColumnMetadata;
 use crate::security::cell_decryptor::CellDecryptor;
 use crate::token::parsers::TokenParser;
@@ -15,8 +18,10 @@ use crate::token::parsers::{
     OrderTokenParser, ReturnStatusTokenParser, ReturnValueTokenParser, RowTokenParser,
     SessionStateTokenParser, SspiTokenParser, TabNameTokenParser,
 };
+use crate::token::tokens::DecodeOp;
 use crate::token::tokens::{ColMetadataToken, TokenType, Tokens};
 use async_trait::async_trait;
+use byteorder::{ByteOrder, LittleEndian};
 use core::convert::From;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -279,6 +284,414 @@ pub trait TdsTokenStreamReader {
     ) -> TdsResult<usize>;
 }
 
+/// Decodes one ROW or NBCROW token straight out of the reader's current buffer,
+/// without entering the async packet path.
+///
+/// # Why this path exists
+///
+/// The async path reads every column with its own `await`, and each of those
+/// reads crosses `#[async_trait]`, which allocates a boxed future. A column
+/// costs two such reads, one for the length prefix and one for the data. The
+/// row is normally sitting whole in the read buffer the entire time, so all of
+/// that work happens to move bytes that have already arrived.
+///
+/// This function takes the whole row from that buffer under a single borrow.
+///
+/// # The two passes
+///
+/// Pass one measures the row. Every field is bounds checked. If the row runs
+/// past the end of the buffer the pass returns `Ok(None)`, and the caller falls
+/// back to the async path, which is able to wait for the next packet. At that
+/// point nothing has been written to the writer and nothing has been consumed
+/// from the reader, so the fallback starts from a clean state.
+///
+/// Pass two walks the same bytes and decodes them. It carries no bounds checks
+/// and no early exits, because pass one already proved every offset is in
+/// range. That is the whole reason for the split. A single pass would have to
+/// check bounds at every column, and would still have to undo its writes when
+/// it discovered the row was short.
+///
+/// The two passes must stay in step. Any field whose width pass one computes
+/// one way and pass two computes another will silently misread the rest of the
+/// row. Change them together.
+///
+/// `DecodeOp::Generic` marks a column this path does not implement. Pass one
+/// declines on it, which is why pass two can treat it as `unreachable!()`.
+///
+/// # Reader contract
+///
+/// The reader is touched exactly twice. Once to borrow the buffer, and once to
+/// consume the byte count pass two settled on. The borrow is held across the
+/// whole body, so nothing in between can move the buffer underneath it.
+///
+/// # Returns
+///
+/// * `Ok(Some(RowReadResult::RowWritten))` - a row was decoded and consumed.
+/// * `Ok(None)` - this path declined. Not an error. The caller must run the
+///   async path instead.
+fn try_receive_row_into_buffered<R: TdsPacketReader + Send + Sync>(
+    reader: &mut R,
+    context: &ParserContext,
+    writer: &mut (dyn RowWriter + Send),
+) -> TdsResult<Option<RowReadResult>> {
+    let (metadata, decryptor) = extract_column_metadata(context)?;
+    // Encrypted cells arrive as ciphertext and only the async path knows how to
+    // decrypt them, so decline the whole row when a decryptor is present.
+    if decryptor.is_some() {
+        return Ok(None);
+    }
+    let columns = &metadata.columns;
+    let plan = metadata.decode_plan();
+
+    let consumed = {
+        let Some(buffer) = reader.buffered_slice() else {
+            return Ok(None);
+        };
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+
+        let token = TokenType::try_from(buffer[0])?;
+        let is_nbc = match token {
+            TokenType::Row => false,
+            TokenType::NbcRow => true,
+            _ => return Ok(None),
+        };
+        let bitmap_len = if is_nbc { columns.len().div_ceil(8) } else { 0 };
+        let data_start = 1 + bitmap_len;
+        if buffer.len() < data_start {
+            return Ok(None);
+        }
+
+        let is_null = |column: usize| is_nbc && buffer[1 + column / 8] & (1 << (column % 8)) != 0;
+
+        /*
+         * pass 1: measure the row
+         *
+         * Bounds check every field. Return Ok(None) the moment the row runs
+         * past the buffer, before anything has been written or consumed.
+         */
+        let mut position = data_start;
+        for (column, operation) in plan.iter().enumerate() {
+            if is_null(column) {
+                continue;
+            }
+            match operation {
+                DecodeOp::IntN => {
+                    if position >= buffer.len() {
+                        return Ok(None);
+                    }
+                    let length = buffer[position] as usize;
+                    if !matches!(length, 0 | 1 | 2 | 4 | 8) {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid IntN length: {length}"
+                        )));
+                    }
+                    position += 1;
+                    if position + length > buffer.len() {
+                        return Ok(None);
+                    }
+                    position += length;
+                }
+                DecodeOp::BitN => {
+                    if position >= buffer.len() {
+                        return Ok(None);
+                    }
+                    let length = buffer[position] as usize;
+                    if !matches!(length, 0 | 1) {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid BitN length: {length}"
+                        )));
+                    }
+                    position += 1;
+                    if position + length > buffer.len() {
+                        return Ok(None);
+                    }
+                    position += length;
+                }
+                DecodeOp::FltN => {
+                    if position >= buffer.len() {
+                        return Ok(None);
+                    }
+                    let length = buffer[position] as usize;
+                    if !matches!(length, 0 | 4 | 8) {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid FltN length: {length}"
+                        )));
+                    }
+                    position += 1;
+                    if position + length > buffer.len() {
+                        return Ok(None);
+                    }
+                    position += length;
+                }
+                DecodeOp::Decimal { .. } => {
+                    if position >= buffer.len() {
+                        return Ok(None);
+                    }
+                    let length = buffer[position] as usize;
+                    if !matches!(length, 0 | 5 | 9 | 13 | 17) {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid decimal length: {length}"
+                        )));
+                    }
+                    position += 1;
+                    if position + length > buffer.len() {
+                        return Ok(None);
+                    }
+                    position += length;
+                }
+                DecodeOp::DateN => {
+                    if position >= buffer.len() {
+                        return Ok(None);
+                    }
+                    let length = buffer[position] as usize;
+                    if !matches!(length, 0 | 3) {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid DateN length: {length}"
+                        )));
+                    }
+                    position += 1;
+                    if position + length > buffer.len() {
+                        return Ok(None);
+                    }
+                    position += length;
+                }
+                DecodeOp::TimeN { .. } => {
+                    if position >= buffer.len() {
+                        return Ok(None);
+                    }
+                    let length = buffer[position] as usize;
+                    if !matches!(length, 0 | 3 | 4 | 5) {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid TimeN length: {length}"
+                        )));
+                    }
+                    position += 1;
+                    if position + length > buffer.len() {
+                        return Ok(None);
+                    }
+                    position += length;
+                }
+                DecodeOp::DateTime2N { .. } => {
+                    if position >= buffer.len() {
+                        return Ok(None);
+                    }
+                    let length = buffer[position] as usize;
+                    if !matches!(length, 0 | 6 | 7 | 8) {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid DateTime2N length: {length}"
+                        )));
+                    }
+                    position += 1;
+                    if position + length > buffer.len() {
+                        return Ok(None);
+                    }
+                    position += length;
+                }
+                DecodeOp::ShortBinary => {
+                    if position + 2 > buffer.len() {
+                        return Ok(None);
+                    }
+                    let length = LittleEndian::read_u16(&buffer[position..]) as usize;
+                    position += 2;
+                    if length != 0xFFFF {
+                        if position + length > buffer.len() {
+                            return Ok(None);
+                        }
+                        position += length;
+                    }
+                }
+                DecodeOp::ShortString(_) => {
+                    if position + 2 > buffer.len() {
+                        return Ok(None);
+                    }
+                    let length = LittleEndian::read_u16(&buffer[position..]) as usize;
+                    position += 2;
+                    if length != 0xFFFF {
+                        if position + length > buffer.len() {
+                            return Ok(None);
+                        }
+                        position += length;
+                    }
+                }
+                DecodeOp::Generic => return Ok(None),
+            }
+        }
+
+        /*
+         * pass 2: decode the row
+         *
+         * No bounds checks below. Pass 1 walked these exact offsets and proved
+         * they are in range.
+         */
+        position = data_start;
+        for (column, operation) in plan.iter().enumerate() {
+            if is_null(column) {
+                writer.write_null(column);
+                continue;
+            }
+            match operation {
+                DecodeOp::IntN => {
+                    let length = buffer[position] as usize;
+                    position += 1;
+                    match length {
+                        0 => writer.write_null(column),
+                        1 => writer.write_u8(column, buffer[position]),
+                        2 => writer.write_i16(column, LittleEndian::read_i16(&buffer[position..])),
+                        4 => writer.write_i32(column, LittleEndian::read_i32(&buffer[position..])),
+                        8 => writer.write_i64(column, LittleEndian::read_i64(&buffer[position..])),
+                        _ => unreachable!(),
+                    }
+                    position += length;
+                }
+                DecodeOp::BitN => {
+                    let length = buffer[position] as usize;
+                    position += 1;
+                    if length == 0 {
+                        writer.write_null(column);
+                    } else {
+                        writer.write_bool(column, buffer[position] == 1);
+                        position += 1;
+                    }
+                }
+                DecodeOp::FltN => {
+                    let length = buffer[position] as usize;
+                    position += 1;
+                    match length {
+                        0 => writer.write_null(column),
+                        4 => writer.write_f32(column, LittleEndian::read_f32(&buffer[position..])),
+                        8 => writer.write_f64(column, LittleEndian::read_f64(&buffer[position..])),
+                        _ => unreachable!(),
+                    }
+                    position += length;
+                }
+                DecodeOp::Decimal {
+                    precision,
+                    scale,
+                    numeric,
+                } => {
+                    let length = buffer[position] as usize;
+                    position += 1;
+                    if length == 0 {
+                        writer.write_null(column);
+                    } else {
+                        let is_positive = buffer[position] == 1;
+                        position += 1;
+                        let mut int_parts = Vec::with_capacity((length - 1) / 4);
+                        for _ in 0..(length - 1) / 4 {
+                            int_parts.push(LittleEndian::read_i32(&buffer[position..]));
+                            position += 4;
+                        }
+                        let parts = DecimalParts {
+                            is_positive,
+                            scale: *scale,
+                            precision: *precision,
+                            int_parts,
+                        };
+                        if *numeric {
+                            writer.write_numeric(column, parts);
+                        } else {
+                            writer.write_decimal(column, parts);
+                        }
+                    }
+                }
+                DecodeOp::DateN => {
+                    let length = buffer[position] as usize;
+                    position += 1;
+                    if length == 0 {
+                        writer.write_null(column);
+                    } else {
+                        let date = SqlDate::create(LittleEndian::read_u24(&buffer[position..]))?;
+                        position += 3;
+                        writer.write_date(column, date);
+                    }
+                }
+                DecodeOp::TimeN { scale } => {
+                    let length = buffer[position] as usize;
+                    position += 1;
+                    if length == 0 {
+                        writer.write_null(column);
+                    } else {
+                        let time = decode_buffered_time(&buffer[position..], length, *scale);
+                        position += length;
+                        writer.write_time(column, time);
+                    }
+                }
+                DecodeOp::DateTime2N { scale } => {
+                    let length = buffer[position] as usize;
+                    position += 1;
+                    if length == 0 {
+                        writer.write_null(column);
+                    } else {
+                        let time_len = length - 3;
+                        let time = decode_buffered_time(&buffer[position..], time_len, *scale);
+                        position += time_len;
+                        let days = LittleEndian::read_u24(&buffer[position..]);
+                        position += 3;
+                        writer.write_datetime2(column, SqlDateTime2 { days, time });
+                    }
+                }
+                DecodeOp::ShortBinary => {
+                    let length = LittleEndian::read_u16(&buffer[position..]) as usize;
+                    position += 2;
+                    if length == 0xFFFF {
+                        writer.write_null(column);
+                    } else {
+                        writer.write_bytes_ref(column, &buffer[position..position + length]);
+                        position += length;
+                    }
+                }
+                DecodeOp::ShortString(encoding) => {
+                    let length = LittleEndian::read_u16(&buffer[position..]) as usize;
+                    position += 2;
+                    if length == 0xFFFF {
+                        writer.write_null(column);
+                    } else {
+                        writer.write_string_ref(
+                            column,
+                            &buffer[position..position + length],
+                            encoding,
+                        );
+                        position += length;
+                    }
+                }
+                DecodeOp::Generic => unreachable!(),
+            }
+        }
+        position
+    };
+
+    // The buffer borrow ends here, so this is the first point at which the
+    // reader can be advanced. It cannot fail today, because nothing released
+    // bytes while the borrow was held. It is checked so that a future change
+    // which breaks that invariant fails loudly instead of skipping a row.
+    if !reader.consume_buffered(consumed) {
+        return Err(crate::error::Error::ImplementationError(
+            "Buffered row changed before commit".to_string(),
+        ));
+    }
+    Ok(Some(RowReadResult::RowWritten))
+}
+
+fn decode_buffered_time(buffer: &[u8], length: usize, scale: u8) -> SqlTime {
+    let scaled = LittleEndian::read_uint(buffer, length);
+    let multiplier = match scale {
+        0 => 10_000_000,
+        1 => 1_000_000,
+        2 => 100_000,
+        3 => 10_000,
+        4 => 1_000,
+        5 => 100,
+        6 => 10,
+        _ => 1,
+    };
+    SqlTime {
+        time_nanoseconds: scaled * multiplier,
+        scale,
+    }
+}
+
 #[cfg(fuzzing)]
 pub struct TokenStreamReader<T, R>
 where
@@ -347,6 +760,19 @@ fn extract_row_context(context: &ParserContext) -> TdsResult<RowDecodeContext<'_
         ParserContext::ColumnMetadata(metadata, decryptor) => {
             Ok((&metadata.columns, decryptor.as_ref()))
         }
+        _ => Err(crate::error::Error::ProtocolError(
+            "Expected ColumnMetadata in context for row decoding".to_string(),
+        )),
+    }
+}
+
+/// Like [`extract_row_context`], but yields the whole token so the caller can
+/// reach [`ColMetadataToken::decode_plan`].
+fn extract_column_metadata(
+    context: &ParserContext,
+) -> TdsResult<(&ColMetadataToken, Option<&Arc<dyn CellDecryptor>>)> {
+    match context {
+        ParserContext::ColumnMetadata(metadata, decryptor) => Ok((metadata, decryptor.as_ref())),
         _ => Err(crate::error::Error::ProtocolError(
             "Expected ColumnMetadata in context for row decoding".to_string(),
         )),
@@ -584,9 +1010,17 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
     plan: ColumnPolicy,
     writer: &mut (dyn RowWriter + Send),
 ) -> TdsResult<RowReadResult> {
-    let token_type_byte = reader.read_byte().await?;
+    // The buffered path decodes every column of one whole row, so it can only
+    // stand in for DecodeAll. Cursor policies pause mid row and are left to
+    // drive_row_columns.
+    if matches!(plan, ColumnPolicy::DecodeAll)
+        && let Some(result) = try_receive_row_into_buffered(reader, context, writer)?
+    {
+        return Ok(result);
+    }
+
+    let token_type_byte = read_byte_buffered(reader).await?;
     let token_type: TokenType = token_type_byte.try_into()?;
-    debug!("Parsing token type: {:?}", &token_type);
 
     match token_type {
         TokenType::Row => {
@@ -1314,6 +1748,7 @@ mod tests {
                 column_count: 1,
                 columns: vec![metadata],
                 cek_table: vec![],
+                ..Default::default()
             }),
             None,
         );
@@ -1361,6 +1796,7 @@ mod tests {
                     plp_varbinary_metadata("c2", None),
                 ],
                 cek_table: vec![],
+                ..Default::default()
             }),
             None,
         );
@@ -1397,6 +1833,7 @@ mod tests {
                 column_count: 1,
                 columns: vec![plp_varbinary_metadata("c1", Some(ae_crypto_metadata()))],
                 cek_table: vec![],
+                ..Default::default()
             }),
             None,
         );

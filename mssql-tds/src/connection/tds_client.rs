@@ -3073,7 +3073,6 @@ impl TdsClient {
     ///
     /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
     /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
-    #[instrument(skip(self, writer), level = "info")]
     pub(crate) async fn get_next_row_into(
         &mut self,
         writer: &mut (dyn RowWriter + Send),
@@ -3130,7 +3129,6 @@ impl TdsClient {
             match result {
                 RowReadResult::RowWritten => {
                     writer.end_row();
-                    info!("Row Received");
                     return Ok(true);
                 }
                 RowReadResult::RowPaused(_) | RowReadResult::PlpPaused(_) => {
@@ -3500,6 +3498,29 @@ impl TdsClient {
             _ => Err(crate::error::Error::ProtocolError(format!(
                 "Unexpected token while finding the next row: {token:?}"
             ))),
+        }
+    }
+
+    /// Decodes the next row into `writer` without going through the
+    /// [`ResultSet`] trait.
+    ///
+    /// `ResultSet::next_row_into` is an `#[async_trait]` method, so every call
+    /// to it allocates a boxed future. This inherent form reaches the same
+    /// `get_next_row_into`. Both are kept, because a caller holding a
+    /// `dyn ResultSet` still needs the trait method.
+    ///
+    /// # Returns
+    ///
+    /// `true` when a row was written, and `false` once the result set is
+    /// drained.
+    pub async fn next_row_into_unboxed(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<bool> {
+        if self.maybe_has_unread_rows() {
+            self.get_next_row_into(writer).await
+        } else {
+            Ok(false)
         }
     }
 

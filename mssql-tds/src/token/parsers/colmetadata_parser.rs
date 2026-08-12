@@ -244,6 +244,7 @@ where
             column_count: col_count,
             columns: column_metadata,
             cek_table,
+            decode_plan: std::sync::OnceLock::new(),
         };
         Ok(Tokens::from(metadata))
     }

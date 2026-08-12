@@ -232,6 +232,7 @@ mod tests {
                 column_count: columns.len() as u16,
                 columns,
                 cek_table: Vec::new(),
+                decode_plan: std::sync::OnceLock::new(),
             }),
             None,
         )

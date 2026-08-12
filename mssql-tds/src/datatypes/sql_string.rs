@@ -3,7 +3,7 @@
 
 use crate::{query::metadata::ColumnMetadata, token::tokens::SqlCollation};
 use core::fmt;
-use std::{fmt::Debug, fmt::Display};
+use std::{borrow::Cow, fmt::Debug, fmt::Display};
 use tracing::warn;
 
 use super::{
@@ -12,7 +12,7 @@ use super::{
 };
 
 /// Character encoding used by a [`SqlString`].
-#[derive(PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum EncodingType {
     /// UTF-8 encoding.
     Utf8,
@@ -54,50 +54,7 @@ impl SqlString {
 
     /// Decodes the stored bytes into a Rust `String` according to the encoding type.
     pub fn to_utf8_string(&self) -> String {
-        match self.encoding_type {
-            // TODO: Investigation needed. When creating a Utf8 strings from the vector, the string is weirdly encoded.
-            // UTF16 decode works better.
-            EncodingType::Utf8 => String::from_utf8(self.bytes.clone()).unwrap(),
-            EncodingType::Utf16 => {
-                // Use encoding_rs for efficient UTF-16LE decoding without intermediate Vec<u16> allocation
-                let (decoded, _, _) = encoding_rs::UTF_16LE.decode(&self.bytes);
-                decoded.into_owned()
-            }
-            EncodingType::LcidBased(collation) => {
-                // Extract LCID from the lower 20 bits of collation.info
-                let lcid = collation.info & 0x000F_FFFF;
-
-                // Map LCID to encoding
-                let encoding = match lcid_to_encoding(lcid) {
-                    Ok(enc) => enc,
-                    Err(e) => {
-                        warn!(
-                            "Unsupported LCID 0x{:04X} ({}), falling back to Windows-1252. Error: {}",
-                            lcid, lcid, e
-                        );
-                        // Fall back to Windows-1252 for unsupported LCIDs
-                        encoding_rs::WINDOWS_1252
-                    }
-                };
-
-                // Decode bytes using the determined encoding
-                let (decoded, _used_encoding, had_errors) = encoding.decode(&self.bytes);
-
-                if had_errors {
-                    warn!(
-                        "Encountered decoding errors while converting LCID 0x{:04X} ({}) encoded data. \
-                         Some characters may have been replaced with U+FFFD.",
-                        lcid, lcid
-                    );
-                }
-
-                decoded.into_owned()
-            }
-            EncodingType::DelayedSet => {
-                // DelayedSet encoding is not defined, so we return the bytes as a UTF-8 string.
-                unimplemented!("DelayedSet encoding conversion to UTF8 not implemented");
-            }
-        }
+        decode_bytes_to_utf8(&self.bytes, &self.encoding_type).into_owned()
     }
 
     /// Returns true if this SqlString is already encoded as UTF-16
@@ -132,6 +89,55 @@ impl SqlString {
     #[inline]
     pub fn encoding_type(&self) -> &EncodingType {
         &self.encoding_type
+    }
+}
+
+/// Decodes encoded SQL string bytes into UTF-8.
+///
+/// The result borrows the input whenever no transcoding is needed. That covers
+/// the UTF-8 case and the single-byte collation case when the content is ASCII.
+/// UTF-16 always allocates. Returning a `Cow` lets a caller that only reads the
+/// text avoid a copy, while [`SqlString::to_utf8_string`] keeps its owned
+/// return by calling `into_owned`.
+///
+/// # Panics
+///
+/// Panics when `EncodingType::Utf8` bytes are not valid UTF-8, and on
+/// `EncodingType::DelayedSet`, which has no conversion defined.
+pub fn decode_bytes_to_utf8<'a>(bytes: &'a [u8], encoding_type: &EncodingType) -> Cow<'a, str> {
+    match encoding_type {
+        // TODO: Investigation needed. When creating a Utf8 string from the bytes,
+        // the string is weirdly encoded. UTF16 decode works better.
+        EncodingType::Utf8 => Cow::Borrowed(std::str::from_utf8(bytes).unwrap()),
+        EncodingType::Utf16 => {
+            let (decoded, _, _) = encoding_rs::UTF_16LE.decode(bytes);
+            decoded
+        }
+        EncodingType::LcidBased(collation) => {
+            let lcid = collation.info & 0x000F_FFFF;
+            let encoding = match lcid_to_encoding(lcid) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    warn!(
+                        "Unsupported LCID 0x{:04X} ({}), falling back to Windows-1252. Error: {}",
+                        lcid, lcid, e
+                    );
+                    encoding_rs::WINDOWS_1252
+                }
+            };
+            let (decoded, _used_encoding, had_errors) = encoding.decode(bytes);
+            if had_errors {
+                warn!(
+                    "Encountered decoding errors while converting LCID 0x{:04X} ({}) encoded data. \
+                     Some characters may have been replaced with U+FFFD.",
+                    lcid, lcid
+                );
+            }
+            decoded
+        }
+        EncodingType::DelayedSet => {
+            unimplemented!("DelayedSet encoding conversion to UTF8 not implemented");
+        }
     }
 }
 

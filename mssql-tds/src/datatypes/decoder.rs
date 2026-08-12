@@ -12,6 +12,7 @@ use super::{
 };
 use crate::datatypes::sqldatatypes::TypeInfo;
 use crate::security::cell_decryptor::CellDecryptor;
+use crate::token::tokens::DecodeOp;
 use crate::{
     core::TdsResult,
     datatypes::{sql_json::SqlJson, sql_string::EncodingType, sqldatatypes::FixedLengthTypes},
@@ -21,7 +22,10 @@ use crate::{
         ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
         SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
     },
-    io::packet_reader::TdsPacketReader,
+    io::packet_reader::{
+        TdsPacketReader, read_byte_buffered, read_bytes_buffered, read_int32_buffered,
+        read_uint16_buffered,
+    },
 };
 use crate::{query::metadata::ColumnMetadata, token::tokens::SqlCollation};
 
@@ -997,92 +1001,232 @@ impl GenericDecoder {
         let long_len_i64 = reader.read_int64().await?;
         let long_len = long_len_i64 as u64;
 
-        // If the length is SQL_PLP_NULL, it means the value is NULL.
         if long_len as usize == Self::SQL_PLP_NULL {
-            Ok(None)
-        } else {
-            // If the length is SQL_PLP_UNKNOWNLEN, it means the length is unknown and we have to
-            // gather all the chunks until we reach the end of the PLP data which is a zero length
-            // chunk.
-            let mut vector_capacity = if long_len as usize != Self::SQL_PLP_UNKNOWNLEN {
-                let capacity = long_len as usize;
-                // Check for overflow or excessively large values
-                // If long_len_i64 was negative, casting to u64 then usize can produce huge values
-                if long_len_i64 < 0 || capacity > MAX_PLP_SIZE {
-                    return Err(crate::error::Error::ProtocolError(format!(
-                        "PLP length {capacity} (raw i64: {long_len_i64}) exceeds maximum allowed size of {MAX_PLP_SIZE} bytes"
-                    )));
-                }
-                capacity
-            } else {
-                0
-            };
-            let mut plp_buffer = vec![0u8; vector_capacity];
-            let mut chunk_len = reader.read_uint32().await? as usize;
-            let mut offset: usize = 0;
-            let mut chunk_count = 0u32;
-
-            while chunk_len > 0 {
-                chunk_count += 1;
-
-                #[cfg(fuzzing)]
-                {
-                    eprintln!(
-                        "[ALLOC] read_plp_bytes: chunk #{chunk_count}, chunk_len={chunk_len}, total_capacity={vector_capacity}"
-                    );
-                }
-
-                if chunk_count > Self::MAX_PLP_CHUNKS {
-                    return Err(crate::error::Error::ProtocolError(format!(
-                        "Too many PLP chunks: {chunk_count} (max {})",
-                        Self::MAX_PLP_CHUNKS
-                    )));
-                }
-
-                // Limit individual chunk size
-                if chunk_len > Self::MAX_PLP_CHUNK_SIZE {
-                    return Err(crate::error::Error::ProtocolError(format!(
-                        "PLP chunk size {chunk_len} exceeds maximum allowed chunk size of {} bytes",
-                        Self::MAX_PLP_CHUNK_SIZE
-                    )));
-                }
-
-                if long_len as usize == Self::SQL_PLP_UNKNOWNLEN {
-                    // Use checked_add to prevent capacity overflow
-                    vector_capacity = vector_capacity.checked_add(chunk_len).ok_or_else(|| {
-                        crate::error::Error::ProtocolError(format!(
-                            "PLP chunk accumulation would overflow capacity: {vector_capacity} + {chunk_len}"
-                        ))
-                    })?;
-                    // Validate against MAX_PLP_SIZE after accumulation
-                    if vector_capacity > MAX_PLP_SIZE {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "PLP accumulated size {vector_capacity} exceeds maximum allowed size of {MAX_PLP_SIZE} bytes (SQL Server limit: 2GB)"
-                        )));
-                    }
-                    plp_buffer.resize(vector_capacity, 0);
-                } else {
-                    // For known length, validate that chunk fits within the allocated buffer
-                    let end_offset = offset.checked_add(chunk_len).ok_or_else(|| {
-                        crate::error::Error::ProtocolError(format!(
-                            "PLP chunk offset would overflow: {offset} + {chunk_len}"
-                        ))
-                    })?;
-                    if end_offset > plp_buffer.len() {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "PLP chunk exceeds declared length: offset={offset}, chunk_len={chunk_len}, buffer_len={}, declared_len={long_len}",
-                            plp_buffer.len()
-                        )));
-                    }
-                }
-                let chunk_size_read = reader
-                    .read_bytes(&mut plp_buffer[offset..offset + chunk_len])
-                    .await?;
-                offset += chunk_size_read;
-                chunk_len = reader.read_uint32().await? as usize;
-            }
-            Ok(Some(plp_buffer))
+            return Ok(None);
         }
+        if long_len as usize == Self::SQL_PLP_UNKNOWNLEN {
+            return Ok(Some(Self::read_unknown_plp_bytes(reader).await?));
+        }
+
+        let length = Self::validate_known_plp_length(long_len_i64)?;
+        let mut bytes = vec![0u8; length];
+        Self::read_known_plp_bytes(reader, &mut bytes).await?;
+        Ok(Some(bytes))
+    }
+
+    /// Reads a PLP character value and hands it to the writer.
+    ///
+    /// A PLP value arrives as a declared total length followed by chunks. When
+    /// that length is known up front, the writer is offered the chance to
+    /// supply the destination through [`RowWriter::string_destination`], and
+    /// the chunks are read straight into the consumer's own storage. Nothing
+    /// is allocated here in that case.
+    ///
+    /// A writer that cannot hold the bytes in their wire encoding returns
+    /// `None`, and this falls back to an owned `Vec` wrapped in a [`SqlString`].
+    ///
+    /// [`RowWriter::finish_string_destination`] is called whether the read
+    /// succeeded or not, so the writer can commit or discard a destination it
+    /// only partly filled.
+    ///
+    /// The unknown-length form gets no destination, because the consumer
+    /// cannot size its storage until the final chunk arrives.
+    async fn read_plp_string_into<T, W>(
+        reader: &mut T,
+        col: usize,
+        writer: &mut W,
+        encoding_type: &EncodingType,
+    ) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+        W: RowWriter + ?Sized,
+    {
+        let long_len_i64 = reader.read_int64().await?;
+        let long_len = long_len_i64 as u64;
+
+        if long_len as usize == Self::SQL_PLP_NULL {
+            writer.write_null(col);
+        } else if long_len as usize == Self::SQL_PLP_UNKNOWNLEN {
+            let bytes = Self::read_unknown_plp_bytes(reader).await?;
+            writer.write_string(col, SqlString::new(bytes, encoding_type.clone()));
+        } else {
+            let length = Self::validate_known_plp_length(long_len_i64)?;
+            if let Some(destination) = writer.string_destination(col, length, encoding_type) {
+                let result = Self::read_known_plp_bytes(reader, destination).await;
+                writer.finish_string_destination(col, result.is_ok());
+                result?;
+            } else {
+                let mut bytes = vec![0u8; length];
+                Self::read_known_plp_bytes(reader, &mut bytes).await?;
+                writer.write_string(col, SqlString::new(bytes, encoding_type.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads a PLP binary value and hands it to the writer.
+    ///
+    /// Same shape as [`Self::read_plp_string_into`], using
+    /// [`RowWriter::bytes_destination`]. Binary needs no encoding agreement, so
+    /// a writer can accept the destination for any known length.
+    async fn read_plp_binary_into<T, W>(reader: &mut T, col: usize, writer: &mut W) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+        W: RowWriter + ?Sized,
+    {
+        let long_len_i64 = reader.read_int64().await?;
+        let long_len = long_len_i64 as u64;
+
+        if long_len as usize == Self::SQL_PLP_NULL {
+            writer.write_null(col);
+        } else if long_len as usize == Self::SQL_PLP_UNKNOWNLEN {
+            writer.write_bytes(col, Self::read_unknown_plp_bytes(reader).await?);
+        } else {
+            let length = Self::validate_known_plp_length(long_len_i64)?;
+            if let Some(destination) = writer.bytes_destination(col, length) {
+                let result = Self::read_known_plp_bytes(reader, destination).await;
+                writer.finish_bytes_destination(col, result.is_ok());
+                result?;
+            } else {
+                let mut bytes = vec![0u8; length];
+                Self::read_known_plp_bytes(reader, &mut bytes).await?;
+                writer.write_bytes(col, bytes);
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks a declared PLP length before it is used to size an allocation.
+    ///
+    /// The wire carries the length as a signed 64-bit value. A negative one
+    /// would become a huge `usize` on cast, so it is rejected on the signed
+    /// value rather than after conversion.
+    fn validate_known_plp_length(long_len_i64: i64) -> TdsResult<usize> {
+        let length = long_len_i64 as usize;
+        if long_len_i64 < 0 || length > MAX_PLP_SIZE {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "PLP length {length} (raw i64: {long_len_i64}) exceeds maximum allowed size of {MAX_PLP_SIZE} bytes"
+            )));
+        }
+        Ok(length)
+    }
+
+    /// Reads a PLP body of declared length into `destination`.
+    ///
+    /// The chunks have to add up to exactly `destination.len()`. A body that
+    /// ends early and one that overruns are both protocol errors, because the
+    /// destination may belong to the consumer and must not be left part filled
+    /// without the writer being told.
+    async fn read_known_plp_bytes<T>(reader: &mut T, destination: &mut [u8]) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
+        let mut chunk_len = reader.read_uint32().await? as usize;
+        let mut offset = 0usize;
+        let mut chunk_count = 0u32;
+
+        while chunk_len > 0 {
+            chunk_count += 1;
+            Self::validate_plp_chunk(chunk_count, chunk_len)?;
+
+            let end_offset = offset.checked_add(chunk_len).ok_or_else(|| {
+                crate::error::Error::ProtocolError(format!(
+                    "PLP chunk offset would overflow: {offset} + {chunk_len}"
+                ))
+            })?;
+            if end_offset > destination.len() {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "PLP chunk exceeds declared length: offset={offset}, chunk_len={chunk_len}, declared_len={}",
+                    destination.len()
+                )));
+            }
+            let chunk_size_read = reader
+                .read_bytes(&mut destination[offset..end_offset])
+                .await?;
+            if chunk_size_read != chunk_len {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "Short PLP chunk read: expected={chunk_len}, actual={chunk_size_read}"
+                )));
+            }
+            offset = end_offset;
+            chunk_len = reader.read_uint32().await? as usize;
+        }
+
+        if offset != destination.len() {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "PLP data shorter than declared length: actual={offset}, declared={}",
+                destination.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reads a PLP body whose total length the sender did not declare.
+    ///
+    /// Chunks are appended until a zero-length chunk ends the value, so the
+    /// size is only known once the read finishes. That is why this form cannot
+    /// use a writer destination.
+    async fn read_unknown_plp_bytes<T>(reader: &mut T) -> TdsResult<Vec<u8>>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
+        let mut bytes = Vec::new();
+        let mut chunk_len = reader.read_uint32().await? as usize;
+        let mut chunk_count = 0u32;
+
+        while chunk_len > 0 {
+            chunk_count += 1;
+            Self::validate_plp_chunk(chunk_count, chunk_len)?;
+
+            let offset = bytes.len();
+            let new_len = offset.checked_add(chunk_len).ok_or_else(|| {
+                crate::error::Error::ProtocolError(format!(
+                    "PLP chunk accumulation would overflow capacity: {offset} + {chunk_len}"
+                ))
+            })?;
+            if new_len > MAX_PLP_SIZE {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "PLP accumulated size {new_len} exceeds maximum allowed size of {MAX_PLP_SIZE} bytes (SQL Server limit: 2GB)"
+                )));
+            }
+            bytes.resize(new_len, 0);
+            let chunk_size_read = reader.read_bytes(&mut bytes[offset..new_len]).await?;
+            if chunk_size_read != chunk_len {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "Short PLP chunk read: expected={chunk_len}, actual={chunk_size_read}"
+                )));
+            }
+            chunk_len = reader.read_uint32().await? as usize;
+        }
+        Ok(bytes)
+    }
+
+    /// Caps how long an undeclared PLP stream is allowed to run.
+    ///
+    /// Without a declared total length the only protection is a bound on the
+    /// number of chunks and on each chunk's size. Both limits are tightened
+    /// under `fuzzing` so a generated input fails fast.
+    fn validate_plp_chunk(chunk_count: u32, chunk_len: usize) -> TdsResult<()> {
+        #[cfg(fuzzing)]
+        const MAX_PLP_CHUNKS: u32 = 1000;
+        #[cfg(not(fuzzing))]
+        const MAX_PLP_CHUNKS: u32 = 100000;
+        #[cfg(fuzzing)]
+        const MAX_CHUNK_SIZE: usize = 8 * 1024;
+        #[cfg(not(fuzzing))]
+        const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
+        if chunk_count > MAX_PLP_CHUNKS {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "Too many PLP chunks: {chunk_count} (max {MAX_PLP_CHUNKS})"
+            )));
+        }
+        if chunk_len > MAX_CHUNK_SIZE {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "PLP chunk size {chunk_len} exceeds maximum allowed chunk size of {MAX_CHUNK_SIZE} bytes"
+            )));
+        }
+        Ok(())
     }
 
     /// Decodes a column value from the wire and writes it directly into a
@@ -1103,23 +1247,23 @@ impl GenericDecoder {
         match metadata.data_type {
             // === Fixed-length integer types ===
             TdsDataType::Int1 => {
-                writer.write_u8(col, reader.read_byte().await?);
+                writer.write_u8(col, read_byte_buffered(reader).await?);
             }
             TdsDataType::Int2 => {
                 writer.write_i16(col, reader.read_int16().await?);
             }
             TdsDataType::Int4 => {
-                writer.write_i32(col, reader.read_int32().await?);
+                writer.write_i32(col, read_int32_buffered(reader).await?);
             }
             TdsDataType::Int8 => {
                 writer.write_i64(col, reader.read_int64().await?);
             }
             TdsDataType::IntN => {
-                let byte_len = reader.read_byte().await?;
+                let byte_len = read_byte_buffered(reader).await?;
                 match byte_len {
-                    1 => writer.write_u8(col, reader.read_byte().await?),
+                    1 => writer.write_u8(col, read_byte_buffered(reader).await?),
                     2 => writer.write_i16(col, reader.read_int16().await?),
-                    4 => writer.write_i32(col, reader.read_int32().await?),
+                    4 => writer.write_i32(col, read_int32_buffered(reader).await?),
                     8 => writer.write_i64(col, reader.read_int64().await?),
                     0 => writer.write_null(col),
                     _ => {
@@ -1209,14 +1353,18 @@ impl GenericDecoder {
             TdsDataType::BigBinary => {
                 let length = reader.read_uint16().await?;
                 // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
-                if length == 0xFFFF {
+                if length == u16::MAX {
                     writer.write_null(col);
+                    return Ok(());
+                }
+                if length as usize > MAX_ALLOC_SIZE {
+                    return Err(crate::error::Error::ProtocolError(format!(
+                        "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
+                    )));
+                }
+                if let Some(bytes) = reader.try_read_slice(length as usize) {
+                    writer.write_bytes_ref(col, bytes);
                 } else {
-                    if length as usize > MAX_ALLOC_SIZE {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
-                        )));
-                    }
                     let mut bytes = vec![0u8; length as usize];
                     reader.read_bytes(&mut bytes).await?;
                     writer.write_bytes(col, bytes);
@@ -1224,21 +1372,22 @@ impl GenericDecoder {
             }
             TdsDataType::BigVarBinary => {
                 if metadata.is_plp() {
-                    match GenericDecoder::read_plp_bytes(reader).await? {
-                        Some(bytes) => writer.write_bytes(col, bytes),
-                        None => writer.write_null(col),
-                    }
+                    GenericDecoder::read_plp_binary_into(reader, col, writer).await?;
                 } else {
                     let length = reader.read_uint16().await?;
                     // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
-                    if length == 0xFFFF {
+                    if length == u16::MAX {
                         writer.write_null(col);
+                        return Ok(());
+                    }
+                    if length as usize > MAX_ALLOC_SIZE {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
+                        )));
+                    }
+                    if let Some(bytes) = reader.try_read_slice(length as usize) {
+                        writer.write_bytes_ref(col, bytes);
                     } else {
-                        if length as usize > MAX_ALLOC_SIZE {
-                            return Err(crate::error::Error::ProtocolError(format!(
-                                "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
-                            )));
-                        }
                         let mut bytes = vec![0u8; length as usize];
                         reader.read_bytes(&mut bytes).await?;
                         writer.write_bytes(col, bytes);
@@ -1367,6 +1516,62 @@ impl GenericDecoder {
             }
         }
         Ok(())
+    }
+
+    /// Decodes one column according to a resolved [`DecodeOp`].
+    ///
+    /// Nothing calls this yet. The async path still decodes straight from
+    /// [`ColumnMetadata`] in `drive_row_columns`, which also has to handle
+    /// cursor policies, Always Encrypted and paused rows. Applying the plan
+    /// there is the remaining half of this change.
+    ///
+    /// Reads go through the `*_buffered` helpers, which stay off the async
+    /// machinery while the bytes are already in the reader's buffer.
+    #[allow(dead_code)]
+    pub(crate) async fn decode_op_into<T, W>(
+        &self,
+        reader: &mut T,
+        operation: &DecodeOp,
+        metadata: &ColumnMetadata,
+        col: usize,
+        writer: &mut W,
+    ) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+        W: RowWriter + ?Sized,
+    {
+        match operation {
+            DecodeOp::IntN => {
+                let byte_len = read_byte_buffered(reader).await?;
+                match byte_len {
+                    1 => writer.write_u8(col, read_byte_buffered(reader).await?),
+                    2 => writer.write_i16(col, reader.read_int16().await?),
+                    4 => writer.write_i32(col, read_int32_buffered(reader).await?),
+                    8 => writer.write_i64(col, reader.read_int64().await?),
+                    0 => writer.write_null(col),
+                    _ => {
+                        return Err(crate::error::Error::from(Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid IntN length",
+                        )));
+                    }
+                }
+                Ok(())
+            }
+            DecodeOp::ShortString(encoding_type) => {
+                self.string_decoder
+                    .decode_short_string_into(reader, encoding_type, col, writer)
+                    .await
+            }
+            DecodeOp::BitN
+            | DecodeOp::FltN
+            | DecodeOp::Decimal { .. }
+            | DecodeOp::DateN
+            | DecodeOp::TimeN { .. }
+            | DecodeOp::DateTime2N { .. }
+            | DecodeOp::ShortBinary
+            | DecodeOp::Generic => self.decode_into(reader, metadata, col, writer).await,
+        }
     }
 }
 
@@ -1716,10 +1921,7 @@ impl StringDecoder {
         let encoding_type = get_encoding_type(metadata);
 
         if metadata.is_plp() {
-            match GenericDecoder::read_plp_bytes(reader).await? {
-                Some(bytes) => writer.write_string(col, SqlString::new(bytes, encoding_type)),
-                None => writer.write_null(col),
-            }
+            GenericDecoder::read_plp_string_into(reader, col, writer, &encoding_type).await?;
         } else if Self::is_long_len_type(metadata.data_type) {
             let text_ptr_len = reader.read_byte().await? as usize;
 
@@ -1748,14 +1950,39 @@ impl StringDecoder {
             };
             writer.write_string(col, sql_string);
         } else {
-            let length = reader.read_uint16().await? as usize;
-            if length == 0xFFFF {
-                writer.write_null(col);
-            } else {
-                let mut buffer = vec![0u8; length];
-                reader.read_bytes(&mut buffer).await?;
-                writer.write_string(col, SqlString::new(buffer, encoding_type));
-            }
+            self.decode_short_string_into(reader, &encoding_type, col, writer)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Decodes a non-PLP character value.
+    ///
+    /// When the bytes are already buffered they reach the writer as a borrow,
+    /// and only a writer that needs to keep them pays for a copy. Otherwise the
+    /// value is read into an owned buffer.
+    ///
+    /// A length of `0xFFFF` is the wire encoding for NULL, not a real length.
+    async fn decode_short_string_into<T, W>(
+        &self,
+        reader: &mut T,
+        encoding_type: &EncodingType,
+        col: usize,
+        writer: &mut W,
+    ) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+        W: RowWriter + ?Sized,
+    {
+        let length = read_uint16_buffered(reader).await? as usize;
+        if length == 0xFFFF {
+            writer.write_null(col);
+        } else if let Some(bytes) = reader.try_read_slice(length) {
+            writer.write_string_ref(col, bytes, encoding_type);
+        } else {
+            let mut buffer = vec![0u8; length];
+            read_bytes_buffered(reader, &mut buffer).await?;
+            writer.write_string(col, SqlString::new(buffer, encoding_type.clone()));
         }
         Ok(())
     }
@@ -3142,17 +3369,24 @@ mod test {
         use byteorder::{ByteOrder, LittleEndian};
 
         use crate::core::TdsResult;
-        use crate::datatypes::column_values::{ColumnValues, SqlDateTime, SqlSmallDateTime};
+        use crate::datatypes::column_values::{
+            ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
+            SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
+        };
         use crate::datatypes::decoder::{
-            GenericDecoder, MAX_PLP_SIZE, PlpChunkReadLength, PlpChunkStreamReader,
+            DecimalParts, GenericDecoder, MAX_PLP_SIZE, PlpChunkReadLength, PlpChunkStreamReader,
             PlpColumnStream, SqlTypeDecode,
         };
-        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
+        use crate::datatypes::sql_json::SqlJson;
+        use crate::datatypes::sql_string::SqlString;
+        use crate::datatypes::sql_vector::SqlVector;
         use crate::datatypes::sqldatatypes::{
             PartialLengthType, TdsDataType, TypeInfo, TypeInfoVariant, VariableLengthTypes,
         };
         use crate::io::packet_reader::TdsPacketReader;
         use crate::query::metadata::ColumnMetadata;
+        use uuid::Uuid;
 
         /// Byte-buffer backed mock implementing every `TdsPacketReader` method
         /// used by the decoder.
@@ -3298,6 +3532,88 @@ mod test {
                 multi_part_name: None,
                 crypto_metadata: None,
             }
+        }
+
+        fn plp_binary_metadata() -> ColumnMetadata {
+            ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::BigVarBinary,
+                type_info: TypeInfo {
+                    tds_type: TdsDataType::BigVarBinary,
+                    length: usize::MAX,
+                    type_info_variant: TypeInfoVariant::PartialLen(
+                        PartialLengthType::BigVarBinary,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                },
+                column_name: String::new(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            }
+        }
+
+        fn plp_wire_chunked(declared_length: i64, chunks: &[&[u8]]) -> Vec<u8> {
+            let mut bytes = declared_length.to_le_bytes().to_vec();
+            for chunk in chunks {
+                bytes.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(chunk);
+            }
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes
+        }
+
+        #[derive(Default)]
+        struct BinaryDestinationWriter {
+            bytes: Vec<u8>,
+            is_null: bool,
+            used_destination: bool,
+            used_owned_fallback: bool,
+            destination_success: Option<bool>,
+        }
+
+        impl RowWriter for BinaryDestinationWriter {
+            fn write_null(&mut self, _col: usize) {
+                self.is_null = true;
+            }
+            fn write_bool(&mut self, _col: usize, _val: bool) {}
+            fn write_u8(&mut self, _col: usize, _val: u8) {}
+            fn write_i16(&mut self, _col: usize, _val: i16) {}
+            fn write_i32(&mut self, _col: usize, _val: i32) {}
+            fn write_i64(&mut self, _col: usize, _val: i64) {}
+            fn write_f32(&mut self, _col: usize, _val: f32) {}
+            fn write_f64(&mut self, _col: usize, _val: f64) {}
+            fn write_string(&mut self, _col: usize, _val: SqlString) {}
+            fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
+                self.bytes = val;
+                self.used_owned_fallback = true;
+            }
+            fn bytes_destination(&mut self, _col: usize, length: usize) -> Option<&mut [u8]> {
+                self.bytes.resize(length, 0);
+                self.used_destination = true;
+                Some(&mut self.bytes)
+            }
+            fn finish_bytes_destination(&mut self, _col: usize, success: bool) {
+                self.destination_success = Some(success);
+            }
+            fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
+            fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
+            fn write_date(&mut self, _col: usize, _val: SqlDate) {}
+            fn write_time(&mut self, _col: usize, _val: SqlTime) {}
+            fn write_datetime(&mut self, _col: usize, _val: SqlDateTime) {}
+            fn write_smalldatetime(&mut self, _col: usize, _val: SqlSmallDateTime) {}
+            fn write_datetime2(&mut self, _col: usize, _val: SqlDateTime2) {}
+            fn write_datetimeoffset(&mut self, _col: usize, _val: SqlDateTimeOffset) {}
+            fn write_money(&mut self, _col: usize, _val: SqlMoney) {}
+            fn write_smallmoney(&mut self, _col: usize, _val: SqlSmallMoney) {}
+            fn write_uuid(&mut self, _col: usize, _val: Uuid) {}
+            fn write_xml(&mut self, _col: usize, _val: SqlXml) {}
+            fn write_json(&mut self, _col: usize, _val: SqlJson) {}
+            fn write_vector(&mut self, _col: usize, _val: SqlVector) {}
+            fn end_row(&mut self) {}
         }
 
         /// Runs both decode() and decode_into() on the same bytes and asserts
@@ -4042,6 +4358,55 @@ mod test {
             buf.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
             let val = assert_decode_equivalence(buf, &md).await;
             assert_eq!(val, ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        }
+
+        #[tokio::test]
+        async fn decode_into_known_plp_binary_uses_destination() {
+            let metadata = plp_binary_metadata();
+            let mut reader = ByteReader::new(plp_wire_chunked(6, &[b"ab", b"cdef"]));
+            let mut writer = BinaryDestinationWriter::default();
+
+            GenericDecoder::default()
+                .decode_into(&mut reader, &metadata, 0, &mut writer)
+                .await
+                .unwrap();
+
+            assert_eq!(writer.bytes, b"abcdef");
+            assert!(writer.used_destination);
+            assert!(!writer.used_owned_fallback);
+            assert_eq!(writer.destination_success, Some(true));
+        }
+
+        #[tokio::test]
+        async fn decode_into_unknown_plp_binary_uses_owned_fallback() {
+            let metadata = plp_binary_metadata();
+            let mut reader = ByteReader::new(plp_wire_chunked(-2, &[b"ab", b"cdef"]));
+            let mut writer = BinaryDestinationWriter::default();
+
+            GenericDecoder::default()
+                .decode_into(&mut reader, &metadata, 0, &mut writer)
+                .await
+                .unwrap();
+
+            assert_eq!(writer.bytes, b"abcdef");
+            assert!(!writer.used_destination);
+            assert!(writer.used_owned_fallback);
+            assert_eq!(writer.destination_success, None);
+        }
+
+        #[tokio::test]
+        async fn decode_into_known_plp_binary_rejects_length_mismatch() {
+            let metadata = plp_binary_metadata();
+            let mut reader = ByteReader::new(plp_wire_chunked(3, &[b"abcd"]));
+            let mut writer = BinaryDestinationWriter::default();
+
+            let error = GenericDecoder::default()
+                .decode_into(&mut reader, &metadata, 0, &mut writer)
+                .await
+                .unwrap_err();
+
+            assert!(error.to_string().contains("exceeds declared length"));
+            assert_eq!(writer.destination_success, Some(false));
         }
 
         #[tokio::test]

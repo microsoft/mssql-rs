@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::fmt::{self, Debug};
+use std::sync::OnceLock;
 
 use super::{
     fed_auth_info::{FedAuthInfoToken, SspiToken},
@@ -9,6 +10,7 @@ use super::{
     tokenitems::ReturnValueStatus,
 };
 use crate::datatypes::column_values::ColumnValues;
+use crate::datatypes::sql_string::{EncodingType, get_encoding_type};
 use crate::{
     error::Error,
     message::login::{FeatureExtension, RoutingInfo},
@@ -311,6 +313,108 @@ pub(crate) struct ColMetadataToken {
     /// references entries here by ordinal.
     #[allow(dead_code)] // Consumed by CEK decryption in a later phase.
     pub cek_table: Vec<CekTableEntry>,
+    /// Per-column decode plan, built on first use. See [`Self::decode_plan`].
+    pub(crate) decode_plan: OnceLock<Vec<DecodeOp>>,
+}
+
+/// What the fast row path should do with one column.
+///
+/// A column's type, precision, scale and collation are fixed for the whole
+/// result set, but the async decoder works them out from [`ColumnMetadata`]
+/// again on every row. `DecodeOp` settles that once and reduces each column to
+/// a single tag the row loop can switch on.
+///
+/// `Generic` is the escape hatch. It marks a column the fast path does not
+/// handle, and one such column sends the whole row to the async decoder.
+#[derive(Debug, Clone)]
+pub(crate) enum DecodeOp {
+    IntN,
+    BitN,
+    FltN,
+    Decimal {
+        precision: u8,
+        scale: u8,
+        numeric: bool,
+    },
+    DateN,
+    TimeN {
+        scale: u8,
+    },
+    DateTime2N {
+        scale: u8,
+    },
+    ShortBinary,
+    ShortString(EncodingType),
+    Generic,
+}
+
+impl ColMetadataToken {
+    /// Returns the per-column decode plan, building it on first use.
+    ///
+    /// The plan is derived from metadata that cannot change while the result
+    /// set is open, so it is built once and reused by every row. `OnceLock`
+    /// keeps that lazy without making the token mutable, which matters because
+    /// the token is shared behind an `Arc`.
+    ///
+    /// A column whose metadata does not match a shape the fast path knows
+    /// becomes [`DecodeOp::Generic`] rather than an error. Declining is always
+    /// safe, because the async decoder handles every type.
+    pub(crate) fn decode_plan(&self) -> &[DecodeOp] {
+        self.decode_plan.get_or_init(|| {
+            self.columns
+                .iter()
+                .map(|metadata| match metadata.data_type {
+                    crate::datatypes::sqldatatypes::TdsDataType::IntN => DecodeOp::IntN,
+                    crate::datatypes::sqldatatypes::TdsDataType::BitN => DecodeOp::BitN,
+                    crate::datatypes::sqldatatypes::TdsDataType::FltN => DecodeOp::FltN,
+                    crate::datatypes::sqldatatypes::TdsDataType::DecimalN
+                    | crate::datatypes::sqldatatypes::TdsDataType::NumericN => {
+                        let crate::datatypes::sqldatatypes::TypeInfoVariant::VarLenPrecisionScale(
+                            _,
+                            _,
+                            precision,
+                            scale,
+                        ) = metadata.type_info.type_info_variant
+                        else {
+                            return DecodeOp::Generic;
+                        };
+                        DecodeOp::Decimal {
+                            precision,
+                            scale,
+                            numeric: metadata.data_type
+                                == crate::datatypes::sqldatatypes::TdsDataType::NumericN,
+                        }
+                    }
+                    crate::datatypes::sqldatatypes::TdsDataType::DateN => DecodeOp::DateN,
+                    crate::datatypes::sqldatatypes::TdsDataType::TimeN => DecodeOp::TimeN {
+                        scale: metadata.get_scale().unwrap_or(7),
+                    },
+                    crate::datatypes::sqldatatypes::TdsDataType::DateTime2N => {
+                        DecodeOp::DateTime2N {
+                            scale: metadata.get_scale().unwrap_or(7),
+                        }
+                    }
+                    crate::datatypes::sqldatatypes::TdsDataType::BigBinary
+                    | crate::datatypes::sqldatatypes::TdsDataType::BigVarBinary
+                        if !metadata.is_plp() =>
+                    {
+                        DecodeOp::ShortBinary
+                    }
+                    crate::datatypes::sqldatatypes::TdsDataType::NChar
+                    | crate::datatypes::sqldatatypes::TdsDataType::NVarChar
+                    | crate::datatypes::sqldatatypes::TdsDataType::BigChar
+                    | crate::datatypes::sqldatatypes::TdsDataType::BigVarChar
+                    | crate::datatypes::sqldatatypes::TdsDataType::Char
+                    | crate::datatypes::sqldatatypes::TdsDataType::VarChar
+                        if !metadata.is_plp() =>
+                    {
+                        DecodeOp::ShortString(get_encoding_type(metadata))
+                    }
+                    _ => DecodeOp::Generic,
+                })
+                .collect()
+        })
+    }
 }
 
 impl Token for ColMetadataToken {

@@ -1109,6 +1109,72 @@ impl TdsPacketReader for NetworkTransport {
         self.tds_read_buffer.reset_to_length(0);
     }
 
+    fn try_read_byte(&mut self) -> Option<u8> {
+        if !self.tds_read_buffer.do_we_have_enough_data(1) {
+            return None;
+        }
+        let value = self.tds_read_buffer.get_slice()[0];
+        self.tds_read_buffer.consume_bytes(1);
+        Some(value)
+    }
+
+    fn try_read_uint16(&mut self) -> Option<u16> {
+        if !self.tds_read_buffer.do_we_have_enough_data(2) {
+            return None;
+        }
+        let value = LittleEndian::read_u16(self.tds_read_buffer.get_slice());
+        self.tds_read_buffer.consume_bytes(2);
+        Some(value)
+    }
+
+    fn try_read_int32(&mut self) -> Option<i32> {
+        if !self.tds_read_buffer.do_we_have_enough_data(4) {
+            return None;
+        }
+        let value = LittleEndian::read_i32(self.tds_read_buffer.get_slice());
+        self.tds_read_buffer.consume_bytes(4);
+        Some(value)
+    }
+
+    fn try_read_bytes(&mut self, buffer: &mut [u8]) -> Option<usize> {
+        if !self.tds_read_buffer.do_we_have_enough_data(buffer.len()) {
+            return None;
+        }
+        buffer.copy_from_slice(&self.tds_read_buffer.get_slice()[..buffer.len()]);
+        self.tds_read_buffer.consume_bytes(buffer.len());
+        Some(buffer.len())
+    }
+
+    fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+        if !self.tds_read_buffer.do_we_have_enough_data(length) {
+            return None;
+        }
+        let start = self.tds_read_buffer.buffer_position;
+        let end = start + length;
+        self.tds_read_buffer.consume_bytes(length);
+        // consume_bytes only moves buffer_position, so these bytes stay readable
+        // until the next packet read overwrites working_buffer. That read needs
+        // &mut self, which is what bounds the returned borrow.
+        Some(&self.tds_read_buffer.working_buffer[start..end])
+    }
+
+    fn buffered_slice(&self) -> Option<&[u8]> {
+        // Always Some, and empty when the buffer is drained. Callers treat an
+        // empty slice as not enough data and fall back to the async path.
+        Some(
+            &self.tds_read_buffer.working_buffer
+                [self.tds_read_buffer.buffer_position..self.tds_read_buffer.buffer_length],
+        )
+    }
+
+    fn consume_buffered(&mut self, length: usize) -> bool {
+        if !self.tds_read_buffer.do_we_have_enough_data(length) {
+            return false;
+        }
+        self.tds_read_buffer.consume_bytes(length);
+        true
+    }
+
     async fn read_byte(&mut self) -> TdsResult<u8> {
         while !self.tds_read_buffer.do_we_have_enough_data(1) {
             self.read_tds_packet().await?;
