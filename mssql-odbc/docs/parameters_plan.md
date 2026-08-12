@@ -1,7 +1,7 @@
 # Parameterized execution - `SQLBindParameter` / `SQLExecute` / `SQLExecDirect`
 
 Status, behavior, and known gaps for parameterized prepared-statement execution
-in the ODBC Driver 18 (Rust). Updated 2026-08-09.
+in the ODBC Driver 18 (Rust). Updated 2026-08-11.
 
 ---
 
@@ -12,18 +12,18 @@ in the ODBC Driver 18 (Rust). Updated 2026-08-09.
 transparent reconnects.
 
 - **Managed prepared statement** - `StmtState` stores a
-  `mssql_tds::PreparedStatement` containing the rewritten SQL and its optional
-  `PreparedHandle`. `SQLExecute` moves it out while executing and writes it back
-  afterward. The first execute runs `sp_prepexec`; subsequent executes reuse the
-  live handle via `sp_execute`.
+  `mssql_tds::PreparedStatement` containing the rewritten SQL and, once
+  materialized, an opaque client-issued `StatementId`. The live server handle
+  lives in the `TdsClient`, keyed by that id. `SQLExecute` moves the statement
+  out while executing and writes it back afterward. The first execute runs
+  `sp_prepexec`; subsequent executes reuse the live handle via `sp_execute`.
 - **`SQLExecDirect`** - parameterized text runs `sp_executesql` (direct, no
   cached handle); unparameterized text runs as a plain language batch.
 - **Prepared-handle capture** - for a result-returning `sp_prepexec`, the
-  `@handle` arrives after the result set and is captured at drain time
-  (`SQLCloseCursor` / DDL finish) via `capture_prepared_handle_into()`. The
-  explicit post-drain capture remains for now: replacing it with shared
-  completion state adds clone aliasing, stale delivery, cancellation, and
-  lock-order hazards.
+  `@handle` arrives after the result set. It is written straight into the
+  client's `StatementId -> handle` map by `push_return_value` when the token
+  lands, in the same token funnel that pins Always Encrypted metadata — no
+  caller-side capture step, so no drain path can drop it.
 - **`sp_unprepare` (handle release)** - a handle superseded by a re-prepare or
   rebind is deferred in `pending_unprepare` and released at the next
   `SQLExecute` by piggybacking onto `sp_prepexec`: the superseded handle is sent
@@ -38,14 +38,16 @@ transparent reconnects.
   Serialization, send, and response failures remain ambiguous: the server may
   already have consumed the handle, so retrying cleanup could target an invalid
   or reused id. This matches msodbcsql after its `ExecRPCImmediate` boundary.
-- **Stale-handle invalidation after transparent reconnect** - every cached
-  handle carries the connection's recovery epoch at capture.
-  `TdsClient::execute_prepared` performs recovery first, then compares handles
-  with the post-recovery epoch. A handle from an old physical session is dropped
-  and its SQL is prepared again; a stale pending drop is skipped because the
-  old session already discarded it. `unprepare` applies the same liveness rule.
-  If ODBC cannot claim the connection before execution, it restores both the
-  moved prepared statement and pending orphan to `StmtState`.
+- **Stale-handle invalidation after transparent reconnect** - the client's
+  `StatementId -> handle` map is cleared on every reconnect, alongside the
+  Always Encrypted describe cache. `TdsClient::execute_prepared` performs
+  recovery first, then resolves the statement's id against the (possibly
+  cleared) map: a hit reuses the handle, a miss re-prepares the SQL. "Stale"
+  therefore collapses to "absent from the map", and a superseded pending drop
+  that the reconnect discarded is likewise absent and skipped. `unprepare`
+  applies the same lookup. If ODBC cannot claim the connection before execution,
+  it restores both the moved prepared statement and pending orphan to
+  `StmtState`.
 - **Lifecycle** - `SQL_RESET_PARAMS` clears bindings; `SQLCloseCursor` and
   `SQLFreeStmt(SQL_CLOSE)` preserve the handle; re-`SQLPrepare` and rebind
   orphan it for release.
@@ -58,29 +60,28 @@ transparent reconnects.
 
 ## `mssql-tds` prepared API
 
-- `PreparedHandle` stores the server id and recovery epoch;
-  `PreparedStatement` stores SQL plus an optional handle.
+- `PreparedStatement` stores SQL plus an optional opaque `StatementId`; the
+  server handle lives in the client's `StatementId -> handle` map.
 - `execute_prepared` owns recovery, timeout deduction, live-handle reuse,
   stale-handle invalidation, reprepare, and live-orphan piggyback planning.
-  `unprepare` sends `sp_unprepare` only for a handle from the current session.
+  `unprepare` sends `sp_unprepare` only when the client still holds a handle for
+  the statement in the live session.
 - `sp_prepexec` captures its `@handle` RETURNVALUE separately from user output
   parameters. Always Encrypted describe metadata is retained until capture and
   pinned under the returned handle, allowing the next managed `sp_execute` to
   encrypt parameters without another describe. When `sp_prepexec` replaces a
   prior handle, successful replacement capture also removes the superseded
   handle's metadata; failed or incomplete capture leaves it untouched.
-- Focused coverage includes recovery-epoch planning, unprepare behavior, handle
-  capture, wire-byte assertions for piggybacked drops, claim-failure restoration,
-  and Always Encrypted metadata pinning.
+- Focused coverage includes handle-map reuse/re-prepare planning, unprepare
+  behavior, in-funnel handle capture, wire-byte assertions for piggybacked
+  drops, claim-failure restoration, and Always Encrypted metadata pinning.
 
 ### Tracked follow-ups
 
-- **Cross-client ownership:** an epoch distinguishes reconnect generations of
-  one client but does not identify different clients. Direct `mssql-tds`
-  consumers can move a `PreparedStatement` between clients with equal epochs.
-  Normal ODBC ownership cannot do this because an HSTMT has one parent HDBC.
-  Track the direct-client hardening in
-  [ADO 47098](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47098).
+- **Cross-client ownership:** closed structurally by the opaque `StatementId`.
+  Ids are unique to the issuing client, so a `PreparedStatement` carried to a
+  different client resolves to "not materialized here" and is re-prepared rather
+  than aliasing an unrelated server handle. (Formerly tracked as ADO 47098.)
 - **Enabled reconnect e2e:** session-recovery baseline state is being fixed in
   [ADO 46631](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46631).
   Enable `StaleHandleAfterReconnectIsInvalidatedAndReprepared` afterward under

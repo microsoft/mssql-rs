@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use tracing::error;
 
-use mssql_tds::connection::tds_client::{PreparedHandle, PreparedStatement};
+use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 
 use super::desc::{DescHandle, DescKind};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
@@ -79,17 +79,16 @@ pub(crate) struct StmtState {
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
     pub(crate) bound_params: Vec<Option<BoundParam>>,
-    /// The live server handle of a prepared statement superseded by a
-    /// re-prepare / rebind / `SQLExecDirect`, awaiting release with
-    /// `sp_unprepare`. The drop is deferred to the next point that already
-    /// holds the TDS client (execute / exec-direct) or to statement free, so
-    /// bind/prepare stay I/O-free. Invariant: this is `None` whenever
-    /// `prepared` holds a live handle (a new handle can only be acquired by
-    /// an execute, which flushes any pending drop first).
-    /// `mssql_tds::TdsClient::execute_prepared` relies on this: it is what keeps
-    /// a live orphan from being discarded on the `sp_execute` reuse path (see
-    /// `plan_prepared_execution`).
-    pub(crate) pending_unprepare: Option<PreparedHandle>,
+    /// The identity of a prepared statement superseded by a re-prepare / rebind
+    /// / `SQLExecDirect`, whose server handle awaits release with `sp_unprepare`.
+    /// The drop is deferred to the next point that already holds the TDS client
+    /// (execute / exec-direct) or to statement free, so bind/prepare stay
+    /// I/O-free. Invariant: this is `None` whenever `prepared` holds a live
+    /// handle (a new handle can only be acquired by an execute, which flushes any
+    /// pending drop first). `mssql_tds::TdsClient::execute_prepared` relies on
+    /// this: it is what keeps a live orphan from being discarded on the
+    /// `sp_execute` reuse path.
+    pub(crate) pending_unprepare: Option<StatementId>,
     /// `true` when SQLFetch has positioned the cursor on a row ready for SQLGetData.
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
@@ -193,17 +192,17 @@ impl StmtState {
         let Some(plan) = self.prepared.as_mut() else {
             return;
         };
-        let Some(handle) = plan.stmt.take_session_handle() else {
+        let Some(id) = plan.stmt.take_id() else {
             // No materialized handle to release; the statement stays in place.
             return;
         };
-        if let Some(previous) = self.pending_unprepare.replace(handle) {
+        if let Some(previous) = self.pending_unprepare.replace(id) {
             debug_assert!(
                 false,
                 "orphan_prepared_handle: a pending unprepare already exists"
             );
             error!(
-                id = previous.id(),
+                orphaned = ?previous,
                 "orphan_prepared_handle: overwriting a pending unprepare — handle leaked until disconnect"
             );
         }

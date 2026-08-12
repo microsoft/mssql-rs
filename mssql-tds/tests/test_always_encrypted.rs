@@ -1213,7 +1213,7 @@ mod always_encrypted {
                 StatusFlags::NONE,
                 SqlType::Int(None),
             );
-            let handle = h
+            let statement = h
                 .client
                 .execute_sp_prepare_for_test(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
@@ -1230,7 +1230,7 @@ mod always_encrypted {
                     SqlType::Int(Some(v)),
                 );
                 h.client
-                    .execute_sp_execute_for_test(handle, None, Some(vec![param]), ())
+                    .execute_sp_execute_for_test(statement, None, Some(vec![param]), ())
                     .await
                     .expect("sp_execute with encrypted named parameter");
                 while h.client.advance_to_rows().await.unwrap() {}
@@ -1238,7 +1238,7 @@ mod always_encrypted {
             }
 
             h.client
-                .execute_sp_unprepare_for_test(handle, ())
+                .execute_sp_unprepare_for_test(statement, ())
                 .await
                 .expect("unprepare");
 
@@ -1270,7 +1270,7 @@ mod always_encrypted {
                 StatusFlags::NONE,
                 SqlType::Int(None),
             );
-            let handle = h
+            let statement = h
                 .client
                 .execute_sp_prepare_for_test(
                     format!("INSERT INTO {table} (val) VALUES (@val);"),
@@ -1283,14 +1283,14 @@ mod always_encrypted {
             // Positional (unnamed) value, matched to the declared @val by ordinal.
             let param = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(999)));
             h.client
-                .execute_sp_execute_for_test(handle, Some(vec![param]), None, ())
+                .execute_sp_execute_for_test(statement, Some(vec![param]), None, ())
                 .await
                 .expect("sp_execute with positional encrypted parameter");
             while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             h.client
-                .execute_sp_unprepare_for_test(handle, ())
+                .execute_sp_unprepare_for_test(statement, ())
                 .await
                 .expect("unprepare");
 
@@ -1330,7 +1330,7 @@ mod always_encrypted {
                     SqlType::Int(None),
                 ),
             ];
-            let handle = h
+            let statement = h
                 .client
                 .execute_sp_prepare_for_test(
                     format!("INSERT INTO {table} (a, b) VALUES (@a, @b);"),
@@ -1352,14 +1352,14 @@ mod always_encrypted {
                 SqlType::Int(Some(22)),
             )];
             h.client
-                .execute_sp_execute_for_test(handle, Some(positional), Some(named), ())
+                .execute_sp_execute_for_test(statement, Some(positional), Some(named), ())
                 .await
                 .expect("sp_execute with mixed positional and named encrypted params");
             while h.client.advance_to_rows().await.unwrap() {}
             h.client.close_query().await.unwrap();
 
             h.client
-                .execute_sp_unprepare_for_test(handle, ())
+                .execute_sp_unprepare_for_test(statement, ())
                 .await
                 .expect("unprepare");
 
@@ -1378,9 +1378,10 @@ mod always_encrypted {
         });
     }
 
-    /// `sp_execute` with parameters under Always Encrypted requires the handle to
+    /// `sp_execute` with parameters under Always Encrypted requires the statement to
     /// have been prepared on this connection (so its parameter-encryption metadata
-    /// is cached). An unknown handle must error rather than send plaintext.
+    /// is cached). A handle with no cached metadata must error rather than send
+    /// plaintext.
     #[tokio::test]
     async fn sp_execute_without_prepared_metadata_errors_under_ae() {
         ae_test!(|h| {
@@ -1389,9 +1390,12 @@ mod always_encrypted {
                 StatusFlags::NONE,
                 SqlType::Int(Some(1)),
             );
+            // Seeded directly, so the handle is live to the client but its
+            // describe metadata was never cached.
+            let statement = h.client.register_prepared_handle_for_test(999_999);
             let err = h
                 .client
-                .execute_sp_execute_for_test(999_999, None, Some(vec![param]), ())
+                .execute_sp_execute_for_test(statement, None, Some(vec![param]), ())
                 .await
                 .expect_err("sp_execute with an unprepared handle must error under AE");
             assert!(

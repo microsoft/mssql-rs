@@ -157,9 +157,9 @@ pub(super) fn fail_with_tds(
 /// leaked handle is freed when the connection closes, and must not fail the
 /// caller's execution.
 ///
-/// A handle whose `session_epoch` no longer matches the connection's is skipped:
-/// a transparent reconnect already discarded it server-side, so an `sp_unprepare`
-/// would target a nonexistent handle on the new session.
+/// A statement the client no longer holds a handle for is skipped inside
+/// `unprepare`: a transparent reconnect already discarded it server-side, so an
+/// `sp_unprepare` would target a nonexistent handle on the new session.
 ///
 /// No lock is held across the network I/O.
 pub(super) fn flush_pending_unprepare(
@@ -229,21 +229,6 @@ pub(super) unsafe fn build_named_params(
     Ok(named_params)
 }
 
-/// Captures the server-side prepared-statement handle from `sp_prepexec`'s
-/// `@handle` RETURNVALUE once the batch has been drained.
-///
-/// For a result-returning statement the handle arrives *after* the result set,
-/// so it only lands in the client's return values once the stream is fully
-/// drained via `close_query`. Capture-if-absent: the handle is stable for the
-/// prepared plan, and `sp_execute` re-runs don't re-issue it.
-pub(super) fn capture_prepared_handle(stmt: &StmtHandle, client: &mut TdsClient) {
-    if let Ok(mut stmt_state) = stmt.inner.lock()
-        && let Some(plan) = stmt_state.prepared.as_mut()
-    {
-        client.capture_prepared_handle_into(&mut plan.stmt);
-    }
-}
-
 /// Captures result metadata after a successful execution and finalizes the
 /// statement/connection state.
 ///
@@ -301,7 +286,6 @@ pub(super) fn finish_execute(
             error!(%e, "{op}: failed to drain after DDL/DML");
             return fail_with_tds(dbc, stmt, statement_handle, client, &e);
         }
-        capture_prepared_handle(stmt, &mut client);
         let info_messages = client.take_info_messages();
         // A pure-DML batch (UPDATE; DELETE; INSERT) yields one count per
         // statement. Report the first here; queue the rest for SQLMoreResults to

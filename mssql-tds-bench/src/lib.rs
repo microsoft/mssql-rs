@@ -206,33 +206,6 @@ pub async fn drain(client: &mut TdsClient) -> u64 {
     rows
 }
 
-/// Like [`drain`], but captures the prepared-statement handle the driver
-/// funnelled out of the `sp_prepexec` `@handle` RETURNVALUE, via
-/// [`take_prepared_statement_handle`](TdsClient::take_prepared_statement_handle).
-///
-/// Used by the `sp_prepexec` benchmark to release the handle it just created so
-/// server-side prepared state does not accumulate across iterations (which would
-/// drift the measurement upward).
-pub async fn drain_capture_handle(client: &mut TdsClient) -> i32 {
-    loop {
-        while client.next_row().await.expect("next_row failed").is_some() {}
-        if !client
-            .advance_to_rows()
-            .await
-            .expect("advance_to_rows failed")
-        {
-            break;
-        }
-    }
-    // sp_prepexec funnels the @handle RETURNVALUE into a dedicated slot, read
-    // via take_prepared_statement_handle() rather than the return-value buffer.
-    let handle = client
-        .take_prepared_statement_handle()
-        .expect("sp_prepexec did not capture a prepared handle");
-    client.close_query().await.expect("close_query failed");
-    handle
-}
-
 /// Create a session temp table `table` filled with `rows` deterministic rows of
 /// eight mixed-type columns, using a single set-based `GENERATE_SERIES` insert.
 ///

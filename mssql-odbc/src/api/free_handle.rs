@@ -14,7 +14,7 @@ use crate::api::sqlstate::SQLSTATE_HY000;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{DbcHandle, EnvHandle, HandleType, StmtHandle, free_handle, handle_from_raw};
-use mssql_tds::connection::tds_client::PreparedHandle;
+use mssql_tds::connection::tds_client::StatementId;
 
 /// Implementation of [`SQLFreeHandle`](super::exports::SQLFreeHandle).
 ///
@@ -220,7 +220,7 @@ fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &Dbc
         ),
         Err(_) => return,
     };
-    let handles: Vec<PreparedHandle> = [prepared.and_then(|p| p.session_handle()), pending]
+    let handles: Vec<StatementId> = [prepared.and_then(|p| p.id()), pending]
         .into_iter()
         .flatten()
         .collect();
@@ -236,8 +236,8 @@ fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &Dbc
 
     // `unprepare` skips a handle from a superseded session (already gone
     // server-side) and releases a live one.
-    for prepared_handle in handles {
-        if let Err(e) = dbc.runtime.block_on(client.unprepare(prepared_handle, ())) {
+    for statement_id in handles {
+        if let Err(e) = dbc.runtime.block_on(client.unprepare(statement_id, ())) {
             error!(%e, "SQLFreeHandle(STMT): sp_unprepare failed — handle leaked until disconnect");
         }
     }

@@ -6,7 +6,7 @@ mod common;
 
 mod rpc_results {
     use crate::common::{begin_connection, build_tcp_datasource, get_scalar_value, init_tracing};
-    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
+    use mssql_tds::connection::tds_client::{ResultSet, StatementId, TdsClient};
     use mssql_tds::datatypes::column_values::{ColumnValues, SqlDateTime2, SqlTime};
     use mssql_tds::datatypes::decoder::DecimalParts;
     use mssql_tds::datatypes::sql_string::SqlString;
@@ -225,15 +225,15 @@ mod rpc_results {
 
         let named_parameters = vec![database_id_param, compat_level_param];
 
-        let handle = connection
+        let statement = connection
             .execute_sp_prepare_for_test(query.to_string(), named_parameters, ())
             .await
             .unwrap();
 
-        assert!(handle > 0);
-
         // This should simply complete and be successful.
-        let result = connection.execute_sp_unprepare_for_test(handle, ()).await;
+        let result = connection
+            .execute_sp_unprepare_for_test(statement, ())
+            .await;
         assert!(result.is_ok());
     }
 
@@ -257,15 +257,20 @@ mod rpc_results {
 
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
-        let handle = connection
+        let statement = connection
             .execute_sp_prepare_for_test(query.to_string(), vec![db_name_param], ())
             .await
             .expect("sp_prepare should succeed for an NVARCHAR-parameterized statement");
 
-        assert!(handle > 0, "expected a positive prepared statement handle");
+        assert!(
+            connection
+                .prepared_handle_for_test(statement)
+                .is_some_and(|handle| handle > 0),
+            "expected a positive prepared statement handle"
+        );
 
         connection
-            .execute_sp_unprepare_for_test(handle, ())
+            .execute_sp_unprepare_for_test(statement, ())
             .await
             .expect("sp_unprepare should succeed");
     }
@@ -280,7 +285,11 @@ mod rpc_results {
     async fn test_sp_unprepare_surfaces_server_error_on_invalid_handle() {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
-        let res = connection.execute_sp_unprepare_for_test(0, ()).await;
+        // Handle 0 was never prepared; seed it so the RPC actually goes out.
+        let statement = connection.register_prepared_handle_for_test(0);
+        let res = connection
+            .execute_sp_unprepare_for_test(statement, ())
+            .await;
 
         match res {
             Ok(()) => panic!("Expected sp_unprepare to fail for handle 0"),
@@ -318,7 +327,7 @@ mod rpc_results {
             .await;
 
         match res {
-            Ok(handle) => panic!("Expected sp_prepare to fail; got handle {}", handle),
+            Ok(statement) => panic!("Expected sp_prepare to fail; got {statement:?}"),
             Err(Error::SqlServerError { diagnostics }) => {
                 assert!(
                     diagnostics
@@ -480,19 +489,21 @@ mod rpc_results {
         );
         let param = RpcParameter::new(Some(param_name.to_string()), StatusFlags::NONE, value);
 
-        let handle = connection
+        let statement = connection
             .execute_sp_prepare_for_test(sql.clone(), vec![param.clone()], ())
             .await
             .unwrap_or_else(|err| {
                 panic!("sp_prepare failed for column `{column}`: {err}");
             });
         assert!(
-            handle > 0,
+            connection
+                .prepared_handle_for_test(statement)
+                .is_some_and(|handle| handle > 0),
             "expected positive prepared handle for column `{column}`"
         );
 
         connection
-            .execute_sp_execute_for_test(handle, None, Some(vec![param]), ())
+            .execute_sp_execute_for_test(statement, None, Some(vec![param]), ())
             .await
             .unwrap_or_else(|err| {
                 panic!("sp_execute failed for column `{column}`: {err}");
@@ -508,7 +519,7 @@ mod rpc_results {
         };
 
         connection
-            .execute_sp_unprepare_for_test(handle, ())
+            .execute_sp_unprepare_for_test(statement, ())
             .await
             .unwrap_or_else(|err| {
                 panic!("sp_unprepare failed for column `{column}`: {err}");
@@ -536,12 +547,12 @@ mod rpc_results {
 
         let named_parameters = vec![database_id_param, compat_level_param];
 
-        let mut drop_handle = None;
-        connection
+        let mut orphan = None;
+        let (statement_id, _) = connection
             .execute_sp_prepexec_for_test(
                 query.to_string(),
                 named_parameters.clone(),
-                &mut drop_handle,
+                &mut orphan,
                 (),
             )
             .await
@@ -556,21 +567,16 @@ mod rpc_results {
         // `@handle` return value).
         connection.advance_to_rows().await.unwrap();
 
-        // The sp_prepexec `@handle` is captured into `prepared_statement_handle`
-        // during the drain above and is deliberately NOT surfaced through
-        // `retrieve_output_params()` (see `push_return_value`).
-        assert!(
-            connection.retrieve_output_params().unwrap().is_none(),
-            "the @handle should be diverted, leaving no surfaced output params"
-        );
+        // The `@handle` RETURNVALUE is captured during the drain and recorded
+        // under the statement's identity.
         let retrieved_handle = connection
-            .take_prepared_statement_handle()
-            .expect("sp_prepexec should capture the @handle during drain");
+            .prepared_handle_for_test(statement_id)
+            .expect("sp_prepexec should surface the @handle during drain");
         assert!(retrieved_handle > 0);
 
         // Execute the prepared statement again
         connection
-            .execute_sp_execute_for_test(retrieved_handle, None, Some(named_parameters), ())
+            .execute_sp_execute_for_test(statement_id, None, Some(named_parameters), ())
             .await
             .unwrap();
 
@@ -582,22 +588,22 @@ mod rpc_results {
         }
 
         let result = connection
-            .execute_sp_unprepare_for_test(retrieved_handle, ())
+            .execute_sp_unprepare_for_test(statement_id, ())
             .await;
         assert!(result.is_ok());
     }
 
     // Prepares and executes `sql` via sp_prepexec, drains the result set, and
-    // returns the server-assigned prepared-statement handle. `drop_handle`
-    // piggybacks a release of a prior handle onto the prepare (sent as the
-    // `@handle` input).
+    // returns the statement's identity plus the server-assigned handle.
+    // `orphan` piggybacks a release of a prior statement onto the prepare (its
+    // handle is sent as the `@handle` input).
     async fn prepexec_and_get_handle(
         connection: &mut mssql_tds::connection::tds_client::TdsClient,
         sql: &str,
-        mut drop_handle: Option<i32>,
-    ) -> i32 {
-        connection
-            .execute_sp_prepexec_for_test(sql.to_string(), vec![], &mut drop_handle, ())
+        mut orphan: Option<StatementId>,
+    ) -> (StatementId, i32) {
+        let (statement_id, _) = connection
+            .execute_sp_prepexec_for_test(sql.to_string(), vec![], &mut orphan, ())
             .await
             .unwrap();
 
@@ -606,12 +612,12 @@ mod rpc_results {
         }
         connection.advance_to_rows().await.unwrap();
 
-        // The `@handle` RETURNVALUE arrives after the result set and is captured
-        // into `prepared_statement_handle` during the drain above — it is not
-        // exposed through `retrieve_output_params()` (see `push_return_value`).
-        connection
-            .take_prepared_statement_handle()
-            .expect("sp_prepexec should capture the @handle during drain")
+        // The `@handle` RETURNVALUE arrives after the result set and is recorded
+        // under `statement_id` during the drain.
+        let handle = connection
+            .prepared_handle_for_test(statement_id)
+            .expect("sp_prepexec should surface the @handle during drain");
+        (statement_id, handle)
     }
 
     // The sp_prepexec `@handle` piggyback: passing a prior prepared handle as
@@ -626,17 +632,26 @@ mod rpc_results {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
         // First prepare+execute → handle h1.
-        let h1 = prepexec_and_get_handle(&mut connection, "SELECT 1 AS v", None).await;
+        let (sid1, h1) = prepexec_and_get_handle(&mut connection, "SELECT 1 AS v", None).await;
         assert!(h1 > 0);
 
-        // Re-prepare with new text, passing h1 as the `@handle` input so the
-        // server drops h1's plan and prepares "SELECT 2" in one RPC.
-        let h2 = prepexec_and_get_handle(&mut connection, "SELECT 2 AS v", Some(h1)).await;
+        // Re-prepare with new text, passing sid1 so its handle goes out as the
+        // `@handle` input and the server drops h1's plan and prepares
+        // "SELECT 2" in one RPC.
+        let (sid2, h2) =
+            prepexec_and_get_handle(&mut connection, "SELECT 2 AS v", Some(sid1)).await;
         assert!(h2 > 0);
+
+        // The piggybacked drop released sid1's entry.
+        assert_eq!(
+            connection.prepared_handle_for_test(sid1),
+            None,
+            "the piggybacked drop should have evicted the orphan's handle"
+        );
 
         // The returned handle runs the NEW statement.
         connection
-            .execute_sp_execute_for_test(h2, None, None, ())
+            .execute_sp_execute_for_test(sid2, None, None, ())
             .await
             .unwrap();
         let scalar = get_scalar_value(&mut connection).await.unwrap();
@@ -646,7 +661,7 @@ mod rpc_results {
         );
 
         connection
-            .execute_sp_unprepare_for_test(h2, ())
+            .execute_sp_unprepare_for_test(sid2, ())
             .await
             .unwrap();
     }

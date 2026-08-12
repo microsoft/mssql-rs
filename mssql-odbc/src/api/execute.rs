@@ -6,7 +6,7 @@
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::{ExecuteOptions, PreparedHandle, StatementResult};
+use mssql_tds::connection::tds_client::{ExecuteOptions, StatementId, StatementResult};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{build_named_params, claim_connection, fail_with_tds, finish_execute};
@@ -51,7 +51,7 @@ struct Execution {
     prepared: PreparedPlan,
     /// A prepared statement's still-live handle, superseded by a prior rebind /
     /// re-prepare, dropped by piggyback on this execute.
-    orphaned: Option<PreparedHandle>,
+    orphaned: Option<StatementId>,
 }
 
 fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
@@ -191,7 +191,7 @@ mod tests {
     use crate::api::odbc_types::SQL_NULL_HANDLE;
     use crate::api::util::rewrite_param_markers;
     use crate::test_support::TestHandles;
-    use mssql_tds::connection::tds_client::PreparedStatement;
+    use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 
     fn set_prepared(stmt_raw: SqlHandle, sql: &str) {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_raw) };
@@ -301,9 +301,7 @@ mod tests {
         // can't be released twice.
         let h = TestHandles::with_env_dbc_stmt();
         set_prepared(h.stmt, "SELECT 1");
-        let orphan = PreparedStatement::materialized_for_test("SELECT 0", 42, 0)
-            .session_handle()
-            .unwrap();
+        let orphan = StatementId::from_raw_for_test(42);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().pending_unprepare = Some(orphan);
 
@@ -340,9 +338,7 @@ mod tests {
         // silently unprepared.
         let h = TestHandles::with_env_dbc_stmt();
         set_prepared(h.stmt, "SELECT 1");
-        let orphan = PreparedStatement::materialized_for_test("SELECT 0", 42, 0)
-            .session_handle()
-            .unwrap();
+        let orphan = StatementId::from_raw_for_test(42);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().pending_unprepare = Some(orphan);
 

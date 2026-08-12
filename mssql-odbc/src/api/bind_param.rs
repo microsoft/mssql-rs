@@ -425,7 +425,10 @@ mod tests {
         {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(PreparedPlan {
-                stmt: PreparedStatement::materialized_for_test("SELECT @P1", 42, 3),
+                stmt: PreparedStatement::materialized_for_test(
+                    "SELECT @P1",
+                    mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
+                ),
                 marker_count: 0,
             });
         }
@@ -450,17 +453,13 @@ mod tests {
         // release at the next execute, so that execute re-prepares.
         let state = stmt.inner.lock().unwrap();
         assert!(state.prepared.is_some());
-        assert!(
-            state
-                .prepared
-                .as_ref()
-                .and_then(|p| p.stmt.session_handle())
-                .is_none()
-        );
+        assert!(state.prepared.as_ref().and_then(|p| p.stmt.id()).is_none());
         let orphaned = state
             .pending_unprepare
             .expect("prior handle queued for release");
-        assert_eq!(orphaned.id(), 42);
-        assert_eq!(orphaned.session_epoch(), 3);
+        assert_eq!(
+            orphaned,
+            mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42)
+        );
     }
 }
