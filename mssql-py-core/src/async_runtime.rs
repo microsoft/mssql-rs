@@ -1,17 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Process-wide Tokio runtime shared by every `PyCoreConnection` and by the
-//! Python `asyncio` bridge (`pyo3_async_runtimes::tokio`).
+//! Process-wide Tokio runtime backing the async surface (`PyAsyncConnection`
+//! and the `pyo3_async_runtimes::tokio` bridge).
+//!
+//! Scope: this runtime serves only the async API. The synchronous
+//! `PyCoreConnection` still owns its own per-connection `tokio::runtime::Runtime`
+//! for its `block_on` calls and does not touch this shared runtime today.
 //!
 //! Rationale:
-//! * A single multi-threaded runtime is created lazily on first use and reused
-//!   for every connection, cursor, and awaitable returned to Python. This
-//!   avoids the per-connection worker-thread explosion of the previous model
-//!   where each `PyCoreConnection` owned its own [`tokio::runtime::Runtime`].
-//! * The runtime is handed to `pyo3_async_runtimes::tokio::init` so that both
-//!   synchronous (`Handle::block_on`) and asynchronous (`future_into_py`) paths
-//!   share the exact same executor, event loop, and I/O driver.
+//! * A single multi-threaded runtime is created lazily on first async use and
+//!   reused for every `PyAsyncConnection` and every Python awaitable returned
+//!   via `future_into_py`, so async connection count does not multiply
+//!   worker-thread pools.
+//! * The runtime is registered with `pyo3_async_runtimes::tokio::init` so
+//!   `future_into_py` and `get_runtime()` both resolve to the same executor,
+//!   event loop, and I/O driver.
 //! * Worker-thread count follows Tokio's default (one per logical CPU).
 
 use std::sync::Once;

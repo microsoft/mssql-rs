@@ -10,17 +10,17 @@
 //! semantics may change without notice in any release.
 //!
 //! Sibling of `cursor.rs` (the synchronous surface). A [`PyAsyncCursor`] is
-//! bound to exactly one [`crate::async_connection::PyAsyncConnection`] and
+//! bound to a single [`crate::async_connection::PyAsyncConnection`] and
 //! shares that connection's `TdsClient` via an `Arc<tokio::sync::Mutex<_>>`.
 //! All I/O methods will submit their futures to the shared process-wide
 //! Tokio runtime and return Python awaitables through
 //! `pyo3_async_runtimes::tokio::future_into_py`.
 //!
-//! Invariant: one connection ↔ one cursor ↔ one `TdsClient` ↔ one TDS wire
-//! session. The invariant is expressed by design, not by a runtime flag:
-//! creating a second cursor is not forbidden, but both would serialize on
-//! the same `Mutex<TdsClient>` and share the same TDS session, so no wire
-//! corruption is possible.
+//! Invariant: one `TdsClient` per connection, one TDS wire session per
+//! `TdsClient`, and all access serialized through the async mutex. Creating
+//! a second cursor on the same connection is allowed — both cursors share
+//! the same client and serialize on the same mutex, so wire integrity is
+//! preserved.
 
 use std::sync::Arc;
 
