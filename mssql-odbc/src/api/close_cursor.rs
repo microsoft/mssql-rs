@@ -131,22 +131,24 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
 /// Closes the cursor on a statement as part of a *connection*-scoped operation
 /// (`SQLEndTran`, an autocommit switch, an isolation change, disconnect).
 ///
-/// Deliberately not routed through the public `SQLFreeStmt(SQL_CLOSE)` entry
-/// point. ODBC clears diagnostics on the handle the function was called on, so a
-/// `SQLEndTran` against a DBC must leave every child STMT's diagnostics intact —
-/// an application whose statement failed and which then rolls back before
-/// reading `SQLGetDiagRec` must still find its error. Going through
-/// `SQLFreeStmt(SQL_CLOSE)` would call [`free_errors`] on every statement and
-/// erase exactly that record.
+/// Reproduces what msodbcsql's sweep does to each statement. `CommitAbortTran`
+/// calls `SQLFreeStmt(lpstmt, SQL_CLOSE)` on every statement it visits
+/// (`sqlctran.cpp:302-323`), and that entry point calls `FreeErrors(lpstmt)`
+/// before it looks at either the option or the cursor state
+/// (`sqlccmd.cpp:379-380`). Statement diagnostics are therefore discarded even
+/// on a statement that never opened a cursor — the failed-statement case — so
+/// [`free_errors`] runs here unconditionally, ahead of the cursor check.
 ///
-/// Statements with no open cursor return immediately, before any drain work, so
-/// the common case costs one lock and nothing else.
+/// Kept separate from the public `SQLFreeStmt(SQL_CLOSE)` path only for cost:
+/// statements with no open cursor return straight after the diagnostics reset,
+/// with no FFI entry and no drain.
 pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandle) -> SqlReturn {
     {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("close_cursor_for_connection_op: stmt mutex poisoned");
             return SQL_ERROR;
         };
+        free_errors(&mut stmt_state);
         if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
             return SQL_SUCCESS;
         }

@@ -122,9 +122,9 @@ pub(super) fn exec_batch(
 /// and honoring the `SQL_CB_CLOSE` this driver advertises.
 ///
 /// Routes through [`close_cursor_for_connection_op`] rather than the public
-/// `SQLFreeStmt(SQL_CLOSE)`: this is a connection-scoped operation, so it must
-/// not clear the diagnostics belonging to child statement handles. Statements
-/// with no open cursor cost a single lock, which is the common case.
+/// `SQLFreeStmt(SQL_CLOSE)` purely to keep the sweep cheap — statements with no
+/// open cursor cost a single lock. The observable effect is the same as
+/// msodbcsql's, statement diagnostics included.
 ///
 /// Returns `SQL_ERROR` if any cursor could not be closed. Callers must not
 /// proceed in that case: a statement whose result stream did not drain leaves
@@ -665,11 +665,11 @@ mod tests {
     }
 
     #[test]
-    fn closing_cursors_preserves_statement_diagnostics() {
-        // ODBC clears diagnostics on the handle the function was called on. A
-        // connection-scoped operation must therefore leave child statement
-        // diagnostics alone, or an application that rolls back after a failed
-        // statement can no longer read why the statement failed.
+    fn closing_cursors_clears_statement_diagnostics() {
+        // msodbcsql's sweep calls SQLFreeStmt(SQL_CLOSE) on every statement
+        // (sqlctran.cpp:302-323), and that entry point frees the statement's
+        // errors before it inspects the cursor state (sqlccmd.cpp:379-380). The
+        // records go even on a statement that never opened a cursor.
         use crate::test_support::TestHandles;
         use crate::{error::HasDiagnostics, handles::StmtHandle};
 
@@ -684,10 +684,9 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         assert_eq!(close_all_cursors(dbc), SQL_SUCCESS);
 
-        assert_eq!(
-            stmt.inner.lock().unwrap().diag_records().len(),
-            1,
-            "the cursor sweep must not clear diagnostics on child statements"
+        assert!(
+            stmt.inner.lock().unwrap().diag_records().is_empty(),
+            "the cursor sweep must clear diagnostics on child statements, as msodbcsql does"
         );
     }
 }

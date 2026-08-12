@@ -292,34 +292,32 @@ TEST_F(TransactionLiveTest, EndTranOnEnvironmentSkipsUnconnectedConnections) {
     SQLFreeHandle(SQL_HANDLE_DBC, spare);
 }
 
-// ODBC clears diagnostics on the handle a function was called on. SQLEndTran
-// against a connection must therefore leave its statements' diagnostics intact,
-// so an application that rolls back after a failure can still report why.
-//
-// Deliberate divergence from msodbcsql, which fails this assertion: its
-// SQLEndTran sweeps child cursors through SQLFreeStmt(SQL_CLOSE), and that
-// clears each statement's diagnostic records as a side effect. Preserving them
-// is strictly more useful to applications and cannot break one that does not
-// look, so mssql-odbc keeps the records. See the unit test
-// `txn::tests::closing_cursors_preserves_statement_diagnostics`.
-TEST_F(TransactionLiveTest, EndTranPreservesStatementDiagnostics) {
-    SKIP_IF_COMPARING_MSODBCSQL();
+// SQLEndTran sweeps the connection's statements through the equivalent of
+// SQLFreeStmt(SQL_CLOSE), and that discards each statement's diagnostic records
+// — including on a statement that failed and so never opened a cursor. Both
+// drivers behave identically here; see the unit test
+// `txn::tests::closing_cursors_clears_statement_diagnostics`.
+TEST_F(TransactionLiveTest, EndTranClearsStatementDiagnostics) {
     ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
 
     SQLRETURN rc = Run(stmt_, "SELECT * FROM this_table_does_not_exist_xyz");
     ASSERT_EQ(SQL_ERROR, rc) << "the statement was expected to fail";
 
-    ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK), SQL_HANDLE_DBC, dbc_);
-
+    // The record is readable right up until the rollback.
     SQLTCHAR state[6] = {};
     SQLINTEGER native = 0;
     SQLTCHAR message[1024] = {};
     SQLSMALLINT length = 0;
     rc = SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native, message,
                        static_cast<SQLSMALLINT>(std::size(message)), &length);
-    EXPECT_NE(SQL_NO_DATA, rc)
-        << "the rollback erased the statement's diagnostic record; the application "
-           "can no longer discover why its statement failed";
+    ASSERT_NE(SQL_NO_DATA, rc) << "the failed statement should have posted a diagnostic record";
+
+    ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK), SQL_HANDLE_DBC, dbc_);
+
+    rc = SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native, message,
+                       static_cast<SQLSMALLINT>(std::size(message)), &length);
+    EXPECT_EQ(SQL_NO_DATA, rc)
+        << "the cursor sweep in SQLEndTran must clear the statement's diagnostic records";
 }
 
 // The vendor isolation attribute is accepted and reads back, including SNAPSHOT
