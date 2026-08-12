@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 use async_trait::async_trait;
+use bigdecimal::num_bigint::BigUint;
+use bigdecimal::num_traits::ToPrimitive;
 use core::fmt;
 use std::sync::Arc;
 use std::{fmt::Debug, io::Error, vec};
@@ -83,6 +85,12 @@ const MAX_ALLOC_SIZE: usize = 100 * 1024 * 1024;
 const MAX_PLP_SIZE: usize = 64 * 1024; // 64KB for fuzzing
 #[cfg(not(fuzzing))]
 const MAX_PLP_SIZE: usize = i32::MAX as usize;
+
+/// Maximum number of little-endian 32-bit words in a `decimal`/`numeric`
+/// magnitude. SQL Server's maximum precision of 38 digits fits in 128 bits, and
+/// the widest value the TDS wire format carries is 17 bytes (sign byte plus four
+/// words), so anything longer is malformed.
+const MAX_DECIMAL_INT_PARTS: u8 = 4;
 
 // Helper function to validate allocation size before allocating
 #[inline]
@@ -660,12 +668,6 @@ impl GenericDecoder {
         let is_positive = sign == 1;
 
         let number_of_int_parts = (length - 1) >> 2;
-
-        // Limit decimal parts allocation for fuzzing
-        #[cfg(fuzzing)]
-        const MAX_DECIMAL_INT_PARTS: u8 = 10; // Maximum 10 int parts = 40 bytes
-        #[cfg(not(fuzzing))]
-        const MAX_DECIMAL_INT_PARTS: u8 = 64; // SQL Server max precision is 38, which needs max ~17 int parts
 
         if number_of_int_parts > MAX_DECIMAL_INT_PARTS {
             return Err(crate::error::Error::ProtocolError(format!(
@@ -2009,17 +2011,10 @@ impl DecimalParts {
     /// Convert DecimalParts to a string representation suitable for Python Decimal.
     /// Returns a string like "123.45", "-0.01", etc.
     fn to_decimal_string(&self) -> String {
-        // Convert int_parts to u128
-        // int_parts[0] is the least significant, int_parts[n-1] is most significant
-        let u128_value = self
-            .int_parts
-            .iter()
-            .enumerate()
-            .fold(0u128, |acc, (i, &part)| {
-                acc + ((part as u32 as u128) << (i * 32))
-            });
-
-        let value_str = u128_value.to_string();
+        let value_str = match self.magnitude() {
+            Some(magnitude) => magnitude.to_string(),
+            None => self.magnitude_big().to_string(),
+        };
 
         // Insert decimal point at the correct position
         let result = if self.scale == 0 {
@@ -2043,19 +2038,40 @@ impl DecimalParts {
     }
 
     fn to_f64(&self) -> f64 {
-        let u128_value = self
-            .int_parts
-            .iter()
-            .enumerate()
-            .fold(0u128, |acc, (i, &part)| {
-                acc + ((part as u32 as u128) << (i * 32))
-            });
+        let magnitude = match self.magnitude() {
+            Some(magnitude) => magnitude as f64,
+            None => self.magnitude_big().to_f64().unwrap_or(f64::INFINITY),
+        };
 
-        let mut d_ret: f64 = u128_value as f64;
-
-        d_ret /= 10.0_f64.powi(self.scale as i32);
+        let d_ret = magnitude / 10.0_f64.powi(self.scale as i32);
 
         if self.is_positive { d_ret } else { -d_ret }
+    }
+
+    /// Reassembles `int_parts` into the unsigned magnitude.
+    ///
+    /// `int_parts[0]` is the least significant word. Returns `None` when the
+    /// value carries more words than a `u128` holds, which only a malformed
+    /// payload or a hand-built [`DecimalParts`] can do; callers fall back to
+    /// [`Self::magnitude_big`] instead of shifting past the accumulator width.
+    fn magnitude(&self) -> Option<u128> {
+        if self.int_parts.len() > MAX_DECIMAL_INT_PARTS as usize {
+            return None;
+        }
+        Some(
+            self.int_parts
+                .iter()
+                .enumerate()
+                .fold(0u128, |acc, (i, &part)| {
+                    acc | ((part as u32 as u128) << (i * 32))
+                }),
+        )
+    }
+
+    /// Reassembles `int_parts` into an arbitrary-precision magnitude, for values
+    /// too wide for [`Self::magnitude`].
+    fn magnitude_big(&self) -> BigUint {
+        BigUint::new(self.int_parts.iter().map(|&part| part as u32).collect())
     }
 }
 
@@ -2980,6 +2996,48 @@ mod test {
         assert!(result.is_ok());
         let parts = result.unwrap();
         assert_eq!(parts.to_decimal_string(), "123.45");
+    }
+
+    #[test]
+    fn test_decimal_parts_max_width_magnitude() {
+        // Four words of all-ones is the widest magnitude a u128 holds.
+        let parts = DecimalParts {
+            is_positive: true,
+            scale: 0,
+            precision: 38,
+            int_parts: vec![-1, -1, -1, -1],
+        };
+        assert_eq!(parts.to_decimal_string(), u128::MAX.to_string());
+    }
+
+    #[test]
+    fn test_decimal_parts_oversized_magnitude_does_not_overflow() {
+        // A malformed 5-word magnitude used to shift a u128 by 128 bits: a panic
+        // in debug builds and a wrapped, wrong value in release builds.
+        let parts = DecimalParts {
+            is_positive: true,
+            scale: 0,
+            precision: 38,
+            int_parts: vec![1, 0, 0, 0, 1],
+        };
+        // 2^128 + 1, rendered exactly rather than wrapping onto the low word.
+        assert_eq!(
+            parts.to_decimal_string(),
+            "340282366920938463463374607431768211457"
+        );
+        assert!((parts.to_f64() - 3.402_823_669_209_385e38).abs() < 1e23);
+    }
+
+    #[test]
+    fn test_decimal_parts_oversized_magnitude_with_trailing_zero_words() {
+        // Zero-padded words past the fourth carry no magnitude.
+        let parts = DecimalParts {
+            is_positive: false,
+            scale: 2,
+            precision: 38,
+            int_parts: vec![12345, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(parts.to_decimal_string(), "-123.45");
     }
 
     // Vector deserialization tests
@@ -4285,13 +4343,24 @@ mod test {
         #[tokio::test]
         async fn decimal_large_valid() {
             let md = precision_scale_metadata(TdsDataType::DecimalN, 17, 38, 0);
-            // length=17 → (17-1)>>2 = 4 int parts, which is well under the 64 limit
+            // length=17 → (17-1)>>2 = 4 int parts, the widest valid decimal
             let mut buf = vec![17u8, 1u8]; // length=17, sign=positive
             for _ in 0..4 {
                 buf.extend_from_slice(&1i32.to_le_bytes());
             }
             let val = assert_decode_equivalence(buf, &md).await;
             assert!(matches!(val, ColumnValues::Decimal(_)));
+        }
+
+        #[tokio::test]
+        async fn decimal_too_many_int_parts_rejected() {
+            let md = precision_scale_metadata(TdsDataType::DecimalN, 21, 38, 0);
+            // length=21 → (21-1)>>2 = 5 int parts, which no valid decimal produces
+            let mut buf = vec![21u8, 1u8];
+            for _ in 0..5 {
+                buf.extend_from_slice(&1i32.to_le_bytes());
+            }
+            assert_decode_err(buf, &md).await;
         }
 
         // ── Time scale branches ────────────────────────────────────────
