@@ -544,11 +544,19 @@ TEST_F(GetDataLiveTest, NvarcharMaxWideRoundTrip) {
     SQLCloseCursor(stmt_);
 }
 
-// An unsupported C target type is rejected with HYC00 and does not consume the
-// column, so a follow-up call with a supported type still returns the value.
-// The reference msodbcsql driver implements SQL_C_SSHORT conversion, so the
-// HYC00 assertion is mssql-odbc-specific — skip it on the msodbcsql leg.
-TEST_F(GetDataLiveTest, UnsupportedCTypeReturnsHyc00ThenValueReadable) {
+// Character text that is not a valid literal for a numeric C target is rejected
+// with 22018 and does not consume the column, so a follow-up call with a
+// supported type still returns the value. Before the P1a source-type
+// conversions this pairing was simply unimplemented and reported HYC00.
+//
+// TODO(convergence): this skip is temporary. msodbcsql implements this
+// conversion and its CVT_CAST_ERROR carries the "Invalid character value for
+// cast specification" message, so it very likely agrees, but the constant is
+// spelled IDS_22_005 in its source and that has not been confirmed against a
+// live run. Confirm against a live msodbcsql run, then drop the skip so this
+// compares on both legs; if the two do not agree, record the difference in the
+// "Known divergences from msodbcsql" table in docs/typed-columnar-fetch-plan.md.
+TEST_F(GetDataLiveTest, InvalidCharacterForNumericTargetIs22018ThenValueReadable) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -558,6 +566,32 @@ TEST_F(GetDataLiveTest, UnsupportedCTypeReturnsHyc00ThenValueReadable) {
     SQLSMALLINT sbuf = 0;
     SQLLEN ind = 0;
     SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_SSHORT, &sbuf, 0, &ind);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+
+    SQLRETURN rc2;
+    EXPECT_EQ("hello", GetChar(1, &rc2, &ind));
+    EXPECT_SQL_OK(rc2, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(5, ind);
+
+    SQLCloseCursor(stmt_);
+}
+
+// An unsupported C target type is rejected with HYC00 and does not consume the
+// column. SQL_C_NUMERIC is the durable anchor for this: emitting the
+// SQL_NUMERIC_STRUCT is a permanent non-goal, recorded in the "Known divergences
+// from msodbcsql" table in docs/typed-columnar-fetch-plan.md, so unlike the
+// other C targets it is not scheduled to become supported.
+TEST_F(GetDataLiveTest, UnsupportedCTypeReturnsHyc00ThenValueReadable) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS c1"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQL_NUMERIC_STRUCT nbuf{};
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_NUMERIC, &nbuf, sizeof(nbuf), &ind);
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 
