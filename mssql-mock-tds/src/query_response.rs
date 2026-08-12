@@ -162,12 +162,37 @@ impl InfoMessage {
     }
 }
 
+/// A server error injected ahead of a result set in the same batch.
+///
+/// Models a statement-scoped failure (for example `RAISERROR(...); SELECT ...`)
+/// where an ERROR token and its DONE (carrying the MORE flag) precede the
+/// row-returning statement. Used to reproduce go-mssqldb #410.
+#[derive(Debug, Clone)]
+pub struct LeadingError {
+    pub number: u32,
+    pub severity: u8,
+    pub message: String,
+}
+
+impl LeadingError {
+    pub fn new(number: u32, severity: u8, message: impl Into<String>) -> Self {
+        Self {
+            number,
+            severity,
+            message: message.into(),
+        }
+    }
+}
+
 /// A complete query response definition
 #[derive(Debug, Clone)]
 pub struct QueryResponse {
     pub columns: Vec<ColumnDefinition>,
     pub rows: Vec<Row>,
     pub info_tokens: Vec<InfoMessage>,
+    /// An error emitted (with a DONE MORE token) before the result set, so the
+    /// server keeps streaming the row set after a statement-scoped error.
+    pub leading_error: Option<LeadingError>,
 }
 
 impl QueryResponse {
@@ -177,11 +202,19 @@ impl QueryResponse {
             columns,
             rows,
             info_tokens: Vec::new(),
+            leading_error: None,
         }
     }
 
     pub fn with_info_tokens(mut self, info_tokens: Vec<InfoMessage>) -> Self {
         self.info_tokens = info_tokens;
+        self
+    }
+
+    /// Prefix this response with a statement-scoped error whose DONE carries the
+    /// MORE flag, so the row set that follows must still be drained.
+    pub fn with_leading_error(mut self, leading_error: LeadingError) -> Self {
+        self.leading_error = Some(leading_error);
         self
     }
 
@@ -191,6 +224,7 @@ impl QueryResponse {
             columns: vec![ColumnDefinition::new("", SqlDataType::Int)],
             rows: vec![Row::new(vec![ColumnValue::Int(1)])],
             info_tokens: Vec::new(),
+            leading_error: None,
         }
     }
 
@@ -208,6 +242,7 @@ impl QueryResponse {
                 ColumnValue::Int(3),
             ])],
             info_tokens: Vec::new(),
+            leading_error: None,
         }
     }
 }

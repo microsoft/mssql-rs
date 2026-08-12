@@ -101,3 +101,9 @@ pub mod fuzz_support;
 // behind `test-util` so downstream crates can unit-test client-driven paths.
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_client_support;
+
+// Test-only plumbing for feeding hand-built TDS packets to a real
+// `NetworkTransport`. Spans `io` and `connection::transport`, so it belongs to
+// neither.
+#[cfg(test)]
+pub(crate) mod test_packet_support;

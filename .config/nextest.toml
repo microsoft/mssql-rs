@@ -3,6 +3,10 @@ path = "junit.xml"
 
 [profile.ci]
 retries = 5
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }
 
 # Test groups for tests that need to run sequentially
 # TLS tests have race conditions with macOS Security.framework when creating
