@@ -5,6 +5,7 @@ use crate::connection::client_context::{IPAddressPreference, TransportContext};
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
 use crate::connection::transport::parallel_connect::{ParallelConnectConfig, parallel_connect};
+use crate::connection::transport::request_timeout::await_within_request_timeout;
 use crate::connection::transport::ssl_handler::SslHandler;
 use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
 use crate::core::{
@@ -1386,17 +1387,13 @@ impl TdsTokenStreamReader for NetworkTransport {
         plan: ColumnPolicy,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
-        let cancellable = CancelHandle::run_until_cancelled(
-            cancel_handle,
-            receive_row_into_internal(self, &*PARSER_REGISTRY, context, plan, writer),
+        let result = await_within_request_timeout!(
+            remaining_request_timeout,
+            CancelHandle::run_until_cancelled(
+                cancel_handle,
+                receive_row_into_internal(self, &*PARSER_REGISTRY, context, plan, writer),
+            )
         );
-        let result = match remaining_request_timeout.as_ref() {
-            Some(t) => match timeout(*t, cancellable).await {
-                Ok(r) => r,
-                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-            },
-            None => cancellable.await,
-        };
 
         match &result {
             Ok(_) => {}
@@ -1416,17 +1413,13 @@ impl TdsTokenStreamReader for NetworkTransport {
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<RowHeader> {
-        let cancellable = CancelHandle::run_until_cancelled(
-            cancel_handle,
-            receive_row_header_internal(self, &*PARSER_REGISTRY, context),
+        let result = await_within_request_timeout!(
+            remaining_request_timeout,
+            CancelHandle::run_until_cancelled(
+                cancel_handle,
+                receive_row_header_internal(self, &*PARSER_REGISTRY, context),
+            )
         );
-        let result = match remaining_request_timeout.as_ref() {
-            Some(t) => match timeout(*t, cancellable).await {
-                Ok(r) => r,
-                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-            },
-            None => cancellable.await,
-        };
 
         match &result {
             Ok(_) => {}
@@ -1448,17 +1441,13 @@ impl TdsTokenStreamReader for NetworkTransport {
         plan: ColumnPolicy,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
-        let cancellable = CancelHandle::run_until_cancelled(
-            cancel_handle,
-            resume_row_into_internal(self, pause_state, plan, writer),
+        let result = await_within_request_timeout!(
+            remaining_request_timeout,
+            CancelHandle::run_until_cancelled(
+                cancel_handle,
+                resume_row_into_internal(self, pause_state, plan, writer),
+            )
         );
-        let result = match remaining_request_timeout.as_ref() {
-            Some(t) => match timeout(*t, cancellable).await {
-                Ok(r) => r,
-                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-            },
-            None => cancellable.await,
-        };
 
         match &result {
             Ok(_) => {}
