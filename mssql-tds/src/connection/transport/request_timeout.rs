@@ -36,13 +36,9 @@
 /// (once by this macro, then again by `Timeout`'s first poll) and the deadline
 /// starts from after that poll rather than before it. Both are permitted:
 /// futures must tolerate spurious polls, and the shift is one poll of CPU time
-/// against a budget measured in seconds.
-///
-/// On the suspending path `$fut` is polled once more than it would be today
-/// (once by this macro, then again by `Timeout`'s first poll) and the deadline
-/// starts from after that poll rather than before it. Both are permitted:
-/// futures must tolerate spurious polls, and the shift is one poll of CPU time
-/// against a budget measured in seconds.
+/// against a budget measured in seconds. It does not change the verdict on an
+/// exhausted budget either, because `sleep(ZERO)` is itself `Pending` on its
+/// first poll, so eager `timeout` grants that same extra poll.
 macro_rules! await_within_request_timeout {
     ($budget:expr, $fut:expr) => {{
         let mut fut = ::std::pin::pin!($fut);
@@ -142,6 +138,53 @@ mod tests {
                 .await
                 .is_err(),
             "baseline: eager timeout elapses on a suspending future"
+        );
+    }
+
+    /// Suspends on its first poll, then completes. Wakes itself so the suspend
+    /// is not a deadlock, mirroring a decode that stalls and is immediately
+    /// resumable.
+    struct PendingThenReady(bool);
+
+    impl Future for PendingThenReady {
+        type Output = TdsResult<u8>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.0 {
+                return Poll::Ready(Ok(5));
+            }
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    /// Review raised this as a divergence: probing before arming grants the
+    /// inner future a poll that `Timeout` supposedly withholds, so a future
+    /// suspending once on a spent budget should elapse eagerly but succeed
+    /// lazily. Measured, it does not. `sleep(ZERO)` returns `Pending` on its
+    /// first poll and only elapses after a timer wake, so `Timeout`'s first
+    /// poll suspends too and the self-wake lets the inner future win in both
+    /// forms. Asserted as equivalence rather than a fixed outcome, so the two
+    /// stay pinned together if tokio ever changes that.
+    #[tokio::test]
+    async fn suspend_then_complete_on_a_spent_budget_matches_eager_timeout() {
+        let eager = tokio::time::timeout(Duration::ZERO, PendingThenReady(false)).await;
+        let lazy = await_within_request_timeout!(Some(Duration::ZERO), PendingThenReady(false));
+
+        assert_eq!(
+            eager.is_err(),
+            is_elapsed(&lazy),
+            "lazy arming must reach the same verdict as eager timeout"
+        );
+        assert!(
+            eager.is_ok() && !is_elapsed(&lazy),
+            "both forms let the future complete: sleep(ZERO) is Pending on its first poll"
+        );
+        assert_eq!(
+            lazy.expect("completed on the re-poll"),
+            5,
+            "and both yield the value the future produced"
         );
     }
 
