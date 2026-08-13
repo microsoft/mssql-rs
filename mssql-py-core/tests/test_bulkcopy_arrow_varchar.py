@@ -94,7 +94,10 @@ def test_cursor_bulkcopy_arrow_varchar_string_view(client_context):
     source = pa.table(
         {
             "id": pa.array([1, 2, 3], type=pa.int32()),
-            "name": pa.array(["alpha", None, "gamma"], type=pa.string_view()),
+            "name": pa.array(
+                ["inline", None, "this value exceeds twelve bytes"],
+                type=pa.string_view(),
+            ),
         }
     )
 
@@ -102,7 +105,11 @@ def test_cursor_bulkcopy_arrow_varchar_string_view(client_context):
     assert result["rows_copied"] == 3
 
     cursor.execute(f"SELECT id, name FROM {table_name} ORDER BY id")
-    assert cursor.fetchall() == [(1, "alpha"), (2, None), (3, "gamma")]
+    assert cursor.fetchall() == [
+        (1, "inline"),
+        (2, None),
+        (3, "this value exceeds twelve bytes"),
+    ]
 
     conn.close()
 

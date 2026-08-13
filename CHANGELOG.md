@@ -63,7 +63,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ### Fixed
 
 - `mssql-py-core`: Arrow bulk copy now accepts `Utf8View` and `BinaryView`
-  columns, enabling zero-copy string ingestion from Polars DataFrames.
+  columns, allowing Polars DataFrames to load without first converting their
+  string columns to a PyArrow table.
 
 - `mssql-tds`: reading a fixed-width value that straddles a TDS packet boundary
   could return bytes from the wrong place or panic. The readers checked for

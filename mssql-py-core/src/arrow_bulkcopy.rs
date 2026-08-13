@@ -128,11 +128,11 @@ pub enum ColumnPlanKind {
     SmallDateTime {
         unit: TimeUnit,
     },
-    /// Arrow `utf8`/`large_utf8` → SQL `xml`.
+    /// Arrow `utf8`/`large_utf8`/`utf8_view` → SQL `xml`.
     Xml,
-    /// Arrow `utf8`/`large_utf8` → SQL `json`.
+    /// Arrow `utf8`/`large_utf8`/`utf8_view` → SQL `json`.
     Json,
-    /// Arrow `utf8`/`large_utf8` GUID text → SQL `uniqueidentifier`.
+    /// Arrow `utf8`/`large_utf8`/`utf8_view` GUID text → SQL `uniqueidentifier`.
     Utf8Uuid,
     /// All-null arrow column.
     Null,
@@ -1176,16 +1176,25 @@ mod tests {
 
     #[test]
     fn utf8_view_varchar_and_nvarchar() {
-        let array: ArrayRef = Arc::new(StringViewArray::from(vec![Some("hello"), None]));
+        let external = "this value exceeds twelve bytes";
+        let array: ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("inline"),
+            Some(external),
+            None,
+        ]));
         for sql_type in [SqlDbType::VarChar, SqlDbType::NVarChar] {
             let dest = meta("name", sql_type, true);
             let plan = one_col_plan(DataType::Utf8View, &dest);
             match plan.extract_value(array.as_ref(), 0, &dest).unwrap() {
-                ColumnValues::String(value) => assert_eq!(value.to_utf8_string(), "hello"),
+                ColumnValues::String(value) => assert_eq!(value.to_utf8_string(), "inline"),
+                other => panic!("expected String, got {other:?}"),
+            }
+            match plan.extract_value(array.as_ref(), 1, &dest).unwrap() {
+                ColumnValues::String(value) => assert_eq!(value.to_utf8_string(), external),
                 other => panic!("expected String, got {other:?}"),
             }
             assert_eq!(
-                plan.extract_value(array.as_ref(), 1, &dest).unwrap(),
+                plan.extract_value(array.as_ref(), 2, &dest).unwrap(),
                 ColumnValues::Null
             );
         }
@@ -1228,12 +1237,24 @@ mod tests {
             ColumnValues::Bytes(vec![10, 11])
         );
 
-        let view: ArrayRef = Arc::new(BinaryViewArray::from(vec![Some(&b"\x0c\x0d"[..])]));
+        let external = b"more than twelve bytes";
+        let view: ArrayRef = Arc::new(BinaryViewArray::from(vec![
+            Some(&b"\x0c\x0d"[..]),
+            Some(&external[..]),
+            None,
+        ]));
+        let plan = one_col_plan(DataType::BinaryView, &dest);
         assert_eq!(
-            one_col_plan(DataType::BinaryView, &dest)
-                .extract_value(view.as_ref(), 0, &dest)
-                .unwrap(),
+            plan.extract_value(view.as_ref(), 0, &dest).unwrap(),
             ColumnValues::Bytes(vec![12, 13])
+        );
+        assert_eq!(
+            plan.extract_value(view.as_ref(), 1, &dest).unwrap(),
+            ColumnValues::Bytes(external.to_vec())
+        );
+        assert_eq!(
+            plan.extract_value(view.as_ref(), 2, &dest).unwrap(),
+            ColumnValues::Null
         );
     }
 

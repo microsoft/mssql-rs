@@ -124,7 +124,10 @@ def test_cursor_bulkcopy_arrow_varbinary_binary_view(client_context):
     source = pa.table(
         {
             "id": pa.array([1, 2, 3], type=pa.int32()),
-            "data": pa.array([b"\x01\x02", None, b"\x0a\x0b"], type=pa.binary_view()),
+            "data": pa.array(
+                [b"\x01\x02", None, b"more than twelve bytes"],
+                type=pa.binary_view(),
+            ),
         }
     )
 
@@ -132,7 +135,11 @@ def test_cursor_bulkcopy_arrow_varbinary_binary_view(client_context):
     assert result["rows_copied"] == 3
 
     cursor.execute(f"SELECT id, data FROM {table_name} ORDER BY id")
-    assert cursor.fetchall() == [(1, b"\x01\x02"), (2, None), (3, b"\x0a\x0b")]
+    assert cursor.fetchall() == [
+        (1, b"\x01\x02"),
+        (2, None),
+        (3, b"more than twelve bytes"),
+    ]
 
     conn.close()
 
