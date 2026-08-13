@@ -8,7 +8,7 @@ use mssql_tds::connection::tds_client::TdsClient;
 use tokio::runtime::Runtime;
 
 use super::{EnvHandle, HandleType, HasObjectType};
-use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE};
+use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED};
 use crate::error::{DiagRecord, HasDiagnostics};
 
 /// Connection state machine — tracks whether the DBC is connected.
@@ -75,6 +75,22 @@ pub(crate) struct DbcState {
     pub(crate) connection_timeout: u32,
     /// `SQL_ATTR_PACKET_SIZE` in bytes. Stored, not yet honored.
     pub(crate) packet_size: u32,
+    /// `SQL_ATTR_AUTOCOMMIT`. `true` is the ODBC-mandated default
+    /// (msodbcsql `SQL_AUTOCOMMIT_DEFAULT`); `false` selects manual-commit, in
+    /// which the driver keeps a transaction open until `SQLEndTran`.
+    pub(crate) autocommit: bool,
+    /// `SQL_ATTR_TXN_ISOLATION`, one of the `SQL_TXN_*` bits. Cached client-side
+    /// and read back without a server round trip, matching msodbcsql
+    /// (`sqlcmisc.cpp:3426`). Applied as a `SET TRANSACTION ISOLATION LEVEL`
+    /// batch when connected, otherwise deferred to connect time.
+    pub(crate) txn_isolation: u32,
+    /// The application executed a statement in manual-commit mode, so the open
+    /// transaction may hold uncommitted user work. Mirrors msodbcsql's
+    /// `CONN_ST_LOCALTRANS_STARTED` (`sqlcprot.h:2298`) and is deliberately
+    /// distinct from `TdsClient::has_active_transaction()`, which also reports
+    /// driver-begun *piggyback* transactions that carry no user work. Only this
+    /// flag blocks `SQLDisconnect` (25000) and `SQL_ATTR_TXN_ISOLATION` (HY011).
+    pub(crate) local_tran_started: bool,
 }
 
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
@@ -92,6 +108,9 @@ impl std::fmt::Debug for DbcState {
                 &self.access_token.as_ref().map(|_| "<REDACTED>"),
             )
             .field("login_timeout", &self.login_timeout)
+            .field("autocommit", &self.autocommit)
+            .field("txn_isolation", &self.txn_isolation)
+            .field("local_tran_started", &self.local_tran_started)
             .finish()
     }
 }
@@ -122,6 +141,9 @@ impl DbcHandle {
                 access_mode: SQL_MODE_READ_WRITE,
                 connection_timeout: 0,
                 packet_size: DEFAULT_PACKET_SIZE,
+                autocommit: true,
+                txn_isolation: SQL_TXN_READ_COMMITTED,
+                local_tran_started: false,
             }),
         }
     }

@@ -11,6 +11,7 @@ use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{build_named_params, claim_connection, fail_with_tds, finish_execute};
 use super::sqlstate::*;
+use super::txn::begin_transaction_if_manual;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
 use crate::error::free_errors;
 use crate::handles::stmt::{
@@ -80,6 +81,16 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             return rc;
         }
     };
+
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecute") {
+        // Nothing ran, so put the staged statement (and any pending orphan)
+        // back before reporting, exactly as the failed-claim path does.
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            stmt_state.prepared = Some(prepared);
+            stmt_state.pending_unprepare = orphaned;
+        }
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
 
     // `execute_prepared` owns the whole recovery sequence: reconnect once up
     // front (mirrors msodbcsql `GetBatchCtxOrRecover`), charge it against the

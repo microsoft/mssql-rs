@@ -9,6 +9,7 @@ use super::exec_common::{
     build_named_params, claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
 };
 use super::sqlstate::*;
+use super::txn::begin_transaction_if_manual;
 use super::util::{read_utf16, rewrite_param_markers};
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
@@ -125,6 +126,10 @@ fn sql_exec_direct_w_safe(
 
     // Release any handle orphaned by the reset above before running the batch.
     flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecDirectW");
+
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecDirectW") {
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
 
     // Parameterized text runs via sp_executesql (direct execution, no cached
     // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor

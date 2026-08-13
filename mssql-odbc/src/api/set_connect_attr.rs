@@ -11,10 +11,12 @@
 use tracing::{debug, error};
 
 use super::sqlstate::*;
+use super::txn::{set_autocommit, set_txn_isolation};
 use crate::api::odbc_types::{
-    SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT,
-    SQL_ATTR_PACKET_SIZE, SQL_COPT_SS_ACCESS_TOKEN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT,
+    SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN,
+    SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
@@ -73,6 +75,19 @@ unsafe fn sql_set_connect_attr_w_impl(
         HandleType::Dbc,
         "SQLSetConnectAttrW: handle is not a DBC"
     );
+
+    // The transaction attributes talk to the server, which must not happen while
+    // the DBC mutex is held, so they manage their own locking.
+    match attribute {
+        SQL_ATTR_AUTOCOMMIT => return set_autocommit(dbc, value_ptr as usize as u64),
+        // Both spellings drive the same session setting. The vendor attribute is
+        // the only one that can carry SQL_TXN_SS_SNAPSHOT, because the Driver
+        // Manager screens SQL_ATTR_TXN_ISOLATION down to the four standard bits.
+        SQL_ATTR_TXN_ISOLATION | SQL_COPT_SS_TXN_ISOLATION => {
+            return set_txn_isolation(dbc, value_ptr as usize as u64);
+        }
+        _ => {}
+    }
 
     let Ok(mut state) = dbc.inner.lock() else {
         error!("SQLSetConnectAttrW: dbc mutex poisoned");
@@ -246,7 +261,11 @@ unsafe fn decode_access_token(value_ptr: SqlPointer) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_IS_POINTER};
+    use crate::api::odbc_types::{
+        DEFAULT_PACKET_SIZE, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_IS_POINTER,
+        SQL_TXN_READ_COMMITTED, SQL_TXN_READ_UNCOMMITTED, SQL_TXN_REPEATABLE_READ,
+        SQL_TXN_SERIALIZABLE, SQL_TXN_SS_SNAPSHOT,
+    };
     use crate::error::HasDiagnostics;
     use crate::test_support::TestHandles;
 
@@ -505,5 +524,156 @@ mod tests {
         assert_eq!(state.access_mode, 1);
         assert_eq!(state.connection_timeout, 30);
         assert_eq!(state.packet_size, 16384);
+    }
+
+    #[test]
+    fn autocommit_off_is_stored_before_connect() {
+        let h = TestHandles::with_env_dbc();
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_AUTOCOMMIT,
+                SQL_AUTOCOMMIT_OFF as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(!dbc.inner.lock().unwrap().autocommit);
+    }
+
+    #[test]
+    fn autocommit_default_is_on_and_resetting_it_is_a_no_op() {
+        // ODBC's default is SQL_AUTOCOMMIT_ON; msodbcsql short-circuits a set to
+        // the current mode (`sqlcmisc.cpp:1720`) instead of touching the server.
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(dbc.inner.lock().unwrap().autocommit);
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_AUTOCOMMIT,
+                SQL_AUTOCOMMIT_ON as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert!(dbc.inner.lock().unwrap().autocommit);
+    }
+
+    #[test]
+    fn autocommit_rejects_values_outside_the_two_modes() {
+        let h = TestHandles::with_env_dbc();
+        let ret = unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_AUTOCOMMIT, 7 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HY024);
+        assert!(state.autocommit, "a rejected set must not change the mode");
+    }
+
+    #[test]
+    fn isolation_levels_are_stored_before_connect() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        for level in [
+            SQL_TXN_READ_UNCOMMITTED,
+            SQL_TXN_READ_COMMITTED,
+            SQL_TXN_REPEATABLE_READ,
+            SQL_TXN_SERIALIZABLE,
+            SQL_TXN_SS_SNAPSHOT,
+        ] {
+            let ret = unsafe {
+                sql_set_connect_attr_w(
+                    h.dbc,
+                    SQL_ATTR_TXN_ISOLATION,
+                    level as usize as SqlPointer,
+                    0,
+                )
+            };
+            assert_eq!(ret, SQL_SUCCESS, "level {level:#x}");
+            assert_eq!(dbc.inner.lock().unwrap().txn_isolation, level);
+        }
+    }
+
+    #[test]
+    fn vendor_isolation_attribute_is_accepted_and_reads_back() {
+        // SQL_COPT_SS_TXN_ISOLATION is the only route to SNAPSHOT: the Driver
+        // Manager screens SQL_ATTR_TXN_ISOLATION down to the four standard bits
+        // before the driver is called.
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_COPT_SS_TXN_ISOLATION,
+                SQL_TXN_SS_SNAPSHOT as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(dbc.inner.lock().unwrap().txn_isolation, SQL_TXN_SS_SNAPSHOT);
+    }
+
+    #[test]
+    fn setting_the_current_isolation_level_again_is_a_no_op() {
+        // Matches the same-value short-circuit autocommit uses
+        // (`sqlcmisc.cpp:1720`): no cursor sweep and no round trip.
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        h.mark_dbc_connected();
+        assert_eq!(
+            dbc.inner.lock().unwrap().txn_isolation,
+            SQL_TXN_READ_COMMITTED
+        );
+        // Connected with no TDS client: reaching the server would fail, so
+        // SQL_SUCCESS proves the short-circuit fired.
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_TXN_ISOLATION,
+                SQL_TXN_READ_COMMITTED as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+    }
+
+    #[test]
+    fn isolation_rejects_unsupported_level_with_hyc00() {
+        // msodbcsql answers HYC00 rather than HY024 here (`sqlcmisc.cpp:1817`):
+        // the value is a valid ODBC isolation bit the driver does not implement.
+        let h = TestHandles::with_env_dbc();
+        let ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_TXN_ISOLATION, 0x10 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HYC00);
+        assert_eq!(
+            state.txn_isolation, SQL_TXN_READ_COMMITTED,
+            "a rejected set must not change the stored level"
+        );
+    }
+
+    #[test]
+    fn isolation_is_rejected_while_a_transaction_is_open() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().local_tran_started = true;
+
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_TXN_ISOLATION,
+                SQL_TXN_SERIALIZABLE as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let mut state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HY011);
+        assert_eq!(state.txn_isolation, SQL_TXN_READ_COMMITTED);
+        state.local_tran_started = false;
     }
 }

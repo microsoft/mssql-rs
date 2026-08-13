@@ -8,6 +8,7 @@ mod connect;
 mod describe_col;
 mod disconnect;
 mod driver_connect;
+mod end_tran;
 mod exec_common;
 mod exec_direct;
 mod execute;
@@ -30,6 +31,7 @@ pub(crate) mod set_connect_attr;
 pub(crate) mod set_env_attr;
 pub(crate) mod set_stmt_attr;
 pub(crate) mod sqlstate;
+mod txn;
 pub(crate) mod util;
 
 // Exported ODBC entry points — the driver's public API surface.
