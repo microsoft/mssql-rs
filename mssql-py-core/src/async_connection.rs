@@ -129,6 +129,7 @@ impl PyAsyncConnection {
                 .await
                 .map_err(|e| {
                     tracing::error!("PyAsyncConnection::connect: failed: {}", e);
+                    // TODO(User Story 47181): map TdsError to a DB-API-compliant exception, preserving SQLSTATE + server error number.
                     PyRuntimeError::new_err(format!("Failed to connect to SQL Server: {e}"))
                 })?;
 
@@ -168,7 +169,7 @@ impl PyAsyncConnection {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let Some(client) = client_opt else {
                 tracing::debug!("PyAsyncConnection::close: already closed, no-op");
-                return Ok(());
+                return Python::attach(|py| Ok(py.None()));
             };
 
             tracing::info!(
@@ -184,7 +185,7 @@ impl PyAsyncConnection {
                     e
                 );
             }
-            Ok(())
+            Python::attach(|py| Ok(py.None()))
         })
     }
 
@@ -216,10 +217,11 @@ impl PyAsyncConnection {
             let mut guard = client.lock().await;
             guard.commit_transaction(None, None).await.map_err(|e| {
                 tracing::error!("PyAsyncConnection::commit: failed: {}", e);
+                // TODO(User Story 47181): map TdsError to a DB-API-compliant exception, preserving SQLSTATE + server error number.
                 PyRuntimeError::new_err(format!("Commit failed: {e}"))
             })?;
             tracing::info!("PyAsyncConnection::commit: transaction committed");
-            Ok(())
+            Python::attach(|py| Ok(py.None()))
         })
     }
 
@@ -251,10 +253,11 @@ impl PyAsyncConnection {
             let mut guard = client.lock().await;
             guard.rollback_transaction(None, None).await.map_err(|e| {
                 tracing::error!("PyAsyncConnection::rollback: failed: {}", e);
+                // TODO(User Story 47181): map TdsError to a DB-API-compliant exception, preserving SQLSTATE + server error number.
                 PyRuntimeError::new_err(format!("Rollback failed: {e}"))
             })?;
             tracing::info!("PyAsyncConnection::rollback: transaction rolled back");
-            Ok(())
+            Python::attach(|py| Ok(py.None()))
         })
     }
 

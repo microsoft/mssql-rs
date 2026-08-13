@@ -74,14 +74,13 @@ def test_connect_returns_pyasyncconnection(client_context):
 
 @pytest.mark.integration
 def test_close_is_awaitable(client_context):
-    """close() returns an awaitable that resolves cleanly."""
+    """close() returns an awaitable that resolves to None."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
-            # pyo3-async-runtimes converts Rust `()` to a Python empty tuple.
             result = await conn.close()
-            assert result is None or result == ()
+            assert result is None
 
     asyncio.run(run())
 
@@ -117,7 +116,7 @@ def test_commit_returns_awaitable_that_resolves(client_context):
                 # acceptable outcomes for this plumbing test.
                 try:
                     result = await conn.commit()
-                    assert result is None or result == ()
+                    assert result is None
                 except RuntimeError as e:
                     assert "Commit failed" in str(e)
             finally:
@@ -136,7 +135,7 @@ def test_rollback_returns_awaitable_that_resolves(client_context):
             try:
                 try:
                     result = await conn.rollback()
-                    assert result is None or result == ()
+                    assert result is None
                 except RuntimeError as e:
                     assert "Rollback failed" in str(e)
             finally:
