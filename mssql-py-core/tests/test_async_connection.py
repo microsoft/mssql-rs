@@ -1,15 +1,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Tests for PyAsyncConnection: connect, close, commit, rollback, cursor.
-
-NOTE: PyAsyncConnection is a preview API. `PREVIEW_WARNED` is a process-wide
-AtomicBool that latches to True after the first successful FutureWarning
-emission — see `test_future_warning_propagates_when_promoted_to_error` for the
-ordering constraint that follows.
-"""
+"""Tests for PyAsyncConnection: connect, close, commit, rollback, cursor."""
 
 import asyncio
+import subprocess
+import sys
+import textwrap
 import warnings
 
 import pytest
@@ -20,33 +17,38 @@ import mssql_py_core
 # Preview warning
 # ---------------------------------------------------------------------------
 
-# This test must run before any other test in this session that awaits
-# PyAsyncConnection.connect(). Once the warning fires successfully,
-# PREVIEW_WARNED (a process-wide AtomicBool in Rust) is set to True and the
-# warning cannot be re-observed in this process. If invocation order places
-# another connect-issuing test before this one, this test self-skips.
+# Isolated in a fresh interpreter so PREVIEW_WARNED (the process-wide
+# AtomicBool latch in Rust) is guaranteed False; no invocation-order coupling
+# and no fail-open path where a real regression would surface as a skip.
 def test_future_warning_propagates_when_promoted_to_error():
     """warnings.filterwarnings('error', FutureWarning) makes connect() raise it."""
-    async def try_connect():
-        try:
-            await mssql_py_core.PyAsyncConnection.connect({})
-        except FutureWarning:
-            return "warning_raised"
-        except Exception as exc:
-            return f"other:{type(exc).__name__}"
-        return "no_error"
+    script = textwrap.dedent(
+        """
+        import asyncio, sys, warnings
+        import mssql_py_core
 
-    with warnings.catch_warnings():
         warnings.simplefilter("error", FutureWarning)
-        outcome = asyncio.run(try_connect())
 
-    if outcome == "warning_raised":
-        return
-    if outcome.startswith("other:"):
-        pytest.skip(
-            f"PREVIEW_WARNED already latched by an earlier test; connect proceeded and hit {outcome[6:]}"
+        async def main():
+            try:
+                await mssql_py_core.PyAsyncConnection.connect({})
+            except FutureWarning:
+                sys.exit(0)
+            sys.exit(1)
+
+        asyncio.run(main())
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            f"expected FutureWarning to be raised in subprocess "
+            f"(exit={result.returncode}, stderr={result.stderr!r})"
         )
-    pytest.fail(f"unexpected outcome: {outcome!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -104,21 +106,18 @@ def test_close_is_idempotent(client_context):
 
 @pytest.mark.integration
 def test_commit_returns_awaitable_that_resolves(client_context):
-    """commit() returns an awaitable; resolves cleanly or raises RuntimeError."""
+    """commit() with no active transaction always raises SQL Server 3902."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             try:
-                # With no active transaction, SQL Server returns error 3902
-                # which the driver surfaces as RuntimeError. Either the server
-                # accepts the commit (auto-commit mode) or raises — both are
-                # acceptable outcomes for this plumbing test.
-                try:
-                    result = await conn.commit()
-                    assert result is None
-                except RuntimeError as e:
-                    assert "Commit failed" in str(e)
+                # PyAsyncConnection has no begin_transaction, so a fresh
+                # connection has no open TDS transaction; TM_COMMIT deterministically
+                # yields SQL Server 3902. Matching the server error number keeps
+                # this valid after the DB-API error taxonomy lands.
+                with pytest.raises(Exception, match="3902"):
+                    await conn.commit()
             finally:
                 await conn.close()
 
@@ -127,17 +126,16 @@ def test_commit_returns_awaitable_that_resolves(client_context):
 
 @pytest.mark.integration
 def test_rollback_returns_awaitable_that_resolves(client_context):
-    """rollback() returns an awaitable; resolves cleanly or raises RuntimeError."""
+    """rollback() with no active transaction always raises SQL Server 3903."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             try:
-                try:
-                    result = await conn.rollback()
-                    assert result is None
-                except RuntimeError as e:
-                    assert "Rollback failed" in str(e)
+                # Same rationale as commit: fresh connection has no open TDS
+                # transaction; TM_ROLLBACK deterministically yields 3903.
+                with pytest.raises(Exception, match="3903"):
+                    await conn.rollback()
             finally:
                 await conn.close()
 
