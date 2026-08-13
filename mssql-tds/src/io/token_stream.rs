@@ -598,6 +598,28 @@ fn zeroed_bitmap(bitmap_len: usize) -> Arc<[u8]> {
     std::iter::repeat_n(0u8, bitmap_len).collect()
 }
 
+/// Fills `buffer` with exactly `buffer.len()` bitmap bytes.
+///
+/// [`TdsPacketReader::read_bytes`] reports a count and does not contract a full
+/// fill. That matters more here than elsewhere: because the buffer is reused, a
+/// short read would leave the *previous* row's bits in the tail and silently
+/// yield wrong NULL flags for this row, with the wrongness depending on whatever
+/// row came before. A short bitmap read is a protocol violation, so treat it as
+/// one rather than decoding from half-stale state.
+async fn fill_bitmap<R: TdsPacketReader + Send + Sync>(
+    reader: &mut R,
+    buffer: &mut [u8],
+) -> TdsResult<()> {
+    let expected = buffer.len();
+    let read = reader.read_bytes(buffer).await?;
+    if read != expected {
+        return Err(crate::error::Error::ProtocolError(format!(
+            "NBCROW null bitmap truncated: expected {expected} bytes, read {read}"
+        )));
+    }
+    Ok(())
+}
+
 /// Reads an NBCROW null bitmap, refilling `scratch`'s allocation in place when
 /// nothing else still holds it.
 ///
@@ -608,25 +630,27 @@ fn zeroed_bitmap(bitmap_len: usize) -> Arc<[u8]> {
 /// The [`Arc::get_mut`] check is load-bearing for correctness, not just an
 /// optimization guard: a consumer holding a [`RowPauseState`] past end-of-row
 /// keeps the cached bitmap alive, and refilling it would corrupt a row that is
-/// still being read.
+/// still being read. Falling through to a fresh allocation is the only safe
+/// response, so the reuse and allocate paths are kept separate — each takes the
+/// single [`Arc::get_mut`] it needs, and the one that must not fail is the one
+/// operating on an `Arc` allocated a line earlier.
 async fn read_nbc_bitmap<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
     bitmap_len: usize,
     scratch: &mut Option<Arc<[u8]>>,
 ) -> TdsResult<Arc<[u8]>> {
-    let mut bitmap = match scratch.take() {
-        Some(mut cached) if cached.len() == bitmap_len => {
-            if Arc::get_mut(&mut cached).is_some() {
-                cached
-            } else {
-                zeroed_bitmap(bitmap_len)
-            }
-        }
-        _ => zeroed_bitmap(bitmap_len),
-    };
+    if let Some(mut cached) = scratch.take()
+        && cached.len() == bitmap_len
+        && let Some(buffer) = Arc::get_mut(&mut cached)
+    {
+        fill_bitmap(reader, buffer).await?;
+        *scratch = Some(Arc::clone(&cached));
+        return Ok(cached);
+    }
 
-    let buffer = Arc::get_mut(&mut bitmap).expect("bitmap is unique before it is shared");
-    reader.read_bytes(buffer).await?;
+    let mut bitmap = zeroed_bitmap(bitmap_len);
+    let buffer = Arc::get_mut(&mut bitmap).expect("a freshly allocated Arc is unique");
+    fill_bitmap(reader, buffer).await?;
 
     *scratch = Some(Arc::clone(&bitmap));
     Ok(bitmap)
@@ -1205,11 +1229,23 @@ mod tests {
     struct TestByteReader {
         data: Vec<u8>,
         pos: usize,
+        /// When set, the next `read_bytes` fills only this many bytes and
+        /// reports that count, modelling a reader that does not fully fill.
+        short_read: Option<usize>,
     }
 
     impl TestByteReader {
         fn new(data: Vec<u8>) -> Self {
-            Self { data, pos: 0 }
+            Self {
+                data,
+                pos: 0,
+                short_read: None,
+            }
+        }
+
+        fn with_short_read(mut self, filled: usize) -> Self {
+            self.short_read = Some(filled);
+            self
         }
 
         fn take(&mut self, n: usize) -> TdsResult<&[u8]> {
@@ -1276,6 +1312,11 @@ mod tests {
         }
 
         async fn read_bytes(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
+            if let Some(filled) = self.short_read.take() {
+                let raw = self.take(filled)?;
+                buffer[..filled].copy_from_slice(raw);
+                return Ok(filled);
+            }
             let raw = self.take(buffer.len())?;
             buffer.copy_from_slice(raw);
             Ok(buffer.len())
@@ -1617,6 +1658,38 @@ mod tests {
 
         let second = next_nbc_bitmap(&mut reader, &registry, &wide, &mut scratch).await;
         assert_eq!(*second, [0b0000_0011, 0b0000_0001]);
+    }
+
+    // `read_bytes` reports a count and contracts no full fill. Because the
+    // buffer is reused, a partial fill would leave the previous row's bits in
+    // the tail, so it has to be rejected rather than decoded.
+    #[tokio::test]
+    async fn nbcrow_short_bitmap_read_is_rejected() {
+        let context = ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: 9,
+                columns: (0..9).map(|i| int4_metadata(&format!("c{i}"))).collect(),
+                cek_table: vec![],
+            }),
+            None,
+        );
+
+        let mut reader =
+            TestByteReader::new(vec![TokenType::NbcRow as u8, 0b0000_0011, 0b0000_0001])
+                .with_short_read(1);
+        let registry = GenericTokenParserRegistry::default();
+        let mut scratch = None;
+
+        let Err(err) =
+            receive_row_header_internal(&mut reader, &registry, &context, &mut scratch).await
+        else {
+            panic!("a truncated null bitmap must be rejected");
+        };
+
+        assert!(
+            err.to_string().contains("NBCROW null bitmap truncated"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

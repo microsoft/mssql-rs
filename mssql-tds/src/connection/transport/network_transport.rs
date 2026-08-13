@@ -1393,7 +1393,10 @@ impl TdsTokenStreamReader for NetworkTransport {
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         // `self` is the packet reader, so the scratch slot has to be moved out
-        // for the duration of the read and put back afterwards.
+        // for the duration of the read and put back afterwards. The restore
+        // below must stay unconditional, and no `?` may be introduced between
+        // these two points: an early return would drop the cached bitmap and
+        // silently cost an allocation on every subsequent row.
         let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
         let cancellable = CancelHandle::run_until_cancelled(
             cancel_handle,
@@ -1433,6 +1436,8 @@ impl TdsTokenStreamReader for NetworkTransport {
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<RowHeader> {
+        // Same take/restore as `receive_row_into`: unconditional restore, no `?`
+        // between the two points.
         let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
         let cancellable = CancelHandle::run_until_cancelled(
             cancel_handle,
