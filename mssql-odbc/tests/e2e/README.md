@@ -35,6 +35,9 @@ tests/e2e/
 ├── run_e2e.sh                  # Build + test runner (Linux / macOS)
 ├── build_e2e.sh                # Build-only half for CI artifact reuse (Linux / macOS)
 ├── run_e2e.ps1                 # Build + test runner (Windows, requires admin)
+├── run_bench.ps1               # Build + run the fetch-throughput A/B benchmark (Windows, no admin)
+├── bench/
+│   └── fetch_bench.cpp         # Fetch/row-throughput A/B benchmark (mssql-odbc vs msodbcsql18)
 └── README.md                   # This file
 ```
 
@@ -407,3 +410,74 @@ across matching distros:
 A glibc-2.35 binary may fail to load on older glibc (e.g. RHEL 8's 2.28), and an
 OpenSSL 3 binary won't find `libssl.so.1.1`, which is why the glibc-2.28 track
 exists as a separate build.
+
+## Fetch-throughput A/B benchmark
+
+`bench/fetch_bench.cpp` is a standalone perf harness (not a pass/fail CTest
+test) that times the **fetch / row-decode path** — the `SQLFetch` +
+`SQLGetData` drain over a large result set — and runs an A/B between the native
+**ODBC Driver 18 for SQL Server** and the Rust `mssql-odbc` dev driver in one
+invocation. It deliberately does **not** benchmark `SQLExecDirect` (that path is
+I/O bound; see PR #186); the query returns many rows so row decode dominates.
+
+### What it measures
+
+- The query is `SELECT TOP (N)` of an `int` / `bigint` / `varchar` / `nvarchar`
+  / `float` row set materialised entirely server-side (a `sys.all_objects`
+  self cross-join), so the client spends its time decoding rows.
+- Every column is pulled with `SQLGetData` as character data — the one column
+  path both drivers share (the Rust dev driver does not export `SQLBindCol`, and
+  its Phase-1 `SQLGetData` converts to `SQL_C_CHAR` / `SQL_C_WCHAR` only, so
+  `datetime2` is intentionally excluded).
+- Timing uses `QueryPerformanceCounter` around each execute+drain rep. The first
+  rep per driver is a discarded warmup; every remaining rep is printed (ms and
+  rows/sec) along with the median. A checksum over all decoded values is summed
+  so nothing is optimised away — it matches across both legs, confirming an
+  identical, fair workload.
+
+> **Always benchmark the Rust leg as a `--release` build.** A debug `mssql-odbc`
+> build is 10–30x slower purely from codegen (no inlining, overflow checks), which
+> swamps the real driver-path cost and produces a badly misleading gap. Pass
+> `-Release` to `run_bench.ps1` (it builds `cargo build --release` and points the
+> Rust leg at `target\release\msodbcsql18.dll`).
+
+### Driver-manager bypass (no admin, no registry)
+
+Each leg loads a driver **DLL directly** (`LoadLibrary` + `GetProcAddress`,
+acting as its own tiny driver manager) via the `dll:<path>` leg syntax, so the
+unregistered Rust dev driver runs with **zero admin rights** and both legs
+execute on an identical, DM-free code path. A leg given a bare name instead of
+`dll:` routes through `odbc32.dll` (the real DM) and resolves that name from the
+registry as usual.
+
+### Running it (Windows)
+
+```powershell
+# From mssql-odbc\tests\e2e\  — builds the Rust driver + fetch_bench, then runs
+# both legs. No administrator required.
+.\run_bench.ps1
+
+# Tune the workload
+.\run_bench.ps1 -Rows 500000 -Reps 11 -Warmup 1
+
+# Point at specific driver DLLs (defaults: system32 msodbcsql18.dll for native,
+# target\debug\msodbcsql18.dll for Rust)
+.\run_bench.ps1 -NativeDll 'C:\Windows\System32\msodbcsql18.dll' -RustDll '...\target\debug\msodbcsql18.dll'
+```
+
+Connection info is resolved the same way as the e2e tests (`ODBC_TEST_*` env
+vars, else `mssql-tds/.env` for host/port/user and `$env:SQL_PASSWORD` /
+`C:\tmp\password` for the password — never echoed).
+
+The binary can also be driven directly once built:
+
+```powershell
+build\fetch_bench.exe --rows 200000 --reps 9 --warmup 1 `
+  --driver "native=dll:C:\Windows\System32\msodbcsql18.dll" `
+  --driver "rust=dll:...\target\debug\msodbcsql18.dll"
+```
+
+The final line prints `ratio (rust median / native median)` — `1.00x` is
+parity, `>1` means Rust is slower. Per-driver deltas under ~15% are within
+run-to-run noise.
+
