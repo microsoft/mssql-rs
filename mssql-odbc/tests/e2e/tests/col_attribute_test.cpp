@@ -173,7 +173,14 @@ TEST_F(ColAttributeLiveTest, NameTruncationReturnsInfo) {
 
 // The variant attribute is rejected outright on a column that is not a
 // sql_variant, rather than reporting a type the caller would then trust.
+//
+// msodbcsql-specific: msodbcsql returns SUCCESS here. Its `SQL_CA_SS_VARIANT_TYPE`
+// case sets `wError = IDS_S1_113` and then plain `break`s, where the neighbouring
+// `SQL_CA_SS_VARIANT_SERVER_TYPE` case does `SETRC_SERR_GOTO(retcode, ErrorRet)`
+// with the same error — so the diagnostic it prepares is never actually returned.
+// Recorded in the divergence table in docs/typed-columnar-fetch-plan.md.
 TEST_F(ColAttributeLiveTest, VariantTypeOnNonVariantColumn) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect("SELECT CAST(1 AS INT) AS c1");
     SQLLEN value = 0;
     SQLRETURN rc =
