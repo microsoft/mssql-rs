@@ -107,3 +107,7 @@ pub mod test_client_support;
 // neither.
 #[cfg(test)]
 pub(crate) mod test_packet_support;
+
+// Throwaway row-decode microbenchmark for the E1-E6 perf spikes.
+#[cfg(test)]
+mod decode_bench;
