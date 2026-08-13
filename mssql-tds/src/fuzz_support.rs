@@ -447,6 +447,11 @@ impl FuzzPacketReader {
     pub fn from_data(data: &[u8]) -> Self {
         Self::Fuzz(FuzzReader::new(data))
     }
+
+    /// Builds a reader that always reports end-of-stream.
+    pub fn empty() -> Self {
+        Self::Empty(EmptyReader)
+    }
 }
 
 impl TdsPacketReader for FuzzPacketReader {

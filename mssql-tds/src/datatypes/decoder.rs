@@ -506,7 +506,6 @@ impl GenericDecoder {
     #[cfg(not(fuzzing))]
     const MAX_PLP_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
-    // Reads a SQL_VARIANT type from the TDS stream.
     /// Boxed re-entry into [`SqlTypeDecode::decode`], used only by SQL_VARIANT.
     ///
     /// SQL_VARIANT embeds a base type, so decoding one re-enters the type switch. Native
@@ -525,6 +524,7 @@ impl GenericDecoder {
         Box::pin(self.decode(reader, metadata))
     }
 
+    // Reads a SQL_VARIANT type from the TDS stream.
     async fn read_sql_variant<T>(&self, reader: &mut T) -> TdsResult<ColumnValues>
     where
         T: TdsPacketReader + Send + Sync,

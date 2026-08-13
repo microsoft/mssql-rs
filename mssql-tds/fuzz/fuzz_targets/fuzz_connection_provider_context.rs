@@ -20,7 +20,7 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
 use mssql_tds::message::login_options::ApplicationIntent;
-use mssql_tds::fuzz_support::{EmptyReader, FuzzPacketReader, MockTransport, TdsConnectionProvider};
+use mssql_tds::fuzz_support::{FuzzPacketReader, MockTransport, TdsConnectionProvider};
 
 #[derive(Debug, Arbitrary)]
 struct FuzzClientContext {
@@ -101,7 +101,7 @@ fuzz_target!(|fuzz_context: FuzzClientContext| {
 });
 
 async fn fuzz_client_context(fuzz_context: FuzzClientContext) {
-    let reader = FuzzPacketReader::Empty(EmptyReader);
+    let reader = FuzzPacketReader::empty();
     let packet_size = 4096;
     let transport = MockTransport::new(reader, packet_size);
     

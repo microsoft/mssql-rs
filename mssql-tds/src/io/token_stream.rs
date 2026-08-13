@@ -1069,6 +1069,88 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    /// Companion to `row_fetch_futures_stay_small` (#225) for the decode chain below
+    /// `Box<dyn TdsTransport>`. That guard measures futures built on `TdsClient`, which
+    /// re-boxes at the transport boundary, so it cannot observe anything in this file:
+    /// its four futures are byte-identical before and after this chain roughly doubled.
+    #[test]
+    fn row_decode_futures_stay_small() {
+        const MAX: usize = 4096;
+
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 0,
+            columns: vec![],
+            cek_table: vec![],
+        });
+        let context = ParserContext::ColumnMetadata(Arc::clone(&metadata), None);
+        let registry = GenericTokenParserRegistry::default();
+        let mut reader = TestByteReader::new(vec![TokenType::Row as u8]);
+        let mut sink = DiscardRowWriter;
+
+        // Constructing an async fn's future runs none of its body, so these are free to
+        // build and drop unpolled. Each borrow ends with its statement.
+        //
+        // Both instantiations are measured: `dyn` is what production reaches today, and
+        // the monomorphic one is what a concrete writer gets once the transport boundary
+        // stops erasing it (#265).
+        let receive_dyn = size_of_val(&receive_row_into_internal(
+            &mut reader,
+            &registry,
+            &context,
+            ColumnPolicy::DecodeAll,
+            &mut sink as &mut (dyn RowWriter + Send),
+        ));
+        let receive_mono = size_of_val(&receive_row_into_internal(
+            &mut reader,
+            &registry,
+            &context,
+            ColumnPolicy::DecodeAll,
+            &mut sink,
+        ));
+        let drive_dyn = size_of_val(&drive_row_columns(
+            &mut reader,
+            &metadata,
+            None,
+            None,
+            0,
+            ColumnPolicy::DecodeAll,
+            &mut sink as &mut (dyn RowWriter + Send),
+        ));
+        let drive_mono = size_of_val(&drive_row_columns(
+            &mut reader,
+            &metadata,
+            None,
+            None,
+            0,
+            ColumnPolicy::DecodeAll,
+            &mut sink,
+        ));
+        let resume_dyn = size_of_val(&resume_row_into_internal(
+            &mut reader,
+            RowPauseState {
+                next_column_index: 0,
+                metadata: Arc::clone(&metadata),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            },
+            ColumnPolicy::DecodeAll,
+            &mut sink as &mut (dyn RowWriter + Send),
+        ));
+
+        for (name, size) in [
+            ("receive_row_into_internal (dyn)", receive_dyn),
+            ("receive_row_into_internal (mono)", receive_mono),
+            ("drive_row_columns (dyn)", drive_dyn),
+            ("drive_row_columns (mono)", drive_mono),
+            ("resume_row_into_internal (dyn)", resume_dyn),
+        ] {
+            assert!(
+                size <= MAX,
+                "{name} future is {size} B, expected <= {MAX} B"
+            );
+        }
+    }
+
     #[test]
     fn test_parser_context_default() {
         let context = ParserContext::default();
