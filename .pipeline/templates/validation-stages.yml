@@ -428,6 +428,7 @@ stages:
       - template: install-dependencies.yml
         parameters:
           osType: Linux
+          enableJsDeps: false
       - template: fuzz-template.yml
         parameters:
           osType: Linux
@@ -449,6 +450,7 @@ stages:
       - template: install-dependencies.yml
         parameters:
           osType: Linux
+          enableJsDeps: false
       - template: fuzz-template.yml
         parameters:
           osType: Linux
@@ -470,6 +472,7 @@ stages:
       - template: install-dependencies.yml
         parameters:
           osType: Linux
+          enableJsDeps: false
       - template: fuzz-template.yml
         parameters:
           osType: Linux
