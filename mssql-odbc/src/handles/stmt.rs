@@ -15,6 +15,7 @@ use crate::api::odbc_types::{SqlULen, SqlUSmallInt};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
 
 /// State for a PLP column being streamed across repeated SQLGetData calls.
@@ -93,6 +94,9 @@ pub(crate) struct StmtState {
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
     pub(crate) last_captured: Option<(usize, ColumnValues)>,
+    /// Base type of `last_captured` when that column is `sql_variant`. Set per
+    /// value, since a variant column can hold a different type in every row.
+    pub(crate) last_variant_base: Option<TdsDataType>,
     /// `true` when the last resume consumed the row's final column
     /// (`CursorColumn::RowEnded`). Distinguishes "row exhausted" from "decoder
     /// paused at a PLP column" when `last_captured` is `None` (see
@@ -165,6 +169,7 @@ impl StmtState {
     pub(crate) fn reset_row_stream(&mut self) {
         self.row_positioned = false;
         self.last_captured = None;
+        self.last_variant_base = None;
         self.row_exhausted = false;
         self.active_plp = None;
         self.current_row_last_col = 0;
@@ -242,6 +247,7 @@ impl StmtHandle {
                 pending_unprepare: None,
                 row_positioned: false,
                 last_captured: None,
+                last_variant_base: None,
                 row_exhausted: false,
                 active_plp: None,
                 current_row_last_col: 0,

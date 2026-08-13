@@ -513,6 +513,21 @@ impl GenericDecoder {
     where
         T: TdsPacketReader + Send + Sync,
     {
+        self.read_sql_variant_with_base(reader)
+            .await
+            .map(|(_, value)| value)
+    }
+
+    /// As [`Self::read_sql_variant`], but also returns the base type the variant
+    /// declared on the wire. The decoded value alone cannot always recover it —
+    /// `varchar` and `nvarchar` both arrive as [`ColumnValues::String`].
+    async fn read_sql_variant_with_base<T>(
+        &self,
+        reader: &mut T,
+    ) -> TdsResult<(TdsDataType, ColumnValues)>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         let length = reader.read_uint32().await?;
         let variant_base_type = reader.read_byte().await?;
         let tds_type = TdsDataType::try_from(variant_base_type)?;
@@ -553,7 +568,7 @@ impl GenericDecoder {
                 )));
             }
         };
-        Ok(col_value)
+        Ok((tds_type, col_value))
     }
 
     async fn decode_zero_propbyte_variant<T>(
@@ -1371,6 +1386,15 @@ impl GenericDecoder {
                     })?;
                     writer.write_uuid(col, uuid);
                 }
+            }
+
+            // A variant carries its own base type, which the caller may need in
+            // order to report the underlying type; the decoded value cannot
+            // always recover it.
+            TdsDataType::SsVariant => {
+                let (base, value) = self.read_sql_variant_with_base(reader).await?;
+                writer.write_variant_base_type(col, base);
+                write_column_value(writer, col, value);
             }
 
             // === Fallback: rare types go through decode() → write_column_value() ===

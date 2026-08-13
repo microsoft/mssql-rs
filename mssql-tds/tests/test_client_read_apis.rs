@@ -896,7 +896,7 @@ mod client_based_iterators {
             let c2 = client.read_row_column(1).await?;
             assert!(matches!(
                 &c2,
-                CursorColumn::Value(ColumnValues::String(s)) if s.to_utf8_string() == "row1-c2"
+                CursorColumn::Value { value: ColumnValues::String(s), .. } if s.to_utf8_string() == "row1-c2"
             ));
             assert!(matches!(
                 client.read_row_column(3).await?,
@@ -924,7 +924,7 @@ mod client_based_iterators {
             let c2b = client.read_row_column(1).await?;
             assert!(matches!(
                 &c2b,
-                CursorColumn::Value(ColumnValues::String(s)) if s.to_utf8_string() == "row2-c2"
+                CursorColumn::Value { value: ColumnValues::String(s), .. } if s.to_utf8_string() == "row2-c2"
             ));
             assert!(matches!(
                 client.read_row_column(3).await?,
@@ -987,7 +987,10 @@ mod client_based_iterators {
             assert!(client.next_row_cursor().await?);
             assert_eq!(
                 client.read_row_column(0).await?,
-                CursorColumn::Value(ColumnValues::Null)
+                CursorColumn::Value {
+                    value: ColumnValues::Null,
+                    variant_base: None
+                }
             );
             assert!(matches!(
                 client.read_row_column(1).await?,
@@ -1014,7 +1017,10 @@ mod client_based_iterators {
             assert!(client.next_row_cursor().await?);
             assert_eq!(
                 client.read_row_column(0).await?,
-                CursorColumn::Value(ColumnValues::Null)
+                CursorColumn::Value {
+                    value: ColumnValues::Null,
+                    variant_base: None
+                }
             );
             assert!(matches!(
                 client.read_row_column(1).await?,
@@ -1097,7 +1103,13 @@ mod client_based_iterators {
             assert!(first_row_c2.chunks_exact(2).all(|c| c == [b'X', 0]));
 
             let c4 = client.read_row_column(3).await?;
-            assert_eq!(c4, CursorColumn::Value(ColumnValues::Int(24)));
+            assert_eq!(
+                c4,
+                CursorColumn::Value {
+                    value: ColumnValues::Int(24),
+                    variant_base: None
+                }
+            );
 
             // Row 2.
             assert!(client.next_row_cursor().await?);
@@ -1122,7 +1134,13 @@ mod client_based_iterators {
             assert!(second_row_c2.chunks_exact(2).all(|c| c == [b'Y', 0]));
 
             let c4b = client.read_row_column(3).await?;
-            assert_eq!(c4b, CursorColumn::Value(ColumnValues::Int(34)));
+            assert_eq!(
+                c4b,
+                CursorColumn::Value {
+                    value: ColumnValues::Int(34),
+                    variant_base: None
+                }
+            );
 
             assert!(!client.next_row_cursor().await?);
         }
@@ -1210,7 +1228,10 @@ mod client_based_iterators {
         // Cursor re-parked: a valid pull still returns the column value.
         assert_eq!(
             client.read_row_column(0).await?,
-            CursorColumn::Value(ColumnValues::Int(10))
+            CursorColumn::Value {
+                value: ColumnValues::Int(10),
+                variant_base: None
+            }
         );
 
         assert!(!client.next_row_cursor().await?);
@@ -1245,7 +1266,10 @@ mod client_based_iterators {
         // the row stays paused (not fully consumed).
         assert_eq!(
             client.read_row_column(1).await?,
-            CursorColumn::Value(ColumnValues::Int(20))
+            CursorColumn::Value {
+                value: ColumnValues::Int(20),
+                variant_base: None
+            }
         );
 
         // c1 (0-based 0) is now behind the cursor: forward-only violation.
@@ -1287,7 +1311,10 @@ mod client_based_iterators {
         // Read the last column (0-based 1); the cursor advances to idle.
         assert_eq!(
             client.read_row_column(1).await?,
-            CursorColumn::Value(ColumnValues::Int(20))
+            CursorColumn::Value {
+                value: ColumnValues::Int(20),
+                variant_base: None
+            }
         );
 
         // Out-of-range and backward pulls both collapse to RowEnded once idle.

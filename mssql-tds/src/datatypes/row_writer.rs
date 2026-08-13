@@ -9,6 +9,7 @@ use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sql_json::SqlJson;
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sql_vector::SqlVector;
+use crate::datatypes::sqldatatypes::TdsDataType;
 use uuid::Uuid;
 
 /// Pluggable decode sink for TDS row data.
@@ -65,6 +66,10 @@ pub trait RowWriter {
     fn write_json(&mut self, col: usize, val: SqlJson);
     /// Writes a `vector` value.
     fn write_vector(&mut self, col: usize, val: SqlVector);
+    /// Reports the base type a `sql_variant` column carries, immediately before
+    /// the value write. Defaulted, so writers that do not surface the variant's
+    /// underlying type are unaffected.
+    fn write_variant_base_type(&mut self, _col: usize, _base: TdsDataType) {}
     /// Signals the end of the current row.
     fn end_row(&mut self);
 }
@@ -73,6 +78,9 @@ pub trait RowWriter {
 /// the current decoder behavior. Existing `next_row()` callers see no change.
 pub struct DefaultRowWriter {
     row: Vec<ColumnValues>,
+    /// Base type of each `sql_variant` value, keyed by its position in `row`.
+    /// Empty unless the row contained a variant column.
+    variant_bases: Vec<(usize, TdsDataType)>,
 }
 
 impl DefaultRowWriter {
@@ -80,11 +88,22 @@ impl DefaultRowWriter {
     pub fn new(col_count: usize) -> Self {
         Self {
             row: Vec::with_capacity(col_count),
+            variant_bases: Vec::new(),
         }
+    }
+
+    /// Base type of the `sql_variant` value at `index`, or `None` when that
+    /// column was not a variant. Valid until [`Self::take_row`].
+    pub fn variant_base(&self, index: usize) -> Option<TdsDataType> {
+        self.variant_bases
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, base)| *base)
     }
 
     /// Takes the completed row, leaving the writer ready for reuse.
     pub fn take_row(&mut self) -> Vec<ColumnValues> {
+        self.variant_bases.clear();
         std::mem::take(&mut self.row)
     }
 }
@@ -92,6 +111,12 @@ impl DefaultRowWriter {
 impl RowWriter for DefaultRowWriter {
     fn write_null(&mut self, _col: usize) {
         self.row.push(ColumnValues::Null);
+    }
+
+    // The hook fires before the value is pushed, so `row.len()` is the index the
+    // value is about to occupy.
+    fn write_variant_base_type(&mut self, _col: usize, base: TdsDataType) {
+        self.variant_bases.push((self.row.len(), base));
     }
 
     fn write_bool(&mut self, _col: usize, val: bool) {

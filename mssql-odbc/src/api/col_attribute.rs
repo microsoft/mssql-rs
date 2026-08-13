@@ -12,18 +12,21 @@ use tracing::{debug, error};
 
 use crate::api::describe_col::{column_size, decimal_digits, odbc_sql_type};
 use crate::api::odbc_types::{
-    SQL_ATTR_READWRITE_UNKNOWN, SQL_DESC_AUTO_UNIQUE_VALUE, SQL_DESC_BASE_COLUMN_NAME,
-    SQL_DESC_CASE_SENSITIVE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DISPLAY_SIZE,
-    SQL_DESC_FIXED_PREC_SCALE, SQL_DESC_LABEL, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE,
-    SQL_DESC_NUM_PREC_RADIX, SQL_DESC_OCTET_LENGTH, SQL_DESC_PRECISION, SQL_DESC_SCALE,
-    SQL_DESC_SEARCHABLE, SQL_DESC_TYPE, SQL_DESC_TYPE_NAME, SQL_DESC_UNNAMED, SQL_DESC_UNSIGNED,
-    SQL_DESC_UPDATABLE, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NAMED, SQL_NO_NULLS, SQL_NULLABLE,
-    SQL_PRED_SEARCHABLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_UNNAMED, SqlHandle, SqlLen,
-    SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_ATTR_READWRITE_UNKNOWN, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT,
+    SQL_C_GUID, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT,
+    SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR, SQL_CA_SS_VARIANT_TYPE,
+    SQL_DESC_AUTO_UNIQUE_VALUE, SQL_DESC_BASE_COLUMN_NAME, SQL_DESC_CASE_SENSITIVE,
+    SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DISPLAY_SIZE, SQL_DESC_FIXED_PREC_SCALE,
+    SQL_DESC_LABEL, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE, SQL_DESC_NUM_PREC_RADIX,
+    SQL_DESC_OCTET_LENGTH, SQL_DESC_PRECISION, SQL_DESC_SCALE, SQL_DESC_SEARCHABLE, SQL_DESC_TYPE,
+    SQL_DESC_TYPE_NAME, SQL_DESC_UNNAMED, SQL_DESC_UNSIGNED, SQL_DESC_UPDATABLE, SQL_ERROR,
+    SQL_INVALID_HANDLE, SQL_NAMED, SQL_NO_NULLS, SQL_NULLABLE, SQL_PRED_SEARCHABLE, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SQL_UNNAMED, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
+    SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX,
-    ERR_STRING_RIGHT_TRUNCATION, post_diag,
+    ERR_NOT_VARIANT_COLUMN, ERR_STRING_RIGHT_TRUNCATION, post_diag,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
@@ -136,6 +139,25 @@ fn sql_col_attribute_w_safe(
     if column_number == 0 || column_number as usize > stmt_state.column_metadata.len() {
         post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
         return SQL_ERROR;
+    }
+
+    // The underlying type of a `sql_variant` is a property of the value, not the
+    // column, so it comes from the row that was read rather than the metadata.
+    if field_identifier == SQL_CA_SS_VARIANT_TYPE {
+        let is_variant = stmt_state.column_metadata[(column_number - 1) as usize].data_type
+            == TdsDataType::SsVariant;
+        if !is_variant {
+            post_diag(&mut stmt_state, ERR_NOT_VARIANT_COLUMN);
+            return SQL_ERROR;
+        }
+        let Some(base) = stmt_state.last_variant_base else {
+            // Callers probe the column with SQLGetData first; that read is what
+            // supplies the base type.
+            post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        };
+        unsafe { write_if_some(numeric_attribute_ptr, SqlLen::from(variant_c_type(base))) };
+        return SQL_SUCCESS;
     }
 
     let meta = &stmt_state.column_metadata[(column_number - 1) as usize];
@@ -263,6 +285,53 @@ fn num_prec_radix(meta: &ColumnMetadata) -> SqlLen {
         | TdsDataType::MoneyN => 10,
         // Non-numeric columns have no radix.
         _ => 0,
+    }
+}
+
+/// The C type a `sql_variant` value reports for `SQL_CA_SS_VARIANT_TYPE`.
+///
+/// msodbcsql answers this from its per-row column info, so the value's base type
+/// decides it rather than the column's declared type.
+fn variant_c_type(base: TdsDataType) -> SqlSmallInt {
+    match base {
+        TdsDataType::Int1 => SQL_C_TINYINT,
+        TdsDataType::Int2 => SQL_C_SSHORT,
+        TdsDataType::Int4 => SQL_C_SLONG,
+        TdsDataType::Int8 => SQL_C_SBIGINT,
+        TdsDataType::Bit | TdsDataType::BitN => SQL_C_BIT,
+        TdsDataType::Flt4 => SQL_C_FLOAT,
+        TdsDataType::Flt8 | TdsDataType::FltN => SQL_C_DOUBLE,
+        // msodbcsql reports SQL_C_NUMERIC here, but emitting SQL_NUMERIC_STRUCT
+        // is a permanent non-goal for this driver (see the divergence table), so
+        // the exact numerics are advertised as character data, which is how they
+        // are actually delivered.
+        TdsDataType::Decimal
+        | TdsDataType::DecimalN
+        | TdsDataType::Numeric
+        | TdsDataType::NumericN
+        | TdsDataType::Money
+        | TdsDataType::Money4
+        | TdsDataType::MoneyN => SQL_C_CHAR,
+        TdsDataType::DateN => SQL_C_TYPE_DATE,
+        TdsDataType::TimeN => SQL_C_SS_TIME2,
+        TdsDataType::DateTime | TdsDataType::DateTim4 | TdsDataType::DateTimeN => {
+            SQL_C_TYPE_TIMESTAMP
+        }
+        TdsDataType::DateTime2N => SQL_C_TYPE_TIMESTAMP,
+        TdsDataType::DateTimeOffsetN => SQL_C_SS_TIMESTAMPOFFSET,
+        TdsDataType::Char
+        | TdsDataType::BigChar
+        | TdsDataType::VarChar
+        | TdsDataType::BigVarChar => SQL_C_CHAR,
+        TdsDataType::NChar | TdsDataType::NVarChar => SQL_C_WCHAR,
+        TdsDataType::Binary
+        | TdsDataType::BigBinary
+        | TdsDataType::VarBinary
+        | TdsDataType::BigVarBinary => SQL_C_BINARY,
+        TdsDataType::Guid => SQL_C_GUID,
+        // SQL Server rejects the remaining types at insert time, so a variant
+        // cannot actually carry them; character is the safe fallback.
+        _ => SQL_C_CHAR,
     }
 }
 
@@ -534,6 +603,33 @@ mod tests {
         assert_eq!(
             s.diag_records.last().unwrap().sql_state,
             ERR_STRING_RIGHT_TRUNCATION.state
+        );
+    }
+
+    /// The variant attribute is rejected outright on a column that is not a
+    /// `sql_variant`, rather than reporting a type the caller would then trust.
+    #[test]
+    fn variant_type_on_non_variant_column_is_rejected() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+        let mut out: SqlLen = 0;
+        let rc = unsafe {
+            sql_col_attribute_w(
+                h.stmt,
+                1,
+                SQL_CA_SS_VARIANT_TYPE,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                &mut out,
+            )
+        };
+        assert_eq!(rc, SQL_ERROR);
+        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = sh.inner.lock().unwrap();
+        assert_eq!(
+            s.diag_records.last().unwrap().sql_state,
+            ERR_NOT_VARIANT_COLUMN.state
         );
     }
 

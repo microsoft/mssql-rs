@@ -8,6 +8,7 @@ use crate::connection::session_recovery::RecoveryContext;
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::datatypes::row_writer::{DefaultRowWriter, DiscardRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
+use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::datatypes::sqltypes::SqlType;
 use crate::error::Error::UsageError;
 use crate::error::{SqlErrorInfo, SqlInfoMessage};
@@ -114,7 +115,14 @@ pub struct PlpChunk {
 #[derive(Debug, PartialEq)]
 pub enum CursorColumn {
     /// A fully decoded, materialized column value (non-PLP).
-    Value(ColumnValues),
+    Value {
+        /// The decoded value.
+        value: ColumnValues,
+        /// Base type declared by a `sql_variant` column, `None` otherwise. The
+        /// decoded value cannot always recover it, since `varchar` and
+        /// `nvarchar` both arrive as [`ColumnValues::String`].
+        variant_base: Option<TdsDataType>,
+    },
     /// `target` is a PLP column; its bytes are streamed via
     /// [`TdsClient::read_active_plp_chunk`] until
     /// [`PlpChunk::reached_end`] is `true`.
@@ -3760,12 +3768,16 @@ impl TdsClient {
         match result {
             RowReadResult::RowPaused(next_pause) => {
                 self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(next_pause));
+                let variant_base = capture.variant_base(0);
                 let value = capture.take_row().into_iter().next().ok_or_else(|| {
                     crate::error::Error::ProtocolError(format!(
                         "Decoder produced no value for non-null column {target}"
                     ))
                 })?;
-                Ok(CursorColumn::Value(value))
+                Ok(CursorColumn::Value {
+                    value,
+                    variant_base,
+                })
             }
             RowReadResult::RowWritten => {
                 // `target` was the last column; the row is now fully consumed.
@@ -3773,12 +3785,16 @@ impl TdsClient {
                 // pull reports `RowEnded`. Callers needing to distinguish a
                 // rewind from "no row positioned" track the column themselves.
                 self.active_row_read_state = ActiveRowReadState::Idle;
+                let variant_base = capture.variant_base(0);
                 let value = capture.take_row().into_iter().next().ok_or_else(|| {
                     crate::error::Error::ProtocolError(format!(
                         "Decoder produced no value for non-null column {target}"
                     ))
                 })?;
-                Ok(CursorColumn::Value(value))
+                Ok(CursorColumn::Value {
+                    value,
+                    variant_base,
+                })
             }
             RowReadResult::PlpPaused(plp_state) => {
                 let collation = plp_state.collation();

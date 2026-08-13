@@ -38,6 +38,9 @@ pub(crate) const SQLSTATE_HY091: [u8; 5] = *b"HY091";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
 pub(crate) const SQLSTATE_HY096: [u8; 5] = *b"HY096";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
+// msodbcsql spells this IDS_S1_113; its `S1` prefix is the ODBC 2.x form of
+// `HY` (IDS_S1_C00 is HYC00), so the 3.x state is HY113.
+pub(crate) const SQLSTATE_HY113: [u8; 5] = *b"HY113";
 
 // Driver-raised diagnostics: a fixed SQLSTATE paired with its canonical
 // message text. Bundling the two means a call site posts one value and can't
@@ -81,6 +84,10 @@ pub(crate) const ERR_INVALID_DESCRIPTOR_INDEX: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_DESCRIPTOR_FIELD: DiagMsg = DiagMsg {
     state: SQLSTATE_HY091,
     text: "Invalid descriptor field identifier",
+};
+pub(crate) const ERR_NOT_VARIANT_COLUMN: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY113,
+    text: "Variant operation requested on column that is not sql_variant",
 };
 pub(crate) const ERR_UNBOUND_PARAMETER: DiagMsg = DiagMsg {
     state: SQLSTATE_07002,
