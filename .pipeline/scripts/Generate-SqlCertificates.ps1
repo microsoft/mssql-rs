@@ -103,7 +103,14 @@ function New-And-Install-Certificates($instanceName) {
 
     Set-ItemProperty -Path $registryPath -Name "Certificate" -Value $thumbprint
 
-    Restart-SqlServiceSafely -serviceName $instanceName
+    # Named instances register as MSSQL$<instance>; the default instance is MSSQLSERVER.
+    if ($instanceName -eq "MSSQLSERVER") {
+        $serviceName = "MSSQLSERVER"
+    } else {
+        $serviceName = "MSSQL`$$instanceName"
+    }
+
+    Restart-SqlServiceSafely -serviceName $serviceName
     Copy-To-Root-Store -cert $cert
 }
 
