@@ -5,6 +5,7 @@ use crate::core::{CancelHandle, TdsResult};
 use crate::datatypes::decode_spec::{ColumnSpec, resolve_plan};
 use crate::datatypes::decoder::{GenericDecoder, PlpColumnStream, decrypt_encrypted_column};
 use crate::datatypes::row_writer::{DiscardRowWriter, RowWriter, write_column_value};
+use crate::datatypes::sql_string::EncodingType;
 use crate::io::packet_reader::TdsPacketReader;
 use crate::query::metadata::ColumnMetadata;
 use crate::security::cell_decryptor::CellDecryptor;
@@ -424,15 +425,27 @@ pub(crate) async fn receive_token_internal<R: TdsPacketReader + Send + Sync>(
 /// [`DiscardRowWriter`], which drops any transient value instead of retaining it
 /// in a row `Vec`. Encrypted columns are skipped as their raw ciphertext
 /// varbinary — no decryption is performed for a skipped column.
+/// Borrow bundle for the per-column decode helpers.
+///
+/// Keeps the column metadata, encoding table, and decryptor travelling together
+/// so the helpers cannot be handed arrays from different result sets, and so
+/// their signatures stay inside clippy's argument budget.
+#[derive(Clone, Copy)]
+struct RowLayout<'a> {
+    columns: &'a [ColumnMetadata],
+    encodings: &'a [EncodingType],
+    decryptor: Option<&'a Arc<dyn CellDecryptor>>,
+}
+
 async fn skip_column<R: TdsPacketReader + Send + Sync>(
     decoder: &GenericDecoder,
     reader: &mut R,
-    meta: &ColumnMetadata,
+    layout: RowLayout<'_>,
     spec: &ColumnSpec,
     col: usize,
 ) -> TdsResult<()> {
     if spec.is_plp() {
-        if let Some(mut stream) = PlpColumnStream::begin(meta, reader).await? {
+        if let Some(mut stream) = PlpColumnStream::begin(&layout.columns[col], reader).await? {
             stream.skip_to_end(reader).await?;
         }
         Ok(())
@@ -445,7 +458,7 @@ async fn skip_column<R: TdsPacketReader + Send + Sync>(
         // decoding). Larger change tracked as work item 47154.
         let mut sink = DiscardRowWriter;
         decoder
-            .decode_into(reader, spec.decode, meta, col, &mut sink)
+            .decode_into(reader, spec.decode, layout.encodings, col, &mut sink)
             .await
     }
 }
@@ -489,9 +502,17 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send
 ) -> TdsResult<RowReadResult> {
     let decoder = GenericDecoder;
     let columns = &metadata.columns;
-    let mut rederived = Vec::new();
+    let mut rederived = None;
     let plan = resolve_plan(metadata.decode_plan(), columns, &mut rederived);
-    for (col, (meta, spec)) in columns.iter().zip(plan).enumerate().skip(start_col) {
+    let layout = RowLayout {
+        columns,
+        encodings: plan.encodings(),
+        decryptor,
+    };
+    // Iterate the 6-byte specs, not the 640-byte metadata: the hot path only
+    // needs a column's metadata on the skip, pause, and encrypted branches, all
+    // of which are cold.
+    for (col, spec) in plan.specs().iter().enumerate().skip(start_col) {
         let stop_here = matches!(policy, ColumnPolicy::DecodeOne(target) if target == col);
         let skip = match policy {
             ColumnPolicy::SkipAll => true,
@@ -513,13 +534,14 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send
         }
 
         if skip {
-            skip_column(&decoder, reader, meta, spec, col).await?;
+            skip_column(&decoder, reader, layout, spec, col).await?;
             continue;
         }
 
         // At the cursor's target PLP column, pause before payload so the caller
         // can stream chunks via `read_active_plp_bytes`.
         if stop_here && spec.is_plp() {
+            let meta = &columns[col];
             // TODO: Add AE-aware PLP streaming path for paused row reads.
             // Until then, fail fast to avoid streaming ciphertext bytes to callers.
             if meta.crypto_metadata.is_some() {
@@ -556,7 +578,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send
             }
         }
 
-        decode_or_decrypt_column(&decoder, reader, meta, spec, decryptor, col, writer).await?;
+        decode_or_decrypt_column(&decoder, reader, layout, spec, col, writer).await?;
 
         if stop_here {
             return Ok(pause_after_column(col, metadata, bitmap, decryptor));
@@ -571,31 +593,33 @@ async fn decode_or_decrypt_column<
 >(
     decoder: &GenericDecoder,
     reader: &mut R,
-    meta: &ColumnMetadata,
+    layout: RowLayout<'_>,
     spec: &ColumnSpec,
-    decryptor: Option<&Arc<dyn CellDecryptor>>,
     col: usize,
     writer: &mut W,
 ) -> TdsResult<()> {
-    match (spec.encrypted, decryptor) {
+    // `columns` is indexed only on the encrypted arms so the common path never
+    // touches the 640-byte-per-column metadata.
+    match (spec.encrypted, layout.decryptor) {
         (true, Some(dec)) => {
-            let value = decrypt_encrypted_column(decoder, reader, meta, dec).await?;
+            let value =
+                decrypt_encrypted_column(decoder, reader, &layout.columns[col], dec).await?;
             write_column_value(writer, col, value);
         }
         (true, None) => {
             tracing::debug!(
-                column = %meta.column_name,
+                column = %layout.columns[col].column_name,
                 "Encrypted column has no column-encryption decryptor available \
                  (Always Encrypted disabled for this command, or no key-store \
                  provider registered); returning the raw ciphertext varbinary"
             );
             decoder
-                .decode_into(reader, spec.decode, meta, col, writer)
+                .decode_into(reader, spec.decode, layout.encodings, col, writer)
                 .await?;
         }
         (false, _) => {
             decoder
-                .decode_into(reader, spec.decode, meta, col, writer)
+                .decode_into(reader, spec.decode, layout.encodings, col, writer)
                 .await?;
         }
     }

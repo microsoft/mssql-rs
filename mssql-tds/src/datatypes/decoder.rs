@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::{fmt::Debug, io::Error, vec};
 
 use super::{
-    sql_string::{EncodingType, SqlString},
+    sql_string::{EncodingType, SqlString, get_encoding_type},
     sqldatatypes::{PartialLengthType, TdsDataType, TypeInfoVariant},
 };
 use crate::datatypes::decode_spec::{
@@ -1125,7 +1125,7 @@ impl GenericDecoder {
         &self,
         reader: &mut T,
         spec: ColumnDecodeSpec,
-        metadata: &ColumnMetadata,
+        encodings: &[EncodingType],
         col: usize,
         writer: &mut W,
     ) -> TdsResult<()>
@@ -1261,10 +1261,9 @@ impl GenericDecoder {
                     None => writer.write_null(col),
                 }
             }
-            ColumnDecodeSpec::VarLenU16(VarU16Kind::String(encoding)) => {
+            ColumnDecodeSpec::VarLenU16(VarU16Kind::String) => {
                 match Self::read_short_len_bytes(reader).await? {
-                    Some(bytes) => writer
-                        .write_string(col, SqlString::new(bytes, encoding.materialize(metadata))),
+                    Some(bytes) => writer.write_string(col, SqlString::new(bytes, encodings[col])),
                     None => writer.write_null(col),
                 }
             }
@@ -1273,8 +1272,9 @@ impl GenericDecoder {
                 None => writer.write_null(col),
                 Some(bytes) => match kind {
                     PlpKind::Bytes => writer.write_bytes(col, bytes),
-                    PlpKind::String(encoding) => writer
-                        .write_string(col, SqlString::new(bytes, encoding.materialize(metadata))),
+                    PlpKind::String => {
+                        writer.write_string(col, SqlString::new(bytes, encodings[col]))
+                    }
                     PlpKind::Xml => writer.write_xml(col, SqlXml { bytes }),
                     PlpKind::Json => writer.write_json(col, SqlJson::new(bytes)),
                 },
@@ -1284,7 +1284,7 @@ impl GenericDecoder {
             // future. Each is still handled in exactly one place.
             ColumnDecodeSpec::LongLen(kind) => {
                 Box::pin(Self::read_long_len_into(
-                    reader, kind, metadata, col, writer,
+                    reader, kind, encodings, col, writer,
                 ))
                 .await?;
             }
@@ -1309,7 +1309,7 @@ impl GenericDecoder {
     async fn read_long_len_into<T, W>(
         reader: &mut T,
         kind: LongLenKind,
-        metadata: &ColumnMetadata,
+        encodings: &[EncodingType],
         col: usize,
         writer: &mut W,
     ) -> TdsResult<()>
@@ -1318,8 +1318,8 @@ impl GenericDecoder {
         W: RowWriter + ?Sized,
     {
         match (Self::read_long_len_bytes(reader).await?, kind) {
-            (Some(bytes), LongLenKind::String(encoding)) => {
-                writer.write_string(col, SqlString::new(bytes, encoding.materialize(metadata)))
+            (Some(bytes), LongLenKind::String) => {
+                writer.write_string(col, SqlString::new(bytes, encodings[col]))
             }
             // `image` reports a zero-length payload as NULL, unlike `text`.
             (Some(bytes), LongLenKind::Bytes) if !bytes.is_empty() => {
@@ -1372,13 +1372,13 @@ impl GenericDecoder {
         &self,
         reader: &mut T,
         spec: ColumnDecodeSpec,
-        metadata: &ColumnMetadata,
+        encoding: EncodingType,
     ) -> TdsResult<ColumnValues>
     where
         T: TdsPacketReader + Send + Sync,
     {
         let mut capture = CaptureWriter::default();
-        self.decode_into(reader, spec, metadata, 0, &mut capture)
+        self.decode_into(reader, spec, &[encoding], 0, &mut capture)
             .await?;
         Ok(capture.into_value())
     }
@@ -1389,8 +1389,12 @@ impl SqlTypeDecode for GenericDecoder {
     where
         T: TdsPacketReader + Send + Sync,
     {
-        self.decode_value(reader, ColumnDecodeSpec::for_column(metadata), metadata)
-            .await
+        self.decode_value(
+            reader,
+            ColumnDecodeSpec::for_column(metadata),
+            get_encoding_type(metadata),
+        )
+        .await
     }
 }
 
@@ -2672,6 +2676,7 @@ mod test {
             PlpColumnStream, SqlTypeDecode,
         };
         use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::datatypes::sql_string::get_encoding_type;
         use crate::datatypes::sqldatatypes::{
             PartialLengthType, TdsDataType, TypeInfo, TypeInfoVariant, VariableLengthTypes,
         };
@@ -2844,7 +2849,7 @@ mod test {
                 .decode_into(
                     &mut reader2,
                     ColumnDecodeSpec::for_column(metadata),
-                    metadata,
+                    &[get_encoding_type(metadata)],
                     0,
                     &mut writer,
                 )
@@ -2887,7 +2892,7 @@ mod test {
                 .decode_into(
                     &mut reader,
                     ColumnDecodeSpec::for_column(&md),
-                    &md,
+                    &[get_encoding_type(&md)],
                     0,
                     &mut writer,
                 )
@@ -2908,7 +2913,7 @@ mod test {
                 .decode_into(
                     &mut reader,
                     ColumnDecodeSpec::for_column(&md),
-                    &md,
+                    &[get_encoding_type(&md)],
                     0,
                     &mut writer,
                 )
@@ -2930,7 +2935,7 @@ mod test {
                 .decode_into(
                     &mut reader,
                     ColumnDecodeSpec::for_column(&md),
-                    &md,
+                    &[get_encoding_type(&md)],
                     0,
                     &mut writer,
                 )
@@ -2951,7 +2956,7 @@ mod test {
                 .decode_into(
                     &mut reader,
                     ColumnDecodeSpec::for_column(&md),
-                    &md,
+                    &[get_encoding_type(&md)],
                     0,
                     &mut writer,
                 )

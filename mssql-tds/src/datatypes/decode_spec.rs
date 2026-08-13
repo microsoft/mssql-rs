@@ -26,7 +26,6 @@ use crate::datatypes::sql_string::{EncodingType, get_encoding_type};
 use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfoVariant};
 use crate::error::Error;
 use crate::query::metadata::ColumnMetadata;
-use crate::token::tokens::SqlCollation;
 
 /// A column's wire shape plus the flags the row driver needs alongside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +124,7 @@ pub(crate) enum VarU16Kind {
     /// Opaque bytes (`binary`, non-PLP `varbinary`).
     Bytes,
     /// Character data in the column's resolved encoding.
-    String(StringEncoding),
+    String,
     /// `vector`, validated against the base type and length declared in TYPE_INFO.
     Vector { base_type: u8, declared_len: u16 },
 }
@@ -136,7 +135,7 @@ pub(crate) enum LongLenKind {
     /// `image`.
     Bytes,
     /// `text`/`ntext` in the column's resolved encoding.
-    String(StringEncoding),
+    String,
 }
 
 /// PARTLEN types.
@@ -145,64 +144,11 @@ pub(crate) enum PlpKind {
     /// `varbinary(max)`, UDTs.
     Bytes,
     /// `varchar(max)`/`nvarchar(max)` in the column's resolved encoding.
-    String(StringEncoding),
+    String,
     /// `xml`.
     Xml,
     /// `json`.
     Json,
-}
-
-/// Which encoding a character column decodes to.
-///
-/// Deliberately *not* [`EncodingType`], which inlines a [`SqlCollation`] and so
-/// costs 16 bytes. Because an enum is as wide as its widest variant, embedding it
-/// would make every spec — including `int` — carry that payload into each cell's
-/// future. This keeps the classification hoisted while leaving the collation in
-/// the metadata the decoder already holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StringEncoding {
-    /// UTF-8, from a collation with the UTF-8 flag set.
-    Utf8,
-    /// UTF-16LE, for the Unicode types.
-    Utf16,
-    /// Codepage implied by the column's collation.
-    Lcid,
-    /// Collation not yet known; resolved from the connection later.
-    Delayed,
-}
-
-impl StringEncoding {
-    /// Classifies a character column. This is the work being hoisted out of the
-    /// per-cell path.
-    fn for_column(metadata: &ColumnMetadata) -> Self {
-        match get_encoding_type(metadata) {
-            EncodingType::Utf8 => StringEncoding::Utf8,
-            EncodingType::Utf16 => StringEncoding::Utf16,
-            EncodingType::LcidBased(_) => StringEncoding::Lcid,
-            EncodingType::DelayedSet => StringEncoding::Delayed,
-        }
-    }
-
-    /// Rebuilds the [`EncodingType`] a [`SqlString`](crate::datatypes::sql_string::SqlString)
-    /// needs. Only the `Lcid` arm touches metadata, and only to copy out a
-    /// collation that was already parsed — no reclassification.
-    pub(crate) fn materialize(self, metadata: &ColumnMetadata) -> EncodingType {
-        match self {
-            StringEncoding::Utf8 => EncodingType::Utf8,
-            StringEncoding::Utf16 => EncodingType::Utf16,
-            StringEncoding::Delayed => EncodingType::DelayedSet,
-            StringEncoding::Lcid => EncodingType::LcidBased(collation_of(metadata)),
-        }
-    }
-}
-
-/// The column's collation, defaulted when TYPE_INFO carries none.
-fn collation_of(metadata: &ColumnMetadata) -> SqlCollation {
-    match metadata.type_info.type_info_variant {
-        TypeInfoVariant::PartialLen(_, _, collation, _, _)
-        | TypeInfoVariant::VarLenString(_, _, collation) => collation.unwrap_or_default(),
-        _ => SqlCollation::default(),
-    }
 }
 
 /// Why a column can never be decoded.
@@ -256,9 +202,7 @@ impl ColumnDecodeSpec {
                 TdsDataType::Xml => PlpKind::Xml,
                 TdsDataType::Json => PlpKind::Json,
                 TdsDataType::Udt | TdsDataType::BigVarBinary => PlpKind::Bytes,
-                TdsDataType::BigVarChar | TdsDataType::NVarChar => {
-                    PlpKind::String(StringEncoding::for_column(metadata))
-                }
+                TdsDataType::BigVarChar | TdsDataType::NVarChar => PlpKind::String,
                 _ => PlpKind::Bytes,
             });
         }
@@ -303,13 +247,11 @@ impl ColumnDecodeSpec {
             | TdsDataType::BigChar
             | TdsDataType::BigVarChar
             | TdsDataType::Char
-            | TdsDataType::VarChar => ColumnDecodeSpec::VarLenU16(VarU16Kind::String(
-                StringEncoding::for_column(metadata),
-            )),
+            | TdsDataType::VarChar => ColumnDecodeSpec::VarLenU16(VarU16Kind::String),
             TdsDataType::Vector => Self::vector(metadata),
 
             TdsDataType::Text | TdsDataType::NText => {
-                ColumnDecodeSpec::LongLen(LongLenKind::String(StringEncoding::for_column(metadata)))
+                ColumnDecodeSpec::LongLen(LongLenKind::String)
             }
             TdsDataType::Image => ColumnDecodeSpec::LongLen(LongLenKind::Bytes),
 
@@ -365,6 +307,40 @@ impl ColumnDecodeSpec {
     }
 }
 
+/// A result set's precomputed decode plan.
+///
+/// `specs` and `encodings` are parallel to the column list and are only ever
+/// built together, so the per-cell path can index both by column without the two
+/// arrays being able to disagree.
+///
+/// The encodings live here rather than inside [`ColumnDecodeSpec`] because
+/// [`EncodingType`] is 16 bytes and an enum is as wide as its widest variant:
+/// inlining it would make every spec — including `int` — carry that payload. A
+/// side table keeps the spec small *and* keeps the decoder from reaching back
+/// into the per-column [`ColumnMetadata`] to rebuild it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DecodePlan {
+    specs: Vec<ColumnSpec>,
+    encodings: Vec<EncodingType>,
+}
+
+impl DecodePlan {
+    pub(crate) fn build(columns: &[ColumnMetadata]) -> Self {
+        Self {
+            specs: columns.iter().map(ColumnSpec::for_column).collect(),
+            encodings: columns.iter().map(get_encoding_type).collect(),
+        }
+    }
+
+    pub(crate) fn specs(&self) -> &[ColumnSpec] {
+        &self.specs
+    }
+
+    pub(crate) fn encodings(&self) -> &[EncodingType] {
+        &self.encodings
+    }
+}
+
 /// Resolves the plan to use for `columns`, re-deriving it when the cached plan
 /// does not cover them.
 ///
@@ -373,15 +349,14 @@ impl ColumnDecodeSpec {
 /// change how a cell is decoded, so the plan is treated as a cache and never as
 /// authority.
 pub(crate) fn resolve_plan<'a>(
-    cached: &'a [ColumnSpec],
+    cached: &'a DecodePlan,
     columns: &[ColumnMetadata],
-    rederived: &'a mut Vec<ColumnSpec>,
-) -> &'a [ColumnSpec] {
-    if cached.len() == columns.len() {
+    rederived: &'a mut Option<DecodePlan>,
+) -> &'a DecodePlan {
+    if cached.specs.len() == columns.len() {
         return cached;
     }
-    rederived.extend(columns.iter().map(ColumnSpec::for_column));
-    rederived
+    rederived.insert(DecodePlan::build(columns))
 }
 
 /// Keeps the spec small enough to stay cheap in the per-cell decode future.
@@ -539,7 +514,6 @@ mod tests {
     #[test]
     fn every_data_type_is_classified() {
         fn expected(data_type: TdsDataType) -> ColumnDecodeSpec {
-            let lcid = StringEncoding::Lcid;
             match data_type {
                 TdsDataType::Int1 => ColumnDecodeSpec::Fixed(FixedKind::U8),
                 TdsDataType::Int2 => ColumnDecodeSpec::Fixed(FixedKind::I16),
@@ -577,21 +551,19 @@ mod tests {
                 TdsDataType::BigBinary | TdsDataType::BigVarBinary => {
                     ColumnDecodeSpec::VarLenU16(VarU16Kind::Bytes)
                 }
-                TdsDataType::NChar | TdsDataType::NVarChar => {
-                    ColumnDecodeSpec::VarLenU16(VarU16Kind::String(StringEncoding::Utf16))
-                }
-                TdsDataType::BigChar
+                TdsDataType::NChar
+                | TdsDataType::NVarChar
+                | TdsDataType::BigChar
                 | TdsDataType::BigVarChar
                 | TdsDataType::Char
-                | TdsDataType::VarChar => ColumnDecodeSpec::VarLenU16(VarU16Kind::String(lcid)),
+                | TdsDataType::VarChar => ColumnDecodeSpec::VarLenU16(VarU16Kind::String),
                 TdsDataType::Vector => ColumnDecodeSpec::VarLenU16(VarU16Kind::Vector {
                     base_type: 0,
                     declared_len: 8,
                 }),
 
-                TdsDataType::Text => ColumnDecodeSpec::LongLen(LongLenKind::String(lcid)),
-                TdsDataType::NText => {
-                    ColumnDecodeSpec::LongLen(LongLenKind::String(StringEncoding::Utf16))
+                TdsDataType::Text | TdsDataType::NText => {
+                    ColumnDecodeSpec::LongLen(LongLenKind::String)
                 }
                 TdsDataType::Image => ColumnDecodeSpec::LongLen(LongLenKind::Bytes),
 
@@ -723,11 +695,11 @@ mod tests {
         );
         assert_eq!(
             spec(&plp(TdsDataType::NVarChar)),
-            ColumnDecodeSpec::Plp(PlpKind::String(StringEncoding::Utf16))
+            ColumnDecodeSpec::Plp(PlpKind::String)
         );
         assert_eq!(
             spec(&plp(TdsDataType::BigVarChar)),
-            ColumnDecodeSpec::Plp(PlpKind::String(StringEncoding::Lcid))
+            ColumnDecodeSpec::Plp(PlpKind::String)
         );
     }
 
@@ -817,21 +789,27 @@ mod tests {
 
     #[test]
     fn resolve_plan_rederives_when_the_plan_is_short() {
-        let columns = vec![fixed(TdsDataType::Int4), fixed(TdsDataType::Flt8)];
-        let cached: Vec<_> = columns.iter().map(ColumnSpec::for_column).collect();
+        let columns = vec![
+            fixed(TdsDataType::Int4),
+            string(TdsDataType::BigVarChar),
+            fixed(TdsDataType::Flt8),
+        ];
+        let cached = DecodePlan::build(&columns);
 
-        let mut scratch = Vec::new();
-        assert_eq!(resolve_plan(&cached, &columns, &mut scratch), &cached[..]);
-        assert!(scratch.is_empty(), "a matching plan must be used as-is");
+        let mut scratch = None;
+        let resolved = resolve_plan(&cached, &columns, &mut scratch);
+        assert_eq!(resolved.specs(), cached.specs());
+        assert!(scratch.is_none(), "a matching plan must be used as-is");
 
-        let mut scratch = Vec::new();
-        assert_eq!(resolve_plan(&[], &columns, &mut scratch), &cached[..]);
-
-        let mut scratch = Vec::new();
-        assert_eq!(
-            resolve_plan(&cached[..1], &columns, &mut scratch),
-            &cached[..]
-        );
+        // Re-deriving must rebuild both arrays: an encoding table left behind
+        // would misdecode strings rather than merely cost time.
+        for short in [DecodePlan::default(), DecodePlan::build(&columns[..1])] {
+            let mut scratch = None;
+            let resolved = resolve_plan(&short, &columns, &mut scratch);
+            assert_eq!(resolved.specs(), cached.specs());
+            assert_eq!(resolved.encodings(), cached.encodings());
+            assert!(scratch.is_some());
+        }
     }
 
     #[test]

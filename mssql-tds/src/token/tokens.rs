@@ -10,7 +10,7 @@ use super::{
     tokenitems::ReturnValueStatus,
 };
 use crate::datatypes::column_values::ColumnValues;
-use crate::datatypes::decode_spec::ColumnSpec;
+use crate::datatypes::decode_spec::DecodePlan;
 use crate::{
     error::Error,
     message::login::{FeatureExtension, RoutingInfo},
@@ -315,7 +315,7 @@ pub(crate) struct ColMetadataToken {
     pub cek_table: Vec<CekTableEntry>,
     /// Per-column decode plan, filled eagerly by the COLMETADATA parser so the
     /// row path never pays for lazy initialisation.
-    decode_plan: OnceLock<Vec<ColumnSpec>>,
+    decode_plan: OnceLock<DecodePlan>,
 }
 
 impl ColMetadataToken {
@@ -326,7 +326,7 @@ impl ColMetadataToken {
         columns: Vec<ColumnMetadata>,
         cek_table: Vec<CekTableEntry>,
     ) -> Self {
-        let plan: Vec<ColumnSpec> = columns.iter().map(ColumnSpec::for_column).collect();
+        let plan = DecodePlan::build(&columns);
         ColMetadataToken {
             column_count,
             columns,
@@ -338,11 +338,12 @@ impl ColMetadataToken {
     /// The per-column decode plan, derived on demand if it was not seeded.
     ///
     /// Callers must still tolerate a plan shorter than `columns` (see
-    /// [`crate::datatypes::decode_spec::spec_at`]): re-deriving costs time, whereas
-    /// substituting a default spec would silently change how a cell is decoded.
-    pub(crate) fn decode_plan(&self) -> &[ColumnSpec] {
+    /// [`crate::datatypes::decode_spec::resolve_plan`]): re-deriving costs time,
+    /// whereas substituting a default spec would silently change how a cell is
+    /// decoded.
+    pub(crate) fn decode_plan(&self) -> &DecodePlan {
         self.decode_plan
-            .get_or_init(|| self.columns.iter().map(ColumnSpec::for_column).collect())
+            .get_or_init(|| DecodePlan::build(&self.columns))
     }
 }
 
