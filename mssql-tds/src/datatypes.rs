@@ -11,6 +11,7 @@
 pub mod bulk_copy_metadata;
 /// Decoded column value types returned in result rows.
 pub mod column_values;
+pub(crate) mod decode_spec;
 /// Decimal/numeric decoding helpers.
 pub mod decoder;
 pub(crate) mod encoder;

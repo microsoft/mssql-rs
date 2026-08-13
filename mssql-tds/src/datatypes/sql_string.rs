@@ -12,7 +12,7 @@ use super::{
 };
 
 /// Character encoding used by a [`SqlString`].
-#[derive(PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum EncodingType {
     /// UTF-8 encoding.
     Utf8,
@@ -165,10 +165,13 @@ pub fn get_encoding_type(metadata: &ColumnMetadata) -> EncodingType {
 
     if is_unicode_type(metadata.data_type) {
         EncodingType::Utf16
-    } else if collation.is_some() && collation.unwrap().utf8() {
+    } else if collation.is_some_and(|c| c.utf8()) {
         EncodingType::Utf8
     } else {
-        EncodingType::LcidBased(collation.unwrap())
+        // A non-Unicode string column should always carry a collation, but this
+        // now runs while parsing COLMETADATA rather than while decoding a cell, so
+        // a malformed token must not be able to panic the parser.
+        EncodingType::LcidBased(collation.unwrap_or_default())
     }
 }
 

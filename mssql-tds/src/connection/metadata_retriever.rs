@@ -502,11 +502,7 @@ mod tests {
         collation_names: Vec<Option<String>>,
     ) -> TableMetadataResult {
         TableMetadataResult {
-            col_metadata: ColMetadataToken {
-                column_count: columns.len() as u16,
-                columns,
-                cek_table: Vec::new(),
-            },
+            col_metadata: ColMetadataToken::new(columns.len() as u16, columns, Vec::new()),
             collation_names,
         }
     }

@@ -260,6 +260,99 @@ pub fn write_column_value<W: RowWriter + ?Sized>(writer: &mut W, col: usize, val
     }
 }
 
+/// Single-slot writer that captures the value decoded for one column.
+///
+/// This is the inverse of [`write_column_value`], and it is what lets
+/// `SqlTypeDecode::decode` reuse the `RowWriter` decode path instead of carrying
+/// a second copy of the per-type switch that could silently drift from it.
+#[derive(Default)]
+pub(crate) struct CaptureWriter {
+    value: Option<ColumnValues>,
+}
+
+impl CaptureWriter {
+    /// Takes the captured value, or `Null` if the decoder wrote nothing.
+    pub(crate) fn into_value(self) -> ColumnValues {
+        self.value.unwrap_or(ColumnValues::Null)
+    }
+}
+
+impl RowWriter for CaptureWriter {
+    fn write_null(&mut self, _col: usize) {
+        self.value = Some(ColumnValues::Null);
+    }
+    fn write_bool(&mut self, _col: usize, val: bool) {
+        self.value = Some(ColumnValues::Bit(val));
+    }
+    fn write_u8(&mut self, _col: usize, val: u8) {
+        self.value = Some(ColumnValues::TinyInt(val));
+    }
+    fn write_i16(&mut self, _col: usize, val: i16) {
+        self.value = Some(ColumnValues::SmallInt(val));
+    }
+    fn write_i32(&mut self, _col: usize, val: i32) {
+        self.value = Some(ColumnValues::Int(val));
+    }
+    fn write_i64(&mut self, _col: usize, val: i64) {
+        self.value = Some(ColumnValues::BigInt(val));
+    }
+    fn write_f32(&mut self, _col: usize, val: f32) {
+        self.value = Some(ColumnValues::Real(val));
+    }
+    fn write_f64(&mut self, _col: usize, val: f64) {
+        self.value = Some(ColumnValues::Float(val));
+    }
+    fn write_string(&mut self, _col: usize, val: SqlString) {
+        self.value = Some(ColumnValues::String(val));
+    }
+    fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
+        self.value = Some(ColumnValues::Bytes(val));
+    }
+    fn write_decimal(&mut self, _col: usize, val: DecimalParts) {
+        self.value = Some(ColumnValues::Decimal(val));
+    }
+    fn write_numeric(&mut self, _col: usize, val: DecimalParts) {
+        self.value = Some(ColumnValues::Numeric(val));
+    }
+    fn write_date(&mut self, _col: usize, val: SqlDate) {
+        self.value = Some(ColumnValues::Date(val));
+    }
+    fn write_time(&mut self, _col: usize, val: SqlTime) {
+        self.value = Some(ColumnValues::Time(val));
+    }
+    fn write_datetime(&mut self, _col: usize, val: SqlDateTime) {
+        self.value = Some(ColumnValues::DateTime(val));
+    }
+    fn write_smalldatetime(&mut self, _col: usize, val: SqlSmallDateTime) {
+        self.value = Some(ColumnValues::SmallDateTime(val));
+    }
+    fn write_datetime2(&mut self, _col: usize, val: SqlDateTime2) {
+        self.value = Some(ColumnValues::DateTime2(val));
+    }
+    fn write_datetimeoffset(&mut self, _col: usize, val: SqlDateTimeOffset) {
+        self.value = Some(ColumnValues::DateTimeOffset(val));
+    }
+    fn write_money(&mut self, _col: usize, val: SqlMoney) {
+        self.value = Some(ColumnValues::Money(val));
+    }
+    fn write_smallmoney(&mut self, _col: usize, val: SqlSmallMoney) {
+        self.value = Some(ColumnValues::SmallMoney(val));
+    }
+    fn write_uuid(&mut self, _col: usize, val: Uuid) {
+        self.value = Some(ColumnValues::Uuid(val));
+    }
+    fn write_xml(&mut self, _col: usize, val: SqlXml) {
+        self.value = Some(ColumnValues::Xml(val));
+    }
+    fn write_json(&mut self, _col: usize, val: SqlJson) {
+        self.value = Some(ColumnValues::Json(val));
+    }
+    fn write_vector(&mut self, _col: usize, val: SqlVector) {
+        self.value = Some(ColumnValues::Vector(val));
+    }
+    fn end_row(&mut self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

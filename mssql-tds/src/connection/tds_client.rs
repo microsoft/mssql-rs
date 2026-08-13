@@ -4777,11 +4777,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let row_metadata = Arc::new(ColMetadataToken {
-            column_count: 1,
-            columns: vec![metadata.clone()],
-            cek_table: vec![],
-        });
+        let row_metadata = Arc::new(ColMetadataToken::new(1, vec![metadata.clone()], vec![]));
         let inner_pause_state = RowPauseState {
             next_column_index: 1,
             metadata: Arc::clone(&row_metadata),

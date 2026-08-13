@@ -147,11 +147,11 @@ mod tests {
 
     fn make_context(columns: Vec<ColumnMetadata>) -> ParserContext {
         ParserContext::ColumnMetadata(
-            Arc::new(ColMetadataToken {
-                column_count: columns.len() as u16,
+            Arc::new(ColMetadataToken::new(
+                columns.len() as u16,
                 columns,
-                cek_table: Vec::new(),
-            }),
+                Vec::new(),
+            )),
             None,
         )
     }

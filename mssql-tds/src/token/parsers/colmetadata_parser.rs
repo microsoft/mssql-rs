@@ -240,11 +240,7 @@ where
         }
 
         // Construct the complete metadata token
-        let metadata = ColMetadataToken {
-            column_count: col_count,
-            columns: column_metadata,
-            cek_table,
-        };
+        let metadata = ColMetadataToken::new(col_count, column_metadata, cek_table);
         Ok(Tokens::from(metadata))
     }
 }

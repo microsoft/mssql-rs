@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::fmt::{self, Debug};
+use std::sync::OnceLock;
 
 use super::{
     fed_auth_info::{FedAuthInfoToken, SspiToken},
@@ -9,6 +10,7 @@ use super::{
     tokenitems::ReturnValueStatus,
 };
 use crate::datatypes::column_values::ColumnValues;
+use crate::datatypes::decode_spec::ColumnSpec;
 use crate::{
     error::Error,
     message::login::{FeatureExtension, RoutingInfo},
@@ -311,6 +313,37 @@ pub(crate) struct ColMetadataToken {
     /// references entries here by ordinal.
     #[allow(dead_code)] // Consumed by CEK decryption in a later phase.
     pub cek_table: Vec<CekTableEntry>,
+    /// Per-column decode plan, filled eagerly by the COLMETADATA parser so the
+    /// row path never pays for lazy initialisation.
+    decode_plan: OnceLock<Vec<ColumnSpec>>,
+}
+
+impl ColMetadataToken {
+    /// Builds a token and eagerly derives its decode plan, so the row path never
+    /// pays for lazy initialisation.
+    pub(crate) fn new(
+        column_count: u16,
+        columns: Vec<ColumnMetadata>,
+        cek_table: Vec<CekTableEntry>,
+    ) -> Self {
+        let plan: Vec<ColumnSpec> = columns.iter().map(ColumnSpec::for_column).collect();
+        ColMetadataToken {
+            column_count,
+            columns,
+            cek_table,
+            decode_plan: OnceLock::from(plan),
+        }
+    }
+
+    /// The per-column decode plan, derived on demand if it was not seeded.
+    ///
+    /// Callers must still tolerate a plan shorter than `columns` (see
+    /// [`crate::datatypes::decode_spec::spec_at`]): re-deriving costs time, whereas
+    /// substituting a default spec would silently change how a cell is decoded.
+    pub(crate) fn decode_plan(&self) -> &[ColumnSpec] {
+        self.decode_plan
+            .get_or_init(|| self.columns.iter().map(ColumnSpec::for_column).collect())
+    }
 }
 
 impl Token for ColMetadataToken {
