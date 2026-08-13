@@ -8,6 +8,9 @@
 # behaviour rather than breaking the job.
 set -euo pipefail
 
+# Keep in sync with the non-macOS `cargo install` step in
+# .pipeline/templates/build-template.yml, which pins the same two versions for
+# Windows and Linux. Bumping only one side gives macOS a different toolchain.
 LLVM_COV_VERSION=0.6.16
 NEXTEST_VERSION=0.9.99
 
@@ -22,8 +25,6 @@ NEXTEST_SHA256=fb1e9fb9a6da22972182d96e62f6664d325db3788775c96a07dacaf04cfed244
 CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
 mkdir -p "$CARGO_BIN"
 
-# Both downloads are universal binaries, so an x86_64 or arm64 pool image works
-# alike, and both archives contain the bare binary at their root.
 verify_sha256() {
   local file="$1" expected="$2" actual
   actual="$(shasum -a 256 "$file" | awk '{print $1}')"
@@ -34,6 +35,9 @@ verify_sha256() {
   return 1
 }
 
+# Both downloads are universal binaries, so an x86_64 or arm64 pool image works
+# alike, and both archives contain the bare binary at their root.
+#
 # Every step stays in the && chain so a failure anywhere - including the final
 # install - is reported to the caller and falls back to the source build.
 fetch_binary() {
@@ -50,7 +54,12 @@ fetch_binary() {
 install_tool() {
   local subcommand="$1" binary="$2" version="$3" expected="$4" url="$5"
 
-  if cargo "$subcommand" --version 2>/dev/null | grep -qF "$version"; then
+  # Require a word boundary on both sides: a bare substring match would treat an
+  # installed 0.6.161 as satisfying a 0.6.16 pin. `cargo nextest --version`
+  # prints a commit suffix after the version, so anchoring on end-of-line alone
+  # is not enough either.
+  if cargo "$subcommand" --version 2>/dev/null |
+    grep -qE "(^|[[:space:]])${version//./\\.}([[:space:]]|\$)"; then
     echo "$binary $version already present, skipping"
     return
   fi
@@ -60,7 +69,9 @@ install_tool() {
     return
   fi
 
-  echo "Could not download prebuilt $binary, building from source"
+  # Surface the slow path on the build summary. This step exists to avoid the
+  # ~10 minute source build, so a silent fallback would hide the regression.
+  echo "##vso[task.logissue type=warning]Prebuilt $binary $version unavailable or failed verification; falling back to cargo install (slow)"
   cargo install "$binary" --version "$version" --locked
 }
 

@@ -118,14 +118,6 @@ steps:
     displayName: Clean up old coverage files
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
-  - ${{ if eq(parameters.osType, 'Linux') }}:
-    - script: |
-        echo "##vso[task.setvariable variable=ARCHIVE_NAME;isOutput=false]tdslib-nextest.tar.zst"   
-        cargo install cargo-nextest  --version 0.9.99 --locked
-        cd mssql-tds && cargo nextest archive --archive-file tdslib-nextest.tar.zst && cp tdslib-nextest.tar.zst $(Build.ArtifactStagingDirectory) && mv tdslib-nextest.tar.zst ../ 
-      displayName: Archive nextest results
-      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-
   - script: |
         export CERT_HOST_NAME="sql1"
         cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --package mssql-odbc --no-fail-fast --profile ci --success-output immediate
