@@ -5,8 +5,10 @@
 
 use tracing::{debug, error};
 
+use mssql_tds::connection::tds_client::PreparedStatement;
+
 use super::sqlstate::*;
-use super::util::read_utf16;
+use super::util::{read_utf16, rewrite_param_markers};
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
     SqlWChar,
@@ -14,7 +16,8 @@ use crate::api::odbc_types::{
 use crate::error::free_errors;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_PREPARED,
+    PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+    STMT_STATE_PREPARED,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -111,8 +114,14 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     // Store the SQL text and defer the server-side prepare to SQLExecute.
     // Re-preparing discards any prior prepared text and stale result metadata.
     // A prior prepared handle is orphaned for release at the next execute.
-    stmt_state.prepared_sql = Some(sql);
+    // Markers are rewritten to `@P1..@Pn` once here so `SQLExecute` re-prepares
+    // (after a reconnect) without re-scanning the SQL.
+    let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
     stmt_state.orphan_prepared_handle();
+    stmt_state.prepared = Some(PreparedPlan {
+        stmt: PreparedStatement::new(rewritten_sql),
+        marker_count,
+    });
     stmt_state.column_metadata.clear();
     stmt_state.reset_row_stream();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
@@ -152,7 +161,10 @@ mod tests {
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.prepared_sql.as_deref(), Some("SELECT 1"));
+        assert_eq!(
+            state.prepared.as_ref().map(|p| p.stmt.sql()),
+            Some("SELECT 1")
+        );
         assert!(state.has_state(STMT_STATE_PREPARED));
     }
 
@@ -164,8 +176,13 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.prepared_sql = Some("SELECT 1".to_string());
-            state.prepared_handle = Some(42);
+            state.prepared = Some(PreparedPlan {
+                stmt: PreparedStatement::materialized_for_test(
+                    "SELECT 1",
+                    mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
+                ),
+                marker_count: 0,
+            });
             state.set_state(STMT_STATE_PREPARED);
         }
 
@@ -179,10 +196,20 @@ mod tests {
         );
 
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.prepared_sql.as_deref(), Some("SELECT 2"));
-        assert!(state.prepared_handle.is_none());
-        // The old handle is queued for release at the next execute.
-        assert_eq!(state.pending_unprepare, Some(42));
+        // The re-prepared statement holds the new SQL with no server handle yet.
+        assert_eq!(
+            state.prepared.as_ref().map(|p| p.stmt.sql()),
+            Some("SELECT 2")
+        );
+        assert!(state.prepared.as_ref().and_then(|p| p.stmt.id()).is_none());
+        // The old statement is queued for release at the next execute.
+        let orphaned = state
+            .pending_unprepare
+            .expect("prior handle queued for release");
+        assert_eq!(
+            orphaned,
+            mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42)
+        );
     }
 
     #[test]
