@@ -38,7 +38,7 @@ mod connectivity {
         let token_response = credential.unwrap().get_token(&[SCOPE], None).await;
 
         let secret = token_response.as_ref().unwrap().token.secret();
-        print!("{secret}");
+        debug_assert!(!secret.is_empty(), "empty access token");
         secret.to_string()
     }
 
@@ -82,7 +82,7 @@ mod connectivity {
         };
 
         let secret = token_response.as_ref().unwrap().token.secret();
-        print!("{secret}");
+        debug_assert!(!secret.is_empty(), "empty access token");
         secret.to_string()
     }
 
