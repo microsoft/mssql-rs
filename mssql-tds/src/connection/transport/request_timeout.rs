@@ -19,8 +19,14 @@
 /// `Instant::now()` clock read plus building the `Sleep`, and — because
 /// `timeout` takes its future by value — moving the multi-kilobyte row future
 /// into `Timeout<F>`. Pinning first and passing `Pin<&mut F>` avoids the move
-/// as well as the timer. Measured in isolation at ~60 ns per call, of which
-/// this removes ~90%.
+/// as well as the timer.
+///
+/// Because that dominant term scales with the size of the inner future, an
+/// isolated micro-benchmark on a trivial future understates it by ~3x. Measured
+/// in situ on a 48-column row, whose inner future is 2360 B, the saving is
+/// ~200 ns per row: ~3.1% of row decode into a discarding writer and ~2.6% into
+/// an allocating one. The absolute saving is writer-independent, as it must be —
+/// the writer is behind `&mut dyn` and does not change the future's layout.
 ///
 /// The condition is *suspension*, deliberately not "the budget is zero".
 /// `update_remaining_timeout` saturates to `Duration::ZERO` rather than `None`,
