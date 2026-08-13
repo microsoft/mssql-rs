@@ -103,12 +103,22 @@ These were found by reading `Sql/Ntdbms/sqlncli/odbc/sqlccnvt.cpp` while reviewi
 | `T` separator, `HH:MM` without seconds, unpadded fields such as `2023-6-5` | rejected (fixed-length token grammar) | accepted | Permissive. Low risk, same task. |
 | A time-only value into `SQL_C_TYPE_TIMESTAMP` | fills in the current date and succeeds, per Appendix D | `22018` from a character source, `07006` from a `time` column | Gap — Task [47247](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47247). Needs a platform-specific local-date helper, so it is not a one-line fix. |
 | Any source into `SQL_C_NUMERIC` | converts, per Appendix D | `HYC00` | **Deliberate, and permanent.** Decimal is delivered as character data, which is what mssql-python requests, so `SQL_NUMERIC_STRUCT` is not scheduled to become supported. Anchored by `UnsupportedCTypeReturnsHyc00ThenValueReadable`. |
+| `SQL_CA_SS_VARIANT_TYPE` for a variant holding `decimal` / `numeric` / `money` | `SQL_C_NUMERIC` | `SQL_C_CHAR` | **Deliberate**, and follows from the row above: reporting `SQL_C_NUMERIC` would make the caller request a `SQL_NUMERIC_STRUCT` this driver refuses. Character is how those values are actually delivered. |
+| `SQL_CA_SS_VARIANT_TYPE` on a column that is not `sql_variant` | `HY113` (`IDS_S1_113`) | `HY113` | Matches. The `S1` prefix in msodbcsql's identifier is the ODBC 2.x spelling of `HY`, cf. `IDS_S1_C00` = `HYC00`. |
 
 ### P2 — SQLColAttributeW — Task [46579](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46579)
 
 - Required minimum: `SQL_CA_SS_VARIANT_TYPE` so the `sql_variant` underlying C type resolves after the `SQL_C_BINARY` probe.
 - Plus common descriptor fields (type / concise type, length, octet length, precision, scale, name, unsigned, nullable, display size) reusing the `SQLDescribeColW` metadata mapping.
 - Export `SQLColAttributeW` (driver-load requires the pointer non-null).
+
+Reading a `sql_variant` column takes three things, not one, and mssql-python needs all of them before it will produce a value — on any failure it logs and yields `None` for the column, so a missing link shows up as silently empty data rather than an error:
+
+1. `SQLDescribeCol` must report `SQL_SS_VARIANT`. mssql-python branches on that exact type; while the column was reported as `SQL_VARCHAR` it never entered the variant path at all.
+2. `SQLGetData(col, SQL_C_BINARY, NULL, 0, &indicator)` must succeed. This is a length/NULL probe, not a data read; it is admitted while binary delivery stays unimplemented (a real buffer is still `HYC00`, tracked as Task [47239](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47239)).
+3. `SQLColAttribute(SQL_CA_SS_VARIANT_TYPE)` returns the C type of the value just probed.
+
+The underlying type is a property of the **value**, not the column — a variant column can hold a different type in every row — so it is carried up from the decoder rather than derived from metadata: `RowWriter` gained a defaulted `write_variant_base_type`, `CursorColumn::Value` carries the base type alongside the value, and `StmtState` clears it with the rest of the row-stream state. `ColumnValues` is deliberately untouched, which is what keeps this change out of the Python and Node bindings.
 
 ### P3 — SQLBindCol + block SQLFetchScroll — Task [46580](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46580)
 
@@ -149,7 +159,7 @@ Both of those landed with the fetch rework in [#153](https://github.com/microsof
 | P0 — Prerequisites & plumbing | 46577 | Implemented (build + clippy clean, 332 tests pass) |
 | P1 — Typed SQLGetData | 46578 | Implemented (int/float/guid/date-time C targets + char/wchar rendering; 491 tests pass). Chunked retrieval and incremental PLP streaming are owned by #153 (merged), on top of which the typed targets are dispatched; missing source-type conversions tracked as P1a; `SQL_C_BINARY` and binary→char hex are **not** implemented (see the P1 section); `sql_variant` underlying-type resolution deferred to P2. |
 | P1a — Mandatory source-type conversions | 47107 | Implemented (decimal, money and character sources into the numeric and date/time C targets; `01S07` on lossy numeric conversion, `22018` on an invalid character literal). |
-| P2 — SQLColAttributeW | 46579 | Not started |
+| P2 — SQLColAttributeW | 46579 | Implemented (common descriptor fields + `SQL_CA_SS_VARIANT_TYPE`, plus the `SQL_SS_VARIANT` type mapping and the zero-length `SQL_C_BINARY` probe the variant path depends on). Binary *delivery* remains unimplemented (Task 47239). |
 | P3 — SQLBindCol + SQLFetchScroll | 46580 | Not started |
 | P4 — Exports & driver-load compat | 46581 | Not started |
 | P5 — Testing & end-to-end | 46582 | Not started |
