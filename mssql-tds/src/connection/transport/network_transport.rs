@@ -32,6 +32,7 @@ use std::cmp::min;
 use std::io::Error;
 use std::io::ErrorKind;
 use std::net::ToSocketAddrs;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{self, TcpStream};
@@ -518,6 +519,10 @@ pub(crate) struct NetworkTransport {
     /// closed or an I/O operation observes it broken. Surfaced by
     /// `connection_known_dead()` as a cheap, socket-free liveness check.
     known_dead: bool,
+    /// Reusable NBCROW null-bitmap allocation. Refilled in place for every
+    /// NBCROW row of a result set instead of reallocating per row; see
+    /// `read_nbc_bitmap`.
+    nbc_bitmap_scratch: Option<Arc<[u8]>>,
 }
 
 impl std::fmt::Debug for NetworkTransport {
@@ -618,6 +623,7 @@ impl NetworkTransport {
             extractable_stream_handle: None,
             pending_reset: ResetConnectionMode::None,
             known_dead: false,
+            nbc_bitmap_scratch: None,
         }
     }
 
@@ -1386,9 +1392,19 @@ impl TdsTokenStreamReader for NetworkTransport {
         plan: ColumnPolicy,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
+        // `self` is the packet reader, so the scratch slot has to be moved out
+        // for the duration of the read and put back afterwards.
+        let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
         let cancellable = CancelHandle::run_until_cancelled(
             cancel_handle,
-            receive_row_into_internal(self, &*PARSER_REGISTRY, context, plan, writer),
+            receive_row_into_internal(
+                self,
+                &*PARSER_REGISTRY,
+                context,
+                plan,
+                writer,
+                &mut nbc_bitmap_scratch,
+            ),
         );
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {
@@ -1397,6 +1413,7 @@ impl TdsTokenStreamReader for NetworkTransport {
             },
             None => cancellable.await,
         };
+        self.nbc_bitmap_scratch = nbc_bitmap_scratch;
 
         match &result {
             Ok(_) => {}
@@ -1416,9 +1433,10 @@ impl TdsTokenStreamReader for NetworkTransport {
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<RowHeader> {
+        let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
         let cancellable = CancelHandle::run_until_cancelled(
             cancel_handle,
-            receive_row_header_internal(self, &*PARSER_REGISTRY, context),
+            receive_row_header_internal(self, &*PARSER_REGISTRY, context, &mut nbc_bitmap_scratch),
         );
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {
@@ -1427,6 +1445,7 @@ impl TdsTokenStreamReader for NetworkTransport {
             },
             None => cancellable.await,
         };
+        self.nbc_bitmap_scratch = nbc_bitmap_scratch;
 
         match &result {
             Ok(_) => {}
