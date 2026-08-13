@@ -19,7 +19,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use mssql_tds::fuzz_support::{FuzzReader, create_fuzz_tds_client};
+use mssql_tds::fuzz_support::{FuzzPacketReader, create_fuzz_tds_client};
 
 fuzz_target!(|data: &[u8]| {
     // Need at least 2 bytes: 1 for scenario, 1+ for token data
@@ -39,7 +39,7 @@ fuzz_target!(|data: &[u8]| {
 
     rt.block_on(async {
         // Create TdsClient with mock transport using fuzzer data
-        let packet_reader = Box::new(FuzzReader::new(token_data));
+        let packet_reader = FuzzPacketReader::from_data(token_data);
         let mut client = create_fuzz_tds_client(packet_reader, 4096);
 
         // Execute scenario based on fuzzer input
