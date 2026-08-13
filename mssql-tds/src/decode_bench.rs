@@ -15,8 +15,11 @@
 //! feasibility branch except for the `#[async_trait]` attribute on the reader
 //! impl, which the trait's own shape forces.
 
+use std::future::poll_fn;
 use std::hint::black_box;
+use std::pin::pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use crate::core::{CancelHandle, TdsResult};
@@ -577,6 +580,13 @@ enum WrapMode {
     CancelSome,
     /// Full production shape: cancel handle plus a request timeout.
     CancelSomeTimeout,
+    /// Proposed shape: same budget, but the timer is armed only if the decode
+    /// actually suspends. Polls the inner future once first; a row served from
+    /// an already-buffered packet never touches the timer wheel.
+    CancelSomeLazyTimeout,
+    /// Same lazy arming, written inline instead of behind an `async fn`, to
+    /// price the wrapper future that the helper itself introduces.
+    CancelSomeLazyInline,
 }
 
 impl WrapMode {
@@ -586,7 +596,26 @@ impl WrapMode {
             WrapMode::CancelNone => "cancel_none",
             WrapMode::CancelSome => "cancel_some",
             WrapMode::CancelSomeTimeout => "cancel_some_timeout",
+            WrapMode::CancelSomeLazyTimeout => "cancel_some_lazy_timeout",
+            WrapMode::CancelSomeLazyInline => "cancel_some_lazy_inline",
         }
+    }
+}
+
+/// Arms a `tokio::time::timeout` only if `f` does not complete on its first poll.
+///
+/// Observationally equivalent to `tokio::time::timeout` for this path:
+/// `Timeout::poll` polls the inner future before the delay, so a future that is
+/// ready immediately never observes the timer either way. The difference is that
+/// this version never registers a timer-wheel entry in that case.
+async fn lazy_timeout<F, T>(dur: Duration, f: F) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: Future<Output = T>,
+{
+    let mut f = pin!(f);
+    match poll_fn(|cx| Poll::Ready(f.as_mut().poll(cx))).await {
+        Poll::Ready(v) => Ok(v),
+        Poll::Pending => tokio::time::timeout(dur, f).await,
     }
 }
 
@@ -657,6 +686,42 @@ async fn decode_pass_wrapped(
                     Err(_) => panic!("bench timeout fired"),
                 }
             }
+            WrapMode::CancelSomeLazyTimeout => {
+                let cancellable = CancelHandle::run_until_cancelled(
+                    Some(handle),
+                    receive_row_into_internal(
+                        &mut reader,
+                        &registry,
+                        context,
+                        ColumnPolicy::DecodeAll,
+                        &mut writer,
+                    ),
+                );
+                match lazy_timeout(request_timeout, cancellable).await {
+                    Ok(r) => r,
+                    Err(_) => panic!("bench timeout fired"),
+                }
+            }
+            WrapMode::CancelSomeLazyInline => {
+                let mut cancellable = pin!(CancelHandle::run_until_cancelled(
+                    Some(handle),
+                    receive_row_into_internal(
+                        &mut reader,
+                        &registry,
+                        context,
+                        ColumnPolicy::DecodeAll,
+                        &mut writer,
+                    ),
+                ));
+                match poll_fn(|cx| Poll::Ready(cancellable.as_mut().poll(cx))).await {
+                    Poll::Ready(r) => r,
+                    Poll::Pending => match tokio::time::timeout(request_timeout, cancellable).await
+                    {
+                        Ok(r) => r,
+                        Err(_) => panic!("bench timeout fired"),
+                    },
+                }
+            }
         };
         result.expect("row decode failed");
         black_box(&writer.buf);
@@ -688,6 +753,8 @@ fn run_wrapper_ladder(name: &str, specs: Vec<ColSpec>, nbc: bool) {
         WrapMode::CancelNone,
         WrapMode::CancelSome,
         WrapMode::CancelSomeTimeout,
+        WrapMode::CancelSomeLazyTimeout,
+        WrapMode::CancelSomeLazyInline,
     ] {
         for _ in 0..WARMUP_PASSES {
             rt.block_on(decode_pass_wrapped(
@@ -818,4 +885,52 @@ fn bench_row_decode() {
     run_contiguous_case("contig_wide_strings_8x512", wide_string_columns(), false);
     run_wrapper_ladder("wrap_poc_row_39int_9varchar", poc_columns(), false);
     println!("BENCH_END");
+}
+
+/// Proves `lazy_timeout` is observationally identical to `tokio::time::timeout`
+/// at the case #271 flags as a trap: an exhausted (`ZERO`) budget.
+///
+/// The distinction that matters is *suspension*, not the budget value. A future
+/// that is ready on its first poll must succeed even on a zero budget (because
+/// `Timeout::poll` polls the inner future first), while a future that suspends
+/// must still fail with `Elapsed`. Skipping the timer when the budget is zero —
+/// the obvious "optimization" — would invert the second case into an unbounded wait.
+#[test]
+fn lazy_timeout_matches_eager_timeout_on_exhausted_budget() {
+    use std::future::ready;
+
+    struct NeverReady;
+    impl Future for NeverReady {
+        type Output = u8;
+        fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<u8> {
+            Poll::Pending
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    rt.block_on(async {
+        let z = Duration::ZERO;
+
+        // Ready-on-first-poll: both succeed despite a zero budget.
+        assert_eq!(tokio::time::timeout(z, ready(7u8)).await.ok(), Some(7));
+        assert_eq!(lazy_timeout(z, ready(7u8)).await.ok(), Some(7));
+
+        // Suspends: both must still elapse. This is the inversion guard.
+        assert!(tokio::time::timeout(z, NeverReady).await.is_err());
+        assert!(
+            lazy_timeout(z, NeverReady).await.is_err(),
+            "lazy arming must not turn an exhausted budget into an unbounded wait"
+        );
+
+        // A live budget still elapses on a suspending future.
+        assert!(
+            lazy_timeout(Duration::from_millis(20), NeverReady)
+                .await
+                .is_err()
+        );
+    });
 }
