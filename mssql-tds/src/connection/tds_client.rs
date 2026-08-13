@@ -1631,9 +1631,8 @@ impl TdsClient {
     /// Owns the full recovery protocol so callers never juggle raw handle ids or
     /// session epochs:
     ///
-    /// 1. Recover the connection if the socket died
-    ///    ([`check_and_reconnect`](Self::check_and_reconnect)) and charge the
-    ///    elapsed time against the command timeout.
+    /// 1. Recover the connection if the socket died, and charge the elapsed
+    ///    time against the command timeout.
     /// 2. If `statement` holds a handle from the live session, reuse it via
     ///    `sp_execute`.
     /// 3. Otherwise prepare and execute in one round trip via `sp_prepexec`; the
@@ -1693,11 +1692,24 @@ impl TdsClient {
                     .await
             }
             None => {
-                let (statement_id, result) = self
-                    .execute_sp_prepexec(statement.sql.clone(), named_params, orphaned, true, opts)
-                    .await?;
-                statement.id = Some(statement_id);
-                Ok(result)
+                // Reported by `sp_prepexec` whenever the server's prepare `@handle`
+                // landed - including on a failed batch, where the plan still
+                // exists and must stay releasable (Ex: prepare passed but execute failed).
+                let mut issued_id = None;
+                let result = self
+                    .execute_sp_prepexec(
+                        statement.sql.clone(),
+                        named_params,
+                        &mut issued_id,
+                        orphaned,
+                        true,
+                        opts,
+                    )
+                    .await;
+                if issued_id.is_some() {
+                    statement.id = issued_id;
+                }
+                result
             }
         }
     }
@@ -1759,57 +1771,68 @@ impl TdsClient {
     }
 
     /// Prepares and executes a parameterized statement in a single round-trip
-    /// via `sp_prepexec`.
+    /// via `sp_prepexec`, combining
+    /// [`execute_sp_prepare()`](Self::execute_sp_prepare) and
+    /// [`execute_sp_execute()`](Self::execute_sp_execute).
     ///
-    /// Combines [`execute_sp_prepare()`](Self::execute_sp_prepare) and
-    /// [`execute_sp_execute()`](Self::execute_sp_execute), returning the
-    /// [`StatementId`] it issues for the statement. The `@handle` RETURNVALUE is
-    /// captured during the drain and recorded under that id, so the statement is
-    /// executable via `sp_execute` once the result set is drained.
+    /// The `@handle` RETURNVALUE trails the result set, so it is captured during
+    /// the push_return_values and recorded under the issued [`StatementId`]; the statement
+    /// becomes reusable via `sp_execute` once drained. Rows are read with
+    /// [`read_row()`](Self::read_row).
     ///
-    /// `orphan` piggybacks a prepared-statement release onto this call: when
-    /// `Some(id)`, that statement's handle is sent as the input value of the
-    /// by-reference `@handle` parameter, so the server drops it before preparing
-    /// the new one - replacing a separate `sp_unprepare` round trip. `None` (or
-    /// an id with no live handle) prepares fresh with a NULL `@handle` input.
-    /// This mirrors the reference ODBC/`SqlClient` drivers, which send the
-    /// retained handle as the `sp_prepexec` in/out `@handle` argument.
+    /// A low-level wire call - prefer the managed
+    /// [`execute_prepared`](Self::execute_prepared) /
+    /// [`unprepare`](Self::unprepare) API.
     ///
-    /// The mutable option also reports ownership after the call. It remains
-    /// `Some(id)` when execution fails before the RPC serialization boundary, so
-    /// the caller still owns the statement and may retry its release. It is
-    /// taken - and its map entries dropped - immediately before serialization;
-    /// from that point onward the server may have consumed the handle, even if
-    /// serialization, send, or response processing returns an error, so the
-    /// caller must not reuse it.
+    /// # Parameters
     ///
-    /// Result rows are available through [`read_row()`](Self::read_row) after
-    /// this call returns.
+    /// - `named_params` - the statement's parameters. Unlike `sp_prepare`,
+    ///   their values are sent and executed, not just declared.
+    ///
+    /// - `statement_id` - **out**: the id this call issues. Set whenever the
+    ///   server allocated a plan, which is not the same as "the batch
+    ///   succeeded":
+    ///   - success - always set (the `@handle` may still be in flight);
+    ///   - error *with* a `@handle` (e.g. Prepare passed but execute failed)
+    ///     - set, so the caller can reuse or [`unprepare`](Self::unprepare) it;
+    ///   - error *without* one (compile failure, or the stream broke first) -
+    ///     left untouched, leaving the statement unmaterialized.
+    ///
+    /// - `orphan` - **in/out**: a statement whose prepared handle is to be
+    ///   released, piggybacked onto this prepexec.
+    ///   `Some(id)` sends its handle as the by-reference `@handle`
+    ///   input so the server drops that plan while preparing the new one,
+    ///   saving a separate `sp_unprepare` round trip; `None`, or an id with
+    ///   no live handle, sends NULL and prepares fresh. On return it reports
+    ///   ownership: still `Some` if the call failed before serialization (the
+    ///   caller may retry the release), `None` once the drop crossed that
+    ///   boundary - past which the server may have consumed it even if the call
+    ///   then fails after the dropping of orphan.
+    ///
+    /// - `command_started` - `true` when the caller already opened the command
+    ///   boundary via `begin_command` (as
+    ///   [`execute_prepared`](Self::execute_prepared) does before recovering, so
+    ///   the reconnect's info messages survive); `false` opens it here.
+    ///
+    /// Both handle decisions match msodbcsql, which keys them on whether it
+    /// holds a handle rather than on the batch's return code.
     ///
     /// # Recovery
     ///
-    /// This method never reconnects; callers that need it recover once with
-    /// [`check_and_reconnect`](Self::check_and_reconnect) first, as
+    /// Never reconnects - the caller recovers once up front, as
     /// [`execute_prepared`](Self::execute_prepared) does. Staleness needs no
-    /// caller check: a reconnect clears `prepared_handles`, so an `orphan` the
-    /// dead session owned resolves to no handle and its piggybacked drop is
-    /// simply skipped.
-    /// A low-level wire call with caller-owned recovery — prefer the
-    /// managed [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
-    ///
-    /// `command_started`: `true` when the caller already opened the command
-    /// boundary via `begin_command` (as `execute_prepared` does before recovery,
-    /// so the reconnect's info messages survive); `false` opens it here. It does
-    /// not affect recovery — this method never reconnects.
+    /// caller check: a reconnect clears `prepared_handles`, so an `orphan` from
+    /// the dead session resolves to no handle and its drop is skipped.
     #[instrument(skip(self, named_params, options), level = "info")]
     async fn execute_sp_prepexec<'a>(
         &mut self,
         sql: String,
         mut named_params: Vec<RpcParameter>,
+        statement_id: &mut Option<StatementId>,
         orphan: &mut Option<StatementId>,
         command_started: bool,
         options: impl Into<ExecuteOptions<'a>>,
-    ) -> TdsResult<(StatementId, StatementResult)> {
+    ) -> TdsResult<StatementResult> {
         if !command_started {
             if self.execution_context.has_open_batch() {
                 return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
@@ -1910,8 +1933,8 @@ impl TdsClient {
 
         // Armed here, not earlier: the AE describe round-trip above emits its own
         // RETURNVALUEs, and a build failure must not leave a stale target.
-        let statement_id = self.issue_statement_id();
-        self.pending_capture = Some(statement_id);
+        let issued_id = self.issue_statement_id();
+        self.pending_capture = Some(issued_id);
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
@@ -1919,6 +1942,7 @@ impl TdsClient {
         drop(packet_writer);
         if let Err(e) = serialize_result {
             self.abort_pending_prepare_capture();
+            self.report_issued_id(issued_id, statement_id);
             return Err(e);
         }
 
@@ -1926,10 +1950,27 @@ impl TdsClient {
             Ok(boundary) => boundary,
             Err(e) => {
                 self.abort_pending_prepare_capture();
+                self.report_issued_id(issued_id, statement_id);
                 return Err(e);
             }
         };
-        Ok((statement_id, self.apply_result_boundary(boundary)))
+        // The handle may still be in flight (it follows the result set), so the id
+        // is always reported here.
+        *statement_id = Some(issued_id);
+        Ok(self.apply_result_boundary(boundary))
+    }
+
+    /// Reports `issued_id` to the caller only if the server's `@handle` actually
+    /// arrived.
+    ///
+    /// Call this after aborting the capture, so no later token can land: the map
+    /// lookup is then a final answer to "did we get a prepared plan?". Reporting an id
+    /// with no handle behind it would leave the statement claiming to be
+    /// prepared when nothing was.
+    fn report_issued_id(&self, issued_id: StatementId, out: &mut Option<StatementId>) {
+        if self.prepared_handles.contains_key(&issued_id) {
+            *out = Some(issued_id);
+        }
     }
 
     /// Executes a previously prepared statement by handle via `sp_execute`.
@@ -2115,8 +2156,14 @@ impl TdsClient {
         orphan: &mut Option<StatementId>,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<(StatementId, StatementResult)> {
-        self.execute_sp_prepexec(sql, named_params, orphan, false, options)
-            .await
+        let mut issued_id = None;
+        let result = self
+            .execute_sp_prepexec(sql, named_params, &mut issued_id, orphan, false, options)
+            .await?;
+        Ok((
+            issued_id.expect("a successful sp_prepexec always reports its id"),
+            result,
+        ))
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -4390,13 +4437,20 @@ impl ResultSet for TdsClient {
     }
 }
 
-/// Opaque, client-scoped identity for a managed prepared statement.
+/// Opaque identity for a managed prepared statement.
 ///
 /// Issued by [`TdsClient::execute_prepared`] the first time a statement is
-/// materialized and used to key the client's private server-handle map. Ids are
-/// unique within a client's lifetime and meaningless to any other client, so a
-/// statement carried to a different client resolves to "not materialized here"
-/// and is re-prepared rather than aliasing an unrelated server handle.
+/// materialized, and used to key the issuing client's private server-handle
+/// map. Ids are unique and never reused within the lifetime of the client that
+/// issued them.
+///
+/// They are **not** globally unique across clients yet (AB#47098): the counter
+/// restarts from the same value on each client, so a statement must only be
+/// executed or unprepared with the [`TdsClient`] that materialized it. Using it
+/// with a different client can alias that client's unrelated handle instead of
+/// re-preparing. ODBC upholds this because an `HSTMT` is bound to one
+/// connection; direct `mssql-tds` consumers must not share a statement across
+/// clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StatementId(u64);
 
@@ -6081,6 +6135,127 @@ mod tests {
         assert!(
             bytes.windows(expected.len()).any(|w| w == expected),
             "sp_execute must address the cached handle on the wire"
+        );
+    }
+
+    // The server can report an error and still return a `@handle` for the plan
+    // it allocated. The drain records that handle, so the statement must carry
+    // the id naming it or the entry — and the server-side plan — is unreachable.
+    #[tokio::test]
+    async fn execute_prepared_keeps_the_handle_reachable_when_the_batch_errors() {
+        use crate::token::tokens::ErrorToken;
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(ErrorToken {
+                number: 50000,
+                state: 1,
+                severity: 16,
+                message: "prepexec failed".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            done_no_more(),
+        ]);
+        let mut statement = PreparedStatement::new("SELECT 1");
+        let mut orphaned = None;
+
+        let result = client
+            .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await;
+
+        assert!(result.is_err(), "the batch reported an error");
+        let statement_id = statement
+            .id()
+            .expect("the statement must carry the id even though the execute failed");
+        assert_eq!(
+            client.prepared_handles.get(&statement_id).copied(),
+            Some(9),
+            "the captured handle must stay addressable so unprepare can release it"
+        );
+
+        client.close_query().await.ok();
+        client.unprepare(statement_id, ()).await.ok();
+        assert!(
+            !client.prepared_handles.contains_key(&statement_id),
+            "the caller can release the plan the failed prepare left behind"
+        );
+    }
+
+    // A compile failure (bad syntax) returns no `@handle`, so nothing was
+    // materialized and the statement must not claim an identity.
+    #[tokio::test]
+    async fn execute_prepared_leaves_the_statement_unmaterialized_when_no_handle_returns() {
+        use crate::token::tokens::ErrorToken;
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(ErrorToken {
+                number: 102,
+                state: 1,
+                severity: 15,
+                message: "Incorrect syntax near 'SELCT'".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            done_no_more(),
+        ]);
+        let mut statement = PreparedStatement::new("SELCT 1");
+        let mut orphaned = None;
+
+        let result = client
+            .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            statement.id(),
+            None,
+            "no handle came back, so the statement was never materialized"
+        );
+        assert!(client.prepared_handles.is_empty());
+    }
+
+    // A multi-statement batch whose *later* statement fails: `execute_prepared`
+    // returns Ok on the first result, and the error surfaces on a subsequent
+    // drain. The `@handle` trails the whole batch, so capture must survive that
+    // error — the drain reads on past it and only the terminal DONE aborts.
+    #[tokio::test]
+    async fn handle_is_captured_when_a_later_statement_in_the_batch_errors() {
+        use crate::token::tokens::ErrorToken;
+
+        let mut client = create_capturing_client(vec![
+            done_count(CurrentCommand::Insert, 1, true),
+            Tokens::Error(ErrorToken {
+                number: 2627,
+                state: 1,
+                severity: 14,
+                message: "Violation of PRIMARY KEY constraint".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 2,
+            }),
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            done_no_more(),
+        ])
+        .0;
+        let mut statement = PreparedStatement::new("INSERT INTO a ...; INSERT INTO b ...;");
+        let mut orphaned = None;
+
+        client
+            .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await
+            .expect("the first statement's result is reached before the error");
+        let statement_id = statement.id().expect("materialized on the first result");
+
+        // The error only surfaces here, after execute_prepared already returned.
+        assert!(client.advance().await.is_err());
+
+        assert_eq!(
+            client.prepared_handles.get(&statement_id).copied(),
+            Some(9),
+            "the trailing @handle must be captured while draining past the error"
         );
     }
 
