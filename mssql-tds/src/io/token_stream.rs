@@ -21,7 +21,7 @@ use core::convert::From;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, trace};
 
 #[cfg(fuzzing)]
 use crate::error::Error::{OperationCancelledError, TimeoutError};
@@ -368,7 +368,7 @@ pub(crate) async fn dispatch_token<R: TdsPacketReader + Send + Sync>(
         }
     };
 
-    debug!("Parsing token type: {:?}", &token_type);
+    trace!("Parsing token type: {:?}", &token_type);
 
     match parser {
         TokenParsers::EnvChange(parser) => parser.parse(reader, context).await,
@@ -456,6 +456,14 @@ fn pause_after_column(
         RowReadResult::RowWritten
     }
 }
+
+/// Largest NBCROW null bitmap held on the stack.
+///
+/// SQL Server caps a result set at 4096 columns, so 512 bytes covers every legal
+/// shape; the heap fallback exists only to keep a malformed COLMETADATA from
+/// indexing out of bounds. Reading the bitmap here rather than into a fresh `Vec`
+/// removes one allocate/free pair per row from the scan.
+const NBC_STACK_BITMAP_BYTES: usize = 512;
 
 /// Unified per-column decode driver for ROW and NBCROW tokens.
 ///
@@ -586,7 +594,7 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
 ) -> TdsResult<RowReadResult> {
     let token_type_byte = reader.read_byte().await?;
     let token_type: TokenType = token_type_byte.try_into()?;
-    debug!("Parsing token type: {:?}", &token_type);
+    trace!("Parsing token type: {:?}", &token_type);
 
     match token_type {
         TokenType::Row => {
@@ -596,9 +604,17 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
         TokenType::NbcRow => {
             let (columns, decryptor) = extract_row_context(context)?;
             let bitmap_len = columns.len().div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_len];
-            reader.read_bytes(&mut bitmap).await?;
-            drive_row_columns(reader, columns, decryptor, Some(&bitmap), 0, plan, writer).await
+            let mut stack_bitmap = [0u8; NBC_STACK_BITMAP_BYTES];
+            let mut heap_bitmap;
+            let bitmap: &[u8] = if bitmap_len <= NBC_STACK_BITMAP_BYTES {
+                reader.read_bytes(&mut stack_bitmap[..bitmap_len]).await?;
+                &stack_bitmap[..bitmap_len]
+            } else {
+                heap_bitmap = vec![0u8; bitmap_len];
+                reader.read_bytes(&mut heap_bitmap).await?;
+                &heap_bitmap
+            };
+            drive_row_columns(reader, columns, decryptor, Some(bitmap), 0, plan, writer).await
         }
         _ => {
             let token = dispatch_token(reader, registry, token_type, context).await?;

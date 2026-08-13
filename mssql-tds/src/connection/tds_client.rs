@@ -39,7 +39,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::{
     core::{CancelHandle, TdsResult},
@@ -3073,7 +3073,6 @@ impl TdsClient {
     ///
     /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
     /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
-    #[instrument(skip(self, writer), level = "info")]
     pub(crate) async fn get_next_row_into(
         &mut self,
         writer: &mut (dyn RowWriter + Send),
@@ -3130,7 +3129,7 @@ impl TdsClient {
             match result {
                 RowReadResult::RowWritten => {
                     writer.end_row();
-                    info!("Row Received");
+                    trace!("Row Received");
                     return Ok(true);
                 }
                 RowReadResult::RowPaused(_) | RowReadResult::PlpPaused(_) => {
@@ -3397,7 +3396,7 @@ impl TdsClient {
         match result {
             RowReadResult::RowWritten => {
                 writer.end_row();
-                info!("Row Received");
+                trace!("Row Received");
                 Ok(true)
             }
             RowReadResult::RowPaused(next_pause) => {
@@ -3940,7 +3939,6 @@ impl ResultSet for TdsClient {
         }
     }
 
-    #[instrument(skip(self, writer), level = "info")]
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool> {
         if self.maybe_has_unread_rows() {
             self.get_next_row_into(writer).await
