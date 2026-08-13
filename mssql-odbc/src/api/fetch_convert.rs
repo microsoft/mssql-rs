@@ -197,38 +197,44 @@ pub(crate) fn money_scaled(lsb: i32, msb: i32) -> i64 {
     (i64::from(lsb) & 0xFFFF_FFFF) | (i64::from(msb) << 32)
 }
 
-/// Interprets a column as a number, or `None` when the column type has no
-/// numeric interpretation.
-fn numeric_source(value: &ColumnValues) -> Option<NumericSource> {
+/// Interprets a column as a number.
+///
+/// [`ConvError::Restricted`] (`07006`) means the column type has no numeric
+/// interpretation at all; [`ConvError::OutOfRange`] (`22003`) means the column
+/// is numeric but the value cannot be represented here.
+fn numeric_source(value: &ColumnValues) -> Result<NumericSource, ConvError> {
     match value {
-        ColumnValues::TinyInt(x) => Some(NumericSource::Int(i128::from(*x))),
-        ColumnValues::SmallInt(x) => Some(NumericSource::Int(i128::from(*x))),
-        ColumnValues::Int(x) => Some(NumericSource::Int(i128::from(*x))),
-        ColumnValues::BigInt(x) => Some(NumericSource::Int(i128::from(*x))),
-        ColumnValues::Bit(b) => Some(NumericSource::Int(i128::from(*b))),
-        ColumnValues::Real(x) => Some(NumericSource::Float(f64::from(*x))),
-        ColumnValues::Float(x) => Some(NumericSource::Float(*x)),
+        ColumnValues::TinyInt(x) => Ok(NumericSource::Int(i128::from(*x))),
+        ColumnValues::SmallInt(x) => Ok(NumericSource::Int(i128::from(*x))),
+        ColumnValues::Int(x) => Ok(NumericSource::Int(i128::from(*x))),
+        ColumnValues::BigInt(x) => Ok(NumericSource::Int(i128::from(*x))),
+        ColumnValues::Bit(b) => Ok(NumericSource::Int(i128::from(*b))),
+        ColumnValues::Real(x) => Ok(NumericSource::Float(f64::from(*x))),
+        ColumnValues::Float(x) => Ok(NumericSource::Float(*x)),
         // `DecimalParts` stores a base-2^32 little-endian magnitude. 38 digits
-        // fit in 4 words, and `magnitude` returns `None` for a wider (malformed)
-        // value rather than shifting past 128 bits.
+        // fit in 4 words; a wider magnitude, or one past `i128::MAX`, is a
+        // numeric value this converter cannot represent, not an illegal cast.
         ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
-            let m = i128::try_from(d.magnitude()?).ok()?;
-            Some(NumericSource::Scaled {
+            let m = d
+                .magnitude()
+                .and_then(|mag| i128::try_from(mag).ok())
+                .ok_or(ConvError::OutOfRange)?;
+            Ok(NumericSource::Scaled {
                 mantissa: if d.is_positive { m } else { -m },
                 scale: u32::from(d.scale),
             })
         }
-        ColumnValues::Money(m) => Some(NumericSource::Scaled {
+        ColumnValues::Money(m) => Ok(NumericSource::Scaled {
             mantissa: i128::from(money_scaled(m.lsb_part, m.msb_part)),
             scale: 4,
         }),
-        ColumnValues::SmallMoney(m) => Some(NumericSource::Scaled {
+        ColumnValues::SmallMoney(m) => Ok(NumericSource::Scaled {
             mantissa: i128::from(m.int_val),
             scale: 4,
         }),
         // Character columns are handled by `numeric_source_or_parse`, which can
         // distinguish bad text (22018) from a non-numeric column (07006).
-        _ => None,
+        _ => Err(ConvError::Restricted),
     }
 }
 
@@ -252,7 +258,7 @@ fn numeric_source_or_parse(value: &ColumnValues) -> Result<NumericSource, ConvEr
             _ => Err(ConvError::InvalidCharacterValue),
         };
     }
-    numeric_source(value).ok_or(ConvError::Restricted)
+    numeric_source(value)
 }
 
 /// Converts a numeric column value to a fixed-width integer C target,
@@ -262,8 +268,9 @@ fn numeric_source_or_parse(value: &ColumnValues) -> Result<NumericSource, ConvEr
 /// `numeric`, `money`, `smallmoney`), the floating-point columns, and character
 /// columns holding a numeric literal. A dropped fractional part is reported as
 /// [`ConvOk::Truncated`], text that is not a valid number as
-/// [`ConvError::InvalidCharacterValue`], and a column with no numeric
-/// interpretation as [`ConvError::Restricted`].
+/// [`ConvError::InvalidCharacterValue`], a numeric value too wide to represent
+/// as [`ConvError::OutOfRange`], and a column with no numeric interpretation as
+/// [`ConvError::Restricted`].
 ///
 /// Returns [`ConvError::NotHandledHere`] when the target is not a fixed-width
 /// integer C type, letting the caller fall back to another conversion path.
@@ -1462,7 +1469,20 @@ mod tests {
             )
         }
         .unwrap_err();
-        assert_eq!(err, ConvError::Restricted);
+        assert_eq!(err, ConvError::OutOfRange);
+
+        // A magnitude filling all four limbs exceeds `i128::MAX`: also a
+        // representability failure, not an illegal cast.
+        let err = unsafe {
+            convert_integer_c(
+                &decimal(true, 0, vec![-1, -1, -1, -1]),
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
 
         // Zero-padded limbs past the fourth carry no magnitude, so this path
         // agrees with the string rendering instead of refusing the value.
@@ -1772,6 +1792,27 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ConvError::Restricted);
+    }
+
+    #[test]
+    fn oversized_decimal_into_float_target_is_out_of_range() {
+        use mssql_tds::datatypes::decoder::DecimalParts;
+
+        let mut out: f64 = 0.0;
+        let mut ind: SqlLen = 0;
+        let err = conv_f(
+            &ColumnValues::Decimal(DecimalParts {
+                is_positive: true,
+                scale: 0,
+                precision: 38,
+                int_parts: vec![1, 0, 0, 0, 1],
+            }),
+            SQL_C_DOUBLE,
+            (&mut out as *mut f64).cast(),
+            &mut ind,
+        )
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
     }
 
     #[test]
