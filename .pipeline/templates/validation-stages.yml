@@ -331,12 +331,15 @@ stages:
           osType: MacOS
           buildType: ${{ parameters.buildType }}
           testFilter: -E 'not (test(connectivity))'
-          enableJsBuild: true
+          # JS build and macOS wheels dominate this job's runtime and nothing in a
+          # PR run consumes their output, so they only run on CI (non-PR) builds.
+          enableJsBuild: ${{ ne(variables['Build.Reason'], 'PullRequest') }}
           enableTests: false
-      - template: build-python-wheels-template.yml
-        parameters:
-          osType: MacOS
-          architecture: x64
+      - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: MacOS
+            architecture: x64
 
   - job: Test_MacOS
     displayName: Test MacOS

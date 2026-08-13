@@ -3617,7 +3617,8 @@ impl TdsClient {
     ///
     /// After this returns `true`, individual columns are pulled with
     /// [`read_row_column`](Self::read_row_column). Any previously positioned row
-    /// is drained first (allocation-free).
+    /// is drained first; its remaining column bytes are read and discarded rather
+    /// than returned to the caller.
     #[instrument(skip(self), level = "info")]
     pub async fn next_row_cursor(&mut self) -> TdsResult<bool> {
         if self.current_metadata.is_none() {
@@ -3721,14 +3722,14 @@ impl TdsClient {
         pause_state: RowPauseState,
         target: usize,
     ) -> TdsResult<CursorColumn> {
-        if target >= pause_state.columns.len() {
+        let column_count = pause_state.columns().len();
+        if target >= column_count {
             // Out-of-range: decoding with ColumnPolicy::DecodeOne(target) would skip
             // every remaining column and report RowWritten, silently consuming
             // the row. Reject without touching the transport and keep the
             // cursor positioned so valid pulls still work. ODBC validates the
             // column index first, so this guards the public API against other
             // callers.
-            let column_count = pause_state.columns.len();
             self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
             return Err(UsageError(format!(
                 "read_row_column target column {target} is out of range (row has {column_count} columns)"
@@ -3813,8 +3814,16 @@ impl TdsClient {
     }
 
     /// Reads and discards all remaining bytes of an active PLP stream.
+    ///
+    /// The scratch buffer is heap-allocated rather than a stack array: it is live
+    /// across the await below, so a stack array would be stored inline in this
+    /// future and propagate into every caller that awaits it — `read_row_column`
+    /// directly, plus `drain_rows`, `get_next_row_into` and `next_row_cursor` via
+    /// `drain_active_row`. Abandoning a partially read PLP column is rare and
+    /// already network-bound, so one allocation there is negligible; an 8 KiB
+    /// per-row state machine is not.
     async fn drain_active_plp(&mut self, plp_state: &mut PlpPauseState) -> TdsResult<()> {
-        let mut buffer = [0u8; 8192];
+        let mut buffer = vec![0u8; 8192];
         while !plp_state.reached_end() {
             let start = Instant::now();
             let read = self
@@ -4964,6 +4973,36 @@ mod tests {
         )
     }
 
+    /// Guards the fix for #225: a large local held across an `.await` in
+    /// `drain_active_plp` is stored inline in that future and propagates into
+    /// every caller in the await chain, costing a memcpy per row on the hot path.
+    #[test]
+    fn row_fetch_futures_stay_small() {
+        const MAX: usize = 4096;
+
+        let mut client = create_test_client();
+        let mut sink = DiscardRowWriter;
+
+        // Constructing an async fn's future runs none of its body, so these are
+        // free to build and drop unpolled. Each borrow ends with its statement.
+        let next_row_cursor = std::mem::size_of_val(&client.next_row_cursor());
+        let read_row_column = std::mem::size_of_val(&client.read_row_column(0));
+        let drain_rows = std::mem::size_of_val(&client.drain_rows());
+        let get_next_row_into = std::mem::size_of_val(&client.get_next_row_into(&mut sink));
+
+        for (name, size) in [
+            ("next_row_cursor", next_row_cursor),
+            ("read_row_column", read_row_column),
+            ("drain_rows", drain_rows),
+            ("get_next_row_into", get_next_row_into),
+        ] {
+            assert!(
+                size <= MAX,
+                "{name} future is {size} B, expected <= {MAX} B"
+            );
+        }
+    }
+
     #[test]
     fn prepare_reset_connection_routes_mode_to_transport() {
         let mut client = create_test_client();
@@ -5303,9 +5342,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let row_metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![metadata.clone()],
+            cek_table: vec![],
+        });
         let inner_pause_state = RowPauseState {
             next_column_index: 1,
-            columns: vec![metadata.clone()],
+            metadata: Arc::clone(&row_metadata),
             nbc_null_bitmap: None,
             decryptor: None,
         };
@@ -5323,7 +5367,7 @@ mod tests {
         let mut client = create_test_client_with_transport(transport);
         client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 0,
-            columns: vec![metadata],
+            metadata: row_metadata,
             nbc_null_bitmap: None,
             decryptor: None,
         }));
@@ -5343,7 +5387,7 @@ mod tests {
         let mut client = create_test_client();
         client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 1,
-            columns: Vec::new(),
+            metadata: Arc::new(ColMetadataToken::default()),
             nbc_null_bitmap: None,
             decryptor: None,
         }));
@@ -5362,7 +5406,7 @@ mod tests {
         client.current_result_set_has_been_read_till_end = false;
         client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 1,
-            columns: Vec::new(),
+            metadata: Arc::new(ColMetadataToken::default()),
             nbc_null_bitmap: None,
             decryptor: None,
         }));
