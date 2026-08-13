@@ -328,11 +328,11 @@ fn build_row_buffer(columns: &[ColumnMetadata], rows: usize) -> Arc<Vec<u8>> {
 /// Isolated because this is the one call whose shape differs across the branches
 /// this benchmark is used to compare.
 fn metadata_token(columns: Vec<ColumnMetadata>) -> Arc<ColMetadataToken> {
-    Arc::new(ColMetadataToken::new(
-        columns.len() as u16,
+    Arc::new(ColMetadataToken {
+        column_count: columns.len() as u16,
         columns,
-        Vec::new(),
-    ))
+        cek_table: Vec::new(),
+    })
 }
 
 /// Decodes every row in `buffer`, returning the elapsed time for the pass.
