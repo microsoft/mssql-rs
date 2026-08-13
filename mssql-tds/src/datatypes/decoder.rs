@@ -197,9 +197,10 @@ impl PlpChunkStreamReader {
         }
     }
 
-    pub(crate) async fn begin(
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<Option<Self>> {
+    pub(crate) async fn begin<T>(reader: &mut T) -> TdsResult<Option<Self>>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         let raw_len_i64 = reader.read_int64().await?;
         let raw_len = raw_len_i64 as u64;
         let raw_len_usize = raw_len as usize;
@@ -243,10 +244,10 @@ impl PlpChunkStreamReader {
         self.reached_end
     }
 
-    async fn ensure_active_chunk(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<bool> {
+    async fn ensure_active_chunk<T>(&mut self, reader: &mut T) -> TdsResult<bool>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         if self.reached_end {
             return Ok(false);
         }
@@ -310,11 +311,10 @@ impl PlpChunkStreamReader {
         Ok(true)
     }
 
-    pub(crate) async fn read_into(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-        out: &mut [u8],
-    ) -> TdsResult<usize> {
+    pub(crate) async fn read_into<T>(&mut self, reader: &mut T, out: &mut [u8]) -> TdsResult<usize>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         // Supports the msodbcsql-style cbRequest==0 pattern to consume a
         // pending terminator after all data bytes were already read.
         if out.is_empty() {
@@ -352,10 +352,10 @@ impl PlpChunkStreamReader {
         Ok(written)
     }
 
-    pub(crate) async fn skip_to_end(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<()> {
+    pub(crate) async fn skip_to_end<T>(&mut self, reader: &mut T) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         while self.ensure_active_chunk(reader).await? {
             if self.chunk_remaining > 0 {
                 reader.skip_bytes(self.chunk_remaining).await?;
@@ -413,10 +413,13 @@ impl PlpColumnStream {
     /// - `Ok(None)` for SQL NULL
     /// - `Ok(Some(stream))` ready for incremental reads
     /// - `Err` if the column is not PLP-typed or the header is malformed
-    pub(crate) async fn begin(
+    pub(crate) async fn begin<T>(
         metadata: &ColumnMetadata,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<Option<Self>> {
+        reader: &mut T,
+    ) -> TdsResult<Option<Self>>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         let (plp_type, collation) = Self::type_from_metadata(metadata)?;
         let inner = match PlpChunkStreamReader::begin(reader).await? {
             None => return Ok(None),
@@ -456,19 +459,18 @@ impl PlpColumnStream {
     }
 
     /// Incrementally reads PLP payload bytes into `out`.
-    pub(crate) async fn read_into(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-        out: &mut [u8],
-    ) -> TdsResult<usize> {
+    pub(crate) async fn read_into<T>(&mut self, reader: &mut T, out: &mut [u8]) -> TdsResult<usize>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         self.inner.read_into(reader, out).await
     }
 
     /// Discards all remaining PLP payload and terminator bytes.
-    pub(crate) async fn skip_to_end(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<()> {
+    pub(crate) async fn skip_to_end<T>(&mut self, reader: &mut T) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         self.inner.skip_to_end(reader).await
     }
 
@@ -3158,7 +3160,7 @@ mod test {
     }
 
     mod decode_into_tests {
-        use async_trait::async_trait;
+
         use byteorder::{ByteOrder, LittleEndian};
 
         use crate::core::TdsResult;
@@ -3199,7 +3201,6 @@ mod test {
             }
         }
 
-        #[async_trait]
         impl TdsPacketReader for ByteReader {
             async fn read_byte(&mut self) -> TdsResult<u8> {
                 Ok(self.take(1)?[0])

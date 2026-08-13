@@ -4316,7 +4316,6 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl crate::io::packet_reader::TdsPacketReader for TestTransport {
         async fn read_byte(&mut self) -> TdsResult<u8> {
             Ok(self.take_packet_bytes(1)?[0])

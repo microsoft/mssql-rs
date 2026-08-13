@@ -1056,7 +1056,7 @@ mod tests {
     use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
     use crate::io::packet_reader::TdsPacketReader;
     use crate::token::tokens::{SqlCollation, TokenType};
-    use async_trait::async_trait;
+
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1173,7 +1173,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl TdsPacketReader for TestByteReader {
         async fn read_byte(&mut self) -> TdsResult<u8> {
             Ok(self.take(1)?[0])
