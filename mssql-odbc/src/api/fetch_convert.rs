@@ -1397,7 +1397,8 @@ mod tests {
 
     /// The limbs are reassembled directly, and a payload with more limbs than
     /// 128 bits can hold is refused instead of shifting past the width. The wire
-    /// decoder admits up to 64 limbs, so this is reachable from a bad payload.
+    /// decoder now caps the count at 4, so the oversized case below is reachable
+    /// only through FFI or a hand-built `DecimalParts`.
     #[test]
     fn decimal_limbs_are_reassembled_and_bounded() {
         use mssql_tds::datatypes::decoder::DecimalParts;
@@ -1462,6 +1463,20 @@ mod tests {
         }
         .unwrap_err();
         assert_eq!(err, ConvError::Restricted);
+
+        // Zero-padded limbs past the fourth carry no magnitude, so this path
+        // agrees with the string rendering instead of refusing the value.
+        let ok = unsafe {
+            convert_integer_c(
+                &decimal(true, 2, vec![12345, 0, 0, 0, 0, 0]),
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, 123);
     }
 
     /// Multi-byte input must not panic while probing for a trailing UTC offset:
