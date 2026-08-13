@@ -6,9 +6,9 @@
 use tracing::{debug, error};
 
 use super::odbc_types::{
-    SQL_C_CHAR, SQL_C_GUID, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_TOTAL,
-    SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer, SqlReturn,
-    SqlSmallInt, SqlUSmallInt,
+    SQL_C_BINARY, SQL_C_CHAR, SQL_C_GUID, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA,
+    SQL_NO_TOTAL, SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer,
+    SqlReturn, SqlSmallInt, SqlUSmallInt,
 };
 use super::sqlstate::*;
 use crate::api::odbc_types::SqlWChar;
@@ -235,8 +235,13 @@ fn write_captured_column(
     // native); callers that need ANSI must transcode. SQL_C_WCHAR is UTF-16LE on
     // both drivers.
     // Check target type first — an unsupported type must not consume last_captured so the app can retry.
+    // A zero-length SQL_C_BINARY read is a length/NULL probe rather than a data
+    // read. mssql-python issues one on every sql_variant column to detect NULL
+    // and to make the underlying type available to SQLColAttribute, so the probe
+    // is admitted here; delivering binary data is still AB#47239.
+    let binary_probe = target_type == SQL_C_BINARY && buffer_length == 0;
     let typed_target = is_typed_c_target(target_type);
-    if !typed_target && target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
+    if !typed_target && target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR && !binary_probe {
         post_sql_error(
             stmt_state,
             SQLSTATE_HYC00,
@@ -287,6 +292,13 @@ fn write_captured_column(
 
     // Fixed / typed C targets deliver the whole value in one call through the
     // shared conversion core; only the character targets chunk.
+    if binary_probe {
+        // Report what is available and leave the value resident — the caller
+        // reads it for real on a following call.
+        unsafe { write_if_some(strlen_or_ind_ptr, binary_length(value)) };
+        return SQL_SUCCESS;
+    }
+
     if typed_target {
         let converted =
             unsafe { convert_typed_c(value, target_type, target_value_ptr, strlen_or_ind_ptr) };
@@ -303,8 +315,8 @@ fn write_captured_column(
         Ok(t) => t,
         Err(TextError::Malformed) => {
             // Leave the value resident so the column stays re-readable. There is no
-            // raw-bytes fallback today: SQL_C_BINARY is rejected by the target gate
-            // above.
+            // raw-bytes fallback today: SQL_C_BINARY only answers the zero-length
+            // probe, it does not deliver data (AB#47239).
             error!("SQLGetData: column payload could not be decoded as text");
             post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE);
             return SQL_ERROR;
@@ -902,6 +914,26 @@ enum TextError {
 }
 
 /// `true` for the C targets served by the shared conversion core in one call.
+/// Byte count a value would occupy in its `SQL_C_BINARY` form, for the length
+/// probe. `SQL_NO_TOTAL` where the binary encoding is not fixed by the value
+/// alone — this driver does not deliver binary data yet (AB#47239), so there is
+/// no length to promise for those.
+fn binary_length(value: &ColumnValues) -> SqlLen {
+    let len = match value {
+        ColumnValues::Bytes(b) => b.len(),
+        ColumnValues::String(s) => s.bytes.len(),
+        ColumnValues::Xml(x) => x.bytes.len(),
+        ColumnValues::Json(j) => j.bytes.len(),
+        ColumnValues::Bit(_) | ColumnValues::TinyInt(_) => 1,
+        ColumnValues::SmallInt(_) => 2,
+        ColumnValues::Int(_) | ColumnValues::Real(_) | ColumnValues::SmallMoney(_) => 4,
+        ColumnValues::BigInt(_) | ColumnValues::Float(_) | ColumnValues::Money(_) => 8,
+        ColumnValues::Uuid(_) => 16,
+        _ => return SQL_NO_TOTAL,
+    };
+    SqlLen::try_from(len).unwrap_or(SqlLen::MAX)
+}
+
 fn is_typed_c_target(target_type: SqlSmallInt) -> bool {
     is_integer_c_target(target_type)
         || is_float_c_target(target_type)
@@ -1378,6 +1410,73 @@ mod tests {
         s.column_metadata = int_columns(2);
         s.row_positioned = true;
         s.last_captured = Some((1, value));
+    }
+
+    /// A zero-length SQL_C_BINARY read reports the available length and leaves
+    /// the value resident, so the caller can still read it for real afterwards.
+    /// This is the probe mssql-python issues on every sql_variant column.
+    #[test]
+    fn get_data_binary_probe_reports_length_without_consuming() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Int(7));
+
+        let mut ind: SqlLen = 0;
+        let ret =
+            unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, 4);
+
+        // The value survived the probe.
+        let mut out: i32 = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                crate::api::odbc_types::SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                4,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 7);
+    }
+
+    #[test]
+    fn get_data_binary_probe_reports_null() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Null);
+
+        let mut ind: SqlLen = 0;
+        let ret =
+            unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, SQL_NULL_DATA);
+    }
+
+    /// Only the zero-length probe is supported; asking for binary data is still
+    /// unimplemented.
+    #[test]
+    fn get_data_binary_with_buffer_is_not_implemented() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Int(7));
+
+        let mut buf = [0u8; 8];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_BINARY,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = sh.inner.lock().unwrap();
+        assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
     }
 
     #[test]
