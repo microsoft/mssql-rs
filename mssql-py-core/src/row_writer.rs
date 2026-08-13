@@ -6,9 +6,9 @@ use mssql_tds::datatypes::column_values::{
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
 };
 use mssql_tds::datatypes::decoder::DecimalParts;
-use mssql_tds::datatypes::row_writer::RowWriter;
+use mssql_tds::datatypes::row_writer::{LenHint, RowWriter, ValueKind};
 use mssql_tds::datatypes::sql_json::SqlJson;
-use mssql_tds::datatypes::sql_string::SqlString;
+use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sql_vector::SqlVector;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -24,12 +24,16 @@ use crate::cursor::PyCoreCursor;
 /// everything to Python objects in a single pass.
 pub(crate) struct PyRowWriter {
     row: Vec<ColumnValues>,
+    scratch: Vec<u8>,
+    pending: Option<ValueKind>,
 }
 
 impl PyRowWriter {
     pub fn new(col_count: usize) -> Self {
         Self {
             row: Vec::with_capacity(col_count),
+            scratch: Vec::new(),
+            pending: None,
         }
     }
 
@@ -76,12 +80,13 @@ impl RowWriter for PyRowWriter {
         self.row.push(ColumnValues::Float(val));
     }
 
-    fn write_string(&mut self, _col: usize, val: SqlString) {
-        self.row.push(ColumnValues::String(val));
+    fn write_str(&mut self, _col: usize, bytes: &[u8], encoding: EncodingType) {
+        self.row
+            .push(ColumnValues::String(SqlString::new(bytes.to_vec(), encoding)));
     }
 
-    fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
-        self.row.push(ColumnValues::Bytes(val));
+    fn write_blob(&mut self, _col: usize, bytes: &[u8]) {
+        self.row.push(ColumnValues::Bytes(bytes.to_vec()));
     }
 
     fn write_decimal(&mut self, _col: usize, val: DecimalParts) {
@@ -140,7 +145,40 @@ impl RowWriter for PyRowWriter {
         self.row.push(ColumnValues::Vector(val));
     }
 
+    fn begin_value(&mut self, _col: usize, kind: ValueKind, hint: LenHint) {
+        /// Declared PLP lengths reach ~2 GiB; treat them as a sizing hint, not an order.
+        const PREALLOC_CAP: usize = 1 << 20;
+        if let LenHint::Exact(n) = hint {
+            self.scratch.reserve(n.min(PREALLOC_CAP));
+        }
+        self.pending = Some(kind);
+    }
+
+    fn reserve(&mut self, _col: usize, n: usize) -> &mut [u8] {
+        let at = self.scratch.len();
+        self.scratch.resize(at + n, 0);
+        &mut self.scratch[at..]
+    }
+
+    fn commit_value(&mut self, _col: usize) {
+        let kind = self
+            .pending
+            .take()
+            .expect("commit_value without begin_value");
+        let bytes = std::mem::take(&mut self.scratch);
+        self.row.push(match kind {
+            ValueKind::Str(enc) => ColumnValues::String(SqlString::new(bytes, enc)),
+            ValueKind::Blob => ColumnValues::Bytes(bytes),
+        });
+    }
+
     fn end_row(&mut self) {
         // No-op — caller takes the row after each decode cycle.
+    }
+
+    fn abandon_row(&mut self) {
+        self.pending = None;
+        self.scratch.clear();
+        self.row.clear();
     }
 }

@@ -12,7 +12,7 @@ use super::{
 };
 
 /// Character encoding used by a [`SqlString`].
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 pub enum EncodingType {
     /// UTF-8 encoding.
     Utf8,
@@ -43,6 +43,11 @@ impl SqlString {
         }
     }
 
+    /// Returns the wire encoding of the stored bytes.
+    pub fn encoding(&self) -> EncodingType {
+        self.encoding_type
+    }
+
     /// Creates a UTF-16LE–encoded `SqlString` from a Rust `String`.
     pub fn from_utf8_string(string: String) -> Self {
         let utf16_bytes = string
@@ -57,7 +62,7 @@ impl SqlString {
         match self.encoding_type {
             // TODO: Investigation needed. When creating a Utf8 strings from the vector, the string is weirdly encoded.
             // UTF16 decode works better.
-            EncodingType::Utf8 => String::from_utf8(self.bytes.clone()).unwrap(),
+            EncodingType::Utf8 => String::from_utf8_lossy(&self.bytes).into_owned(),
             EncodingType::Utf16 => {
                 // Use encoding_rs for efficient UTF-16LE decoding without intermediate Vec<u16> allocation
                 let (decoded, _, _) = encoding_rs::UTF_16LE.decode(&self.bytes);

@@ -431,7 +431,7 @@ async fn skip_column<R: TdsPacketReader + Send + Sync>(
         // when several columns are skipped per row. Skip the bytes at the
         // PacketReader level instead (advance past the column's length without
         // decoding). Larger change tracked as work item 47154.
-        let mut sink = DiscardRowWriter;
+        let mut sink = DiscardRowWriter::default();
         decoder.decode_into(reader, meta, col, &mut sink).await
     }
 }
@@ -1321,7 +1321,7 @@ mod tests {
         packet.extend_from_slice(&(-2_i64).to_le_bytes());
         let mut reader = TestByteReader::new(packet);
         let registry = GenericTokenParserRegistry::default();
-        let mut writer = DiscardRowWriter;
+        let mut writer = DiscardRowWriter::default();
 
         let result = receive_row_into_internal(
             &mut reader,
@@ -1368,7 +1368,7 @@ mod tests {
         packet.extend_from_slice(&(-2_i64).to_le_bytes());
         let mut reader = TestByteReader::new(packet);
         let registry = GenericTokenParserRegistry::default();
-        let mut writer = DiscardRowWriter;
+        let mut writer = DiscardRowWriter::default();
 
         let result = receive_row_into_internal(
             &mut reader,
@@ -1402,7 +1402,7 @@ mod tests {
 
         let mut reader = TestByteReader::new(vec![TokenType::Row as u8]);
         let registry = GenericTokenParserRegistry::default();
-        let mut writer = DiscardRowWriter;
+        let mut writer = DiscardRowWriter::default();
 
         let result = receive_row_into_internal(
             &mut reader,

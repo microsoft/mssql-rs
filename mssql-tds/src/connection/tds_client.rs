@@ -1875,7 +1875,7 @@ impl TdsClient {
         let mut discarded_rows: u64 = 0;
         loop {
             let start = Instant::now();
-            let mut writer = DiscardRowWriter;
+            let mut writer = DiscardRowWriter::default();
             let result = self
                 .transport
                 .receive_row_into(
@@ -3335,14 +3335,14 @@ impl TdsClient {
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
             ActiveRowReadState::Idle => Ok(()),
             ActiveRowReadState::RowPaused(pause_state) => {
-                let mut sink = DiscardRowWriter;
+                let mut sink = DiscardRowWriter::default();
                 self.resume_row_loop(*pause_state, ColumnPolicy::SkipAll, &mut sink)
                     .await?;
                 Ok(())
             }
             ActiveRowReadState::PlpPaused(mut plp_state) => {
                 self.drain_active_plp(&mut plp_state).await?;
-                let mut sink = DiscardRowWriter;
+                let mut sink = DiscardRowWriter::default();
                 self.resume_row_loop(plp_state.row_pause_state, ColumnPolicy::SkipAll, &mut sink)
                     .await?;
                 Ok(())
@@ -4802,7 +4802,7 @@ mod tests {
             decryptor: None,
         }));
 
-        let mut sink = DiscardRowWriter;
+        let mut sink = DiscardRowWriter::default();
         let err = client
             .get_next_row_into(&mut sink)
             .await

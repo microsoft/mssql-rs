@@ -8,9 +8,9 @@ use mssql_tds::datatypes::column_values::{
     SqlSmallMoney, SqlTime, SqlXml,
 };
 use mssql_tds::datatypes::decoder::DecimalParts;
-use mssql_tds::datatypes::row_writer::RowWriter;
+use mssql_tds::datatypes::row_writer::{LenHint, RowWriter, ValueKind};
 use mssql_tds::datatypes::sql_json::SqlJson;
-use mssql_tds::datatypes::sql_string::SqlString;
+use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sql_vector::SqlVector;
 use uuid::Uuid;
 
@@ -60,6 +60,22 @@ pub(crate) struct BinaryRowWriter {
     row_count: u32,
     /// Column count for this result set.
     col_count: u16,
+    /// Staging area for a character value being streamed in; blobs bypass this
+    /// and are written straight into `row_data`.
+    scratch: Vec<u8>,
+    /// State of the value currently being streamed, if any.
+    pending: Option<Pending>,
+    /// Offset in `row_data` where the current row began, for [`RowWriter::abandon_row`].
+    row_start: usize,
+}
+
+/// A variable-length value in the middle of being streamed in.
+enum Pending {
+    /// Character data staged in `scratch`, transcoded and interned on commit.
+    Str(EncodingType),
+    /// Binary data written directly into `row_data`; `len_pos` is the offset of the
+    /// placeholder length that gets patched on commit.
+    Blob { len_pos: usize },
 }
 
 impl BinaryRowWriter {
@@ -70,6 +86,9 @@ impl BinaryRowWriter {
             string_table: Vec::new(),
             row_count: 0,
             col_count,
+            scratch: Vec::new(),
+            pending: None,
+            row_start: 0,
         }
     }
 
@@ -203,18 +222,18 @@ impl RowWriter for BinaryRowWriter {
         self.row_data.extend_from_slice(&val.to_le_bytes());
     }
 
-    fn write_string(&mut self, _col: usize, val: SqlString) {
-        let utf8 = val.to_utf8_string();
+    fn write_str(&mut self, _col: usize, bytes: &[u8], encoding: EncodingType) {
+        let utf8 = SqlString::new(bytes.to_vec(), encoding).to_utf8_string();
         let idx = self.intern_string(utf8);
         self.row_data.push(TAG_STRING_REF);
         self.row_data.extend_from_slice(&idx.to_le_bytes());
     }
 
-    fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
+    fn write_blob(&mut self, _col: usize, bytes: &[u8]) {
         self.row_data.push(TAG_BYTES);
         self.row_data
-            .extend_from_slice(&(val.len() as u32).to_le_bytes());
-        self.row_data.extend_from_slice(&val);
+            .extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        self.row_data.extend_from_slice(bytes);
     }
 
     fn write_decimal(&mut self, _col: usize, val: DecimalParts) {
@@ -327,8 +346,71 @@ impl RowWriter for BinaryRowWriter {
         }
     }
 
+    fn begin_value(&mut self, _col: usize, kind: ValueKind, hint: LenHint) {
+        /// Cap on eager allocation; a PLP header may declare ~2 GiB before any payload
+        /// arrives, so a declared length is a sizing hint, not an allocation order.
+        const PREALLOC_CAP: usize = 1 << 20;
+        let reserve_by = match hint {
+            LenHint::Exact(n) => n.min(PREALLOC_CAP),
+            LenHint::Unknown => 0,
+        };
+        self.pending = Some(match kind {
+            ValueKind::Str(enc) => {
+                self.scratch.reserve(reserve_by);
+                Pending::Str(enc)
+            }
+            ValueKind::Blob => {
+                // Emit the tag and a placeholder length now, then let the decoder write
+                // payload bytes straight into row_data. Nothing is copied twice.
+                self.row_data.push(TAG_BYTES);
+                let len_pos = self.row_data.len();
+                self.row_data.extend_from_slice(&0u32.to_le_bytes());
+                self.row_data.reserve(reserve_by);
+                Pending::Blob { len_pos }
+            }
+        });
+    }
+
+    fn reserve(&mut self, _col: usize, n: usize) -> &mut [u8] {
+        let buf = match self.pending {
+            Some(Pending::Blob { .. }) => &mut self.row_data,
+            _ => &mut self.scratch,
+        };
+        let at = buf.len();
+        // resize, not set_len: the decoder may read these bytes back, and handing out
+        // uninitialized memory as &mut [u8] is undefined behaviour.
+        buf.resize(at + n, 0);
+        &mut buf[at..]
+    }
+
+    fn commit_value(&mut self, _col: usize) {
+        match self
+            .pending
+            .take()
+            .expect("commit_value without begin_value")
+        {
+            Pending::Str(enc) => {
+                let utf8 = SqlString::new(std::mem::take(&mut self.scratch), enc).to_utf8_string();
+                let idx = self.intern_string(utf8);
+                self.row_data.push(TAG_STRING_REF);
+                self.row_data.extend_from_slice(&idx.to_le_bytes());
+            }
+            Pending::Blob { len_pos } => {
+                let len = (self.row_data.len() - len_pos - 4) as u32;
+                self.row_data[len_pos..len_pos + 4].copy_from_slice(&len.to_le_bytes());
+            }
+        }
+    }
+
     fn end_row(&mut self) {
         self.row_count += 1;
+        self.row_start = self.row_data.len();
+    }
+
+    fn abandon_row(&mut self) {
+        self.pending = None;
+        self.scratch.clear();
+        self.row_data.truncate(self.row_start);
     }
 }
 

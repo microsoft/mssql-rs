@@ -7,15 +7,73 @@ use crate::datatypes::column_values::{
 };
 use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sql_json::SqlJson;
-use crate::datatypes::sql_string::SqlString;
+use crate::datatypes::sql_string::{EncodingType, SqlString};
 use crate::datatypes::sql_vector::SqlVector;
 use uuid::Uuid;
+
+/// Upper bound on eager allocation from a declared length.
+///
+/// A PLP header may declare up to `MAX_PLP_SIZE` (~2 GiB) before a single payload byte
+/// arrives. Honouring that literally lets a malicious or malfunctioning server force a
+/// 2 GiB allocation per column. Preallocating up to this cap keeps the common case at
+/// zero reallocations while leaving anything larger to grow on demand.
+const PREALLOC_CAP: usize = 1 << 20;
+
+/// Byte length of a value the decoder is about to stream, when it is known up front.
+///
+/// PLP (partially-length-prefixed) columns may declare `UNKNOWN`, in which case the
+/// total length only becomes apparent when the terminating zero-length chunk arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LenHint {
+    /// The decoder has already range-checked this length; it is the exact byte count.
+    Exact(usize),
+    /// Length is not known until the value ends.
+    Unknown,
+}
+
+/// What a streamed value represents, so the writer can choose its own representation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ValueKind {
+    /// Character data in the given wire encoding.
+    Str(EncodingType),
+    /// Opaque binary data.
+    Blob,
+}
 
 /// Pluggable decode sink for TDS row data.
 ///
 /// The decoder calls these typed methods directly during wire decoding,
 /// enabling consumers (Arrow writers, N-API binary encoders, etc.) to
 /// receive values without going through the intermediate `ColumnValues` enum.
+///
+/// # Streaming variable-length values
+///
+/// Fixed-width values arrive by value and cost nothing to pass. Character and binary
+/// values are different: the decoder used to allocate a `Vec<u8>`, hand over ownership,
+/// and let the writer copy it into its own layout. For a PLP `nvarchar(max)` reaching
+/// the N-API encoder that meant three full-size allocations of the same payload.
+///
+/// [`begin_value`](RowWriter::begin_value) / [`reserve`](RowWriter::reserve) /
+/// [`commit_value`](RowWriter::commit_value) invert that: the writer hands the decoder
+/// somewhere to put bytes, so the payload lands in its final buffer on the first copy.
+///
+/// ```ignore
+/// writer.begin_value(col, ValueKind::Str(EncodingType::Utf16), LenHint::Exact(n));
+/// let dst = writer.reserve(col, n);      // repeat per chunk for PLP
+/// reader.read_bytes(dst).await?;
+/// writer.commit_value(col);             // value is complete; writer may transcode
+/// ```
+///
+/// ## Contract
+///
+/// | | |
+/// |---|---|
+/// | Ordering | `begin_value` → `reserve`* → `commit_value`, per column |
+/// | Overlap | at most one value in progress per writer |
+/// | Trust | `LenHint::Exact(n)` is the true byte count |
+/// | Length | `reserve(col, n)` must return exactly `n` bytes, never fewer |
+/// | Errors | writers never fail; a decode failure surfaces as [`abandon_row`](RowWriter::abandon_row) |
+/// | Encoding | writers receive raw wire bytes; transcoding is the writer's choice and is lossy |
 pub trait RowWriter {
     /// Writes a SQL `NULL` for column `col`.
     fn write_null(&mut self, col: usize);
@@ -33,10 +91,10 @@ pub trait RowWriter {
     fn write_f32(&mut self, col: usize, val: f32);
     /// Writes a `float` value.
     fn write_f64(&mut self, col: usize, val: f64);
-    /// Writes a character string value.
-    fn write_string(&mut self, col: usize, val: SqlString);
-    /// Writes a binary value.
-    fn write_bytes(&mut self, col: usize, val: Vec<u8>);
+    /// Writes a character string value from borrowed wire bytes.
+    fn write_str(&mut self, col: usize, bytes: &[u8], encoding: EncodingType);
+    /// Writes a binary value from borrowed wire bytes.
+    fn write_blob(&mut self, col: usize, bytes: &[u8]);
     /// Writes a `decimal` value.
     fn write_decimal(&mut self, col: usize, val: DecimalParts);
     /// Writes a `numeric` value.
@@ -65,14 +123,49 @@ pub trait RowWriter {
     fn write_json(&mut self, col: usize, val: SqlJson);
     /// Writes a `vector` value.
     fn write_vector(&mut self, col: usize, val: SqlVector);
+
+    /// Announces a variable-length value that will be streamed in via [`reserve`](Self::reserve).
+    ///
+    /// `hint` lets the writer size its buffer once instead of growing per chunk. A writer
+    /// may ignore it; it must not treat `Exact(n)` as permission to skip `commit_value`,
+    /// because only the decoder can see a PLP terminator.
+    fn begin_value(&mut self, col: usize, kind: ValueKind, hint: LenHint);
+
+    /// Returns exactly `n` writable bytes for the value opened by [`begin_value`](Self::begin_value).
+    ///
+    /// `n` is the length of the chunk the decoder is about to read, never a packet
+    /// remainder — TDS packet framing stays invisible to writers. Called repeatedly for
+    /// chunked PLP payloads.
+    ///
+    /// Returning fewer than `n` bytes desyncs the stream, so implementations must panic
+    /// rather than short-return. The returned slice must be initialized (`resize`, not
+    /// `set_len`) because the decoder may read it back.
+    fn reserve(&mut self, col: usize, n: usize) -> &mut [u8];
+
+    /// Marks the value complete.
+    ///
+    /// This is the only signal that a `LenHint::Unknown` value has ended, so it is
+    /// required rather than merely tidy. Writers that buffer fragments reassemble here
+    /// and release them; writers that transcode do so here, lossily.
+    fn commit_value(&mut self, col: usize);
+
     /// Signals the end of the current row.
     fn end_row(&mut self);
+
+    /// Discards everything written for the current row.
+    ///
+    /// Called when decoding fails partway through a row. Without it, values already
+    /// written for that row stay in the writer's buffer and shift every subsequent
+    /// column, silently corrupting the result set rather than failing it.
+    fn abandon_row(&mut self);
 }
 
 /// Default implementation that assembles `Vec<ColumnValues>`, preserving
 /// the current decoder behavior. Existing `next_row()` callers see no change.
 pub struct DefaultRowWriter {
     row: Vec<ColumnValues>,
+    scratch: Vec<u8>,
+    pending: Option<ValueKind>,
 }
 
 impl DefaultRowWriter {
@@ -80,6 +173,8 @@ impl DefaultRowWriter {
     pub fn new(col_count: usize) -> Self {
         Self {
             row: Vec::with_capacity(col_count),
+            scratch: Vec::new(),
+            pending: None,
         }
     }
 
@@ -122,12 +217,15 @@ impl RowWriter for DefaultRowWriter {
         self.row.push(ColumnValues::Float(val));
     }
 
-    fn write_string(&mut self, _col: usize, val: SqlString) {
-        self.row.push(ColumnValues::String(val));
+    fn write_str(&mut self, _col: usize, bytes: &[u8], encoding: EncodingType) {
+        self.row.push(ColumnValues::String(SqlString::new(
+            bytes.to_vec(),
+            encoding,
+        )));
     }
 
-    fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
-        self.row.push(ColumnValues::Bytes(val));
+    fn write_blob(&mut self, _col: usize, bytes: &[u8]) {
+        self.row.push(ColumnValues::Bytes(bytes.to_vec()));
     }
 
     fn write_decimal(&mut self, _col: usize, val: DecimalParts) {
@@ -186,8 +284,39 @@ impl RowWriter for DefaultRowWriter {
         self.row.push(ColumnValues::Vector(val));
     }
 
+    fn begin_value(&mut self, _col: usize, kind: ValueKind, hint: LenHint) {
+        if let LenHint::Exact(n) = hint {
+            self.scratch.reserve(n.min(PREALLOC_CAP));
+        }
+        self.pending = Some(kind);
+    }
+
+    fn reserve(&mut self, _col: usize, n: usize) -> &mut [u8] {
+        let at = self.scratch.len();
+        self.scratch.resize(at + n, 0);
+        &mut self.scratch[at..]
+    }
+
+    fn commit_value(&mut self, _col: usize) {
+        let kind = self
+            .pending
+            .take()
+            .expect("commit_value without begin_value");
+        let bytes = std::mem::take(&mut self.scratch);
+        self.row.push(match kind {
+            ValueKind::Str(enc) => ColumnValues::String(SqlString::new(bytes, enc)),
+            ValueKind::Blob => ColumnValues::Bytes(bytes),
+        });
+    }
+
     fn end_row(&mut self) {
         // No-op for DefaultRowWriter — row is taken via take_row().
+    }
+
+    fn abandon_row(&mut self) {
+        self.pending = None;
+        self.scratch.clear();
+        self.row.clear();
     }
 }
 
@@ -198,7 +327,14 @@ impl RowWriter for DefaultRowWriter {
 /// `ColumnValues`, `String`, or `Vec` is retained. Fixed-width types allocate
 /// nothing at all; the transient value a variable-length decoder builds is
 /// dropped immediately instead of being pushed onto a row `Vec`.
-pub struct DiscardRowWriter;
+///
+/// `reserve` must hand back real writable bytes, so this type carries one scratch
+/// buffer that grows to the largest chunk seen and is then reused for the life of
+/// the drain. See [`RowWriter::reserve`].
+#[derive(Default)]
+pub struct DiscardRowWriter {
+    sink: Vec<u8>,
+}
 
 impl RowWriter for DiscardRowWriter {
     fn write_null(&mut self, _col: usize) {}
@@ -209,8 +345,8 @@ impl RowWriter for DiscardRowWriter {
     fn write_i64(&mut self, _col: usize, _val: i64) {}
     fn write_f32(&mut self, _col: usize, _val: f32) {}
     fn write_f64(&mut self, _col: usize, _val: f64) {}
-    fn write_string(&mut self, _col: usize, _val: SqlString) {}
-    fn write_bytes(&mut self, _col: usize, _val: Vec<u8>) {}
+    fn write_str(&mut self, _col: usize, _bytes: &[u8], _encoding: EncodingType) {}
+    fn write_blob(&mut self, _col: usize, _bytes: &[u8]) {}
     fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
     fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
     fn write_date(&mut self, _col: usize, _val: SqlDate) {}
@@ -225,7 +361,21 @@ impl RowWriter for DiscardRowWriter {
     fn write_xml(&mut self, _col: usize, _val: SqlXml) {}
     fn write_json(&mut self, _col: usize, _val: SqlJson) {}
     fn write_vector(&mut self, _col: usize, _val: SqlVector) {}
+
+    fn begin_value(&mut self, _col: usize, _kind: ValueKind, _hint: LenHint) {}
+
+    fn reserve(&mut self, _col: usize, n: usize) -> &mut [u8] {
+        // Overwrite rather than append: discarded bytes are never read back, so one
+        // buffer sized to the largest chunk serves the whole drain.
+        if self.sink.len() < n {
+            self.sink.resize(n, 0);
+        }
+        &mut self.sink[..n]
+    }
+
+    fn commit_value(&mut self, _col: usize) {}
     fn end_row(&mut self) {}
+    fn abandon_row(&mut self) {}
 }
 
 /// Bridges a `ColumnValues` into a `RowWriter` call. Used as a fallback path
@@ -241,8 +391,8 @@ pub fn write_column_value<W: RowWriter + ?Sized>(writer: &mut W, col: usize, val
         ColumnValues::BigInt(v) => writer.write_i64(col, v),
         ColumnValues::Real(v) => writer.write_f32(col, v),
         ColumnValues::Float(v) => writer.write_f64(col, v),
-        ColumnValues::String(v) => writer.write_string(col, v),
-        ColumnValues::Bytes(v) => writer.write_bytes(col, v),
+        ColumnValues::String(v) => writer.write_str(col, &v.bytes, v.encoding()),
+        ColumnValues::Bytes(v) => writer.write_blob(col, &v),
         ColumnValues::Decimal(v) => writer.write_decimal(col, v),
         ColumnValues::Numeric(v) => writer.write_numeric(col, v),
         ColumnValues::Date(v) => writer.write_date(col, v),
@@ -273,7 +423,7 @@ mod tests {
         writer.write_null(1);
         writer.write_bool(2, true);
         writer.write_f64(3, 99.5);
-        writer.write_string(4, SqlString::new(b"hello".to_vec(), EncodingType::Utf16));
+        writer.write_str(4, b"h\0e\0l\0l\0o\0", EncodingType::Utf16);
         writer.end_row();
 
         let row = writer.take_row();
