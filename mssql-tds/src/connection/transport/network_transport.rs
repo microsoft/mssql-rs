@@ -1468,17 +1468,13 @@ impl TdsTokenStreamReader for NetworkTransport {
         cancel_handle: Option<&CancelHandle>,
         out: &mut [u8],
     ) -> TdsResult<usize> {
-        let cancellable = CancelHandle::run_until_cancelled(
-            cancel_handle,
-            read_active_plp_bytes_internal(self, plp_state, out),
+        let result = await_within_request_timeout!(
+            remaining_request_timeout,
+            CancelHandle::run_until_cancelled(
+                cancel_handle,
+                read_active_plp_bytes_internal(self, plp_state, out),
+            )
         );
-        let result = match remaining_request_timeout.as_ref() {
-            Some(t) => match timeout(*t, cancellable).await {
-                Ok(r) => r,
-                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-            },
-            None => cancellable.await,
-        };
 
         match &result {
             Ok(_) => {}
