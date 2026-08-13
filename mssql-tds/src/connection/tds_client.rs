@@ -4739,6 +4739,7 @@ mod tests {
         let inner_pause_state = RowPauseState {
             next_column_index: 1,
             columns: vec![metadata.clone()],
+            decode_ops: Vec::new(),
             nbc_null_bitmap: None,
             decryptor: None,
         };
@@ -4757,6 +4758,7 @@ mod tests {
         client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 0,
             columns: vec![metadata],
+            decode_ops: Vec::new(),
             nbc_null_bitmap: None,
             decryptor: None,
         }));
@@ -4777,6 +4779,7 @@ mod tests {
         client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 1,
             columns: Vec::new(),
+            decode_ops: Vec::new(),
             nbc_null_bitmap: None,
             decryptor: None,
         }));
@@ -4796,6 +4799,7 @@ mod tests {
         client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
             next_column_index: 1,
             columns: Vec::new(),
+            decode_ops: Vec::new(),
             nbc_null_bitmap: None,
             decryptor: None,
         }));

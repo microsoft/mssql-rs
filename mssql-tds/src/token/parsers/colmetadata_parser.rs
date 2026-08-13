@@ -85,6 +85,7 @@
 //! ```
 
 use std::io::Error;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 
@@ -97,7 +98,7 @@ use crate::{
     query::metadata::{
         CekTableEntry, ColumnMetadata, CryptoMetadata, EncryptedCekValue, MultiPartName,
     },
-    token::tokens::ColMetadataToken,
+    token::tokens::{ColMetadataToken, ColumnPlan},
 };
 
 /// Column-flag bit indicating the column is protected by Always Encrypted.
@@ -239,11 +240,15 @@ where
             column_metadata.push(col_metadata);
         }
 
-        // Construct the complete metadata token
+        // Construct the complete metadata token, resolving the per-column decode
+        // shapes now that the column list is final.
+        let decode_plan: Vec<ColumnPlan> =
+            column_metadata.iter().map(ColumnPlan::for_column).collect();
         let metadata = ColMetadataToken {
             column_count: col_count,
             columns: column_metadata,
             cek_table,
+            decode_plan: OnceLock::from(decode_plan),
         };
         Ok(Tokens::from(metadata))
     }

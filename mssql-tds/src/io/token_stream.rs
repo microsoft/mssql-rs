@@ -15,7 +15,7 @@ use crate::token::parsers::{
     OrderTokenParser, ReturnStatusTokenParser, ReturnValueTokenParser, RowTokenParser,
     SessionStateTokenParser, SspiTokenParser, TabNameTokenParser,
 };
-use crate::token::tokens::{ColMetadataToken, TokenType, Tokens};
+use crate::token::tokens::{ColMetadataToken, ColumnPlan, DecodeOp, TokenType, Tokens};
 use async_trait::async_trait;
 use core::convert::From;
 use std::collections::HashMap;
@@ -128,6 +128,9 @@ pub(crate) struct RowPauseState {
     pub(crate) next_column_index: usize,
     /// Full column metadata for the row (shared with the ParserContext).
     pub(crate) columns: Vec<ColumnMetadata>,
+    /// Per-column decode plan, cloned alongside columns so a resumed row
+    /// classifies columns exactly as the initial pass did.
+    pub(crate) decode_ops: Vec<ColumnPlan>,
     /// NBCROW null-bitmap (one bit per column, LSB-first).  `None` for plain ROW.
     pub(crate) nbc_null_bitmap: Option<Vec<u8>>,
     /// Optional AE decryptor needed to continue decrypting encrypted columns
@@ -140,6 +143,7 @@ pub(crate) struct RowPauseState {
 pub struct RowPauseState {
     pub next_column_index: usize,
     pub columns: Vec<ColumnMetadata>,
+    pub decode_ops: Vec<ColumnPlan>,
     pub nbc_null_bitmap: Option<Vec<u8>>,
     pub decryptor: Option<Arc<dyn CellDecryptor>>,
 }
@@ -291,9 +295,33 @@ where
 
 /// Column metadata plus the optional cell decryptor needed to decode a row.
 ///
-/// Returned by [`extract_row_context`] so the ROW/NBCROW decode paths can both
-/// access the column layout and the Always Encrypted decryptor (if any).
-type RowDecodeContext<'a> = (&'a [ColumnMetadata], Option<&'a Arc<dyn CellDecryptor>>);
+/// Column layout for one result set: the metadata, the decode plan resolved
+/// from it, and the Always Encrypted decryptor (if any).
+///
+/// These three always travel together through the row decode path, so they are
+/// passed as one borrow rather than three parallel parameters that callers
+/// could accidentally desynchronize.
+#[derive(Clone, Copy)]
+pub(crate) struct RowLayout<'a> {
+    pub(crate) columns: &'a [ColumnMetadata],
+    pub(crate) ops: &'a [ColumnPlan],
+    pub(crate) decryptor: Option<&'a Arc<dyn CellDecryptor>>,
+}
+
+impl<'a> RowLayout<'a> {
+    /// Decode facts for `col`.
+    ///
+    /// A hand-built COLMETADATA (tests, `metadata_retriever`) may carry a short or
+    /// empty plan, so fall back to classifying on demand rather than guessing. A
+    /// wrong guess here would silently change decode behavior instead of just
+    /// costing time.
+    fn plan(&self, col: usize) -> ColumnPlan {
+        match self.ops.get(col) {
+            Some(plan) => *plan,
+            None => ColumnPlan::for_column(&self.columns[col]),
+        }
+    }
+}
 
 /// `ParserContext` is used to add additional context, which can be leveraged by the token parsers.
 /// One of the usecase is passing the metadata for the columns, to the row parser and to the
@@ -342,11 +370,13 @@ impl ParserContext {
     }
 }
 
-fn extract_row_context(context: &ParserContext) -> TdsResult<RowDecodeContext<'_>> {
+fn extract_row_context(context: &ParserContext) -> TdsResult<RowLayout<'_>> {
     match context {
-        ParserContext::ColumnMetadata(metadata, decryptor) => {
-            Ok((&metadata.columns, decryptor.as_ref()))
-        }
+        ParserContext::ColumnMetadata(metadata, decryptor) => Ok(RowLayout {
+            columns: &metadata.columns,
+            ops: metadata.decode_plan(),
+            decryptor: decryptor.as_ref(),
+        }),
         _ => Err(crate::error::Error::ProtocolError(
             "Expected ColumnMetadata in context for row decoding".to_string(),
         )),
@@ -439,18 +469,14 @@ async fn skip_column<R: TdsPacketReader + Send + Sync>(
 /// Builds the pause result after column `col` was decoded/skipped: either
 /// [`RowReadResult::RowPaused`] positioned on `col + 1`, or
 /// [`RowReadResult::RowWritten`] if `col` was the last column.
-fn pause_after_column(
-    col: usize,
-    columns: &[ColumnMetadata],
-    bitmap: Option<&[u8]>,
-    decryptor: Option<&Arc<dyn CellDecryptor>>,
-) -> RowReadResult {
-    if col + 1 < columns.len() {
+fn pause_after_column(col: usize, layout: RowLayout<'_>, bitmap: Option<&[u8]>) -> RowReadResult {
+    if col + 1 < layout.columns.len() {
         RowReadResult::RowPaused(RowPauseState {
             next_column_index: col + 1,
-            columns: columns.to_vec(),
+            columns: layout.columns.to_vec(),
+            decode_ops: layout.ops.to_vec(),
             nbc_null_bitmap: bitmap.map(|b| b.to_vec()),
-            decryptor: decryptor.cloned(),
+            decryptor: layout.decryptor.cloned(),
         })
     } else {
         RowReadResult::RowWritten
@@ -468,23 +494,27 @@ const NBC_STACK_BITMAP_BYTES: usize = 512;
 /// Unified per-column decode driver for ROW and NBCROW tokens.
 ///
 /// `bitmap` is `Some` for NBCROW (LSB-first null bits), `None` for plain ROW.
-/// `plan` decides, per column, whether to decode it into `writer`, skip its
+/// `policy` decides, per column, whether to decode it into `writer`, skip its
 /// bytes, or pause. This single loop replaces the former
 /// `decode_row_columns` / `decode_nbcrow_columns` pair and their
 /// `writer.pause_*` polling.
+///
+/// `layout` carries the decode plan resolved once from COLMETADATA, letting the
+/// loop dispatch on a dense enum instead of re-deriving each column's shape from
+/// its metadata on every row.
 async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
-    columns: &[ColumnMetadata],
-    decryptor: Option<&Arc<dyn CellDecryptor>>,
+    layout: RowLayout<'_>,
     bitmap: Option<&[u8]>,
     start_col: usize,
-    plan: ColumnPolicy,
+    policy: ColumnPolicy,
     writer: &mut (dyn RowWriter + Send),
 ) -> TdsResult<RowReadResult> {
     let decoder = GenericDecoder::default();
-    for (col, meta) in columns.iter().enumerate().skip(start_col) {
-        let stop_here = matches!(plan, ColumnPolicy::DecodeOne(target) if target == col);
-        let skip = match plan {
+    for (col, meta) in layout.columns.iter().enumerate().skip(start_col) {
+        let plan = layout.plan(col);
+        let stop_here = matches!(policy, ColumnPolicy::DecodeOne(target) if target == col);
+        let skip = match policy {
             ColumnPolicy::SkipAll => true,
             ColumnPolicy::DecodeOne(target) => col < target,
             ColumnPolicy::DecodeAll => false,
@@ -498,7 +528,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
                 writer.write_null(col);
             }
             if stop_here {
-                return Ok(pause_after_column(col, columns, bitmap, decryptor));
+                return Ok(pause_after_column(col, layout, bitmap));
             }
             continue;
         }
@@ -510,7 +540,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
 
         // At the cursor's target PLP column, pause before payload so the caller
         // can stream chunks via `read_active_plp_bytes`.
-        if stop_here && meta.is_plp() {
+        if stop_here && plan.shape == DecodeOp::Plp {
             // TODO: Add AE-aware PLP streaming path for paused row reads.
             // Until then, fail fast to avoid streaming ciphertext bytes to callers.
             if meta.crypto_metadata.is_some() {
@@ -525,7 +555,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
             match PlpColumnStream::begin(meta, reader).await? {
                 None => {
                     writer.write_null(col);
-                    return Ok(pause_after_column(col, columns, bitmap, decryptor));
+                    return Ok(pause_after_column(col, layout, bitmap));
                 }
                 Some(plp_stream) => {
                     // `pause_after_column` reports `RowWritten` when `col` is the
@@ -537,9 +567,10 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
                     return Ok(RowReadResult::PlpPaused(PlpPauseState {
                         row_pause_state: RowPauseState {
                             next_column_index: col + 1,
-                            columns: columns.to_vec(),
+                            columns: layout.columns.to_vec(),
+                            decode_ops: layout.ops.to_vec(),
                             nbc_null_bitmap: bitmap.map(|b| b.to_vec()),
-                            decryptor: decryptor.cloned(),
+                            decryptor: layout.decryptor.cloned(),
                         },
                         plp_stream,
                     }));
@@ -547,10 +578,11 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
             }
         }
 
-        decode_or_decrypt_column(&decoder, reader, meta, decryptor, col, writer).await?;
+        decode_or_decrypt_column(&decoder, reader, meta, plan, layout.decryptor, col, writer)
+            .await?;
 
         if stop_here {
-            return Ok(pause_after_column(col, columns, bitmap, decryptor));
+            return Ok(pause_after_column(col, layout, bitmap));
         }
     }
     Ok(RowReadResult::RowWritten)
@@ -560,25 +592,28 @@ async fn decode_or_decrypt_column<R: TdsPacketReader + Send + Sync>(
     decoder: &GenericDecoder,
     reader: &mut R,
     meta: &ColumnMetadata,
+    plan: ColumnPlan,
     decryptor: Option<&Arc<dyn CellDecryptor>>,
     col: usize,
     writer: &mut (dyn RowWriter + Send),
 ) -> TdsResult<()> {
-    match (meta.crypto_metadata.is_some(), decryptor) {
-        (true, Some(dec)) => {
+    // The overwhelmingly common case is an unencrypted column, and the plan already
+    // answered that question once for the whole result set.
+    if !plan.encrypted {
+        return decoder.decode_into(reader, meta, col, writer).await;
+    }
+    match decryptor {
+        Some(dec) => {
             let value = decrypt_encrypted_column(decoder, reader, meta, dec).await?;
             write_column_value(writer, col, value);
         }
-        (true, None) => {
+        None => {
             tracing::debug!(
                 column = %meta.column_name,
                 "Encrypted column has no column-encryption decryptor available \
                  (Always Encrypted disabled for this command, or no key-store \
                  provider registered); returning the raw ciphertext varbinary"
             );
-            decoder.decode_into(reader, meta, col, writer).await?;
-        }
-        (false, _) => {
             decoder.decode_into(reader, meta, col, writer).await?;
         }
     }
@@ -598,12 +633,12 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
 
     match token_type {
         TokenType::Row => {
-            let (columns, decryptor) = extract_row_context(context)?;
-            drive_row_columns(reader, columns, decryptor, None, 0, plan, writer).await
+            let layout = extract_row_context(context)?;
+            drive_row_columns(reader, layout, None, 0, plan, writer).await
         }
         TokenType::NbcRow => {
-            let (columns, decryptor) = extract_row_context(context)?;
-            let bitmap_len = columns.len().div_ceil(8);
+            let layout = extract_row_context(context)?;
+            let bitmap_len = layout.columns.len().div_ceil(8);
             let mut stack_bitmap = [0u8; NBC_STACK_BITMAP_BYTES];
             let mut heap_bitmap;
             let bitmap: &[u8] = if bitmap_len <= NBC_STACK_BITMAP_BYTES {
@@ -614,7 +649,7 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
                 reader.read_bytes(&mut heap_bitmap).await?;
                 &heap_bitmap
             };
-            drive_row_columns(reader, columns, decryptor, Some(bitmap), 0, plan, writer).await
+            drive_row_columns(reader, layout, Some(bitmap), 0, plan, writer).await
         }
         _ => {
             let token = dispatch_token(reader, registry, token_type, context).await?;
@@ -638,24 +673,26 @@ pub(crate) async fn receive_row_header_internal<R: TdsPacketReader + Send + Sync
 
     match token_type {
         TokenType::Row => {
-            let (columns, decryptor) = extract_row_context(context)?;
+            let layout = extract_row_context(context)?;
             Ok(RowHeader::Positioned(RowPauseState {
                 next_column_index: 0,
-                columns: columns.to_vec(),
+                columns: layout.columns.to_vec(),
+                decode_ops: layout.ops.to_vec(),
                 nbc_null_bitmap: None,
-                decryptor: decryptor.cloned(),
+                decryptor: layout.decryptor.cloned(),
             }))
         }
         TokenType::NbcRow => {
-            let (columns, decryptor) = extract_row_context(context)?;
-            let bitmap_len = columns.len().div_ceil(8);
+            let layout = extract_row_context(context)?;
+            let bitmap_len = layout.columns.len().div_ceil(8);
             let mut bitmap = vec![0u8; bitmap_len];
             reader.read_bytes(&mut bitmap).await?;
             Ok(RowHeader::Positioned(RowPauseState {
                 next_column_index: 0,
-                columns: columns.to_vec(),
+                columns: layout.columns.to_vec(),
+                decode_ops: layout.ops.to_vec(),
                 nbc_null_bitmap: Some(bitmap),
-                decryptor: decryptor.cloned(),
+                decryptor: layout.decryptor.cloned(),
             }))
         }
         _ => {
@@ -678,14 +715,20 @@ pub(crate) async fn resume_row_into_internal<R: TdsPacketReader + Send + Sync>(
     let RowPauseState {
         next_column_index,
         columns,
+        decode_ops,
         nbc_null_bitmap,
         decryptor,
     } = pause_state;
 
+    let layout = RowLayout {
+        columns: &columns,
+        ops: &decode_ops,
+        decryptor: decryptor.as_ref(),
+    };
+
     drive_row_columns(
         reader,
-        &columns,
-        decryptor.as_ref(),
+        layout,
         nbc_null_bitmap.as_deref(),
         next_column_index,
         plan,
@@ -1329,6 +1372,7 @@ mod tests {
                 column_count: 1,
                 columns: vec![metadata],
                 cek_table: vec![],
+                decode_plan: Default::default(),
             }),
             None,
         );
@@ -1376,6 +1420,7 @@ mod tests {
                     plp_varbinary_metadata("c2", None),
                 ],
                 cek_table: vec![],
+                decode_plan: Default::default(),
             }),
             None,
         );
@@ -1412,6 +1457,7 @@ mod tests {
                 column_count: 1,
                 columns: vec![plp_varbinary_metadata("c1", Some(ae_crypto_metadata()))],
                 cek_table: vec![],
+                decode_plan: Default::default(),
             }),
             None,
         );

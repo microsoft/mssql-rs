@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::fmt::{self, Debug};
+use std::sync::OnceLock;
 
 use super::{
     fed_auth_info::{FedAuthInfoToken, SspiToken},
@@ -302,6 +303,91 @@ impl Token for SessionStateToken {
     }
 }
 
+/// Per-column wire shape, resolved once per result set from COLMETADATA.
+///
+/// The per-column decoder otherwise re-derives the same facts on every row: a ~40-arm
+/// match on `data_type`, plus an `is_plp()` probe and an encryption check. Over a
+/// 1.5M-row scan of 48 columns that is ~72M redundant classifications of metadata that
+/// cannot change within a result set. Resolving it once turns the hot loop into a match
+/// on a small dense enum.
+///
+/// This describes the bytes **on the wire**, so it is deliberately independent of
+/// Always Encrypted: an encrypted PLP column is still [`DecodeOp::Plp`] here, and
+/// callers consult [`ColumnPlan::encrypted`] separately. Folding the two together
+/// silently disables the guard that refuses to stream ciphertext to PLP readers.
+///
+/// [`DecodeOp::Fallback`] covers the rare types (XML, JSON, Vector, UDT, SQL_VARIANT)
+/// that still route through the full metadata-driven path, so this classification never
+/// has to be exhaustive to be correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodeOp {
+    /// Fixed-width payload with no length prefix.
+    Fixed(u8),
+    /// Single-byte length prefix followed by that many payload bytes.
+    ByteLen,
+    /// `u16` length prefix; `0xFFFF` means NULL.
+    ShortLen,
+    /// `u32` length prefix behind a text pointer and timestamp.
+    LongLen,
+    /// Partially-length-prefixed: `i64` header then a chunk stream.
+    Plp,
+    /// Not classified; decode from `ColumnMetadata` as before.
+    Fallback,
+}
+
+/// One column's precomputed decode facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ColumnPlan {
+    /// Wire shape, ignoring encryption.
+    pub(crate) shape: DecodeOp,
+    /// Whether the column carries Always Encrypted ciphertext.
+    pub(crate) encrypted: bool,
+}
+
+impl ColumnPlan {
+    /// Classifies one column.
+    pub(crate) fn for_column(meta: &ColumnMetadata) -> Self {
+        use crate::datatypes::sqldatatypes::TdsDataType as D;
+
+        let shape = if meta.is_plp() {
+            DecodeOp::Plp
+        } else {
+            match meta.data_type {
+                D::Bit | D::Int1 => DecodeOp::Fixed(1),
+                D::Int2 => DecodeOp::Fixed(2),
+                D::Int4 | D::Flt4 | D::Money4 | D::DateTim4 => DecodeOp::Fixed(4),
+                D::Int8 | D::Flt8 | D::Money | D::DateTime => DecodeOp::Fixed(8),
+                D::IntN
+                | D::FltN
+                | D::BitN
+                | D::MoneyN
+                | D::DateTimeN
+                | D::Guid
+                | D::DecimalN
+                | D::NumericN
+                | D::Decimal
+                | D::Numeric
+                | D::DateN
+                | D::TimeN
+                | D::DateTime2N
+                | D::DateTimeOffsetN => DecodeOp::ByteLen,
+                D::BigChar
+                | D::BigVarChar
+                | D::NChar
+                | D::NVarChar
+                | D::BigBinary
+                | D::BigVarBinary => DecodeOp::ShortLen,
+                D::Text | D::NText | D::Image => DecodeOp::LongLen,
+                _ => DecodeOp::Fallback,
+            }
+        };
+        ColumnPlan {
+            shape,
+            encrypted: meta.crypto_metadata.is_some(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ColMetadataToken {
     pub column_count: u16,
@@ -311,6 +397,20 @@ pub(crate) struct ColMetadataToken {
     /// references entries here by ordinal.
     #[allow(dead_code)] // Consumed by CEK decryption in a later phase.
     pub cek_table: Vec<CekTableEntry>,
+    /// Per-column decode shapes, built on first row and reused for the result set.
+    ///
+    /// Lazily initialized rather than built in the parser so that tokens assembled
+    /// directly in tests and in `metadata_retriever` stay valid without changes.
+    pub(crate) decode_plan: OnceLock<Vec<ColumnPlan>>,
+}
+
+impl ColMetadataToken {
+    /// Returns the per-column decode plan, building it on first access.
+    #[allow(dead_code)] // Consumed by the planned decode-plan row driver.
+    pub(crate) fn decode_plan(&self) -> &[ColumnPlan] {
+        self.decode_plan
+            .get_or_init(|| self.columns.iter().map(ColumnPlan::for_column).collect())
+    }
 }
 
 impl Token for ColMetadataToken {
