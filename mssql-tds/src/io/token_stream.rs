@@ -129,7 +129,7 @@ pub(crate) struct RowPauseState {
     /// Column metadata for the row, shared with the ParserContext.
     pub(crate) metadata: Arc<ColMetadataToken>,
     /// NBCROW null-bitmap (one bit per column, LSB-first).  `None` for plain ROW.
-    pub(crate) nbc_null_bitmap: Option<Vec<u8>>,
+    pub(crate) nbc_null_bitmap: Option<Arc<[u8]>>,
     /// Optional AE decryptor needed to continue decrypting encrypted columns
     /// after a row pause/resume boundary.
     pub(crate) decryptor: Option<Arc<dyn CellDecryptor>>,
@@ -141,7 +141,7 @@ pub(crate) struct RowPauseState {
 pub struct RowPauseState {
     pub next_column_index: usize,
     pub metadata: Arc<ColMetadataToken>,
-    pub nbc_null_bitmap: Option<Vec<u8>>,
+    pub nbc_null_bitmap: Option<Arc<[u8]>>,
     pub decryptor: Option<Arc<dyn CellDecryptor>>,
 }
 
@@ -452,14 +452,14 @@ async fn skip_column<R: TdsPacketReader + Send + Sync>(
 fn pause_after_column(
     col: usize,
     metadata: &Arc<ColMetadataToken>,
-    bitmap: Option<&[u8]>,
+    bitmap: Option<&Arc<[u8]>>,
     decryptor: Option<&Arc<dyn CellDecryptor>>,
 ) -> RowReadResult {
     if col + 1 < metadata.columns.len() {
         RowReadResult::RowPaused(RowPauseState {
             next_column_index: col + 1,
             metadata: Arc::clone(metadata),
-            nbc_null_bitmap: bitmap.map(|b| b.to_vec()),
+            nbc_null_bitmap: bitmap.cloned(),
             decryptor: decryptor.cloned(),
         })
     } else {
@@ -478,7 +478,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
     metadata: &Arc<ColMetadataToken>,
     decryptor: Option<&Arc<dyn CellDecryptor>>,
-    bitmap: Option<&[u8]>,
+    bitmap: Option<&Arc<[u8]>>,
     start_col: usize,
     plan: ColumnPolicy,
     writer: &mut (dyn RowWriter + Send),
@@ -541,7 +541,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
                         row_pause_state: RowPauseState {
                             next_column_index: col + 1,
                             metadata: Arc::clone(metadata),
-                            nbc_null_bitmap: bitmap.map(|b| b.to_vec()),
+                            nbc_null_bitmap: bitmap.cloned(),
                             decryptor: decryptor.cloned(),
                         },
                         plp_stream,
@@ -609,6 +609,7 @@ pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
             let bitmap_len = metadata.columns.len().div_ceil(8);
             let mut bitmap = vec![0u8; bitmap_len];
             reader.read_bytes(&mut bitmap).await?;
+            let bitmap = Arc::from(bitmap);
             drive_row_columns(reader, metadata, decryptor, Some(&bitmap), 0, plan, writer).await
         }
         _ => {
@@ -649,7 +650,7 @@ pub(crate) async fn receive_row_header_internal<R: TdsPacketReader + Send + Sync
             Ok(RowHeader::Positioned(RowPauseState {
                 next_column_index: 0,
                 metadata: Arc::clone(metadata),
-                nbc_null_bitmap: Some(bitmap),
+                nbc_null_bitmap: Some(Arc::from(bitmap)),
                 decryptor: decryptor.cloned(),
             }))
         }
@@ -681,7 +682,7 @@ pub(crate) async fn resume_row_into_internal<R: TdsPacketReader + Send + Sync>(
         reader,
         &metadata,
         decryptor.as_ref(),
-        nbc_null_bitmap.as_deref(),
+        nbc_null_bitmap.as_ref(),
         next_column_index,
         plan,
         writer,
@@ -1428,24 +1429,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nbcrow_header_shares_result_metadata_arc() {
+    async fn nbcrow_pause_shares_header_bitmap_arc() {
         let metadata = two_int4_metadata();
         let context = ParserContext::ColumnMetadata(Arc::clone(&metadata), None);
 
-        let mut reader = TestByteReader::new(vec![TokenType::NbcRow as u8, 0b0000_0010]);
+        let mut reader = TestByteReader::new(vec![TokenType::NbcRow as u8, 0b0000_0001]);
         let registry = GenericTokenParserRegistry::default();
+        let mut writer = DiscardRowWriter;
 
-        match receive_row_header_internal(&mut reader, &registry, &context)
-            .await
-            .unwrap()
+        let RowHeader::Positioned(header_state) =
+            receive_row_header_internal(&mut reader, &registry, &context)
+                .await
+                .unwrap()
+        else {
+            panic!("expected Positioned");
+        };
+        let bitmap = header_state.nbc_null_bitmap.as_ref().unwrap().clone();
+
+        match resume_row_into_internal(
+            &mut reader,
+            header_state,
+            ColumnPolicy::DecodeOne(0),
+            &mut writer,
+        )
+        .await
+        .unwrap()
         {
-            RowHeader::Positioned(state) => {
+            RowReadResult::RowPaused(state) => {
                 assert!(Arc::ptr_eq(&metadata, &state.metadata));
-                assert_eq!(state.next_column_index, 0);
-                // bitmap_len still derives from the shared token's column count.
-                assert_eq!(state.nbc_null_bitmap.as_deref(), Some(&[0b0000_0010][..]));
+                assert_eq!(state.next_column_index, 1);
+                assert!(Arc::ptr_eq(
+                    &bitmap,
+                    state.nbc_null_bitmap.as_ref().unwrap()
+                ));
             }
-            RowHeader::Token(_) => panic!("expected Positioned, got Token"),
+            other => panic!("expected RowPaused, got {other:?}"),
         }
     }
 
@@ -1546,10 +1564,17 @@ mod tests {
         let registry = GenericTokenParserRegistry::default();
         let mut writer = DiscardRowWriter;
 
-        let result = receive_row_into_internal(
+        let RowHeader::Positioned(header_state) =
+            receive_row_header_internal(&mut reader, &registry, &context)
+                .await
+                .unwrap()
+        else {
+            panic!("expected Positioned");
+        };
+        let bitmap = header_state.nbc_null_bitmap.as_ref().unwrap().clone();
+        let result = resume_row_into_internal(
             &mut reader,
-            &registry,
-            &context,
+            header_state,
             ColumnPolicy::DecodeOne(1),
             &mut writer,
         )
@@ -1560,6 +1585,10 @@ mod tests {
             RowReadResult::PlpPaused(plp_state) => {
                 assert!(plp_state.collation().is_none());
                 assert!(!plp_state.reached_end());
+                assert!(Arc::ptr_eq(
+                    &bitmap,
+                    plp_state.row_pause_state.nbc_null_bitmap.as_ref().unwrap()
+                ));
             }
             _ => panic!("expected PlpPaused"),
         }
