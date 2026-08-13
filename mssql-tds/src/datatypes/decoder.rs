@@ -1066,9 +1066,17 @@ impl GenericDecoder {
     }
 
     /// Decodes a column value from the wire and writes it directly into a
-    /// [`RowWriter`], bypassing the intermediate `ColumnValues` enum for
-    /// common types. Rare types (XML, JSON, Vector, Image, UDT, SsVariant)
-    /// fall back to `decode()` + `write_column_value()`.
+    /// [`RowWriter`], bypassing the intermediate `ColumnValues` enum.
+    ///
+    /// This is the single per-type switch in the decoder: `SqlTypeDecode::decode`
+    /// is defined as this method plus a [`CaptureWriter`], so there is no second
+    /// switch that could drift out of sync with it. A few rare shapes (Vector,
+    /// SsVariant) still materialize a `ColumnValues` internally because their
+    /// sub-decoders produce one, but they are dispatched from here, not from a
+    /// parallel match.
+    ///
+    /// Every arm must either write exactly one value or return an error;
+    /// returning `Ok` without writing is reported by [`CaptureWriter::into_value`].
     pub(crate) async fn decode_into<T, W>(
         &self,
         reader: &mut T,
@@ -1491,7 +1499,7 @@ impl SqlTypeDecode for GenericDecoder {
     {
         let mut capture = CaptureWriter::default();
         self.decode_into(reader, metadata, 0, &mut capture).await?;
-        Ok(capture.into_value())
+        capture.into_value()
     }
 }
 
@@ -1549,7 +1557,7 @@ impl SqlTypeDecode for StringDecoder {
         let mut capture = CaptureWriter::default();
         self.decode_string_into(reader, metadata, 0, &mut capture)
             .await?;
-        Ok(capture.into_value())
+        capture.into_value()
     }
 }
 

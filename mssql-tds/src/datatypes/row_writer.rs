@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use crate::core::TdsResult;
 use crate::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
@@ -9,6 +10,7 @@ use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sql_json::SqlJson;
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sql_vector::SqlVector;
+use crate::error::Error;
 use uuid::Uuid;
 
 /// Pluggable decode sink for TDS row data.
@@ -271,84 +273,108 @@ pub(crate) struct CaptureWriter {
 }
 
 impl CaptureWriter {
-    /// Takes the captured value, or `Null` if the decoder wrote nothing.
-    pub(crate) fn into_value(self) -> ColumnValues {
-        self.value.unwrap_or(ColumnValues::Null)
+    /// Records the decoded value for the single captured column.
+    ///
+    /// A second write means a `decode_into` arm produced two values for one
+    /// column, so it is caught in debug builds rather than silently keeping
+    /// the last one.
+    fn set(&mut self, value: ColumnValues) {
+        debug_assert!(
+            self.value.is_none(),
+            "decode_into wrote twice for one column: {:?} then {value:?}",
+            self.value
+        );
+        self.value = Some(value);
+    }
+
+    /// Takes the captured value.
+    ///
+    /// A SQL `NULL` is written explicitly via [`RowWriter::write_null`], so an
+    /// empty slot means a `decode_into` arm returned `Ok` without writing
+    /// anything. That is a decoder bug, and reporting it as `NULL` would be
+    /// exactly the silent wrong-data failure this convergence exists to
+    /// prevent, so it is an error instead.
+    pub(crate) fn into_value(self) -> TdsResult<ColumnValues> {
+        self.value.ok_or_else(|| {
+            Error::ImplementationError(
+                "decode_into returned without writing a value for the column".to_string(),
+            )
+        })
     }
 }
 
 impl RowWriter for CaptureWriter {
     fn write_null(&mut self, _col: usize) {
-        self.value = Some(ColumnValues::Null);
+        self.set(ColumnValues::Null);
     }
     fn write_bool(&mut self, _col: usize, val: bool) {
-        self.value = Some(ColumnValues::Bit(val));
+        self.set(ColumnValues::Bit(val));
     }
     fn write_u8(&mut self, _col: usize, val: u8) {
-        self.value = Some(ColumnValues::TinyInt(val));
+        self.set(ColumnValues::TinyInt(val));
     }
     fn write_i16(&mut self, _col: usize, val: i16) {
-        self.value = Some(ColumnValues::SmallInt(val));
+        self.set(ColumnValues::SmallInt(val));
     }
     fn write_i32(&mut self, _col: usize, val: i32) {
-        self.value = Some(ColumnValues::Int(val));
+        self.set(ColumnValues::Int(val));
     }
     fn write_i64(&mut self, _col: usize, val: i64) {
-        self.value = Some(ColumnValues::BigInt(val));
+        self.set(ColumnValues::BigInt(val));
     }
     fn write_f32(&mut self, _col: usize, val: f32) {
-        self.value = Some(ColumnValues::Real(val));
+        self.set(ColumnValues::Real(val));
     }
     fn write_f64(&mut self, _col: usize, val: f64) {
-        self.value = Some(ColumnValues::Float(val));
+        self.set(ColumnValues::Float(val));
     }
     fn write_string(&mut self, _col: usize, val: SqlString) {
-        self.value = Some(ColumnValues::String(val));
+        self.set(ColumnValues::String(val));
     }
     fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
-        self.value = Some(ColumnValues::Bytes(val));
+        self.set(ColumnValues::Bytes(val));
     }
     fn write_decimal(&mut self, _col: usize, val: DecimalParts) {
-        self.value = Some(ColumnValues::Decimal(val));
+        self.set(ColumnValues::Decimal(val));
     }
     fn write_numeric(&mut self, _col: usize, val: DecimalParts) {
-        self.value = Some(ColumnValues::Numeric(val));
+        self.set(ColumnValues::Numeric(val));
     }
     fn write_date(&mut self, _col: usize, val: SqlDate) {
-        self.value = Some(ColumnValues::Date(val));
+        self.set(ColumnValues::Date(val));
     }
     fn write_time(&mut self, _col: usize, val: SqlTime) {
-        self.value = Some(ColumnValues::Time(val));
+        self.set(ColumnValues::Time(val));
     }
     fn write_datetime(&mut self, _col: usize, val: SqlDateTime) {
-        self.value = Some(ColumnValues::DateTime(val));
+        self.set(ColumnValues::DateTime(val));
     }
     fn write_smalldatetime(&mut self, _col: usize, val: SqlSmallDateTime) {
-        self.value = Some(ColumnValues::SmallDateTime(val));
+        self.set(ColumnValues::SmallDateTime(val));
     }
     fn write_datetime2(&mut self, _col: usize, val: SqlDateTime2) {
-        self.value = Some(ColumnValues::DateTime2(val));
+        self.set(ColumnValues::DateTime2(val));
     }
     fn write_datetimeoffset(&mut self, _col: usize, val: SqlDateTimeOffset) {
-        self.value = Some(ColumnValues::DateTimeOffset(val));
+        self.set(ColumnValues::DateTimeOffset(val));
     }
     fn write_money(&mut self, _col: usize, val: SqlMoney) {
-        self.value = Some(ColumnValues::Money(val));
+        self.set(ColumnValues::Money(val));
     }
     fn write_smallmoney(&mut self, _col: usize, val: SqlSmallMoney) {
-        self.value = Some(ColumnValues::SmallMoney(val));
+        self.set(ColumnValues::SmallMoney(val));
     }
     fn write_uuid(&mut self, _col: usize, val: Uuid) {
-        self.value = Some(ColumnValues::Uuid(val));
+        self.set(ColumnValues::Uuid(val));
     }
     fn write_xml(&mut self, _col: usize, val: SqlXml) {
-        self.value = Some(ColumnValues::Xml(val));
+        self.set(ColumnValues::Xml(val));
     }
     fn write_json(&mut self, _col: usize, val: SqlJson) {
-        self.value = Some(ColumnValues::Json(val));
+        self.set(ColumnValues::Json(val));
     }
     fn write_vector(&mut self, _col: usize, val: SqlVector) {
-        self.value = Some(ColumnValues::Vector(val));
+        self.set(ColumnValues::Vector(val));
     }
     fn end_row(&mut self) {}
 }
@@ -492,5 +518,30 @@ mod tests {
         assert_eq!(row[5], ColumnValues::Float(2.5));
         assert_eq!(row[6], ColumnValues::Bit(false));
         assert_eq!(row[7], ColumnValues::Null);
+    }
+
+    #[test]
+    fn capture_writer_returns_written_value() {
+        let mut capture = CaptureWriter::default();
+        capture.write_i32(0, 42);
+        assert_eq!(capture.into_value().unwrap(), ColumnValues::Int(42));
+    }
+
+    #[test]
+    fn capture_writer_distinguishes_written_null_from_no_write() {
+        let mut capture = CaptureWriter::default();
+        capture.write_null(0);
+        assert_eq!(capture.into_value().unwrap(), ColumnValues::Null);
+    }
+
+    #[test]
+    fn capture_writer_errors_when_nothing_was_written() {
+        let err = CaptureWriter::default()
+            .into_value()
+            .expect_err("an unwritten column must not silently decode as NULL");
+        assert!(
+            matches!(err, Error::ImplementationError(ref msg) if msg.contains("without writing")),
+            "unexpected error: {err:?}"
+        );
     }
 }
