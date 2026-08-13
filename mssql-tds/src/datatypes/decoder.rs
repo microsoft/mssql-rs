@@ -2062,16 +2062,21 @@ impl DecimalParts {
     /// Reassembles `int_parts` into the unsigned magnitude.
     ///
     /// `int_parts[0]` is the least significant word. Returns `None` when the
-    /// value carries more words than a `u128` holds. A valid `decimal`/`numeric`
+    /// value does not fit in a `u128`. A valid `decimal`/`numeric`
     /// (precision <= 38) fits in four words, so only a malformed payload or a
     /// hand-built [`DecimalParts`] can exceed that; the alternative would be to
     /// shift past the width of the accumulator.
     pub fn magnitude(&self) -> Option<u128> {
-        if self.int_parts.len() > MAX_DECIMAL_INT_PARTS {
+        let significant = self
+            .int_parts
+            .iter()
+            .rposition(|&part| part != 0)
+            .map_or(0, |i| i + 1);
+        if significant > MAX_DECIMAL_INT_PARTS {
             return None;
         }
         Some(
-            self.int_parts
+            self.int_parts[..significant]
                 .iter()
                 .enumerate()
                 .fold(0u128, |acc, (i, &part)| {
@@ -3020,6 +3025,7 @@ mod test {
             int_parts: vec![-1, -1, -1, -1],
         };
         assert_eq!(parts.to_decimal_string(), u128::MAX.to_string());
+        assert_eq!(parts.magnitude(), Some(u128::MAX));
     }
 
     #[test]
@@ -3038,11 +3044,13 @@ mod test {
             "340282366920938463463374607431768211457"
         );
         assert!((parts.to_f64() - 3.402_823_669_209_385e38).abs() < 1e23);
+        assert_eq!(parts.magnitude(), None);
     }
 
     #[test]
     fn test_decimal_parts_oversized_magnitude_with_trailing_zero_words() {
-        // Zero-padded words past the fourth carry no magnitude.
+        // Zero-padded words past the fourth carry no magnitude, so the value
+        // still fits a u128 and both the string and typed paths agree on it.
         let parts = DecimalParts {
             is_positive: false,
             scale: 2,
@@ -3050,6 +3058,19 @@ mod test {
             int_parts: vec![12345, 0, 0, 0, 0, 0],
         };
         assert_eq!(parts.to_decimal_string(), "-123.45");
+        assert_eq!(parts.magnitude(), Some(12345));
+    }
+
+    #[test]
+    fn test_decimal_parts_empty_magnitude_is_zero() {
+        let parts = DecimalParts {
+            is_positive: true,
+            scale: 0,
+            precision: 38,
+            int_parts: vec![],
+        };
+        assert_eq!(parts.magnitude(), Some(0));
+        assert_eq!(parts.to_decimal_string(), "0");
     }
 
     // Vector deserialization tests
