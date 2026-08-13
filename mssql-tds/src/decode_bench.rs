@@ -19,7 +19,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::core::TdsResult;
+use crate::core::{CancelHandle, TdsResult};
 use crate::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
@@ -562,6 +562,166 @@ async fn decode_pass_contiguous(
     start.elapsed()
 }
 
+/// Which of the production wrappers to apply around the row decode.
+///
+/// `NetworkTransport::receive_row_into` wraps `receive_row_into_internal` in
+/// `CancelHandle::run_until_cancelled` and then optionally `tokio::time::timeout`.
+/// The harness normally bypasses both, so this ladder exists to price them.
+#[derive(Clone, Copy, Debug)]
+enum WrapMode {
+    /// Direct call, as the rest of this harness does.
+    Bare,
+    /// Wrapped, but with no cancel handle supplied — the `None => f.await` arm.
+    CancelNone,
+    /// Wrapped with a live cancel handle that never fires.
+    CancelSome,
+    /// Full production shape: cancel handle plus a request timeout.
+    CancelSomeTimeout,
+}
+
+impl WrapMode {
+    fn label(self) -> &'static str {
+        match self {
+            WrapMode::Bare => "bare",
+            WrapMode::CancelNone => "cancel_none",
+            WrapMode::CancelSome => "cancel_some",
+            WrapMode::CancelSomeTimeout => "cancel_some_timeout",
+        }
+    }
+}
+
+async fn decode_pass_wrapped(
+    data: Arc<Vec<u8>>,
+    context: &ParserContext,
+    mode: WrapMode,
+    handle: &CancelHandle,
+) -> Duration {
+    let registry = GenericTokenParserRegistry::default();
+    let mut reader = MemReader::new(data);
+    let mut writer = ContiguousRowWriter::new();
+    // Long enough that it can never fire; we are pricing the wrapper, not the timer.
+    let request_timeout = Duration::from_secs(600);
+
+    let start = Instant::now();
+    for _ in 0..ROWS {
+        let result = match mode {
+            WrapMode::Bare => {
+                receive_row_into_internal(
+                    &mut reader,
+                    &registry,
+                    context,
+                    ColumnPolicy::DecodeAll,
+                    &mut writer,
+                )
+                .await
+            }
+            WrapMode::CancelNone => {
+                CancelHandle::run_until_cancelled(
+                    None,
+                    receive_row_into_internal(
+                        &mut reader,
+                        &registry,
+                        context,
+                        ColumnPolicy::DecodeAll,
+                        &mut writer,
+                    ),
+                )
+                .await
+            }
+            WrapMode::CancelSome => {
+                CancelHandle::run_until_cancelled(
+                    Some(handle),
+                    receive_row_into_internal(
+                        &mut reader,
+                        &registry,
+                        context,
+                        ColumnPolicy::DecodeAll,
+                        &mut writer,
+                    ),
+                )
+                .await
+            }
+            WrapMode::CancelSomeTimeout => {
+                let cancellable = CancelHandle::run_until_cancelled(
+                    Some(handle),
+                    receive_row_into_internal(
+                        &mut reader,
+                        &registry,
+                        context,
+                        ColumnPolicy::DecodeAll,
+                        &mut writer,
+                    ),
+                );
+                match tokio::time::timeout(request_timeout, cancellable).await {
+                    Ok(r) => r,
+                    Err(_) => panic!("bench timeout fired"),
+                }
+            }
+        };
+        result.expect("row decode failed");
+        black_box(&writer.buf);
+        writer.end_row();
+    }
+    start.elapsed()
+}
+
+/// Prices the per-row cancellation/timeout wrappers that the rest of this
+/// harness bypasses. All modes share one runtime so the comparison is paired.
+fn run_wrapper_ladder(name: &str, specs: Vec<ColSpec>, nbc: bool) {
+    let col_count = specs.len();
+    let data = Arc::new(if nbc {
+        build_nbcrow_stream(&specs)
+    } else {
+        build_row_stream(&specs)
+    });
+    let context = context_for(&specs);
+
+    // `timeout` needs the time driver, which the other cases do not enable.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let handle = CancelHandle::new();
+
+    for mode in [
+        WrapMode::Bare,
+        WrapMode::CancelNone,
+        WrapMode::CancelSome,
+        WrapMode::CancelSomeTimeout,
+    ] {
+        for _ in 0..WARMUP_PASSES {
+            rt.block_on(decode_pass_wrapped(
+                Arc::clone(&data),
+                &context,
+                mode,
+                &handle,
+            ));
+        }
+
+        let mut samples: Vec<Duration> = (0..MEASURED_PASSES)
+            .map(|_| {
+                rt.block_on(decode_pass_wrapped(
+                    Arc::clone(&data),
+                    &context,
+                    mode,
+                    &handle,
+                ))
+            })
+            .collect();
+        samples.sort();
+
+        let median = samples[MEASURED_PASSES / 2];
+        let ns_per_row = median.as_nanos() as f64 / ROWS as f64;
+
+        println!(
+            "BENCH\t{name}_{}\tcols={col_count}\trows={ROWS}\tmedian_ms={:.3}\t\
+             ns_per_row={ns_per_row:.1}",
+            mode.label(),
+            median.as_secs_f64() * 1000.0,
+        );
+    }
+}
+
 fn run_case(name: &str, specs: Vec<ColSpec>, nbc: bool) {
     let col_count = specs.len();
     let data = Arc::new(if nbc {
@@ -656,5 +816,6 @@ fn bench_row_decode() {
     run_case("wide_strings_8x512", wide_string_columns(), false);
     run_contiguous_case("contig_poc_row_39int_9varchar", poc_columns(), false);
     run_contiguous_case("contig_wide_strings_8x512", wide_string_columns(), false);
+    run_wrapper_ladder("wrap_poc_row_39int_9varchar", poc_columns(), false);
     println!("BENCH_END");
 }
