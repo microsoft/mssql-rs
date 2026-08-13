@@ -140,6 +140,7 @@ pub const SQL_API_ODBC3_ALL_FUNCTIONS_SIZE: usize = 250;
 pub const SQL_API_SQLCONNECT: SqlUSmallInt = 7;
 pub const SQL_API_SQLCANCEL: SqlUSmallInt = 5;
 pub const SQL_API_SQLDESCRIBECOL: SqlUSmallInt = 8;
+pub const SQL_API_SQLCOLATTRIBUTE: SqlUSmallInt = 6;
 pub const SQL_API_SQLDISCONNECT: SqlUSmallInt = 9;
 pub const SQL_API_SQLEXECDIRECT: SqlUSmallInt = 11;
 pub const SQL_API_SQLEXECUTE: SqlUSmallInt = 12;
