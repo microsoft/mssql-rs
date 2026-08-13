@@ -94,9 +94,10 @@ pub(crate) struct StmtState {
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
     pub(crate) last_captured: Option<(usize, ColumnValues)>,
-    /// Base type of `last_captured` when that column is `sql_variant`. Set per
-    /// value, since a variant column can hold a different type in every row.
-    pub(crate) last_variant_base: Option<TdsDataType>,
+    /// Base type of `last_captured` when that column is `sql_variant`, with its
+    /// 1-based column index. Set per value, since a variant column can hold a
+    /// different type in every row.
+    pub(crate) last_variant_base: Option<(usize, TdsDataType)>,
     /// `true` when the last resume consumed the row's final column
     /// (`CursorColumn::RowEnded`). Distinguishes "row exhausted" from "decoder
     /// paused at a PLP column" when `last_captured` is `None` (see

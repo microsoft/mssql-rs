@@ -150,7 +150,13 @@ fn sql_col_attribute_w_safe(
             post_diag(&mut stmt_state, ERR_NOT_VARIANT_COLUMN);
             return SQL_ERROR;
         }
-        let Some(base) = stmt_state.last_variant_base else {
+        // The base type belongs to the value that was probed, so it only answers
+        // for the column it came from.
+        let base = stmt_state
+            .last_variant_base
+            .filter(|(col, _)| *col == column_number as usize)
+            .map(|(_, base)| base);
+        let Some(base) = base else {
             // Callers probe the column with SQLGetData first; that read is what
             // supplies the base type.
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);

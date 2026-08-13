@@ -456,7 +456,7 @@ fn resume_row_to_column(
         }) => {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.last_captured = Some((column_number, value));
-                stmt_state.last_variant_base = variant_base;
+                stmt_state.last_variant_base = variant_base.map(|base| (column_number, base));
                 stmt_state.row_exhausted = false;
                 stmt_state.partial_text_offset = None;
                 return SQL_SUCCESS;

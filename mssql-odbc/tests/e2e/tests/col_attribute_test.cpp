@@ -226,6 +226,53 @@ TEST_F(ColAttributeLiveTest, VariantUnderlyingTypeAfterProbe) {
     SQLCloseCursor(stmt_);
 }
 
+// A NULL sql_variant is just a zero length on the wire, with no base type or
+// property byte following it. Reading those anyway would consume the next
+// column's bytes, so the column after the variant is what actually proves it.
+TEST_F(ColAttributeLiveTest, NullVariantDoesNotDisturbTheFollowingColumn) {
+    ExecDirect("SELECT CAST(NULL AS SQL_VARIANT) AS v, CAST(12345 AS INT) AS following");
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NULL_DATA, indicator);
+
+    SQLINTEGER following = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_SLONG, &following, sizeof(following), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(12345, following);
+
+    SQLCloseCursor(stmt_);
+}
+
+// The base type belongs to the value that was probed, so probing one variant
+// column must not answer for another.
+TEST_F(ColAttributeLiveTest, VariantTypeIsPerColumn) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExecDirect("SELECT CAST(42 AS SQL_VARIANT) AS a,"
+               " CAST(CAST('x' AS VARCHAR(5)) AS SQL_VARIANT) AS b");
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLCHAR probe = 0;
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_C_SLONG, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+    // Column 2 has not been probed, so it has no type to report yet -- it must
+    // not inherit column 1's.
+    SQLLEN value = 0;
+    SQLRETURN rc =
+        SQLColAttribute(stmt_, 2, SQL_CA_SS_VARIANT_TYPE, nullptr, 0, nullptr, &value);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
+
+    SQLCloseCursor(stmt_);
+}
+
 // Without the probe there is no value to report a type for; msodbcsql relies on
 // the same ordering, so this only pins our diagnostic.
 TEST_F(ColAttributeLiveTest, VariantTypeBeforeProbeIsSequenceError) {
