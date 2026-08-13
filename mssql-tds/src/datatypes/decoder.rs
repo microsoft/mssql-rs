@@ -1,8 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use async_trait::async_trait;
 use core::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt::Debug, io::Error, vec};
 
@@ -136,9 +137,12 @@ macro_rules! safe_vec {
     }};
 }
 
-#[async_trait]
 pub(crate) trait SqlTypeDecode {
-    async fn decode<T>(&self, reader: &mut T, metadata: &ColumnMetadata) -> TdsResult<ColumnValues>
+    fn decode<T>(
+        &self,
+        reader: &mut T,
+        metadata: &ColumnMetadata,
+    ) -> impl Future<Output = TdsResult<ColumnValues>> + Send
     where
         T: TdsPacketReader + Send + Sync;
 }
@@ -501,6 +505,24 @@ impl GenericDecoder {
     const MAX_PLP_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
     // Reads a SQL_VARIANT type from the TDS stream.
+    /// Boxed re-entry into [`SqlTypeDecode::decode`], used only by SQL_VARIANT.
+    ///
+    /// SQL_VARIANT embeds a base type, so decoding one re-enters the type switch. Native
+    /// `async fn` cannot express that cycle: the opaque return type would contain itself.
+    /// Naming a concrete `Pin<Box<dyn Future>>` in the signature severs the dependency, at
+    /// the cost of one allocation per nested variant column — a rare type, never on the hot
+    /// path of ordinary scalar columns.
+    fn decode_boxed<'a, T>(
+        &'a self,
+        reader: &'a mut T,
+        metadata: &'a ColumnMetadata,
+    ) -> Pin<Box<dyn Future<Output = TdsResult<ColumnValues>> + Send + 'a>>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
+        Box::pin(self.decode(reader, metadata))
+    }
+
     async fn read_sql_variant<T>(&self, reader: &mut T) -> TdsResult<ColumnValues>
     where
         T: TdsPacketReader + Send + Sync,
@@ -576,7 +598,7 @@ impl GenericDecoder {
                     multi_part_name: None,
                     crypto_metadata: None,
                 };
-                self.decode(reader, &variant_actual_type_md).await
+                self.decode_boxed(reader, &variant_actual_type_md).await
             }
             _ => {
                 // If the type is not a fixed length type, we should not reach here.
@@ -1370,7 +1392,6 @@ impl GenericDecoder {
     }
 }
 
-#[async_trait]
 impl SqlTypeDecode for GenericDecoder {
     async fn decode<T>(&self, reader: &mut T, metadata: &ColumnMetadata) -> TdsResult<ColumnValues>
     where
@@ -1761,7 +1782,6 @@ impl StringDecoder {
     }
 }
 
-#[async_trait]
 impl SqlTypeDecode for StringDecoder {
     async fn decode<T>(&self, reader: &mut T, metadata: &ColumnMetadata) -> TdsResult<ColumnValues>
     where
@@ -1832,8 +1852,8 @@ impl SqlTypeDecode for StringDecoder {
             Ok(ColumnValues::String(sql_string))
         } else {
             let length = reader.read_uint16().await? as usize;
-            if length == 0xFFFF {
-                return Ok(ColumnValues::Null);
+            if length == crate::io::packet_reader::LENGTH_NULL as usize {
+                Ok(ColumnValues::Null)
             } else {
                 let mut buffer = vec![0u8; length];
                 reader.read_bytes(&mut buffer).await?;
