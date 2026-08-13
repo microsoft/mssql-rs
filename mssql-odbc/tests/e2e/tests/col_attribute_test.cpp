@@ -34,7 +34,16 @@
 #define SQL_SS_VARIANT (-150)
 #endif
 
-class ColAttributeLiveTest : public ODBCTest {};
+class ColAttributeLiveTest : public ODBCTest {
+protected:
+    void SetUp() override {
+        ODBCTest::SetUp();
+        if (!ODBCTestConfig::Instance().HasConnection()) {
+            FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+        }
+        Connect();
+    }
+};
 
 // Reads a numeric attribute, asserting the call succeeded.
 static SQLLEN NumericAttr(SQLHSTMT stmt, SQLUSMALLINT col, SQLUSMALLINT field) {
@@ -190,15 +199,20 @@ TEST_F(ColAttributeLiveTest, VariantUnderlyingTypeAfterProbe) {
     EXPECT_EQ(SQL_SS_VARIANT, dataType);
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    // The probe is keyed on a zero buffer length, not on a null pointer:
+    // mssql-python passes NULL here, but it dlopen's the driver directly, while
+    // these tests go through the Driver Manager, which rejects a null
+    // TargetValuePtr with HY009 before the driver ever sees the call.
+    SQLCHAR probe = 0;
     SQLLEN indicator = 0;
-    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, nullptr, 0, &indicator),
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_NE(SQL_NULL_DATA, indicator);
     EXPECT_EQ(SQL_C_SLONG, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
 
     // Second row holds a different base type in the same column.
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, nullptr, 0, &indicator),
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_C_CHAR, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
 
