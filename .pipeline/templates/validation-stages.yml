@@ -159,10 +159,13 @@ stages:
           testResultsFormat: 'JUnit'
           testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
           testRunTitle: 'Extended Protection (EPA)'
-      - template: build-python-wheels-template.yml
-        parameters:
-          osType: Windows
-          architecture: x64
+      # Wheels are not consumed by anything in a PR run (PrivateLink_Smoke, the
+      # only consumer, is non-PR only), so build them on CI runs only.
+      - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: Windows
+            architecture: x64
 
   - job: Build_Windows_Arm
     displayName: Build Windows ARM
@@ -192,16 +195,19 @@ stages:
         parameters:
           osType: Windows
           enableJsDeps: false
-      - template: build-python-wheels-template.yml
-        parameters:
-          osType: Windows
-          architecture: arm64
-          # Python 3.10 excluded - limited ARM64 support
-          pythonVersions:
-          - '3.11'
-          - '3.12'
-          - '3.13'
-          - '3.14'
+      # Wheels are not consumed by anything in a PR run (PrivateLink_Smoke, the
+      # only consumer, is non-PR only), so build them on CI runs only.
+      - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: Windows
+            architecture: arm64
+            # Python 3.10 excluded - limited ARM64 support
+            pythonVersions:
+            - '3.11'
+            - '3.12'
+            - '3.13'
+            - '3.14'
 
       # ODBC C++ e2e against the cross-pool x64 SQL host booted above. This image
       # has no local SQL Server, so it joins the same artifact-sentinel rendezvous
@@ -240,14 +246,17 @@ stages:
           osType: Linux
           buildType: ${{ parameters.buildType }}
           testFilter: -E 'not (test(connectivity))'
-      - template: build-python-wheels-template.yml
-        parameters:
-          osType: Linux
-          architecture: x64
-      - template: build-python-wheels-template.yml
-        parameters:
-          osType: Alpine
-          architecture: x64
+      # Wheels are not consumed by anything in a PR run (PrivateLink_Smoke, the
+      # only consumer, is non-PR only), so build them on CI runs only.
+      - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: Linux
+            architecture: x64
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: Alpine
+            architecture: x64
       - template: build-odbc-template.yml
         parameters:
           architecture: x64
@@ -289,14 +298,17 @@ stages:
           osType: Linux
           buildType: ${{ parameters.buildType }}
           testFilter: -E 'not (test(connectivity))'
-      - template: build-python-wheels-template.yml
-        parameters:
-          osType: Linux
-          architecture: ARM64
-      - template: build-python-wheels-template.yml
-        parameters:
-          osType: Alpine
-          architecture: ARM64
+      # Wheels are not consumed by anything in a PR run (PrivateLink_Smoke, the
+      # only consumer, is non-PR only), so build them on CI runs only.
+      - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: Linux
+            architecture: ARM64
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: Alpine
+            architecture: ARM64
       - template: build-odbc-template.yml
         parameters:
           architecture: ARM64
@@ -365,7 +377,6 @@ stages:
           osType: MacOS
           buildType: ${{ parameters.buildType }}
           testFilter: -E 'not (test(connectivity))'
-          enableRustBuild: false
           enableClippy: false
 
 # Kerberos tests for PRs (fast - 2 distros: ubuntu22 + alpine318)
