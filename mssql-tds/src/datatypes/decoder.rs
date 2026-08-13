@@ -1125,6 +1125,7 @@ impl GenericDecoder {
         &self,
         reader: &mut T,
         spec: ColumnDecodeSpec,
+        metadata: &ColumnMetadata,
         col: usize,
         writer: &mut W,
     ) -> TdsResult<()>
@@ -1262,7 +1263,8 @@ impl GenericDecoder {
             }
             ColumnDecodeSpec::VarLenU16(VarU16Kind::String(encoding)) => {
                 match Self::read_short_len_bytes(reader).await? {
-                    Some(bytes) => writer.write_string(col, SqlString::new(bytes, encoding)),
+                    Some(bytes) => writer
+                        .write_string(col, SqlString::new(bytes, encoding.materialize(metadata))),
                     None => writer.write_null(col),
                 }
             }
@@ -1271,9 +1273,8 @@ impl GenericDecoder {
                 None => writer.write_null(col),
                 Some(bytes) => match kind {
                     PlpKind::Bytes => writer.write_bytes(col, bytes),
-                    PlpKind::String(encoding) => {
-                        writer.write_string(col, SqlString::new(bytes, encoding))
-                    }
+                    PlpKind::String(encoding) => writer
+                        .write_string(col, SqlString::new(bytes, encoding.materialize(metadata))),
                     PlpKind::Xml => writer.write_xml(col, SqlXml { bytes }),
                     PlpKind::Json => writer.write_json(col, SqlJson::new(bytes)),
                 },
@@ -1282,7 +1283,10 @@ impl GenericDecoder {
             // Rare shapes are boxed so their locals stay out of the hot path's
             // future. Each is still handled in exactly one place.
             ColumnDecodeSpec::LongLen(kind) => {
-                Box::pin(Self::read_long_len_into(reader, kind, col, writer)).await?;
+                Box::pin(Self::read_long_len_into(
+                    reader, kind, metadata, col, writer,
+                ))
+                .await?;
             }
             ColumnDecodeSpec::VarLenU16(VarU16Kind::Vector {
                 base_type,
@@ -1305,6 +1309,7 @@ impl GenericDecoder {
     async fn read_long_len_into<T, W>(
         reader: &mut T,
         kind: LongLenKind,
+        metadata: &ColumnMetadata,
         col: usize,
         writer: &mut W,
     ) -> TdsResult<()>
@@ -1314,7 +1319,7 @@ impl GenericDecoder {
     {
         match (Self::read_long_len_bytes(reader).await?, kind) {
             (Some(bytes), LongLenKind::String(encoding)) => {
-                writer.write_string(col, SqlString::new(bytes, encoding))
+                writer.write_string(col, SqlString::new(bytes, encoding.materialize(metadata)))
             }
             // `image` reports a zero-length payload as NULL, unlike `text`.
             (Some(bytes), LongLenKind::Bytes) if !bytes.is_empty() => {
@@ -1367,12 +1372,14 @@ impl GenericDecoder {
         &self,
         reader: &mut T,
         spec: ColumnDecodeSpec,
+        metadata: &ColumnMetadata,
     ) -> TdsResult<ColumnValues>
     where
         T: TdsPacketReader + Send + Sync,
     {
         let mut capture = CaptureWriter::default();
-        self.decode_into(reader, spec, 0, &mut capture).await?;
+        self.decode_into(reader, spec, metadata, 0, &mut capture)
+            .await?;
         Ok(capture.into_value())
     }
 }
@@ -1382,7 +1389,7 @@ impl SqlTypeDecode for GenericDecoder {
     where
         T: TdsPacketReader + Send + Sync,
     {
-        self.decode_value(reader, ColumnDecodeSpec::for_column(metadata))
+        self.decode_value(reader, ColumnDecodeSpec::for_column(metadata), metadata)
             .await
     }
 }
@@ -2837,6 +2844,7 @@ mod test {
                 .decode_into(
                     &mut reader2,
                     ColumnDecodeSpec::for_column(metadata),
+                    metadata,
                     0,
                     &mut writer,
                 )
@@ -2879,6 +2887,7 @@ mod test {
                 .decode_into(
                     &mut reader,
                     ColumnDecodeSpec::for_column(&md),
+                    &md,
                     0,
                     &mut writer,
                 )
@@ -2899,6 +2908,7 @@ mod test {
                 .decode_into(
                     &mut reader,
                     ColumnDecodeSpec::for_column(&md),
+                    &md,
                     0,
                     &mut writer,
                 )
@@ -2920,6 +2930,7 @@ mod test {
                 .decode_into(
                     &mut reader,
                     ColumnDecodeSpec::for_column(&md),
+                    &md,
                     0,
                     &mut writer,
                 )
@@ -2940,6 +2951,7 @@ mod test {
                 .decode_into(
                     &mut reader,
                     ColumnDecodeSpec::for_column(&md),
+                    &md,
                     0,
                     &mut writer,
                 )

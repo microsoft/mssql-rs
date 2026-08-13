@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use crate::core::{CancelHandle, TdsResult};
-use crate::datatypes::decode_spec::{ColumnSpec, spec_at};
+use crate::datatypes::decode_spec::{ColumnSpec, resolve_plan};
 use crate::datatypes::decoder::{GenericDecoder, PlpColumnStream, decrypt_encrypted_column};
 use crate::datatypes::row_writer::{DiscardRowWriter, RowWriter, write_column_value};
 use crate::io::packet_reader::TdsPacketReader;
@@ -445,7 +445,7 @@ async fn skip_column<R: TdsPacketReader + Send + Sync>(
         // decoding). Larger change tracked as work item 47154.
         let mut sink = DiscardRowWriter;
         decoder
-            .decode_into(reader, spec.decode, col, &mut sink)
+            .decode_into(reader, spec.decode, meta, col, &mut sink)
             .await
     }
 }
@@ -489,9 +489,9 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send
 ) -> TdsResult<RowReadResult> {
     let decoder = GenericDecoder;
     let columns = &metadata.columns;
-    let plan = metadata.decode_plan();
-    for (col, meta) in columns.iter().enumerate().skip(start_col) {
-        let spec = spec_at(plan, col, meta);
+    let mut rederived = Vec::new();
+    let plan = resolve_plan(metadata.decode_plan(), columns, &mut rederived);
+    for (col, (meta, spec)) in columns.iter().zip(plan).enumerate().skip(start_col) {
         let stop_here = matches!(policy, ColumnPolicy::DecodeOne(target) if target == col);
         let skip = match policy {
             ColumnPolicy::SkipAll => true,
@@ -513,7 +513,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send
         }
 
         if skip {
-            skip_column(&decoder, reader, meta, &spec, col).await?;
+            skip_column(&decoder, reader, meta, spec, col).await?;
             continue;
         }
 
@@ -556,7 +556,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send
             }
         }
 
-        decode_or_decrypt_column(&decoder, reader, meta, &spec, decryptor, col, writer).await?;
+        decode_or_decrypt_column(&decoder, reader, meta, spec, decryptor, col, writer).await?;
 
         if stop_here {
             return Ok(pause_after_column(col, metadata, bitmap, decryptor));
@@ -590,12 +590,12 @@ async fn decode_or_decrypt_column<
                  provider registered); returning the raw ciphertext varbinary"
             );
             decoder
-                .decode_into(reader, spec.decode, col, writer)
+                .decode_into(reader, spec.decode, meta, col, writer)
                 .await?;
         }
         (false, _) => {
             decoder
-                .decode_into(reader, spec.decode, col, writer)
+                .decode_into(reader, spec.decode, meta, col, writer)
                 .await?;
         }
     }
