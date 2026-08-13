@@ -474,14 +474,14 @@ fn pause_after_column(
 /// bytes, or pause. This single loop replaces the former
 /// `decode_row_columns` / `decode_nbcrow_columns` pair and their
 /// `writer.pause_*` polling.
-async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
+async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send + ?Sized>(
     reader: &mut R,
     metadata: &Arc<ColMetadataToken>,
     decryptor: Option<&Arc<dyn CellDecryptor>>,
     bitmap: Option<&[u8]>,
     start_col: usize,
     plan: ColumnPolicy,
-    writer: &mut (dyn RowWriter + Send),
+    writer: &mut W,
 ) -> TdsResult<RowReadResult> {
     let decoder = GenericDecoder::default();
     let columns = &metadata.columns;
@@ -559,13 +559,16 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
     Ok(RowReadResult::RowWritten)
 }
 
-async fn decode_or_decrypt_column<R: TdsPacketReader + Send + Sync>(
+async fn decode_or_decrypt_column<
+    R: TdsPacketReader + Send + Sync,
+    W: RowWriter + Send + ?Sized,
+>(
     decoder: &GenericDecoder,
     reader: &mut R,
     meta: &ColumnMetadata,
     decryptor: Option<&Arc<dyn CellDecryptor>>,
     col: usize,
-    writer: &mut (dyn RowWriter + Send),
+    writer: &mut W,
 ) -> TdsResult<()> {
     match (meta.crypto_metadata.is_some(), decryptor) {
         (true, Some(dec)) => {
@@ -588,12 +591,15 @@ async fn decode_or_decrypt_column<R: TdsPacketReader + Send + Sync>(
     Ok(())
 }
 
-pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
+pub(crate) async fn receive_row_into_internal<
+    R: TdsPacketReader + Send + Sync,
+    W: RowWriter + Send + ?Sized,
+>(
     reader: &mut R,
     registry: &impl TokenParserRegistry,
     context: &ParserContext,
     plan: ColumnPolicy,
-    writer: &mut (dyn RowWriter + Send),
+    writer: &mut W,
 ) -> TdsResult<RowReadResult> {
     let token_type_byte = reader.read_byte().await?;
     let token_type: TokenType = token_type_byte.try_into()?;
@@ -664,11 +670,14 @@ pub(crate) async fn receive_row_header_internal<R: TdsPacketReader + Send + Sync
 /// `plan` to the remaining columns.
 ///
 /// Does not read a token-type byte — the token has already been consumed.
-pub(crate) async fn resume_row_into_internal<R: TdsPacketReader + Send + Sync>(
+pub(crate) async fn resume_row_into_internal<
+    R: TdsPacketReader + Send + Sync,
+    W: RowWriter + Send + ?Sized,
+>(
     reader: &mut R,
     pause_state: RowPauseState,
     plan: ColumnPolicy,
-    writer: &mut (dyn RowWriter + Send),
+    writer: &mut W,
 ) -> TdsResult<RowReadResult> {
     let RowPauseState {
         next_column_index,
