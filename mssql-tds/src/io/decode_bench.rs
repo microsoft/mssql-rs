@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::TdsResult;
-use crate::datatypes::row_writer::DiscardRowWriter;
+use crate::datatypes::row_writer::{DefaultRowWriter, DiscardRowWriter, RowWriter};
 use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
 use crate::io::packet_reader::TdsPacketReader;
 use crate::io::token_stream::{
@@ -336,14 +336,33 @@ fn metadata_token(columns: Vec<ColumnMetadata>) -> Arc<ColMetadataToken> {
 }
 
 /// Decodes every row in `buffer`, returning the elapsed time for the pass.
-async fn one_pass(
+#[derive(Clone, Copy)]
+enum Sink {
+    /// Cheapest possible consumer: maximises decode's share of the total.
+    Discard,
+    /// Materialises `ColumnValues` per cell and hands the row off, which is how
+    /// the public row API and the JS binding actually consume rows.
+    Materialize,
+}
+
+impl Sink {
+    fn label(self) -> &'static str {
+        match self {
+            Sink::Discard => "discard",
+            Sink::Materialize => "materialize",
+        }
+    }
+}
+
+async fn drive<W: RowWriter + Send + ?Sized>(
     buffer: Arc<Vec<u8>>,
     context: &ParserContext,
     registry: &GenericTokenParserRegistry,
     rows: usize,
+    writer: &mut W,
+    mut after_row: impl FnMut(&mut W),
 ) -> Duration {
     let mut reader = BenchReader::new(buffer);
-    let mut writer = DiscardRowWriter;
 
     let start = Instant::now();
     for _ in 0..rows {
@@ -352,16 +371,47 @@ async fn one_pass(
             registry,
             context,
             ColumnPolicy::DecodeAll,
-            &mut writer,
+            writer,
         )
         .await
         .expect("bench row must decode");
         std::hint::black_box(&result);
+        after_row(writer);
     }
     start.elapsed()
 }
 
-async fn measure(label: &str, columns: Vec<ColumnMetadata>) {
+async fn one_pass(
+    buffer: Arc<Vec<u8>>,
+    context: &ParserContext,
+    registry: &GenericTokenParserRegistry,
+    rows: usize,
+    columns: usize,
+    sink: Sink,
+) -> Duration {
+    match sink {
+        Sink::Discard => {
+            drive(
+                buffer,
+                context,
+                registry,
+                rows,
+                &mut DiscardRowWriter,
+                |_| {},
+            )
+            .await
+        }
+        Sink::Materialize => {
+            let mut writer = DefaultRowWriter::new(columns);
+            drive(buffer, context, registry, rows, &mut writer, |w| {
+                std::hint::black_box(w.take_row());
+            })
+            .await
+        }
+    }
+}
+
+async fn measure(label: &str, columns: Vec<ColumnMetadata>, sink: Sink) {
     let rows = rows_per_pass();
     let column_count = columns.len();
     let buffer = build_row_buffer(&columns, rows);
@@ -371,21 +421,40 @@ async fn measure(label: &str, columns: Vec<ColumnMetadata>) {
     let registry = GenericTokenParserRegistry::default();
 
     for _ in 0..WARMUP_PASSES {
-        one_pass(Arc::clone(&buffer), &context, &registry, rows).await;
+        one_pass(
+            Arc::clone(&buffer),
+            &context,
+            &registry,
+            rows,
+            column_count,
+            sink,
+        )
+        .await;
     }
 
     let mut timings: Vec<Duration> = Vec::with_capacity(MEASURED_PASSES);
     for _ in 0..MEASURED_PASSES {
-        timings.push(one_pass(Arc::clone(&buffer), &context, &registry, rows).await);
+        timings.push(
+            one_pass(
+                Arc::clone(&buffer),
+                &context,
+                &registry,
+                rows,
+                column_count,
+                sink,
+            )
+            .await,
+        );
     }
     timings.sort();
 
     let median = timings[MEASURED_PASSES / 2];
     let cells = rows * column_count;
     let ns_per_cell = median.as_nanos() as f64 / cells as f64;
+    let sink = sink.label();
 
     println!(
-        "{label:<18} cols={column_count:<3} rows={rows} cells={cells} \
+        "{label:<18} sink={sink:<12} cols={column_count:<3} rows={rows} cells={cells} \
          bytes={bytes} median={median:?} min={:?} max={:?} ns/cell={ns_per_cell:.2}",
         timings[0],
         timings[MEASURED_PASSES - 1],
@@ -395,11 +464,13 @@ async fn measure(label: &str, columns: Vec<ColumnMetadata>) {
 #[tokio::test]
 #[ignore = "benchmark; run explicitly in release"]
 async fn decode_bench_int_varchar() {
-    measure("int_varchar(#238)", schema_int_varchar()).await;
+    measure("int_varchar(#238)", schema_int_varchar(), Sink::Discard).await;
+    measure("int_varchar(#238)", schema_int_varchar(), Sink::Materialize).await;
 }
 
 #[tokio::test]
 #[ignore = "benchmark; run explicitly in release"]
 async fn decode_bench_mixed() {
-    measure("mixed_shapes", schema_mixed()).await;
+    measure("mixed_shapes", schema_mixed(), Sink::Discard).await;
+    measure("mixed_shapes", schema_mixed(), Sink::Materialize).await;
 }
