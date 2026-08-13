@@ -297,14 +297,3 @@ steps:
       testResultsFormat: "JUnit"
       testResultsFiles: $(Build.SourcesDirectory)/mssql-js/junit.xml
       testRunTitle: $(System.PhaseName)-Js
-
-# On CI the drop carries the Python wheels staged by build-python-wheels-template.
-# PR runs stage nothing into it and no job downloads $(System.PhaseName), so the
-# upload is skipped there rather than publishing an empty artifact.
-- ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
-  - task: PublishBuildArtifacts@1
-    displayName: Publish Build Drop
-    inputs:
-      PathtoPublish: '$(Build.ArtifactStagingDirectory)'
-      ArtifactName: $(System.PhaseName)
-      publishLocation: Container
