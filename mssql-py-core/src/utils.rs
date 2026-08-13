@@ -14,6 +14,7 @@ pub fn convert_error(error: anyhow::Error) -> PyErr {
 }
 
 /// Convert TDS errors to appropriate Python exceptions
+// TODO(User Story 47181): return a DB-API-compliant exception (DatabaseError / OperationalError / ProgrammingError) preserving SQLSTATE + server error number; current mapping is a placeholder.
 pub fn convert_tds_error(error: TdsError) -> PyErr {
     match error {
         TdsError::UsageError(msg) => {

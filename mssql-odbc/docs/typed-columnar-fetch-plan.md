@@ -75,18 +75,34 @@ Both paths must share one conversion core: `ColumnValues -> requested SQL_C_* ta
 - Start with int types (existing child task [46404](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46404)) and int→char/wchar (existing child task [46405](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46405)), then floats, decimal/numeric (→ `SQL_C_CHAR`), strings, binary, guid, date/time/timestamp/time2/timestampoffset, money, xml, json/vector.
 - Add chunked-offset streaming so repeated `SQLGetData` calls advance (`01004` + `SQL_SUCCESS_WITH_INFO` reporting remaining length). **Moved out of P1** — chunked retrieval and incremental PLP streaming are owned by the fetch rework in [#153](https://github.com/microsoft/mssql-rs/pull/153) (column-wise fetch + incremental PLP), which uses ODBC wire-stream state rather than an offset over a materialized value. P1 returns each value in a single call and reports truncation with `01004`.
 - Implement `sql_variant` probe semantics (`SQL_C_BINARY` NULL detection + variant metadata init).
+- **Binary targets regressed out of P1 and are not implemented.** `SQL_C_BINARY` was implemented alongside the chunked-offset streaming, so removing that streaming (ceding it to [#153](https://github.com/microsoft/mssql-rs/pull/153)) took `SQL_C_BINARY` with it; the target gate in `write_captured_column` now rejects it with `HYC00`. Separately, binary → character (hex rendering) has never been implemented in any phase: `ColumnValues::Bytes` has no `column_value_to_text` arm. Note that the e2e test `GetDataLiveTest.UnsupportedColumnTypeHyc00PreservesValue` is currently anchored on `VARBINARY(8)` being unconvertible, so implementing binary → char requires re-pointing it (see the maintenance note in that test).
 - Add the e2e coverage deferred from P0: a `set_stmt_attr_test.cpp` (parity with `set_env_attr_test.cpp`) plus a live-connection test that drives typed `SQLGetData` through the Driver Manager. P0's statement attributes (`SQL_ATTR_ROW_ARRAY_SIZE`, etc.) are descriptor-backed and intercepted by unixODBC, so they are only meaningfully observable end-to-end once a fetch path consumes them here (block fetch lands in P3).
 
 ### P1a — Mandatory source-type conversions — Task [47107](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47107)
 
-ODBC Appendix D requires a driver to support conversions to **all** ODBC C types from every SQL type it supports. P1 implements the integer, floating-point, GUID and date/time targets, but only from a subset of sources. The following pairings still fail and must be added:
+ODBC Appendix D requires a driver to support conversions to **all** ODBC C types from every SQL type it supports. P1 implemented the integer, floating-point, GUID and date/time targets, but only from a subset of sources. P1a added the missing source types, delivered in PR #217:
 
-- `decimal` / `numeric` → the numeric C targets (`SQL_C_DOUBLE`, `SQL_C_FLOAT`, `SQL_C_SLONG`, `SQL_C_SBIGINT`, …). `numeric_source_as_f64` currently rejects the exact-decimal types.
-- `money` / `smallmoney` → the numeric C targets.
-- Character sources (`char` / `varchar` / `nchar` / `nvarchar`) → numeric and date/time C targets (e.g. `'123'` → `SQL_C_SLONG`, `'2023-06-15'` → `SQL_C_TYPE_DATE`), with `22018` when the text is not a valid literal for the target.
-- Lossy **numeric** conversions must report fractional truncation with `01S07` + `SQL_SUCCESS_WITH_INFO` (e.g. `float` `1234.99` → `SQL_C_SLONG` yields `1234` + `01S07`). The `01S07` diagnostic and the `ConvOk::Truncated` plumbing already exist (P1 uses them for date/time targets that discard a component); P1a extends them to the numeric conversions above.
+- `decimal` / `numeric` → the numeric C targets (`SQL_C_DOUBLE`, `SQL_C_FLOAT`, `SQL_C_SLONG`, `SQL_C_SBIGINT`, …). A `NumericSource` abstraction keeps the exact-decimal types exact instead of routing them through `f64`, so an integer target can report truncation rather than silently dropping a fraction.
+- `money` / `smallmoney` → the numeric C targets, from their 10^4-scaled wire value.
+- Character sources (`char` / `varchar` / `nchar` / `nvarchar`) → numeric and date/time C targets (`'123'` → `SQL_C_SLONG`, `'2023-06-15'` → `SQL_C_TYPE_DATE`). Decimal literals parse exactly, with an `f64` fallback for exponent forms; the `date` / `time` / `datetime2` / `datetimeoffset` character forms are all accepted. Text that is not a valid literal for the requested target returns `22018`, including a literal that parses as a different temporal shape (`'12:00'` into `SQL_C_TYPE_DATE`) and impossible calendar dates (`'2023-02-31'`).
+- Lossy **numeric** conversions report fractional truncation with `01S07` + `SQL_SUCCESS_WITH_INFO` (`float` `1234.99` → `SQL_C_SLONG` yields `1234` + `01S07`), reusing the `ConvOk::Truncated` plumbing P1 introduced for date/time targets that discard a component.
 
-Until then these pairings return `HYC00` (not implemented) rather than converting.
+A source with no interpretation for the requested target (binary, guid) is `07006`, since that pairing is illegal rather than unimplemented.
+
+Max-length character sources (`varchar(max)` / `nvarchar(max)`) into the numeric and date/time targets are **excluded** from P1a and tracked as Task [47238](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47238). They arrive as PLP, so parsing needs the ODBC layer to accumulate chunks, which inverts the "never buffer the full PLP payload" invariant that `stream_active_plp_chunk` documents. That work is sequenced after #204 and #215, which are both rewriting the same read path, and needs a bounded-prefix policy agreed first so a 2 GB column cannot be drained to produce a `SQL_C_SLONG`.
+
+#### Known divergences from msodbcsql
+
+These were found by reading `Sql/Ntdbms/sqlncli/odbc/sqlccnvt.cpp` while reviewing P1a. They are recorded here because `GetDataLiveTest` skips the msodbcsql comparison leg for these cases, so the parity run will not surface them.
+
+| Case | msodbcsql | mssql-odbc | Status |
+| --- | --- | --- | --- |
+| A UTC offset in a literal, for any target other than `SQL_C_SS_TIMESTAMPOFFSET` | shifts the value into the client's local zone (`ConvertOffsetToLocal`) | validates the offset, then delivers the wall-clock fields as written | **Deliberate.** Matching would make the returned value depend on the client machine's time zone. Locked in by `offset_is_ignored_for_non_offset_targets`. |
+| Character or decimal source into `SQL_C_TINYINT` above 127 | `22003` — the signed limit applies whenever the input type is not itself a tinyint C type | `Ok(200)` — the target is `u8`, matching a real `tinyint` column (0-255) and what mssql-python fetches | **Deliberate**, but P1a is what first opens these sources into that target, so the divergence starts here. |
+| `YYYY/MM/DD` and the ODBC escape literals `{d '...'}` / `{t '...'}` / `{ts '...'}` | accepted (`rgbECODE_DATE_SLASH` retry, and the `FindECode` branch) | `22018` | Gap — Task [47246](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47246). |
+| `T` separator, `HH:MM` without seconds, unpadded fields such as `2023-6-5` | rejected (fixed-length token grammar) | accepted | Permissive. Low risk, same task. |
+| A time-only value into `SQL_C_TYPE_TIMESTAMP` | fills in the current date and succeeds, per Appendix D | `22018` from a character source, `07006` from a `time` column | Gap — Task [47247](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47247). Needs a platform-specific local-date helper, so it is not a one-line fix. |
+| Any source into `SQL_C_NUMERIC` | converts, per Appendix D | `HYC00` | **Deliberate, and permanent.** Decimal is delivered as character data, which is what mssql-python requests, so `SQL_NUMERIC_STRUCT` is not scheduled to become supported. Anchored by `UnsupportedCTypeReturnsHyc00ThenValueReadable`. |
 
 ### P2 — SQLColAttributeW — Task [46579](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46579)
 
@@ -131,8 +147,8 @@ Both of those landed with the fetch rework in [#153](https://github.com/microsof
 | Phase | Task | State |
 | --- | --- | --- |
 | P0 — Prerequisites & plumbing | 46577 | Implemented (build + clippy clean, 332 tests pass) |
-| P1 — Typed SQLGetData | 46578 | Implemented (int/float/guid/date-time C targets + char/binary rendering; 491 tests pass). Chunked retrieval and incremental PLP streaming are owned by #153 (merged), on top of which the typed targets are dispatched; missing source-type conversions tracked as P1a; `sql_variant` underlying-type resolution deferred to P2. |
-| P1a — Mandatory source-type conversions | 47107 | Not started |
+| P1 — Typed SQLGetData | 46578 | Implemented (int/float/guid/date-time C targets + char/wchar rendering; 491 tests pass). Chunked retrieval and incremental PLP streaming are owned by #153 (merged), on top of which the typed targets are dispatched; missing source-type conversions tracked as P1a; `SQL_C_BINARY` and binary→char hex are **not** implemented (see the P1 section); `sql_variant` underlying-type resolution deferred to P2. |
+| P1a — Mandatory source-type conversions | 47107 | Implemented (decimal, money and character sources into the numeric and date/time C targets; `01S07` on lossy numeric conversion, `22018` on an invalid character literal). |
 | P2 — SQLColAttributeW | 46579 | Not started |
 | P3 — SQLBindCol + SQLFetchScroll | 46580 | Not started |
 | P4 — Exports & driver-load compat | 46581 | Not started |

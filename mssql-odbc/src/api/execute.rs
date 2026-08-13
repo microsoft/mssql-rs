@@ -6,17 +6,16 @@
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::StatementResult;
+use mssql_tds::connection::tds_client::{ExecuteOptions, StatementId, StatementResult};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{build_named_params, claim_connection, fail_with_tds, finish_execute};
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
-use super::util::rewrite_param_markers;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
 use crate::error::free_errors;
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+    PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -47,59 +46,74 @@ unsafe fn sql_execute_impl(statement_handle: SqlHandle) -> SqlReturn {
 
 /// Values gathered under the STMT lock before any network I/O.
 struct Execution {
-    rewritten_sql: String,
     named_params: Vec<RpcParameter>,
-    handle: Option<i32>,
-    /// A superseded prepared handle (from a prior rebind / re-prepare) to be dropped
-    /// on the server
-    drop_handle: Option<i32>,
+    /// The prepared plan moved out of `StmtState` for the execute; written
+    /// back afterward (possibly re-prepared with a fresh handle).
+    prepared: PreparedPlan,
+    /// A prepared statement's still-live handle, superseded by a prior rebind /
+    /// re-prepare, dropped by piggyback on this execute.
+    orphaned: Option<StatementId>,
 }
 
 fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
-    let exec = match stage_execution(stmt) {
+    let Execution {
+        named_params,
+        mut prepared,
+        mut orphaned,
+    } = match stage_execution(stmt) {
         Ok(exec) => exec,
         Err(rc) => return rc,
     };
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
         Ok(client) => client,
-        Err(rc) => return rc,
+        Err(rc) => {
+            // Staging moved the prepared statement (and any pending orphan) out;
+            // a failed connection claim runs nothing, so put them back so the
+            // statement stays prepared and re-executable. `claim_connection`
+            // already cleared `EXEC_STARTED`.
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                stmt_state.prepared = Some(prepared);
+                stmt_state.pending_unprepare = orphaned;
+            }
+            return rc;
+        }
     };
 
     if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecute") {
+        // Nothing ran, so put the staged statement (and any pending orphan)
+        // back before reporting, exactly as the failed-claim path does.
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            stmt_state.prepared = Some(prepared);
+            stmt_state.pending_unprepare = orphaned;
+        }
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    let exec_result = match exec.handle {
-        // Already prepared: reuse the cached server handle (msodbcsql
-        // `cmdp.hPrepCurrent`) via sp_execute. No pending prepared handle drop can
-        // exist here. (StmtState invariant: `pending_unprepare` is set only when
-        // `prepared_handle` is None), so nothing to release.
-        Some(handle) => dbc.runtime.block_on(client.execute_sp_execute(
-            handle,
-            None,
-            Some(exec.named_params),
-            (),
-        )),
-        // First execute / re-prepare: prepare and run in one round trip via
-        // sp_prepexec (deferred-prepare path). A prepared handle superseded
-        // by a prior rebind / re-prepare is dropped in the same RPC by passing
-        // it as sp_prepexec's `@handle` input (`drop_handle`). This avoids
-        // a separate `sp_unprepare` round trip.
-        //
-        // NOTE: msodbcsql falls back to sp_prepare + sp_execute for statements
-        // with data-at-execution (DAE) parameters, which sp_prepexec can't
-        // carry. Phase 1 rejects DAE params at bind time, so that case can't
-        // occur here yet - add the sp_prepare branch when DAE support lands.
-        None => dbc.runtime.block_on(client.execute_sp_prepexec(
-            exec.rewritten_sql,
-            exec.named_params,
-            exec.drop_handle,
-            (),
-        )),
-    };
+    // `execute_prepared` owns the whole recovery sequence: reconnect once up
+    // front (mirrors msodbcsql `GetBatchCtxOrRecover`), charge it against the
+    // command timeout, then reuse the cached handle or transparently re-prepare
+    // when it belongs to a superseded session (msodbcsql `FIsReprepareRequired`).
+    // A still-live orphaned handle is released by piggyback on the re-prepare.
+    //
+    // Command timeout (SQL_ATTR_QUERY_TIMEOUT) isn't wired up yet; the default
+    // `ExecuteOptions` means no per-command limit.
+    let exec_result = dbc.runtime.block_on(client.execute_prepared(
+        &mut prepared.stmt,
+        named_params,
+        &mut orphaned,
+        ExecuteOptions::default(),
+    ));
+
+    // Write the statement back along with any orphan that was not consumed
+    // because execution failed before the prepexec send boundary. The fresh
+    // handle's RETURNVALUE arrives after the result set and is captured later.
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        stmt_state.prepared = Some(prepared);
+        stmt_state.pending_unprepare = orphaned;
+    }
 
     let stmt_result = match exec_result {
         Ok(result) => result,
@@ -112,8 +126,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
     // A prepared statement runs a single SQL statement. If it produced no result
     // set (DML / no-row), drain its trailing tokens so the statement is left idle
     // and immediately re-executable (msodbcsql parity) instead of leaving a
-    // 0-column cursor open — matching how the pre-statement-wise path collapsed
-    // no-row results. A row-returning statement keeps its cursor open for
+    // 0-column cursor open. A row-returning statement keeps its cursor open for
     // SQLFetch; its `@handle` RETURNVALUE (sp_prepexec) is captured later at
     // drain time (SQLCloseCursor / the DDL finish path).
     if !matches!(stmt_result, StatementResult::Rows)
@@ -141,13 +154,13 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
     // The release-path fallback still returns SQL_ERROR since we have no SQL
     // to run, but it can't be reached through a conforming Driver Manager.
     debug_assert!(
-        stmt_state.prepared_sql.is_some(),
+        stmt_state.prepared.is_some(),
         "SQLExecute: statement not prepared — DM should have rejected this"
     );
-    let Some(sql) = stmt_state.prepared_sql.clone() else {
+    if stmt_state.prepared.is_none() {
         error!("SQLExecute: statement has not been prepared");
         return Err(SQL_ERROR);
-    };
+    }
 
     if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
         error!("SQLExecute: statement has an active execute or open cursor");
@@ -155,12 +168,20 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
         return Err(SQL_ERROR);
     }
 
-    let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
-
+    let marker_count = stmt_state
+        .prepared
+        .as_ref()
+        .expect("prepared checked non-None above")
+        .marker_count;
     let named_params = unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
 
-    let handle = stmt_state.prepared_handle;
-    let drop_handle = stmt_state.pending_unprepare.take();
+    // All fallible validation passed: move the prepared plan out (written
+    // back after the execute) and take any orphaned handle for piggyback drop.
+    let prepared = stmt_state
+        .prepared
+        .take()
+        .expect("prepared checked non-None above");
+    let orphaned = stmt_state.pending_unprepare.take();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.column_metadata.clear();
     stmt_state.reset_row_stream();
@@ -169,10 +190,9 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
     stmt_state.set_state(STMT_STATE_EXEC_STARTED);
 
     Ok(Execution {
-        rewritten_sql,
         named_params,
-        handle,
-        drop_handle,
+        prepared,
+        orphaned,
     })
 }
 
@@ -180,12 +200,18 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
 mod tests {
     use super::*;
     use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::api::util::rewrite_param_markers;
     use crate::test_support::TestHandles;
+    use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 
     fn set_prepared(stmt_raw: SqlHandle, sql: &str) {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_raw) };
+        let (rewritten, marker_count) = rewrite_param_markers(sql);
         let mut state = stmt.inner.lock().unwrap();
-        state.prepared_sql = Some(sql.to_string());
+        state.prepared = Some(PreparedPlan {
+            stmt: PreparedStatement::new(rewritten),
+            marker_count,
+        });
     }
 
     #[test]
@@ -279,42 +305,72 @@ mod tests {
     }
 
     #[test]
-    fn stage_execution_threads_pending_unprepare_as_drop_handle() {
+    fn stage_execution_moves_prepared_out_and_threads_orphaned_handle() {
         // A handle orphaned by a prior rebind / re-prepare lives in
-        // `pending_unprepare` with `prepared_handle == None`. Staging must move
-        // it into `drop_handle` (to piggyback onto sp_prepexec) and consume it
-        // so it can't be dropped twice.
+        // `pending_unprepare`. Staging must move the prepared statement out and
+        // hand the orphan to `orphaned` for a piggyback drop, consuming it so it
+        // can't be released twice.
         let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "SELECT 1");
+        let orphan = StatementId::from_raw_for_test(42);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut state = stmt.inner.lock().unwrap();
-            state.prepared_sql = Some("SELECT 1".to_string());
-            state.pending_unprepare = Some(42);
-        }
+        stmt.inner.lock().unwrap().pending_unprepare = Some(orphan);
 
         let exec = stage_execution(stmt).expect("staging should succeed");
-        assert_eq!(exec.handle, None);
-        assert_eq!(exec.drop_handle, Some(42));
+        assert_eq!(exec.orphaned, Some(orphan));
+        assert_eq!(exec.prepared.stmt.sql(), "SELECT 1");
 
         let state = stmt.inner.lock().unwrap();
-        assert!(state.pending_unprepare.is_none());
+        assert!(state.prepared.is_none(), "prepared moved out of state");
+        assert!(state.pending_unprepare.is_none(), "orphan consumed");
+        assert!(state.has_state(STMT_STATE_EXEC_STARTED));
     }
 
     #[test]
-    fn stage_execution_reuse_path_has_no_drop_handle() {
-        // With a cached `prepared_handle`, the next execute reuses it via
-        // sp_execute; the invariant guarantees no pending drop, so `drop_handle`
-        // is None.
+    fn stage_execution_without_pending_has_no_orphaned_handle() {
+        // Nothing pending: staging threads no orphan, so the execute won't
+        // piggyback a drop.
         let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "SELECT 1");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut state = stmt.inner.lock().unwrap();
-            state.prepared_sql = Some("SELECT 1".to_string());
-            state.prepared_handle = Some(7);
-        }
 
         let exec = stage_execution(stmt).expect("staging should succeed");
-        assert_eq!(exec.handle, Some(7));
-        assert_eq!(exec.drop_handle, None);
+        assert_eq!(exec.orphaned, None);
+        assert_eq!(exec.prepared.stmt.sql(), "SELECT 1");
+        assert!(stmt.inner.lock().unwrap().prepared.is_none());
+    }
+
+    #[test]
+    fn failed_connection_claim_restores_prepared_statement() {
+        // Staging moves the prepared statement (and any pending orphan) out
+        // before the connection is claimed. When the claim fails (here: the DBC
+        // is not connected) the statement must be restored so a retried
+        // SQLExecute still sees it as prepared and re-executable, rather than
+        // silently unprepared.
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "SELECT 1");
+        let orphan = StatementId::from_raw_for_test(42);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().pending_unprepare = Some(orphan);
+
+        let ret = unsafe { sql_execute(h.stmt) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_CONNECTION_DOES_NOT_EXIST.state
+        );
+        assert_eq!(
+            state.prepared.as_ref().map(|p| p.stmt.sql()),
+            Some("SELECT 1"),
+            "the prepared statement must be restored after a failed connection claim"
+        );
+        assert_eq!(
+            state.pending_unprepare,
+            Some(orphan),
+            "the pending orphan must be restored so its drop is not lost"
+        );
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }
 }

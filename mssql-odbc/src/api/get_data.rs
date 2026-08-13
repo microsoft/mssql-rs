@@ -302,8 +302,9 @@ fn write_captured_column(
     let as_text = match column_value_to_text(value) {
         Ok(t) => t,
         Err(TextError::Malformed) => {
-            // The server payload could not be decoded. Leave the value resident;
-            // a retry with SQL_C_BINARY can still read the raw bytes.
+            // Leave the value resident so the column stays re-readable. There is no
+            // raw-bytes fallback today: SQL_C_BINARY is rejected by the target gate
+            // above.
             error!("SQLGetData: column payload could not be decoded as text");
             post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE);
             return SQL_ERROR;
@@ -948,6 +949,10 @@ fn finish_typed_conv(
             post_diag(stmt_state, ERR_RESTRICTED_DATA_TYPE);
             SQL_ERROR
         }
+        Err(ConvError::InvalidCharacterValue) => {
+            post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE);
+            SQL_ERROR
+        }
         Err(ConvError::NotHandledHere) => {
             post_sql_error(
                 stmt_state,
@@ -1014,9 +1019,9 @@ fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError> {
         ColumnValues::Float(x) => Ok(x.to_string()),
         ColumnValues::Bit(x) => Ok(if *x { "1".into() } else { "0".into() }),
         ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => Ok(d.to_string()),
-        ColumnValues::Money(m) => Ok(money_scaled_to_string(
-            (i64::from(m.lsb_part) & 0xFFFF_FFFF) | (i64::from(m.msb_part) << 32),
-        )),
+        ColumnValues::Money(m) => Ok(money_scaled_to_string(super::fetch_convert::money_scaled(
+            m.lsb_part, m.msb_part,
+        ))),
         ColumnValues::SmallMoney(m) => Ok(money_scaled_to_string(i64::from(m.int_val))),
         // `SqlString::to_utf8_string` unwraps on its UTF-8 branch; decode fallibly.
         ColumnValues::String(s) => sql_string_to_text(s).ok_or(TextError::Malformed),
@@ -1534,10 +1539,10 @@ mod tests {
         assert_last_diag(&s.diag_records, ERR_INVALID_CHARACTER_VALUE);
     }
 
-    /// Character into a date/time target is legal per Appendix D and lands in
-    /// P1a, so it must report "not implemented" rather than claiming 07006.
+    /// Character into a date/time target is legal per Appendix D and is
+    /// implemented as of P1a.
     #[test]
-    fn get_data_character_into_date_target_is_not_implemented() {
+    fn get_data_character_into_date_target_converts() {
         use crate::api::odbc_types::SqlDateStruct;
         use mssql_tds::datatypes::sql_string::SqlString;
         let h = TestHandles::with_env_dbc_stmt();
@@ -1558,12 +1563,41 @@ mod tests {
                 &mut ind,
             )
         };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!((out.year, out.month, out.day), (2023, 6, 15));
+        assert_eq!(ind, std::mem::size_of::<SqlDateStruct>() as SqlLen);
+    }
+
+    /// Character that is not a valid literal for the target is 22018, not a
+    /// silent zero value.
+    #[test]
+    fn get_data_invalid_character_into_date_target_is_22018() {
+        use crate::api::odbc_types::SqlDateStruct;
+        use mssql_tds::datatypes::sql_string::SqlString;
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(
+            &h,
+            ColumnValues::String(SqlString::from_utf8_string("not a date".to_string())),
+        );
+
+        let mut out = SqlDateStruct::default();
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                crate::api::odbc_types::SQL_C_TYPE_DATE,
+                (&mut out as *mut SqlDateStruct).cast(),
+                std::mem::size_of::<SqlDateStruct>() as SqlLen,
+                &mut ind,
+            )
+        };
         assert_eq!(ret, SQL_ERROR);
         let s = unsafe { handle_from_raw::<StmtHandle>(h.stmt) }
             .inner
             .lock()
             .unwrap();
         let last = s.diag_records.last().unwrap();
-        assert_eq!(&last.sql_state, b"HYC00");
+        assert_eq!(&last.sql_state, b"22018");
     }
 }
