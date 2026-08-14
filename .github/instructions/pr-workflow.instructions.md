@@ -18,6 +18,7 @@ Follow this workflow for pull requests in `microsoft/mssql-rs`.
 - Address Copilot feedback before requesting human review.
 - Watch PR validation pipelines and fix any failures.
 - Iterate until all feedback is addressed and validation passes on the latest commit.
+- Update the PR description to reflect the latest changes.
 - Mark the PR as ready for review only after the latest commit has passing validation and the author has completed a self-review.
 - Request human review after the PR is ready for review.
 

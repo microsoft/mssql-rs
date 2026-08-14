@@ -208,17 +208,11 @@ fn numeric_source(value: &ColumnValues) -> Option<NumericSource> {
         ColumnValues::Bit(b) => Some(NumericSource::Int(i128::from(*b))),
         ColumnValues::Real(x) => Some(NumericSource::Float(f64::from(*x))),
         ColumnValues::Float(x) => Some(NumericSource::Float(*x)),
-        // `DecimalParts` stores a base-2^32 little-endian magnitude; reassemble
-        // it directly. 38 digits fit in 4 limbs, and the wire decoder admits up
-        // to 64, so reject longer payloads rather than shifting past 128 bits.
+        // `DecimalParts` stores a base-2^32 little-endian magnitude. 38 digits
+        // fit in 4 words, and `magnitude` returns `None` for a wider (malformed)
+        // value rather than shifting past 128 bits.
         ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
-            if d.int_parts.len() > 4 {
-                return None;
-            }
-            let mag = d.int_parts.iter().enumerate().fold(0u128, |acc, (i, &p)| {
-                acc | (u128::from(p as u32) << (i * 32))
-            });
-            let m = i128::try_from(mag).ok()?;
+            let m = i128::try_from(d.magnitude()?).ok()?;
             Some(NumericSource::Scaled {
                 mantissa: if d.is_positive { m } else { -m },
                 scale: u32::from(d.scale),
@@ -1403,7 +1397,8 @@ mod tests {
 
     /// The limbs are reassembled directly, and a payload with more limbs than
     /// 128 bits can hold is refused instead of shifting past the width. The wire
-    /// decoder admits up to 64 limbs, so this is reachable from a bad payload.
+    /// decoder now caps the count at 4, so the oversized case below is reachable
+    /// only through FFI or a hand-built `DecimalParts`.
     #[test]
     fn decimal_limbs_are_reassembled_and_bounded() {
         use mssql_tds::datatypes::decoder::DecimalParts;
@@ -1468,6 +1463,20 @@ mod tests {
         }
         .unwrap_err();
         assert_eq!(err, ConvError::Restricted);
+
+        // Zero-padded limbs past the fourth carry no magnitude, so this path
+        // agrees with the string rendering instead of refusing the value.
+        let ok = unsafe {
+            convert_integer_c(
+                &decimal(true, 2, vec![12345, 0, 0, 0, 0, 0]),
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, 123);
     }
 
     /// Multi-byte input must not panic while probing for a trailing UTC offset:

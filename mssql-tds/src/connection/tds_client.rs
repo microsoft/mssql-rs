@@ -159,14 +159,16 @@ pub struct TdsClient {
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
     info_messages: Vec<SqlInfoMessage>,
-    /// Per-prepared-handle Always Encrypted parameter metadata, captured by
-    /// `execute_sp_prepare` from `sp_describe_parameter_encryption` and reused by
-    /// `execute_sp_execute` to encrypt parameter values without describing again.
-    /// Holds an `Arc` to the same describe result stored in
-    /// `query_metadata_cache`, pinning it for the prepared statement's lifetime
-    /// even if the shared cache evicts it. Evicted by `execute_sp_unprepare`.
+    /// Per-statement Always Encrypted parameter metadata, keyed by the same
+    /// client-issued [`StatementId`] as `prepared_handles`. Captured by
+    /// `execute_sp_prepare` / `sp_prepexec` from
+    /// `sp_describe_parameter_encryption` and reused by `execute_sp_execute` to
+    /// encrypt parameter values without describing again. Holds an `Arc` to the
+    /// same describe result stored in `query_metadata_cache`, pinning it for the
+    /// statement's lifetime even if the shared cache evicts it. Evicted when the
+    /// statement is unprepared or superseded, and cleared on reconnect.
     prepared_param_encryption: HashMap<
-        i32,
+        StatementId,
         std::sync::Arc<
             crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult,
         >,
@@ -198,14 +200,29 @@ pub struct TdsClient {
     /// result-decryption paths to honor per-command overrides.
     current_command_ce_setting: crate::connection::client_context::ExecutionColumnEncryptionSetting,
 
-    /// Set while an `sp_prepexec` is in flight, cleared once its `@handle`
-    /// output parameter (RETURNVALUE ordinal 0) has been captured.
-    expecting_prepare_handle: bool,
-    /// Prepared-statement handle from the most recent `sp_prepexec`, surfaced
-    /// via [`take_prepared_statement_handle`](Self::take_prepared_statement_handle).
-    /// Kept separately because [`close_query`](Self::close_query) clears
-    /// `return_values` once the batch has been drained.
-    prepared_statement_handle: Option<i32>,
+    /// The [`StatementId`] awaiting its `@handle` from an in-flight managed
+    /// `sp_prepexec` (armed by [`execute_prepared`](Self::execute_prepared));
+    /// `None` once captured, aborted, or on the raw protocol path (sp_* RPCs directly,
+    /// where `@handle` is left in `return_values` like any other output parameter).
+    pending_capture: Option<StatementId>,
+    /// Always Encrypted metadata produced for the in-flight `sp_prepexec`,
+    /// pinned under the statement's id when its handle is captured from the
+    /// token stream.
+    pending_prepared_param_encryption: Option<
+        Arc<crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult>,
+    >,
+
+    /// Monotonic source of [`StatementId`]s for managed prepared statements.
+    /// Never reset (including across reconnect) so an id is never reused within
+    /// this client's lifetime.
+    next_statement_id: u64,
+    /// Live server handles of prepared statements, keyed by their client-issued
+    /// [`StatementId`]. Owned by the sp_* RPCs: written by `execute_sp_prepare`
+    /// and by `push_return_value` when the `sp_prepexec` `@handle` RETURNVALUE
+    /// lands, removed by `execute_sp_unprepare`. Cleared on reconnect — the old
+    /// session's handles are gone — so "stale" collapses to "absent from the
+    /// map".
+    prepared_handles: HashMap<StatementId, i32>,
 
     /// The remaining request timeout for operations. This is updated after each token read.
     pub(in crate::connection) remaining_request_timeout: Option<Duration>,
@@ -258,8 +275,10 @@ impl TdsClient {
             current_result_set_has_been_read_till_end: false,
             current_command_ce_setting:
                 crate::connection::client_context::ExecutionColumnEncryptionSetting::default(),
-            expecting_prepare_handle: false,
-            prepared_statement_handle: None,
+            pending_capture: None,
+            pending_prepared_param_encryption: None,
+            next_statement_id: 0,
+            prepared_handles: HashMap::new(),
             remaining_request_timeout: None,
             cancel_handle: None,
             empty_metadata: Vec::new(),
@@ -391,8 +410,12 @@ impl TdsClient {
                     // drop their cached Always Encrypted metadata to avoid
                     // encrypting a later sp_execute with a stale describe result.
                     self.prepared_param_encryption.clear();
-                    self.expecting_prepare_handle = false;
-                    self.prepared_statement_handle = None;
+                    self.pending_capture = None;
+                    self.pending_prepared_param_encryption = None;
+                    // Managed prepared handles belong to the dead session; drop
+                    // them so a later `execute_prepared` re-prepares against the
+                    // new session instead of aliasing an unrelated handle.
+                    self.prepared_handles.clear();
                     self.current_result_set_has_been_read_till_end = false;
                     self.remaining_request_timeout = None;
                     self.cancel_handle = None;
@@ -516,6 +539,14 @@ impl TdsClient {
     ///
     /// The bulk copy API uses `0` to mean "no timeout" (infinite). This helper
     /// normalises that convention so `Some(0)` becomes `None` (no deadline).
+    ///
+    /// Only pass a *caller-supplied* timeout here. A value returned by
+    /// [`deduct_timeout`](Self::deduct_timeout) can be `Some(0)` meaning "budget
+    /// exhausted", which this helper would silently widen to `None` (infinite) —
+    /// the opposite of the intent. Handle that exhaustion before converting; see
+    /// `deduct_timeout`'s "Interpreting `Some(0)`" note. This is latent today
+    /// (the ODBC path passes `None`) and is slated to be fixed when
+    /// `SQL_ATTR_QUERY_TIMEOUT` is wired.
     pub(in crate::connection) fn timeout_to_duration(timeout_sec: Option<u32>) -> Option<Duration> {
         timeout_sec.and_then(|secs| {
             if secs == 0 {
@@ -540,25 +571,48 @@ impl TdsClient {
 
     /// Pre-execution check: detect a dead connection and attempt session recovery.
     ///
-    /// Called at the top of every method that sends a TDS request (SQL batch,
-    /// RPC, bulk load, `BEGIN TRANSACTION`). If session recovery was negotiated
-    /// and the underlying TCP socket is dead, this will attempt `reconnect()`.
+    /// Call this at the top of any operation that sends a TDS request (SQL
+    /// batch, RPC, bulk load, `BEGIN TRANSACTION`). Recovery is attempted only
+    /// when all of the following hold; otherwise this is a cheap no-op that
+    /// returns `Duration::ZERO`:
+    /// - session recovery was negotiated at login, and the server offered a
+    ///   retry count (`connect_retry_count > 0`); and
+    /// - the underlying socket is actually dead (a non-blocking poll).
     ///
-    /// Returns the time spent reconnecting so callers can deduct it from the
-    /// command timeout. When no reconnection is needed, returns `Duration::ZERO`.
+    /// `timeout_sec` is the overall budget for recovery **and** the subsequent
+    /// execution, matching ODBC's `CheckOrRecoverConnection` (which deducts
+    /// recovery time from the remaining command timeout). Charge the returned
+    /// duration back with [`deduct_timeout`](Self::deduct_timeout) so a
+    /// 30-second command timeout still means at most 30 seconds total whether
+    /// or not a reconnect occurred. When `timeout_sec` is `None` or `Some(0)`,
+    /// recovery is instead bounded by the login `connect_timeout`, so it can
+    /// never block indefinitely.
     ///
-    /// The command timeout (`timeout_sec`) is used as the overall budget for
-    /// recovery + execution, matching ODBC's `CheckOrRecoverConnection` which
-    /// deducts recovery time from the remaining command timeout via
-    /// `timer.GetTimeoutLeft()`. This ensures applications can set reliable
-    /// SLAs — a 30-second command timeout means at most 30 seconds total,
-    /// regardless of whether a reconnect occurred.
+    /// Operations inside an active transaction (`COMMIT`, `ROLLBACK`, `SAVE`)
+    /// intentionally skip recovery — `is_recovery_possible()` returns `false`
+    /// while a transaction is open, matching SqlClient's
+    /// `RestoreBrokenConnection` behavior.
     ///
-    /// Methods that operate within an active transaction (`COMMIT`, `ROLLBACK`,
-    /// `SAVE`) intentionally skip this — `is_recovery_possible()` returns
-    /// `false` when a transaction is active, matching SqlClient's
-    /// `RestoreBrokenConnection` flag behavior.
-    pub(in crate::connection) async fn check_and_reconnect(
+    /// A caller managing prepared statements uses this as its single recovery
+    /// point: a successful reconnect clears the client's prepared-handle map, so
+    /// the next [`execute_prepared`](Self::execute_prepared) re-prepares against
+    /// the new session instead of addressing a plan that died with the old one.
+    ///
+    /// # Parameters
+    /// - `timeout_sec`: recovery budget in seconds; `None` (or `Some(0)`) falls
+    ///   back to the connection's `connect_timeout`.
+    /// - `cancel_handle`: optional token used to abort an in-progress reconnect.
+    ///
+    /// # Returns
+    /// The wall-clock time spent reconnecting, or `Duration::ZERO` when no
+    /// reconnect was needed.
+    ///
+    /// # Errors
+    /// Returns [`Error::ConnectionClosed`](crate::error::Error::ConnectionClosed)
+    /// when the socket is dead but the session state forbids recovery (e.g. an
+    /// open transaction), and propagates any error raised by the underlying
+    /// `reconnect()` attempt (including a timed-out or cancelled reconnect).
+    pub(crate) async fn check_and_reconnect(
         &mut self,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
@@ -612,10 +666,35 @@ impl TdsClient {
         Ok(start.elapsed())
     }
 
-    /// Subtracts `elapsed` from `timeout_sec`, returning the remaining seconds.
-    /// Returns `Some(0)` (immediate timeout) if recovery consumed the entire budget.
-    /// Passes through `None` (no timeout) unchanged.
-    /// Rounds up to avoid exceeding the caller's timeout budget on sub-second elapsed times.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn check_and_reconnect_for_test(
+        &mut self,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Duration> {
+        self.check_and_reconnect(timeout_sec, cancel_handle).await
+    }
+
+    /// Charges elapsed recovery time against a command-timeout budget.
+    ///
+    /// # Parameters
+    /// - `timeout_sec`: remaining command budget in seconds; `None` means "no
+    ///   timeout".
+    /// - `elapsed`: time already consumed.
+    ///
+    /// # Returns
+    /// - `None` when `timeout_sec` is `None` — passed through unchanged (still
+    ///   no timeout).
+    /// - `Some(remaining)` otherwise, saturating at `Some(0)` once the budget is
+    ///   exhausted.
+    ///
+    /// # Interpreting `Some(0)`
+    /// `Some(0)` means the budget is **already exhausted** (deadline reached),
+    /// *not* "no timeout". Callers must fail the operation fast at this point.
+    /// In particular, do **not** route `Some(0)` into a path that follows the
+    /// "0 seconds = infinite" convention (`timeout_to_duration` normalizes
+    /// `Some(0)` to `None`), or an exhausted budget will silently run unbounded.
     pub(in crate::connection) fn deduct_timeout(
         timeout_sec: Option<u32>,
         elapsed: Duration,
@@ -1271,13 +1350,14 @@ impl TdsClient {
         self.position_on_first_result().await
     }
 
-    /// Prepares a parameterized statement via `sp_prepare` and returns the
-    /// server-side handle.
+    /// Prepares a parameterized statement via `sp_prepare`, returning the
+    /// [`StatementId`] it issues for the statement.
     ///
-    /// The returned `i32` handle can be passed to
-    /// [`execute_sp_execute()`](Self::execute_sp_execute) for repeated
-    /// execution without re-parsing. Call
-    /// [`execute_sp_unprepare()`](Self::execute_sp_unprepare) when the handle
+    /// The server handle stays inside the client, keyed by that id, alongside
+    /// the statement's cached Always Encrypted metadata. Pass the id to
+    /// [`execute_sp_execute()`](Self::execute_sp_execute) for repeated execution
+    /// without re-parsing, and to
+    /// [`execute_sp_unprepare()`](Self::execute_sp_unprepare) when the statement
     /// is no longer needed.
     ///
     /// Drains the token stream internally — no rows are returned.
@@ -1293,17 +1373,21 @@ impl TdsClient {
     ///   carried by the entries are ignored. Supply the actual parameter
     ///   values later on the matching
     ///   [`execute_sp_execute()`](Self::execute_sp_execute) call.
-    /// * `timeout_sec` — optional per-request timeout in seconds. `None`
-    ///   means no timeout beyond the connection default.
-    /// * `cancel_handle` — optional handle to cooperatively cancel the
-    ///   request.
+    /// # Recovery
+    ///
+    /// Unlike the other prepared RPCs, this method reconnects
+    /// before sending. This is safe because `sp_prepare` accepts no existing
+    /// handle that recovery could invalidate; the handle it records belongs to
+    /// the resulting live session. Prefer the managed
+    /// [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
+    #[allow(dead_code)]
     #[instrument(skip(self, named_params, options), level = "info")]
-    pub async fn execute_sp_prepare<'a>(
+    async fn execute_sp_prepare<'a>(
         &mut self,
         sql: String,
         named_params: Vec<RpcParameter>,
         options: impl Into<ExecuteOptions<'a>>,
-    ) -> TdsResult<i32> {
+    ) -> TdsResult<StatementId> {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
@@ -1341,7 +1425,7 @@ impl TdsClient {
 
         // Always Encrypted: describe the statement's parameters now (serving from
         // or populating the query-metadata cache) and pin the result under the
-        // prepared handle so a later sp_execute can encrypt values without
+        // statement's id so a later sp_execute can encrypt values without
         // describing again. sp_prepare itself sends no user parameter values, so
         // nothing is encrypted here.
         let describe_for_cache = if self.should_encrypt_parameters() && !named_params.is_empty() {
@@ -1420,12 +1504,17 @@ impl TdsClient {
             let returned_parameter = self.return_values.first().unwrap();
             if let ColumnValues::Int(handle) = &returned_parameter.value {
                 let handle = *handle;
-                // Cache the parameter-encryption metadata (if any) under the
-                // handle for reuse by execute_sp_execute.
+                let statement_id = self.issue_statement_id();
+                let previous = self.prepared_handles.insert(statement_id, handle);
+                debug_assert!(
+                    previous.is_none(),
+                    "prepared handle map overwrote a live entry for a reused StatementId"
+                );
                 if let Some(describe) = describe_for_cache {
-                    self.prepared_param_encryption.insert(handle, describe);
+                    self.prepared_param_encryption
+                        .insert(statement_id, describe);
                 }
-                Ok(handle)
+                Ok(statement_id)
             } else {
                 Err(crate::error::Error::ProtocolError(
                     "Expected an integer value".to_string(),
@@ -1443,15 +1532,46 @@ impl TdsClient {
     /// Frees server-side resources associated with the handle returned by
     /// [`execute_sp_prepare()`](Self::execute_sp_prepare) or
     /// [`execute_sp_prepexec()`](Self::execute_sp_prepexec).
+    ///
+    /// # Recovery
+    ///
+    /// This method never reconnects. `sp_unprepare` releases an *existing*
+    /// server handle, so once the connection has reconnected that handle is
+    /// already gone — reusing it hits SQL Server error 8179. Staleness needs no
+    /// caller check: a reconnect clears `prepared_handles`, so an id with no
+    /// entry is skipped below without an RPC; on a dead connection the send just
+    /// fails and is ignored (best-effort). Forcing recovery, if ever wanted, is
+    /// the caller's job (see
+    /// [`check_and_reconnect`](Self::check_and_reconnect)).
+    /// A low-level wire call with caller-owned recovery — prefer the
+    /// managed [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
+    ///
+    /// Drops `statement_id`'s handle and cached Always Encrypted metadata from
+    /// the client's maps before sending, whether or not the RPC succeeds: a
+    /// failure is ambiguous (the send may have landed and the response been
+    /// lost), and a map entry naming a plan the server already dropped would
+    /// make the next execute fail with error 8179 instead of re-preparing.
+    /// Absent is the recoverable state; stale-but-present is not.
+    ///
+    /// `command_started`: `true` when the caller already opened the command
+    /// boundary via `begin_command` (as `unprepare` does before recovery, so the
+    /// reconnect's info messages survive); `false` opens it here. It does not
+    /// affect recovery — this method never reconnects.
     #[instrument(skip(self, options), level = "info")]
-    pub async fn execute_sp_unprepare<'a>(
+    async fn execute_sp_unprepare<'a>(
         &mut self,
-        handle: i32,
+        statement_id: StatementId,
+        command_started: bool,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
-            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
-        };
+        if !command_started {
+            if self.execution_context.has_open_batch() {
+                return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+            }
+            self.begin_command();
+        }
+        // No reconnect here — recovery is caller-owned (see this method's
+        // `# Recovery` docs).
 
         let ExecuteOptions {
             timeout: timeout_sec,
@@ -1459,15 +1579,19 @@ impl TdsClient {
             ..
         } = options.into();
 
-        self.begin_command();
-        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
-
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
         self.transport.reset_reader();
+
+        // Evicted before the send: a failed RPC is ambiguous, and keeping an
+        // entry the server may already have dropped is the worse of the two
+        // wrong answers (see this method's docs).
+        let Some(handle) = self.prepared_handles.remove(&statement_id) else {
+            return Ok(());
+        };
+        self.prepared_param_encryption.remove(&statement_id);
 
         let database_collation = self.negotiated_settings.database_collation;
 
@@ -1497,44 +1621,226 @@ impl TdsClient {
         if !server_errors.is_empty() {
             return Err(crate::error::Error::from_sql_errors(server_errors));
         }
-        // The handle is now released on the server; drop its cached Always
-        // Encrypted metadata. Done only after a successful unprepare so a failed
-        // RPC (handle possibly still valid) does not strip metadata a later
-        // sp_execute would need.
-        self.prepared_param_encryption.remove(&handle);
         Ok(())
     }
 
-    /// Prepares and executes a parameterized statement in a single round-trip
-    /// via `sp_prepexec`.
+    /// Executes `statement`, transparently recovering the connection and
+    /// re-preparing the server handle when it no longer belongs to the live
+    /// session.
     ///
-    /// Combines [`execute_sp_prepare()`](Self::execute_sp_prepare) and
-    /// [`execute_sp_execute()`](Self::execute_sp_execute). The prepared handle
-    /// is stored internally and can be retrieved with
-    /// [`get_return_values()`](Self::get_return_values).
+    /// Owns the full recovery protocol so callers never juggle raw handle ids or
+    /// session epochs:
     ///
-    /// `drop_handle` piggybacks a prepared-handle release onto this call: when
-    /// `Some(h)`, `h` is sent as the input value of the by-reference `@handle`
-    /// parameter, so the server drops that prior prepared statement before
-    /// preparing the new one - replacing a separate `sp_unprepare` round trip.
-    /// `None` prepares fresh (the `@handle` input is NULL). Either way the new
-    /// handle is returned in the `@handle` RETURNVALUE (ordinal 0). This mirrors
-    /// the reference ODBC/`SqlClient` drivers, which send the retained handle as
-    /// the `sp_prepexec` in/out `@handle` argument.
+    /// 1. Recover the connection if the socket died, and charge the elapsed
+    ///    time against the command timeout.
+    /// 2. If `statement` holds a handle from the live session, reuse it via
+    ///    `sp_execute`.
+    /// 3. Otherwise prepare and execute in one round trip via `sp_prepexec`; the
+    ///    new handle is recorded inside the client, keyed by the statement's
+    ///    [`StatementId`], when the `@handle` RETURNVALUE lands during the drain
+    ///    — no caller step is required.
     ///
-    /// Result rows are available through [`read_row()`](Self::read_row) after
-    /// this call returns.
-    #[instrument(skip(self, named_params, options), level = "info")]
-    pub async fn execute_sp_prepexec<'a>(
+    /// `orphaned` names a statement superseded by a re-prepare/rebind whose
+    /// server handle should be released: its drop is piggybacked onto the
+    /// `sp_prepexec` `@handle` argument when the handle is still live in this
+    /// session, and skipped when the map no longer holds it (a reconnect already
+    /// discarded it server-side). The id is cleared from `orphaned` only once the
+    /// drop crosses the serialization boundary, so callers retain it across
+    /// reconnect, validation, parameter-building, and encryption failures that
+    /// precede the send and can retry its release.
+    ///
+    /// Returns positioned on the first result; drain rows with
+    /// [`next_row`](ResultSet::next_row) / [`advance`](Self::advance).
+    pub async fn execute_prepared<'a>(
         &mut self,
-        sql: String,
-        mut named_params: Vec<RpcParameter>,
-        drop_handle: Option<i32>,
+        statement: &mut PreparedStatement,
+        named_params: Vec<RpcParameter>,
+        orphaned: &mut Option<StatementId>,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
         if self.execution_context.has_open_batch() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
-        };
+        }
+
+        // Open the command boundary before recovery so a transparent reconnect's
+        // login info messages land in this command's buffer; the inner RPC skips
+        // its own `begin_command` via `command_started`.
+        self.begin_command();
+
+        let mut opts = options.into();
+        let reconnect_elapsed = self.check_and_reconnect(opts.timeout, opts.cancel).await?;
+        opts.timeout = Self::deduct_timeout(opts.timeout, reconnect_elapsed);
+        // `Some(0)` means recovery consumed the whole command budget; fail fast
+        // rather than fall through into the `0 == infinite` convention that
+        // `timeout_to_duration` applies downstream.
+        if opts.timeout == Some(0) {
+            return Err(crate::error::Error::TimeoutError(
+                crate::error::TimeoutErrorType::String(
+                    "command timeout exhausted by connection recovery".to_string(),
+                ),
+            ));
+        }
+
+        // Reuse the statement's handle when the client still holds one; a
+        // reconnect clears the map, so an id from a dead session re-prepares.
+        match statement
+            .id
+            .filter(|id| self.prepared_handles.contains_key(id))
+        {
+            Some(statement_id) => {
+                self.execute_sp_execute(statement_id, None, Some(named_params), true, opts)
+                    .await
+            }
+            None => {
+                // Reported by `sp_prepexec` whenever the server's prepare `@handle`
+                // landed - including on a failed batch, where the plan still
+                // exists and must stay releasable (Ex: prepare passed but execute failed).
+                let mut issued_id = None;
+                let result = self
+                    .execute_sp_prepexec(
+                        statement.sql.clone(),
+                        named_params,
+                        &mut issued_id,
+                        orphaned,
+                        true,
+                        opts,
+                    )
+                    .await;
+                if issued_id.is_some() {
+                    statement.id = issued_id;
+                }
+                result
+            }
+        }
+    }
+
+    /// Issues the next unique [`StatementId`] for a managed prepared statement.
+    fn issue_statement_id(&mut self) -> StatementId {
+        let id = StatementId(self.next_statement_id);
+        // Exhausting u64 (~1.8e19 prepares on one connection) is unreachable, so
+        // wrap rather than branch; the insert-site debug_assert catches the
+        // impossible id-0 collision in tests.
+        self.next_statement_id = self.next_statement_id.wrapping_add(1);
+        id
+    }
+
+    /// Releases a managed prepared statement's server handle via `sp_unprepare`.
+    ///
+    /// Recovers a dead connection first (charging the elapsed time against the
+    /// command budget), then releases the handle only if the client still holds
+    /// one for `statement_id` in the live session. A statement whose handle is
+    /// absent — never materialized, or dropped when a reconnect cleared the map —
+    /// is already gone server-side, so it is skipped with no RPC. This mirrors
+    /// msodbcsql's `DropPrepHandle`, which recovers via `GetBatchCtxOrRecover`
+    /// and sends `sp_unprepare` only when the statement's connection id still
+    /// matches the recovered connection. Take the id with
+    /// [`PreparedStatement::take_id`] once the statement is done.
+    pub async fn unprepare<'a>(
+        &mut self,
+        statement_id: StatementId,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<()> {
+        if self.execution_context.has_open_batch() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        // Open the command boundary before recovery so a transparent reconnect's
+        // login info messages land in this command's buffer; the inner RPC skips
+        // its own `begin_command` via `command_started`.
+        self.begin_command();
+
+        let mut opts = options.into();
+        let reconnect_elapsed = self.check_and_reconnect(opts.timeout, opts.cancel).await?;
+        opts.timeout = Self::deduct_timeout(opts.timeout, reconnect_elapsed);
+        // Absent handle (never materialized, or a reconnect cleared the map):
+        // already gone server-side, skip with no RPC — including the timeout
+        // check below, since releasing nothing cannot time out.
+        if !self.prepared_handles.contains_key(&statement_id) {
+            return Ok(());
+        }
+        // `Some(0)` means the budget is spent — fail fast rather than fall
+        // through the `Some(0) == infinite` convention downstream.
+        if opts.timeout == Some(0) {
+            return Err(crate::error::Error::TimeoutError(
+                crate::error::TimeoutErrorType::String(
+                    "command timeout exhausted by connection recovery".to_string(),
+                ),
+            ));
+        }
+        self.execute_sp_unprepare(statement_id, true, opts).await
+    }
+
+    /// Prepares and executes a parameterized statement in a single round-trip
+    /// via `sp_prepexec`, combining
+    /// [`execute_sp_prepare()`](Self::execute_sp_prepare) and
+    /// [`execute_sp_execute()`](Self::execute_sp_execute).
+    ///
+    /// The `@handle` RETURNVALUE trails the result set, so it is captured during
+    /// the push_return_values and recorded under the issued [`StatementId`]; the statement
+    /// becomes reusable via `sp_execute` once drained. Rows are read with
+    /// [`read_row()`](Self::read_row).
+    ///
+    /// A low-level wire call - prefer the managed
+    /// [`execute_prepared`](Self::execute_prepared) /
+    /// [`unprepare`](Self::unprepare) API.
+    ///
+    /// # Parameters
+    ///
+    /// - `named_params` - the statement's parameters. Unlike `sp_prepare`,
+    ///   their values are sent and executed, not just declared.
+    ///
+    /// - `statement_id` - **out**: the id this call issues. Set whenever the
+    ///   server allocated a plan, which is not the same as "the batch
+    ///   succeeded":
+    ///   - success - always set (the `@handle` may still be in flight);
+    ///   - error *with* a `@handle` (e.g. Prepare passed but execute failed)
+    ///     - set, so the caller can reuse or [`unprepare`](Self::unprepare) it;
+    ///   - error *without* one (compile failure, or the stream broke first) -
+    ///     left untouched, leaving the statement unmaterialized.
+    ///
+    /// - `orphan` - **in/out**: a statement whose prepared handle is to be
+    ///   released, piggybacked onto this prepexec.
+    ///   `Some(id)` sends its handle as the by-reference `@handle`
+    ///   input so the server drops that plan while preparing the new one,
+    ///   saving a separate `sp_unprepare` round trip; `None`, or an id with
+    ///   no live handle, sends NULL and prepares fresh. On return it reports
+    ///   ownership: still `Some` if the call failed before serialization (the
+    ///   caller may retry the release), `None` once the drop crossed that
+    ///   boundary - past which the server may have consumed it even if the call
+    ///   then fails after the dropping of orphan.
+    ///
+    /// - `command_started` - `true` when the caller already opened the command
+    ///   boundary via `begin_command` (as
+    ///   [`execute_prepared`](Self::execute_prepared) does before recovering, so
+    ///   the reconnect's info messages survive); `false` opens it here.
+    ///
+    /// Both handle decisions match msodbcsql, which keys them on whether it
+    /// holds a handle rather than on the batch's return code.
+    ///
+    /// # Recovery
+    ///
+    /// Never reconnects - the caller recovers once up front, as
+    /// [`execute_prepared`](Self::execute_prepared) does. Staleness needs no
+    /// caller check: a reconnect clears `prepared_handles`, so an `orphan` from
+    /// the dead session resolves to no handle and its drop is skipped.
+    #[instrument(skip(self, named_params, options), level = "info")]
+    async fn execute_sp_prepexec<'a>(
+        &mut self,
+        sql: String,
+        mut named_params: Vec<RpcParameter>,
+        statement_id: &mut Option<StatementId>,
+        orphan: &mut Option<StatementId>,
+        command_started: bool,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StatementResult> {
+        if !command_started {
+            if self.execution_context.has_open_batch() {
+                return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+            }
+            self.begin_command();
+        }
+        // No reconnect here — recovery is caller-owned (see this method's
+        // `# Recovery` docs).
 
         let ExecuteOptions {
             timeout: timeout_sec,
@@ -1542,10 +1848,6 @@ impl TdsClient {
             column_encryption,
         } = options.into();
         self.current_command_ce_setting = column_encryption;
-
-        self.begin_command();
-        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -1558,10 +1860,10 @@ impl TdsClient {
         let sql_statement_value =
             SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql.clone())));
 
-        // Reset any prepared handle from a prior operation. The capture flag is
-        // armed just before the send below so a failure while building the RPC
-        // cannot leave it set.
-        self.prepared_statement_handle = None;
+        // The capture target is armed just before the send below so a failure
+        // while building the RPC cannot leave it set.
+        self.pending_prepared_param_encryption = None;
+        self.pending_capture = None;
 
         // Create the parameter list for sp_prepexec
         let statement_parameter = RpcParameter::new(None, StatusFlags::NONE, sql_statement_value);
@@ -1579,14 +1881,16 @@ impl TdsClient {
         // metadata.
         self.ensure_force_column_encryption_supported(named_params.iter())?;
         if self.should_encrypt_parameters() && !named_params.is_empty() {
-            self.encrypt_parameters(
-                &sql,
-                &params_list_as_string,
-                &mut named_params,
-                timeout_sec,
-                cancel_handle,
-            )
-            .await?;
+            self.pending_prepared_param_encryption = Some(
+                self.encrypt_parameters(
+                    &sql,
+                    &params_list_as_string,
+                    &mut named_params,
+                    timeout_sec,
+                    cancel_handle,
+                )
+                .await?,
+            );
             // The describe round-trip closes its own batch and clears the
             // per-operation timeout/cancel state; restore it for the real RPC.
             self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -1602,6 +1906,13 @@ impl TdsClient {
         // The by-reference `@handle`: NULL input prepares fresh; a `Some(h)`
         // input tells the server to drop prepared statement `h` before
         // preparing. The new handle comes back as the `@handle` RETURNVALUE captured during drain.
+        // From this point onward, serialization or response failures are
+        // ambiguous: the server may have consumed the piggybacked drop, so the
+        // orphan is released and its entries evicted either way.
+        let drop_handle = orphan.take().and_then(|orphan_id| {
+            self.prepared_param_encryption.remove(&orphan_id);
+            self.prepared_handles.remove(&orphan_id)
+        });
         let handle_value = SqlType::Int(drop_handle);
 
         let handle_parameter = RpcParameter::new(None, StatusFlags::BY_REF_VALUE, handle_value);
@@ -1620,28 +1931,46 @@ impl TdsClient {
             &self.execution_context,
         );
 
-        // Clear the flag on any send/read failure so a leaked
-        // `true` cannot miscapture the first Int RETURNVALUE of a later
-        // operation as a prepared handle.
-        self.expecting_prepare_handle = true;
+        // Armed here, not earlier: the AE describe round-trip above emits its own
+        // RETURNVALUEs, and a build failure must not leave a stale target.
+        let issued_id = self.issue_statement_id();
+        self.pending_capture = Some(issued_id);
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         let serialize_result = rpc.serialize(&mut packet_writer).await;
         drop(packet_writer);
         if let Err(e) = serialize_result {
-            self.expecting_prepare_handle = false;
+            self.abort_pending_prepare_capture();
+            self.report_issued_id(issued_id, statement_id);
             return Err(e);
         }
 
         let boundary = match self.advance_to_result_boundary().await {
             Ok(boundary) => boundary,
             Err(e) => {
-                self.expecting_prepare_handle = false;
+                self.abort_pending_prepare_capture();
+                self.report_issued_id(issued_id, statement_id);
                 return Err(e);
             }
         };
+        // The handle may still be in flight (it follows the result set), so the id
+        // is always reported here.
+        *statement_id = Some(issued_id);
         Ok(self.apply_result_boundary(boundary))
+    }
+
+    /// Reports `issued_id` to the caller only if the server's `@handle` actually
+    /// arrived.
+    ///
+    /// Call this after aborting the capture, so no later token can land: the map
+    /// lookup is then a final answer to "did we get a prepared plan?". Reporting an id
+    /// with no handle behind it would leave the statement claiming to be
+    /// prepared when nothing was.
+    fn report_issued_id(&self, issued_id: StatementId, out: &mut Option<StatementId>) {
+        if self.prepared_handles.contains_key(&issued_id) {
+            *out = Some(issued_id);
+        }
     }
 
     /// Executes a previously prepared statement by handle via `sp_execute`.
@@ -1651,20 +1980,48 @@ impl TdsClient {
     /// [`execute_sp_prepexec()`](Self::execute_sp_prepexec) call.
     /// Supply fresh parameter values through `positional_parameters` and/or
     /// `named_parameters`.
+    ///
+    /// # Recovery
+    ///
+    /// This method never reconnects; callers that need it recover once with
+    /// [`check_and_reconnect`](Self::check_and_reconnect) first, as
+    /// [`execute_prepared`](Self::execute_prepared) does. Staleness needs no
+    /// caller check: a reconnect clears `prepared_handles`, so `statement_id`
+    /// either resolves to a handle belonging to the live session or the call
+    /// fails before reaching the wire.
+    /// A low-level wire call with caller-owned recovery — prefer the
+    /// managed [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
+    ///
+    /// `command_started`: `true` when the caller already opened the command
+    /// boundary via `begin_command` (as `execute_prepared` does before recovery,
+    /// so the reconnect's info messages survive); `false` opens it here. It does
+    /// not affect recovery — this method never reconnects.
     #[instrument(
         skip(self, positional_parameters, named_parameters, options),
         level = "info"
     )]
-    pub async fn execute_sp_execute<'a>(
+    async fn execute_sp_execute<'a>(
         &mut self,
-        handle: i32,
+        statement_id: StatementId,
         mut positional_parameters: Option<Vec<RpcParameter>>,
         mut named_parameters: Option<Vec<RpcParameter>>,
+        command_started: bool,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
-        if self.execution_context.has_open_batch() {
-            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        let Some(handle) = self.prepared_handles.get(&statement_id).copied() else {
+            return Err(UsageError(
+                "Cannot execute. Given prepared statement is not materialized on this connection"
+                    .to_string(),
+            ));
         };
+        if !command_started {
+            if self.execution_context.has_open_batch() {
+                return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+            }
+            self.begin_command();
+        }
+        // No reconnect here — recovery is caller-owned (see this method's
+        // `# Recovery` docs).
 
         let ExecuteOptions {
             timeout: timeout_sec,
@@ -1672,10 +2029,6 @@ impl TdsClient {
             column_encryption,
         } = options.into();
         self.current_command_ce_setting = column_encryption;
-
-        self.begin_command();
-        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
@@ -1702,7 +2055,7 @@ impl TdsClient {
             let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
             let describe = self
                 .prepared_param_encryption
-                .get(&handle)
+                .get(&statement_id)
                 .cloned()
                 .ok_or_else(|| {
                     crate::error::Error::ColumnEncryptionError(format!(
@@ -1761,17 +2114,103 @@ impl TdsClient {
         self.position_on_first_result().await
     }
 
-    /// Collects a return value, capturing the `sp_prepexec` `@handle`
-    /// (RETURNVALUE ordinal 0) the first time one arrives while a prepare is in
-    /// flight. Every `Tokens::ReturnValue` is funnelled through here so capture
-    /// works regardless of which drain path reads the stream.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn execute_sp_prepare_for_test<'a>(
+        &mut self,
+        sql: String,
+        named_params: Vec<RpcParameter>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StatementId> {
+        self.execute_sp_prepare(sql, named_params, options).await
+    }
+
+    /// Records `handle` under a fresh id without a round-trip, so wire-protocol
+    /// tests can drive the sp_* RPCs with a handle the server never issued (or
+    /// issued to a session that has since died).
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn register_prepared_handle_for_test(&mut self, handle: i32) -> StatementId {
+        let statement_id = self.issue_statement_id();
+        self.prepared_handles.insert(statement_id, handle);
+        statement_id
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn execute_sp_unprepare_for_test<'a>(
+        &mut self,
+        statement_id: StatementId,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<()> {
+        self.execute_sp_unprepare(statement_id, false, options)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn execute_sp_prepexec_for_test<'a>(
+        &mut self,
+        sql: String,
+        named_params: Vec<RpcParameter>,
+        orphan: &mut Option<StatementId>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<(StatementId, StatementResult)> {
+        let mut issued_id = None;
+        let result = self
+            .execute_sp_prepexec(sql, named_params, &mut issued_id, orphan, false, options)
+            .await?;
+        Ok((
+            issued_id.expect("a successful sp_prepexec always reports its id"),
+            result,
+        ))
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn execute_sp_execute_for_test<'a>(
+        &mut self,
+        statement_id: StatementId,
+        positional_parameters: Option<Vec<RpcParameter>>,
+        named_parameters: Option<Vec<RpcParameter>>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StatementResult> {
+        self.execute_sp_execute(
+            statement_id,
+            positional_parameters,
+            named_parameters,
+            false,
+            options,
+        )
+        .await
+    }
+
+    /// Collects a return value. While an `sp_prepexec` is in flight (an armed
+    /// `pending_capture`) the `@handle` (RETURNVALUE ordinal 0) is diverted into
+    /// the client's prepared handle map instead of being surfaced; every
+    /// `Tokens::ReturnValue` funnels through here so capture works regardless of
+    /// which drain path reads the stream. For every other RPC `pending_capture`
+    /// is `None` and ordinal 0 is a genuine output parameter, so it falls
+    /// through to `return_values`.
     fn push_return_value(&mut self, return_value: ReturnValue) {
-        if self.expecting_prepare_handle
+        if let Some(statement_id) = self.pending_capture
             && return_value.param_ordinal == 0
             && let ColumnValues::Int(handle) = &return_value.value
         {
-            self.prepared_statement_handle = Some(*handle);
-            self.expecting_prepare_handle = false;
+            // Route the handle into the client's map under the
+            // statement's id and divert it from `return_values`. `execute_prepared`
+            // arms `pending_capture` only when the id was absent from the map, so
+            // this never overwrites a live handle.
+            self.pending_capture = None;
+            let previous = self.prepared_handles.insert(statement_id, *handle);
+            debug_assert!(
+                previous.is_none(),
+                "prepared handle map overwrote a live entry for a reused StatementId"
+            );
+            if let Some(describe) = self.pending_prepared_param_encryption.take() {
+                self.prepared_param_encryption
+                    .insert(statement_id, describe);
+            }
             return;
         }
         self.return_values.push(return_value);
@@ -1833,6 +2272,9 @@ impl TdsClient {
                     info!(?done);
                     info!(?done.status);
                     if !done.has_more() {
+                        if !collected_errors.is_empty() || done.has_error() {
+                            self.abort_pending_prepare_capture();
+                        }
                         break;
                     }
                 }
@@ -2247,8 +2689,11 @@ impl TdsClient {
         if !self.execution_context.has_open_batch() {
             return Ok(StatementResult::End);
         }
-        if self.maybe_has_unread_rows() {
-            self.drain_rows().await?;
+        if self.maybe_has_unread_rows()
+            && let Err(error) = self.drain_rows().await
+        {
+            self.abort_pending_prepare_capture();
+            return Err(error);
         }
         // Draining the current result set may have consumed the batch's final
         // DONE token (has_more=false), which closes the batch. If so there is
@@ -2257,7 +2702,13 @@ impl TdsClient {
         if !self.execution_context.has_open_batch() {
             return Ok(StatementResult::End);
         }
-        self.position_on_first_result().await
+        match self.position_on_first_result().await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.abort_pending_prepare_capture();
+                Err(error)
+            }
+        }
     }
 
     /// Advances to the next **row-returning** result set, collapsing (skipping)
@@ -2540,7 +2991,9 @@ impl TdsClient {
         named_params: &mut [RpcParameter],
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
-    ) -> TdsResult<()> {
+    ) -> TdsResult<
+        Arc<crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult>,
+    > {
         let mut param_refs: Vec<&mut RpcParameter> = named_params.iter_mut().collect();
         self.encrypt_combined_parameters(
             sql,
@@ -2567,7 +3020,9 @@ impl TdsClient {
         params: &mut [&mut RpcParameter],
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
-    ) -> TdsResult<()> {
+    ) -> TdsResult<
+        Arc<crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult>,
+    > {
         // Mirror SqlClient: don't cache metadata for statements with output
         // parameters — the client can't validate cached describe results against
         // a RETURNVALUE — but still use it for this call.
@@ -2585,7 +3040,8 @@ impl TdsClient {
             &mut self.output_param_ceks,
             &trusted_key_paths,
         )
-        .await
+        .await?;
+        Ok(describe)
     }
 
     /// Returns the describe result for a statement, serving it from the
@@ -3022,7 +3478,7 @@ impl TdsClient {
         };
 
         let start = Instant::now();
-        let read = self
+        let result = self
             .transport
             .read_active_plp_bytes(
                 plp_state,
@@ -3030,9 +3486,15 @@ impl TdsClient {
                 self.cancel_handle.as_ref(),
                 out,
             )
-            .await?;
+            .await;
         self.update_remaining_timeout(start);
-        Ok(read)
+        match result {
+            Ok(read) => Ok(read),
+            Err(error) => {
+                self.abort_pending_prepare_capture();
+                Err(error)
+            }
+        }
     }
 
     /// Streams the next chunk of the active PLP column into `out`, returning the
@@ -3581,11 +4043,16 @@ impl TdsClient {
         self.dml_result_counts.clear();
     }
 
-    /// Returns and clears the prepared-statement handle captured from the most
-    /// recent `sp_prepexec` (its `@handle` output parameter, RETURNVALUE
-    /// ordinal 0).
-    pub fn take_prepared_statement_handle(&mut self) -> Option<i32> {
-        self.prepared_statement_handle.take()
+    /// The live server handle the client holds for `statement_id`, if any.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn prepared_handle_for_test(&self, statement_id: StatementId) -> Option<i32> {
+        self.prepared_handles.get(&statement_id).copied()
+    }
+
+    fn abort_pending_prepare_capture(&mut self) {
+        self.pending_capture = None;
+        self.pending_prepared_param_encryption = None;
     }
 
     /// Retrieves a snapshot of the output parameters (including return values)
@@ -3625,7 +4092,7 @@ impl TdsClient {
         // (see push_return_value) and survives this clear.
         self.current_metadata = None;
         self.return_values.clear();
-        self.expecting_prepare_handle = false;
+        self.abort_pending_prepare_capture();
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
         self.active_row_read_state = ActiveRowReadState::Idle;
@@ -3687,12 +4154,15 @@ impl TdsClient {
         self.recovery_context.session_recovery_negotiated
     }
 
+    /// Test only.
     /// Returns the number of times this connection has been successfully
     /// recovered after detecting a dead connection.
     ///
     /// The count is incremented each time [`reconnect()`] completes
     /// successfully, including session-state restoration and server-property
     /// validation.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
     pub fn connection_recovery_count(&self) -> u32 {
         self.recovery_context.recovery_count
     }
@@ -3942,20 +4412,28 @@ impl ResultSet for TdsClient {
 
     #[instrument(skip(self), level = "info")]
     async fn next_row(&mut self) -> TdsResult<Option<Vec<ColumnValues>>> {
-        if self.maybe_has_unread_rows() {
+        let result = if self.maybe_has_unread_rows() {
             self.get_next_row().await
         } else {
             Ok(None)
+        };
+        if result.is_err() {
+            self.abort_pending_prepare_capture();
         }
+        result
     }
 
     #[instrument(skip(self, writer), level = "info")]
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool> {
-        if self.maybe_has_unread_rows() {
+        let result = if self.maybe_has_unread_rows() {
             self.get_next_row_into(writer).await
         } else {
             Ok(false)
+        };
+        if result.is_err() {
+            self.abort_pending_prepare_capture();
         }
+        result
     }
 
     fn maybe_has_unread_rows(&self) -> bool {
@@ -3965,6 +4443,92 @@ impl ResultSet for TdsClient {
     #[instrument(skip(self), level = "info")]
     async fn close(&mut self) -> TdsResult<()> {
         self.close_query().await
+    }
+}
+
+/// Opaque identity for a managed prepared statement.
+///
+/// Issued by [`TdsClient::execute_prepared`] the first time a statement is
+/// materialized, and used to key the issuing client's private server-handle
+/// map. Ids are unique and never reused within the lifetime of the client that
+/// issued them.
+///
+/// They are **not** globally unique across clients yet (AB#47098): the counter
+/// restarts from the same value on each client, so a statement must only be
+/// executed or unprepared with the [`TdsClient`] that materialized it. Using it
+/// with a different client can alias that client's unrelated handle instead of
+/// re-preparing. ODBC upholds this because an `HSTMT` is bound to one
+/// connection; direct `mssql-tds` consumers must not share a statement across
+/// clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StatementId(u64);
+
+#[cfg(any(test, feature = "test-util"))]
+impl StatementId {
+    /// Builds a `StatementId` from a raw value, for tests that need to seed a
+    /// statement's identity without a live server.
+    #[doc(hidden)]
+    pub fn from_raw_for_test(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+/// A logical prepared statement: the SQL to (re)prepare plus its client-issued
+/// identity once materialized.
+///
+/// The server handle is an implementation detail the [`TdsClient`] owns and
+/// resolves from [`id`](Self::id) — callers never touch raw handle ids or
+/// epochs. If the connection reconnects, the next
+/// [`execute_prepared`](TdsClient::execute_prepared) transparently re-prepares
+/// against the new session.
+///
+// Not `Clone`: clones would share one id, so unpreparing either would silently
+// unmaterialize the other.
+#[derive(Debug)]
+pub struct PreparedStatement {
+    sql: String,
+    id: Option<StatementId>,
+}
+
+impl PreparedStatement {
+    /// Creates an unmaterialized prepared statement for `sql`. The server handle
+    /// is created lazily on the first [`TdsClient::execute_prepared`].
+    pub fn new(sql: impl Into<String>) -> Self {
+        Self {
+            sql: sql.into(),
+            id: None,
+        }
+    }
+
+    /// The client-issued identity, once the statement has been materialized by
+    /// [`TdsClient::execute_prepared`]. `None` before the first execute.
+    pub fn id(&self) -> Option<StatementId> {
+        self.id
+    }
+
+    /// Removes and returns the statement's identity, leaving it unmaterialized
+    /// with its SQL intact. The caller owns releasing the associated server
+    /// handle via [`TdsClient::unprepare`].
+    pub fn take_id(&mut self) -> Option<StatementId> {
+        self.id.take()
+    }
+
+    /// The SQL text this statement prepares.
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl PreparedStatement {
+    /// Builds a statement already carrying an identity, for tests that need to
+    /// exercise handle-lifecycle transitions without a live server.
+    #[doc(hidden)]
+    pub fn materialized_for_test(sql: impl Into<String>, id: StatementId) -> Self {
+        Self {
+            sql: sql.into(),
+            id: Some(id),
+        }
     }
 }
 
@@ -4316,7 +4880,6 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl crate::io::packet_reader::TdsPacketReader for TestTransport {
         async fn read_byte(&mut self) -> TdsResult<u8> {
             Ok(self.take_packet_bytes(1)?[0])
@@ -5071,7 +5634,11 @@ mod tests {
             line_number: None,
         }]);
 
-        client.execute_sp_unprepare(1, ()).await.unwrap();
+        let statement_id = client.register_prepared_handle_for_test(1);
+        client
+            .execute_sp_unprepare_for_test(statement_id, ())
+            .await
+            .unwrap();
 
         let msgs = client.info_messages();
         assert!(
@@ -5467,6 +6034,582 @@ mod tests {
         assert_eq!(client.connection_recovery_count(), 3);
     }
 
+    // ── execute_prepared / unprepare: StatementId-keyed handle map ──
+
+    fn sid(raw: u64) -> StatementId {
+        StatementId::from_raw_for_test(raw)
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_open_batch_guard_precedes_recovery_and_map_lookup() {
+        let mut client = create_test_client();
+        client.execution_context.set_has_open_batch(true);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT 1", sid(1));
+        client.prepared_handles.insert(sid(1), 55);
+        let mut orphaned = Some(sid(9));
+
+        let result = client
+            .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await;
+
+        // Re-entering with an open batch is a local usage error reported before
+        // any recovery I/O or handle-map lookup, so nothing is consumed.
+        assert!(matches!(result, Err(UsageError(_))));
+        assert_eq!(orphaned, Some(sid(9)));
+        assert_eq!(statement.id(), Some(sid(1)));
+        assert_eq!(client.prepared_handles.get(&sid(1)), Some(&55));
+        assert_eq!(client.connection_recovery_count(), 0);
+    }
+
+    // A piggyback needs a prepare to ride on, so an orphan handed in alongside a
+    // still-live statement stays with the caller rather than being dropped.
+    #[tokio::test]
+    async fn execute_prepared_leaves_orphan_untouched_on_the_execute_path() {
+        let mut client = create_test_client();
+        let mut statement = PreparedStatement::materialized_for_test("SELECT 1", sid(1));
+        client.prepared_handles.insert(sid(1), 55);
+        client.prepared_handles.insert(sid(9), 77);
+        let mut orphaned = Some(sid(9));
+
+        let result = client
+            .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await;
+
+        assert!(result.is_err(), "no server behind the test transport");
+        assert_eq!(orphaned, Some(sid(9)));
+        assert_eq!(
+            client.prepared_handles.get(&sid(9)),
+            Some(&77),
+            "the orphan is still releasable via unprepare"
+        );
+    }
+
+    // ── execute_prepared: reuse-vs-reprepare branch ──
+    //
+    // The RPC name serializes as PROC_ID_SWITCH (0xFFFF) followed by the proc id
+    // as i16 LE, so sp_prepexec (13) is `FF FF 0D 00` and sp_execute (12) is
+    // `FF FF 0C 00`. Asserting on those bytes pins which branch actually reached
+    // the wire, which the returned `StatementResult` alone cannot show.
+
+    #[tokio::test]
+    async fn execute_prepared_materializes_an_unmaterialized_statement() {
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            done_no_more(),
+        ]);
+        let mut statement = PreparedStatement::new("SELECT 1");
+        let mut orphaned = None;
+
+        client
+            .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await
+            .expect("sp_prepexec should succeed against the queued tokens");
+
+        let statement_id = statement
+            .id()
+            .expect("the first execute must materialize the statement");
+        assert_eq!(client.prepared_handles.get(&statement_id).copied(), Some(9));
+        assert!(
+            sent.lock()
+                .unwrap()
+                .windows(4)
+                .any(|w| w == [0xFF, 0xFF, 0x0D, 0x00]),
+            "a statement with no identity must go out as sp_prepexec"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_reprepares_when_the_id_has_no_live_handle() {
+        // The state a reconnect leaves behind: the caller's statement keeps its
+        // id but the map that resolved it is gone. That id must not address the
+        // new session's plan.
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            done_no_more(),
+        ]);
+        let stale = sid(99);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT 1", stale);
+        let mut orphaned = None;
+
+        client
+            .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await
+            .expect("sp_prepexec should succeed against the queued tokens");
+
+        let statement_id = statement.id().expect("re-prepare must re-materialize");
+        assert_ne!(
+            statement_id, stale,
+            "a re-prepare must issue a fresh identity, not revive the dead one"
+        );
+        assert_eq!(client.prepared_handles.get(&statement_id).copied(), Some(9));
+        assert!(!client.prepared_handles.contains_key(&stale));
+        assert!(
+            sent.lock()
+                .unwrap()
+                .windows(4)
+                .any(|w| w == [0xFF, 0xFF, 0x0D, 0x00]),
+            "an id with no live handle must re-prepare via sp_prepexec"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_reuses_a_live_handle_via_sp_execute() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let statement_id = sid(1);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT 1", statement_id);
+        client.prepared_handles.insert(statement_id, 55);
+        let mut orphaned = None;
+
+        client
+            .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await
+            .expect("sp_execute should succeed against the queued DONE token");
+
+        assert_eq!(
+            statement.id(),
+            Some(statement_id),
+            "reuse must keep the statement's identity"
+        );
+        let bytes = sent.lock().unwrap().clone();
+        assert!(
+            bytes.windows(4).any(|w| w == [0xFF, 0xFF, 0x0C, 0x00]),
+            "a live handle must be reused via sp_execute, not re-prepared"
+        );
+        // The @handle positional: name length 0x00, status 0x00 (NONE — a
+        // re-prepare would send 0x01/BY_REF_VALUE here), INTN 0x26, max size
+        // 0x04, value length 0x04, then the handle (55) little-endian.
+        let expected = [0x00, 0x00, 0x26, 0x04, 0x04, 0x37, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(expected.len()).any(|w| w == expected),
+            "sp_execute must address the cached handle on the wire"
+        );
+    }
+
+    // The server can report an error and still return a `@handle` for the plan
+    // it allocated. The drain records that handle, so the statement must carry
+    // the id naming it or the entry — and the server-side plan — is unreachable.
+    #[tokio::test]
+    async fn execute_prepared_keeps_the_handle_reachable_when_the_batch_errors() {
+        use crate::token::tokens::ErrorToken;
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(ErrorToken {
+                number: 50000,
+                state: 1,
+                severity: 16,
+                message: "prepexec failed".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            done_no_more(),
+        ]);
+        let mut statement = PreparedStatement::new("SELECT 1");
+        let mut orphaned = None;
+
+        let result = client
+            .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await;
+
+        assert!(result.is_err(), "the batch reported an error");
+        let statement_id = statement
+            .id()
+            .expect("the statement must carry the id even though the execute failed");
+        assert_eq!(
+            client.prepared_handles.get(&statement_id).copied(),
+            Some(9),
+            "the captured handle must stay addressable so unprepare can release it"
+        );
+
+        client.close_query().await.ok();
+        client.unprepare(statement_id, ()).await.ok();
+        assert!(
+            !client.prepared_handles.contains_key(&statement_id),
+            "the caller can release the plan the failed prepare left behind"
+        );
+    }
+
+    // A compile failure (bad syntax) returns no `@handle`, so nothing was
+    // materialized and the statement must not claim an identity.
+    #[tokio::test]
+    async fn execute_prepared_leaves_the_statement_unmaterialized_when_no_handle_returns() {
+        use crate::token::tokens::ErrorToken;
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(ErrorToken {
+                number: 102,
+                state: 1,
+                severity: 15,
+                message: "Incorrect syntax near 'SELCT'".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            done_no_more(),
+        ]);
+        let mut statement = PreparedStatement::new("SELCT 1");
+        let mut orphaned = None;
+
+        let result = client
+            .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            statement.id(),
+            None,
+            "no handle came back, so the statement was never materialized"
+        );
+        assert!(client.prepared_handles.is_empty());
+    }
+
+    // A multi-statement batch whose *later* statement fails: `execute_prepared`
+    // returns Ok on the first result, and the error surfaces on a subsequent
+    // drain. The `@handle` trails the whole batch, so capture must survive that
+    // error — the drain reads on past it and only the terminal DONE aborts.
+    #[tokio::test]
+    async fn handle_is_captured_when_a_later_statement_in_the_batch_errors() {
+        use crate::token::tokens::ErrorToken;
+
+        let mut client = create_capturing_client(vec![
+            done_count(CurrentCommand::Insert, 1, true),
+            Tokens::Error(ErrorToken {
+                number: 2627,
+                state: 1,
+                severity: 14,
+                message: "Violation of PRIMARY KEY constraint".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 2,
+            }),
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            done_no_more(),
+        ])
+        .0;
+        let mut statement = PreparedStatement::new("INSERT INTO a ...; INSERT INTO b ...;");
+        let mut orphaned = None;
+
+        client
+            .execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await
+            .expect("the first statement's result is reached before the error");
+        let statement_id = statement.id().expect("materialized on the first result");
+
+        // The error only surfaces here, after execute_prepared already returned.
+        assert!(client.advance().await.is_err());
+
+        assert_eq!(
+            client.prepared_handles.get(&statement_id).copied(),
+            Some(9),
+            "the trailing @handle must be captured while draining past the error"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_errors_when_budget_exhausted_by_recovery() {
+        // A command budget fully consumed before execution — the same `Some(0)`
+        // state a reconnect that ate the whole timeout produces (see
+        // `deduct_timeout_saturates_at_zero`) — must fail fast rather than fall
+        // through `timeout_to_duration`'s `Some(0) == infinite` convention.
+        let mut client = create_test_client();
+        let mut statement = PreparedStatement::new("SELECT 1");
+        let mut orphaned = None;
+
+        let result = client
+            .execute_prepared(
+                &mut statement,
+                Vec::new(),
+                &mut orphaned,
+                ExecuteOptions::new().timeout_secs(0),
+            )
+            .await;
+
+        assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
+    }
+
+    // ── PreparedStatement lifecycle & the StatementId handle map ──
+
+    #[test]
+    fn take_id_clears_and_returns() {
+        let mut stmt = PreparedStatement::materialized_for_test("SELECT 1", sid(7));
+        assert_eq!(stmt.take_id(), Some(sid(7)));
+        assert!(stmt.id().is_none());
+        // Second take yields nothing — the identity is gone.
+        assert!(stmt.take_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn unprepare_skips_absent_handle_without_rpc() {
+        // The client holds no handle for this id (never materialized, or a
+        // reconnect cleared the map): unprepare skips sp_unprepare. The transport
+        // has no queued tokens, so a drain would error — reaching Ok proves no RPC
+        // was sent.
+        let mut client = create_test_client();
+
+        client.unprepare(sid(5), ()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unprepare_releases_live_handle() {
+        // A handle the client still holds is released via sp_unprepare. Asserting
+        // on the captured wire bytes proves the RPC was actually sent — a wrongly
+        // skipped release would also return Ok, leaving the DONE unread.
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client.prepared_handles.insert(sid(5), 5);
+
+        client.unprepare(sid(5), ()).await.unwrap();
+
+        // The sp_unprepare @handle positional parameter serializes as: name length
+        // 0x00, status 0x00 (NONE), INTN type 0x26, max size 0x04, value length
+        // 0x04, then the handle id (5) little-endian.
+        let bytes = sent.lock().unwrap().clone();
+        let expected = [0x00, 0x00, 0x26, 0x04, 0x04, 0x05, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(expected.len()).any(|w| w == expected),
+            "a live handle must be released by sending sp_unprepare with its id on the wire"
+        );
+        // The map entry is evicted once the release is sent.
+        assert!(!client.prepared_handles.contains_key(&sid(5)));
+    }
+
+    #[tokio::test]
+    async fn unprepare_open_batch_returns_usage_error_before_io() {
+        // Parity with execute_prepared: the open-batch guard is a local check
+        // reported before any recovery I/O.
+        let mut client = create_test_client();
+        client.execution_context.set_has_open_batch(true);
+
+        let result = client.unprepare(sid(5), ()).await;
+
+        assert!(matches!(result, Err(UsageError(_))));
+    }
+
+    #[tokio::test]
+    async fn unprepare_propagates_reconnect_error_when_unrecoverable() {
+        // Recover-first parity with msodbcsql: a dead, unrecoverable connection
+        // (open transaction) fails recovery, so unprepare surfaces that error
+        // instead of sending sp_unprepare on a dead socket. The ODBC layer
+        // swallows it best-effort.
+        let mut client = create_test_client();
+        client.prepared_handles.insert(sid(5), 5);
+        client.recovery_context.session_recovery_negotiated = true;
+        client.execution_context.set_transaction_descriptor(42);
+
+        let result = client.unprepare(sid(5), ()).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn unprepare_errors_when_budget_exhausted_before_send() {
+        // A live handle with a spent budget must fail fast rather than send
+        // sp_unprepare with a `Some(0)` that `timeout_to_duration` would
+        // reinterpret as infinite.
+        let mut client = create_test_client();
+        client.prepared_handles.insert(sid(5), 5);
+
+        let result = client
+            .unprepare(sid(5), ExecuteOptions::new().timeout_secs(0))
+            .await;
+
+        assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
+        // The budget guard fires before the map is mutated, so the entry survives.
+        assert!(client.prepared_handles.contains_key(&sid(5)));
+    }
+
+    #[tokio::test]
+    async fn unprepare_drops_both_map_entries_even_when_the_rpc_fails() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        // The transport has no queued tokens, so the sp_unprepare drain fails.
+        // `unprepare` consumed the identity, so nothing can reach either entry
+        // again — both must be gone rather than leaving the AE entry behind.
+        let mut client = create_test_client();
+        client.prepared_handles.insert(sid(5), 5);
+        client
+            .prepared_param_encryption
+            .insert(sid(5), Arc::new(DescribeParameterEncryptionResult::new()));
+
+        assert!(client.unprepare(sid(5), ()).await.is_err());
+
+        assert!(!client.prepared_handles.contains_key(&sid(5)));
+        assert!(!client.prepared_param_encryption.contains_key(&sid(5)));
+    }
+
+    #[test]
+    fn push_return_value_routes_handle_into_map_under_pending_id() {
+        let mut client = create_test_client();
+        client.pending_capture = Some(sid(3));
+
+        client.push_return_value(int_return_value(0, 9));
+
+        assert_eq!(client.prepared_handles.get(&sid(3)).copied(), Some(9));
+        // The capture is one-shot.
+        assert!(client.pending_capture.is_none());
+    }
+
+    #[test]
+    fn push_return_value_pins_pending_encryption_metadata() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        let mut client = create_test_client();
+        client.pending_capture = Some(sid(1));
+        let describe = Arc::new(DescribeParameterEncryptionResult::new());
+        client.pending_prepared_param_encryption = Some(Arc::clone(&describe));
+
+        client.push_return_value(int_return_value(0, 9));
+
+        // Metadata pinning is protocol-owned and completes in the token funnel,
+        // keyed by the same StatementId as the handle.
+        assert!(Arc::ptr_eq(
+            client.prepared_param_encryption.get(&sid(1)).unwrap(),
+            &describe
+        ));
+        assert!(client.pending_prepared_param_encryption.is_none());
+    }
+
+    #[test]
+    fn reused_server_handle_id_cannot_collide_across_statements() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        // The server may hand out the same integer handle again after a plan is
+        // dropped. Keyed by StatementId, the replacement lands in its own slot
+        // instead of overwriting (or being overwritten by) the prior statement's
+        // metadata — the aliasing hazard an i32-keyed map required an ordered
+        // evict-before-insert to avoid.
+        let mut client = create_test_client();
+        let dropped = Arc::new(DescribeParameterEncryptionResult::new());
+        client.prepared_param_encryption.insert(sid(1), dropped);
+        client.prepared_handles.insert(sid(1), 7);
+
+        client.pending_capture = Some(sid(2));
+        let replacement = Arc::new(DescribeParameterEncryptionResult::new());
+        client.pending_prepared_param_encryption = Some(Arc::clone(&replacement));
+
+        client.push_return_value(int_return_value(0, 7));
+
+        assert!(Arc::ptr_eq(
+            client.prepared_param_encryption.get(&sid(2)).unwrap(),
+            &replacement
+        ));
+        assert_eq!(client.prepared_handles.get(&sid(2)).copied(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn drain_error_after_returned_handle_retains_prepared_metadata() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+        use crate::token::tokens::ErrorToken;
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(ErrorToken {
+                number: 50000,
+                state: 1,
+                severity: 16,
+                message: "prepexec failed".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            done_no_more(),
+        ]);
+        client.pending_capture = Some(sid(1));
+        let replacement = Arc::new(DescribeParameterEncryptionResult::new());
+        client.pending_prepared_param_encryption = Some(Arc::clone(&replacement));
+
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+        let result = client.advance().await;
+
+        assert!(result.is_err());
+        assert_eq!(client.prepared_handles.get(&sid(1)).copied(), Some(9));
+        assert!(Arc::ptr_eq(
+            client.prepared_param_encryption.get(&sid(1)).unwrap(),
+            &replacement
+        ));
+        assert!(client.pending_prepared_param_encryption.is_none());
+    }
+
+    #[tokio::test]
+    async fn returned_handle_is_available_after_terminal_done() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            done_no_more(),
+        ]);
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+        client.pending_capture = Some(sid(1));
+        let replacement = Arc::new(DescribeParameterEncryptionResult::new());
+        client.pending_prepared_param_encryption = Some(Arc::clone(&replacement));
+
+        assert!(matches!(client.advance().await, Ok(StatementResult::End)));
+
+        assert_eq!(client.prepared_handles.get(&sid(1)).copied(), Some(9));
+        assert!(Arc::ptr_eq(
+            client.prepared_param_encryption.get(&sid(1)).unwrap(),
+            &replacement
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_query_error_aborts_pending_prepare_capture() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        let mut client = create_test_client();
+        client.execution_context.set_has_open_batch(true);
+        client.pending_capture = Some(sid(1));
+        client.pending_prepared_param_encryption =
+            Some(Arc::new(DescribeParameterEncryptionResult::new()));
+
+        assert!(client.close_query().await.is_err());
+        assert!(client.pending_capture.is_none());
+        assert!(client.pending_prepared_param_encryption.is_none());
+
+        client.push_return_value(int_return_value(0, 9));
+        assert!(!client.prepared_handles.contains_key(&sid(1)));
+        assert!(!client.prepared_param_encryption.contains_key(&sid(1)));
+    }
+
+    #[tokio::test]
+    async fn advance_error_aborts_pending_prepare_capture() {
+        let mut client = create_test_client();
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+        client.pending_capture = Some(sid(1));
+
+        assert!(client.advance().await.is_err());
+        assert!(client.pending_capture.is_none());
+    }
+
+    #[tokio::test]
+    async fn next_row_error_aborts_pending_prepare_capture() {
+        let mut client = create_test_client();
+        client.current_result_set_has_been_read_till_end = false;
+        client.pending_capture = Some(sid(1));
+
+        assert!(client.next_row().await.is_err());
+        assert!(client.pending_capture.is_none());
+    }
+
+    #[test]
+    fn push_return_value_without_pending_capture_leaves_map_untouched() {
+        // A reuse (sp_execute) issues no handle and arms no pending capture, so a
+        // stray Int return value is surfaced as an output param, not routed into
+        // the handle map.
+        let mut client = create_test_client();
+
+        client.push_return_value(int_return_value(0, 9));
+
+        assert!(client.prepared_handles.is_empty());
+        assert_eq!(
+            client.retrieve_output_params().unwrap().map(|v| v.len()),
+            Some(1)
+        );
+    }
+
     // ── execute() / current_metadata invariants ──
     //
     // After an execute path returns, `current_metadata` must reflect the
@@ -5674,8 +6817,15 @@ mod tests {
     #[tokio::test]
     async fn execute_sp_prepexec_clears_stale_metadata_when_no_result_set() {
         assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
-            c.execute_sp_prepexec("UPDATE t SET v = 1".to_string(), Vec::new(), None, ())
-                .await
+            let mut orphan = None;
+            c.execute_sp_prepexec_for_test(
+                "UPDATE t SET v = 1".to_string(),
+                Vec::new(),
+                &mut orphan,
+                (),
+            )
+            .await
+            .map(|(_, result)| result)
         })
         .await;
     }
@@ -5686,17 +6836,20 @@ mod tests {
     //   0x26  TYPE_INFO type byte = INTN
     //   0x04  TYPE_INFO max size = 4
     //   value: length byte then little-endian bytes (length 0x00 for NULL).
-    // These tests pin the byte the current selection controls: `drop_handle`
-    // becomes the input value of that by-reference `@handle`.
+    // These tests pin the byte the current selection controls: the orphan's
+    // live handle becomes the input value of that by-reference `@handle`.
 
     #[tokio::test]
-    async fn execute_sp_prepexec_sends_drop_handle_as_byref_handle_input() {
+    async fn execute_sp_prepexec_sends_orphan_handle_as_byref_handle_input() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let orphan_id = client.issue_statement_id();
+        client.prepared_handles.insert(orphan_id, 0x5152_5354);
+        let mut orphan = Some(orphan_id);
         client
-            .execute_sp_prepexec(
+            .execute_sp_prepexec_for_test(
                 "UPDATE t SET v = 1".to_string(),
                 Vec::new(),
-                Some(0x5152_5354),
+                &mut orphan,
                 (),
             )
             .await
@@ -5706,16 +6859,22 @@ mod tests {
         let expected = [0x00, 0x01, 0x26, 0x04, 0x04, 0x54, 0x53, 0x52, 0x51];
         assert!(
             bytes.windows(expected.len()).any(|w| w == expected),
-            "Some(handle) must be sent as the by-reference @handle input so the server \
+            "the orphan's handle must be sent as the by-reference @handle input so the server \
              drops the prior prepared statement"
         );
     }
 
     #[tokio::test]
-    async fn execute_sp_prepexec_sends_null_handle_when_no_drop_handle() {
+    async fn execute_sp_prepexec_sends_null_handle_when_no_orphan() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let mut orphan = None;
         client
-            .execute_sp_prepexec("UPDATE t SET v = 1".to_string(), Vec::new(), None, ())
+            .execute_sp_prepexec_for_test(
+                "UPDATE t SET v = 1".to_string(),
+                Vec::new(),
+                &mut orphan,
+                (),
+            )
             .await
             .expect("sp_prepexec should succeed against the queued DONE token");
 
@@ -5726,6 +6885,73 @@ mod tests {
                 .windows(expected_null.len())
                 .any(|w| w == expected_null),
             "None must send a NULL @handle input so the server prepares fresh"
+        );
+    }
+
+    // A reconnect clears `prepared_handles`, so an orphan the caller still holds
+    // may name a statement with no live handle. That drop is a no-op server-side.
+    #[tokio::test]
+    async fn execute_sp_prepexec_sends_null_handle_when_orphan_has_no_live_handle() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let mut orphan = Some(client.issue_statement_id());
+        client
+            .execute_sp_prepexec_for_test(
+                "UPDATE t SET v = 1".to_string(),
+                Vec::new(),
+                &mut orphan,
+                (),
+            )
+            .await
+            .expect("sp_prepexec should succeed against the queued DONE token");
+
+        let bytes = sent.lock().unwrap().clone();
+        let expected_null = [0x00, 0x01, 0x26, 0x04, 0x00];
+        assert!(
+            bytes
+                .windows(expected_null.len())
+                .any(|w| w == expected_null),
+            "an orphan with no live handle must send a NULL @handle input"
+        );
+        assert_eq!(orphan, None, "the orphan is released either way");
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_preserves_orphan_on_pre_send_error() {
+        let mut client = create_test_client();
+        let orphan_id = client.issue_statement_id();
+        client.prepared_handles.insert(orphan_id, 7);
+        client.execution_context.set_has_open_batch(true);
+        let mut orphan = Some(orphan_id);
+
+        let result = client
+            .execute_sp_prepexec_for_test("SELECT 1".to_string(), Vec::new(), &mut orphan, ())
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(orphan, Some(orphan_id));
+        assert_eq!(
+            client.prepared_handles.get(&orphan_id),
+            Some(&7),
+            "a pre-send failure must leave the orphan releasable"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_consumes_orphan_after_send_begins() {
+        let mut client = create_test_client();
+        let orphan_id = client.issue_statement_id();
+        client.prepared_handles.insert(orphan_id, 7);
+        let mut orphan = Some(orphan_id);
+
+        let result = client
+            .execute_sp_prepexec_for_test("SELECT 1".to_string(), Vec::new(), &mut orphan, ())
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(orphan, None);
+        assert!(
+            !client.prepared_handles.contains_key(&orphan_id),
+            "once the drop crosses the send boundary the orphan's entry is dead"
         );
     }
 
@@ -5762,18 +6988,21 @@ mod tests {
     #[test]
     fn push_return_value_captures_handle_then_surfaces_following_output_params() {
         let mut client = create_test_client();
-        client.expecting_prepare_handle = true;
+        client.pending_capture = Some(sid(1));
 
-        // First value = the sp_prepexec @handle: captured into the dedicated
-        // field and NOT surfaced as a user output parameter — mirroring
-        // msodbcsql, which routes it to hPrepCurrent, not the output-param path.
+        // First value = the sp_prepexec @handle: on the managed path it is
+        // diverted into the handle map and NOT surfaced as a user output
+        // parameter — mirroring msodbcsql, which routes it to hPrepCurrent.
         client.push_return_value(int_return_value(0, 0x0102_0304));
 
-        assert_eq!(client.prepared_statement_handle, Some(0x0102_0304));
-        assert!(!client.expecting_prepare_handle, "flag must be one-shot");
+        assert_eq!(
+            client.prepared_handles.get(&sid(1)).copied(),
+            Some(0x0102_0304)
+        );
+        assert!(client.pending_capture.is_none(), "capture is one-shot");
         assert!(
             client.return_values.is_empty(),
-            "the internal handle must not appear in return_values"
+            "the diverted handle must not appear in return_values"
         );
         assert!(client.get_return_values().is_empty());
 
@@ -5784,15 +7013,14 @@ mod tests {
             client.return_values[0].value,
             ColumnValues::Int(7)
         ));
-
-        // The captured handle stays retrievable independently of return_values.
-        assert_eq!(client.take_prepared_statement_handle(), Some(0x0102_0304));
     }
 
     #[tokio::test]
     async fn execute_sp_execute_clears_stale_metadata_when_no_result_set() {
         assert_no_result_set_clears_metadata(async |c: &mut TdsClient| {
-            c.execute_sp_execute(42, None, None, ()).await
+            let statement_id = c.register_prepared_handle_for_test(42);
+            c.execute_sp_execute_for_test(statement_id, None, None, ())
+                .await
         })
         .await;
     }

@@ -22,11 +22,9 @@
 /// as well as the timer.
 ///
 /// Because that dominant term scales with the size of the inner future, an
-/// isolated micro-benchmark on a trivial future understates it by ~3x. Measured
-/// in situ on a 48-column row, whose inner future is 2360 B, the saving is
-/// ~200 ns per row: ~3.1% of row decode into a discarding writer and ~2.6% into
-/// an allocating one. The absolute saving is writer-independent, as it must be —
-/// the writer is behind `&mut dyn` and does not change the future's layout.
+/// isolated micro-benchmark on a trivial future understates it. In a paired
+/// A/B benchmark after the packet-reader de-boxing merged in #264, this saves
+/// ~254 ns per 48-column row, about 15% of the isolated decode cost.
 ///
 /// The condition is *suspension*, deliberately not "the budget is zero".
 /// `update_remaining_timeout` saturates to `Duration::ZERO` rather than `None`,

@@ -20,6 +20,7 @@ use super::exec_common::{
     claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
 };
 use super::sqlstate::*;
+use super::txn::begin_transaction_if_manual;
 use crate::api::odbc_types::{
     SQL_ALL_TYPES, SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DATETIME, SQL_DECIMAL,
     SQL_DOUBLE, SQL_ERROR, SQL_FLOAT, SQL_GUID, SQL_INTEGER, SQL_INVALID_HANDLE, SQL_LONGVARBINARY,
@@ -149,10 +150,10 @@ fn sql_get_type_info_w_safe(
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.column_metadata.clear();
         stmt_state.reset_row_stream();
-        stmt_state.prepared_sql = None;
         // A cached prepared plan is superseded; release its server handle
         // (deferred) once we hold the client below.
         stmt_state.orphan_prepared_handle();
+        stmt_state.prepared = None;
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
     }
@@ -182,6 +183,10 @@ fn sql_get_type_info_w_safe(
 
     // Release any handle orphaned by the reset above before running the RPC.
     flush_pending_unprepare(dbc, stmt, &mut client, "SQLGetTypeInfoW");
+
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLGetTypeInfoW") {
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
 
     let exec_result = dbc.runtime.block_on(client.execute_stored_procedure(
         DATATYPE_INFO_PROC.to_string(),

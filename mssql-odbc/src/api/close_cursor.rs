@@ -128,6 +128,42 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
     }
 }
 
+/// Closes the cursor on a statement as part of a *connection*-scoped operation
+/// (`SQLEndTran`, an autocommit switch, an isolation change, disconnect).
+///
+/// Reproduces what msodbcsql's sweep does to each statement. `CommitAbortTran`
+/// calls `SQLFreeStmt(lpstmt, SQL_CLOSE)` on every statement it visits
+/// (`sqlctran.cpp:302-323`), and that entry point calls `FreeErrors(lpstmt)`
+/// before it looks at either the option or the cursor state
+/// (`sqlccmd.cpp:379-380`). Statement diagnostics are therefore discarded even
+/// on a statement that never opened a cursor — the failed-statement case — so
+/// [`free_errors`] runs here unconditionally, ahead of the cursor check.
+///
+/// Kept separate from the public `SQLFreeStmt(SQL_CLOSE)` path only for cost:
+/// statements with no open cursor return straight after the diagnostics reset,
+/// with no FFI entry and no drain.
+pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandle) -> SqlReturn {
+    {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("close_cursor_for_connection_op: stmt mutex poisoned");
+            return SQL_ERROR;
+        };
+        free_errors(&mut stmt_state);
+        if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
+            return SQL_SUCCESS;
+        }
+        reset_cursor_state(&mut stmt_state);
+    }
+
+    match drain_and_release(stmt, handle) {
+        DrainOutcome::Failed => {
+            error!("close_cursor_for_connection_op: failed to drain TDS stream");
+            SQL_ERROR
+        }
+        DrainOutcome::InfoPosted | DrainOutcome::Clean => SQL_SUCCESS,
+    }
+}
+
 /// Resets cursor state on the statement (cursor is no longer open, metadata cleared).
 pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
     stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);
@@ -213,7 +249,6 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
     };
 
     // Drain complete: return client and release busy claim atomically.
-    super::exec_common::capture_prepared_handle(stmt, &mut client);
     if let Ok(mut dbc_state) = dbc.inner.lock() {
         dbc_state.client = Some(client);
         if dbc_state.active_stmt == Some(statement_handle) {

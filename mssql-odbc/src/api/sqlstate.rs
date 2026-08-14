@@ -17,12 +17,17 @@ pub(crate) const SQLSTATE_07006: [u8; 5] = *b"07006";
 pub(crate) const SQLSTATE_07009: [u8; 5] = *b"07009";
 pub(crate) const SQLSTATE_08001: [u8; 5] = *b"08001";
 pub(crate) const SQLSTATE_08003: [u8; 5] = *b"08003";
+/// Connection failure during a transaction — ODBC's precise state for a
+/// commit or rollback that could not reach the server.
+pub(crate) const SQLSTATE_08007: [u8; 5] = *b"08007";
 pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
 pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
+pub(crate) const SQLSTATE_25000: [u8; 5] = *b"25000";
 pub(crate) const SQLSTATE_HY000: [u8; 5] = *b"HY000";
 pub(crate) const SQLSTATE_HY003: [u8; 5] = *b"HY003";
 pub(crate) const SQLSTATE_HY004: [u8; 5] = *b"HY004";
+pub(crate) const SQLSTATE_HY012: [u8; 5] = *b"HY012";
 pub(crate) const SQLSTATE_HYC00: [u8; 5] = *b"HYC00";
 pub(crate) const SQLSTATE_HY009: [u8; 5] = *b"HY009";
 pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
@@ -119,6 +124,29 @@ pub(crate) const ERR_INVALID_ATTRIBUTE_VALUE: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_ATTRIBUTE_IDENTIFIER: DiagMsg = DiagMsg {
     state: SQLSTATE_HY092,
     text: "Invalid attribute/option identifier",
+};
+/// `SQLEndTran` given a `CompletionType` other than `SQL_COMMIT` / `SQL_ROLLBACK`.
+pub(crate) const ERR_INVALID_TRANSACTION_OPERATION_CODE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY012,
+    text: "Invalid transaction operation code",
+};
+/// `SQLDisconnect` while a manual-commit transaction holds uncommitted work
+/// (msodbcsql `sqlcconn.cpp:1234`).
+pub(crate) const ERR_INVALID_TRANSACTION_STATE: DiagMsg = DiagMsg {
+    state: SQLSTATE_25000,
+    text: "Invalid transaction state",
+};
+/// Posted when turning autocommit back on commits an open transaction
+/// (msodbcsql `sqlcconn.cpp:3698`, `IDS_01_000_00`).
+pub(crate) const WARN_TRANSACTION_COMMITTED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01000,
+    text: "The open transaction was committed because autocommit mode was enabled",
+};
+/// `SQL_ATTR_TXN_ISOLATION` changed while a manual-commit transaction is open
+/// (msodbcsql `sqlcmisc.cpp:360`).
+pub(crate) const ERR_ATTRIBUTE_CANNOT_BE_SET_NOW: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY011,
+    text: "Attribute cannot be set now",
 };
 pub(crate) const ERR_INVALID_CONNECTION_STRING_ATTRIBUTE: DiagMsg = DiagMsg {
     state: SQLSTATE_01S00,
