@@ -103,6 +103,13 @@ use crate::{
 /// Column-flag bit indicating the column is protected by Always Encrypted.
 const FLAG_ENCRYPTED: u16 = 0x0800;
 
+/// Maximum number of columns a single result set may declare. SQL Server caps a
+/// SELECT at 4096 columns, so a COLMETADATA token claiming more is malformed.
+/// Rejecting an implausible count before reserving per-column storage bounds the
+/// eager `Vec<ColumnMetadata>` allocation and prevents a tiny token (a 3-byte
+/// `81 FF FE` reserves ~42 MB) from driving a memory-amplification DoS.
+const MAX_COLUMN_COUNT: u16 = 4096;
+
 /// Cipher algorithm id signalling a custom (named) algorithm whose name follows
 /// inline in the crypto metadata.
 const CUSTOM_CIPHER_ALGORITHM_ID: u8 = 0x00;
@@ -130,6 +137,16 @@ where
         // This occurs for non-query statements like INSERT, UPDATE, DELETE
         if col_count == 0xFFFF {
             return Ok(Tokens::from(ColMetadataToken::default()));
+        }
+
+        // Reject an implausible column count before reserving per-column storage.
+        // Without this bound a 3-byte token can drive a ~42 MB eager allocation
+        // (col_count * size_of::<ColumnMetadata>()), a memory-amplification DoS
+        // that the fuzzer surfaces as a timeout.
+        if col_count > MAX_COLUMN_COUNT {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "COLMETADATA column count {col_count} exceeds maximum supported {MAX_COLUMN_COUNT}"
+            )));
         }
 
         // When column encryption is negotiated, the CEK table is sent right
@@ -629,6 +646,25 @@ mod tests {
 
         let result = parser.parse(&mut reader, &context).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rejects_implausible_column_count() {
+        // Regression for the fuzz_token_stream timeout (build 164079): a
+        // COLMETADATA token declaring col_count 0xB884 (47236) forced a ~30 MB
+        // eager `Vec<ColumnMetadata>` reservation from 2 bytes. Counts above
+        // MAX_COLUMN_COUNT must be rejected before any storage is reserved.
+        let data = vec![0x84, 0xB8]; // col_count = 0xB884 = 47236 (> MAX_COLUMN_COUNT)
+        let mut reader = MockReader::new(data);
+        let parser = ColMetadataTokenParser;
+        let context = ParserContext::default();
+
+        match parser.parse(&mut reader, &context).await {
+            Err(crate::error::Error::ProtocolError(msg)) => {
+                assert!(msg.contains("column count"), "unexpected message: {msg}");
+            }
+            other => panic!("expected ProtocolError, got {other:?}"),
+        }
     }
 
     #[tokio::test]
