@@ -280,9 +280,12 @@ impl CursorClient for TdsClient {
         }
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
-        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
         self.transport.reset_reader();
@@ -351,9 +354,12 @@ impl CursorClient for TdsClient {
         }
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
-        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
         self.transport.reset_reader();
@@ -431,9 +437,12 @@ impl CursorClient for TdsClient {
         }
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
-        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
         self.transport.reset_reader();
@@ -524,9 +533,12 @@ impl CursorClient for TdsClient {
         }
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
-        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
         self.transport.reset_reader();
@@ -585,9 +597,12 @@ impl CursorClient for TdsClient {
         }
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
-        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
         self.transport.reset_reader();
@@ -675,9 +690,12 @@ impl CursorClient for TdsClient {
         };
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
-        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
         self.transport.reset_reader();
@@ -733,9 +751,12 @@ impl CursorClient for TdsClient {
         }
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
-        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
         self.transport.reset_reader();
@@ -839,9 +860,12 @@ impl CursorClient for TdsClient {
         }
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
-        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
         self.transport.reset_reader();
@@ -902,9 +926,12 @@ impl CursorClient for TdsClient {
         }
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
-        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
         self.transport.reset_reader();
@@ -992,9 +1019,12 @@ impl CursorClient for TdsClient {
         }
 
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let timeout_sec = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
-        self.remaining_request_timeout = Self::timeout_to_duration(timeout_sec);
+        self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
         self.transport.reset_reader();

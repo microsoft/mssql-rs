@@ -129,7 +129,7 @@ pub(crate) struct RowPauseState {
     /// Column metadata for the row, shared with the ParserContext.
     pub(crate) metadata: Arc<ColMetadataToken>,
     /// NBCROW null-bitmap (one bit per column, LSB-first).  `None` for plain ROW.
-    pub(crate) nbc_null_bitmap: Option<Vec<u8>>,
+    pub(crate) nbc_null_bitmap: Option<Arc<[u8]>>,
     /// Optional AE decryptor needed to continue decrypting encrypted columns
     /// after a row pause/resume boundary.
     pub(crate) decryptor: Option<Arc<dyn CellDecryptor>>,
@@ -141,7 +141,7 @@ pub(crate) struct RowPauseState {
 pub struct RowPauseState {
     pub next_column_index: usize,
     pub metadata: Arc<ColMetadataToken>,
-    pub nbc_null_bitmap: Option<Vec<u8>>,
+    pub nbc_null_bitmap: Option<Arc<[u8]>>,
     pub decryptor: Option<Arc<dyn CellDecryptor>>,
 }
 
@@ -302,6 +302,7 @@ where
 {
     pub packet_reader: T,
     pub parser_registry: Box<R>,
+    pub nbc_bitmap_scratch: Option<Arc<[u8]>>,
 }
 
 /// Column metadata plus the optional cell decryptor needed to decode a row.
@@ -458,14 +459,14 @@ async fn skip_column<R: TdsPacketReader + Send + Sync>(
 fn pause_after_column(
     col: usize,
     metadata: &Arc<ColMetadataToken>,
-    bitmap: Option<&[u8]>,
+    bitmap: Option<&Arc<[u8]>>,
     decryptor: Option<&Arc<dyn CellDecryptor>>,
 ) -> RowReadResult {
     if col + 1 < metadata.columns.len() {
         RowReadResult::RowPaused(RowPauseState {
             next_column_index: col + 1,
             metadata: Arc::clone(metadata),
-            nbc_null_bitmap: bitmap.map(|b| b.to_vec()),
+            nbc_null_bitmap: bitmap.cloned(),
             decryptor: decryptor.cloned(),
         })
     } else {
@@ -484,7 +485,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send
     reader: &mut R,
     metadata: &Arc<ColMetadataToken>,
     decryptor: Option<&Arc<dyn CellDecryptor>>,
-    bitmap: Option<&[u8]>,
+    bitmap: Option<&Arc<[u8]>>,
     start_col: usize,
     plan: ColumnPolicy,
     writer: &mut W,
@@ -547,7 +548,7 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send
                         row_pause_state: RowPauseState {
                             next_column_index: col + 1,
                             metadata: Arc::clone(metadata),
-                            nbc_null_bitmap: bitmap.map(|b| b.to_vec()),
+                            nbc_null_bitmap: bitmap.cloned(),
                             decryptor: decryptor.cloned(),
                         },
                         plp_stream,
@@ -597,6 +598,73 @@ async fn decode_or_decrypt_column<
     Ok(())
 }
 
+/// Allocates a zeroed null bitmap in a single allocation.
+///
+/// `Arc<[u8]>` stores its refcounts inline with the data, so `Arc::from(Vec<u8>)`
+/// cannot reuse the `Vec`'s buffer — it allocates again and memcpies. Collecting
+/// from a `TrustedLen` iterator writes straight into the `Arc`'s allocation.
+fn zeroed_bitmap(bitmap_len: usize) -> Arc<[u8]> {
+    std::iter::repeat_n(0u8, bitmap_len).collect()
+}
+
+/// Fills `buffer` with exactly `buffer.len()` bitmap bytes.
+///
+/// [`TdsPacketReader::read_bytes`] reports a count and does not contract a full
+/// fill. That matters more here than elsewhere: because the buffer is reused, a
+/// short read would leave the *previous* row's bits in the tail and silently
+/// yield wrong NULL flags for this row, with the wrongness depending on whatever
+/// row came before. A short bitmap read is a protocol violation, so treat it as
+/// one rather than decoding from half-stale state.
+async fn fill_bitmap<R: TdsPacketReader + Send + Sync>(
+    reader: &mut R,
+    buffer: &mut [u8],
+) -> TdsResult<()> {
+    let expected = buffer.len();
+    let read = reader.read_bytes(buffer).await?;
+    if read != expected {
+        return Err(crate::error::Error::ProtocolError(format!(
+            "NBCROW null bitmap truncated: expected {expected} bytes, read {read}"
+        )));
+    }
+    Ok(())
+}
+
+/// Reads an NBCROW null bitmap, refilling `scratch`'s allocation in place when
+/// nothing else still holds it.
+///
+/// `bitmap_len` is constant for a result set and paused rows are drained before
+/// the next row header is read, so after the first NBCROW row of a result set
+/// this allocates nothing.
+///
+/// The [`Arc::get_mut`] check is load-bearing for correctness, not just an
+/// optimization guard: a consumer holding a [`RowPauseState`] past end-of-row
+/// keeps the cached bitmap alive, and refilling it would corrupt a row that is
+/// still being read. Falling through to a fresh allocation is the only safe
+/// response, so the reuse and allocate paths are kept separate — each takes the
+/// single [`Arc::get_mut`] it needs, and the one that must not fail is the one
+/// operating on an `Arc` allocated a line earlier.
+async fn read_nbc_bitmap<R: TdsPacketReader + Send + Sync>(
+    reader: &mut R,
+    bitmap_len: usize,
+    scratch: &mut Option<Arc<[u8]>>,
+) -> TdsResult<Arc<[u8]>> {
+    if let Some(mut cached) = scratch.take()
+        && cached.len() == bitmap_len
+        && let Some(buffer) = Arc::get_mut(&mut cached)
+    {
+        fill_bitmap(reader, buffer).await?;
+        *scratch = Some(Arc::clone(&cached));
+        return Ok(cached);
+    }
+
+    let mut bitmap = zeroed_bitmap(bitmap_len);
+    let buffer = Arc::get_mut(&mut bitmap).expect("a freshly allocated Arc is unique");
+    fill_bitmap(reader, buffer).await?;
+
+    *scratch = Some(Arc::clone(&bitmap));
+    Ok(bitmap)
+}
+
 pub(crate) async fn receive_row_into_internal<
     R: TdsPacketReader + Send + Sync,
     W: RowWriter + Send + ?Sized,
@@ -606,6 +674,7 @@ pub(crate) async fn receive_row_into_internal<
     context: &ParserContext,
     plan: ColumnPolicy,
     writer: &mut W,
+    nbc_bitmap_scratch: &mut Option<Arc<[u8]>>,
 ) -> TdsResult<RowReadResult> {
     let token_type_byte = reader.read_byte().await?;
     let token_type: TokenType = token_type_byte.try_into()?;
@@ -619,8 +688,7 @@ pub(crate) async fn receive_row_into_internal<
         TokenType::NbcRow => {
             let (metadata, decryptor) = extract_row_context(context)?;
             let bitmap_len = metadata.columns.len().div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_len];
-            reader.read_bytes(&mut bitmap).await?;
+            let bitmap = read_nbc_bitmap(reader, bitmap_len, nbc_bitmap_scratch).await?;
             drive_row_columns(reader, metadata, decryptor, Some(&bitmap), 0, plan, writer).await
         }
         _ => {
@@ -638,6 +706,7 @@ pub(crate) async fn receive_row_header_internal<R: TdsPacketReader + Send + Sync
     reader: &mut R,
     registry: &impl TokenParserRegistry,
     context: &ParserContext,
+    nbc_bitmap_scratch: &mut Option<Arc<[u8]>>,
 ) -> TdsResult<RowHeader> {
     let token_type_byte = reader.read_byte().await?;
     let token_type: TokenType = token_type_byte.try_into()?;
@@ -656,8 +725,7 @@ pub(crate) async fn receive_row_header_internal<R: TdsPacketReader + Send + Sync
         TokenType::NbcRow => {
             let (metadata, decryptor) = extract_row_context(context)?;
             let bitmap_len = metadata.columns.len().div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_len];
-            reader.read_bytes(&mut bitmap).await?;
+            let bitmap = read_nbc_bitmap(reader, bitmap_len, nbc_bitmap_scratch).await?;
             Ok(RowHeader::Positioned(RowPauseState {
                 next_column_index: 0,
                 metadata: Arc::clone(metadata),
@@ -696,7 +764,7 @@ pub(crate) async fn resume_row_into_internal<
         reader,
         &metadata,
         decryptor.as_ref(),
-        nbc_null_bitmap.as_deref(),
+        nbc_null_bitmap.as_ref(),
         next_column_index,
         plan,
         writer,
@@ -722,6 +790,7 @@ where
         TokenStreamReader {
             packet_reader,
             parser_registry,
+            nbc_bitmap_scratch: None,
         }
     }
 
@@ -800,6 +869,7 @@ where
                 context,
                 plan,
                 writer,
+                &mut self.nbc_bitmap_scratch,
             ),
         );
         let result = match remaining_request_timeout.as_ref() {
@@ -830,7 +900,12 @@ where
     ) -> TdsResult<RowHeader> {
         let cancellable = CancelHandle::run_until_cancelled(
             cancel_handle,
-            receive_row_header_internal(&mut self.packet_reader, &*self.parser_registry, context),
+            receive_row_header_internal(
+                &mut self.packet_reader,
+                &*self.parser_registry,
+                context,
+                &mut self.nbc_bitmap_scratch,
+            ),
         );
         let result = match remaining_request_timeout.as_ref() {
             Some(t) => match timeout(*t, cancellable).await {
@@ -1090,6 +1165,7 @@ mod tests {
         let registry = GenericTokenParserRegistry::default();
         let mut reader = TestByteReader::new(vec![TokenType::Row as u8]);
         let mut sink = DiscardRowWriter;
+        let mut nbc_bitmap_scratch = None;
 
         // Constructing an async fn's future runs none of its body, so these are free to
         // build and drop unpolled. Each borrow ends with its statement.
@@ -1103,6 +1179,7 @@ mod tests {
             &context,
             ColumnPolicy::DecodeAll,
             &mut sink as &mut (dyn RowWriter + Send),
+            &mut nbc_bitmap_scratch,
         ));
         let receive_mono = size_of_val(&receive_row_into_internal(
             &mut reader,
@@ -1110,6 +1187,7 @@ mod tests {
             &context,
             ColumnPolicy::DecodeAll,
             &mut sink,
+            &mut nbc_bitmap_scratch,
         ));
         let drive_dyn = size_of_val(&drive_row_columns(
             &mut reader,
@@ -1249,11 +1327,23 @@ mod tests {
     struct TestByteReader {
         data: Vec<u8>,
         pos: usize,
+        /// When set, the next `read_bytes` fills only this many bytes and
+        /// reports that count, modelling a reader that does not fully fill.
+        short_read: Option<usize>,
     }
 
     impl TestByteReader {
         fn new(data: Vec<u8>) -> Self {
-            Self { data, pos: 0 }
+            Self {
+                data,
+                pos: 0,
+                short_read: None,
+            }
+        }
+
+        fn with_short_read(mut self, filled: usize) -> Self {
+            self.short_read = Some(filled);
+            self
         }
 
         fn take(&mut self, n: usize) -> TdsResult<&[u8]> {
@@ -1319,6 +1409,11 @@ mod tests {
         }
 
         async fn read_bytes(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
+            if let Some(filled) = self.short_read.take() {
+                let raw = self.take(filled)?;
+                buffer[..filled].copy_from_slice(raw);
+                return Ok(filled);
+            }
             let raw = self.take(buffer.len())?;
             buffer.copy_from_slice(raw);
             Ok(buffer.len())
@@ -1434,6 +1529,7 @@ mod tests {
             &context,
             ColumnPolicy::DecodeOne(0),
             &mut writer,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1487,6 +1583,7 @@ mod tests {
             &context,
             ColumnPolicy::DecodeOne(0),
             &mut writer,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1508,7 +1605,7 @@ mod tests {
         let mut reader = TestByteReader::new(vec![TokenType::Row as u8]);
         let registry = GenericTokenParserRegistry::default();
 
-        match receive_row_header_internal(&mut reader, &registry, &context)
+        match receive_row_header_internal(&mut reader, &registry, &context, &mut None)
             .await
             .unwrap()
         {
@@ -1522,25 +1619,174 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nbcrow_header_shares_result_metadata_arc() {
+    async fn nbcrow_pause_shares_header_bitmap_arc() {
         let metadata = two_int4_metadata();
         let context = ParserContext::ColumnMetadata(Arc::clone(&metadata), None);
 
-        let mut reader = TestByteReader::new(vec![TokenType::NbcRow as u8, 0b0000_0010]);
+        let mut reader = TestByteReader::new(vec![TokenType::NbcRow as u8, 0b0000_0001]);
         let registry = GenericTokenParserRegistry::default();
+        let mut writer = DiscardRowWriter;
 
-        match receive_row_header_internal(&mut reader, &registry, &context)
-            .await
-            .unwrap()
+        let RowHeader::Positioned(header_state) =
+            receive_row_header_internal(&mut reader, &registry, &context, &mut None)
+                .await
+                .unwrap()
+        else {
+            panic!("expected Positioned");
+        };
+        let bitmap = header_state.nbc_null_bitmap.as_ref().unwrap().clone();
+
+        match resume_row_into_internal(
+            &mut reader,
+            header_state,
+            ColumnPolicy::DecodeOne(0),
+            &mut writer,
+        )
+        .await
+        .unwrap()
         {
-            RowHeader::Positioned(state) => {
+            RowReadResult::RowPaused(state) => {
                 assert!(Arc::ptr_eq(&metadata, &state.metadata));
-                assert_eq!(state.next_column_index, 0);
-                // bitmap_len still derives from the shared token's column count.
-                assert_eq!(state.nbc_null_bitmap.as_deref(), Some(&[0b0000_0010][..]));
+                assert_eq!(state.next_column_index, 1);
+                assert!(Arc::ptr_eq(
+                    &bitmap,
+                    state.nbc_null_bitmap.as_ref().unwrap()
+                ));
             }
-            RowHeader::Token(_) => panic!("expected Positioned, got Token"),
+            other => panic!("expected RowPaused, got {other:?}"),
         }
+    }
+
+    /// Reads the next NBCROW header and yields just its null bitmap, dropping
+    /// the rest of the pause state so the bitmap's only holders are the caller
+    /// and `scratch`.
+    async fn next_nbc_bitmap(
+        reader: &mut TestByteReader,
+        registry: &GenericTokenParserRegistry,
+        context: &ParserContext,
+        scratch: &mut Option<Arc<[u8]>>,
+    ) -> Arc<[u8]> {
+        let RowHeader::Positioned(state) =
+            receive_row_header_internal(reader, registry, context, scratch)
+                .await
+                .unwrap()
+        else {
+            panic!("expected Positioned");
+        };
+        state.nbc_null_bitmap.expect("NBCROW carries a null bitmap")
+    }
+
+    // NBCROW rows are the hot path for wide result sets, so the bitmap
+    // allocation must be refilled rather than reallocated once no paused row
+    // still holds it.
+    #[tokio::test]
+    async fn nbcrow_bitmap_allocation_is_reused_across_rows() {
+        let context = ParserContext::ColumnMetadata(two_int4_metadata(), None);
+
+        let mut reader = TestByteReader::new(vec![
+            TokenType::NbcRow as u8,
+            0b0000_0001,
+            TokenType::NbcRow as u8,
+            0b0000_0010,
+        ]);
+        let registry = GenericTokenParserRegistry::default();
+        let mut scratch = None;
+
+        let first = next_nbc_bitmap(&mut reader, &registry, &context, &mut scratch).await;
+        assert_eq!(*first, [0b0000_0001]);
+        let first_allocation = first.as_ptr();
+        drop(first);
+
+        let second = next_nbc_bitmap(&mut reader, &registry, &context, &mut scratch).await;
+        assert_eq!(*second, [0b0000_0010]);
+        assert_eq!(second.as_ptr(), first_allocation);
+    }
+
+    // A consumer holding a `RowPauseState` past end-of-row keeps its bitmap
+    // alive, so refilling in place would corrupt a row still being read.
+    #[tokio::test]
+    async fn nbcrow_bitmap_is_not_reused_while_a_paused_row_holds_it() {
+        let context = ParserContext::ColumnMetadata(two_int4_metadata(), None);
+
+        let mut reader = TestByteReader::new(vec![
+            TokenType::NbcRow as u8,
+            0b0000_0001,
+            TokenType::NbcRow as u8,
+            0b0000_0010,
+        ]);
+        let registry = GenericTokenParserRegistry::default();
+        let mut scratch = None;
+
+        let held = next_nbc_bitmap(&mut reader, &registry, &context, &mut scratch).await;
+        let next = next_nbc_bitmap(&mut reader, &registry, &context, &mut scratch).await;
+
+        assert_ne!(next.as_ptr(), held.as_ptr());
+        assert_eq!(*held, [0b0000_0001]);
+        assert_eq!(*next, [0b0000_0010]);
+    }
+
+    // A new result set can change the column count, so a cached bitmap of the
+    // wrong length must not be refilled and handed back at the wrong size.
+    #[tokio::test]
+    async fn nbcrow_bitmap_is_not_reused_across_a_column_count_change() {
+        let narrow = ParserContext::ColumnMetadata(two_int4_metadata(), None);
+        let wide = ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: 9,
+                columns: (0..9).map(|i| int4_metadata(&format!("c{i}"))).collect(),
+                cek_table: vec![],
+            }),
+            None,
+        );
+
+        let mut reader = TestByteReader::new(vec![
+            TokenType::NbcRow as u8,
+            0b0000_0001,
+            TokenType::NbcRow as u8,
+            0b0000_0011,
+            0b0000_0001,
+        ]);
+        let registry = GenericTokenParserRegistry::default();
+        let mut scratch = None;
+
+        let first = next_nbc_bitmap(&mut reader, &registry, &narrow, &mut scratch).await;
+        assert_eq!(*first, [0b0000_0001]);
+        drop(first);
+
+        let second = next_nbc_bitmap(&mut reader, &registry, &wide, &mut scratch).await;
+        assert_eq!(*second, [0b0000_0011, 0b0000_0001]);
+    }
+
+    // `read_bytes` reports a count and contracts no full fill. Because the
+    // buffer is reused, a partial fill would leave the previous row's bits in
+    // the tail, so it has to be rejected rather than decoded.
+    #[tokio::test]
+    async fn nbcrow_short_bitmap_read_is_rejected() {
+        let context = ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: 9,
+                columns: (0..9).map(|i| int4_metadata(&format!("c{i}"))).collect(),
+                cek_table: vec![],
+            }),
+            None,
+        );
+
+        let mut reader =
+            TestByteReader::new(vec![TokenType::NbcRow as u8, 0b0000_0011, 0b0000_0001])
+                .with_short_read(1);
+        let registry = GenericTokenParserRegistry::default();
+        let mut scratch = None;
+
+        let Err(err) =
+            receive_row_header_internal(&mut reader, &registry, &context, &mut scratch).await
+        else {
+            panic!("a truncated null bitmap must be rejected");
+        };
+
+        assert!(
+            err.to_string().contains("NBCROW null bitmap truncated"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1564,6 +1810,7 @@ mod tests {
             &context,
             ColumnPolicy::DecodeOne(0),
             &mut writer,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1640,10 +1887,17 @@ mod tests {
         let registry = GenericTokenParserRegistry::default();
         let mut writer = DiscardRowWriter;
 
-        let result = receive_row_into_internal(
+        let RowHeader::Positioned(header_state) =
+            receive_row_header_internal(&mut reader, &registry, &context, &mut None)
+                .await
+                .unwrap()
+        else {
+            panic!("expected Positioned");
+        };
+        let bitmap = header_state.nbc_null_bitmap.as_ref().unwrap().clone();
+        let result = resume_row_into_internal(
             &mut reader,
-            &registry,
-            &context,
+            header_state,
             ColumnPolicy::DecodeOne(1),
             &mut writer,
         )
@@ -1654,6 +1908,10 @@ mod tests {
             RowReadResult::PlpPaused(plp_state) => {
                 assert!(plp_state.collation().is_none());
                 assert!(!plp_state.reached_end());
+                assert!(Arc::ptr_eq(
+                    &bitmap,
+                    plp_state.row_pause_state.nbc_null_bitmap.as_ref().unwrap()
+                ));
             }
             _ => panic!("expected PlpPaused"),
         }
@@ -1680,6 +1938,7 @@ mod tests {
             &context,
             ColumnPolicy::DecodeOne(0),
             &mut writer,
+            &mut None,
         )
         .await;
 

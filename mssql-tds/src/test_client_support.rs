@@ -288,6 +288,7 @@ pub(crate) mod byte_stream {
     struct ByteStreamTransport {
         reader: MockReader,
         registry: crate::io::token_stream::GenericTokenParserRegistry,
+        nbc_bitmap_scratch: Option<std::sync::Arc<[u8]>>,
     }
 
     impl ByteStreamTransport {
@@ -295,6 +296,7 @@ pub(crate) mod byte_stream {
             Self {
                 reader: MockReader::new(bytes),
                 registry: crate::io::token_stream::GenericTokenParserRegistry::default(),
+                nbc_bitmap_scratch: None,
             }
         }
     }
@@ -335,6 +337,7 @@ pub(crate) mod byte_stream {
                 context,
                 plan,
                 writer,
+                &mut self.nbc_bitmap_scratch,
             )
             .await
         }
