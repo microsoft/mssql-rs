@@ -97,20 +97,6 @@ impl PyAsyncConnection {
     /// Dictionary parsing runs synchronously on the calling thread (it needs
     /// the GIL). The network handshake is submitted to the shared Tokio
     /// runtime and driven concurrently with the caller's asyncio loop.
-    ///
-    /// # `python_logger`
-    ///
-    /// Optional Python logger. The bridge is installed via
-    /// [`scoped_tracing_bridge`], which returns a `!Send` thread-local
-    /// `DefaultGuard` covering the caller's thread only. Logs emitted during
-    /// the synchronous prelude (dict extraction, encryption options, auth
-    /// method resolution, datasource selection) reach the logger. Logs
-    /// emitted inside the awaitable's async work (`create_client`,
-    /// everything mssql-tds emits during pre-login / TLS / Login7, and the
-    /// completion trace) run on Tokio worker threads and are NOT bridged
-    /// here — those still route through the process-wide subscriber set up
-    /// by `tracing_init::init_tracing()`. Full async-phase bridging is
-    /// future work.
     #[classmethod]
     #[pyo3(signature = (client_context_dict, python_logger=None))]
     fn connect<'py>(
@@ -191,6 +177,7 @@ impl PyAsyncConnection {
     /// still considered closed — the OS closes the socket on drop either
     /// way, so we never leak the resource.
     fn close<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        tracing::info!("PyAsyncConnection::close: initiating close");
         // Detach the client from `self` synchronously (while `&mut self` is
         // valid) so the future can own it for `'static + Send`. Subsequent
         // method calls on this connection will see `tds_client == None`.
@@ -215,6 +202,7 @@ impl PyAsyncConnection {
                     e
                 );
             }
+            tracing::info!("PyAsyncConnection::close: connection closed");
             Python::attach(|py| Ok(py.None()))
         })
     }
