@@ -1343,9 +1343,8 @@ impl TdsPacketReader for NetworkTransport {
     }
 }
 
-#[async_trait]
-impl TdsTokenStreamReader for NetworkTransport {
-    async fn receive_token(
+impl NetworkTransport {
+    pub(crate) async fn receive_token(
         &mut self,
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
@@ -1377,14 +1376,17 @@ impl TdsTokenStreamReader for NetworkTransport {
         token_result
     }
 
-    async fn receive_row_into(
+    pub(crate) async fn receive_row_into<W>(
         &mut self,
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
         plan: ColumnPolicy,
-        writer: &mut (dyn RowWriter + Send),
-    ) -> TdsResult<RowReadResult> {
+        writer: &mut W,
+    ) -> TdsResult<RowReadResult>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
         let cancellable = CancelHandle::run_until_cancelled(
             cancel_handle,
             receive_row_into_internal(self, &*PARSER_REGISTRY, context, plan, writer),
@@ -1409,7 +1411,7 @@ impl TdsTokenStreamReader for NetworkTransport {
         result
     }
 
-    async fn receive_row_header(
+    pub(crate) async fn receive_row_header(
         &mut self,
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
@@ -1439,14 +1441,17 @@ impl TdsTokenStreamReader for NetworkTransport {
         result
     }
 
-    async fn resume_row_into(
+    pub(crate) async fn resume_row_into<W>(
         &mut self,
         pause_state: RowPauseState,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
         plan: ColumnPolicy,
-        writer: &mut (dyn RowWriter + Send),
-    ) -> TdsResult<RowReadResult> {
+        writer: &mut W,
+    ) -> TdsResult<RowReadResult>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
         let cancellable = CancelHandle::run_until_cancelled(
             cancel_handle,
             resume_row_into_internal(self, pause_state, plan, writer),
@@ -1471,7 +1476,7 @@ impl TdsTokenStreamReader for NetworkTransport {
         result
     }
 
-    async fn read_active_plp_bytes(
+    pub(crate) async fn read_active_plp_bytes(
         &mut self,
         plp_state: &mut PlpPauseState,
         remaining_request_timeout: Option<Duration>,
@@ -1500,6 +1505,89 @@ impl TdsTokenStreamReader for NetworkTransport {
             },
         }
         result
+    }
+}
+
+#[async_trait]
+impl TdsTokenStreamReader for NetworkTransport {
+    async fn receive_token(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Tokens> {
+        NetworkTransport::receive_token(self, context, remaining_request_timeout, cancel_handle)
+            .await
+    }
+
+    async fn receive_row_into(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        plan: ColumnPolicy,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult> {
+        NetworkTransport::receive_row_into(
+            self,
+            context,
+            remaining_request_timeout,
+            cancel_handle,
+            plan,
+            writer,
+        )
+        .await
+    }
+
+    async fn receive_row_header(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<RowHeader> {
+        NetworkTransport::receive_row_header(
+            self,
+            context,
+            remaining_request_timeout,
+            cancel_handle,
+        )
+        .await
+    }
+
+    async fn resume_row_into(
+        &mut self,
+        pause_state: RowPauseState,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        plan: ColumnPolicy,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult> {
+        NetworkTransport::resume_row_into(
+            self,
+            pause_state,
+            remaining_request_timeout,
+            cancel_handle,
+            plan,
+            writer,
+        )
+        .await
+    }
+
+    async fn read_active_plp_bytes(
+        &mut self,
+        plp_state: &mut PlpPauseState,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        out: &mut [u8],
+    ) -> TdsResult<usize> {
+        NetworkTransport::read_active_plp_bytes(
+            self,
+            plp_state,
+            remaining_request_timeout,
+            cancel_handle,
+            out,
+        )
+        .await
     }
 }
 

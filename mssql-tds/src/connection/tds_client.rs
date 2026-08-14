@@ -5,6 +5,7 @@ use crate::connection::bulk_copy::{BulkCopyOptions, BulkLoadRow, ResolvedColumnM
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{ClientContext, ExecutionColumnEncryptionSetting};
 use crate::connection::session_recovery::RecoveryContext;
+use crate::connection::transport::any_transport::AnyTransport;
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::datatypes::row_writer::{DefaultRowWriter, DiscardRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
@@ -136,7 +137,7 @@ pub enum CursorColumn {
 /// Provides methods for executing queries, managing transactions, and bulk copy.
 #[derive(Debug)]
 pub struct TdsClient {
-    pub(crate) transport: Box<dyn TdsTransport>,
+    pub(crate) transport: AnyTransport,
     pub(crate) negotiated_settings: NegotiatedSettings,
     pub(crate) execution_context: ExecutionContext,
     pub(crate) recovery_context: Box<RecoveryContext>,
@@ -239,7 +240,7 @@ pub struct TdsClient {
 
 impl TdsClient {
     pub(crate) fn new(
-        transport: Box<dyn TdsTransport>,
+        transport: AnyTransport,
         negotiated_settings: NegotiatedSettings,
         execution_context: ExecutionContext,
         client_context: ClientContext,
@@ -3526,6 +3527,28 @@ impl TdsClient {
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
     ///
+    /// Concrete writers stay concrete through the production transport and
+    /// decode chain. Calling the object-safe [`ResultSet::next_row_into`] method
+    /// remains supported for callers that intentionally hold a trait object.
+    #[instrument(skip(self, writer), level = "info")]
+    pub async fn next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let result = if !self.current_result_set_has_been_read_till_end {
+            self.get_next_row_into(writer).await
+        } else {
+            Ok(false)
+        };
+        if result.is_err() {
+            self.abort_pending_prepare_capture();
+        }
+        result
+    }
+
+    /// Decodes the next row directly into a [`RowWriter`], returning `true` if
+    /// a row was written or `false` when the result set is exhausted.
+    ///
     /// This is the **push** entry point used by bulk consumers (Arrow / N-API /
     /// `next_row`). It always decodes a full row ([`ColumnPolicy::DecodeAll`]) and
     /// never pauses. If the pull cursor
@@ -3536,10 +3559,10 @@ impl TdsClient {
     /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
     /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
     #[instrument(skip(self, writer), level = "info")]
-    pub(crate) async fn get_next_row_into(
-        &mut self,
-        writer: &mut (dyn RowWriter + Send),
-    ) -> TdsResult<bool> {
+    pub(crate) async fn get_next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
         if self.current_metadata.is_none() {
             return Err(UsageError(
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
@@ -3846,12 +3869,15 @@ impl TdsClient {
         Ok(())
     }
 
-    async fn resume_row_loop(
+    async fn resume_row_loop<W>(
         &mut self,
         pause_state: RowPauseState,
         plan: ColumnPolicy,
-        writer: &mut (dyn RowWriter + Send),
-    ) -> TdsResult<bool> {
+        writer: &mut W,
+    ) -> TdsResult<bool>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
         let current = pause_state;
         let start = Instant::now();
         let result = self
@@ -4423,17 +4449,8 @@ impl ResultSet for TdsClient {
         result
     }
 
-    #[instrument(skip(self, writer), level = "info")]
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool> {
-        let result = if self.maybe_has_unread_rows() {
-            self.get_next_row_into(writer).await
-        } else {
-            Ok(false)
-        };
-        if result.is_err() {
-            self.abort_pending_prepare_capture();
-        }
-        result
+        TdsClient::next_row_into(self, writer).await
     }
 
     fn maybe_has_unread_rows(&self) -> bool {
@@ -4959,7 +4976,7 @@ mod tests {
     }
 
     fn create_test_client_with_transport(transport: TestTransport) -> TdsClient {
-        let transport = Box::new(transport);
+        let transport = AnyTransport::dynamic(transport);
         let negotiated_settings =
             crate::handler::handler_factory::create_test_negotiated_settings_internal();
         let execution_context = crate::connection::execution_context::ExecutionContext::new();
@@ -4981,6 +4998,7 @@ mod tests {
 
         let mut client = create_test_client();
         let mut sink = DiscardRowWriter;
+        let mut plp_out = [0u8; 64];
 
         // Constructing an async fn's future runs none of its body, so these are
         // free to build and drop unpolled. Each borrow ends with its statement.
@@ -4988,12 +5006,17 @@ mod tests {
         let read_row_column = std::mem::size_of_val(&client.read_row_column(0));
         let drain_rows = std::mem::size_of_val(&client.drain_rows());
         let get_next_row_into = std::mem::size_of_val(&client.get_next_row_into(&mut sink));
+        let next_row_into = std::mem::size_of_val(&client.next_row_into(&mut sink));
+        let read_active_plp_chunk =
+            std::mem::size_of_val(&client.read_active_plp_chunk(&mut plp_out));
 
         for (name, size) in [
             ("next_row_cursor", next_row_cursor),
             ("read_row_column", read_row_column),
             ("drain_rows", drain_rows),
             ("get_next_row_into", get_next_row_into),
+            ("next_row_into", next_row_into),
+            ("read_active_plp_chunk", read_active_plp_chunk),
         ] {
             assert!(
                 size <= MAX,
@@ -5033,7 +5056,7 @@ mod tests {
     }
 
     fn create_test_client_with_tokens(tokens: Vec<Tokens>) -> TdsClient {
-        let transport = Box::new(TestTransport::with_tokens(tokens));
+        let transport = AnyTransport::dynamic(TestTransport::with_tokens(tokens));
         let negotiated_settings =
             crate::handler::handler_factory::create_test_negotiated_settings_internal();
         let execution_context = crate::connection::execution_context::ExecutionContext::new();
@@ -5049,8 +5072,9 @@ mod tests {
     /// Builds a client whose transport replays `tokens` and captures every byte
     /// written to the wire, returning the shared capture buffer alongside it.
     fn create_capturing_client(tokens: Vec<Tokens>) -> (TdsClient, Arc<std::sync::Mutex<Vec<u8>>>) {
-        let transport = Box::new(TestTransport::with_tokens(tokens));
+        let transport = TestTransport::with_tokens(tokens);
         let sent = Arc::clone(&transport.sent);
+        let transport = AnyTransport::dynamic(transport);
         let negotiated_settings =
             crate::handler::handler_factory::create_test_negotiated_settings_internal();
         let execution_context = crate::connection::execution_context::ExecutionContext::new();
