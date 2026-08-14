@@ -146,6 +146,18 @@ impl PyAsyncConnection {
         self.default_query_timeout = value;
     }
 
+    /// True after `close()` has been awaited (or if `connect()` never produced a
+    /// live client). Cheap LBYL check; performs no I/O.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.tds_client.is_none()
+    }
+
+    /// Inverse of `.closed`, provided for sync-path parity with `PyCoreConnection`.
+    fn is_connected(&self) -> bool {
+        self.tds_client.is_some()
+    }
+
     /// Close the connection. Idempotent. Shutdown errors are logged and swallowed.
     fn close<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         tracing::info!("PyAsyncConnection::close: initiating close");

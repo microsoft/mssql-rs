@@ -223,3 +223,52 @@ def test_timeout_setter_rejects_negative(client_context):
                 await conn.close()
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# closed (property) and is_connected() — lifecycle state
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+def test_closed_property_toggles_across_close(client_context):
+    """closed is False on a live connection and True after close()."""
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            assert conn.closed is False
+            await conn.close()
+            assert conn.closed is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_is_connected_is_inverse_of_closed(client_context):
+    """is_connected() mirrors sync PyCoreConnection; always the inverse of .closed."""
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            assert conn.is_connected() is True
+            assert conn.is_connected() is (not conn.closed)
+            await conn.close()
+            assert conn.is_connected() is False
+            assert conn.is_connected() is (not conn.closed)
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_closed_is_idempotent_across_repeated_close(client_context):
+    """Second close() is a no-op; closed stays True."""
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            await conn.close()
+            assert conn.closed is True
+            await conn.close()
+            assert conn.closed is True
+
+    asyncio.run(run())
