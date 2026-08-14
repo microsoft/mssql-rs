@@ -3487,6 +3487,29 @@ mod test {
             );
         }
 
+        /// A non-NULL variant reports its base type alongside the value, which
+        /// is the whole reason the base type is threaded through the writer:
+        /// an `int` and a `varchar` variant both decode to distinct
+        /// `ColumnValues`, but only the wire header says what the column was
+        /// declared to hold.
+        #[tokio::test]
+        async fn decode_into_sql_variant_reports_the_base_type() {
+            let md = fixed_metadata(TdsDataType::SsVariant, 0);
+            // 6-byte payload: base type INT4 (0x38), zero property bytes, then
+            // the four value bytes. 0xAB trails to prove nothing overreads.
+            let mut reader = ByteReader::new(vec![6, 0, 0, 0, 0x38, 0x00, 42, 0, 0, 0, 0xAB]);
+            let decoder = GenericDecoder::default();
+            let mut writer = DefaultRowWriter::new(1);
+            decoder
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await
+                .unwrap();
+
+            assert_eq!(writer.variant_base(0), Some(TdsDataType::Int4));
+            assert_eq!(writer.take_row()[0], ColumnValues::Int(42));
+            assert_eq!(reader.read_byte().await.unwrap(), 0xAB);
+        }
+
         #[tokio::test]
         async fn decode_into_int2() {
             let md = fixed_metadata(TdsDataType::Int2, 2);

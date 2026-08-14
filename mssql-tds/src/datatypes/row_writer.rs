@@ -425,4 +425,29 @@ mod tests {
         assert_eq!(row[6], ColumnValues::Bit(false));
         assert_eq!(row[7], ColumnValues::Null);
     }
+
+    /// A variant's base type is keyed to the position the value lands in, so a
+    /// row mixing variant and non-variant columns reports the right base for
+    /// each, and nothing for the others.
+    #[test]
+    fn default_row_writer_keys_variant_base_types_to_their_column() {
+        let mut writer = DefaultRowWriter::new(3);
+
+        writer.write_i32(0, 1);
+        writer.write_variant_base_type(1, TdsDataType::NVarChar);
+        writer.write_string(1, SqlString::new(vec![0x41, 0x00], EncodingType::Utf16));
+        writer.write_variant_base_type(2, TdsDataType::Int4);
+        writer.write_i32(2, 7);
+        writer.end_row();
+
+        assert_eq!(writer.variant_base(0), None);
+        assert_eq!(writer.variant_base(1), Some(TdsDataType::NVarChar));
+        assert_eq!(writer.variant_base(2), Some(TdsDataType::Int4));
+        // Out of range is simply "not a variant".
+        assert_eq!(writer.variant_base(9), None);
+
+        // Taking the row clears the bases so the writer can be reused.
+        assert_eq!(writer.take_row().len(), 3);
+        assert_eq!(writer.variant_base(1), None);
+    }
 }

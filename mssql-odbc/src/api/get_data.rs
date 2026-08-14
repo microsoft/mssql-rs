@@ -1412,6 +1412,44 @@ mod tests {
         s.last_captured = Some((1, value));
     }
 
+    /// The byte count a probe reports for each value kind. Variable-length
+    /// values report their real size; fixed-width values report their wire
+    /// width; anything without a defined binary form reports SQL_NO_TOTAL so
+    /// the caller falls back to reading without a size hint.
+    #[test]
+    fn binary_length_covers_the_value_kinds() {
+        use mssql_tds::datatypes::column_values::SqlXml;
+        use mssql_tds::datatypes::sql_string::SqlString;
+
+        let cases: &[(ColumnValues, SqlLen)] = &[
+            (ColumnValues::Bytes(vec![1, 2, 3]), 3),
+            // A SqlString holds the bytes as they came off the wire, so a
+            // four-character UTF-16 string is eight bytes.
+            (
+                ColumnValues::String(SqlString::from_utf8_string("abcd".to_string())),
+                8,
+            ),
+            (
+                ColumnValues::Xml(SqlXml {
+                    bytes: vec![0x41, 0x42],
+                }),
+                2,
+            ),
+            (ColumnValues::Bit(true), 1),
+            (ColumnValues::TinyInt(1), 1),
+            (ColumnValues::SmallInt(1), 2),
+            (ColumnValues::Int(1), 4),
+            (ColumnValues::Real(1.0), 4),
+            (ColumnValues::BigInt(1), 8),
+            (ColumnValues::Float(1.0), 8),
+            (ColumnValues::Uuid(uuid::Uuid::nil()), 16),
+            (ColumnValues::Null, SQL_NO_TOTAL),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(binary_length(value), *expected, "{value:?}");
+        }
+    }
+
     /// A zero-length SQL_C_BINARY read reports the available length and leaves
     /// the value resident, so the caller can still read it for real afterwards.
     /// This is the probe mssql-python issues on every sql_variant column.

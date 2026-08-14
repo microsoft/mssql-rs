@@ -409,12 +409,12 @@ fn type_name(meta: &ColumnMetadata) -> &'static str {
 mod tests {
     use std::ptr;
 
-    use mssql_tds::test_client_support::int_columns;
-
     use super::*;
     use crate::api::odbc_types::{SQL_INTEGER, SQL_NULLABLE};
     use crate::api::sqlstate::ERR_INVALID_DESCRIPTOR_FIELD;
     use crate::test_support::TestHandles;
+    use mssql_tds::datatypes::sqldatatypes::TypeInfo;
+    use mssql_tds::test_client_support::int_columns;
 
     /// A statement positioned on a result set of `n` nullable `int` columns.
     fn stmt_with_int_columns(h: &TestHandles, n: usize) {
@@ -637,6 +637,316 @@ mod tests {
             s.diag_records.last().unwrap().sql_state,
             ERR_NOT_VARIANT_COLUMN.state
         );
+    }
+
+    /// Retypes column `col` (1-based) in place. `int_columns` is the only
+    /// metadata constructor available here, and the fields are public, so this
+    /// is how the per-type mapping tables get exercised without a live server.
+    fn retype_column(h: &TestHandles, col: usize, data_type: TdsDataType, length: usize) {
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut s = stmt_handle.inner.lock().unwrap();
+        let meta = &mut s.column_metadata[col - 1];
+        meta.data_type = data_type;
+        meta.type_info.tds_type = data_type;
+        meta.type_info.length = length;
+    }
+
+    /// Every numeric attribute this driver reports, on one `int` column.
+    #[test]
+    fn every_numeric_attribute_answers_for_an_int_column() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+
+        assert_eq!(numeric(&h, 1, SQL_DESC_LENGTH), 10);
+        assert_eq!(numeric(&h, 1, SQL_DESC_DISPLAY_SIZE), 10);
+        assert_eq!(numeric(&h, 1, SQL_DESC_OCTET_LENGTH), 4);
+        assert_eq!(numeric(&h, 1, SQL_DESC_PRECISION), 10);
+        assert_eq!(numeric(&h, 1, SQL_DESC_SCALE), 0);
+        assert_eq!(numeric(&h, 1, SQL_DESC_CASE_SENSITIVE), 0);
+        assert_eq!(numeric(&h, 1, SQL_DESC_FIXED_PREC_SCALE), 0);
+        assert_eq!(
+            numeric(&h, 1, SQL_DESC_UPDATABLE),
+            SQL_ATTR_READWRITE_UNKNOWN
+        );
+        assert_eq!(numeric(&h, 1, SQL_DESC_AUTO_UNIQUE_VALUE), 0);
+        assert_eq!(numeric(&h, 1, SQL_DESC_SEARCHABLE), SQL_PRED_SEARCHABLE);
+    }
+
+    /// A column with no name reports `SQL_UNNAMED`; `int_columns` names them.
+    #[test]
+    fn unnamed_column_is_reported() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.column_metadata[0].column_name.clear();
+        }
+        assert_eq!(numeric(&h, 1, SQL_DESC_UNNAMED), SQL_UNNAMED);
+    }
+
+    /// A non-nullable column reports `SQL_NO_NULLS`. `int_columns` sets the
+    /// nullable flag, so clear it.
+    #[test]
+    fn not_nullable_column_is_reported() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.column_metadata[0].flags &= !0x01;
+        }
+        assert_eq!(
+            numeric(&h, 1, SQL_DESC_NULLABLE),
+            SqlLen::from(SQL_NO_NULLS)
+        );
+    }
+
+    #[test]
+    fn type_name_and_radix_track_the_column_type() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+
+        // (type, wire length, expected type name, expected radix)
+        let cases: &[(TdsDataType, usize, &str, SqlLen)] = &[
+            (TdsDataType::Int1, 1, "tinyint", 10),
+            (TdsDataType::Int2, 2, "smallint", 10),
+            (TdsDataType::Int8, 8, "bigint", 10),
+            (TdsDataType::Flt4, 4, "real", 2),
+            (TdsDataType::Flt8, 8, "float", 2),
+            (TdsDataType::MoneyN, 8, "money", 10),
+            (TdsDataType::Guid, 16, "uniqueidentifier", 0),
+            (TdsDataType::BigVarChar, 10, "varchar", 0),
+            (TdsDataType::NVarChar, 20, "nvarchar", 0),
+            (TdsDataType::SsVariant, 8, "sql_variant", 0),
+        ];
+        for (ty, len, name, radix) in cases {
+            retype_column(&h, 1, *ty, *len);
+            assert_eq!(numeric(&h, 1, SQL_DESC_NUM_PREC_RADIX), *radix, "{ty:?}");
+            assert_eq!(
+                numeric(&h, 1, SQL_DESC_OCTET_LENGTH),
+                *len as SqlLen,
+                "{ty:?}"
+            );
+
+            let mut buf = [0u16; 32];
+            let mut written: SqlSmallInt = 0;
+            let rc = unsafe {
+                sql_col_attribute_w(
+                    h.stmt,
+                    1,
+                    SQL_DESC_TYPE_NAME,
+                    buf.as_mut_ptr() as SqlPointer,
+                    (buf.len() * 2) as SqlSmallInt,
+                    &mut written,
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, SQL_SUCCESS, "{ty:?}");
+            let got = String::from_utf16_lossy(&buf[..(written as usize) / 2]);
+            assert_eq!(got, *name, "{ty:?}");
+        }
+    }
+
+    /// `tinyint` is the only unsigned integer, and it is the one type this
+    /// driver deliberately reports as unsigned.
+    #[test]
+    fn unsigned_is_reported_only_for_tinyint() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+        retype_column(&h, 1, TdsDataType::Int1, 1);
+        assert_eq!(numeric(&h, 1, SQL_DESC_UNSIGNED), 1);
+        retype_column(&h, 1, TdsDataType::IntN, 1);
+        assert_eq!(numeric(&h, 1, SQL_DESC_UNSIGNED), 1);
+        retype_column(&h, 1, TdsDataType::IntN, 4);
+        assert_eq!(numeric(&h, 1, SQL_DESC_UNSIGNED), 0);
+    }
+
+    /// The C type reported for each base type a `sql_variant` can carry.
+    /// Exercised directly because a variant's base type is a property of the
+    /// value, which unit tests cannot produce.
+    #[test]
+    fn variant_c_type_covers_the_base_types() {
+        let cases: &[(TdsDataType, SqlSmallInt)] = &[
+            (TdsDataType::Int1, SQL_C_TINYINT),
+            (TdsDataType::Int2, SQL_C_SSHORT),
+            (TdsDataType::Int4, SQL_C_SLONG),
+            (TdsDataType::Int8, SQL_C_SBIGINT),
+            (TdsDataType::Bit, SQL_C_BIT),
+            (TdsDataType::Flt4, SQL_C_FLOAT),
+            (TdsDataType::Flt8, SQL_C_DOUBLE),
+            // The exact numerics are advertised as character data because
+            // SQL_NUMERIC_STRUCT is a permanent non-goal.
+            (TdsDataType::Numeric, SQL_C_CHAR),
+            (TdsDataType::MoneyN, SQL_C_CHAR),
+            (TdsDataType::DateN, SQL_C_TYPE_DATE),
+            (TdsDataType::TimeN, SQL_C_SS_TIME2),
+            (TdsDataType::DateTimeN, SQL_C_TYPE_TIMESTAMP),
+            (TdsDataType::DateTime2N, SQL_C_TYPE_TIMESTAMP),
+            (TdsDataType::DateTimeOffsetN, SQL_C_SS_TIMESTAMPOFFSET),
+            (TdsDataType::BigVarChar, SQL_C_CHAR),
+            (TdsDataType::NVarChar, SQL_C_WCHAR),
+            (TdsDataType::BigVarBinary, SQL_C_BINARY),
+            (TdsDataType::Guid, SQL_C_GUID),
+            // A variant cannot carry these, so character is the fallback.
+            (TdsDataType::Xml, SQL_C_CHAR),
+        ];
+        for (base, expected) in cases {
+            assert_eq!(variant_c_type(*base), *expected, "{base:?}");
+        }
+    }
+
+    /// The success path: a variant column whose value has been probed reports
+    /// that value's underlying C type.
+    #[test]
+    fn variant_type_is_reported_after_the_value_is_probed() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 2);
+        retype_column(&h, 1, TdsDataType::SsVariant, 8);
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.last_variant_base = Some((1, TdsDataType::NVarChar));
+        }
+        assert_eq!(
+            numeric(&h, 1, SQL_CA_SS_VARIANT_TYPE),
+            SqlLen::from(SQL_C_WCHAR)
+        );
+    }
+
+    /// A base type captured for one column must not answer for another.
+    #[test]
+    fn variant_type_does_not_leak_across_columns() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 2);
+        retype_column(&h, 1, TdsDataType::SsVariant, 8);
+        retype_column(&h, 2, TdsDataType::SsVariant, 8);
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.last_variant_base = Some((1, TdsDataType::Int4));
+        }
+        let mut out: SqlLen = 0;
+        let rc = unsafe {
+            sql_col_attribute_w(
+                h.stmt,
+                2,
+                SQL_CA_SS_VARIANT_TYPE,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                &mut out,
+            )
+        };
+        assert_eq!(rc, SQL_ERROR);
+        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = sh.inner.lock().unwrap();
+        assert_eq!(
+            s.diag_records.last().unwrap().sql_state,
+            ERR_FUNCTION_SEQUENCE.state
+        );
+    }
+
+    /// Every arm of the type-name table. Driven directly because a name is a
+    /// pure function of the metadata and needs no live result set.
+    #[test]
+    fn type_name_covers_every_supported_type() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+
+        let cases: &[(TdsDataType, usize, &str)] = &[
+            (TdsDataType::Int1, 1, "tinyint"),
+            (TdsDataType::Int2, 2, "smallint"),
+            (TdsDataType::Int4, 4, "int"),
+            (TdsDataType::Int8, 8, "bigint"),
+            (TdsDataType::IntN, 1, "tinyint"),
+            (TdsDataType::IntN, 2, "smallint"),
+            (TdsDataType::IntN, 4, "int"),
+            (TdsDataType::IntN, 8, "bigint"),
+            // A length the server never sends still has to name something.
+            (TdsDataType::IntN, 3, "int"),
+            (TdsDataType::Bit, 1, "bit"),
+            (TdsDataType::BitN, 1, "bit"),
+            (TdsDataType::Flt4, 4, "real"),
+            (TdsDataType::Flt8, 8, "float"),
+            (TdsDataType::FltN, 4, "real"),
+            (TdsDataType::FltN, 8, "float"),
+            (TdsDataType::Decimal, 9, "decimal"),
+            (TdsDataType::DecimalN, 9, "decimal"),
+            (TdsDataType::Numeric, 9, "numeric"),
+            (TdsDataType::NumericN, 9, "numeric"),
+            (TdsDataType::Money, 8, "money"),
+            (TdsDataType::MoneyN, 8, "money"),
+            (TdsDataType::Money4, 4, "smallmoney"),
+            (TdsDataType::DateN, 3, "date"),
+            (TdsDataType::TimeN, 5, "time"),
+            (TdsDataType::DateTime, 8, "datetime"),
+            (TdsDataType::DateTimeN, 8, "datetime"),
+            (TdsDataType::DateTim4, 4, "smalldatetime"),
+            (TdsDataType::DateTime2N, 8, "datetime2"),
+            (TdsDataType::DateTimeOffsetN, 10, "datetimeoffset"),
+            (TdsDataType::Char, 10, "char"),
+            (TdsDataType::BigChar, 10, "char"),
+            (TdsDataType::VarChar, 10, "varchar"),
+            (TdsDataType::BigVarChar, 10, "varchar"),
+            (TdsDataType::Text, 16, "text"),
+            (TdsDataType::NChar, 20, "nchar"),
+            (TdsDataType::NVarChar, 20, "nvarchar"),
+            (TdsDataType::NText, 16, "ntext"),
+            (TdsDataType::Binary, 8, "binary"),
+            (TdsDataType::BigBinary, 8, "binary"),
+            (TdsDataType::VarBinary, 8, "varbinary"),
+            (TdsDataType::BigVarBinary, 8, "varbinary"),
+            (TdsDataType::Image, 16, "image"),
+            (TdsDataType::Guid, 16, "uniqueidentifier"),
+            (TdsDataType::Xml, 0, "xml"),
+            (TdsDataType::Json, 0, "json"),
+            (TdsDataType::Vector, 0, "vector"),
+            (TdsDataType::SsVariant, 8, "sql_variant"),
+            (TdsDataType::Udt, 0, "udt"),
+            (TdsDataType::Void, 0, "unknown"),
+        ];
+        for (ty, len, name) in cases {
+            retype_column(&h, 1, *ty, *len);
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let s = stmt_handle.inner.lock().unwrap();
+            assert_eq!(type_name(&s.column_metadata[0]), *name, "{ty:?} len {len}");
+        }
+    }
+
+    /// A `varchar(max)` streams as PLP, which has no fixed octet length, so
+    /// the driver reports zero rather than the sentinel wire length.
+    #[test]
+    fn plp_column_reports_zero_octet_length() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            let meta = &mut s.column_metadata[0];
+            meta.data_type = TdsDataType::BigVarChar;
+            meta.type_info = TypeInfo::partial_len(TdsDataType::BigVarChar, 0xFFFF, None)
+                .expect("varchar(max) is a PLP type");
+        }
+        assert_eq!(numeric(&h, 1, SQL_DESC_OCTET_LENGTH), 0);
+    }
+
+    /// A `decimal` carries its own precision on the wire, which takes
+    /// precedence over the display size fallback.
+    #[test]
+    fn decimal_reports_its_declared_precision() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            let meta = &mut s.column_metadata[0];
+            meta.data_type = TdsDataType::DecimalN;
+            meta.type_info = TypeInfo::var_len_precision_scale(TdsDataType::DecimalN, 9, 18, 4)
+                .expect("decimal carries precision and scale");
+        }
+        assert_eq!(numeric(&h, 1, SQL_DESC_PRECISION), 18);
+        assert_eq!(numeric(&h, 1, SQL_DESC_SCALE), 4);
     }
 
     /// mssql-python passes a null string buffer and reads only the numeric
