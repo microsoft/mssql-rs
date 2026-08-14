@@ -506,6 +506,182 @@ mod connectivity {
             Ok(())
         }
 
+        // ── Prepared-Handle Invalidation Across Reconnect ─────────────
+
+        /// A prepared-statement handle belongs to the session that created it.
+        /// After a transparent reconnect the server-side handle is gone, so
+        /// reusing it via `sp_execute` fails with error 8179 ("Could not find
+        /// prepared statement with handle"), while a fresh `sp_prepexec` on the
+        /// recovered session succeeds.
+        ///
+        /// This is the hazard the ODBC layer's epoch gate (`plan_execution`)
+        /// prevents: it stamps each handle with the recovery count and
+        /// re-prepares instead of reusing a handle from a superseded session.
+        /// Recovery is caller-owned here — we drive it via `check_and_reconnect`,
+        /// exactly as `SQLExecute` does, and the RPCs never self-recover.
+        #[tokio::test]
+        async fn stale_prepared_handle_after_reconnect_is_invalidated()
+        -> Result<(), Box<dyn std::error::Error>> {
+            use mssql_tds::connection::tds_client::ResultSet;
+            use mssql_tds::datatypes::sqltypes::SqlType;
+            use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+            let make_param = || {
+                RpcParameter::new(
+                    Some("@P1".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(7)),
+                )
+            };
+
+            let provider = TdsConnectionProvider {};
+            let mut client = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            assert!(
+                client.is_session_recovery_enabled(),
+                "session recovery must be negotiated for this scenario"
+            );
+
+            // Prepare + execute "SELECT @P1" and capture the server-side handle.
+            let mut orphan = None;
+            let (statement_id, _) = client
+                .execute_sp_prepexec_for_test(
+                    "SELECT @P1".to_string(),
+                    vec![make_param()],
+                    &mut orphan,
+                    (),
+                )
+                .await?;
+            while client.next_row().await?.is_some() {}
+            client.advance().await?;
+            let handle = client
+                .prepared_handle_for_test(statement_id)
+                .expect("sp_prepexec should surface the @handle during drain");
+            assert!(handle > 0);
+
+            // Kill the owning session from a second connection, then force
+            // recovery through the caller-owned entry point.
+            let spid = get_spid(&mut client).await?;
+            let mut killer = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            exec_and_drain(&mut killer, &format!("KILL {}", spid)).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            client.check_and_reconnect_for_test(None, None).await?;
+            assert_eq!(
+                client.connection_recovery_count(),
+                1,
+                "connection should have reconnected exactly once"
+            );
+
+            // Reusing the pre-reconnect handle must fail: it lived in the dead
+            // session, so the new session rejects it with error 8179. The
+            // reconnect dropped the client's entry, so re-seed it to get the
+            // stale handle back onto the wire.
+            assert_eq!(
+                client.prepared_handle_for_test(statement_id),
+                None,
+                "reconnect must drop the dead session's handle"
+            );
+            let stale = client.register_prepared_handle_for_test(handle);
+            let reuse = client
+                .execute_sp_execute_for_test(stale, None, Some(vec![make_param()]), ())
+                .await;
+            let err = reuse.expect_err("sp_execute on a superseded-session handle must fail");
+            assert!(
+                err.to_string()
+                    .to_lowercase()
+                    .contains("prepared statement"),
+                "expected a 'could not find prepared statement' (8179) error, got: {err}"
+            );
+
+            // A fresh prepare on the recovered session works — the statement
+            // remains usable once the caller re-prepares.
+            let mut orphan = None;
+            client
+                .execute_sp_prepexec_for_test(
+                    "SELECT @P1".to_string(),
+                    vec![make_param()],
+                    &mut orphan,
+                    (),
+                )
+                .await?;
+            Ok(())
+        }
+
+        /// The managed API's headline guarantee, and the counterpart to the raw
+        /// test above: re-executing the *same* `PreparedStatement` after the
+        /// session died transparently reconnects, re-prepares against the new
+        /// session, and returns the right value — with no caller step at all.
+        #[tokio::test]
+        async fn execute_prepared_reprepares_transparently_after_reconnect()
+        -> Result<(), Box<dyn std::error::Error>> {
+            use mssql_tds::connection::tds_client::PreparedStatement;
+            use mssql_tds::datatypes::sqltypes::SqlType;
+            use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+            let make_param = || {
+                RpcParameter::new(
+                    Some("@P1".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(7)),
+                )
+            };
+
+            let provider = TdsConnectionProvider {};
+            let mut client = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            assert!(
+                client.is_session_recovery_enabled(),
+                "session recovery must be negotiated for this scenario"
+            );
+
+            let mut statement = PreparedStatement::new("SELECT @P1");
+            let mut orphaned = None;
+
+            client
+                .execute_prepared(&mut statement, vec![make_param()], &mut orphaned, ())
+                .await?;
+            let value = get_scalar_value(&mut client).await?;
+            assert!(matches!(value, Some(ColumnValues::Int(7))));
+            let first_id = statement
+                .id()
+                .expect("the first execute must materialize the statement");
+
+            // Kill the owning session; the handle behind `first_id` dies with it.
+            let spid = get_spid(&mut client).await?;
+            let mut killer = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            exec_and_drain(&mut killer, &format!("KILL {}", spid)).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            client
+                .execute_prepared(&mut statement, vec![make_param()], &mut orphaned, ())
+                .await?;
+            let value = get_scalar_value(&mut client).await?;
+            assert!(
+                matches!(value, Some(ColumnValues::Int(7))),
+                "the same statement must re-prepare and return its value, got {value:?}"
+            );
+
+            assert_eq!(
+                client.connection_recovery_count(),
+                1,
+                "the execute should have recovered the connection itself"
+            );
+            assert_ne!(
+                statement.id(),
+                Some(first_id),
+                "re-preparing must issue a new identity, not reuse the dead session's"
+            );
+
+            Ok(())
+        }
+
         // ── Recovery Blocked by Transaction ───────────────────────────
 
         /// When a transaction is active and the connection is killed, recovery

@@ -157,6 +157,10 @@ pub(super) fn fail_with_tds(
 /// leaked handle is freed when the connection closes, and must not fail the
 /// caller's execution.
 ///
+/// A statement the client no longer holds a handle for is skipped inside
+/// `unprepare`: a transparent reconnect already discarded it server-side, so an
+/// `sp_unprepare` would target a nonexistent handle on the new session.
+///
 /// No lock is held across the network I/O.
 pub(super) fn flush_pending_unprepare(
     dbc: &DbcHandle,
@@ -164,21 +168,21 @@ pub(super) fn flush_pending_unprepare(
     client: &mut TdsClient,
     op: &str,
 ) {
-    let handle = match stmt.inner.lock() {
+    let pending = match stmt.inner.lock() {
         Ok(mut stmt_state) => stmt_state.pending_unprepare.take(),
         Err(_) => {
             error!("{op}: stmt mutex poisoned taking pending unprepare");
             return;
         }
     };
-    let Some(handle) = handle else {
+    let Some(handle) = pending else {
         return;
     };
-    if let Err(e) = dbc
-        .runtime
-        .block_on(client.execute_sp_unprepare(handle, ()))
-    {
-        error!(%e, handle, "{op}: sp_unprepare failed — handle leaked until disconnect");
+    // `unprepare` recovers a dead connection first, then drops the handle only
+    // if it still belongs to the (recovered) session — a superseded handle is
+    // already gone server-side and is skipped without an RPC.
+    if let Err(e) = dbc.runtime.block_on(client.unprepare(handle, ())) {
+        error!(%e, "{op}: sp_unprepare failed — handle leaked until disconnect");
     }
 }
 
@@ -223,24 +227,6 @@ pub(super) unsafe fn build_named_params(
         }
     }
     Ok(named_params)
-}
-
-/// Captures the server-side prepared-statement handle from `sp_prepexec`'s
-/// `@handle` RETURNVALUE once the batch has been drained.
-///
-/// For a result-returning statement the handle arrives *after* the result set,
-/// so it only lands in the client's return values once the stream is fully
-/// drained via `close_query`. Capture-if-absent: the handle is stable for the
-/// prepared plan, and `sp_execute` re-runs don't re-issue it.
-pub(super) fn capture_prepared_handle(stmt: &StmtHandle, client: &mut TdsClient) {
-    let Some(handle) = client.take_prepared_statement_handle() else {
-        return;
-    };
-    if let Ok(mut stmt_state) = stmt.inner.lock()
-        && stmt_state.prepared_handle.is_none()
-    {
-        stmt_state.prepared_handle = Some(handle);
-    }
 }
 
 /// Captures result metadata after a successful execution and finalizes the
@@ -300,7 +286,6 @@ pub(super) fn finish_execute(
             error!(%e, "{op}: failed to drain after DDL/DML");
             return fail_with_tds(dbc, stmt, statement_handle, client, &e);
         }
-        capture_prepared_handle(stmt, &mut client);
         let info_messages = client.take_info_messages();
         // A pure-DML batch (UPDATE; DELETE; INSERT) yields one count per
         // statement. Report the first here; queue the rest for SQLMoreResults to

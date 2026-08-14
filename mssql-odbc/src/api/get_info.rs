@@ -9,11 +9,13 @@ use crate::api::odbc_types::{
     SQL_ACTIVE_STATEMENTS, SQL_ASYNC_DBC_FUNCTIONS, SQL_ASYNC_DBC_NOT_CAPABLE,
     SQL_ASYNC_NOTIFICATION, SQL_ASYNC_NOTIFICATION_NOT_CAPABLE, SQL_CB_CLOSE,
     SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_DBMS_NAME, SQL_DBMS_VER,
-    SQL_DM_VER, SQL_DRIVER_NAME, SQL_DRIVER_ODBC_VER, SQL_DRIVER_VER, SQL_ERROR, SQL_GD_ANY_COLUMN,
-    SQL_GD_ANY_ORDER, SQL_GETDATA_EXTENSIONS, SQL_IDENTIFIER_QUOTE_CHAR, SQL_INVALID_HANDLE,
-    SQL_MAX_DRIVER_CONNECTIONS, SQL_NEED_LONG_DATA_LEN, SQL_OAC_LEVEL2, SQL_ODBC_API_CONFORMANCE,
+    SQL_DEFAULT_TXN_ISOLATION, SQL_DM_VER, SQL_DRIVER_NAME, SQL_DRIVER_ODBC_VER, SQL_DRIVER_VER,
+    SQL_ERROR, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER, SQL_GETDATA_EXTENSIONS,
+    SQL_IDENTIFIER_QUOTE_CHAR, SQL_INVALID_HANDLE, SQL_MAX_DRIVER_CONNECTIONS,
+    SQL_MULTIPLE_ACTIVE_TXN, SQL_NEED_LONG_DATA_LEN, SQL_OAC_LEVEL2, SQL_ODBC_API_CONFORMANCE,
     SQL_ODBC_SQL_CONFORMANCE, SQL_ODBC_VER, SQL_OSC_CORE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SqlHandle, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_TC_ALL, SQL_TXN_CAPABLE, SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT,
+    SQL_TXN_READ_COMMITTED, SqlHandle, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{ERR_INVALID_INFO_TYPE, ERR_STRING_RIGHT_TRUNCATION, post_diag};
 use crate::api::util::{copy_with_nul, write_if_some};
@@ -129,6 +131,25 @@ fn sql_get_info_w_safe(
         SQL_ODBC_SQL_CONFORMANCE => write_u16(info_value_ptr, SQL_OSC_CORE, string_length_ptr),
         SQL_CURSOR_COMMIT_BEHAVIOR => write_u16(info_value_ptr, SQL_CB_CLOSE, string_length_ptr),
         SQL_CURSOR_ROLLBACK_BEHAVIOR => write_u16(info_value_ptr, SQL_CB_CLOSE, string_length_ptr),
+        // Transactions cover both DML and DDL on SQL Server (`sqlcinfo.cpp`).
+        SQL_TXN_CAPABLE => write_u16(info_value_ptr, SQL_TC_ALL, string_length_ptr),
+        SQL_DEFAULT_TXN_ISOLATION => {
+            write_u32(info_value_ptr, SQL_TXN_READ_COMMITTED, string_length_ptr)
+        }
+        SQL_TXN_ISOLATION_OPTION => write_u32(
+            info_value_ptr,
+            SQL_TXN_ISOLATION_OPTION_SPT,
+            string_length_ptr,
+        ),
+        // A connection supports only one transaction at a time, but several
+        // connections may each hold one simultaneously.
+        SQL_MULTIPLE_ACTIVE_TXN => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "Y",
+        ),
         SQL_GETDATA_EXTENSIONS => write_u32(
             info_value_ptr,
             SQL_GD_ANY_COLUMN | SQL_GD_ANY_ORDER,
@@ -316,6 +337,7 @@ mod tests {
             (SQL_ODBC_SQL_CONFORMANCE, SQL_OSC_CORE),
             (SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CB_CLOSE),
             (SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_CB_CLOSE),
+            (SQL_TXN_CAPABLE, SQL_TC_ALL),
         ] {
             let (rc, val, len) = get_u16(h.dbc, info_type);
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
@@ -331,6 +353,8 @@ mod tests {
             (SQL_GETDATA_EXTENSIONS, SQL_GD_ANY_COLUMN | SQL_GD_ANY_ORDER),
             (SQL_ASYNC_DBC_FUNCTIONS, SQL_ASYNC_DBC_NOT_CAPABLE),
             (SQL_ASYNC_NOTIFICATION, SQL_ASYNC_NOTIFICATION_NOT_CAPABLE),
+            (SQL_DEFAULT_TXN_ISOLATION, SQL_TXN_READ_COMMITTED),
+            (SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT),
         ] {
             let (rc, val, len) = get_u32(h.dbc, info_type);
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
@@ -377,6 +401,27 @@ mod tests {
         assert_eq!(String::from_utf16_lossy(&buf[..n]), expected);
         // Null-terminated just past the copied text.
         assert_eq!(buf[n], 0);
+    }
+
+    #[test]
+    fn multiple_active_txn_reports_yes() {
+        // One transaction per connection, but several connections may each hold
+        // one at once (`sqlcinfo.cpp`).
+        let h = TestHandles::with_env_dbc();
+        let mut buf = [0u16; 8];
+        let mut len: SqlSmallInt = -1;
+        let rc = unsafe {
+            sql_get_info_w(
+                h.dbc,
+                SQL_MULTIPLE_ACTIVE_TXN,
+                buf.as_mut_ptr() as SqlPointer,
+                (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(len, 2);
+        assert_eq!(String::from_utf16_lossy(&buf[..1]), "Y");
     }
 
     #[test]

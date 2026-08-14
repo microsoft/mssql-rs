@@ -66,7 +66,6 @@ impl FuzzReader {
     }
 }
 
-#[async_trait]
 impl TdsPacketReader for FuzzReader {
     async fn read_byte(&mut self) -> TdsResult<u8> {
         if self.position >= self.data.len() {
@@ -271,7 +270,6 @@ impl TdsPacketReader for FuzzReader {
 /// Always-EOF reader for fuzz targets that only care about context variations.
 pub struct EmptyReader;
 
-#[async_trait]
 impl TdsPacketReader for EmptyReader {
     async fn read_byte(&mut self) -> TdsResult<u8> {
         Err(mssql_tds_error_eof())
@@ -432,10 +430,196 @@ impl NetworkWriter for MockWriter {
     }
 }
 
+/// Concrete packet-reader used by the fuzz harness.
+///
+/// `TdsPacketReader` returns `impl Future` per method, which makes it dyn-incompatible.
+/// The harness only ever supplies one of two readers, so an enum recovers the runtime
+/// choice that `Box<dyn TdsPacketReader>` previously provided, with static dispatch.
+pub enum FuzzPacketReader {
+    /// Reads from the fuzzer-supplied byte slice.
+    Fuzz(FuzzReader),
+    /// Always reports end-of-stream.
+    Empty(EmptyReader),
+}
+
+impl FuzzPacketReader {
+    /// Builds a reader over the fuzzer-supplied input.
+    pub fn from_data(data: &[u8]) -> Self {
+        Self::Fuzz(FuzzReader::new(data))
+    }
+
+    /// Builds a reader that always reports end-of-stream.
+    pub fn empty() -> Self {
+        Self::Empty(EmptyReader)
+    }
+}
+
+impl TdsPacketReader for FuzzPacketReader {
+    async fn read_byte(&mut self) -> TdsResult<u8> {
+        match self {
+            Self::Fuzz(r) => r.read_byte().await,
+            Self::Empty(r) => r.read_byte().await,
+        }
+    }
+
+    async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
+        match self {
+            Self::Fuzz(r) => r.read_int16_big_endian().await,
+            Self::Empty(r) => r.read_int16_big_endian().await,
+        }
+    }
+
+    async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
+        match self {
+            Self::Fuzz(r) => r.read_int32_big_endian().await,
+            Self::Empty(r) => r.read_int32_big_endian().await,
+        }
+    }
+
+    async fn read_uint40(&mut self) -> TdsResult<u64> {
+        match self {
+            Self::Fuzz(r) => r.read_uint40().await,
+            Self::Empty(r) => r.read_uint40().await,
+        }
+    }
+
+    async fn read_float32(&mut self) -> TdsResult<f32> {
+        match self {
+            Self::Fuzz(r) => r.read_float32().await,
+            Self::Empty(r) => r.read_float32().await,
+        }
+    }
+
+    async fn read_float64(&mut self) -> TdsResult<f64> {
+        match self {
+            Self::Fuzz(r) => r.read_float64().await,
+            Self::Empty(r) => r.read_float64().await,
+        }
+    }
+
+    async fn read_int16(&mut self) -> TdsResult<i16> {
+        match self {
+            Self::Fuzz(r) => r.read_int16().await,
+            Self::Empty(r) => r.read_int16().await,
+        }
+    }
+
+    async fn read_uint16(&mut self) -> TdsResult<u16> {
+        match self {
+            Self::Fuzz(r) => r.read_uint16().await,
+            Self::Empty(r) => r.read_uint16().await,
+        }
+    }
+
+    async fn read_uint24(&mut self) -> TdsResult<u32> {
+        match self {
+            Self::Fuzz(r) => r.read_uint24().await,
+            Self::Empty(r) => r.read_uint24().await,
+        }
+    }
+
+    async fn read_int32(&mut self) -> TdsResult<i32> {
+        match self {
+            Self::Fuzz(r) => r.read_int32().await,
+            Self::Empty(r) => r.read_int32().await,
+        }
+    }
+
+    async fn read_uint32(&mut self) -> TdsResult<u32> {
+        match self {
+            Self::Fuzz(r) => r.read_uint32().await,
+            Self::Empty(r) => r.read_uint32().await,
+        }
+    }
+
+    async fn read_int64(&mut self) -> TdsResult<i64> {
+        match self {
+            Self::Fuzz(r) => r.read_int64().await,
+            Self::Empty(r) => r.read_int64().await,
+        }
+    }
+
+    async fn read_uint64(&mut self) -> TdsResult<u64> {
+        match self {
+            Self::Fuzz(r) => r.read_uint64().await,
+            Self::Empty(r) => r.read_uint64().await,
+        }
+    }
+
+    async fn read_bytes(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
+        match self {
+            Self::Fuzz(r) => r.read_bytes(buffer).await,
+            Self::Empty(r) => r.read_bytes(buffer).await,
+        }
+    }
+
+    async fn read_u8_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+        match self {
+            Self::Fuzz(r) => r.read_u8_varbyte().await,
+            Self::Empty(r) => r.read_u8_varbyte().await,
+        }
+    }
+
+    async fn read_u16_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+        match self {
+            Self::Fuzz(r) => r.read_u16_varbyte().await,
+            Self::Empty(r) => r.read_u16_varbyte().await,
+        }
+    }
+
+    async fn read_varchar_u16_length(&mut self) -> TdsResult<Option<String>> {
+        match self {
+            Self::Fuzz(r) => r.read_varchar_u16_length().await,
+            Self::Empty(r) => r.read_varchar_u16_length().await,
+        }
+    }
+
+    async fn read_varchar_u8_length(&mut self) -> TdsResult<String> {
+        match self {
+            Self::Fuzz(r) => r.read_varchar_u8_length().await,
+            Self::Empty(r) => r.read_varchar_u8_length().await,
+        }
+    }
+
+    async fn read_unicode(&mut self, string_length: usize) -> TdsResult<String> {
+        match self {
+            Self::Fuzz(r) => r.read_unicode(string_length).await,
+            Self::Empty(r) => r.read_unicode(string_length).await,
+        }
+    }
+
+    async fn read_unicode_with_byte_length(&mut self, byte_length: usize) -> TdsResult<String> {
+        match self {
+            Self::Fuzz(r) => r.read_unicode_with_byte_length(byte_length).await,
+            Self::Empty(r) => r.read_unicode_with_byte_length(byte_length).await,
+        }
+    }
+
+    async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()> {
+        match self {
+            Self::Fuzz(r) => r.skip_bytes(skip_count).await,
+            Self::Empty(r) => r.skip_bytes(skip_count).await,
+        }
+    }
+
+    async fn cancel_read_stream(&mut self) -> TdsResult<()> {
+        match self {
+            Self::Fuzz(r) => r.cancel_read_stream().await,
+            Self::Empty(r) => r.cancel_read_stream().await,
+        }
+    }
+
+    fn reset_reader(&mut self) {
+        match self {
+            Self::Fuzz(r) => r.reset_reader(),
+            Self::Empty(r) => r.reset_reader(),
+        }
+    }
+}
+
 /// MockTransport simulates a transport layer for fuzzing
 pub struct MockTransport {
-    token_stream_reader:
-        TokenStreamReader<Box<dyn TdsPacketReader + Send + Sync>, GenericTokenParserRegistry>,
+    token_stream_reader: TokenStreamReader<FuzzPacketReader, GenericTokenParserRegistry>,
     mock_writer: MockWriter,
     packet_size: u32,
     encryption_setting: NegotiatedEncryptionSetting,
@@ -451,7 +635,7 @@ impl std::fmt::Debug for MockTransport {
 }
 
 impl MockTransport {
-    pub fn new(packet_reader: Box<dyn TdsPacketReader + Send + Sync>, packet_size: u32) -> Self {
+    pub fn new(packet_reader: FuzzPacketReader, packet_size: u32) -> Self {
         let parser_registry = Box::new(GenericTokenParserRegistry::default());
         let token_stream_reader = TokenStreamReader::new(packet_reader, parser_registry);
 
@@ -615,7 +799,6 @@ impl TdsTransport for MockTransport {
     }
 }
 
-#[async_trait]
 impl TdsPacketReader for MockTransport {
     async fn read_byte(&mut self) -> TdsResult<u8> {
         self.token_stream_reader.packet_reader.read_byte().await
@@ -756,10 +939,7 @@ pub fn create_test_execution_context() -> crate::connection::execution_context::
 }
 
 /// Helper function to create TdsClient for fuzzing
-pub fn create_fuzz_tds_client(
-    packet_reader: Box<dyn TdsPacketReader + Send + Sync>,
-    packet_size: u32,
-) -> TdsClient {
+pub fn create_fuzz_tds_client(packet_reader: FuzzPacketReader, packet_size: u32) -> TdsClient {
     let mock_transport = MockTransport::new(packet_reader, packet_size);
     let negotiated_settings = create_test_negotiated_settings();
     let execution_context = create_test_execution_context();

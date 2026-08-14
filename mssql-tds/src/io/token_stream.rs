@@ -475,14 +475,14 @@ fn pause_after_column(
 /// bytes, or pause. This single loop replaces the former
 /// `decode_row_columns` / `decode_nbcrow_columns` pair and their
 /// `writer.pause_*` polling.
-async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
+async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send + ?Sized>(
     reader: &mut R,
     metadata: &Arc<ColMetadataToken>,
     decryptor: Option<&Arc<dyn CellDecryptor>>,
     bitmap: Option<&Arc<[u8]>>,
     start_col: usize,
     plan: ColumnPolicy,
-    writer: &mut (dyn RowWriter + Send),
+    writer: &mut W,
 ) -> TdsResult<RowReadResult> {
     let decoder = GenericDecoder::default();
     let columns = &metadata.columns;
@@ -560,13 +560,16 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync>(
     Ok(RowReadResult::RowWritten)
 }
 
-async fn decode_or_decrypt_column<R: TdsPacketReader + Send + Sync>(
+async fn decode_or_decrypt_column<
+    R: TdsPacketReader + Send + Sync,
+    W: RowWriter + Send + ?Sized,
+>(
     decoder: &GenericDecoder,
     reader: &mut R,
     meta: &ColumnMetadata,
     decryptor: Option<&Arc<dyn CellDecryptor>>,
     col: usize,
-    writer: &mut (dyn RowWriter + Send),
+    writer: &mut W,
 ) -> TdsResult<()> {
     match (meta.crypto_metadata.is_some(), decryptor) {
         (true, Some(dec)) => {
@@ -656,12 +659,15 @@ async fn read_nbc_bitmap<R: TdsPacketReader + Send + Sync>(
     Ok(bitmap)
 }
 
-pub(crate) async fn receive_row_into_internal<R: TdsPacketReader + Send + Sync>(
+pub(crate) async fn receive_row_into_internal<
+    R: TdsPacketReader + Send + Sync,
+    W: RowWriter + Send + ?Sized,
+>(
     reader: &mut R,
     registry: &impl TokenParserRegistry,
     context: &ParserContext,
     plan: ColumnPolicy,
-    writer: &mut (dyn RowWriter + Send),
+    writer: &mut W,
     nbc_bitmap_scratch: &mut Option<Arc<[u8]>>,
 ) -> TdsResult<RowReadResult> {
     let token_type_byte = reader.read_byte().await?;
@@ -732,11 +738,14 @@ pub(crate) async fn receive_row_header_internal<R: TdsPacketReader + Send + Sync
 /// `plan` to the remaining columns.
 ///
 /// Does not read a token-type byte — the token has already been consumed.
-pub(crate) async fn resume_row_into_internal<R: TdsPacketReader + Send + Sync>(
+pub(crate) async fn resume_row_into_internal<
+    R: TdsPacketReader + Send + Sync,
+    W: RowWriter + Send + ?Sized,
+>(
     reader: &mut R,
     pause_state: RowPauseState,
     plan: ColumnPolicy,
-    writer: &mut (dyn RowWriter + Send),
+    writer: &mut W,
 ) -> TdsResult<RowReadResult> {
     let RowPauseState {
         next_column_index,
@@ -1131,9 +1140,94 @@ mod tests {
     use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
     use crate::io::packet_reader::TdsPacketReader;
     use crate::token::tokens::{SqlCollation, TokenType};
-    use async_trait::async_trait;
+
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// Companion to `row_fetch_futures_stay_small` (#225) for the decode chain below
+    /// `Box<dyn TdsTransport>`. That guard measures futures built on `TdsClient`, which
+    /// re-boxes at the transport boundary, so it cannot observe anything in this file:
+    /// its four futures are byte-identical before and after this chain roughly doubled.
+    #[test]
+    fn row_decode_futures_stay_small() {
+        const MAX: usize = 4096;
+
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 0,
+            columns: vec![],
+            cek_table: vec![],
+        });
+        let context = ParserContext::ColumnMetadata(Arc::clone(&metadata), None);
+        let registry = GenericTokenParserRegistry::default();
+        let mut reader = TestByteReader::new(vec![TokenType::Row as u8]);
+        let mut sink = DiscardRowWriter;
+        let mut nbc_bitmap_scratch = None;
+
+        // Constructing an async fn's future runs none of its body, so these are free to
+        // build and drop unpolled. Each borrow ends with its statement.
+        //
+        // Both instantiations are measured: `dyn` is what production reaches today, and
+        // the monomorphic one is what a concrete writer gets once the transport boundary
+        // stops erasing it (#265).
+        let receive_dyn = size_of_val(&receive_row_into_internal(
+            &mut reader,
+            &registry,
+            &context,
+            ColumnPolicy::DecodeAll,
+            &mut sink as &mut (dyn RowWriter + Send),
+            &mut nbc_bitmap_scratch,
+        ));
+        let receive_mono = size_of_val(&receive_row_into_internal(
+            &mut reader,
+            &registry,
+            &context,
+            ColumnPolicy::DecodeAll,
+            &mut sink,
+            &mut nbc_bitmap_scratch,
+        ));
+        let drive_dyn = size_of_val(&drive_row_columns(
+            &mut reader,
+            &metadata,
+            None,
+            None,
+            0,
+            ColumnPolicy::DecodeAll,
+            &mut sink as &mut (dyn RowWriter + Send),
+        ));
+        let drive_mono = size_of_val(&drive_row_columns(
+            &mut reader,
+            &metadata,
+            None,
+            None,
+            0,
+            ColumnPolicy::DecodeAll,
+            &mut sink,
+        ));
+        let resume_dyn = size_of_val(&resume_row_into_internal(
+            &mut reader,
+            RowPauseState {
+                next_column_index: 0,
+                metadata: Arc::clone(&metadata),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            },
+            ColumnPolicy::DecodeAll,
+            &mut sink as &mut (dyn RowWriter + Send),
+        ));
+
+        for (name, size) in [
+            ("receive_row_into_internal (dyn)", receive_dyn),
+            ("receive_row_into_internal (mono)", receive_mono),
+            ("drive_row_columns (dyn)", drive_dyn),
+            ("drive_row_columns (mono)", drive_mono),
+            ("resume_row_into_internal (dyn)", resume_dyn),
+        ] {
+            assert!(
+                size <= MAX,
+                "{name} future is {size} B, expected <= {MAX} B"
+            );
+        }
+    }
 
     #[test]
     fn test_parser_context_default() {
@@ -1260,7 +1354,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl TdsPacketReader for TestByteReader {
         async fn read_byte(&mut self) -> TdsResult<u8> {
             Ok(self.take(1)?[0])

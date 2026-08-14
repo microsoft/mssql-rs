@@ -54,9 +54,10 @@ steps:
         .pipeline/scripts/install-rustup.sh
       displayName: "Install Rustup"
 
-    - script: |
-        scripts/install-jsdeps.sh
-      displayName: "Install JS dependencies"
+    - ${{ if eq(parameters.enableJsDeps, true) }}:
+      - script: |
+          scripts/install-jsdeps.sh
+        displayName: "Install JS dependencies"
 
     - script: |
         docker ps

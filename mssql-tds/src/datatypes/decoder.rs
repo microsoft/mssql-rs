@@ -1,8 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use async_trait::async_trait;
+use bigdecimal::num_bigint::BigUint;
+use bigdecimal::num_traits::ToPrimitive;
 use core::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt::Debug, io::Error, vec};
 
@@ -84,6 +87,12 @@ const MAX_PLP_SIZE: usize = 64 * 1024; // 64KB for fuzzing
 #[cfg(not(fuzzing))]
 const MAX_PLP_SIZE: usize = i32::MAX as usize;
 
+/// Maximum number of little-endian 32-bit words in a `decimal`/`numeric`
+/// magnitude. SQL Server's maximum precision of 38 digits fits in 128 bits, and
+/// the widest value the TDS wire format carries is 17 bytes (sign byte plus four
+/// words), so anything longer is malformed.
+const MAX_DECIMAL_INT_PARTS: usize = 4;
+
 // Helper function to validate allocation size before allocating
 #[inline]
 fn validate_alloc_size(size: usize, context: &str) -> TdsResult<()> {
@@ -136,9 +145,12 @@ macro_rules! safe_vec {
     }};
 }
 
-#[async_trait]
 pub(crate) trait SqlTypeDecode {
-    async fn decode<T>(&self, reader: &mut T, metadata: &ColumnMetadata) -> TdsResult<ColumnValues>
+    fn decode<T>(
+        &self,
+        reader: &mut T,
+        metadata: &ColumnMetadata,
+    ) -> impl Future<Output = TdsResult<ColumnValues>> + Send
     where
         T: TdsPacketReader + Send + Sync;
 }
@@ -193,9 +205,10 @@ impl PlpChunkStreamReader {
         }
     }
 
-    pub(crate) async fn begin(
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<Option<Self>> {
+    pub(crate) async fn begin<T>(reader: &mut T) -> TdsResult<Option<Self>>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         let raw_len_i64 = reader.read_int64().await?;
         let raw_len = raw_len_i64 as u64;
         let raw_len_usize = raw_len as usize;
@@ -239,10 +252,10 @@ impl PlpChunkStreamReader {
         self.reached_end
     }
 
-    async fn ensure_active_chunk(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<bool> {
+    async fn ensure_active_chunk<T>(&mut self, reader: &mut T) -> TdsResult<bool>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         if self.reached_end {
             return Ok(false);
         }
@@ -306,11 +319,10 @@ impl PlpChunkStreamReader {
         Ok(true)
     }
 
-    pub(crate) async fn read_into(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-        out: &mut [u8],
-    ) -> TdsResult<usize> {
+    pub(crate) async fn read_into<T>(&mut self, reader: &mut T, out: &mut [u8]) -> TdsResult<usize>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         // Supports the msodbcsql-style cbRequest==0 pattern to consume a
         // pending terminator after all data bytes were already read.
         if out.is_empty() {
@@ -348,10 +360,10 @@ impl PlpChunkStreamReader {
         Ok(written)
     }
 
-    pub(crate) async fn skip_to_end(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<()> {
+    pub(crate) async fn skip_to_end<T>(&mut self, reader: &mut T) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         while self.ensure_active_chunk(reader).await? {
             if self.chunk_remaining > 0 {
                 reader.skip_bytes(self.chunk_remaining).await?;
@@ -409,10 +421,13 @@ impl PlpColumnStream {
     /// - `Ok(None)` for SQL NULL
     /// - `Ok(Some(stream))` ready for incremental reads
     /// - `Err` if the column is not PLP-typed or the header is malformed
-    pub(crate) async fn begin(
+    pub(crate) async fn begin<T>(
         metadata: &ColumnMetadata,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<Option<Self>> {
+        reader: &mut T,
+    ) -> TdsResult<Option<Self>>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         let (plp_type, collation) = Self::type_from_metadata(metadata)?;
         let inner = match PlpChunkStreamReader::begin(reader).await? {
             None => return Ok(None),
@@ -452,19 +467,18 @@ impl PlpColumnStream {
     }
 
     /// Incrementally reads PLP payload bytes into `out`.
-    pub(crate) async fn read_into(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-        out: &mut [u8],
-    ) -> TdsResult<usize> {
+    pub(crate) async fn read_into<T>(&mut self, reader: &mut T, out: &mut [u8]) -> TdsResult<usize>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         self.inner.read_into(reader, out).await
     }
 
     /// Discards all remaining PLP payload and terminator bytes.
-    pub(crate) async fn skip_to_end(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<()> {
+    pub(crate) async fn skip_to_end<T>(&mut self, reader: &mut T) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         self.inner.skip_to_end(reader).await
     }
 
@@ -499,6 +513,24 @@ impl GenericDecoder {
     const MAX_PLP_CHUNK_SIZE: usize = 8 * 1024;
     #[cfg(not(fuzzing))]
     const MAX_PLP_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
+    /// Boxed re-entry into [`SqlTypeDecode::decode`], used only by SQL_VARIANT.
+    ///
+    /// SQL_VARIANT embeds a base type, so decoding one re-enters the type switch. Native
+    /// `async fn` cannot express that cycle: the opaque return type would contain itself.
+    /// Naming a concrete `Pin<Box<dyn Future>>` in the signature severs the dependency, at
+    /// the cost of one allocation per nested variant column — a rare type, never on the hot
+    /// path of ordinary scalar columns.
+    fn decode_boxed<'a, T>(
+        &'a self,
+        reader: &'a mut T,
+        metadata: &'a ColumnMetadata,
+    ) -> Pin<Box<dyn Future<Output = TdsResult<ColumnValues>> + Send + 'a>>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
+        Box::pin(self.decode(reader, metadata))
+    }
 
     // Reads a SQL_VARIANT type from the TDS stream.
     async fn read_sql_variant<T>(&self, reader: &mut T) -> TdsResult<ColumnValues>
@@ -576,7 +608,7 @@ impl GenericDecoder {
                     multi_part_name: None,
                     crypto_metadata: None,
                 };
-                self.decode(reader, &variant_actual_type_md).await
+                self.decode_boxed(reader, &variant_actual_type_md).await
             }
             _ => {
                 // If the type is not a fixed length type, we should not reach here.
@@ -659,13 +691,12 @@ impl GenericDecoder {
         let sign = reader.read_byte().await?;
         let is_positive = sign == 1;
 
-        let number_of_int_parts = (length - 1) >> 2;
-
-        // Limit decimal parts allocation for fuzzing
-        #[cfg(fuzzing)]
-        const MAX_DECIMAL_INT_PARTS: u8 = 10; // Maximum 10 int parts = 40 bytes
-        #[cfg(not(fuzzing))]
-        const MAX_DECIMAL_INT_PARTS: u8 = 64; // SQL Server max precision is 38, which needs max ~17 int parts
+        // Round up: a declared length that does not cover whole 32-bit words
+        // still has to be consumed, or the leftover bytes desynchronize the
+        // stream for the next field. A trailing partial word is zero-padded,
+        // which matches the length-tolerant reader on the Always Encrypted path.
+        let magnitude_len = (length - 1) as usize;
+        let number_of_int_parts = magnitude_len.div_ceil(4);
 
         if number_of_int_parts > MAX_DECIMAL_INT_PARTS {
             return Err(crate::error::Error::ProtocolError(format!(
@@ -673,12 +704,18 @@ impl GenericDecoder {
             )));
         }
 
-        let int_parts_len = number_of_int_parts as usize;
-        validate_alloc_size(int_parts_len * 4, "read_decimal int_parts")?;
-        let mut int_parts = vec![0i32; int_parts_len];
-        for part_index in 0..number_of_int_parts {
-            int_parts[part_index as usize] = reader.read_int32().await?;
-        }
+        validate_alloc_size(number_of_int_parts * 4, "read_decimal int_parts")?;
+        let mut magnitude = vec![0u8; number_of_int_parts * 4];
+        reader.read_bytes(&mut magnitude[..magnitude_len]).await?;
+
+        let int_parts = magnitude
+            .chunks_exact(4)
+            .map(|chunk| {
+                let mut word = [0u8; 4];
+                word.copy_from_slice(chunk);
+                i32::from_le_bytes(word)
+            })
+            .collect();
 
         Ok(Some(DecimalParts {
             is_positive,
@@ -1370,7 +1407,6 @@ impl GenericDecoder {
     }
 }
 
-#[async_trait]
 impl SqlTypeDecode for GenericDecoder {
     async fn decode<T>(&self, reader: &mut T, metadata: &ColumnMetadata) -> TdsResult<ColumnValues>
     where
@@ -1761,7 +1797,6 @@ impl StringDecoder {
     }
 }
 
-#[async_trait]
 impl SqlTypeDecode for StringDecoder {
     async fn decode<T>(&self, reader: &mut T, metadata: &ColumnMetadata) -> TdsResult<ColumnValues>
     where
@@ -1833,7 +1868,7 @@ impl SqlTypeDecode for StringDecoder {
         } else {
             let length = reader.read_uint16().await? as usize;
             if length == 0xFFFF {
-                return Ok(ColumnValues::Null);
+                Ok(ColumnValues::Null)
             } else {
                 let mut buffer = vec![0u8; length];
                 reader.read_bytes(&mut buffer).await?;
@@ -2009,17 +2044,10 @@ impl DecimalParts {
     /// Convert DecimalParts to a string representation suitable for Python Decimal.
     /// Returns a string like "123.45", "-0.01", etc.
     fn to_decimal_string(&self) -> String {
-        // Convert int_parts to u128
-        // int_parts[0] is the least significant, int_parts[n-1] is most significant
-        let u128_value = self
-            .int_parts
-            .iter()
-            .enumerate()
-            .fold(0u128, |acc, (i, &part)| {
-                acc + ((part as u32 as u128) << (i * 32))
-            });
-
-        let value_str = u128_value.to_string();
+        let value_str = match self.magnitude() {
+            Some(magnitude) => magnitude.to_string(),
+            None => self.magnitude_big().to_string(),
+        };
 
         // Insert decimal point at the correct position
         let result = if self.scale == 0 {
@@ -2043,19 +2071,46 @@ impl DecimalParts {
     }
 
     fn to_f64(&self) -> f64 {
-        let u128_value = self
-            .int_parts
-            .iter()
-            .enumerate()
-            .fold(0u128, |acc, (i, &part)| {
-                acc + ((part as u32 as u128) << (i * 32))
-            });
+        let magnitude = match self.magnitude() {
+            Some(magnitude) => magnitude as f64,
+            None => self.magnitude_big().to_f64().unwrap_or(f64::INFINITY),
+        };
 
-        let mut d_ret: f64 = u128_value as f64;
-
-        d_ret /= 10.0_f64.powi(self.scale as i32);
+        let d_ret = magnitude / 10.0_f64.powi(self.scale as i32);
 
         if self.is_positive { d_ret } else { -d_ret }
+    }
+
+    /// Reassembles `int_parts` into the unsigned magnitude.
+    ///
+    /// `int_parts[0]` is the least significant word. Returns `None` when the
+    /// value does not fit in a `u128`. A valid `decimal`/`numeric`
+    /// (precision <= 38) fits in four words, so only a malformed payload or a
+    /// hand-built [`DecimalParts`] can exceed that; the alternative would be to
+    /// shift past the width of the accumulator.
+    pub fn magnitude(&self) -> Option<u128> {
+        let significant = self
+            .int_parts
+            .iter()
+            .rposition(|&part| part != 0)
+            .map_or(0, |i| i + 1);
+        if significant > MAX_DECIMAL_INT_PARTS {
+            return None;
+        }
+        Some(
+            self.int_parts[..significant]
+                .iter()
+                .enumerate()
+                .fold(0u128, |acc, (i, &part)| {
+                    acc | ((part as u32 as u128) << (i * 32))
+                }),
+        )
+    }
+
+    /// Reassembles `int_parts` into an arbitrary-precision magnitude, for values
+    /// too wide for [`Self::magnitude`].
+    fn magnitude_big(&self) -> BigUint {
+        BigUint::new(self.int_parts.iter().map(|&part| part as u32).collect())
     }
 }
 
@@ -2982,6 +3037,64 @@ mod test {
         assert_eq!(parts.to_decimal_string(), "123.45");
     }
 
+    #[test]
+    fn test_decimal_parts_max_width_magnitude() {
+        // Four words of all-ones is the widest magnitude a u128 holds.
+        let parts = DecimalParts {
+            is_positive: true,
+            scale: 0,
+            precision: 38,
+            int_parts: vec![-1, -1, -1, -1],
+        };
+        assert_eq!(parts.to_decimal_string(), u128::MAX.to_string());
+        assert_eq!(parts.magnitude(), Some(u128::MAX));
+    }
+
+    #[test]
+    fn test_decimal_parts_oversized_magnitude_does_not_overflow() {
+        // A malformed 5-word magnitude used to shift a u128 by 128 bits: a panic
+        // in debug builds and a wrapped, wrong value in release builds.
+        let parts = DecimalParts {
+            is_positive: true,
+            scale: 0,
+            precision: 38,
+            int_parts: vec![1, 0, 0, 0, 1],
+        };
+        // 2^128 + 1, rendered exactly rather than wrapping onto the low word.
+        assert_eq!(
+            parts.to_decimal_string(),
+            "340282366920938463463374607431768211457"
+        );
+        assert!((parts.to_f64() - 3.402_823_669_209_385e38).abs() < 1e23);
+        assert_eq!(parts.magnitude(), None);
+    }
+
+    #[test]
+    fn test_decimal_parts_oversized_magnitude_with_trailing_zero_words() {
+        // Zero-padded words past the fourth carry no magnitude, so the value
+        // still fits a u128 and both the string and typed paths agree on it.
+        let parts = DecimalParts {
+            is_positive: false,
+            scale: 2,
+            precision: 38,
+            int_parts: vec![12345, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(parts.to_decimal_string(), "-123.45");
+        assert_eq!(parts.magnitude(), Some(12345));
+    }
+
+    #[test]
+    fn test_decimal_parts_empty_magnitude_is_zero() {
+        let parts = DecimalParts {
+            is_positive: true,
+            scale: 0,
+            precision: 38,
+            int_parts: vec![],
+        };
+        assert_eq!(parts.magnitude(), Some(0));
+        assert_eq!(parts.to_decimal_string(), "0");
+    }
+
     // Vector deserialization tests
     mod vector_tests {
         use super::*;
@@ -3138,7 +3251,7 @@ mod test {
     }
 
     mod decode_into_tests {
-        use async_trait::async_trait;
+
         use byteorder::{ByteOrder, LittleEndian};
 
         use crate::core::TdsResult;
@@ -3179,7 +3292,6 @@ mod test {
             }
         }
 
-        #[async_trait]
         impl TdsPacketReader for ByteReader {
             async fn read_byte(&mut self) -> TdsResult<u8> {
                 Ok(self.take(1)?[0])
@@ -4285,13 +4397,57 @@ mod test {
         #[tokio::test]
         async fn decimal_large_valid() {
             let md = precision_scale_metadata(TdsDataType::DecimalN, 17, 38, 0);
-            // length=17 → (17-1)>>2 = 4 int parts, which is well under the 64 limit
+            // length=17 → 16 magnitude bytes = 4 int parts, the widest valid decimal
             let mut buf = vec![17u8, 1u8]; // length=17, sign=positive
             for _ in 0..4 {
                 buf.extend_from_slice(&1i32.to_le_bytes());
             }
             let val = assert_decode_equivalence(buf, &md).await;
             assert!(matches!(val, ColumnValues::Decimal(_)));
+        }
+
+        #[tokio::test]
+        async fn decimal_too_many_int_parts_rejected() {
+            let md = precision_scale_metadata(TdsDataType::DecimalN, 21, 38, 0);
+            // length=21 → 20 magnitude bytes = 5 int parts, which no valid decimal produces
+            let mut buf = vec![21u8, 1u8];
+            for _ in 0..5 {
+                buf.extend_from_slice(&1i32.to_le_bytes());
+            }
+            assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn decimal_oversized_partial_word_length_rejected() {
+            let md = precision_scale_metadata(TdsDataType::DecimalN, 18, 38, 0);
+            // length=18 → 17 magnitude bytes, one byte past the 128-bit limit.
+            // Rounding down would have accepted this as 4 parts and left the
+            // trailing byte unread.
+            let mut buf = vec![18u8, 1u8];
+            buf.extend_from_slice(&[1u8; 17]);
+            assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn decimal_partial_trailing_word_is_fully_consumed() {
+            let md = precision_scale_metadata(TdsDataType::DecimalN, 9, 18, 2);
+            // length=7 → 6 magnitude bytes: a full word plus a 2-byte partial
+            // word that must be zero-padded and consumed, leaving the reader
+            // positioned on the following field rather than mid-value.
+            let mut buf = vec![7u8, 1u8];
+            buf.extend_from_slice(&12345i32.to_le_bytes());
+            buf.extend_from_slice(&[0u8, 0u8]);
+            let trailing = 0x5A5A_5A5Ai32;
+            buf.extend_from_slice(&trailing.to_le_bytes());
+
+            let decoder = GenericDecoder::default();
+            let mut reader = ByteReader::new(buf);
+            let val = decoder.decode(&mut reader, &md).await.unwrap();
+            match val {
+                ColumnValues::Decimal(parts) => assert_eq!(parts.to_string(), "123.45"),
+                other => panic!("expected Decimal, got {other:?}"),
+            }
+            assert_eq!(reader.read_int32().await.unwrap(), trailing);
         }
 
         // ── Time scale branches ────────────────────────────────────────

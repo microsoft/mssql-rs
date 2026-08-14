@@ -62,13 +62,43 @@ pub const SQL_COPT_SS_ACCESS_TOKEN: SqlInteger = 1256;
 // Standard ODBC connection attributes the Driver Manager commonly sets before
 // connecting. Accepted (currently ignored) so the DM handshake is not broken.
 pub const SQL_ATTR_ACCESS_MODE: SqlInteger = 101;
+pub const SQL_ATTR_AUTOCOMMIT: SqlInteger = 102;
 pub const SQL_ATTR_LOGIN_TIMEOUT: SqlInteger = 103;
+pub const SQL_ATTR_TXN_ISOLATION: SqlInteger = 108;
 pub const SQL_ATTR_PACKET_SIZE: SqlInteger = 112;
 pub const SQL_ATTR_CONNECTION_TIMEOUT: SqlInteger = 113;
 pub const SQL_ATTR_ANSI_APP: SqlInteger = 115;
 
 // `SQL_ATTR_ACCESS_MODE` values.
 pub const SQL_MODE_READ_WRITE: u32 = 0;
+
+// `SQL_ATTR_AUTOCOMMIT` values. The ODBC-mandated default is `SQL_AUTOCOMMIT_ON`
+// (msodbcsql `sqlcfunc.cpp:3462`); manual-commit is opt-in per connection.
+pub const SQL_AUTOCOMMIT_OFF: u32 = 0;
+pub const SQL_AUTOCOMMIT_ON: u32 = 1;
+
+// `SQL_ATTR_TXN_ISOLATION` values. These are ODBC *bitmask* bits, distinct from
+// the T-SQL `SET TRANSACTION ISOLATION LEVEL` text they map to — see
+// `txn::txn_isolation_to_tsql`.
+pub const SQL_TXN_READ_UNCOMMITTED: u32 = 0x0000_0001;
+pub const SQL_TXN_READ_COMMITTED: u32 = 0x0000_0002;
+pub const SQL_TXN_REPEATABLE_READ: u32 = 0x0000_0004;
+pub const SQL_TXN_SERIALIZABLE: u32 = 0x0000_0008;
+/// SQL Server extension (`msodbcsql.h:465`).
+pub const SQL_TXN_SS_SNAPSHOT: u32 = 0x0000_0020;
+
+/// SQL Server-specific connection attribute for isolation level
+/// (`msodbcsql.h:200`).
+///
+/// The Windows Driver Manager screens `SQL_ATTR_TXN_ISOLATION` against the four
+/// standard ODBC bits and rejects anything else with HY024 before the driver is
+/// ever called, so this vendor attribute is the only route by which an
+/// application can select `SQL_TXN_SS_SNAPSHOT`.
+pub const SQL_COPT_SS_TXN_ISOLATION: SqlInteger = 1227;
+
+// `SQLEndTran` completion types.
+pub const SQL_COMMIT: SqlSmallInt = 0;
+pub const SQL_ROLLBACK: SqlSmallInt = 1;
 
 /// Default `SQL_ATTR_PACKET_SIZE`, matching `ClientContext::packet_size`.
 pub const DEFAULT_PACKET_SIZE: u32 = 8000;
@@ -127,7 +157,9 @@ pub const SQL_API_SQLBINDPARAMETER: SqlUSmallInt = 72;
 pub const SQL_API_SQLMORERESULTS: SqlUSmallInt = 61;
 pub const SQL_API_SQLALLOCHANDLE: SqlUSmallInt = 1001;
 pub const SQL_API_SQLCLOSECURSOR: SqlUSmallInt = 1003;
+pub const SQL_API_SQLENDTRAN: SqlUSmallInt = 1005;
 pub const SQL_API_SQLFREEHANDLE: SqlUSmallInt = 1006;
+pub const SQL_API_SQLGETCONNECTATTR: SqlUSmallInt = 1007;
 pub const SQL_API_SQLGETDIAGFIELD: SqlUSmallInt = 1010;
 pub const SQL_API_SQLGETDIAGREC: SqlUSmallInt = 1011;
 pub const SQL_API_SQLGETENVATTR: SqlUSmallInt = 1012;
@@ -148,7 +180,11 @@ pub const SQL_DBMS_NAME: SqlUSmallInt = 17;
 pub const SQL_DBMS_VER: SqlUSmallInt = 18;
 pub const SQL_CURSOR_COMMIT_BEHAVIOR: SqlUSmallInt = 23;
 pub const SQL_CURSOR_ROLLBACK_BEHAVIOR: SqlUSmallInt = 24;
+pub const SQL_DEFAULT_TXN_ISOLATION: SqlUSmallInt = 26;
 pub const SQL_IDENTIFIER_QUOTE_CHAR: SqlUSmallInt = 29;
+pub const SQL_MULTIPLE_ACTIVE_TXN: SqlUSmallInt = 37;
+pub const SQL_TXN_CAPABLE: SqlUSmallInt = 46;
+pub const SQL_TXN_ISOLATION_OPTION: SqlUSmallInt = 72;
 pub const SQL_DRIVER_ODBC_VER: SqlUSmallInt = 77;
 pub const SQL_GETDATA_EXTENSIONS: SqlUSmallInt = 81;
 pub const SQL_NEED_LONG_DATA_LEN: SqlUSmallInt = 111;
@@ -160,6 +196,15 @@ pub const SQL_ASYNC_NOTIFICATION: SqlUSmallInt = 10025;
 pub const SQL_OAC_LEVEL2: u16 = 0x0002;
 pub const SQL_OSC_CORE: u16 = 0x0001;
 pub const SQL_CB_CLOSE: u16 = 1;
+/// `SQL_TXN_CAPABLE`: DML and DDL are both transactable (msodbcsql `sqlcinfo.cpp:323`).
+pub const SQL_TC_ALL: u16 = 2;
+/// `SQL_TXN_ISOLATION_OPTION` bitmask — the five levels this driver accepts
+/// (msodbcsql `SQL_TXN_ISOLATION_OPTION_SPT`, `sqlcinfo.cpp:181-183`).
+pub const SQL_TXN_ISOLATION_OPTION_SPT: u32 = SQL_TXN_READ_UNCOMMITTED
+    | SQL_TXN_READ_COMMITTED
+    | SQL_TXN_REPEATABLE_READ
+    | SQL_TXN_SERIALIZABLE
+    | SQL_TXN_SS_SNAPSHOT;
 pub const SQL_GD_ANY_COLUMN: u32 = 0x00000001;
 pub const SQL_GD_ANY_ORDER: u32 = 0x00000002;
 pub const SQL_ASYNC_DBC_NOT_CAPABLE: u32 = 0x00000000;

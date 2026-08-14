@@ -350,9 +350,8 @@ fn read_decimal(bytes: &[u8], base_type_info: &TypeInfo) -> TdsResult<DecimalPar
 
     // A valid decimal/numeric magnitude (precision <= 38) fits in 128 bits, so
     // it is at most 16 bytes (four 32-bit words). Reject anything longer: it
-    // signals wire-format drift or corrupted plaintext, would allocate an
-    // unbounded `int_parts`, and would break the downstream `DecimalParts`
-    // formatting, which folds `int_parts` into a `u128` (only four words wide).
+    // signals wire-format drift or corrupted plaintext, and would allocate an
+    // unbounded `int_parts`.
     if magnitude.len() > DECIMAL_MAGNITUDE_BYTES {
         return Err(Error::ColumnEncryptionError(format!(
             "Invalid decimal magnitude length {} (max {DECIMAL_MAGNITUDE_BYTES} bytes for \
@@ -1385,7 +1384,7 @@ mod tests {
     fn read_decimal_rejects_oversized_magnitude() {
         // A valid decimal magnitude is at most 16 bytes (128 bits). A longer
         // magnitude must be rejected rather than allocating an unbounded
-        // `int_parts` or overflowing the downstream `u128` fold.
+        // `int_parts`.
         let info = type_info(
             TdsDataType::DecimalN,
             5,
