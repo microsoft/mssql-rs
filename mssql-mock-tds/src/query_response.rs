@@ -3,7 +3,7 @@
 
 //! Query response definitions for the mock TDS server
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 
 /// SQL data types supported by the mock server
@@ -57,6 +57,10 @@ pub enum ColumnValue {
 }
 
 impl ColumnValue {
+    pub(crate) fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
     /// Get the SQL data type for this value
     pub fn data_type(&self) -> SqlDataType {
         match self {
@@ -193,6 +197,7 @@ pub struct QueryResponse {
     /// An error emitted (with a DONE MORE token) before the result set, so the
     /// server keeps streaming the row set after a statement-scoped error.
     pub leading_error: Option<LeadingError>,
+    pub(crate) use_nbc_rows: bool,
 }
 
 impl QueryResponse {
@@ -203,6 +208,7 @@ impl QueryResponse {
             rows,
             info_tokens: Vec::new(),
             leading_error: None,
+            use_nbc_rows: false,
         }
     }
 
@@ -218,6 +224,12 @@ impl QueryResponse {
         self
     }
 
+    /// Encode rows as NBCROW tokens with a null bitmap.
+    pub fn with_nbc_rows(mut self) -> Self {
+        self.use_nbc_rows = true;
+        self
+    }
+
     /// Helper to create a response for SELECT 1
     pub fn select_one() -> Self {
         Self {
@@ -225,6 +237,7 @@ impl QueryResponse {
             rows: vec![Row::new(vec![ColumnValue::Int(1)])],
             info_tokens: Vec::new(),
             leading_error: None,
+            use_nbc_rows: false,
         }
     }
 
@@ -243,6 +256,7 @@ impl QueryResponse {
             ])],
             info_tokens: Vec::new(),
             leading_error: None,
+            use_nbc_rows: false,
         }
     }
 }
@@ -250,6 +264,7 @@ impl QueryResponse {
 /// Registry of query responses
 pub struct QueryRegistry {
     responses: HashMap<String, QueryResponse>,
+    wire_responses: HashMap<String, Bytes>,
 }
 
 impl QueryRegistry {
@@ -257,6 +272,7 @@ impl QueryRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
             responses: HashMap::new(),
+            wire_responses: HashMap::new(),
         };
 
         // Add default responses
@@ -272,12 +288,18 @@ impl QueryRegistry {
     /// Register a query response
     pub fn register(&mut self, query: impl Into<String>, response: QueryResponse) {
         let query = query.into().to_uppercase();
-        self.responses.insert(query, response);
+        let wire_response = crate::protocol::build_query_result(&response).freeze();
+        self.responses.insert(query.clone(), response);
+        self.wire_responses.insert(query, wire_response);
     }
 
     /// Get a response for a query
     pub fn get(&self, query: &str) -> Option<&QueryResponse> {
         self.responses.get(&query.to_uppercase())
+    }
+
+    pub(crate) fn get_wire_response(&self, query: &str) -> Option<Bytes> {
+        self.wire_responses.get(&query.to_uppercase()).cloned()
     }
 }
 

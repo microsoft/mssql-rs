@@ -29,6 +29,7 @@ workspace = true
 # across both runs, so any statistically significant delta is attributable to
 # mssql-tds itself.
 mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
+mssql-mock-tds = { path = "../mssql-mock-tds" }
 
 async-trait = "0.1.89"
 criterion = "0.5"
@@ -61,4 +62,8 @@ harness = false
 
 [[bench]]
 name = "tds_specific"
+harness = false
+
+[[bench]]
+name = "nbcrow_rows"
 harness = false

@@ -150,6 +150,7 @@ impl PacketHeader {
 pub enum TokenType {
     ColMetadata = 0x81,
     Row = 0xD1,
+    NbcRow = 0xD2,
     Done = 0xFD,
     DoneProc = 0xFE,
     DoneInProc = 0xFF,
@@ -873,7 +874,7 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
     // Serialize each column
     for col in &response.columns {
         result.put_u32_le(0); // UserType
-        result.put_u16_le(0x0000); // Flags: not nullable, no special flags
+        result.put_u16_le(u16::from(response.use_nbc_rows)); // nullable for NBCROW
         result.put_u8(col.data_type.tds_type_code());
         if col.data_type == crate::query_response::SqlDataType::NVarChar {
             // Required to support string responses (e.g., @@USERAGENT).
@@ -899,9 +900,23 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
 
     // Serialize each row
     for row in &response.rows {
-        result.put_u8(TokenType::Row as u8);
-        for value in &row.values {
-            value.write_to_buffer(&mut result);
+        if response.use_nbc_rows {
+            result.put_u8(TokenType::NbcRow as u8);
+            let mut bitmap = vec![0u8; response.columns.len().div_ceil(8)];
+            for (index, value) in row.values.iter().enumerate() {
+                if value.is_null() {
+                    bitmap[index / 8] |= 1 << (index % 8);
+                }
+            }
+            result.extend_from_slice(&bitmap);
+            for value in row.values.iter().filter(|value| !value.is_null()) {
+                value.write_to_buffer(&mut result);
+            }
+        } else {
+            result.put_u8(TokenType::Row as u8);
+            for value in &row.values {
+                value.write_to_buffer(&mut result);
+            }
         }
     }
 
@@ -959,16 +974,31 @@ pub fn build_error_response(message: &str) -> BytesMut {
 
 /// Wrap token data in a TDS packet
 fn wrap_in_packet(packet_type: PacketType, data: BytesMut) -> BytesMut {
-    let total_length = (PACKET_HEADER_SIZE + data.len()) as u16;
+    let max_payload = MAX_PACKET_SIZE - PACKET_HEADER_SIZE;
+    let packet_count = data.len().max(1).div_ceil(max_payload);
+    let mut packet = BytesMut::with_capacity(data.len() + packet_count * PACKET_HEADER_SIZE);
 
-    let mut packet = BytesMut::with_capacity(total_length as usize);
-    let header = PacketHeader::new(packet_type, total_length, 1);
-    header.write(&mut packet);
-    packet.extend_from_slice(&data);
+    if data.is_empty() {
+        PacketHeader::new(packet_type, PACKET_HEADER_SIZE as u16, 1).write(&mut packet);
+        return packet;
+    }
+
+    for (index, chunk) in data.chunks(max_payload).enumerate() {
+        let total_length = (PACKET_HEADER_SIZE + chunk.len()) as u16;
+        let mut header =
+            PacketHeader::new(packet_type, total_length, (index as u8).wrapping_add(1));
+        if index + 1 < packet_count {
+            header.status = PacketStatus::normal();
+        }
+        header.write(&mut packet);
+        packet.extend_from_slice(chunk);
+    }
 
     trace!(
-        "Built packet: type={:?}, length={}",
-        packet_type, total_length
+        "Built packet stream: type={:?}, packets={}, length={}",
+        packet_type,
+        packet_count,
+        packet.len()
     );
     packet
 }
@@ -1134,6 +1164,63 @@ mod tests {
         use crate::query_response::QueryResponse;
         let response = build_query_result(&QueryResponse::select_one());
         assert!(response.len() >= PACKET_HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_nbcrow_result_serializes_bitmap_and_omits_null_values() {
+        use crate::query_response::{
+            ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType,
+        };
+
+        let columns = (0..9)
+            .map(|_| ColumnDefinition::new("", SqlDataType::Int))
+            .collect();
+        let values = (0..9)
+            .map(|index| {
+                if index == 0 || index == 8 {
+                    ColumnValue::Null
+                } else {
+                    ColumnValue::Int(index)
+                }
+            })
+            .collect();
+        let response = build_query_result(
+            &QueryResponse::new(columns, vec![Row::new(values)]).with_nbc_rows(),
+        );
+
+        let row_offset = PACKET_HEADER_SIZE + 3 + (9 * 9);
+        assert_eq!(response[row_offset], TokenType::NbcRow as u8);
+        assert_eq!(&response[row_offset + 1..row_offset + 3], &[0x01, 0x01]);
+        assert_eq!(response[row_offset + 3], 4);
+        assert_eq!(
+            i32::from_le_bytes(
+                response[row_offset + 4..row_offset + 8]
+                    .try_into()
+                    .expect("first non-null integer should have four bytes")
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn test_large_payload_is_split_into_tds_packets() {
+        let response = wrap_in_packet(
+            PacketType::TabularResult,
+            BytesMut::from(&vec![0xAA; MAX_PACKET_SIZE][..]),
+        );
+
+        let mut first = &response[..PACKET_HEADER_SIZE];
+        let first_header =
+            PacketHeader::parse(&mut first).expect("first packet header should parse");
+        assert_eq!(usize::from(first_header.length), MAX_PACKET_SIZE);
+        assert!(!first_header.status.is_end_of_message());
+
+        let second_offset = usize::from(first_header.length);
+        let mut second = &response[second_offset..second_offset + PACKET_HEADER_SIZE];
+        let second_header =
+            PacketHeader::parse(&mut second).expect("second packet header should parse");
+        assert!(second_header.status.is_end_of_message());
+        assert_eq!(usize::from(second_header.length), PACKET_HEADER_SIZE * 2);
     }
 
     #[test]

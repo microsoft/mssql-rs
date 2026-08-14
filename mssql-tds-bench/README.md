@@ -35,10 +35,11 @@ that file, so every move is reviewed and recorded in git history.
 | `datatypes` | primitives; VARCHAR/NVARCHAR; temporal types; LOB (1 MB/20 MB, byte throughput) |
 | `bulk` | `BulkCopy` insert across batch sizes 500/5,000 |
 | `tds_specific` | packet-size sensitivity (4096/8192/32768); zero-copy `next_row` row-iteration throughput |
+| `nbcrow_rows` | end-to-end NBCROW decode throughput for 4/16/64-column fixed-width, text-heavy, and mixed rows with 25% NULLs |
 
-Each benchmark creates its own session temp tables / temp procedures, so **no
-server-side setup script is required** — the objects vanish when the connection
-closes.
+The SQL Server-backed benchmarks create their own session temp objects, while
+`nbcrow_rows` starts an in-process mock server with pre-serialized responses.
+No server-side setup script is required.
 
 ## Running locally
 
@@ -81,6 +82,7 @@ Criterion tuning knobs (defaults chosen for noisy, network-bound runs):
 | `BENCH_NOISE` | `0.05` | noise threshold |
 | `BENCH_BULK_ROWS` | `10000` | rows for the bulk-insert bench |
 | `BENCH_ITER_ROWS` | `50000` | rows for the row-iteration bench |
+| `BENCH_NBC_ROWS` | `10000` | rows per result set for each NBCROW throughput scenario |
 
 CPU pinning (used by `perf-lab/run-benchmarks.sh` when SQL Server is colocated):
 
