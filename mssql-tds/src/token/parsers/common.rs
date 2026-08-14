@@ -67,7 +67,6 @@ pub(crate) mod test_utils {
         }
     }
 
-    #[async_trait]
     impl TdsPacketReader for MockReader {
         async fn read_byte(&mut self) -> TdsResult<u8> {
             if self.position >= self.data.len() {

@@ -182,8 +182,6 @@ impl<D: SqlTypeDecode + Default + Send + Sync, P: TdsPacketReader + Send + Sync>
 mod tests {
     use std::sync::Arc;
 
-    use async_trait::async_trait;
-
     use super::*;
     use crate::datatypes::sqldatatypes::{
         FixedLengthTypes, TdsDataType, TypeInfo, TypeInfoVariant,
@@ -196,7 +194,6 @@ mod tests {
     #[derive(Default)]
     struct MockDecoder;
 
-    #[async_trait]
     impl SqlTypeDecode for MockDecoder {
         async fn decode<T>(
             &self,
@@ -301,7 +298,6 @@ mod tests {
     #[derive(Default)]
     struct FailingDecoder;
 
-    #[async_trait]
     impl SqlTypeDecode for FailingDecoder {
         async fn decode<T>(
             &self,

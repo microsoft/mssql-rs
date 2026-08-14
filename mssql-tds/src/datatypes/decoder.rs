@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use async_trait::async_trait;
 use bigdecimal::num_bigint::BigUint;
 use bigdecimal::num_traits::ToPrimitive;
 use core::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt::Debug, io::Error, vec};
 
@@ -144,9 +145,12 @@ macro_rules! safe_vec {
     }};
 }
 
-#[async_trait]
 pub(crate) trait SqlTypeDecode {
-    async fn decode<T>(&self, reader: &mut T, metadata: &ColumnMetadata) -> TdsResult<ColumnValues>
+    fn decode<T>(
+        &self,
+        reader: &mut T,
+        metadata: &ColumnMetadata,
+    ) -> impl Future<Output = TdsResult<ColumnValues>> + Send
     where
         T: TdsPacketReader + Send + Sync;
 }
@@ -201,9 +205,10 @@ impl PlpChunkStreamReader {
         }
     }
 
-    pub(crate) async fn begin(
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<Option<Self>> {
+    pub(crate) async fn begin<T>(reader: &mut T) -> TdsResult<Option<Self>>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         let raw_len_i64 = reader.read_int64().await?;
         let raw_len = raw_len_i64 as u64;
         let raw_len_usize = raw_len as usize;
@@ -247,10 +252,10 @@ impl PlpChunkStreamReader {
         self.reached_end
     }
 
-    async fn ensure_active_chunk(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<bool> {
+    async fn ensure_active_chunk<T>(&mut self, reader: &mut T) -> TdsResult<bool>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         if self.reached_end {
             return Ok(false);
         }
@@ -314,11 +319,10 @@ impl PlpChunkStreamReader {
         Ok(true)
     }
 
-    pub(crate) async fn read_into(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-        out: &mut [u8],
-    ) -> TdsResult<usize> {
+    pub(crate) async fn read_into<T>(&mut self, reader: &mut T, out: &mut [u8]) -> TdsResult<usize>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         // Supports the msodbcsql-style cbRequest==0 pattern to consume a
         // pending terminator after all data bytes were already read.
         if out.is_empty() {
@@ -356,10 +360,10 @@ impl PlpChunkStreamReader {
         Ok(written)
     }
 
-    pub(crate) async fn skip_to_end(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<()> {
+    pub(crate) async fn skip_to_end<T>(&mut self, reader: &mut T) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         while self.ensure_active_chunk(reader).await? {
             if self.chunk_remaining > 0 {
                 reader.skip_bytes(self.chunk_remaining).await?;
@@ -417,10 +421,13 @@ impl PlpColumnStream {
     /// - `Ok(None)` for SQL NULL
     /// - `Ok(Some(stream))` ready for incremental reads
     /// - `Err` if the column is not PLP-typed or the header is malformed
-    pub(crate) async fn begin(
+    pub(crate) async fn begin<T>(
         metadata: &ColumnMetadata,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<Option<Self>> {
+        reader: &mut T,
+    ) -> TdsResult<Option<Self>>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         let (plp_type, collation) = Self::type_from_metadata(metadata)?;
         let inner = match PlpChunkStreamReader::begin(reader).await? {
             None => return Ok(None),
@@ -460,19 +467,18 @@ impl PlpColumnStream {
     }
 
     /// Incrementally reads PLP payload bytes into `out`.
-    pub(crate) async fn read_into(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-        out: &mut [u8],
-    ) -> TdsResult<usize> {
+    pub(crate) async fn read_into<T>(&mut self, reader: &mut T, out: &mut [u8]) -> TdsResult<usize>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         self.inner.read_into(reader, out).await
     }
 
     /// Discards all remaining PLP payload and terminator bytes.
-    pub(crate) async fn skip_to_end(
-        &mut self,
-        reader: &mut (dyn TdsPacketReader + Send + Sync),
-    ) -> TdsResult<()> {
+    pub(crate) async fn skip_to_end<T>(&mut self, reader: &mut T) -> TdsResult<()>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         self.inner.skip_to_end(reader).await
     }
 
@@ -507,6 +513,24 @@ impl GenericDecoder {
     const MAX_PLP_CHUNK_SIZE: usize = 8 * 1024;
     #[cfg(not(fuzzing))]
     const MAX_PLP_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
+    /// Boxed re-entry into [`SqlTypeDecode::decode`], used only by SQL_VARIANT.
+    ///
+    /// SQL_VARIANT embeds a base type, so decoding one re-enters the type switch. Native
+    /// `async fn` cannot express that cycle: the opaque return type would contain itself.
+    /// Naming a concrete `Pin<Box<dyn Future>>` in the signature severs the dependency, at
+    /// the cost of one allocation per nested variant column — a rare type, never on the hot
+    /// path of ordinary scalar columns.
+    fn decode_boxed<'a, T>(
+        &'a self,
+        reader: &'a mut T,
+        metadata: &'a ColumnMetadata,
+    ) -> Pin<Box<dyn Future<Output = TdsResult<ColumnValues>> + Send + 'a>>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
+        Box::pin(self.decode(reader, metadata))
+    }
 
     // Reads a SQL_VARIANT type from the TDS stream.
     async fn read_sql_variant<T>(&self, reader: &mut T) -> TdsResult<ColumnValues>
@@ -584,7 +608,7 @@ impl GenericDecoder {
                     multi_part_name: None,
                     crypto_metadata: None,
                 };
-                self.decode(reader, &variant_actual_type_md).await
+                self.decode_boxed(reader, &variant_actual_type_md).await
             }
             _ => {
                 // If the type is not a fixed length type, we should not reach here.
@@ -1383,7 +1407,6 @@ impl GenericDecoder {
     }
 }
 
-#[async_trait]
 impl SqlTypeDecode for GenericDecoder {
     async fn decode<T>(&self, reader: &mut T, metadata: &ColumnMetadata) -> TdsResult<ColumnValues>
     where
@@ -1774,7 +1797,6 @@ impl StringDecoder {
     }
 }
 
-#[async_trait]
 impl SqlTypeDecode for StringDecoder {
     async fn decode<T>(&self, reader: &mut T, metadata: &ColumnMetadata) -> TdsResult<ColumnValues>
     where
@@ -1846,7 +1868,7 @@ impl SqlTypeDecode for StringDecoder {
         } else {
             let length = reader.read_uint16().await? as usize;
             if length == 0xFFFF {
-                return Ok(ColumnValues::Null);
+                Ok(ColumnValues::Null)
             } else {
                 let mut buffer = vec![0u8; length];
                 reader.read_bytes(&mut buffer).await?;
@@ -3229,7 +3251,7 @@ mod test {
     }
 
     mod decode_into_tests {
-        use async_trait::async_trait;
+
         use byteorder::{ByteOrder, LittleEndian};
 
         use crate::core::TdsResult;
@@ -3270,7 +3292,6 @@ mod test {
             }
         }
 
-        #[async_trait]
         impl TdsPacketReader for ByteReader {
             async fn read_byte(&mut self) -> TdsResult<u8> {
                 Ok(self.take(1)?[0])

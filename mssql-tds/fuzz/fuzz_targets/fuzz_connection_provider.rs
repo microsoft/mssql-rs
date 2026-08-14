@@ -20,7 +20,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use mssql_tds::connection::client_context::ClientContext;
-use mssql_tds::fuzz_support::{FuzzReader, MockTransport, TdsConnectionProvider};
+use mssql_tds::fuzz_support::{FuzzPacketReader, MockTransport, TdsConnectionProvider};
 
 fuzz_target!(|data: &[u8]| {
     // Need at least some data to work with
@@ -37,7 +37,7 @@ fuzz_target!(|data: &[u8]| {
 
 async fn fuzz_connection_provider(data: &[u8]) {
     // Create a fuzz reader with the input data
-    let reader = Box::new(FuzzReader::new(data));
+    let reader = FuzzPacketReader::from_data(data);
     let packet_size = 4096;
 
     // Create a mock transport with fuzzed data
