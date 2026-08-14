@@ -969,14 +969,28 @@ fn bench_row_decode() {
     run_contiguous_case("contig_poc_row_39int_9varchar", poc_columns(), false);
     run_contiguous_case("contig_wide_strings_8x512", wide_string_columns(), false);
     run_wrapper_ladder("wrap_poc_row_39int_9varchar", poc_columns(), false);
-    run_paired_wrapper_ab(
-        "paired_eager_timeout",
-        poc_columns(),
-        false,
-        WrapMode::CancelSome,
-        WrapMode::CancelSomeTimeout,
-        41,
-    );
+    for (label, a, b) in [
+        // The four comparisons #271 quotes, each re-priced with a paired design.
+        ("cancel_only", WrapMode::Bare, WrapMode::CancelSome),
+        (
+            "eager_timeout",
+            WrapMode::CancelSome,
+            WrapMode::CancelSomeTimeout,
+        ),
+        ("full_stack", WrapMode::Bare, WrapMode::CancelSomeTimeout),
+        (
+            "lazy_residual",
+            WrapMode::CancelSome,
+            WrapMode::CancelSomeLazyTimeout,
+        ),
+        (
+            "lazy_inline_residual",
+            WrapMode::CancelSome,
+            WrapMode::CancelSomeLazyInline,
+        ),
+    ] {
+        run_paired_wrapper_ab(&format!("paired_{label}"), poc_columns(), false, a, b, 41);
+    }
     println!("BENCH_END");
 }
 
