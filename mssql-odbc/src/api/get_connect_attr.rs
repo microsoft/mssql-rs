@@ -14,8 +14,9 @@ use tracing::{debug, error};
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_ATTR_ACCESS_MODE, SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT,
-    SQL_ATTR_PACKET_SIZE, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
+    SQL_ATTR_ACCESS_MODE, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT,
+    SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
+    SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
     SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
@@ -112,7 +113,12 @@ fn sql_get_connect_attr_w_safe(
         // The remaining attributes the set-side accepts. Returning HYC00 here
         // would make a set/get round-trip fail for a value the driver had just
         // reported as accepted.
-        SQL_ATTR_ACCESS_MODE | SQL_ATTR_CONNECTION_TIMEOUT | SQL_ATTR_PACKET_SIZE => {
+        SQL_ATTR_ACCESS_MODE
+        | SQL_ATTR_CONNECTION_TIMEOUT
+        | SQL_ATTR_PACKET_SIZE
+        | SQL_ATTR_AUTOCOMMIT
+        | SQL_ATTR_TXN_ISOLATION
+        | SQL_COPT_SS_TXN_ISOLATION => {
             if value_ptr.is_null() {
                 error!(attribute, "SQLGetConnectAttrW: value pointer is null");
                 post_diag(&mut state, ERR_INVALID_NULL_POINTER);
@@ -121,6 +127,17 @@ fn sql_get_connect_attr_w_safe(
             let value = match attribute {
                 SQL_ATTR_ACCESS_MODE => state.access_mode,
                 SQL_ATTR_CONNECTION_TIMEOUT => state.connection_timeout,
+                // Read from the cached value rather than the server: msodbcsql
+                // does the same for both (`sqlcmisc.cpp:3426`), so a get never
+                // costs a round trip.
+                SQL_ATTR_AUTOCOMMIT => {
+                    if state.autocommit {
+                        SQL_AUTOCOMMIT_ON
+                    } else {
+                        SQL_AUTOCOMMIT_OFF
+                    }
+                }
+                SQL_ATTR_TXN_ISOLATION | SQL_COPT_SS_TXN_ISOLATION => state.txn_isolation,
                 _ => state.packet_size,
             };
             unsafe { write_if_some(value_ptr as *mut u32, value) };
@@ -150,7 +167,10 @@ fn sql_get_connect_attr_w_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_ATTR_ANSI_APP, SQL_MODE_READ_WRITE};
+    use crate::api::odbc_types::{
+        DEFAULT_PACKET_SIZE, SQL_ATTR_ANSI_APP, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED,
+        SQL_TXN_SS_SNAPSHOT,
+    };
     use crate::api::set_connect_attr::sql_set_connect_attr_w;
     use crate::test_support::TestHandles;
 
@@ -251,6 +271,8 @@ mod tests {
             (SQL_ATTR_ACCESS_MODE, 1u32),
             (SQL_ATTR_CONNECTION_TIMEOUT, 30),
             (SQL_ATTR_PACKET_SIZE, 16384),
+            (SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF),
+            (SQL_ATTR_TXN_ISOLATION, SQL_TXN_SS_SNAPSHOT),
         ] {
             let set = unsafe {
                 sql_set_connect_attr_w(h.dbc, attribute, value as usize as SqlPointer, 0)
@@ -270,6 +292,15 @@ mod tests {
             "ODBC default is no timeout"
         );
         assert_eq!(get_u32(h.dbc, SQL_ATTR_PACKET_SIZE), DEFAULT_PACKET_SIZE);
+        assert_eq!(
+            get_u32(h.dbc, SQL_ATTR_AUTOCOMMIT),
+            SQL_AUTOCOMMIT_ON,
+            "ODBC and msodbcsql both default to autocommit"
+        );
+        assert_eq!(
+            get_u32(h.dbc, SQL_ATTR_TXN_ISOLATION),
+            SQL_TXN_READ_COMMITTED
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::api::sqlstate::SQLSTATE_HY000;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{DbcHandle, EnvHandle, HandleType, StmtHandle, free_handle, handle_from_raw};
+use mssql_tds::connection::tds_client::StatementId;
 
 /// Implementation of [`SQLFreeHandle`](super::exports::SQLFreeHandle).
 ///
@@ -198,7 +199,7 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
 /// server to reclaim when the connection closes. No lock is held across I/O.
 fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &DbcHandle) {
     // If a cursor is still open, drain it first: `drain_and_release` reads the
-    // trailing `@handle` token (capturing `prepared_handle`), returns the
+    // trailing `@handle` token (capturing it into `prepared`), returns the
     // client, and clears `active_stmt` — leaving the connection idle so the
     // unprepare below can claim it. Without this, a `prepare -> SQLExecute
     // (SELECT) -> SQLFreeHandle` sequence (no `SQLCloseCursor`) would skip the
@@ -212,16 +213,17 @@ fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &Dbc
         super::close_cursor::drain_and_release(stmt, handle);
     }
 
-    let handles: Vec<i32> = match stmt.inner.lock() {
-        Ok(mut stmt_state) => [
-            stmt_state.prepared_handle.take(),
+    let (prepared, pending) = match stmt.inner.lock() {
+        Ok(mut stmt_state) => (
+            stmt_state.prepared.take().map(|p| p.stmt),
             stmt_state.pending_unprepare.take(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
+        ),
         Err(_) => return,
     };
+    let handles: Vec<StatementId> = [prepared.and_then(|p| p.id()), pending]
+        .into_iter()
+        .flatten()
+        .collect();
     if handles.is_empty() {
         return;
     }
@@ -232,12 +234,11 @@ fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &Dbc
         return;
     };
 
-    for handle in handles {
-        if let Err(e) = dbc
-            .runtime
-            .block_on(client.execute_sp_unprepare(handle, ()))
-        {
-            error!(%e, handle, "SQLFreeHandle(STMT): sp_unprepare failed — handle leaked until disconnect");
+    // `unprepare` skips a handle from a superseded session (already gone
+    // server-side) and releases a live one.
+    for statement_id in handles {
+        if let Err(e) = dbc.runtime.block_on(client.unprepare(statement_id, ())) {
+            error!(%e, "SQLFreeHandle(STMT): sp_unprepare failed — handle leaked until disconnect");
         }
     }
 

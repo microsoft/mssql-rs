@@ -437,7 +437,7 @@ pub(crate) mod tests {
     use crate::io::packet_reader::TdsPacketReader;
     use crate::io::packet_writer::PacketWriter;
     use crate::io::packet_writer::tests::MockNetworkWriter;
-    use async_trait::async_trait;
+
     use byteorder::{BigEndian, ReadBytesExt};
     use futures::executor::block_on;
 
@@ -446,7 +446,6 @@ pub(crate) mod tests {
 
     mockall::mock! {
         pub TestPacketReader {}
-        #[async_trait]
         impl TdsPacketReader for TestPacketReader {
             async fn read_byte(&mut self) -> TdsResult<u8>;
             async fn read_int16_big_endian(&mut self) -> TdsResult<i16>;

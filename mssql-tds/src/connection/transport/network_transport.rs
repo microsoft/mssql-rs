@@ -1099,7 +1099,6 @@ impl TransportSslHandler for NetworkTransport {
     }
 }
 
-#[async_trait]
 impl TdsPacketReader for NetworkTransport {
     fn reset_reader(&mut self) {
         // Make sure that we have read all the data from the buffer.

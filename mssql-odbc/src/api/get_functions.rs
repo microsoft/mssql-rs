@@ -9,13 +9,13 @@ use crate::api::odbc_types::{
     SQL_API_ALL_FUNCTIONS, SQL_API_ALL_FUNCTIONS_SIZE, SQL_API_ODBC3_ALL_FUNCTIONS,
     SQL_API_SQLALLOCHANDLE, SQL_API_SQLBINDPARAMETER, SQL_API_SQLCANCEL, SQL_API_SQLCLOSECURSOR,
     SQL_API_SQLCONNECT, SQL_API_SQLDESCRIBECOL, SQL_API_SQLDISCONNECT, SQL_API_SQLDRIVERCONNECT,
-    SQL_API_SQLEXECDIRECT, SQL_API_SQLEXECUTE, SQL_API_SQLFETCH, SQL_API_SQLFREEHANDLE,
-    SQL_API_SQLFREESTMT, SQL_API_SQLGETDATA, SQL_API_SQLGETDIAGFIELD, SQL_API_SQLGETDIAGREC,
-    SQL_API_SQLGETENVATTR, SQL_API_SQLGETFUNCTIONS, SQL_API_SQLGETINFO, SQL_API_SQLGETSTMTATTR,
-    SQL_API_SQLGETTYPEINFO, SQL_API_SQLMORERESULTS, SQL_API_SQLNUMRESULTCOLS, SQL_API_SQLPREPARE,
-    SQL_API_SQLROWCOUNT, SQL_API_SQLSETCONNECTATTR, SQL_API_SQLSETENVATTR, SQL_API_SQLSETSTMTATTR,
-    SQL_ERROR, SQL_FALSE, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_TRUE, SqlHandle, SqlReturn,
-    SqlUSmallInt,
+    SQL_API_SQLENDTRAN, SQL_API_SQLEXECDIRECT, SQL_API_SQLEXECUTE, SQL_API_SQLFETCH,
+    SQL_API_SQLFREEHANDLE, SQL_API_SQLFREESTMT, SQL_API_SQLGETCONNECTATTR, SQL_API_SQLGETDATA,
+    SQL_API_SQLGETDIAGFIELD, SQL_API_SQLGETDIAGREC, SQL_API_SQLGETENVATTR, SQL_API_SQLGETFUNCTIONS,
+    SQL_API_SQLGETINFO, SQL_API_SQLGETSTMTATTR, SQL_API_SQLGETTYPEINFO, SQL_API_SQLMORERESULTS,
+    SQL_API_SQLNUMRESULTCOLS, SQL_API_SQLPREPARE, SQL_API_SQLROWCOUNT, SQL_API_SQLSETCONNECTATTR,
+    SQL_API_SQLSETENVATTR, SQL_API_SQLSETSTMTATTR, SQL_ERROR, SQL_FALSE, SQL_INVALID_HANDLE,
+    SQL_SUCCESS, SQL_TRUE, SqlHandle, SqlReturn, SqlUSmallInt,
 };
 use crate::error::free_errors;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
@@ -156,6 +156,7 @@ fn supported_function_ids() -> &'static [SqlUSmallInt] {
         SQL_API_SQLALLOCHANDLE,
         SQL_API_SQLCLOSECURSOR,
         SQL_API_SQLFREEHANDLE,
+        SQL_API_SQLGETCONNECTATTR,
         SQL_API_SQLGETDIAGFIELD,
         SQL_API_SQLGETDIAGREC,
         SQL_API_SQLGETENVATTR,
@@ -165,6 +166,7 @@ fn supported_function_ids() -> &'static [SqlUSmallInt] {
         SQL_API_SQLSETENVATTR,
         SQL_API_SQLPREPARE,
         SQL_API_SQLBINDPARAMETER,
+        SQL_API_SQLENDTRAN,
     ]
 }
 
@@ -222,6 +224,20 @@ mod tests {
         let ret = unsafe { sql_get_functions(h.dbc, SQL_API_SQLSETSTMTATTR, &mut supported) };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(supported, SQL_TRUE);
+    }
+
+    // The Windows DM refuses to dispatch SQLEndTran and SQLGetConnectAttrW with
+    // IM001 unless both are advertised here, which makes every transaction
+    // attribute unreadable from an application.
+    #[test]
+    fn transaction_functions_report_true() {
+        let h = TestHandles::with_env_dbc();
+        for id in [SQL_API_SQLENDTRAN, SQL_API_SQLGETCONNECTATTR] {
+            let mut supported: SqlUSmallInt = SQL_FALSE;
+            let ret = unsafe { sql_get_functions(h.dbc, id, &mut supported) };
+            assert_eq!(ret, SQL_SUCCESS, "id {id}");
+            assert_eq!(supported, SQL_TRUE, "id {id}");
+        }
     }
 
     #[test]
