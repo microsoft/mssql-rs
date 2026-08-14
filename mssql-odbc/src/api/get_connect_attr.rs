@@ -14,13 +14,15 @@ use tracing::{debug, error};
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_ATTR_ACCESS_MODE, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT,
-    SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
+    SQL_ATTR_ACCESS_MODE, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_DEAD,
+    SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE,
+    SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_CD_FALSE, SQL_CD_TRUE,
     SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
     SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
+use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 
 /// Login timeout reported when the application has not set
@@ -144,6 +146,29 @@ fn sql_get_connect_attr_w_safe(
             debug!(attribute, value, "SQLGetConnectAttrW: attribute returned");
             SQL_SUCCESS
         }
+        SQL_ATTR_CONNECTION_DEAD => {
+            if value_ptr.is_null() {
+                error!("SQLGetConnectAttrW: SQL_ATTR_CONNECTION_DEAD value pointer is null");
+                post_diag(&mut state, ERR_INVALID_NULL_POINTER);
+                return SQL_ERROR;
+            }
+            // Cached, never-probe liveness (D1/D2): report DEAD unless the DBC is
+            // connected and its client has not been observed dead. Peek the
+            // client under the DBC mutex — never `take` it (D8) and never touch
+            // the socket. `SQL_CD_FALSE` means "not known dead", not "proven
+            // healthy"; a connection that failed silently while idle is
+            // recovered on the next operation. Disconnected/never-connected
+            // reads DEAD so a pool discards it.
+            let alive = state.connection_state == ConnectionState::Connected
+                && state
+                    .client
+                    .as_ref()
+                    .is_some_and(|client| !client.is_connection_dead());
+            let value = if alive { SQL_CD_FALSE } else { SQL_CD_TRUE };
+            unsafe { write_if_some(value_ptr as *mut u32, value) };
+            debug!(value, "SQLGetConnectAttrW: connection-dead returned");
+            SQL_SUCCESS
+        }
         // Any other attribute is genuinely unsupported: surface HYC00 instead of
         // claiming success while leaving the caller's buffer untouched.
         // `SQL_ATTR_ANSI_APP` lands here deliberately — the Driver Manager sets
@@ -168,8 +193,8 @@ fn sql_get_connect_attr_w_safe(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        DEFAULT_PACKET_SIZE, SQL_ATTR_ANSI_APP, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED,
-        SQL_TXN_SS_SNAPSHOT,
+        DEFAULT_PACKET_SIZE, SQL_ATTR_ANSI_APP, SQL_ATTR_CONNECTION_DEAD, SQL_CD_FALSE,
+        SQL_CD_TRUE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED, SQL_TXN_SS_SNAPSHOT,
     };
     use crate::api::set_connect_attr::sql_set_connect_attr_w;
     use crate::test_support::TestHandles;
@@ -314,6 +339,91 @@ mod tests {
                 h.dbc,
                 SQL_ATTR_ANSI_APP,
                 &mut out as *mut u32 as SqlPointer,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get, SQL_ERROR);
+    }
+
+    #[test]
+    fn connection_dead_reports_true_when_never_connected() {
+        // D1: msodbcsql defaults the attribute to DEAD until a token read
+        // succeeds; a freshly allocated DBC has no client, so a pool must
+        // discard it.
+        let h = TestHandles::with_env_dbc();
+        let mut out: u32 = 12345;
+        let get = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_CONNECTION_DEAD,
+                &mut out as *mut u32 as SqlPointer,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get, SQL_SUCCESS);
+        assert_eq!(out, SQL_CD_TRUE);
+    }
+
+    #[test]
+    fn connection_dead_reports_true_when_marked_connected_without_client() {
+        // `Connected` state but no client (mid-operation, taken) still reads
+        // DEAD: liveness is a property of the client, not the state flag.
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let mut out: u32 = 0;
+        let get = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_CONNECTION_DEAD,
+                &mut out as *mut u32 as SqlPointer,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get, SQL_SUCCESS);
+        assert_eq!(out, SQL_CD_TRUE);
+    }
+
+    #[test]
+    fn connection_dead_reports_false_when_connected_and_alive() {
+        use crate::handles::DbcHandle;
+        use crate::handles::handle_from_raw;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // A replay-transport client has not been observed dead, so the cached
+        // liveness read reports ALIVE.
+        dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![]));
+
+        let mut out: u32 = 12345;
+        let get = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_CONNECTION_DEAD,
+                &mut out as *mut u32 as SqlPointer,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get, SQL_SUCCESS);
+        assert_eq!(out, SQL_CD_FALSE);
+
+        // Clear the client so TestHandles drop does not try to disconnect it.
+        dbc.inner.lock().unwrap().client = None;
+    }
+
+    #[test]
+    fn connection_dead_null_pointer_is_rejected() {
+        let h = TestHandles::with_env_dbc();
+        let get = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_CONNECTION_DEAD,
+                std::ptr::null_mut(),
                 0,
                 std::ptr::null_mut(),
             )

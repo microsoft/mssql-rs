@@ -11,12 +11,13 @@
 use tracing::{debug, error};
 
 use super::sqlstate::*;
-use super::txn::{set_autocommit, set_txn_isolation};
+use super::txn::{reset_connection, set_autocommit, set_txn_isolation};
 use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT,
-    SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN,
-    SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_RESET_CONNECTION,
+    SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN, SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR,
+    SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer,
+    SqlReturn,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
@@ -86,6 +87,9 @@ unsafe fn sql_set_connect_attr_w_impl(
         SQL_ATTR_TXN_ISOLATION | SQL_COPT_SS_TXN_ISOLATION => {
             return set_txn_isolation(dbc, value_ptr as usize as u64);
         }
+        // Pooling check-in reset: rolls back any live local transaction and arms
+        // the RESETCONNECTION bit, so it must not run under the DBC mutex either.
+        SQL_ATTR_RESET_CONNECTION => return reset_connection(dbc, value_ptr as usize as u64),
         _ => {}
     }
 

@@ -17,9 +17,9 @@ use tracing::{debug, error};
 
 use super::close_cursor::close_cursor_for_connection_op;
 use super::odbc_types::{
-    SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_ERROR, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SQL_TXN_READ_COMMITTED, SQL_TXN_READ_UNCOMMITTED, SQL_TXN_REPEATABLE_READ,
-    SQL_TXN_SERIALIZABLE, SQL_TXN_SS_SNAPSHOT, SqlReturn,
+    SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_ERROR, SQL_RESET_CONNECTION_YES, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SQL_TXN_READ_COMMITTED, SQL_TXN_READ_UNCOMMITTED,
+    SQL_TXN_REPEATABLE_READ, SQL_TXN_SERIALIZABLE, SQL_TXN_SS_SNAPSHOT, SqlReturn,
 };
 use super::sqlstate::{
     ERR_ATTRIBUTE_CANNOT_BE_SET_NOW, ERR_CONNECTION_BUSY, ERR_CONNECTION_DOES_NOT_EXIST,
@@ -356,6 +356,73 @@ pub(super) fn set_autocommit(dbc: &DbcHandle, value: u64) -> SqlReturn {
     } else {
         switch_to_manual_commit(dbc, OP)
     }
+}
+
+/// Applies `SQL_ATTR_RESET_CONNECTION` — the connection-pool check-in reset.
+///
+/// Mirrors msodbcsql's `SQL_COPT_SS_RESET_CONNECTION` handler
+/// (`sqlcmisc.cpp:2373-2461`): reject any value but `SQL_RESET_CONNECTION_YES`
+/// with HY024 (D7), roll back a live local transaction first (D4), then arm the
+/// full RESETCONNECTION bit so the next request resets the session to its login
+/// defaults. Pool checkout does not preserve transactions, so this never uses
+/// RESETCONNECTIONSKIPTRAN.
+///
+/// The bit only rides the next request here; making the reset self-acking with
+/// its own round trip is a later stage.
+pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
+    const OP: &str = "SQLSetConnectAttrW(SQL_ATTR_RESET_CONNECTION)";
+
+    {
+        let Ok(mut state) = dbc.inner.lock() else {
+            error!("{OP}: dbc mutex poisoned");
+            return SQL_ERROR;
+        };
+        free_errors(&mut state);
+        if value != u64::from(SQL_RESET_CONNECTION_YES) {
+            error!(value, "{OP}: invalid value");
+            post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+            return SQL_ERROR;
+        }
+    }
+
+    // Claim the idle client: this rejects a busy connection (open cursor /
+    // `active_stmt`) with ERR_CONNECTION_BUSY and a disconnected DBC with
+    // ERR_CONNECTION_DOES_NOT_EXIST (08003, D7).
+    let mut client = match claim_dbc_client(dbc, OP) {
+        Ok(c) => c,
+        Err(ret) => return ret,
+    };
+
+    // D4: roll back a live local transaction before the reset so the next
+    // borrower cannot inherit it. Guard on the server actually having one, the
+    // same way `end_transaction` does — the flag can be stale.
+    let started = match dbc.inner.lock() {
+        Ok(state) => state.local_tran_started,
+        Err(_) => false,
+    };
+    let result = if started && client.has_active_transaction() {
+        debug!("{OP}: rolling back live local transaction before reset");
+        dbc.runtime
+            .block_on(client.rollback_transaction(None, None))
+    } else {
+        Ok(())
+    };
+
+    client.prepare_reset_connection(false);
+    release_dbc_client(dbc, client);
+
+    let Ok(mut state) = dbc.inner.lock() else {
+        error!("{OP}: dbc mutex poisoned");
+        return SQL_ERROR;
+    };
+    state.local_tran_started = false;
+    if let Err(e) = result {
+        error!(%e, "{OP}: rollback before reset failed");
+        post_tds_error(&mut state, &e, SQLSTATE_HY000);
+        return SQL_ERROR;
+    }
+    debug!("{OP}: reset armed for next request");
+    SQL_SUCCESS
 }
 
 /// Manual-commit → autocommit. Any transaction holding user work is **committed**
@@ -758,5 +825,104 @@ mod tests {
             stmt.inner.lock().unwrap().diag_records().is_empty(),
             "the no-transaction path must still sweep cursors"
         );
+    }
+
+    #[test]
+    fn reset_connection_rejects_non_yes_value() {
+        // D7: only SQL_RESET_CONNECTION_YES(1) is valid; anything else is HY024.
+        // Value validation runs before the connection is claimed.
+        use crate::api::odbc_types::SQL_ATTR_RESET_CONNECTION;
+        use crate::api::set_connect_attr::sql_set_connect_attr_w;
+        use crate::api::sqlstate::SQLSTATE_HY024;
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+
+        let h = TestHandles::with_env_dbc();
+        let ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_RESET_CONNECTION, 2usize as _, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().diag_records()[0].sql_state,
+            SQLSTATE_HY024
+        );
+    }
+
+    #[test]
+    fn reset_connection_on_disconnected_dbc_is_08003() {
+        // D7: reset on a connection that does not exist surfaces 08003, the
+        // diagnostic `claim_dbc_client` posts for the disconnected case.
+        use crate::api::odbc_types::{SQL_ATTR_RESET_CONNECTION, SQL_RESET_CONNECTION_YES};
+        use crate::api::set_connect_attr::sql_set_connect_attr_w;
+        use crate::api::sqlstate::SQLSTATE_08003;
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+
+        let h = TestHandles::with_env_dbc();
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_RESET_CONNECTION,
+                SQL_RESET_CONNECTION_YES as usize as _,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().diag_records()[0].sql_state,
+            SQLSTATE_08003
+        );
+    }
+
+    #[test]
+    fn reset_connection_rejects_busy_connection() {
+        // An open cursor / in-progress result set pins `active_stmt`; the reset
+        // must not touch a busy connection.
+        use std::ffi::c_void;
+
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(tds_client_from_tokens(vec![]));
+            state.active_stmt = Some(std::ptr::dangling_mut::<c_void>());
+        }
+
+        assert_eq!(reset_connection(dbc, 1), SQL_ERROR);
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HY000);
+        // The busy connection was rejected without taking the client.
+        assert!(state.client.is_some());
+    }
+
+    #[test]
+    fn reset_connection_arms_and_clears_local_tran() {
+        // A successful reset leaves the idle client in place and clears the
+        // driver-side transaction flag (D4). The RESETCONNECTION bit riding the
+        // next request is covered by the mssql-tds transport test.
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(tds_client_from_tokens(vec![]));
+            state.local_tran_started = true;
+        }
+
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+        let state = dbc.inner.lock().unwrap();
+        assert!(!state.local_tran_started);
+        assert!(state.client.is_some());
+        assert!(state.diag_records().is_empty());
     }
 }
