@@ -17,9 +17,10 @@
 /// That cost is not a timer-wheel registration: on the ready path the eager
 /// form never polls the `Sleep`, so no wheel entry is ever created. It is the
 /// `Instant::now()` clock read plus building the `Sleep`, and — because
-/// `timeout` takes its future by value — moving the multi-kilobyte row future
-/// into `Timeout<F>`. Pinning first and passing `Pin<&mut F>` avoids the move
-/// as well as the timer.
+/// `timeout` takes its future by value — moving the multi-kilobyte
+/// `CancelHandle::run_until_cancelled` future around the row decode into
+/// `Timeout<F>`. Pinning first and passing `Pin<&mut F>` avoids the move as well
+/// as the timer.
 ///
 /// Because that dominant term scales with the size of the inner future, an
 /// isolated micro-benchmark on a trivial future understates it. In a paired
@@ -72,7 +73,7 @@ pub(crate) use await_within_request_timeout;
 #[cfg(test)]
 mod tests {
     use crate::core::TdsResult;
-    use crate::error::Error;
+    use crate::error::{Error, TimeoutErrorType};
     use std::future::{Future, ready};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -95,9 +96,7 @@ mod tests {
     fn is_elapsed<T>(result: &TdsResult<T>) -> bool {
         matches!(
             result,
-            Err(Error::TimeoutError(
-                crate::error::TimeoutErrorType::Elapsed(_)
-            ))
+            Err(Error::TimeoutError(TimeoutErrorType::Elapsed(_)))
         )
     }
 
@@ -128,21 +127,58 @@ mod tests {
         );
     }
 
-    /// Same two cases through `tokio::time::timeout` directly, pinning the
-    /// macro's behaviour to the combinator it replaces rather than to an
-    /// independently asserted expectation.
+    /// Compares both exhausted-budget outcomes directly with the eager
+    /// combinator this macro replaces.
     #[tokio::test]
     async fn matches_eager_timeout_on_exhausted_budget() {
         let zero = Duration::ZERO;
-        let polls = AtomicUsize::new(0);
-
-        assert!(tokio::time::timeout(zero, ready(7u8)).await.is_ok());
-        assert!(
-            tokio::time::timeout(zero, NeverReady(&polls))
-                .await
-                .is_err(),
-            "baseline: eager timeout elapses on a suspending future"
+        let eager_ready = tokio::time::timeout(zero, ready(Ok::<u8, Error>(7)))
+            .await
+            .expect("eager timeout must let a ready future win")
+            .expect("ready future succeeds");
+        let lazy_ready: TdsResult<u8> =
+            await_within_request_timeout!(Some(zero), ready(Ok::<u8, Error>(7)));
+        assert_eq!(
+            eager_ready,
+            lazy_ready.expect("lazy timeout must let a ready future win")
         );
+
+        let eager_polls = AtomicUsize::new(0);
+        let lazy_polls = AtomicUsize::new(0);
+        let eager_pending = tokio::time::timeout(zero, NeverReady(&eager_polls)).await;
+        let lazy_pending = await_within_request_timeout!(Some(zero), NeverReady(&lazy_polls));
+        let eager_elapsed = eager_pending.is_err();
+        let lazy_elapsed = is_elapsed(&lazy_pending);
+
+        assert_eq!(
+            eager_elapsed, lazy_elapsed,
+            "lazy arming must match the eager timeout verdict"
+        );
+        assert!(
+            eager_elapsed,
+            "both forms must elapse on a suspending future"
+        );
+        assert!(
+            eager_polls.load(Ordering::Relaxed) >= 1 && lazy_polls.load(Ordering::Relaxed) >= 1,
+            "both forms must poll the inner future before timing out"
+        );
+    }
+
+    /// The optimization itself: a ready future must not construct a `Sleep`.
+    /// A Tokio runtime without the time driver panics if one is constructed.
+    #[test]
+    fn ready_path_never_constructs_a_sleep() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime without the time driver");
+
+        runtime.block_on(async {
+            let result: TdsResult<u8> = await_within_request_timeout!(
+                Some(Duration::from_secs(30)),
+                ready(Ok::<u8, Error>(7))
+            );
+            assert_eq!(result.expect("ready path must not arm a timer"), 7);
+        });
     }
 
     /// Suspends on its first poll, then completes. Wakes itself so the suspend
