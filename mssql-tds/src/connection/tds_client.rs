@@ -26,10 +26,7 @@ use crate::message::transaction_management::{
 use crate::query::result::ReturnValue;
 use crate::token::tokens::SqlCollation;
 use crate::{
-    connection::{
-        execution_context::{ALREADY_EXECUTING_ERROR, ExecutionContext},
-        transport::tds_transport::TdsTransport,
-    },
+    connection::execution_context::{ALREADY_EXECUTING_ERROR, ExecutionContext},
     datatypes::column_values::ColumnValues,
     handler::handler_factory::NegotiatedSettings,
     io::token_stream::{
@@ -2283,7 +2280,13 @@ impl TdsClient {
             // Drain the current result set.
             let mut writer = DiscardRowWriter;
             while self.next_row_into(&mut writer).await? {
-                info!("Consuming row while draining result set");
+                info!(
+                    column_count = self
+                        .current_metadata
+                        .as_ref()
+                        .map_or(0, |m| m.columns.len()),
+                    "Consuming row while draining result set"
+                );
             }
         }
         Ok(())
@@ -3598,6 +3601,8 @@ impl TdsClient {
     where
         W: RowWriter + Send + ?Sized,
     {
+        // Every error return below must abort the pending prepare capture. A
+        // wrapper that centralizes this cleanup exceeds the row-future size budget.
         // End-of-set reads are idempotent even after advancing clears metadata.
         if self.current_result_set_has_been_read_till_end {
             return Ok(false);

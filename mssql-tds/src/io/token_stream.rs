@@ -201,7 +201,7 @@ pub(crate) trait TdsTokenStreamReader {
 
     // Object-safe fallbacks for cfg-gated dynamic transports. Production calls
     // the native inherent methods on its concrete transport representation.
-    #[allow(dead_code)]
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
     async fn receive_row_into(
         &mut self,
         context: &ParserContext,
@@ -215,7 +215,7 @@ pub(crate) trait TdsTokenStreamReader {
     /// NBCROW null bitmap — pausing before column 0 without decoding columns.
     /// Non-row tokens are returned as [`RowHeader::Token`]. Used by the pull
     /// cursor to position on a row (`SQLFetch`) before pulling columns.
-    #[allow(dead_code)]
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
     async fn receive_row_header(
         &mut self,
         context: &ParserContext,
@@ -228,7 +228,7 @@ pub(crate) trait TdsTokenStreamReader {
     ///
     /// The caller is responsible for passing back the exact [`RowPauseState`]
     /// that was returned inside `RowReadResult::RowPaused`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
     async fn resume_row_into(
         &mut self,
         pause_state: RowPauseState,
@@ -240,7 +240,7 @@ pub(crate) trait TdsTokenStreamReader {
 
     /// Reads bytes from an active PLP stream captured by
     /// [`RowReadResult::PlpPaused`].
-    #[allow(dead_code)]
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
     async fn read_active_plp_bytes(
         &mut self,
         plp_state: &mut PlpPauseState,

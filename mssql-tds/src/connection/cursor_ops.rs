@@ -17,7 +17,6 @@
 
 use crate::connection::execution_context::ALREADY_EXECUTING_ERROR;
 use crate::connection::tds_client::{ResultSet, ReturnStatus, TdsClient};
-use crate::connection::transport::tds_transport::TdsTransport as _;
 use crate::core::{CancelHandle, TdsResult};
 use crate::cursor::{
     CursorConcurrency, CursorOpenResponse, CursorOperation, CursorOptionCode, CursorOptionValue,

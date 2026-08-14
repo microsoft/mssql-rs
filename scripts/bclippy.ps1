@@ -3,6 +3,13 @@
 
 $ErrorActionPreference = "Stop"
 
+Write-Host "Running cargo clippy on mssql-tds production configuration..."
+cargo clippy --frozen -p mssql-tds --lib -- -D warnings
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "mssql-tds production clippy failed"
+    exit $LASTEXITCODE
+}
+
 Write-Host "Running cargo clippy on workspace..."
 cargo clippy --workspace --frozen --all-features --all-targets -- -D warnings
 if ($LASTEXITCODE -ne 0) {

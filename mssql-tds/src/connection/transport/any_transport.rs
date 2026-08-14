@@ -4,7 +4,6 @@
 use std::future::Future;
 use std::time::Duration;
 
-use async_trait::async_trait;
 #[cfg(any(test, feature = "test-util", fuzzing))]
 use futures::future::Either;
 
@@ -15,7 +14,6 @@ use crate::datatypes::row_writer::RowWriter;
 use crate::io::reader_writer::NetworkWriter;
 use crate::io::token_stream::{
     ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
-    TdsTokenStreamReader,
 };
 use crate::token::tokens::Tokens;
 
@@ -206,96 +204,16 @@ impl AnyTransport {
             }
         }
     }
-}
 
-#[async_trait]
-impl TdsTokenStreamReader for AnyTransport {
-    async fn receive_token(
-        &mut self,
-        context: &ParserContext,
-        remaining_request_timeout: Option<Duration>,
-        cancel_handle: Option<&CancelHandle>,
-    ) -> TdsResult<Tokens> {
-        AnyTransport::receive_token(self, context, remaining_request_timeout, cancel_handle).await
-    }
-
-    async fn receive_row_into(
-        &mut self,
-        context: &ParserContext,
-        remaining_request_timeout: Option<Duration>,
-        cancel_handle: Option<&CancelHandle>,
-        plan: ColumnPolicy,
-        writer: &mut (dyn RowWriter + Send),
-    ) -> TdsResult<RowReadResult> {
-        AnyTransport::receive_row_into(
-            self,
-            context,
-            remaining_request_timeout,
-            cancel_handle,
-            plan,
-            writer,
-        )
-        .await
-    }
-
-    async fn receive_row_header(
-        &mut self,
-        context: &ParserContext,
-        remaining_request_timeout: Option<Duration>,
-        cancel_handle: Option<&CancelHandle>,
-    ) -> TdsResult<RowHeader> {
-        AnyTransport::receive_row_header(self, context, remaining_request_timeout, cancel_handle)
-            .await
-    }
-
-    async fn resume_row_into(
-        &mut self,
-        pause_state: RowPauseState,
-        remaining_request_timeout: Option<Duration>,
-        cancel_handle: Option<&CancelHandle>,
-        plan: ColumnPolicy,
-        writer: &mut (dyn RowWriter + Send),
-    ) -> TdsResult<RowReadResult> {
-        AnyTransport::resume_row_into(
-            self,
-            pause_state,
-            remaining_request_timeout,
-            cancel_handle,
-            plan,
-            writer,
-        )
-        .await
-    }
-
-    async fn read_active_plp_bytes(
-        &mut self,
-        plp_state: &mut PlpPauseState,
-        remaining_request_timeout: Option<Duration>,
-        cancel_handle: Option<&CancelHandle>,
-        out: &mut [u8],
-    ) -> TdsResult<usize> {
-        AnyTransport::read_active_plp_bytes(
-            self,
-            plp_state,
-            remaining_request_timeout,
-            cancel_handle,
-            out,
-        )
-        .await
-    }
-}
-
-#[async_trait]
-impl TdsTransport for AnyTransport {
-    fn as_writer(&mut self) -> &mut dyn NetworkWriter {
+    pub(crate) fn as_writer(&mut self) -> &mut dyn NetworkWriter {
         match self {
-            Self::Network(transport) => transport.as_writer(),
+            Self::Network(transport) => TdsTransport::as_writer(transport),
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => transport.as_writer(),
         }
     }
 
-    fn reset_reader(&mut self) {
+    pub(crate) fn reset_reader(&mut self) {
         match self {
             Self::Network(transport) => TdsTransport::reset_reader(transport),
             #[cfg(any(test, feature = "test-util", fuzzing))]
@@ -303,41 +221,38 @@ impl TdsTransport for AnyTransport {
         }
     }
 
-    fn packet_size(&self) -> u32 {
+    pub(crate) async fn close_transport(&mut self) -> TdsResult<()> {
         match self {
-            Self::Network(transport) => TdsTransport::packet_size(transport),
-            #[cfg(any(test, feature = "test-util", fuzzing))]
-            Self::Dynamic(transport) => transport.packet_size(),
-        }
-    }
-
-    async fn close_transport(&mut self) -> TdsResult<()> {
-        match self {
-            Self::Network(transport) => transport.close_transport().await,
+            Self::Network(transport) => TdsTransport::close_transport(transport).await,
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => transport.close_transport().await,
         }
     }
 
-    async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool> {
+    pub(crate) async fn send_attention_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> TdsResult<bool> {
         match self {
-            Self::Network(transport) => transport.send_attention_with_timeout(timeout).await,
+            Self::Network(transport) => {
+                TdsTransport::send_attention_with_timeout(transport, timeout).await
+            }
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => transport.send_attention_with_timeout(timeout).await,
         }
     }
 
-    fn is_connection_dead(&self) -> bool {
+    pub(crate) fn is_connection_dead(&self) -> bool {
         match self {
-            Self::Network(transport) => transport.is_connection_dead(),
+            Self::Network(transport) => TdsTransport::is_connection_dead(transport),
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => transport.is_connection_dead(),
         }
     }
 
-    fn connection_known_dead(&self) -> bool {
+    pub(crate) fn connection_known_dead(&self) -> bool {
         match self {
-            Self::Network(transport) => transport.connection_known_dead(),
+            Self::Network(transport) => TdsTransport::connection_known_dead(transport),
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => transport.connection_known_dead(),
         }
