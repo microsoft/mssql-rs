@@ -56,6 +56,12 @@ use std::time::{Duration, Instant};
 /// in the describe request; the real RPC still sends the parameters unnamed.
 const SYNTHETIC_POSITIONAL_PARAM_PREFIX: &str = "ce_pos_";
 
+/// Server error severity/class at or above which the connection is fatally
+/// broken and must not be reused. Mirrors msodbcsql's `MINFATALERR`: a token
+/// with `severity >= 20` marks the transport dead so a pool checkout discards
+/// it, even if the socket is still readable.
+const FATAL_ERROR_SEVERITY: u8 = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::connection) enum CommandTimeoutBudget {
     None,
@@ -468,16 +474,10 @@ impl TdsClient {
                     self.return_values.clear();
                     self.info_messages.clear();
                     self.info_messages.extend(info_messages);
-                    // Prepared-statement handles do not survive a reconnect, so
-                    // drop their cached Always Encrypted metadata to avoid
-                    // encrypting a later sp_execute with a stale describe result.
-                    self.prepared_param_encryption.clear();
-                    self.pending_capture = None;
-                    self.pending_prepared_param_encryption = None;
-                    // Managed prepared handles belong to the dead session; drop
-                    // them so a later `execute_prepared` re-prepares against the
-                    // new session instead of aliasing an unrelated handle.
-                    self.prepared_handles.clear();
+                    // Prepared-statement handles belong to the dead session and
+                    // do not survive a reconnect, so drop them and their cached
+                    // Always Encrypted metadata.
+                    self.clear_session_bound_caches();
                     self.current_result_set_has_been_read_till_end = false;
                     self.remaining_request_timeout = None;
                     self.cancel_handle = None;
@@ -507,6 +507,54 @@ impl TdsClient {
             attempts: connect_retry_count + 1,
             message,
         })
+    }
+
+    /// Clears the caches bound to a specific server session: managed
+    /// prepared-statement handles, their cached Always Encrypted describe
+    /// metadata, and any in-flight `sp_prepexec` capture state. Shared by the
+    /// reconnect path (the old session's handles are gone) and the
+    /// connection-reset path (`sp_reset_connection` drops server-side prepared
+    /// handles), so a later `execute_prepared` re-prepares against the live
+    /// session instead of aliasing a stale or unrelated handle.
+    fn clear_session_bound_caches(&mut self) {
+        self.prepared_handles.clear();
+        self.prepared_param_encryption.clear();
+        self.pending_capture = None;
+        self.pending_prepared_param_encryption = None;
+    }
+
+    /// Applies the full client-side transition for a server-acknowledged
+    /// connection reset (a `ResetConnection` ENVCHANGE emitted in response to a
+    /// RESETCONNECTION / RESETCONNECTIONSKIPTRAN request). `sp_reset_connection`
+    /// returns the session to its login defaults, so mirror that locally: drop
+    /// accumulated session-recovery state, clear the session-bound caches, and
+    /// restore the negotiated DATABASE / LANGUAGE / COLLATION to their login
+    /// values so a borrower's `USE otherdb` / `SET LANGUAGE` does not persist
+    /// across the reset.
+    fn on_reset_connection_ack(&mut self) {
+        self.recovery_context.session_state_table.reset();
+        self.clear_session_bound_caches();
+        self.negotiated_settings.restore_login_defaults();
+    }
+
+    /// Converts a server `ERROR` token into [`SqlErrorInfo`], marking the
+    /// transport known-dead when the error is fatal (severity/class ≥
+    /// [`FATAL_ERROR_SEVERITY`]). A fatal error breaks the session even when the
+    /// socket is still readable, so flagging it here lets a later pool checkout
+    /// discard the connection instead of handing back an unusable one.
+    fn record_error_token(
+        &mut self,
+        error_token: &crate::token::tokens::ErrorToken,
+    ) -> SqlErrorInfo {
+        if error_token.severity >= FATAL_ERROR_SEVERITY {
+            warn!(
+                severity = error_token.severity,
+                number = error_token.number,
+                "Fatal server error token received; marking connection dead"
+            );
+            self.transport.mark_known_dead();
+        }
+        SqlErrorInfo::from(error_token)
     }
 
     /// Returns the current database collation.
@@ -1220,7 +1268,7 @@ impl TdsClient {
                 }
                 Tokens::Error(error_token) => {
                     info!(?error_token);
-                    collected_errors.push(SqlErrorInfo::from(&error_token));
+                    collected_errors.push(self.record_error_token(&error_token));
                 }
                 Tokens::Info(info_token) => {
                     info!(?info_token);
@@ -1230,7 +1278,7 @@ impl TdsClient {
                 Tokens::EnvChange(env_change) => {
                     info!(?env_change);
                     if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                        self.recovery_context.session_state_table.reset();
+                        self.on_reset_connection_ack();
                     }
                     self.execution_context
                         .capture_change_property(&env_change, &mut self.negotiated_settings)?;
@@ -2421,7 +2469,7 @@ impl TdsClient {
         match token {
             Tokens::Error(error_token) => {
                 info!(?error_token, "Draining ERROR token from stream");
-                collected_errors.push(SqlErrorInfo::from(&error_token));
+                collected_errors.push(self.record_error_token(&error_token));
             }
             Tokens::Info(info_token) => {
                 info!(?info_token, "Draining INFO token from stream");
@@ -2429,7 +2477,7 @@ impl TdsClient {
             }
             Tokens::EnvChange(t1) => {
                 if t1.sub_type == EnvChangeTokenSubType::ResetConnection {
-                    self.recovery_context.session_state_table.reset();
+                    self.on_reset_connection_ack();
                 }
                 self.execution_context
                     .capture_change_property(&t1, &mut self.negotiated_settings)?;
@@ -2605,7 +2653,7 @@ impl TdsClient {
                 Tokens::EnvChange(env_change) => {
                     info!(?env_change);
                     if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                        self.recovery_context.session_state_table.reset();
+                        self.on_reset_connection_ack();
                     }
                     self.execution_context
                         .capture_change_property(&env_change, &mut self.negotiated_settings)?;
@@ -2625,7 +2673,7 @@ impl TdsClient {
                 }
                 Tokens::Error(error_token) => {
                     info!(?error_token);
-                    let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
+                    let mut all_errors = vec![self.record_error_token(&error_token)];
                     let drain_result = self.drain_stream().await;
                     // Reset batch state before propagating: the error terminates
                     // the batch regardless of whether the drain fully consumed
@@ -3973,7 +4021,7 @@ impl TdsClient {
             Tokens::EnvChange(env_change) => {
                 info!(?env_change);
                 if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                    self.recovery_context.session_state_table.reset();
+                    self.on_reset_connection_ack();
                 }
                 self.execution_context
                     .capture_change_property(&env_change, &mut self.negotiated_settings)?;
@@ -3991,7 +4039,7 @@ impl TdsClient {
             }
             Tokens::Error(error_token) => {
                 info!(?error_token);
-                let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
+                let mut all_errors = vec![self.record_error_token(&error_token)];
                 let drain_result = self.drain_stream().await;
                 // Reset batch state before propagating: the error terminates the
                 // batch regardless of whether the drain fully consumed it, so a
@@ -4416,7 +4464,7 @@ impl TdsClient {
                 }
                 Tokens::Error(error_token) => {
                     info!(?error_token);
-                    collected_errors.push(SqlErrorInfo::from(&error_token));
+                    collected_errors.push(self.record_error_token(&error_token));
                     continue;
                 }
                 Tokens::Info(info_token) => {
@@ -4427,7 +4475,7 @@ impl TdsClient {
                 Tokens::EnvChange(env_change) => {
                     info!(?env_change);
                     if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                        self.recovery_context.session_state_table.reset();
+                        self.on_reset_connection_ack();
                     }
                     self.execution_context
                         .capture_change_property(&env_change, &mut self.negotiated_settings)?;
@@ -4756,6 +4804,9 @@ mod tests {
         /// `read_row_column` down a specific arm (e.g. a `PlpPaused` result that
         /// makes the cursor emit `CursorColumn::PlpStreaming`).
         resume_results: VecDeque<RowReadResult>,
+        /// Cached liveness flag toggled by `mark_known_dead`, surfaced through
+        /// `connection_known_dead` so tests can assert the fatal-error path.
+        known_dead: bool,
     }
 
     impl TestTransport {
@@ -4768,6 +4819,7 @@ mod tests {
                 packet_data: Vec::new(),
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                known_dead: false,
             }
         }
 
@@ -4780,6 +4832,7 @@ mod tests {
                 packet_data: Vec::new(),
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                known_dead: false,
             }
         }
 
@@ -4792,6 +4845,7 @@ mod tests {
                 packet_data,
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                known_dead: false,
             }
         }
 
@@ -4935,6 +4989,12 @@ mod tests {
         }
         fn is_connection_dead(&self) -> bool {
             true
+        }
+        fn connection_known_dead(&self) -> bool {
+            self.known_dead
+        }
+        fn mark_known_dead(&mut self) {
+            self.known_dead = true;
         }
     }
 
@@ -7755,6 +7815,108 @@ mod tests {
             client.return_values.len(),
             1,
             "the RETURNVALUE must be surfaced as an output parameter"
+        );
+    }
+
+    // ── ResetConnection ENVCHANGE: full client-side state transition (A1/A3) ──
+
+    fn error_token_with_severity(severity: u8) -> crate::token::tokens::ErrorToken {
+        crate::token::tokens::ErrorToken {
+            number: 4060,
+            state: 1,
+            severity,
+            message: "test error".to_string(),
+            server_name: "test-server".to_string(),
+            proc_name: String::new(),
+            line_number: 1,
+        }
+    }
+
+    /// A server-acknowledged connection reset must return the client to its
+    /// login baseline: session-bound caches emptied and negotiated
+    /// database/language/collation restored to their login values, so a
+    /// previous borrower's `USE otherdb` / `SET LANGUAGE` and prepared handles
+    /// do not leak to the next borrower.
+    #[tokio::test]
+    async fn reset_connection_ack_clears_caches_and_restores_login_defaults() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+        use crate::token::tokens::{
+            EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, SqlCollation,
+        };
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            done_no_more(),
+        ]);
+
+        // Session-bound state a borrower accumulated before the reset.
+        client.prepared_handles.insert(sid(1), 55);
+        client
+            .prepared_param_encryption
+            .insert(sid(1), Arc::new(DescribeParameterEncryptionResult::new()));
+        client.pending_capture = Some(sid(2));
+        client.pending_prepared_param_encryption =
+            Some(Arc::new(DescribeParameterEncryptionResult::new()));
+        client.negotiated_settings.database = "otherdb".to_string();
+        client.negotiated_settings.language = "français".to_string();
+        client.negotiated_settings.database_collation = SqlCollation {
+            info: 0,
+            lcid_language_id: 0x0000,
+            col_flags: 0,
+            sort_id: 0,
+        };
+
+        client.drain_stream().await.unwrap();
+
+        assert!(
+            client.prepared_handles.is_empty(),
+            "prepared handles belong to the reset session"
+        );
+        assert!(
+            client.prepared_param_encryption.is_empty(),
+            "cached AE describe metadata must be dropped"
+        );
+        assert!(client.pending_capture.is_none());
+        assert!(client.pending_prepared_param_encryption.is_none());
+        assert_eq!(client.database(), "master", "database reverts to login");
+        assert_eq!(client.language(), "us_english", "language reverts to login");
+        assert_eq!(
+            client.get_collation().lcid_language_id,
+            0x0409,
+            "collation reverts to login"
+        );
+    }
+
+    /// D3: a server fatal-error token (severity/class ≥ 20) marks the transport
+    /// known-dead even on a still-open socket, so a pool checkout discards it.
+    #[test]
+    fn fatal_error_token_marks_connection_known_dead() {
+        let mut client = create_test_client();
+        assert!(!client.is_connection_dead());
+
+        let info = client.record_error_token(&error_token_with_severity(FATAL_ERROR_SEVERITY));
+
+        assert_eq!(info.class, FATAL_ERROR_SEVERITY as i32);
+        assert!(
+            client.is_connection_dead(),
+            "a class >= 20 error must mark the connection dead"
+        );
+    }
+
+    /// D3 boundary: an error just below the fatal threshold (e.g. a plain
+    /// severity-16 user error) leaves the connection reusable.
+    #[test]
+    fn nonfatal_error_token_leaves_connection_alive() {
+        let mut client = create_test_client();
+
+        client.record_error_token(&error_token_with_severity(FATAL_ERROR_SEVERITY - 1));
+
+        assert!(
+            !client.is_connection_dead(),
+            "a class < 20 error must not mark the connection dead"
         );
     }
 }

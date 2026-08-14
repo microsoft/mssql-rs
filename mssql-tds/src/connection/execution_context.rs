@@ -180,12 +180,12 @@ impl ExecutionContext {
             EnvChangeTokenSubType::ResetConnection => {
                 // Server acknowledgement that the connection was reset to login
                 // defaults (in response to a RESETCONNECTION / RESETCONNECTIONSKIPTRAN
-                // request). The server does not emit individual Database/Language
-                // ENVCHANGE tokens for the revert, so restore the cached session
-                // state to the login defaults here to keep the pool-facing getters
-                // accurate.
+                // request). The full client-side transition — restoring the
+                // negotiated database/language/collation and clearing
+                // session-bound caches — is applied by
+                // `TdsClient::on_reset_connection_ack`, which runs before this
+                // token is captured, so nothing is done here beyond logging.
                 info!("Connection reset acknowledged by server");
-                negotiated_settings.restore_login_defaults();
                 Ok(())
             }
             EnvChangeTokenSubType::UserInstanceName => {
