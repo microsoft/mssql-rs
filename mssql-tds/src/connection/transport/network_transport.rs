@@ -5,6 +5,7 @@ use crate::connection::client_context::{IPAddressPreference, TransportContext};
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
 use crate::connection::transport::parallel_connect::{ParallelConnectConfig, parallel_connect};
+use crate::connection::transport::request_timeout::await_within_request_timeout;
 use crate::connection::transport::ssl_handler::SslHandler;
 use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
 use crate::core::{
@@ -1374,7 +1375,7 @@ impl NetworkTransport {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
@@ -1399,31 +1400,27 @@ impl NetworkTransport {
         // these two points: an early return would drop the cached bitmap and
         // silently cost an allocation on every subsequent row.
         let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
-        let cancellable = CancelHandle::run_until_cancelled(
-            cancel_handle,
-            receive_row_into_internal(
-                self,
-                &*PARSER_REGISTRY,
-                context,
-                plan,
-                writer,
-                &mut nbc_bitmap_scratch,
-            ),
+        let result = await_within_request_timeout!(
+            remaining_request_timeout,
+            CancelHandle::run_until_cancelled(
+                cancel_handle,
+                receive_row_into_internal(
+                    self,
+                    &*PARSER_REGISTRY,
+                    context,
+                    plan,
+                    writer,
+                    &mut nbc_bitmap_scratch,
+                ),
+            )
         );
-        let result = match remaining_request_timeout.as_ref() {
-            Some(t) => match timeout(*t, cancellable).await {
-                Ok(r) => r,
-                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-            },
-            None => cancellable.await,
-        };
         self.nbc_bitmap_scratch = nbc_bitmap_scratch;
 
         match &result {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
@@ -1440,24 +1437,25 @@ impl NetworkTransport {
         // Same take/restore as `receive_row_into`: unconditional restore, no `?`
         // between the two points.
         let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
-        let cancellable = CancelHandle::run_until_cancelled(
-            cancel_handle,
-            receive_row_header_internal(self, &*PARSER_REGISTRY, context, &mut nbc_bitmap_scratch),
+        let result = await_within_request_timeout!(
+            remaining_request_timeout,
+            CancelHandle::run_until_cancelled(
+                cancel_handle,
+                receive_row_header_internal(
+                    self,
+                    &*PARSER_REGISTRY,
+                    context,
+                    &mut nbc_bitmap_scratch,
+                ),
+            )
         );
-        let result = match remaining_request_timeout.as_ref() {
-            Some(t) => match timeout(*t, cancellable).await {
-                Ok(r) => r,
-                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-            },
-            None => cancellable.await,
-        };
         self.nbc_bitmap_scratch = nbc_bitmap_scratch;
 
         match &result {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
@@ -1476,23 +1474,19 @@ impl NetworkTransport {
     where
         W: RowWriter + Send + ?Sized,
     {
-        let cancellable = CancelHandle::run_until_cancelled(
-            cancel_handle,
-            resume_row_into_internal(self, pause_state, plan, writer),
+        let result = await_within_request_timeout!(
+            remaining_request_timeout,
+            CancelHandle::run_until_cancelled(
+                cancel_handle,
+                resume_row_into_internal(self, pause_state, plan, writer),
+            )
         );
-        let result = match remaining_request_timeout.as_ref() {
-            Some(t) => match timeout(*t, cancellable).await {
-                Ok(r) => r,
-                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-            },
-            None => cancellable.await,
-        };
 
         match &result {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
@@ -1507,23 +1501,19 @@ impl NetworkTransport {
         cancel_handle: Option<&CancelHandle>,
         out: &mut [u8],
     ) -> TdsResult<usize> {
-        let cancellable = CancelHandle::run_until_cancelled(
-            cancel_handle,
-            read_active_plp_bytes_internal(self, plp_state, out),
+        let result = await_within_request_timeout!(
+            remaining_request_timeout,
+            CancelHandle::run_until_cancelled(
+                cancel_handle,
+                read_active_plp_bytes_internal(self, plp_state, out),
+            )
         );
-        let result = match remaining_request_timeout.as_ref() {
-            Some(t) => match timeout(*t, cancellable).await {
-                Ok(r) => r,
-                Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-            },
-            None => cancellable.await,
-        };
 
         match &result {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },

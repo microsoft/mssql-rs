@@ -3596,7 +3596,8 @@ impl TdsClient {
     /// Concrete writers stay concrete through the production transport and
     /// decode chain. Calling the object-safe [`ResultSet::next_row_into`] method
     /// remains supported for callers that intentionally hold a trait object.
-    #[instrument(skip(self, writer), level = "info")]
+    // `#[instrument]` adds enough state to exceed the 4096 B budget once the
+    // lazy timeout future is inlined. Successful rows still emit `Row Received`.
     pub async fn next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
     where
         W: RowWriter + Send + ?Sized,
