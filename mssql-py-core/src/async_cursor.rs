@@ -48,14 +48,22 @@ pub struct PyAsyncCursor {
     /// serializes wire access across `.await` points.
     #[allow(dead_code)] // Consumed by upcoming async execute/fetch/close APIs.
     tds_client: Arc<Mutex<TdsClient>>,
+    /// Snapshot of the parent connection's default query timeout at
+    /// `cursor()` time (`0` = no timeout). Applied by the future `execute`
+    /// path unless overridden per-call.
+    #[allow(dead_code)] // Consumed by upcoming async execute API.
+    default_query_timeout: u32,
 }
 
 impl PyAsyncCursor {
     /// Construct a new cursor bound to the given TDS client.
     ///
     /// Called only from `PyAsyncConnection::cursor`.
-    pub(crate) fn new(tds_client: Arc<Mutex<TdsClient>>) -> Self {
-        Self { tds_client }
+    pub(crate) fn new(tds_client: Arc<Mutex<TdsClient>>, default_query_timeout: u32) -> Self {
+        Self {
+            tds_client,
+            default_query_timeout,
+        }
     }
 }
 

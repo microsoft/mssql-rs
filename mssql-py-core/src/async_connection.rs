@@ -54,6 +54,10 @@ fn emit_preview_warning(py: Python<'_>) -> PyResult<()> {
 pub struct PyAsyncConnection {
     /// `Option` so `close()` can `take()`; `Arc<Mutex<>>` for cursor sharing.
     tds_client: Option<Arc<Mutex<TdsClient>>>,
+    /// Default query timeout (seconds) applied to cursors created from this
+    /// connection. `0` = no timeout, per pyodbc/ODBC `SQL_ATTR_QUERY_TIMEOUT`.
+    /// Pure Python-side state — the setter performs no I/O.
+    default_query_timeout: u32,
 }
 
 #[pymethods]
@@ -116,10 +120,30 @@ impl PyAsyncConnection {
                     py,
                     PyAsyncConnection {
                         tds_client: Some(Arc::new(Mutex::new(client))),
+                        default_query_timeout: 0,
                     },
                 )
             })
         })
+    }
+
+    /// Default query timeout (seconds) inherited by cursors created from this
+    /// connection. `0` means no timeout.
+    #[getter]
+    fn timeout(&self) -> u32 {
+        self.default_query_timeout
+    }
+
+    /// Set the default query timeout (seconds) for future cursors. Existing
+    /// cursors and in-flight queries are unaffected. Negative values are
+    /// rejected by PyO3's `u32` extractor (`OverflowError`).
+    #[setter]
+    fn set_timeout(&mut self, value: u32) {
+        tracing::info!(
+            "PyAsyncConnection::set_timeout: default query timeout set to {}s",
+            value
+        );
+        self.default_query_timeout = value;
     }
 
     /// Close the connection. Idempotent. Shutdown errors are logged and swallowed.
@@ -202,6 +226,6 @@ impl PyAsyncConnection {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Connection is closed"))?
             .clone();
-        Ok(PyAsyncCursor::new(client))
+        Ok(PyAsyncCursor::new(client, self.default_query_timeout))
     }
 }

@@ -168,3 +168,58 @@ def test_rollback_after_close_raises_connection_closed(client_context):
                 await conn.rollback()
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# timeout getter/setter (default query timeout for cursors; 0 = no timeout)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+def test_timeout_default_is_zero(client_context):
+    """Fresh connection reports timeout=0 (pyodbc/ODBC convention: no timeout)."""
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            try:
+                assert conn.timeout == 0
+            finally:
+                await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_timeout_setter_roundtrip(client_context):
+    """Setter accepts non-negative int; getter reflects last value written."""
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            try:
+                conn.timeout = 30
+                assert conn.timeout == 30
+                conn.timeout = 0
+                assert conn.timeout == 0
+            finally:
+                await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_timeout_setter_rejects_negative(client_context):
+    """Negative values overflow the u32 extractor and raise OverflowError."""
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            try:
+                with pytest.raises(OverflowError):
+                    conn.timeout = -1
+                # Original value preserved.
+                assert conn.timeout == 0
+            finally:
+                await conn.close()
+
+    asyncio.run(run())
