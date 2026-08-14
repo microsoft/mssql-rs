@@ -731,7 +731,13 @@ async fn decode_pass_wrapped(
 }
 
 /// Prices the per-row cancellation/timeout wrappers that the rest of this
-/// harness bypasses. All modes share one runtime so the comparison is paired.
+/// harness bypasses.
+///
+/// **This design cannot separate a mode's cost from machine drift.** It runs
+/// every pass of one mode before moving to the next, so any drift across the
+/// sequence lands entirely on mode order. Sharing one runtime does not make the
+/// comparison paired. Use [`run_paired_wrapper_ab`] for any figure that is
+/// quoted; this remains only as the survey that suggests which pair to test.
 fn run_wrapper_ladder(name: &str, specs: Vec<ColSpec>, nbc: bool) {
     let col_count = specs.len();
     let data = Arc::new(if nbc {
@@ -787,6 +793,85 @@ fn run_wrapper_ladder(name: &str, specs: Vec<ColSpec>, nbc: bool) {
             median.as_secs_f64() * 1000.0,
         );
     }
+}
+
+/// Paired A/B for a single wrapper pair, with ABBA ordering.
+///
+/// The sample is the **difference within a pair**, so drift shared by both arms
+/// cancels whether it is monotonic or not. [`run_wrapper_ladder`] cannot do
+/// this: an impossible ordering there is evidence that drift *exists*, but is
+/// not a bound on its magnitude, and monotonic drift would produce no impossible
+/// ordering at all while still inflating whichever mode runs last.
+fn run_paired_wrapper_ab(
+    name: &str,
+    specs: Vec<ColSpec>,
+    nbc: bool,
+    a: WrapMode,
+    b: WrapMode,
+    pairs: usize,
+) {
+    let col_count = specs.len();
+    let data = Arc::new(if nbc {
+        build_nbcrow_stream(&specs)
+    } else {
+        build_row_stream(&specs)
+    });
+    let context = context_for(&specs);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let handle = CancelHandle::new();
+
+    for _ in 0..WARMUP_PASSES {
+        rt.block_on(decode_pass_wrapped(Arc::clone(&data), &context, a, &handle));
+        rt.block_on(decode_pass_wrapped(Arc::clone(&data), &context, b, &handle));
+    }
+
+    let mut diffs: Vec<i128> = Vec::with_capacity(pairs);
+    let mut a_samples: Vec<Duration> = Vec::with_capacity(pairs);
+    let mut b_samples: Vec<Duration> = Vec::with_capacity(pairs);
+
+    for i in 0..pairs {
+        // ABBA: alternate which arm leads so within-pair ordering bias cancels
+        // across pairs as well.
+        let (ta, tb) = if i % 2 == 0 {
+            let ta = rt.block_on(decode_pass_wrapped(Arc::clone(&data), &context, a, &handle));
+            let tb = rt.block_on(decode_pass_wrapped(Arc::clone(&data), &context, b, &handle));
+            (ta, tb)
+        } else {
+            let tb = rt.block_on(decode_pass_wrapped(Arc::clone(&data), &context, b, &handle));
+            let ta = rt.block_on(decode_pass_wrapped(Arc::clone(&data), &context, a, &handle));
+            (ta, tb)
+        };
+        diffs.push(tb.as_nanos() as i128 - ta.as_nanos() as i128);
+        a_samples.push(ta);
+        b_samples.push(tb);
+    }
+
+    diffs.sort_unstable();
+    a_samples.sort_unstable();
+    b_samples.sort_unstable();
+
+    let median_diff = diffs[pairs / 2];
+    let b_slower = diffs.iter().filter(|d| **d > 0).count();
+    let a_med = a_samples[pairs / 2];
+    let b_med = b_samples[pairs / 2];
+    let ns_per_row = median_diff as f64 / ROWS as f64;
+    let pct_of_a = median_diff as f64 / a_med.as_nanos() as f64 * 100.0;
+
+    println!(
+        "PAIRED\t{name}\tcols={col_count}\trows={ROWS}\tpairs={pairs}\t\
+         a={}\ta_med_ms={:.3}\tb={}\tb_med_ms={:.3}\t\
+         median_diff_ms={:.3}\tns_per_row={ns_per_row:.1}\t\
+         pct_of_a={pct_of_a:.2}\tb_slower={b_slower}/{pairs}",
+        a.label(),
+        a_med.as_secs_f64() * 1000.0,
+        b.label(),
+        b_med.as_secs_f64() * 1000.0,
+        median_diff as f64 / 1e6,
+    );
 }
 
 fn run_case(name: &str, specs: Vec<ColSpec>, nbc: bool) {
@@ -884,6 +969,14 @@ fn bench_row_decode() {
     run_contiguous_case("contig_poc_row_39int_9varchar", poc_columns(), false);
     run_contiguous_case("contig_wide_strings_8x512", wide_string_columns(), false);
     run_wrapper_ladder("wrap_poc_row_39int_9varchar", poc_columns(), false);
+    run_paired_wrapper_ab(
+        "paired_eager_timeout",
+        poc_columns(),
+        false,
+        WrapMode::CancelSome,
+        WrapMode::CancelSomeTimeout,
+        41,
+    );
     println!("BENCH_END");
 }
 
