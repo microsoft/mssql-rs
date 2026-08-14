@@ -34,6 +34,7 @@ use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvid
 
 use crate::async_cursor::PyAsyncCursor;
 use crate::connection::PyCoreConnection;
+use crate::python_logger_adapter::scoped_tracing_bridge;
 
 /// Emit a `FutureWarning` the first time any async API is exercised in this
 /// process. Silenceable by callers via `warnings.filterwarnings(...)`.
@@ -90,39 +91,68 @@ impl PyAsyncConnection {
     /// Establish a TDS connection asynchronously.
     ///
     /// ```python
-    /// conn = await PyAsyncConnection.connect(client_context_dict)
+    /// conn = await PyAsyncConnection.connect(client_context_dict, python_logger=None)
     /// ```
     ///
     /// Dictionary parsing runs synchronously on the calling thread (it needs
     /// the GIL). The network handshake is submitted to the shared Tokio
     /// runtime and driven concurrently with the caller's asyncio loop.
+    ///
+    /// # `python_logger`
+    ///
+    /// Optional Python logger. The bridge is installed via
+    /// [`scoped_tracing_bridge`], which returns a `!Send` thread-local
+    /// `DefaultGuard` covering the caller's thread only. Logs emitted during
+    /// the synchronous prelude (dict extraction, encryption options, auth
+    /// method resolution, datasource selection) reach the logger. Logs
+    /// emitted inside the awaitable's async work (`create_client`,
+    /// everything mssql-tds emits during pre-login / TLS / Login7, and the
+    /// completion trace) run on Tokio worker threads and are NOT bridged
+    /// here — those still route through the process-wide subscriber set up
+    /// by `tracing_init::init_tracing()`. Full async-phase bridging is
+    /// future work.
     #[classmethod]
+    #[pyo3(signature = (client_context_dict, python_logger=None))]
     fn connect<'py>(
         cls: &Bound<'py, PyType>,
         client_context_dict: &Bound<'_, PyDict>,
+        python_logger: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = cls.py();
+
+        // `DefaultGuard` is `!Send`, so its coverage ends when this method returns.
+        let _guard = python_logger
+            .map(|logger| scoped_tracing_bridge(Arc::new(logger.clone().unbind()), file!()));
 
         // Preview API: emit a one-shot FutureWarning so callers see the
         // instability signal at runtime.
         emit_preview_warning(py)?;
+
+        tracing::info!("PyAsyncConnection::connect: initiating async connection");
 
         tracing::info!("PyAsyncConnection::connect: extracting client context");
         let context = PyCoreConnection::dict_to_client_context(client_context_dict)?;
         let datasource = context.data_source.clone();
 
         tracing::info!(
-            "PyAsyncConnection::connect: encryption mode={:?}, trust_server_certificate={}, host_name_in_cert={:?}",
+            "PyAsyncConnection::connect: encryption mode={:?}, trust_server_certificate={}, host_name_in_cert={:?}, server_certificate={:?}",
             context.encryption_options.mode,
             context.encryption_options.trust_server_certificate,
             context.encryption_options.host_name_in_cert,
+            context.encryption_options.server_certificate,
+        );
+
+        tracing::info!(
+            "PyAsyncConnection::connect: authentication method={:?}",
+            context.tds_authentication_method,
+        );
+
+        tracing::info!(
+            "PyAsyncConnection::connect: attempting connection to datasource: {}",
+            datasource
         );
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            tracing::info!(
-                "PyAsyncConnection::connect: opening TDS connection to {}",
-                datasource
-            );
             let provider = TdsConnectionProvider {};
             let client = provider
                 .create_client(context, &datasource, None)
