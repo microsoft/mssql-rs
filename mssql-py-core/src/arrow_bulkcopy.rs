@@ -12,14 +12,13 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
-    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::array::{BinaryArray, BinaryViewArray};
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use async_trait::async_trait;
 use mssql_tds::connection::bulk_copy::{BulkLoadRow, ResolvedColumnMapping};
@@ -422,13 +421,16 @@ impl ColumnPlan {
                 check_finite(v, dest)?;
                 Ok(ColumnValues::Float(v))
             }
-            ColumnPlanKind::Utf8Nvarchar
-            | ColumnPlanKind::Utf8VarChar
-            | ColumnPlanKind::LargeUtf8Nvarchar
-            | ColumnPlanKind::LargeUtf8VarChar
-            | ColumnPlanKind::Utf8ViewNvarchar
-            | ColumnPlanKind::Utf8ViewVarChar => {
-                let s = read_utf8(arr, row_idx)?.to_owned();
+            ColumnPlanKind::Utf8Nvarchar | ColumnPlanKind::Utf8VarChar => {
+                let s = downcast::<StringArray>(arr)?.value(row_idx).to_owned();
+                Ok(ColumnValues::String(SqlString::from_utf8_string(s)))
+            }
+            ColumnPlanKind::LargeUtf8Nvarchar | ColumnPlanKind::LargeUtf8VarChar => {
+                let s = downcast::<LargeStringArray>(arr)?.value(row_idx).to_owned();
+                Ok(ColumnValues::String(SqlString::from_utf8_string(s)))
+            }
+            ColumnPlanKind::Utf8ViewNvarchar | ColumnPlanKind::Utf8ViewVarChar => {
+                let s = downcast::<StringViewArray>(arr)?.value(row_idx).to_owned();
                 Ok(ColumnValues::String(SqlString::from_utf8_string(s)))
             }
             ColumnPlanKind::Binary => {
@@ -678,7 +680,10 @@ fn read_utf8(arr: &dyn Array, row_idx: usize) -> TdsResult<&str> {
     } else if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
         Ok(a.value(row_idx))
     } else {
-        Err(downcast_err::<StringArray>(arr))
+        Err(Error::UsageError(format!(
+            "Arrow array downcast failed: expected a UTF-8 string array (utf8/large_utf8/utf8_view), got {:?}",
+            arr.data_type()
+        )))
     }
 }
 
@@ -1213,9 +1218,13 @@ mod tests {
         for (sql_type, text) in [(SqlDbType::Xml, "<r/>"), (SqlDbType::Json, "{\"a\":1}")] {
             let array: ArrayRef = Arc::new(StringViewArray::from(vec![Some(text)]));
             let dest = meta("document", sql_type, true);
-            one_col_plan(DataType::Utf8View, &dest)
+            match one_col_plan(DataType::Utf8View, &dest)
                 .extract_value(array.as_ref(), 0, &dest)
-                .unwrap();
+                .unwrap()
+            {
+                ColumnValues::Xml(_) | ColumnValues::Json(_) => {}
+                other => panic!("expected Xml/Json, got {other:?}"),
+            }
         }
     }
 

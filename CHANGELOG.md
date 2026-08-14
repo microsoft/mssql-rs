@@ -27,6 +27,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   close) so it surfaces with a `SQL_SUCCESS_WITH_INFO` hint instead of being
   posted under `SQL_NO_DATA`, which many applications never inspect.
 
+- `mssql-py-core`: Arrow bulk copy now accepts `Utf8View` and `BinaryView`
+  columns, allowing Polars DataFrames to load without first converting the
+  DataFrame to a PyArrow table.
+
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
@@ -61,10 +65,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   federated-auth flows.
 
 ### Fixed
-
-- `mssql-py-core`: Arrow bulk copy now accepts `Utf8View` and `BinaryView`
-  columns, allowing Polars DataFrames to load without first converting the
-  DataFrame to a PyArrow table.
 
 - `mssql-tds`: reading a fixed-width value that straddles a TDS packet boundary
   could return bytes from the wrong place or panic. The readers checked for
