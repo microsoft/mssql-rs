@@ -5039,6 +5039,7 @@ mod tests {
 
         let mut client = create_test_client();
         let mut sink = DiscardRowWriter;
+        let mut plp_out = [0u8; 64];
 
         // Constructing an async fn's future runs none of its body, so these are
         // free to build and drop unpolled. Each borrow ends with its statement.
@@ -5046,12 +5047,15 @@ mod tests {
         let read_row_column = std::mem::size_of_val(&client.read_row_column(0));
         let drain_rows = std::mem::size_of_val(&client.drain_rows());
         let get_next_row_into = std::mem::size_of_val(&client.get_next_row_into(&mut sink));
+        let read_active_plp_chunk =
+            std::mem::size_of_val(&client.read_active_plp_chunk(&mut plp_out));
 
         for (name, size) in [
             ("next_row_cursor", next_row_cursor),
             ("read_row_column", read_row_column),
             ("drain_rows", drain_rows),
             ("get_next_row_into", get_next_row_into),
+            ("read_active_plp_chunk", read_active_plp_chunk),
         ] {
             assert!(
                 size <= MAX,
