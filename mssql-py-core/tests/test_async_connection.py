@@ -328,3 +328,35 @@ def test_async_context_manager_propagates_exception_and_still_closes(client_cont
             assert conn_ref.closed is True
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# __repr__ — introspection
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+def test_repr_shows_connected_state(client_context):
+    """repr(conn) is 'PyAsyncConnection(connected)' on a live connection."""
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            try:
+                assert repr(conn) == "PyAsyncConnection(connected)"
+            finally:
+                await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_repr_shows_closed_state_after_close(client_context):
+    """repr(conn) flips to 'PyAsyncConnection(closed)' after close()."""
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            await conn.close()
+            assert repr(conn) == "PyAsyncConnection(closed)"
+
+    asyncio.run(run())

@@ -41,6 +41,16 @@ fn emit_preview_warning(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
+/// Map a TDS error to a Python exception with per-operation context.
+///
+/// TODO(User Story 47181): map TdsError to a DB-API-compliant exception,
+/// preserving SQLSTATE + server error number.
+/// <https://sqlclientdrivers.visualstudio.com/mssql-python/_workitems/edit/47181>
+fn map_tds_error(op: &str, user_msg: &str, e: impl std::fmt::Display) -> PyErr {
+    tracing::error!("PyAsyncConnection::{op}: failed: {e}");
+    PyRuntimeError::new_err(format!("{user_msg}: {e}"))
+}
+
 /// Asynchronous Python connection backed by the Core TDS client.
 ///
 /// Preview API — unstable.
@@ -108,11 +118,7 @@ impl PyAsyncConnection {
             let client = provider
                 .create_client(context, &datasource, None)
                 .await
-                .map_err(|e| {
-                    tracing::error!("PyAsyncConnection::connect: failed: {}", e);
-                    // TODO(User Story 47181): map TdsError to a DB-API-compliant exception, preserving SQLSTATE + server error number.
-                    PyRuntimeError::new_err(format!("Failed to connect to SQL Server: {e}"))
-                })?;
+                .map_err(|e| map_tds_error("connect", "Failed to connect to SQL Server", e))?;
 
             tracing::info!("PyAsyncConnection::connect: connection established");
             Python::attach(|py| {
@@ -156,6 +162,14 @@ impl PyAsyncConnection {
     /// Inverse of `.closed`, provided for sync-path parity with `PyCoreConnection`.
     fn is_connected(&self) -> bool {
         self.tds_client.is_some()
+    }
+
+    fn __repr__(&self) -> &'static str {
+        if self.tds_client.is_none() {
+            "PyAsyncConnection(closed)"
+        } else {
+            "PyAsyncConnection(connected)"
+        }
     }
 
     /// Close the connection. Idempotent. Shutdown errors are logged and swallowed.
@@ -216,11 +230,10 @@ impl PyAsyncConnection {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tracing::info!("PyAsyncConnection::commit: sending TM_COMMIT");
             let mut guard = client.lock().await;
-            guard.commit_transaction(None, None).await.map_err(|e| {
-                tracing::error!("PyAsyncConnection::commit: failed: {}", e);
-                // TODO(User Story 47181): map TdsError to a DB-API-compliant exception, preserving SQLSTATE + server error number.
-                PyRuntimeError::new_err(format!("Commit failed: {e}"))
-            })?;
+            guard
+                .commit_transaction(None, None)
+                .await
+                .map_err(|e| map_tds_error("commit", "Commit failed", e))?;
             tracing::info!("PyAsyncConnection::commit: transaction committed");
             Python::attach(|py| Ok(py.None()))
         })
@@ -238,11 +251,10 @@ impl PyAsyncConnection {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tracing::info!("PyAsyncConnection::rollback: sending TM_ROLLBACK");
             let mut guard = client.lock().await;
-            guard.rollback_transaction(None, None).await.map_err(|e| {
-                tracing::error!("PyAsyncConnection::rollback: failed: {}", e);
-                // TODO(User Story 47181): map TdsError to a DB-API-compliant exception, preserving SQLSTATE + server error number.
-                PyRuntimeError::new_err(format!("Rollback failed: {e}"))
-            })?;
+            guard
+                .rollback_transaction(None, None)
+                .await
+                .map_err(|e| map_tds_error("rollback", "Rollback failed", e))?;
             tracing::info!("PyAsyncConnection::rollback: transaction rolled back");
             Python::attach(|py| Ok(py.None()))
         })
