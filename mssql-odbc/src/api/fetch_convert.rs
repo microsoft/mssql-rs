@@ -211,17 +211,31 @@ fn numeric_source(value: &ColumnValues) -> Result<NumericSource, ConvError> {
         ColumnValues::Bit(b) => Ok(NumericSource::Int(i128::from(*b))),
         ColumnValues::Real(x) => Ok(NumericSource::Float(f64::from(*x))),
         ColumnValues::Float(x) => Ok(NumericSource::Float(*x)),
-        // `DecimalParts` stores a base-2^32 little-endian magnitude. 38 digits
-        // fit in 4 words; a wider magnitude, or one past `i128::MAX`, is a
-        // numeric value this converter cannot represent, not an illegal cast.
+        // `DecimalParts` stores a base-2^32 little-endian magnitude. A legal
+        // 38-digit value fits in 4 words and in `i128`, so it keeps its exact
+        // scaled form. A non-conforming server can still send 4 words above
+        // `i128::MAX`; that has no exact form here but is a real number, so it
+        // degrades to the `f64` reading rather than an error. Only a magnitude
+        // wider than 4 words has no reading at all.
+        //
+        // Matches msodbcsql: `sqlccnvt.cpp` `ConvertToFixed` returns `CVT_PREC`
+        // (`IDS_22_003`) for an out-of-range numeric and reserves `CVT_ILLEGAL`
+        // (`IDS_07_006`) for a source with no numeric reading, and
+        // `ConvertToFloat` accumulates all four words into a double. Four words
+        // is also all `SQL_NUMERIC_STRUCT` can hold, so a wider magnitude has no
+        // msodbcsql counterpart to diverge from.
         ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
-            let m = d
-                .magnitude()
-                .and_then(|mag| i128::try_from(mag).ok())
-                .ok_or(ConvError::OutOfRange)?;
-            Ok(NumericSource::Scaled {
-                mantissa: if d.is_positive { m } else { -m },
-                scale: u32::from(d.scale),
+            let mag = d.magnitude().ok_or(ConvError::OutOfRange)?;
+            let scale = u32::from(d.scale);
+            Ok(match i128::try_from(mag) {
+                Ok(m) => NumericSource::Scaled {
+                    mantissa: if d.is_positive { m } else { -m },
+                    scale,
+                },
+                Err(_) => {
+                    let v = mag as f64 / 10f64.powi(scale as i32);
+                    NumericSource::Float(if d.is_positive { v } else { -v })
+                }
             })
         }
         ColumnValues::Money(m) => Ok(NumericSource::Scaled {
@@ -350,8 +364,11 @@ pub(crate) fn is_float_c_target(target_type: SqlSmallInt) -> bool {
 
 /// Converts a numeric column value to a floating-point C target.
 ///
-/// Returns [`ConvError::NotHandledHere`] when the source is not numeric or the
-/// target is not a floating-point C type.
+/// Returns [`ConvError::NotHandledHere`] only when the target is not a
+/// floating-point C type. A column with no numeric interpretation is
+/// [`ConvError::Restricted`], a numeric value too wide to represent is
+/// [`ConvError::OutOfRange`], and text that is not a valid number is
+/// [`ConvError::InvalidCharacterValue`].
 ///
 /// # Safety
 /// Same pointer contract as [`convert_integer_c`].
@@ -1471,8 +1488,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, ConvError::OutOfRange);
 
-        // A magnitude filling all four limbs exceeds `i128::MAX`: also a
-        // representability failure, not an illegal cast.
+        // A magnitude filling all four limbs exceeds `i128::MAX`. It has no
+        // exact scaled form, so it reads as `f64` and lands far outside a
+        // 32-bit target: out of range, not an illegal cast.
         let err = unsafe {
             convert_integer_c(
                 &decimal(true, 0, vec![-1, -1, -1, -1]),
@@ -1483,6 +1501,25 @@ mod tests {
         }
         .unwrap_err();
         assert_eq!(err, ConvError::OutOfRange);
+
+        // The largest legal `decimal(38, 38)` magnitude (10^38 - 1) still fits
+        // in `i128`, so it must keep its exact form rather than trip either the
+        // range check above or the `f64` fallback.
+        let ok = unsafe {
+            convert_integer_c(
+                &decimal(
+                    true,
+                    38,
+                    vec![-1, 160_047_679, 1_518_781_562, 1_262_177_448],
+                ),
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, 0);
 
         // Zero-padded limbs past the fourth carry no magnitude, so this path
         // agrees with the string rendering instead of refusing the value.
@@ -1794,6 +1831,36 @@ mod tests {
         assert_eq!(err, ConvError::Restricted);
     }
 
+    /// The reachable wide-decimal case: the decoder validates limb count but
+    /// never the magnitude against `precision`, so 16 bytes of `0xFF` arrives
+    /// intact from a non-conforming server. It exceeds `i128::MAX`, so there is
+    /// no exact scaled form — but msodbcsql's `ConvertToFloat` accumulates all
+    /// four words into a double and succeeds, so a float target must too.
+    #[test]
+    fn wide_decimal_into_float_target_matches_msodbcsql() {
+        use mssql_tds::datatypes::decoder::DecimalParts;
+
+        let mut out: f64 = 0.0;
+        let mut ind: SqlLen = 0;
+        let ret = conv_f(
+            &ColumnValues::Decimal(DecimalParts {
+                is_positive: true,
+                scale: 0,
+                precision: 38,
+                int_parts: vec![-1, -1, -1, -1],
+            }),
+            SQL_C_DOUBLE,
+            (&mut out as *mut f64).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ret, ConvOk::Exact);
+        assert_eq!(out, u128::MAX as f64);
+    }
+
+    /// A magnitude wider than four words has no `SQL_NUMERIC_STRUCT` (or wire)
+    /// counterpart, so there is no msodbcsql behavior to match. It is still a
+    /// numeric value we cannot represent, which is `22003`, not `07006`.
     #[test]
     fn oversized_decimal_into_float_target_is_out_of_range() {
         use mssql_tds::datatypes::decoder::DecimalParts;
