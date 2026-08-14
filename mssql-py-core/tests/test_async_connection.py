@@ -272,3 +272,59 @@ def test_closed_is_idempotent_across_repeated_close(client_context):
             assert conn.closed is True
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# __aenter__ / __aexit__ — async context manager
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+def test_async_context_manager_closes_on_exit(client_context):
+    """`async with` awaits close() on exit; conn.closed becomes True."""
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn_ref = None
+            async with await mssql_py_core.PyAsyncConnection.connect(client_context) as conn:
+                conn_ref = conn
+                assert conn.closed is False
+            assert conn_ref.closed is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_async_context_manager_yields_same_object(client_context):
+    """__aenter__ resolves to `self` — the same PyAsyncConnection instance."""
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            outer = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            try:
+                async with outer as inner:
+                    assert inner is outer
+            finally:
+                if not outer.closed:
+                    await outer.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_async_context_manager_propagates_exception_and_still_closes(client_context):
+    """Exception inside the block propagates AND the connection is closed."""
+    class Boom(RuntimeError):
+        pass
+
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn_ref = None
+            with pytest.raises(Boom, match="kaboom"):
+                async with await mssql_py_core.PyAsyncConnection.connect(client_context) as conn:
+                    conn_ref = conn
+                    raise Boom("kaboom")
+            assert conn_ref is not None
+            assert conn_ref.closed is True
+
+    asyncio.run(run())

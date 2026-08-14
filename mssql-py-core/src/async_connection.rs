@@ -186,6 +186,24 @@ impl PyAsyncConnection {
         })
     }
 
+    /// Async context manager entry. Resolves to `self` with no I/O.
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
+    }
+
+    /// Async context manager exit. Delegates to `close()`; exception info is
+    /// ignored and never suppressed (`close()` resolves to `None`, which is
+    /// falsy per Python's `__aexit__` contract).
+    fn __aexit__<'py>(
+        &mut self,
+        py: Python<'py>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_val: &Bound<'_, PyAny>,
+        _exc_tb: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.close(py)
+    }
+
     /// Commit the current transaction. If none is open, surfaces SQL Server 3902.
     fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         // Clone the Arc so the future is `'static + Send`.
