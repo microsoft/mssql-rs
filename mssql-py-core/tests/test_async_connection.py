@@ -1,7 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Tests for PyAsyncConnection: connect, close, commit, rollback, cursor."""
+"""Tests for PyAsyncConnection: connect, close, commit, rollback, cursor,
+timeout, lifecycle state (closed/is_connected), async context manager, repr."""
 
 import asyncio
 import subprocess
@@ -75,8 +76,8 @@ def test_connect_returns_pyasyncconnection(client_context):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
-def test_close_is_awaitable(client_context):
-    """close() returns an awaitable that resolves to None."""
+def test_close_resolves_to_none(client_context):
+    """Regression guard: close() awaitable must resolve to None, not empty tuple."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
@@ -87,35 +88,20 @@ def test_close_is_awaitable(client_context):
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_close_is_idempotent(client_context):
-    """Awaiting close() twice does not raise."""
-    async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
-            await conn.close()
-            await conn.close()  # no-op path (tds_client is None)
-
-    asyncio.run(run())
-
-
 # ---------------------------------------------------------------------------
 # Commit / Rollback
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
-def test_commit_returns_awaitable_that_resolves(client_context):
-    """commit() with no active transaction always raises SQL Server 3902."""
+def test_commit_without_active_transaction_raises_3902(client_context):
+    """PyAsyncConnection has no begin_transaction; TM_COMMIT deterministically
+    yields SQL Server error 3902. Matching the server error number keeps this
+    valid after the DB-API error taxonomy lands."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             try:
-                # PyAsyncConnection has no begin_transaction, so a fresh
-                # connection has no open TDS transaction; TM_COMMIT deterministically
-                # yields SQL Server 3902. Matching the server error number keeps
-                # this valid after the DB-API error taxonomy lands.
                 with pytest.raises(Exception, match="3902"):
                     await conn.commit()
             finally:
@@ -125,15 +111,13 @@ def test_commit_returns_awaitable_that_resolves(client_context):
 
 
 @pytest.mark.integration
-def test_rollback_returns_awaitable_that_resolves(client_context):
-    """rollback() with no active transaction always raises SQL Server 3903."""
+def test_rollback_without_active_transaction_raises_3903(client_context):
+    """Same rationale as commit: TM_ROLLBACK deterministically yields 3903."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             try:
-                # Same rationale as commit: fresh connection has no open TDS
-                # transaction; TM_ROLLBACK deterministically yields 3903.
                 with pytest.raises(Exception, match="3903"):
                     await conn.rollback()
             finally:
@@ -175,28 +159,14 @@ def test_rollback_after_close_raises_connection_closed(client_context):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
-def test_timeout_default_is_zero(client_context):
-    """Fresh connection reports timeout=0 (pyodbc/ODBC convention: no timeout)."""
+def test_timeout_default_and_setter_roundtrip(client_context):
+    """Default is 0 (pyodbc/ODBC convention: no timeout); setter roundtrips."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             try:
                 assert conn.timeout == 0
-            finally:
-                await conn.close()
-
-    asyncio.run(run())
-
-
-@pytest.mark.integration
-def test_timeout_setter_roundtrip(client_context):
-    """Setter accepts non-negative int; getter reflects last value written."""
-    async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
-            try:
                 conn.timeout = 30
                 assert conn.timeout == 30
                 conn.timeout = 0
@@ -217,7 +187,6 @@ def test_timeout_setter_rejects_negative(client_context):
             try:
                 with pytest.raises(OverflowError):
                     conn.timeout = -1
-                # Original value preserved.
                 assert conn.timeout == 0
             finally:
                 await conn.close()
@@ -226,48 +195,27 @@ def test_timeout_setter_rejects_negative(client_context):
 
 
 # ---------------------------------------------------------------------------
-# closed (property) and is_connected() — lifecycle state
+# Lifecycle state: closed (property) + is_connected() + idempotency
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
-def test_closed_property_toggles_across_close(client_context):
-    """closed is False on a live connection and True after close()."""
+def test_lifecycle_state_reflects_closed_and_is_connected(client_context):
+    """closed and is_connected() are inverses at both live and closed states;
+    close() is idempotent — a second close keeps closed=True."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            # Live state.
             assert conn.closed is False
-            await conn.close()
-            assert conn.closed is True
-
-    asyncio.run(run())
-
-
-@pytest.mark.integration
-def test_is_connected_is_inverse_of_closed(client_context):
-    """is_connected() mirrors sync PyCoreConnection; always the inverse of .closed."""
-    async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             assert conn.is_connected() is True
             assert conn.is_connected() is (not conn.closed)
-            await conn.close()
-            assert conn.is_connected() is False
-            assert conn.is_connected() is (not conn.closed)
-
-    asyncio.run(run())
-
-
-@pytest.mark.integration
-def test_closed_is_idempotent_across_repeated_close(client_context):
-    """Second close() is a no-op; closed stays True."""
-    async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            # First close transitions to closed.
             await conn.close()
             assert conn.closed is True
+            assert conn.is_connected() is False
+            assert conn.is_connected() is (not conn.closed)
+            # Idempotent close keeps state.
             await conn.close()
             assert conn.closed is True
 
@@ -335,14 +283,33 @@ def test_async_context_manager_propagates_exception_and_still_closes(client_cont
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
-def test_repr_shows_connected_state(client_context):
-    """repr(conn) is 'PyAsyncConnection(connected)' on a live connection."""
+def test_repr_reflects_lifecycle(client_context):
+    """repr flips from 'PyAsyncConnection(connected)' to '(closed)' after close."""
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            assert repr(conn) == "PyAsyncConnection(connected)"
+            await conn.close()
+            assert repr(conn) == "PyAsyncConnection(closed)"
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# cursor() — sync method returning PyAsyncCursor
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+def test_cursor_returns_pyasynccursor(client_context):
+    """cursor() on a live connection returns a PyAsyncCursor instance."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             try:
-                assert repr(conn) == "PyAsyncConnection(connected)"
+                cur = conn.cursor()
+                assert isinstance(cur, mssql_py_core.PyAsyncCursor)
             finally:
                 await conn.close()
 
@@ -350,13 +317,34 @@ def test_repr_shows_connected_state(client_context):
 
 
 @pytest.mark.integration
-def test_repr_shows_closed_state_after_close(client_context):
-    """repr(conn) flips to 'PyAsyncConnection(closed)' after close()."""
+def test_cursor_after_close_raises_connection_closed(client_context):
+    """cursor() on a closed connection raises RuntimeError synchronously."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             await conn.close()
-            assert repr(conn) == "PyAsyncConnection(closed)"
+            with pytest.raises(RuntimeError, match="Connection is closed"):
+                conn.cursor()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_cursor_can_be_created_multiple_times(client_context):
+    """Per module invariant, a connection may issue multiple cursors; both
+    share the same TdsClient and serialize on the same async mutex."""
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            try:
+                cur1 = conn.cursor()
+                cur2 = conn.cursor()
+                assert cur1 is not cur2
+                assert isinstance(cur1, mssql_py_core.PyAsyncCursor)
+                assert isinstance(cur2, mssql_py_core.PyAsyncCursor)
+            finally:
+                await conn.close()
 
     asyncio.run(run())
