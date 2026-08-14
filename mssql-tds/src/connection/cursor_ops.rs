@@ -79,7 +79,7 @@ pub trait CursorClient {
 
     /// Fetches rows from an open cursor (`sp_cursorfetch`, RPC ID 7).
     ///
-    /// After calling this, use `get_next_row_into()` to read rows and then
+    /// After calling this, use `next_row_into()` to read rows and then
     /// `close_query()` before the next command. If no rows are available
     /// (end of cursor), `has_open_batch` will be false and no row reading
     /// is needed.

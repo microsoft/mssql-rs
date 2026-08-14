@@ -1,9 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::future::Future;
 use std::time::Duration;
 
 use async_trait::async_trait;
+#[cfg(any(test, feature = "test-util", fuzzing))]
+use futures::future::Either;
 
 use crate::connection::transport::network_transport::NetworkTransport;
 use crate::connection::transport::tds_transport::TdsTransport;
@@ -23,13 +26,13 @@ use crate::token::tokens::Tokens;
 /// without putting production row decoding behind a trait object.
 #[derive(Debug)]
 pub(crate) enum AnyTransport {
-    Network(Box<NetworkTransport>),
+    Network(NetworkTransport),
     #[cfg(any(test, feature = "test-util", fuzzing))]
     Dynamic(Box<dyn TdsTransport>),
 }
 
 impl AnyTransport {
-    pub(crate) fn network(transport: Box<NetworkTransport>) -> Self {
+    pub(crate) fn network(transport: NetworkTransport) -> Self {
         Self::Network(transport)
     }
 
@@ -41,8 +44,6 @@ impl AnyTransport {
         Self::Dynamic(Box::new(transport))
     }
 
-    // Box only the concrete arm at this boundary. The future stays monomorphized
-    // over the writer, while callers retain the 4096-byte row-future budget.
     pub(crate) async fn receive_token(
         &mut self,
         context: &ParserContext,
@@ -51,7 +52,8 @@ impl AnyTransport {
     ) -> TdsResult<Tokens> {
         match self {
             Self::Network(transport) => {
-                Box::pin(transport.receive_token(context, remaining_request_timeout, cancel_handle))
+                transport
+                    .receive_token(context, remaining_request_timeout, cancel_handle)
                     .await
             }
             #[cfg(any(test, feature = "test-util", fuzzing))]
@@ -63,40 +65,62 @@ impl AnyTransport {
         }
     }
 
-    pub(crate) async fn receive_row_into<W>(
-        &mut self,
-        context: &ParserContext,
+    #[cfg(not(any(test, feature = "test-util", fuzzing)))]
+    pub(crate) fn receive_row_into<'a, W>(
+        &'a mut self,
+        context: &'a ParserContext,
         remaining_request_timeout: Option<Duration>,
-        cancel_handle: Option<&CancelHandle>,
+        cancel_handle: Option<&'a CancelHandle>,
         plan: ColumnPolicy,
-        writer: &mut W,
-    ) -> TdsResult<RowReadResult>
+        writer: &'a mut W,
+    ) -> impl Future<Output = TdsResult<RowReadResult>> + Send + 'a
     where
-        W: RowWriter + Send + ?Sized,
+        W: RowWriter + Send + ?Sized + 'a,
     {
         match self {
-            Self::Network(transport) => {
-                Box::pin(transport.receive_row_into(
-                    context,
-                    remaining_request_timeout,
-                    cancel_handle,
-                    plan,
-                    writer,
-                ))
-                .await
-            }
-            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Network(transport) => transport.receive_row_into(
+                context,
+                remaining_request_timeout,
+                cancel_handle,
+                plan,
+                writer,
+            ),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-util", fuzzing))]
+    pub(crate) fn receive_row_into<'a, W>(
+        &'a mut self,
+        context: &'a ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&'a CancelHandle>,
+        plan: ColumnPolicy,
+        writer: &'a mut W,
+    ) -> impl Future<Output = TdsResult<RowReadResult>> + Send + 'a
+    where
+        W: RowWriter + Send + ?Sized + 'a,
+    {
+        match self {
+            Self::Network(transport) => Either::Left(transport.receive_row_into(
+                context,
+                remaining_request_timeout,
+                cancel_handle,
+                plan,
+                writer,
+            )),
             Self::Dynamic(transport) => {
                 let mut writer = DynamicRowWriter(writer);
-                transport
-                    .receive_row_into(
-                        context,
-                        remaining_request_timeout,
-                        cancel_handle,
-                        plan,
-                        &mut writer,
-                    )
-                    .await
+                Either::Right(async move {
+                    transport
+                        .receive_row_into(
+                            context,
+                            remaining_request_timeout,
+                            cancel_handle,
+                            plan,
+                            &mut writer,
+                        )
+                        .await
+                })
             }
         }
     }
@@ -109,12 +133,9 @@ impl AnyTransport {
     ) -> TdsResult<RowHeader> {
         match self {
             Self::Network(transport) => {
-                Box::pin(transport.receive_row_header(
-                    context,
-                    remaining_request_timeout,
-                    cancel_handle,
-                ))
-                .await
+                transport
+                    .receive_row_header(context, remaining_request_timeout, cancel_handle)
+                    .await
             }
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => {
@@ -138,14 +159,15 @@ impl AnyTransport {
     {
         match self {
             Self::Network(transport) => {
-                Box::pin(transport.resume_row_into(
-                    pause_state,
-                    remaining_request_timeout,
-                    cancel_handle,
-                    plan,
-                    writer,
-                ))
-                .await
+                transport
+                    .resume_row_into(
+                        pause_state,
+                        remaining_request_timeout,
+                        cancel_handle,
+                        plan,
+                        writer,
+                    )
+                    .await
             }
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => {
@@ -172,13 +194,9 @@ impl AnyTransport {
     ) -> TdsResult<usize> {
         match self {
             Self::Network(transport) => {
-                Box::pin(transport.read_active_plp_bytes(
-                    plp_state,
-                    remaining_request_timeout,
-                    cancel_handle,
-                    out,
-                ))
-                .await
+                transport
+                    .read_active_plp_bytes(plp_state, remaining_request_timeout, cancel_handle, out)
+                    .await
             }
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => {
@@ -279,7 +297,7 @@ impl TdsTransport for AnyTransport {
 
     fn reset_reader(&mut self) {
         match self {
-            Self::Network(transport) => TdsTransport::reset_reader(&mut **transport),
+            Self::Network(transport) => TdsTransport::reset_reader(transport),
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => transport.reset_reader(),
         }
@@ -287,7 +305,7 @@ impl TdsTransport for AnyTransport {
 
     fn packet_size(&self) -> u32 {
         match self {
-            Self::Network(transport) => TdsTransport::packet_size(&**transport),
+            Self::Network(transport) => TdsTransport::packet_size(transport),
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => transport.packet_size(),
         }
@@ -425,7 +443,7 @@ mod tests {
         let transports = [
             (
                 "network",
-                AnyTransport::network(Box::new(create_network_transport_with_data(&packet))),
+                AnyTransport::network(create_network_transport_with_data(&packet)),
             ),
             (
                 "dynamic",

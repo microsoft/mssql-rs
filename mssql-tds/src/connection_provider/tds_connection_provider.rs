@@ -568,7 +568,7 @@ impl TdsConnectionProvider {
         };
         let session_result = factory
             .session_handler(transport_context)
-            .execute(&mut *transport)
+            .execute(&mut transport)
             .await;
 
         match session_result {

@@ -2217,7 +2217,8 @@ impl TdsClient {
         self.return_values.push(return_value);
     }
 
-    #[instrument(skip(self), level = "info")]
+    // `#[instrument]` adds 88 B to this state machine and pushes the row-fetch
+    // future over its 4096 B budget. The per-row loop already emits an info event.
     async fn drain_rows(&mut self) -> TdsResult<()> {
         if self.maybe_has_unread_rows() {
             // A pull cursor (`next_row_cursor`) may have left the current row
@@ -2226,10 +2227,11 @@ impl TdsClient {
             // still expects to see — but here we are intentionally discarding
             // the rest of the result set, so realign the stream past that parked
             // row first. `drain_active_row` is a no-op when nothing is parked.
-            self.drain_active_row().await?;
+            self.drain_active_row_if_needed().await?;
             // Drain the current result set.
-            while let Some(row) = self.get_next_row().await? {
-                info!("Consuming row while draining result set {:?}", row.len());
+            let mut writer = DiscardRowWriter;
+            while self.next_row_into(&mut writer).await? {
+                info!("Consuming row while draining result set");
             }
         }
         Ok(())
@@ -2738,7 +2740,7 @@ impl TdsClient {
             .map(|m| m.columns.len())
             .unwrap_or(0);
         let mut writer = DefaultRowWriter::new(col_count);
-        if self.get_next_row_into(&mut writer).await? {
+        if self.next_row_into(&mut writer).await? {
             Ok(Some(writer.take_row()))
         } else {
             Ok(None)
@@ -3527,28 +3529,6 @@ impl TdsClient {
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
     ///
-    /// Concrete writers stay concrete through the production transport and
-    /// decode chain. Calling the object-safe [`ResultSet::next_row_into`] method
-    /// remains supported for callers that intentionally hold a trait object.
-    #[instrument(skip(self, writer), level = "info")]
-    pub async fn next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
-    where
-        W: RowWriter + Send + ?Sized,
-    {
-        let result = if !self.current_result_set_has_been_read_till_end {
-            self.get_next_row_into(writer).await
-        } else {
-            Ok(false)
-        };
-        if result.is_err() {
-            self.abort_pending_prepare_capture();
-        }
-        result
-    }
-
-    /// Decodes the next row directly into a [`RowWriter`], returning `true` if
-    /// a row was written or `false` when the result set is exhausted.
-    ///
     /// This is the **push** entry point used by bulk consumers (Arrow / N-API /
     /// `next_row`). It always decodes a full row ([`ColumnPolicy::DecodeAll`]) and
     /// never pauses. If the pull cursor
@@ -3558,22 +3538,24 @@ impl TdsClient {
     ///
     /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
     /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
+    /// Concrete writers stay concrete through the production transport and
+    /// decode chain. Calling the object-safe [`ResultSet::next_row_into`] method
+    /// remains supported for callers that intentionally hold a trait object.
     #[instrument(skip(self, writer), level = "info")]
-    pub(crate) async fn get_next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
+    pub async fn next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
     where
         W: RowWriter + Send + ?Sized,
     {
+        // End-of-set reads are idempotent even after advancing clears metadata.
+        if self.current_result_set_has_been_read_till_end {
+            return Ok(false);
+        }
+
         if self.current_metadata.is_none() {
+            self.abort_pending_prepare_capture();
             return Err(UsageError(
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
             ));
-        }
-
-        // Idempotent at end-of-set: after the terminating DONE, calling again
-        // must report exhaustion instead of blocking on a wire read for a
-        // packet the server will never send (until the caller advances).
-        if self.current_result_set_has_been_read_till_end {
-            return Ok(false);
         }
 
         // The push path decodes whole rows and never pauses, so it must not run
@@ -3586,21 +3568,31 @@ impl TdsClient {
             self.active_row_read_state,
             ActiveRowReadState::RowPaused(_) | ActiveRowReadState::PlpPaused(_)
         ) {
+            self.abort_pending_prepare_capture();
             return Err(UsageError(
-                "get_next_row_into called while a pull-cursor row is still active; \
+                "next_row_into called while a pull-cursor row is still active; \
                  advance the cursor with next_row_cursor before using the push row API"
                     .to_string(),
             ));
         }
 
-        self.drain_active_row().await?;
+        if let Err(error) = self.drain_active_row_if_needed().await {
+            self.abort_pending_prepare_capture();
+            return Err(error);
+        }
 
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
-        let decryptor = self.resolve_cell_decryptor(&metadata).await?;
+        let decryptor = match self.resolve_cell_decryptor(&metadata).await {
+            Ok(decryptor) => decryptor,
+            Err(error) => {
+                self.abort_pending_prepare_capture();
+                return Err(error);
+            }
+        };
         let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
         loop {
             let start = Instant::now();
-            let result = self
+            let result = match self
                 .transport
                 .receive_row_into(
                     &parser_context,
@@ -3609,7 +3601,14 @@ impl TdsClient {
                     ColumnPolicy::DecodeAll,
                     writer,
                 )
-                .await?;
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    self.abort_pending_prepare_capture();
+                    return Err(error);
+                }
+            };
             self.update_remaining_timeout(start);
 
             match result {
@@ -3620,13 +3619,21 @@ impl TdsClient {
                 }
                 RowReadResult::RowPaused(_) | RowReadResult::PlpPaused(_) => {
                     // DecodeAll never pauses; a pause here is a protocol/logic error.
+                    self.abort_pending_prepare_capture();
                     return Err(crate::error::Error::ProtocolError(
                         "Unexpected pause while decoding a full row (ColumnPolicy::DecodeAll)"
                             .to_string(),
                     ));
                 }
                 RowReadResult::Token(token) => {
-                    if let Some(has_row) = self.handle_row_read_token(token).await? {
+                    let handled = match self.handle_row_read_token(token).await {
+                        Ok(handled) => handled,
+                        Err(error) => {
+                            self.abort_pending_prepare_capture();
+                            return Err(error);
+                        }
+                    };
+                    if let Some(has_row) = handled {
                         return Ok(has_row);
                     }
                 }
@@ -3658,7 +3665,7 @@ impl TdsClient {
             return Ok(false);
         }
 
-        self.drain_active_row().await?;
+        self.drain_active_row_if_needed().await?;
 
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
         let decryptor = self.resolve_cell_decryptor(&metadata).await?;
@@ -3817,6 +3824,16 @@ impl TdsClient {
     /// Drains any partially read current row so the stream is aligned on the
     /// next ROW/NBCROW (or terminating) token. Skips remaining column bytes
     /// without materializing them.
+    async fn drain_active_row_if_needed(&mut self) -> TdsResult<()> {
+        if matches!(self.active_row_read_state, ActiveRowReadState::Idle) {
+            return Ok(());
+        }
+
+        // Mixing the pull and push APIs is rare. Keep that large continuation
+        // out of every ordinary row-fetch future, paying only on this recovery path.
+        Box::pin(self.drain_active_row()).await
+    }
+
     async fn drain_active_row(&mut self) -> TdsResult<()> {
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
             ActiveRowReadState::Idle => Ok(()),
@@ -3841,7 +3858,7 @@ impl TdsClient {
     /// The scratch buffer is heap-allocated rather than a stack array: it is live
     /// across the await below, so a stack array would be stored inline in this
     /// future and propagate into every caller that awaits it — `read_row_column`
-    /// directly, plus `drain_rows`, `get_next_row_into` and `next_row_cursor` via
+    /// directly, plus `drain_rows`, `next_row_into` and `next_row_cursor` via
     /// `drain_active_row`. Abandoning a partially read PLP column is rare and
     /// already network-bound, so one allocation there is negligible; an 8 KiB
     /// per-row state machine is not.
@@ -5005,8 +5022,9 @@ mod tests {
         let next_row_cursor = std::mem::size_of_val(&client.next_row_cursor());
         let read_row_column = std::mem::size_of_val(&client.read_row_column(0));
         let drain_rows = std::mem::size_of_val(&client.drain_rows());
-        let get_next_row_into = std::mem::size_of_val(&client.get_next_row_into(&mut sink));
         let next_row_into = std::mem::size_of_val(&client.next_row_into(&mut sink));
+        let next_row_into_dyn =
+            std::mem::size_of_val(&client.next_row_into(&mut sink as &mut (dyn RowWriter + Send)));
         let read_active_plp_chunk =
             std::mem::size_of_val(&client.read_active_plp_chunk(&mut plp_out));
 
@@ -5014,8 +5032,8 @@ mod tests {
             ("next_row_cursor", next_row_cursor),
             ("read_row_column", read_row_column),
             ("drain_rows", drain_rows),
-            ("get_next_row_into", get_next_row_into),
             ("next_row_into", next_row_into),
+            ("next_row_into (dyn writer)", next_row_into_dyn),
             ("read_active_plp_chunk", read_active_plp_chunk),
         ] {
             assert!(
@@ -5419,7 +5437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_next_row_into_rejects_active_pull_cursor_row() {
+    async fn next_row_into_rejects_active_pull_cursor_row() {
         // A row parked by the pull cursor (`next_row_cursor`) must not be
         // silently drained by the push path. Mixing the two would discard the
         // parked row and hand back the *next* one, so the earlier
@@ -5436,7 +5454,7 @@ mod tests {
 
         let mut sink = DiscardRowWriter;
         let err = client
-            .get_next_row_into(&mut sink)
+            .next_row_into(&mut sink)
             .await
             .expect_err("push path must reject a parked pull-cursor row");
         assert!(
@@ -5466,6 +5484,16 @@ mod tests {
         // Only one leading '@' is stripped.
         assert_eq!(TdsClient::normalize_param_name("@@version"), "@VERSION");
         assert_eq!(TdsClient::normalize_param_name(""), "");
+    }
+
+    #[tokio::test]
+    async fn next_row_into_is_idempotent_after_end_without_metadata() {
+        let mut client = create_test_client();
+        client.current_metadata = None;
+        client.current_result_set_has_been_read_till_end = true;
+        let mut sink = DiscardRowWriter;
+
+        assert!(!client.next_row_into(&mut sink).await.unwrap());
     }
 
     #[tokio::test]
@@ -6611,6 +6639,17 @@ mod tests {
         client.pending_capture = Some(sid(1));
 
         assert!(client.next_row().await.is_err());
+        assert!(client.pending_capture.is_none());
+    }
+
+    #[tokio::test]
+    async fn next_row_into_error_aborts_pending_prepare_capture() {
+        let mut client = create_test_client();
+        client.current_result_set_has_been_read_till_end = false;
+        client.pending_capture = Some(sid(1));
+        let mut writer = DiscardRowWriter;
+
+        assert!(client.next_row_into(&mut writer).await.is_err());
         assert!(client.pending_capture.is_none());
     }
 
