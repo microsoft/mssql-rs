@@ -2794,6 +2794,8 @@ impl TdsClient {
 
     /// This functions returns to the next row in the result set.
     /// If there are no more rows, it returns None.
+    // Not instrumented: the span pushes ResultSet::next_row over the 4 KiB
+    // hot-path future budget. next_row_into still carries the row span.
     pub(crate) async fn get_next_row(&mut self) -> TdsResult<Option<Vec<ColumnValues>>> {
         let col_count = self
             .current_metadata
@@ -5126,10 +5128,24 @@ mod tests {
             );
         }
 
+        let native_next_row = std::mem::size_of_val(&client.get_next_row());
         let result_set_next_row = std::mem::size_of_val(&ResultSet::next_row(&mut client));
+        let native_next_row_into =
+            std::mem::size_of_val(&client.next_row_into(&mut sink as &mut (dyn RowWriter + Send)));
         let result_set_next_row_into =
             std::mem::size_of_val(&ResultSet::next_row_into(&mut client, &mut sink));
 
+        assert_eq!(
+            result_set_next_row, native_next_row,
+            "ResultSet::next_row must forward the native future without boxing"
+        );
+        assert_eq!(
+            result_set_next_row_into, native_next_row_into,
+            "ResultSet::next_row_into must forward the native future without boxing"
+        );
+
+        // `close` is not checked against the per-row budget because it runs only
+        // once per result set; its larger future does not affect row iteration.
         for (name, size) in [
             ("ResultSet::next_row", result_set_next_row),
             ("ResultSet::next_row_into", result_set_next_row_into),
