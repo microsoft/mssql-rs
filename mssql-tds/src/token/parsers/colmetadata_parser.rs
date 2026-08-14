@@ -103,12 +103,15 @@ use crate::{
 /// Column-flag bit indicating the column is protected by Always Encrypted.
 const FLAG_ENCRYPTED: u16 = 0x0800;
 
-/// Maximum number of columns a single result set may declare. SQL Server caps a
-/// SELECT at 4096 columns, so a COLMETADATA token claiming more is malformed.
-/// Rejecting an implausible count before reserving per-column storage bounds the
-/// eager `Vec<ColumnMetadata>` allocation and prevents a tiny token (a 3-byte
-/// `81 FF FE` reserves ~42 MB) from driving a memory-amplification DoS.
-const MAX_COLUMN_COUNT: u16 = 4096;
+/// Upper bound on the column vector's initial capacity. `col_count` is attacker-
+/// controlled, so reserving the full count up front lets a tiny token drive a
+/// large eager allocation (`col_count * size_of::<ColumnMetadata>()`) — a memory-
+/// amplification DoS the fuzzer surfaced as a timeout (build 164079: a 3-byte
+/// token reserving ~42 MB). Reserving conservatively and letting the vector grow
+/// as columns are actually parsed keeps work proportional to the bytes on the
+/// wire, so any legitimate column count (SQL Server wide tables allow up to
+/// 30,000 columns) is handled without an artificial cap.
+const COLUMN_PREALLOC_CAP: usize = 256;
 
 /// Cipher algorithm id signalling a custom (named) algorithm whose name follows
 /// inline in the crypto metadata.
@@ -139,16 +142,6 @@ where
             return Ok(Tokens::from(ColMetadataToken::default()));
         }
 
-        // Reject an implausible column count before reserving per-column storage.
-        // Without this bound a 3-byte token can drive a ~42 MB eager allocation
-        // (col_count * size_of::<ColumnMetadata>()), a memory-amplification DoS
-        // that the fuzzer surfaces as a timeout.
-        if col_count > MAX_COLUMN_COUNT {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "COLMETADATA column count {col_count} exceeds maximum supported {MAX_COLUMN_COUNT}"
-            )));
-        }
-
         // When column encryption is negotiated, the CEK table is sent right
         // after the column count (and before any column definitions). It is
         // empty when none of the columns are encrypted.
@@ -164,8 +157,11 @@ where
         // for an (empty) table and desynchronize the token stream.
         let has_cek_table = is_column_encryption_supported;
 
-        // Pre-allocate vector for column metadata
-        let mut column_metadata: Vec<ColumnMetadata> = Vec::with_capacity(col_count as usize);
+        // Reserve conservatively; a large but valid `col_count` grows the vector
+        // as columns are parsed, while a malformed count cannot force a huge
+        // eager allocation. See `COLUMN_PREALLOC_CAP`.
+        let mut column_metadata: Vec<ColumnMetadata> =
+            Vec::with_capacity((col_count as usize).min(COLUMN_PREALLOC_CAP));
 
         // Parse each column definition
         for _ in 0..col_count {
@@ -649,22 +645,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rejects_implausible_column_count() {
+    async fn test_large_column_count_without_data_fails_fast() {
         // Regression for the fuzz_token_stream timeout (build 164079): a
         // COLMETADATA token declaring col_count 0xB884 (47236) forced a ~30 MB
-        // eager `Vec<ColumnMetadata>` reservation from 2 bytes. Counts above
-        // MAX_COLUMN_COUNT must be rejected before any storage is reserved.
-        let data = vec![0x84, 0xB8]; // col_count = 0xB884 = 47236 (> MAX_COLUMN_COUNT)
+        // eager `Vec<ColumnMetadata>` reservation from 2 bytes. The initial
+        // capacity is now bounded by COLUMN_PREALLOC_CAP regardless of col_count,
+        // so an implausible count with no backing bytes fails fast on the first
+        // per-column read (EOF) instead of amplifying into a huge allocation.
+        let data = vec![0x84, 0xB8]; // col_count = 0xB884 = 47236
         let mut reader = MockReader::new(data);
         let parser = ColMetadataTokenParser;
         let context = ParserContext::default();
 
-        match parser.parse(&mut reader, &context).await {
-            Err(crate::error::Error::ProtocolError(msg)) => {
-                assert!(msg.contains("column count"), "unexpected message: {msg}");
-            }
-            other => panic!("expected ProtocolError, got {other:?}"),
-        }
+        assert!(parser.parse(&mut reader, &context).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_large_valid_column_count_without_data_fails_fast() {
+        // A plausible wide-table col_count with no column bytes must also fail on
+        // the first per-column read rather than pre-allocating for the full count:
+        // capacity is bounded by COLUMN_PREALLOC_CAP, so this cannot amplify a
+        // 2-byte token into a huge Vec.
+        let data = vec![0x88, 0x13]; // col_count = 0x1388 = 5000
+        let mut reader = MockReader::new(data);
+        let parser = ColMetadataTokenParser;
+        let context = ParserContext::default();
+
+        assert!(parser.parse(&mut reader, &context).await.is_err());
     }
 
     #[tokio::test]
