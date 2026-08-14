@@ -3,23 +3,9 @@
 
 //! Asynchronous connection API for the Core TDS backend.
 //!
-//! # ⚠️ Preview API — unstable
+//! Preview API — unstable. First use emits a `FutureWarning`.
 //!
-//! The types and methods in this module are **not** part of the stable
-//! `mssql-py-core` surface. Signatures, error behavior, and internal
-//! semantics may change without notice in any release. First use in a
-//! Python process emits a [`FutureWarning`] via `warnings.warn`.
-//!
-//! Sibling of `connection.rs` (the synchronous surface). Every type defined
-//! here submits its I/O to the shared process-wide Tokio runtime via
-//! [`crate::async_runtime`] and returns Python awaitables through
-//! `pyo3_async_runtimes::tokio::future_into_py`, so callers can `await` the
-//! results from `asyncio`.
-//!
-//! Invariant: one async connection maps to exactly one async cursor, one
-//! `TdsClient`, and one TDS wire session.
-//!
-//! [`FutureWarning`]: https://docs.python.org/3/library/exceptions.html#FutureWarning
+//! Invariant: one async connection ↔ one async cursor ↔ one `TdsClient`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,8 +22,7 @@ use crate::async_cursor::PyAsyncCursor;
 use crate::connection::PyCoreConnection;
 use crate::python_logger_adapter::scoped_tracing_bridge;
 
-/// Emit a `FutureWarning` the first time any async API is exercised in this
-/// process. Silenceable by callers via `warnings.filterwarnings(...)`.
+/// One-shot `FutureWarning` per process; silenceable via `warnings.filterwarnings`.
 static PREVIEW_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn emit_preview_warning(py: Python<'_>) -> PyResult<()> {
@@ -58,45 +43,23 @@ fn emit_preview_warning(py: Python<'_>) -> PyResult<()> {
 
 /// Asynchronous Python connection backed by the Core TDS client.
 ///
-/// # ⚠️ Preview API — unstable
-///
-/// Preview surface: API, method signatures, error behavior, and internal
-/// semantics may change without notice in minor releases. Do not depend on
-/// it from production code.
-///
-/// Instances are created via [`PyAsyncConnection::connect`], which returns a
-/// Python awaitable. The awaitable resolves on the caller's `asyncio` loop
-/// once the TCP + TLS + login handshake has completed on the shared Tokio
-/// runtime.
+/// Preview API — unstable.
 ///
 /// TODO(User Story 47180 [mssql-python] Cancel API and Cancellation Bridge):
 /// cancellation of a suspended `commit`, `rollback`, or `close` future can
-/// desync the TDS byte stream (bytes written, response not yet read), so a
-/// subsequent operation on the same connection may read a stale response
-/// and corrupt the wire. Callers must not cancel these awaitables against a
-/// connection they intend to keep using. Cancellation-safe semantics are
-/// tracked at
-/// <https://sqlclientdrivers.visualstudio.com/mssql-python/_workitems/edit/47180>.
+/// desync the TDS byte stream. Callers must not cancel these awaitables
+/// against a connection they intend to keep using.
+/// <https://sqlclientdrivers.visualstudio.com/mssql-python/_workitems/edit/47180>
 #[pyclass]
 pub struct PyAsyncConnection {
-    /// Wrapped in `Option` so `close()` can take ownership and drop the
-    /// client; wrapped in `Arc<tokio::sync::Mutex<...>>` so the (upcoming)
-    /// async cursor and connection-level lifecycle methods can share access
-    /// across `.await` points without corrupting the TDS byte stream.
+    /// `Option` so `close()` can `take()`; `Arc<Mutex<>>` for cursor sharing.
     tds_client: Option<Arc<Mutex<TdsClient>>>,
 }
 
 #[pymethods]
 impl PyAsyncConnection {
-    /// Establish a TDS connection asynchronously.
-    ///
-    /// ```python
-    /// conn = await PyAsyncConnection.connect(client_context_dict, python_logger=None)
-    /// ```
-    ///
-    /// Dictionary parsing runs synchronously on the calling thread (it needs
-    /// the GIL). The network handshake is submitted to the shared Tokio
-    /// runtime and driven concurrently with the caller's asyncio loop.
+    /// Establish a TDS connection. Dict parsing is synchronous; the network
+    /// handshake runs on the shared Tokio runtime.
     #[classmethod]
     #[pyo3(signature = (client_context_dict, python_logger=None))]
     fn connect<'py>(
@@ -110,8 +73,6 @@ impl PyAsyncConnection {
         let _guard = python_logger
             .map(|logger| scoped_tracing_bridge(Arc::new(logger.clone().unbind()), file!()));
 
-        // Preview API: emit a one-shot FutureWarning so callers see the
-        // instability signal at runtime.
         emit_preview_warning(py)?;
 
         tracing::info!("PyAsyncConnection::connect: initiating async connection");
@@ -161,26 +122,10 @@ impl PyAsyncConnection {
         })
     }
 
-    /// Close the TDS connection asynchronously.
-    ///
-    /// ```python
-    /// await conn.close()
-    /// ```
-    ///
-    /// Sends the TDS logout token and tears down the underlying transport.
-    /// The awaitable is submitted to the shared Tokio runtime so the calling
-    /// asyncio loop stays unblocked while the graceful shutdown runs.
-    ///
-    /// Idempotent: awaiting `close()` on an already-closed connection
-    /// resolves immediately with no I/O. If the graceful shutdown itself
-    /// errors, the error is logged at `warn` level and the connection is
-    /// still considered closed — the OS closes the socket on drop either
-    /// way, so we never leak the resource.
+    /// Close the connection. Idempotent. Shutdown errors are logged and swallowed.
     fn close<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         tracing::info!("PyAsyncConnection::close: initiating close");
-        // Detach the client from `self` synchronously (while `&mut self` is
-        // valid) so the future can own it for `'static + Send`. Subsequent
-        // method calls on this connection will see `tds_client == None`.
+        // `take()` before spawning: gives the future 'static ownership; marks conn closed.
         let client_opt = self.tds_client.take();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -194,9 +139,7 @@ impl PyAsyncConnection {
             );
             let mut guard = client.lock().await;
             if let Err(e) = guard.close_connection().await {
-                // Match sync-path semantics: log and swallow. The connection
-                // is treated as closed regardless — the transport will be
-                // dropped when the Arc's last reference goes away.
+                // Log and swallow; connection is closed regardless.
                 tracing::warn!(
                     "PyAsyncConnection::close: error during graceful shutdown: {}",
                     e
@@ -207,23 +150,9 @@ impl PyAsyncConnection {
         })
     }
 
-    /// Commit the current TDS transaction asynchronously.
-    ///
-    /// ```python
-    /// await conn.commit()
-    /// ```
-    ///
-    /// Sends a TM_COMMIT (Transaction Manager COMMIT) request over the wire
-    /// and awaits the server's DONE token. Raises `RuntimeError`
-    /// synchronously if the connection has already been closed.
-    ///
-    /// If no transaction is currently open on the server, the commit will
-    /// fail with the server's own error (SQL Server 3902 — "The COMMIT
-    /// TRANSACTION request has no corresponding BEGIN TRANSACTION").
+    /// Commit the current transaction. If none is open, surfaces SQL Server 3902.
     fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        // Clone the Arc synchronously so the future is `'static + Send`
-        // without borrowing `self`. Only a shared borrow is required —
-        // nothing on `self` is mutated here.
+        // Clone the Arc so the future is `'static + Send`.
         let client = self
             .tds_client
             .as_ref()
@@ -243,23 +172,9 @@ impl PyAsyncConnection {
         })
     }
 
-    /// Roll back the current TDS transaction asynchronously.
-    ///
-    /// ```python
-    /// await conn.rollback()
-    /// ```
-    ///
-    /// Sends a TM_ROLLBACK (Transaction Manager ROLLBACK) request over the
-    /// wire and awaits the server's DONE token. Raises `RuntimeError`
-    /// synchronously if the connection has already been closed.
-    ///
-    /// If no transaction is currently open on the server, the rollback will
-    /// fail with the server's own error (SQL Server 3903 — "The ROLLBACK
-    /// TRANSACTION request has no corresponding BEGIN TRANSACTION").
+    /// Roll back the current transaction. If none is open, surfaces SQL Server 3903.
     fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        // Clone the Arc synchronously so the future is `'static + Send`
-        // without borrowing `self`. Only a shared borrow is required —
-        // nothing on `self` is mutated here.
+        // Clone the Arc so the future is `'static + Send`.
         let client = self
             .tds_client
             .as_ref()
@@ -279,23 +194,8 @@ impl PyAsyncConnection {
         })
     }
 
-    /// Create an async cursor bound to this connection.
-    ///
-    /// ```python
-    /// cur = conn.cursor()
-    /// await cur.execute("SELECT 1")
-    /// ```
-    ///
-    /// This method does not perform I/O — it simply hands out a new
-    /// [`PyAsyncCursor`] that shares the connection's `TdsClient` via an
-    /// `Arc<tokio::sync::Mutex<_>>`. Following DB-API 2.0, `cursor()` is a
-    /// synchronous call; only the cursor's execute/fetch methods will be
-    /// awaitable.
-    ///
-    /// Raises `RuntimeError` if the connection has already been closed.
-    /// A second cursor may be created on the same connection, but both
-    /// cursors share one TDS wire session and serialize on the same async
-    /// mutex — matching the non-MARS TDS session model.
+    /// Sync per DB-API 2.0. A second cursor is allowed; both share the same
+    /// TDS session and serialize on the same async mutex.
     fn cursor(&self) -> PyResult<PyAsyncCursor> {
         let client = self
             .tds_client
