@@ -63,18 +63,47 @@ pub(in crate::connection) enum CommandTimeoutBudget {
     Exhausted,
 }
 
+/// A command timeout resolved after connection recovery, ready for request I/O.
+///
+/// Holds one `Option<NonZeroU32>` (niche-optimized to a bare `u32`) so the
+/// seconds and the deadline it derives can never disagree; `None` is no
+/// deadline (infinite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::connection) struct ResolvedCommandTimeout {
+    seconds: Option<NonZeroU32>,
+}
+
+impl ResolvedCommandTimeout {
+    /// The timeout in whole seconds, or `None` for no deadline.
+    pub(in crate::connection) fn seconds(self) -> Option<u32> {
+        self.seconds.map(NonZeroU32::get)
+    }
+
+    /// The timeout as a [`Duration`] deadline, or `None` for no deadline.
+    pub(in crate::connection) fn duration(self) -> Option<Duration> {
+        self.seconds
+            .map(|seconds| Duration::from_secs(u64::from(seconds.get())))
+    }
+}
+
 impl CommandTimeoutBudget {
-    pub(in crate::connection) fn into_timeout(self) -> TdsResult<(Option<u32>, Option<Duration>)> {
+    /// Resolves the post-recovery budget into the timeout used by request I/O.
+    ///
+    /// `None`/`Remaining` become no-deadline / the remaining positive seconds;
+    /// `Exhausted` is rejected here so a spent budget can never enter the
+    /// `0 == infinite` path.
+    ///
+    /// # Errors
+    /// Returns [`TimeoutError`](crate::error::Error::TimeoutError) when recovery
+    /// consumed the whole command-timeout budget.
+    pub(in crate::connection) fn into_timeout(self) -> TdsResult<ResolvedCommandTimeout> {
         match self {
-            Self::None => Ok((None, None)),
-            Self::Remaining(seconds) => {
-                let seconds = seconds.get();
-                Ok((Some(seconds), Some(Duration::from_secs(u64::from(seconds)))))
-            }
+            Self::None => Ok(ResolvedCommandTimeout { seconds: None }),
+            Self::Remaining(seconds) => Ok(ResolvedCommandTimeout {
+                seconds: Some(seconds),
+            }),
             Self::Exhausted => Err(crate::error::Error::TimeoutError(
-                crate::error::TimeoutErrorType::String(
-                    "command timeout exhausted by connection recovery".to_string(),
-                ),
+                crate::error::TimeoutErrorType::String("command timeout exhausted".to_string()),
             )),
         }
     }
@@ -260,6 +289,12 @@ pub struct TdsClient {
 
     // Active PLP stream state when row decoding paused at a PLP target column.
     active_row_read_state: ActiveRowReadState,
+
+    /// Test-only: when `Some`, [`check_and_reconnect`](Self::check_and_reconnect)
+    /// reports this as the elapsed recovery time and skips the transport, so
+    /// budget-exhaustion paths are exercised without live reconnect timing.
+    #[cfg(test)]
+    reconnect_elapsed_for_test: Option<Duration>,
 }
 
 impl TdsClient {
@@ -308,6 +343,8 @@ impl TdsClient {
             cancel_handle: None,
             empty_metadata: Vec::new(),
             active_row_read_state: ActiveRowReadState::Idle,
+            #[cfg(test)]
+            reconnect_elapsed_for_test: None,
         }
     }
 
@@ -620,6 +657,11 @@ impl TdsClient {
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Duration> {
+        #[cfg(test)]
+        if let Some(elapsed) = self.reconnect_elapsed_for_test.take() {
+            return Ok(elapsed);
+        }
+
         // Only attempt recovery when session recovery was negotiated and
         // the server supports retry (connect_retry_count > 0).
         if !self.recovery_context.session_recovery_negotiated {
@@ -790,7 +832,9 @@ impl TdsClient {
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout, cancel).await?;
         let budget = Self::deduct_timeout(timeout, reconnect_elapsed);
-        let (timeout, request_timeout) = budget.into_timeout()?;
+        let resolved = budget.into_timeout()?;
+        let timeout = resolved.seconds();
+        let request_timeout = resolved.duration();
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = request_timeout;
@@ -843,7 +887,9 @@ impl TdsClient {
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
-        let (timeout_sec, request_timeout) = budget.into_timeout()?;
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = request_timeout;
@@ -965,7 +1011,9 @@ impl TdsClient {
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
-        let (timeout_sec, request_timeout) = budget.into_timeout()?;
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = request_timeout;
@@ -1276,7 +1324,9 @@ impl TdsClient {
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
-        let (timeout_sec, request_timeout) = budget.into_timeout()?;
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = request_timeout;
@@ -1406,7 +1456,9 @@ impl TdsClient {
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
-        let (timeout_sec, request_timeout) = budget.into_timeout()?;
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
 
         // Store timeout and cancel handle for this operation
         self.remaining_request_timeout = request_timeout;
@@ -1586,7 +1638,9 @@ impl TdsClient {
 
         // Store timeout and cancel handle for this operation
         let budget = Self::deduct_timeout(timeout_sec, Duration::ZERO);
-        let (timeout_sec, request_timeout) = budget.into_timeout()?;
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
@@ -1677,7 +1731,7 @@ impl TdsClient {
         let mut opts = options.into();
         let reconnect_elapsed = self.check_and_reconnect(opts.timeout, opts.cancel).await?;
         let budget = Self::deduct_timeout(opts.timeout, reconnect_elapsed);
-        (opts.timeout, _) = budget.into_timeout()?;
+        opts.timeout = budget.into_timeout()?.seconds();
 
         // Reuse the statement's handle when the client still holds one; a
         // reconnect clears the map, so an id from a dead session re-prepares.
@@ -1756,7 +1810,7 @@ impl TdsClient {
         if !self.prepared_handles.contains_key(&statement_id) {
             return Ok(());
         }
-        (opts.timeout, _) = budget.into_timeout()?;
+        opts.timeout = budget.into_timeout()?.seconds();
         self.execute_sp_unprepare(statement_id, true, opts).await
     }
 
@@ -1841,7 +1895,9 @@ impl TdsClient {
 
         // Store timeout and cancel handle for this operation
         let budget = Self::deduct_timeout(timeout_sec, Duration::ZERO);
-        let (timeout_sec, request_timeout) = budget.into_timeout()?;
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
@@ -2024,7 +2080,9 @@ impl TdsClient {
 
         // Store timeout and cancel handle for this operation
         let budget = Self::deduct_timeout(timeout_sec, Duration::ZERO);
-        let (timeout_sec, request_timeout) = budget.into_timeout()?;
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
@@ -4536,7 +4594,9 @@ impl PreparedStatement {
 /// signatures — keeping the `execute*` surface forward-compatible.
 #[derive(Default, Clone)]
 pub struct ExecuteOptions<'a> {
-    /// Per-request timeout in seconds. `None` means no client-side timeout.
+    /// Per-request timeout in seconds. Both `None` and `Some(0)` mean no
+    /// client-side timeout (unlimited); a positive value bounds the command,
+    /// with connection-recovery time charged against it.
     pub timeout: Option<u32>,
     /// Optional [`CancelHandle`] for cooperative cancellation. A child token is
     /// derived so cancelling aborts the request without tearing down the
@@ -4555,7 +4615,11 @@ impl<'a> ExecuteOptions<'a> {
         Self::default()
     }
 
-    /// Sets a per-request timeout, in seconds.
+    /// Sets a per-request timeout, in seconds. `0` means unlimited (no
+    /// deadline), the same as the `None` default — including on the managed
+    /// [`execute_prepared`](TdsClient::execute_prepared) /
+    /// [`unprepare`](TdsClient::unprepare) paths, where `timeout_secs(0)` now
+    /// runs unbounded instead of returning a timeout error.
     pub fn timeout_secs(mut self, seconds: u32) -> Self {
         self.timeout = Some(seconds);
         self
@@ -5265,7 +5329,9 @@ mod tests {
     fn caller_zero_timeout_becomes_explicit_infinite_budget() {
         let budget = TdsClient::deduct_timeout(Some(0), Duration::ZERO);
         assert_eq!(budget, CommandTimeoutBudget::None);
-        assert_eq!(budget.into_timeout().unwrap(), (None, None));
+        let resolved = budget.into_timeout().unwrap();
+        assert_eq!(resolved.seconds(), None);
+        assert_eq!(resolved.duration(), None);
     }
 
     // ── PLP streaming lifecycle contract tests ──
@@ -5962,10 +6028,9 @@ mod tests {
             result,
             CommandTimeoutBudget::Remaining(NonZeroU32::new(18).unwrap())
         );
-        assert_eq!(
-            result.into_timeout().unwrap(),
-            (Some(18), Some(Duration::from_secs(18)))
-        );
+        let resolved = result.into_timeout().unwrap();
+        assert_eq!(resolved.seconds(), Some(18));
+        assert_eq!(resolved.duration(), Some(Duration::from_secs(18)));
     }
 
     #[test]
@@ -6013,6 +6078,64 @@ mod tests {
             result,
             CommandTimeoutBudget::Remaining(NonZeroU32::new(28).unwrap())
         );
+    }
+
+    /// A reconnect that consumes the whole command budget must fail the call
+    /// before any bytes reach the wire — not fall through with an unbounded
+    /// timeout. This exercises the real `execute` entry point, which the
+    /// helper-only `deduct_timeout` tests do not.
+    #[tokio::test]
+    async fn execute_exhausted_reconnect_budget_writes_no_request() {
+        let transport = TestTransport::new();
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+        client.reconnect_elapsed_for_test = Some(Duration::from_secs(1));
+
+        let error = client
+            .execute(
+                "SELECT 1".to_string(),
+                ExecuteOptions::new().timeout_secs(1),
+            )
+            .await
+            .expect_err("execute should fail before serialization");
+
+        assert!(matches!(
+            &error,
+            crate::error::Error::TimeoutError(crate::error::TimeoutErrorType::String(message))
+                if message == "command timeout exhausted"
+        ));
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    /// Same guarantee for the cursor RPC family: one representative call-site
+    /// covers the shared `into_timeout()?` gate across all cursor operations.
+    #[tokio::test]
+    async fn cursor_open_exhausted_reconnect_budget_writes_no_request() {
+        use crate::connection::cursor_ops::CursorClient;
+
+        let transport = TestTransport::new();
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+        client.reconnect_elapsed_for_test = Some(Duration::from_secs(1));
+
+        let error = client
+            .cursor_open(
+                "SELECT 1",
+                crate::cursor::CursorScrollOption::FORWARD_ONLY,
+                crate::cursor::CursorConcurrency::READONLY,
+                0,
+                Some(1),
+                None,
+            )
+            .await
+            .expect_err("cursor_open should fail before serialization");
+
+        assert!(matches!(
+            &error,
+            crate::error::Error::TimeoutError(crate::error::TimeoutErrorType::String(message))
+                if message == "command timeout exhausted"
+        ));
+        assert!(sent.lock().unwrap().is_empty());
     }
 
     // Public Recovery API ──────────────────────────────────────
