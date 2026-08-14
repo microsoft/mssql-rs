@@ -36,11 +36,6 @@ parameters:
   type: boolean
   default: true
 
-- name: enableRustBuild
-  displayName: Enable standalone Rust Debug/Release build steps
-  type: boolean
-  default: true
-
 - name: enableClippy
   displayName: Enable Rust Clippy lint step
   type: boolean
@@ -58,17 +53,6 @@ steps:
 
 - script: cargo fetch
   displayName: Fetch Crates
-
-- ${{ if eq(parameters.enableRustBuild, true) }}:
-  - script: |
-      cargo build --frozen 2>&1
-    displayName: Rust Debug Build
-    condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
-
-  - script: |
-      cargo build --frozen --release 2>&1
-    displayName: Rust Release Build
-    condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
 
 - ${{ if and(eq(parameters.enableClippy, true), eq(parameters.osType, 'Windows')) }}:
   - pwsh: ./scripts/bclippy.ps1
@@ -108,9 +92,18 @@ steps:
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
 - ${{ if eq(parameters.enableTests, true) }}:
-  - script: cargo install cargo-llvm-cov --version 0.6.16 --locked && cargo install cargo-nextest --version 0.9.99 --locked
-    displayName: Install llvm-cov and nextest 
-    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+  # The hosted macOS agent took up to ~10 minutes to compile these from source
+  # and would sometimes time out, so install the published prebuilt binaries
+  # there. Other platforms keep the source build.
+  - ${{ if eq(parameters.osType, 'MacOS') }}:
+    - script: ./.pipeline/scripts/install-coverage-tools-macos.sh
+      displayName: Install llvm-cov and nextest
+      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
+  - ${{ if ne(parameters.osType, 'MacOS') }}:
+    - script: cargo install cargo-llvm-cov --version 0.6.16 --locked && cargo install cargo-nextest --version 0.9.99 --locked
+      displayName: Install llvm-cov and nextest 
+      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
   # Generate test certificates for mock TDS server TLS tests
   - ${{ if eq(parameters.osType, 'Windows') }}:
@@ -124,14 +117,6 @@ steps:
   - script: cargo llvm-cov clean --workspace
     displayName: Clean up old coverage files
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
-
-  - ${{ if eq(parameters.osType, 'Linux') }}:
-    - script: |
-        echo "##vso[task.setvariable variable=ARCHIVE_NAME;isOutput=false]tdslib-nextest.tar.zst"   
-        cargo install cargo-nextest  --version 0.9.99 --locked
-        cd mssql-tds && cargo nextest archive --archive-file tdslib-nextest.tar.zst && cp tdslib-nextest.tar.zst $(Build.ArtifactStagingDirectory) && mv tdslib-nextest.tar.zst ../ 
-      displayName: Archive nextest results
-      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
 
   - script: |
         export CERT_HOST_NAME="sql1"
@@ -254,27 +239,6 @@ steps:
       targetPath: "$(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml"
       artifactName: "CoberturaCoverageOdbcE2E_Windows"
 
-- ${{ if eq(parameters.enableRustBuild, true) }}:
-  - task: CopyFiles@2
-    displayName: Copy Rust Debug Build
-    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'),  or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')))
-    inputs:
-      SourceFolder: '$(CARGO_TARGET_DIR)/debug'
-      Contents: |
-        *
-        !.cargo-lock
-      TargetFolder: '$(Build.ArtifactStagingDirectory)/debug'
-
-  - task: CopyFiles@2
-    displayName: Copy Rust Release Build
-    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), or( eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')))
-    inputs:
-      SourceFolder: '$(CARGO_TARGET_DIR)/release'
-      Contents: |
-        *
-        !.cargo-lock
-      TargetFolder: '$(Build.ArtifactStagingDirectory)/release'
-
 - ${{ if eq(parameters.enableJsBuild, true) }}:
   - bash: |
       export DB_USER=sa
@@ -325,10 +289,3 @@ steps:
       testResultsFormat: "JUnit"
       testResultsFiles: $(Build.SourcesDirectory)/mssql-js/junit.xml
       testRunTitle: $(System.PhaseName)-Js
-
-- task: PublishBuildArtifacts@1
-  displayName: Publish Build Drop
-  inputs:
-    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
-    ArtifactName: $(System.PhaseName)
-    publishLocation: Container

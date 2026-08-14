@@ -7,6 +7,9 @@ use std::sync::OnceLock;
 use mssql_tds::connection::client_context::DriverVersion;
 
 mod arrow_bulkcopy;
+mod async_connection;
+mod async_cursor;
+mod async_runtime;
 mod bulkcopy;
 mod connection;
 mod cursor;
@@ -49,6 +52,10 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize tracing on module load (via MSSQL_TDS_TRACE env var)
     tracing_init::init_tracing();
 
+    // Register the shared Tokio runtime with `pyo3-async-runtimes` before any
+    // async connection can be created from Python. Idempotent via `Once`.
+    async_runtime::init();
+
     // Statically capture the Python version once during module initialization
     let py_version = pyo3::Python::version_str();
     let _ = RUNTIME_DETAILS.set(format!("Python {}", py_version));
@@ -83,6 +90,8 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<connection::PyCoreConnection>()?;
     m.add_class::<cursor::PyCoreCursor>()?;
+    m.add_class::<async_connection::PyAsyncConnection>()?;
+    m.add_class::<async_cursor::PyAsyncCursor>()?;
 
     // Test-only hook to drive PythonEntraIdTokenFactory::create_token from
     // Python tests. Underscore-prefixed to mark as internal/test-only.

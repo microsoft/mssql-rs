@@ -13,9 +13,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
-use mssql_tds_bench::{
-    bench_env, connect, criterion_config, drain, drain_capture_handle, runtime, try_connect,
-};
+use mssql_tds_bench::{bench_env, connect, criterion_config, drain, runtime, try_connect};
 
 fn prepared_execute(c: &mut Criterion) {
     let rt = runtime();
@@ -29,14 +27,14 @@ fn prepared_execute(c: &mut Criterion) {
     // execution — the prepare-once/execute-many pattern that pooled clients and
     // ORMs use. Reusing one handle keeps server state constant so the
     // measurement isolates the `sp_execute` round-trip and row decode.
-    let handle = rt.block_on(async {
+    let statement = rt.block_on(async {
         let decls = vec![RpcParameter::new(
             Some("@id".to_string()),
             StatusFlags::NONE,
             SqlType::Int(None),
         )];
         client
-            .execute_sp_prepare("SELECT @id AS v".to_string(), decls, ())
+            .execute_sp_prepare_for_test("SELECT @id AS v".to_string(), decls, ())
             .await
             .expect("sp_prepare failed")
     });
@@ -50,7 +48,7 @@ fn prepared_execute(c: &mut Criterion) {
                     SqlType::Int(Some(42)),
                 )];
                 client
-                    .execute_sp_execute(handle, None, Some(params), ())
+                    .execute_sp_execute_for_test(statement, None, Some(params), ())
                     .await
                     .expect("sp_execute failed");
                 drain(&mut client).await;
@@ -61,7 +59,7 @@ fn prepared_execute(c: &mut Criterion) {
     // Release the handle (un-measured).
     rt.block_on(async {
         client
-            .execute_sp_unprepare(handle, ())
+            .execute_sp_unprepare_for_test(statement, ())
             .await
             .expect("sp_unprepare failed");
     });
@@ -88,13 +86,19 @@ fn prepared_prepexec(c: &mut Criterion) {
                     StatusFlags::NONE,
                     SqlType::Int(Some(42)),
                 )];
-                client
-                    .execute_sp_prepexec("SELECT @id AS v".to_string(), params, None, ())
+                let mut orphan = None;
+                let (statement_id, _) = client
+                    .execute_sp_prepexec_for_test(
+                        "SELECT @id AS v".to_string(),
+                        params,
+                        &mut orphan,
+                        (),
+                    )
                     .await
                     .expect("sp_prepexec failed");
-                let handle = drain_capture_handle(&mut client).await;
+                drain(&mut client).await;
                 client
-                    .execute_sp_unprepare(handle, ())
+                    .execute_sp_unprepare_for_test(statement_id, ())
                     .await
                     .expect("sp_unprepare failed");
             });

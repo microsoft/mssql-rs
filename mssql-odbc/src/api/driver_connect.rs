@@ -14,6 +14,7 @@ use crate::api::sqlstate::{
     ERR_STRING_RIGHT_TRUNCATION, SQLSTATE_08001, SQLSTATE_HY024, SQLSTATE_HY110, SQLSTATE_HYC00,
     post_diag, post_tds_error, post_tds_info_messages,
 };
+use crate::api::txn::apply_post_connect_txn_settings;
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::DbcHandle;
@@ -180,6 +181,18 @@ pub(crate) fn sql_driver_connect_w_safe(
     if result != SQL_SUCCESS && result != SQL_SUCCESS_WITH_INFO {
         // Reset state on failure
         state.connection_state = ConnectionState::Disconnected;
+        return result;
+    }
+
+    // Autocommit and isolation level set before connecting had no session to
+    // apply to; push them now. Needs the DBC lock and network I/O, so it runs
+    // only once the connect path has released the lock. A failure downgrades the
+    // connect to SQL_SUCCESS_WITH_INFO rather than failing it: the session is
+    // usable, but the application must be able to see that its requested
+    // settings did not take effect.
+    drop(state);
+    if apply_post_connect_txn_settings(dbc) == SQL_SUCCESS_WITH_INFO {
+        return SQL_SUCCESS_WITH_INFO;
     }
 
     result

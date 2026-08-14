@@ -9,6 +9,7 @@ use super::exec_common::{
     build_named_params, claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
 };
 use super::sqlstate::*;
+use super::txn::begin_transaction_if_manual;
 use super::util::{read_utf16, rewrite_param_markers};
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
@@ -109,10 +110,10 @@ fn sql_exec_direct_w_safe(
         stmt_state.reset_row_stream();
         stmt_state.row_count = -1;
         stmt_state.pending_row_counts.clear();
-        stmt_state.prepared_sql = None;
         // Superseding a prepared plan orphans its server handle; release it
         // (deferred) once we hold the client below.
         stmt_state.orphan_prepared_handle();
+        stmt_state.prepared = None;
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
         (named_params, rewritten_sql, marker_count)
@@ -125,6 +126,10 @@ fn sql_exec_direct_w_safe(
 
     // Release any handle orphaned by the reset above before running the batch.
     flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecDirectW");
+
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecDirectW") {
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
 
     // Parameterized text runs via sp_executesql (direct execution, no cached
     // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
@@ -214,12 +219,21 @@ mod tests {
 
     #[test]
     fn exec_direct_clears_stale_prepared_plan() {
+        use mssql_tds::connection::tds_client::PreparedStatement;
+
+        use crate::handles::stmt::PreparedPlan;
+
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.prepared_sql = Some("SELECT 1".to_string());
-            state.prepared_handle = Some(42);
+            state.prepared = Some(PreparedPlan {
+                stmt: PreparedStatement::materialized_for_test(
+                    "SELECT 1",
+                    mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
+                ),
+                marker_count: 0,
+            });
             state.set_state(STMT_STATE_PREPARED);
         }
 
@@ -234,12 +248,17 @@ mod tests {
         );
 
         let state = stmt.inner.lock().unwrap();
-        assert!(state.prepared_sql.is_none());
-        assert!(state.prepared_handle.is_none());
+        assert!(state.prepared.is_none());
         assert!(!state.has_state(STMT_STATE_PREPARED));
         // The superseded handle is queued for sp_unprepare. The flush never ran
         // here because the connection claim failed, so it remains pending.
-        assert_eq!(state.pending_unprepare, Some(42));
+        let orphaned = state
+            .pending_unprepare
+            .expect("superseded handle queued for release");
+        assert_eq!(
+            orphaned,
+            mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42)
+        );
     }
 
     #[test]

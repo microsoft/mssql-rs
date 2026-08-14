@@ -338,6 +338,28 @@ pub unsafe extern "C" fn SQLDisconnect(connection_handle: SqlHandle) -> SqlRetur
     unsafe { super::disconnect::sql_disconnect(connection_handle) }
 }
 
+// ---- Transactions -----------------------------------------------------------
+
+/// Commits or rolls back the transaction on a connection, or on every
+/// connection under an environment.
+///
+/// `handle_type` must be `SQL_HANDLE_DBC` or `SQL_HANDLE_ENV`; `completion_type`
+/// must be `SQL_COMMIT` or `SQL_ROLLBACK`. In autocommit mode, or when no
+/// transaction has been started, this succeeds without contacting the server.
+///
+/// # Safety
+/// - `handle` must be a valid DBC or ENV handle returned by `SQLAllocHandle`,
+///   matching `handle_type`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLEndTran(
+    handle_type: SqlSmallInt,
+    handle: SqlHandle,
+    completion_type: SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe { super::end_tran::sql_end_tran(handle_type, handle, completion_type) }
+}
+
 // ---- Cursor management ------------------------------------------------------
 
 /// Closes the open cursor on a statement handle and discards any pending rows.
