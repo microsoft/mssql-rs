@@ -10,6 +10,24 @@ pub(crate) const LENGTH_NULL: u16 = 0xffff;
 
 #[cfg(not(fuzzing))]
 pub(crate) trait TdsPacketReader {
+    /// Returns a buffered byte, or `None` without consuming data if one is unavailable.
+    #[inline]
+    fn try_read_byte(&mut self) -> Option<u8> {
+        None
+    }
+
+    /// Returns a buffered little-endian `u16`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_uint16(&mut self) -> Option<u16> {
+        None
+    }
+
+    /// Returns a buffered little-endian `i32`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_int32(&mut self) -> Option<i32> {
+        None
+    }
+
     fn read_byte(&mut self) -> impl Future<Output = TdsResult<u8>> + Send;
     fn read_int16_big_endian(&mut self) -> impl Future<Output = TdsResult<i16>> + Send;
     fn read_int32_big_endian(&mut self) -> impl Future<Output = TdsResult<i32>> + Send;
@@ -49,6 +67,24 @@ pub(crate) trait TdsPacketReader {
 /// Low-level TDS packet reading operations (public under `fuzzing` cfg).
 #[cfg(fuzzing)]
 pub trait TdsPacketReader {
+    /// Returns a buffered byte, or `None` without consuming data if one is unavailable.
+    #[inline]
+    fn try_read_byte(&mut self) -> Option<u8> {
+        None
+    }
+
+    /// Returns a buffered little-endian `u16`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_uint16(&mut self) -> Option<u16> {
+        None
+    }
+
+    /// Returns a buffered little-endian `i32`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_int32(&mut self) -> Option<i32> {
+        None
+    }
+
     fn read_byte(&mut self) -> impl Future<Output = TdsResult<u8>> + Send;
     fn read_int16_big_endian(&mut self) -> impl Future<Output = TdsResult<i16>> + Send;
     fn read_int32_big_endian(&mut self) -> impl Future<Output = TdsResult<i32>> + Send;

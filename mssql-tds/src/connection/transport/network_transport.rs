@@ -1115,13 +1115,28 @@ impl TdsPacketReader for NetworkTransport {
         self.tds_read_buffer.reset_to_length(0);
     }
 
+    #[inline(always)]
+    fn try_read_byte(&mut self) -> Option<u8> {
+        self.tds_read_buffer.try_read_byte()
+    }
+
+    #[inline(always)]
+    fn try_read_uint16(&mut self) -> Option<u16> {
+        self.tds_read_buffer.try_read_uint16()
+    }
+
+    #[inline(always)]
+    fn try_read_int32(&mut self) -> Option<i32> {
+        self.tds_read_buffer.try_read_int32()
+    }
+
     async fn read_byte(&mut self) -> TdsResult<u8> {
-        while !self.tds_read_buffer.do_we_have_enough_data(1) {
+        loop {
+            if let Some(value) = self.try_read_byte() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-        let result: u8 = self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position];
-        self.tds_read_buffer.consume_bytes(1);
-        Ok(result)
     }
 
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
@@ -1176,12 +1191,12 @@ impl TdsPacketReader for NetworkTransport {
         Ok(result)
     }
     async fn read_uint16(&mut self) -> TdsResult<u16> {
-        while !self.tds_read_buffer.do_we_have_enough_data(2) {
+        loop {
+            if let Some(value) = self.try_read_uint16() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_u16(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(2);
-        Ok(result)
     }
     async fn read_uint24(&mut self) -> TdsResult<u32> {
         while !self.tds_read_buffer.do_we_have_enough_data(3) {
@@ -1193,12 +1208,12 @@ impl TdsPacketReader for NetworkTransport {
     }
 
     async fn read_int32(&mut self) -> TdsResult<i32> {
-        while !self.tds_read_buffer.do_we_have_enough_data(4) {
+        loop {
+            if let Some(value) = self.try_read_int32() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_i32(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(4);
-        Ok(result)
     }
 
     async fn read_uint32(&mut self) -> TdsResult<u32> {
@@ -2804,6 +2819,29 @@ pub(crate) mod tests {
         let mut reader = create_network_transport_with_chunked_data(&stream, 3);
 
         assert_eq!(reader.read_uint32().await.unwrap(), 0x4433_2211);
+    }
+
+    #[tokio::test]
+    async fn test_sync_scalar_probe_fallback_across_packet_boundaries() {
+        let mut first = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut second = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut third = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut stream = first.append_bytes(&[0xAB, 0x34]).build();
+        stream.extend_from_slice(&second.append_bytes(&[0x12, 0x78, 0x56]).build());
+        stream.extend_from_slice(&third.append_bytes(&[0x34, 0x12]).build());
+
+        let mut reader = create_network_transport_with_data(&stream);
+
+        assert_eq!(reader.try_read_byte(), None);
+        assert_eq!(reader.read_byte().await.unwrap(), 0xAB);
+
+        assert_eq!(reader.try_read_uint16(), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 1);
+        assert_eq!(reader.read_uint16().await.unwrap(), 0x1234);
+
+        assert_eq!(reader.try_read_int32(), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 2);
+        assert_eq!(reader.read_int32().await.unwrap(), 0x1234_5678);
     }
 
     /// A payload-free non-EOM packet is malformed: it neither carries payload

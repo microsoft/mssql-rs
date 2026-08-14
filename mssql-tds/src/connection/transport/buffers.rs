@@ -49,6 +49,49 @@ impl TdsReadBuffer {
         self.buffer_length - self.buffer_position
     }
 
+    #[inline(always)]
+    pub(crate) fn try_read_byte(&mut self) -> Option<u8> {
+        if !self.do_we_have_enough_data(1) {
+            return None;
+        }
+
+        let value = self.working_buffer[self.buffer_position];
+        self.consume_bytes(1);
+        Some(value)
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_read_uint16(&mut self) -> Option<u16> {
+        if !self.do_we_have_enough_data(2) {
+            return None;
+        }
+
+        let position = self.buffer_position;
+        let value = u16::from_le_bytes([
+            self.working_buffer[position],
+            self.working_buffer[position + 1],
+        ]);
+        self.consume_bytes(2);
+        Some(value)
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_read_int32(&mut self) -> Option<i32> {
+        if !self.do_we_have_enough_data(4) {
+            return None;
+        }
+
+        let position = self.buffer_position;
+        let value = i32::from_le_bytes([
+            self.working_buffer[position],
+            self.working_buffer[position + 1],
+            self.working_buffer[position + 2],
+            self.working_buffer[position + 3],
+        ]);
+        self.consume_bytes(4);
+        Some(value)
+    }
+
     pub(crate) fn consume_bytes(&mut self, byte_count: usize) {
         if byte_count > (self.buffer_length - self.buffer_position) {
             panic!("Not enough data to consume");
@@ -424,6 +467,38 @@ mod tests {
         assert!(buf.do_we_have_enough_data(400));
         assert!(buf.do_we_have_enough_data(1));
         assert!(!buf.do_we_have_enough_data(401));
+    }
+
+    #[test]
+    fn test_small_scalar_probes_read_complete_values() {
+        let mut buf = TdsReadBuffer::new(4096);
+        buf.working_buffer[..7].copy_from_slice(&[0xAB, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12]);
+        buf.reset_to_length(7);
+
+        assert_eq!(buf.try_read_byte(), Some(0xAB));
+        assert_eq!(buf.try_read_uint16(), Some(0x1234));
+        assert_eq!(buf.try_read_int32(), Some(0x1234_5678));
+        assert_eq!(buf.get_remaining_byte_count(), 0);
+    }
+
+    #[test]
+    fn test_small_scalar_probe_misses_do_not_consume() {
+        let mut buf = TdsReadBuffer::new(4096);
+
+        assert_eq!(buf.try_read_byte(), None);
+        assert_eq!(buf.buffer_position, 0);
+
+        buf.working_buffer[0] = 0x34;
+        buf.reset_to_length(1);
+        assert_eq!(buf.try_read_uint16(), None);
+        assert_eq!(buf.buffer_position, 0);
+        assert_eq!(buf.get_remaining_byte_count(), 1);
+
+        buf.working_buffer[..3].copy_from_slice(&[0x78, 0x56, 0x34]);
+        buf.reset_to_length(3);
+        assert_eq!(buf.try_read_int32(), None);
+        assert_eq!(buf.buffer_position, 0);
+        assert_eq!(buf.get_remaining_byte_count(), 3);
     }
 
     #[test]

@@ -30,6 +30,33 @@ use crate::{query::metadata::ColumnMetadata, token::tokens::SqlCollation};
 
 use super::row_writer::{RowWriter, write_column_value};
 
+macro_rules! read_byte_sync_first {
+    ($reader:expr) => {
+        match $reader.try_read_byte() {
+            Some(value) => value,
+            None => $reader.read_byte().await?,
+        }
+    };
+}
+
+macro_rules! read_uint16_sync_first {
+    ($reader:expr) => {
+        match $reader.try_read_uint16() {
+            Some(value) => value,
+            None => $reader.read_uint16().await?,
+        }
+    };
+}
+
+macro_rules! read_int32_sync_first {
+    ($reader:expr) => {
+        match $reader.try_read_int32() {
+            Some(value) => value,
+            None => $reader.read_int32().await?,
+        }
+    };
+}
+
 /// Reads an encrypted column's cipher bytes from the wire and turns them back
 /// into a plaintext [`ColumnValues`].
 ///
@@ -559,9 +586,9 @@ impl GenericDecoder {
         if length == 0 {
             return Ok((None, ColumnValues::Null));
         }
-        let variant_base_type = reader.read_byte().await?;
+        let variant_base_type = read_byte_sync_first!(reader);
         let tds_type = TdsDataType::try_from(variant_base_type)?;
-        let variant_prop_bytes = reader.read_byte().await?;
+        let variant_prop_bytes = read_byte_sync_first!(reader);
         let bytes_for_type_and_properties_byte = 2;
 
         // Use checked arithmetic to prevent integer underflow
@@ -653,7 +680,7 @@ impl GenericDecoder {
     where
         T: TdsPacketReader + Send + Sync,
     {
-        let scale = reader.read_byte().await?;
+        let scale = read_byte_sync_first!(reader);
         Ok(match tds_type {
             TdsDataType::TimeN => {
                 let time_nanos = self.read_time(reader, data_length as u8, scale).await?;
@@ -684,7 +711,7 @@ impl GenericDecoder {
         T: TdsPacketReader + Send + Sync,
     {
         // Decimal/numeric data type has 1 byte length.
-        let length = reader.read_byte().await?;
+        let length = read_byte_sync_first!(reader);
         let TypeInfoVariant::VarLenPrecisionScale(_, _, precision, scale) =
             metadata.type_info.type_info_variant
         else {
@@ -709,7 +736,7 @@ impl GenericDecoder {
         if length == 0 {
             return Ok(None);
         }
-        let sign = reader.read_byte().await?;
+        let sign = read_byte_sync_first!(reader);
         let is_positive = sign == 1;
 
         // Round up: a declared length that does not cover whole 32-bit words
@@ -750,7 +777,7 @@ impl GenericDecoder {
     where
         T: TdsPacketReader + Send + Sync,
     {
-        let days = reader.read_int32().await?;
+        let days = read_int32_sync_first!(reader);
         let ticks = reader.read_uint32().await?;
 
         Ok(SqlDateTime { days, time: ticks })
@@ -760,8 +787,8 @@ impl GenericDecoder {
     where
         T: TdsPacketReader + Send + Sync,
     {
-        let days = reader.read_uint16().await?;
-        let minutes = reader.read_uint16().await?;
+        let days = read_uint16_sync_first!(reader);
+        let minutes = read_uint16_sync_first!(reader);
         Ok(SqlSmallDateTime {
             days,
             time: minutes,
@@ -891,7 +918,7 @@ impl GenericDecoder {
     where
         T: TdsPacketReader + Send + Sync,
     {
-        let small_money_val = reader.read_int32().await?;
+        let small_money_val = read_int32_sync_first!(reader);
         Ok(small_money_val.into())
     }
 
@@ -901,8 +928,8 @@ impl GenericDecoder {
     where
         T: TdsPacketReader + Send + Sync,
     {
-        let msb = reader.read_int32().await?;
-        let lsb = reader.read_int32().await?;
+        let msb = read_int32_sync_first!(reader);
+        let lsb = read_int32_sync_first!(reader);
         Ok(SqlMoney {
             lsb_part: lsb,
             msb_part: msb,
@@ -958,7 +985,7 @@ impl GenericDecoder {
         };
 
         // Read length prefix (USHORTLEN format)
-        let length_prefix_value = reader.read_uint16().await? as usize;
+        let length_prefix_value = read_uint16_sync_first!(reader) as usize;
 
         // Handle NULL (length = 0xFFFF)
         if length_prefix_value == 0xFFFF {
@@ -982,13 +1009,13 @@ impl GenericDecoder {
         }
 
         // Read 8-byte header
-        let layout_format_byte = reader.read_byte().await?;
-        let layout_version_byte = reader.read_byte().await?;
-        let dimension_count = reader.read_uint16().await?;
-        let base_type_byte = reader.read_byte().await?;
-        let _reserved1 = reader.read_byte().await?; // Reserved
-        let _reserved2 = reader.read_byte().await?; // Reserved
-        let _reserved3 = reader.read_byte().await?; // Reserved
+        let layout_format_byte = read_byte_sync_first!(reader);
+        let layout_version_byte = read_byte_sync_first!(reader);
+        let dimension_count = read_uint16_sync_first!(reader);
+        let base_type_byte = read_byte_sync_first!(reader);
+        let _reserved1 = read_byte_sync_first!(reader); // Reserved
+        let _reserved2 = read_byte_sync_first!(reader); // Reserved
+        let _reserved3 = read_byte_sync_first!(reader); // Reserved
 
         // Validate header using enum conversions
         let _layout_format = VectorLayoutFormat::try_from(layout_format_byte)?;
@@ -1161,23 +1188,23 @@ impl GenericDecoder {
         match metadata.data_type {
             // === Fixed-length integer types ===
             TdsDataType::Int1 => {
-                writer.write_u8(col, reader.read_byte().await?);
+                writer.write_u8(col, read_byte_sync_first!(reader));
             }
             TdsDataType::Int2 => {
                 writer.write_i16(col, reader.read_int16().await?);
             }
             TdsDataType::Int4 => {
-                writer.write_i32(col, reader.read_int32().await?);
+                writer.write_i32(col, read_int32_sync_first!(reader));
             }
             TdsDataType::Int8 => {
                 writer.write_i64(col, reader.read_int64().await?);
             }
             TdsDataType::IntN => {
-                let byte_len = reader.read_byte().await?;
+                let byte_len = read_byte_sync_first!(reader);
                 match byte_len {
-                    1 => writer.write_u8(col, reader.read_byte().await?),
+                    1 => writer.write_u8(col, read_byte_sync_first!(reader)),
                     2 => writer.write_i16(col, reader.read_int16().await?),
-                    4 => writer.write_i32(col, reader.read_int32().await?),
+                    4 => writer.write_i32(col, read_int32_sync_first!(reader)),
                     8 => writer.write_i64(col, reader.read_int64().await?),
                     0 => writer.write_null(col),
                     _ => {
@@ -1197,7 +1224,7 @@ impl GenericDecoder {
                 writer.write_f64(col, reader.read_float64().await?);
             }
             TdsDataType::FltN => {
-                let length = reader.read_byte().await?;
+                let length = read_byte_sync_first!(reader);
                 match length {
                     0 => writer.write_null(col),
                     4 => writer.write_f32(col, reader.read_float32().await?),
@@ -1207,12 +1234,12 @@ impl GenericDecoder {
 
             // === Bit types ===
             TdsDataType::Bit => {
-                writer.write_bool(col, reader.read_byte().await? == 1);
+                writer.write_bool(col, read_byte_sync_first!(reader) == 1);
             }
             TdsDataType::BitN => {
-                let byte_len = reader.read_byte().await?;
+                let byte_len = read_byte_sync_first!(reader);
                 if byte_len > 0 {
-                    writer.write_bool(col, reader.read_byte().await? == 1);
+                    writer.write_bool(col, read_byte_sync_first!(reader) == 1);
                 } else {
                     writer.write_null(col);
                 }
@@ -1226,7 +1253,7 @@ impl GenericDecoder {
                 writer.write_money(col, self.read_money8(reader).await?);
             }
             TdsDataType::MoneyN => {
-                let byte_len = reader.read_byte().await?;
+                let byte_len = read_byte_sync_first!(reader);
                 match byte_len {
                     4 => writer.write_smallmoney(col, self.read_money4(reader).await?),
                     8 => writer.write_money(col, self.read_money8(reader).await?),
@@ -1265,7 +1292,7 @@ impl GenericDecoder {
 
             // === Binary types ===
             TdsDataType::BigBinary => {
-                let length = reader.read_uint16().await?;
+                let length = read_uint16_sync_first!(reader);
                 // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
                 if length == 0xFFFF {
                     writer.write_null(col);
@@ -1287,7 +1314,7 @@ impl GenericDecoder {
                         None => writer.write_null(col),
                     }
                 } else {
-                    let length = reader.read_uint16().await?;
+                    let length = read_uint16_sync_first!(reader);
                     // 0xFFFF is the USHORTLEN NULL marker (CHARBIN_NULL).
                     if length == 0xFFFF {
                         writer.write_null(col);
@@ -1309,8 +1336,8 @@ impl GenericDecoder {
                 writer.write_datetime(col, self.read_datetime(reader).await?);
             }
             TdsDataType::DateTim4 => {
-                let daypart = reader.read_uint16().await?;
-                let timepart = reader.read_uint16().await?;
+                let daypart = read_uint16_sync_first!(reader);
+                let timepart = read_uint16_sync_first!(reader);
                 writer.write_smalldatetime(
                     col,
                     SqlSmallDateTime {
@@ -1320,7 +1347,7 @@ impl GenericDecoder {
                 );
             }
             TdsDataType::DateTimeN => {
-                let length = reader.read_byte().await?;
+                let length = read_byte_sync_first!(reader);
                 match length {
                     0 => writer.write_null(col),
                     4 => writer.write_smalldatetime(col, self.read_small_datetime(reader).await?),
@@ -1328,7 +1355,7 @@ impl GenericDecoder {
                 }
             }
             TdsDataType::DateN => {
-                let length = reader.read_byte().await?;
+                let length = read_byte_sync_first!(reader);
                 if length == 0 {
                     writer.write_null(col);
                 } else {
@@ -1336,7 +1363,7 @@ impl GenericDecoder {
                 }
             }
             TdsDataType::TimeN => {
-                let length = reader.read_byte().await?;
+                let length = read_byte_sync_first!(reader);
                 if length == 0 {
                     writer.write_null(col);
                 } else {
@@ -1356,7 +1383,7 @@ impl GenericDecoder {
                 }
             }
             TdsDataType::DateTime2N => {
-                let length = reader.read_byte().await?;
+                let length = read_byte_sync_first!(reader);
                 if length == 0 {
                     writer.write_null(col);
                 } else {
@@ -1377,7 +1404,7 @@ impl GenericDecoder {
                 }
             }
             TdsDataType::DateTimeOffsetN => {
-                let length = reader.read_byte().await?;
+                let length = read_byte_sync_first!(reader);
                 if length == 0 {
                     writer.write_null(col);
                 } else {
@@ -1400,7 +1427,7 @@ impl GenericDecoder {
 
             // === GUID ===
             TdsDataType::Guid => {
-                let length = reader.read_byte().await?;
+                let length = read_byte_sync_first!(reader);
                 if length == 0 {
                     writer.write_null(col);
                 } else {
@@ -1790,7 +1817,7 @@ impl StringDecoder {
                 None => writer.write_null(col),
             }
         } else if Self::is_long_len_type(metadata.data_type) {
-            let text_ptr_len = reader.read_byte().await? as usize;
+            let text_ptr_len = read_byte_sync_first!(reader) as usize;
 
             if text_ptr_len == 0 {
                 writer.write_null(col);
@@ -1817,7 +1844,7 @@ impl StringDecoder {
             };
             writer.write_string(col, sql_string);
         } else {
-            let length = reader.read_uint16().await? as usize;
+            let length = read_uint16_sync_first!(reader) as usize;
             if length == 0xFFFF {
                 writer.write_null(col);
             } else {
@@ -2200,7 +2227,7 @@ where
     Ok(match tds_type {
         // BIGVARBINARYTYPE, BIGBINARYTYPE
         TdsDataType::BigVarBinary | TdsDataType::BigBinary => {
-            let _max_length: u16 = reader.read_uint16().await?;
+            let _max_length: u16 = read_uint16_sync_first!(reader);
             if data_length as usize > MAX_ALLOC_SIZE {
                 return Err(crate::error::Error::ProtocolError(format!(
                     "SQL Variant binary data length {data_length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
@@ -2211,8 +2238,8 @@ where
             ColumnValues::Bytes(buffer)
         }
         TdsDataType::NumericN | TdsDataType::DecimalN => {
-            let precision = reader.read_byte().await?;
-            let scale = reader.read_byte().await?;
+            let precision = read_byte_sync_first!(reader);
+            let scale = read_byte_sync_first!(reader);
             let decimal_parts =
                 GenericDecoder::read_decimal_data(reader, data_length as u8, precision, scale)
                     .await?;
@@ -2255,7 +2282,7 @@ where
     }
     let mut collation_bytes = vec![0u8; 5];
     reader.read_bytes(&mut collation_bytes).await?;
-    let _max_length = reader.read_uint16().await? as usize;
+    let _max_length = read_uint16_sync_first!(reader) as usize;
     let collation: SqlCollation = collation_bytes.as_slice().try_into()?;
     if data_length as usize > MAX_ALLOC_SIZE {
         return Err(crate::error::Error::ProtocolError(format!(
