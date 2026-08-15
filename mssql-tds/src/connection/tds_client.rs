@@ -609,6 +609,11 @@ impl TdsClient {
         });
     }
 
+    #[inline]
+    fn request_timeout_start(&self) -> Option<Instant> {
+        self.remaining_request_timeout.map(|_| Instant::now())
+    }
+
     /// Pre-execution check: detect a dead connection and attempt session recovery.
     ///
     /// Call this at the top of any operation that sends a TDS request (SQL
@@ -3715,7 +3720,7 @@ impl TdsClient {
         let decryptor = self.resolve_cell_decryptor(&metadata).await?;
         let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
         loop {
-            let start = Instant::now();
+            let start = self.request_timeout_start();
             let header = self
                 .transport
                 .receive_row_header(
@@ -3724,7 +3729,9 @@ impl TdsClient {
                     self.cancel_handle.as_ref(),
                 )
                 .await?;
-            self.update_remaining_timeout(start);
+            if let Some(start) = start {
+                self.update_remaining_timeout(start);
+            }
 
             match header {
                 RowHeader::Positioned(pause_state) => {
@@ -3776,7 +3783,7 @@ impl TdsClient {
     /// guarantee `read_row_column(0)` yields a value: a zero-column row is
     /// positioned with a column count of 0, so `read_row_column(0)` is
     /// out-of-range and returns `UsageError`.
-    #[instrument(skip(self), level = "info")]
+    // Avoid a span for every SQLGetData column; row and token events retain observability.
     pub async fn read_row_column(&mut self, target: usize) -> TdsResult<CursorColumn> {
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
             ActiveRowReadState::Idle => Ok(CursorColumn::RowEnded),
@@ -3818,7 +3825,7 @@ impl TdsClient {
         }
 
         let mut capture = DefaultRowWriter::new(1);
-        let start = Instant::now();
+        let start = self.request_timeout_start();
         let result = self
             .transport
             .resume_row_into(
@@ -3829,7 +3836,9 @@ impl TdsClient {
                 &mut capture,
             )
             .await?;
-        self.update_remaining_timeout(start);
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
 
         match result {
             RowReadResult::RowPaused(next_pause) => {
@@ -6085,6 +6094,25 @@ mod tests {
     }
 
     // ── deduct_timeout tests ──
+
+    #[test]
+    fn request_timeout_clock_is_skipped_without_budget() {
+        let client = create_test_client();
+        assert!(client.request_timeout_start().is_none());
+    }
+
+    #[test]
+    fn request_timeout_clock_is_kept_for_exhausted_budget() {
+        let mut client = create_test_client();
+        client.remaining_request_timeout = Some(Duration::ZERO);
+
+        let start = client
+            .request_timeout_start()
+            .expect("an explicit zero budget must still be measured");
+        client.update_remaining_timeout(start);
+
+        assert_eq!(client.remaining_request_timeout, Some(Duration::ZERO));
+    }
 
     #[test]
     fn deduct_timeout_subtracts_elapsed() {
