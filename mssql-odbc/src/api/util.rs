@@ -4,6 +4,17 @@
 use std::slice;
 
 use crate::api::odbc_types::{SQL_NTS, SqlSmallInt, SqlWChar};
+use mssql_tds::connection::tds_client::CursorPoll;
+
+pub(crate) fn resolve_cursor_poll<T, E>(
+    poll: Result<CursorPoll<T>, E>,
+    fallback: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    match poll? {
+        CursorPoll::Ready(value) => Ok(value),
+        CursorPoll::Pending => fallback(),
+    }
+}
 
 /// Write `value` to `ptr` if non-null. Every ODBC out-parameter pointer may
 /// legitimately be null (caller opting out of that value), so the
@@ -231,8 +242,47 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_with_nul, read_utf16, rewrite_param_markers, write_if_some};
+    use super::{
+        copy_with_nul, read_utf16, resolve_cursor_poll, rewrite_param_markers, write_if_some,
+    };
     use crate::api::odbc_types::{SQL_NTS, SqlWChar};
+    use mssql_tds::connection::tds_client::CursorPoll;
+
+    #[test]
+    fn cursor_ready_skips_fallback() {
+        let mut calls = 0;
+        let value = resolve_cursor_poll(Ok::<_, ()>(CursorPoll::Ready(7)), || {
+            calls += 1;
+            Ok(9)
+        });
+
+        assert_eq!(value, Ok(7));
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn cursor_pending_calls_fallback_once() {
+        let mut calls = 0;
+        let value = resolve_cursor_poll(Ok::<_, ()>(CursorPoll::Pending), || {
+            calls += 1;
+            Ok(9)
+        });
+
+        assert_eq!(value, Ok(9));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn cursor_error_skips_fallback() {
+        let mut calls = 0;
+        let value = resolve_cursor_poll::<u8, _>(Err("cursor failed"), || {
+            calls += 1;
+            Ok(9)
+        });
+
+        assert_eq!(value, Err("cursor failed"));
+        assert_eq!(calls, 0);
+    }
 
     #[test]
     fn rewrite_no_markers_is_unchanged() {
