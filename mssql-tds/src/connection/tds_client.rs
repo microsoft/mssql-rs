@@ -3634,11 +3634,6 @@ impl TdsClient {
             ));
         }
 
-        if let Err(error) = self.drain_active_row_if_needed().await {
-            self.abort_pending_prepare_capture();
-            return Err(error);
-        }
-
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
         let decryptor = match self.resolve_cell_decryptor(&metadata).await {
             Ok(decryptor) => decryptor,
@@ -3684,7 +3679,7 @@ impl TdsClient {
                     ));
                 }
                 RowReadResult::Token(token) => {
-                    let handled = match self.handle_row_read_token(token).await {
+                    let handled = match Box::pin(self.handle_row_read_token(token)).await {
                         Ok(handled) => handled,
                         Err(error) => {
                             self.abort_pending_prepare_capture();
