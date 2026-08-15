@@ -215,7 +215,16 @@ TEST_F(ConnectionPoolLiveTest, IsolationReturnsToReadCommittedEachCheckout) {
 // the next borrower. A statement prepared and executed before the reset must
 // still execute correctly afterwards (the driver transparently re-prepares
 // against the fresh session) rather than aliasing a stale or dropped handle.
+//
+// This is an intended, mssql-odbc-specific divergence: sp_reset_connection drops
+// the server-side prepared handles, and msodbcsql blindly re-executes the dropped
+// handle and fails with native error 8179 ("Could not find prepared statement
+// with handle N"). Our driver is deliberately more robust here, so the test only
+// asserts on the mssql-odbc leg — SKIP_IF_COMPARING_MSODBCSQL() keeps the parity
+// comparison honest (see transaction_test.cpp / get_data_test.cpp).
 TEST_F(ConnectionPoolLiveTest, PreparedStatementSurvivesResetViaReprepare) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 42");
     ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS), SQL_HANDLE_STMT,
                   stmt_);
