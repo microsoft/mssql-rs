@@ -24,8 +24,8 @@ use super::odbc_types::{
 use super::sqlstate::{
     ERR_ATTRIBUTE_CANNOT_BE_SET_NOW, ERR_CONNECTION_BUSY, ERR_CONNECTION_DOES_NOT_EXIST,
     ERR_INVALID_ATTRIBUTE_VALUE, ERR_NO_ACTIVE_TDS_CLIENT, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED,
-    SQLSTATE_01000, SQLSTATE_08007, SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED, post_diag,
-    post_tds_error,
+    SQLSTATE_08S01, SQLSTATE_01000, SQLSTATE_08007, SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED,
+    post_diag, post_tds_error,
 };
 use crate::error::{HasDiagnostics, free_errors, post_sql_error};
 use crate::handles::DbcHandle;
@@ -362,13 +362,18 @@ pub(super) fn set_autocommit(dbc: &DbcHandle, value: u64) -> SqlReturn {
 ///
 /// Mirrors msodbcsql's `SQL_COPT_SS_RESET_CONNECTION` handler
 /// (`sqlcmisc.cpp:2373-2461`): reject any value but `SQL_RESET_CONNECTION_YES`
-/// with HY024 (D7), roll back a live local transaction first (D4), then arm the
-/// full RESETCONNECTION bit so the next request resets the session to its login
-/// defaults. Pool checkout does not preserve transactions, so this never uses
-/// RESETCONNECTIONSKIPTRAN.
+/// with HY024 (D7), roll back a live local transaction first (D4), then reset
+/// the session to its login defaults. Pool checkout does not preserve
+/// transactions, so this never uses RESETCONNECTIONSKIPTRAN.
 ///
-/// The bit only rides the next request here; making the reset self-acking with
-/// its own round trip is a later stage.
+/// The reset is driven eagerly (A2): rather than only arming the bit for the
+/// next request, it drives a minimal round trip so the server processes the
+/// reset and acknowledges it before this call returns. That way a failed reset
+/// is caught at pool checkout — the connection is poisoned and surfaces `08S01`
+/// so `mssql-python` discards it — instead of failing the next borrower's first
+/// query. The acknowledging round trip also clears the client's session-bound
+/// caches (`on_reset_connection_ack`), so a later short-circuited isolation SET
+/// cannot leave the reset unacknowledged.
 pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     const OP: &str = "SQLSetConnectAttrW(SQL_ATTR_RESET_CONNECTION)";
 
@@ -395,7 +400,10 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
 
     // D4: roll back a live local transaction before the reset so the next
     // borrower cannot inherit it. Guard on the server actually having one, the
-    // same way `end_transaction` does — the flag can be stale.
+    // same way `end_transaction` does — the flag can be stale. A full
+    // RESETCONNECTION would discard the transaction server-side regardless, but
+    // rolling back explicitly keeps the client's own transaction tracking in
+    // step with the server.
     let started = match dbc.inner.lock() {
         Ok(state) => state.local_tran_started,
         Err(_) => false,
@@ -408,7 +416,16 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
         Ok(())
     };
 
-    client.prepare_reset_connection(false);
+    // A2: drive the reset to completion so it is acknowledged before checkout.
+    // The mutex is not held across this I/O — the client is owned here.
+    let result = result.and_then(|()| dbc.runtime.block_on(client.reset_connection()));
+
+    // A failed reset leaves the session in an unknown state; poison the client
+    // so a subsequent SQL_ATTR_CONNECTION_DEAD read reports it dead and the pool
+    // discards it, then restore it so SQLDisconnect can still tear it down.
+    if result.is_err() {
+        client.mark_connection_dead();
+    }
     release_dbc_client(dbc, client);
 
     let Ok(mut state) = dbc.inner.lock() else {
@@ -417,11 +434,11 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     };
     state.local_tran_started = false;
     if let Err(e) = result {
-        error!(%e, "{OP}: rollback before reset failed");
-        post_tds_error(&mut state, &e, SQLSTATE_HY000);
+        error!(%e, "{OP}: connection reset failed");
+        post_tds_error(&mut state, &e, SQLSTATE_08S01);
         return SQL_ERROR;
     }
-    debug!("{OP}: reset armed for next request");
+    debug!("{OP}: reset processed and acknowledged");
     SQL_SUCCESS
 }
 
@@ -551,6 +568,16 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         // explicitly selects the default READ COMMITTED at startup pays neither
         // an error inside a transaction nor a cursor sweep and round trip
         // outside one.
+        //
+        // D9 caveat: this cache tracks only isolation set through this attribute.
+        // A borrower that ran `SET TRANSACTION ISOLATION LEVEL ...` as raw T-SQL
+        // leaves the cache stale, so a pool checkout re-applying READ COMMITTED
+        // can short-circuit here and leak the borrower's level. This mirrors
+        // mssql-python's own coverage gap (#343 only tracks the attribute path);
+        // `sp_reset_connection` does not reset isolation, so it is a shared,
+        // documented limitation (see the plan's Non-goals), not fixed here. The
+        // eager reset does not paper over it: it clears session-bound caches, not
+        // the server's isolation level.
         if level == state.txn_isolation {
             debug!(value, "{OP}: already at this isolation level");
             return SQL_SUCCESS;
@@ -903,9 +930,44 @@ mod tests {
 
     #[test]
     fn reset_connection_arms_and_clears_local_tran() {
-        // A successful reset leaves the idle client in place and clears the
-        // driver-side transaction flag (D4). The RESETCONNECTION bit riding the
-        // next request is covered by the mssql-tds transport test.
+        // A successful reset drives the acknowledging round trip, leaves the idle
+        // client in place, and clears the driver-side transaction flag (D4).
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{
+            done_no_more, env_change_reset_connection, tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(tds_client_from_tokens(vec![
+                env_change_reset_connection(),
+                done_no_more(),
+            ]));
+            state.local_tran_started = true;
+        }
+
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+        let state = dbc.inner.lock().unwrap();
+        assert!(!state.local_tran_started);
+        let client = state.client.as_ref().expect("client restored after reset");
+        assert!(
+            !client.is_connection_dead(),
+            "a reset that was acknowledged must leave the connection reusable"
+        );
+        assert!(state.diag_records().is_empty());
+    }
+
+    #[test]
+    fn reset_connection_poisons_client_on_failure() {
+        // A reset whose round trip fails (the server never acknowledges) leaves
+        // the session in an unknown state: surface 08S01 so the pool discards it
+        // and poison the client so a later SQL_ATTR_CONNECTION_DEAD read reports
+        // dead, while restoring it so SQLDisconnect can still tear it down.
+        use crate::api::sqlstate::SQLSTATE_08S01;
         use crate::error::HasDiagnostics;
         use crate::test_support::TestHandles;
         use mssql_tds::test_client_support::tds_client_from_tokens;
@@ -915,14 +977,122 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
+            // No tokens: the reset round trip runs dry and fails.
             state.client = Some(tds_client_from_tokens(vec![]));
-            state.local_tran_started = true;
+        }
+
+        assert_eq!(reset_connection(dbc, 1), SQL_ERROR);
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_08S01);
+        let client = state.client.as_ref().expect("client restored for teardown");
+        assert!(
+            client.is_connection_dead(),
+            "a failed reset must poison the client so the pool discards it"
+        );
+    }
+
+    #[test]
+    fn reset_then_checkout_isolation_reapplies_read_committed() {
+        // D9/B4: a borrower raised isolation to SERIALIZABLE via the attribute.
+        // At checkout the pool resets (acked eagerly here) and re-applies READ
+        // COMMITTED, which `sp_reset_connection` does not restore. The isolation
+        // SET differs from the cached SERIALIZABLE, so it emits a real batch and
+        // the cached level lands back at READ COMMITTED.
+        use crate::api::odbc_types::SQL_TXN_READ_COMMITTED as READ_COMMITTED;
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{
+            done_no_more, env_change_reset_connection, tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(tds_client_from_tokens(vec![
+                // SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+                done_no_more(),
+                // reset round trip
+                env_change_reset_connection(),
+                done_no_more(),
+                // SET TRANSACTION ISOLATION LEVEL READ COMMITTED
+                done_no_more(),
+            ]));
+        }
+
+        assert_eq!(
+            set_txn_isolation(dbc, u64::from(SQL_TXN_SERIALIZABLE)),
+            SQL_SUCCESS
+        );
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+        assert_eq!(
+            set_txn_isolation(dbc, u64::from(READ_COMMITTED)),
+            SQL_SUCCESS
+        );
+
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(
+            state.txn_isolation, READ_COMMITTED,
+            "checkout must re-apply READ COMMITTED after the reset"
+        );
+        assert!(
+            !state.client.as_ref().unwrap().is_connection_dead(),
+            "the connection stays reusable across reset + isolation re-apply"
+        );
+        assert!(state.diag_records().is_empty());
+    }
+
+    #[test]
+    fn checkout_cycle_reuses_one_physical_connection() {
+        // B5: the mssql-python checkout lifecycle on a single physical client —
+        // acquire (reset, eagerly acked) → setautocommit(False) (begin-txn) →
+        // check-in → next acquire (reset again). One scripted client services the
+        // whole sequence, proving the same physical connection is reused and stays
+        // reusable rather than being reconnected underneath.
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{
+            done_no_more, env_change_reset_connection, tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(tds_client_from_tokens(vec![
+                // acquire: reset round trip
+                env_change_reset_connection(),
+                done_no_more(),
+                // setautocommit(False): begin transaction
+                done_no_more(),
+                // setautocommit(True) on the way back: no active txn, no I/O
+                // next acquire: reset round trip
+                env_change_reset_connection(),
+                done_no_more(),
+            ]));
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+        assert_eq!(
+            set_autocommit(dbc, u64::from(SQL_AUTOCOMMIT_OFF)),
+            SQL_SUCCESS
+        );
+        assert!(!dbc.inner.lock().unwrap().autocommit);
+        assert_eq!(
+            set_autocommit(dbc, u64::from(SQL_AUTOCOMMIT_ON)),
+            SQL_SUCCESS
+        );
+        assert!(dbc.inner.lock().unwrap().autocommit);
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+
         let state = dbc.inner.lock().unwrap();
-        assert!(!state.local_tran_started);
-        assert!(state.client.is_some());
+        let client = state
+            .client
+            .as_ref()
+            .expect("same client reused across cycle");
+        assert!(!client.is_connection_dead());
         assert!(state.diag_records().is_empty());
     }
 }

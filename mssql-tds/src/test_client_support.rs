@@ -36,7 +36,8 @@ use crate::io::token_stream::{
 use crate::message::messages::ResetConnectionMode;
 use crate::query::metadata::ColumnMetadata;
 use crate::token::tokens::{
-    ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
+    ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, EnvChangeContainer, EnvChangeToken,
+    EnvChangeTokenSubType, InfoToken, Tokens,
 };
 
 /// An opaque, scripted TDS token produced by the constructor helpers in this
@@ -51,6 +52,7 @@ pub struct ScriptedToken(Tokens);
 struct TokenReplayTransport {
     pending_tokens: VecDeque<Tokens>,
     reset_mode: ResetConnectionMode,
+    known_dead: bool,
 }
 
 impl TokenReplayTransport {
@@ -58,6 +60,7 @@ impl TokenReplayTransport {
         Self {
             pending_tokens: VecDeque::from(tokens),
             reset_mode: ResetConnectionMode::None,
+            known_dead: false,
         }
     }
 }
@@ -184,6 +187,12 @@ impl TdsTransport for TokenReplayTransport {
     fn is_connection_dead(&self) -> bool {
         true
     }
+    fn connection_known_dead(&self) -> bool {
+        self.known_dead
+    }
+    fn mark_known_dead(&mut self) {
+        self.known_dead = true;
+    }
 }
 
 /// Builds a [`TdsClient`] whose transport replays `tokens`. Combine with the
@@ -245,6 +254,17 @@ pub fn done_no_more() -> ScriptedToken {
         status: DoneStatus::FINAL,
         cur_cmd: CurrentCommand::Insert,
         row_count: 0,
+    }))
+}
+
+/// A `ResetConnection` ENVCHANGE token — the acknowledgement the server emits
+/// when it processes a RESETCONNECTION request. Script it ahead of a terminal
+/// DONE to drive [`TdsClient::reset_connection`](crate::connection::tds_client::TdsClient::reset_connection)
+/// to completion in a consumer test.
+pub fn env_change_reset_connection() -> ScriptedToken {
+    ScriptedToken(Tokens::EnvChange(EnvChangeToken {
+        sub_type: EnvChangeTokenSubType::ResetConnection,
+        change_type: EnvChangeContainer::from((0u32, 0u32)),
     }))
 }
 

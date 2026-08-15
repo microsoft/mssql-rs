@@ -621,6 +621,17 @@ impl TdsClient {
         self.transport.connection_known_dead()
     }
 
+    /// Marks the connection known-dead so [`is_connection_dead`] reports it
+    /// without touching the socket. A caller that observes the session in an
+    /// unrecoverable state — e.g. a connection-pool reset that failed partway —
+    /// uses this so a later liveness check discards the connection instead of
+    /// handing back a session left in an unknown state.
+    ///
+    /// [`is_connection_dead`]: Self::is_connection_dead
+    pub fn mark_connection_dead(&mut self) {
+        self.transport.mark_known_dead();
+    }
+
     pub(crate) fn get_current_metadata(&self) -> Option<&ColMetadataToken> {
         self.current_metadata.as_deref()
     }
@@ -823,6 +834,27 @@ impl TdsClient {
             false => ResetConnectionMode::Reset,
         };
         self.transport.as_writer().set_reset_mode(mode);
+    }
+
+    /// Arms the full RESETCONNECTION bit and drives a minimal round trip so the
+    /// server processes the reset and returns its `ResetConnection` ENVCHANGE
+    /// within this call — the eager, self-acking counterpart to
+    /// [`prepare_reset_connection`](Self::prepare_reset_connection).
+    ///
+    /// A connection pool uses this at checkout so the reset is processed and its
+    /// session-bound caches cleared (via
+    /// [`on_reset_connection_ack`](Self::on_reset_connection_ack)) *before* the
+    /// connection is handed out, instead of riding whatever request the borrower
+    /// issues next. A failed round trip surfaces as an error so the caller can
+    /// discard the connection rather than leak stale session state to the next
+    /// borrower.
+    ///
+    /// `SELECT 1` is the cheapest batch that reliably carries the reset bit and
+    /// forces the acknowledging ENVCHANGE.
+    pub async fn reset_connection(&mut self) -> TdsResult<()> {
+        self.prepare_reset_connection(false);
+        self.execute("SELECT 1".to_string(), ()).await?;
+        self.close_query().await
     }
 
     /// Executes a SQL batch and positions on its **first navigable result**,
@@ -7887,6 +7919,41 @@ mod tests {
             client.get_collation().lcid_language_id,
             0x0409,
             "collation reverts to login"
+        );
+    }
+
+    /// A2: `reset_connection()` arms the RESETCONNECTION bit on the wire and
+    /// drives the round trip whose `ResetConnection` ENVCHANGE clears the
+    /// session-bound caches, so the reset is acknowledged before the call
+    /// returns rather than riding a later request.
+    #[tokio::test]
+    async fn reset_connection_arms_bit_and_acks_within_the_call() {
+        use crate::message::messages::PacketStatusFlags;
+        use crate::token::tokens::{EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType};
+
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            done_no_more(),
+        ]);
+        client.prepared_handles.insert(sid(1), 55);
+
+        client
+            .reset_connection()
+            .await
+            .expect("reset round trip should succeed against the queued ack");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            sent[1] & PacketStatusFlags::ResetConnection as u8,
+            PacketStatusFlags::ResetConnection as u8,
+            "the round trip must carry the RESETCONNECTION bit in its first packet"
+        );
+        assert!(
+            client.prepared_handles.is_empty(),
+            "the ResetConnection ack must clear session-bound caches within the call"
         );
     }
 
