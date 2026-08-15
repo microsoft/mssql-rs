@@ -12,6 +12,7 @@
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
+use tokio::sync::oneshot;
 
 use crate::connection::client_context::ClientContext;
 use crate::connection::transport::network_transport::NetworkTransport;
@@ -52,6 +53,11 @@ impl TestPacketBuilder {
 
     pub(crate) fn append_bytes(&mut self, bytes: &[u8]) -> &mut TestPacketBuilder {
         self.data.extend_from_slice(bytes);
+        self
+    }
+
+    pub(crate) fn end_of_message(&mut self, enabled: bool) -> &mut TestPacketBuilder {
+        self.data[1] = u8::from(enabled);
         self
     }
 
@@ -131,6 +137,29 @@ pub(crate) fn create_network_transport_with_chunked_data(
     });
 
     build_duplex_transport(client_side)
+}
+
+/// Builds a `NetworkTransport` with `first` immediately available and `second`
+/// held until the returned gate is opened.
+pub(crate) fn create_network_transport_with_gated_data(
+    first: &[u8],
+    second: &[u8],
+) -> (NetworkTransport, oneshot::Sender<()>) {
+    let (client_side, mut server_side) = duplex(first.len().max(1));
+    let first = first.to_vec();
+    let second = second.to_vec();
+    let (release, wait) = oneshot::channel();
+    tokio::spawn(async move {
+        if server_side.write_all(&first).await.is_err() {
+            return;
+        }
+        if wait.await.is_err() {
+            return;
+        }
+        let _ = server_side.write_all(&second).await;
+    });
+
+    (build_duplex_transport(client_side), release)
 }
 
 #[cfg(test)]

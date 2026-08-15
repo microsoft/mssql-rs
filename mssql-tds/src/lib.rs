@@ -73,6 +73,7 @@
 //! - [`error`] — Error definitions.
 //! - [`message`] — TDS message types (prelogin, login7, etc.).
 //! - [`query`] — Query metadata and column descriptors.
+//! - [`runtime`] — Runtime interoperability for synchronous callers.
 //! - [`token`] — TDS token stream parsing (COLMETADATA, ROW, DONE, etc.).
 
 pub mod connection;
@@ -88,6 +89,7 @@ pub(crate) mod handler;
 pub(crate) mod io;
 pub mod message;
 pub mod query;
+pub mod runtime;
 pub mod security;
 pub(crate) mod sql_identifier;
 pub(crate) mod ssrp;
