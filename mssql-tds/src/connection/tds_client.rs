@@ -3707,7 +3707,8 @@ impl TdsClient {
     /// [`read_row_column`](Self::read_row_column). Any previously positioned row
     /// is drained first; its remaining column bytes are read and discarded rather
     /// than returned to the caller.
-    #[instrument(skip(self), level = "info")]
+    // `#[instrument]` makes this target-dependent future exceed the 4096 B
+    // budget on Linux. Row positioning still emits its existing row/token events.
     pub async fn next_row_cursor(&mut self) -> TdsResult<bool> {
         if self.current_metadata.is_none() {
             return Err(UsageError(
