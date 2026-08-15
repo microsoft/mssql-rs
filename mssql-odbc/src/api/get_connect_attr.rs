@@ -417,6 +417,41 @@ mod tests {
     }
 
     #[test]
+    fn connection_dead_reports_true_when_client_marked_dead() {
+        use crate::handles::DbcHandle;
+        use crate::handles::handle_from_raw;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // A connected client whose session was left unusable (e.g. a reset whose
+        // round trip failed poisons it) must read DEAD so the pool discards it,
+        // even though the DBC is still marked Connected.
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            let mut client = tds_client_from_tokens(vec![]);
+            client.mark_connection_dead();
+            state.client = Some(client);
+        }
+
+        let mut out: u32 = 12345;
+        let get = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_CONNECTION_DEAD,
+                &mut out as *mut u32 as SqlPointer,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get, SQL_SUCCESS);
+        assert_eq!(out, SQL_CD_TRUE);
+
+        dbc.inner.lock().unwrap().client = None;
+    }
+
+    #[test]
     fn connection_dead_null_pointer_is_rejected() {
         let h = TestHandles::with_env_dbc();
         let get = unsafe {

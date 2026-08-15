@@ -326,6 +326,34 @@ mod tests {
     }
 
     #[test]
+    fn access_token_after_connect_is_rejected() {
+        // B6: an access token is a pre-connect credential. A reset is the same
+        // physical login and never re-authenticates, so a rotated token cannot be
+        // applied to a live session — it must drive a fresh SQLDriverConnect (new
+        // physical login). Setting it after connect is rejected with HY011,
+        // locking in that there is no live-session token-refresh path.
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let buf = make_token_struct("rotated.jwt.value");
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_COPT_SS_ACCESS_TOKEN,
+                buf.as_ptr() as SqlPointer,
+                SQL_IS_POINTER,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HY011);
+        assert!(
+            state.access_token.is_none(),
+            "a post-connect token must not overwrite live-session credentials"
+        );
+    }
+
+    #[test]
     fn null_token_pointer_is_rejected() {
         let h = TestHandles::with_env_dbc();
         let ret = unsafe {

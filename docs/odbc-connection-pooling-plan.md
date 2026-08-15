@@ -127,6 +127,14 @@ Reviewed the real driver: `Sql/Ntdbms/sqlncli/odbc/{sqlcmisc.cpp, sqlcfunc.cpp, 
   - concurrent checkout;
   - token-identity separation + near-expiry reconnect (new login, not re-auth).
 - Diagnose any behavior differences vs. `msodbcsql18`.
+- **No in-repo `mssql-python` harness exists** (adding one would pull a Python +
+  `mssql-python` toolchain into `mssql-rs`, which does not fit the layout and is
+  the "no second pool" non-goal). The supported hook is the existing driver
+  registration the e2e runners perform, so `mssql-python` selects this driver by
+  name. The exact manual/CI steps, env, and expected results for each scenario
+  above are documented in
+  [`odbc-connection-pooling-python-e2e.md`](./odbc-connection-pooling-python-e2e.md),
+  backed by the in-repo unit / TDS / live-C++ coverage listed there.
 
 ---
 

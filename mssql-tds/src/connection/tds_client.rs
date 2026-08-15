@@ -851,6 +851,14 @@ impl TdsClient {
     ///
     /// `SELECT 1` is the cheapest batch that reliably carries the reset bit and
     /// forces the acknowledging ENVCHANGE.
+    ///
+    /// The reset is the *same physical login*: it never re-runs the LOGIN7 /
+    /// fedauth handshake and never re-sends the access token, so the
+    /// authentication and session-recovery context (the `client_context` held in
+    /// [`recovery_context`](Self::recovery_context)) is preserved untouched. A
+    /// new or rotated access token is only ever consumed at connect time, so
+    /// rotating credentials means a fresh connection (new LOGIN7), not a re-auth
+    /// of this live session.
     pub async fn reset_connection(&mut self) -> TdsResult<()> {
         self.prepare_reset_connection(false);
         self.execute("SELECT 1".to_string(), ()).await?;
