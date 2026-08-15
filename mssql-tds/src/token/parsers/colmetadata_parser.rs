@@ -110,8 +110,29 @@ const FLAG_ENCRYPTED: u16 = 0x0800;
 /// token reserving ~42 MB). Reserving conservatively and letting the vector grow
 /// as columns are actually parsed keeps work proportional to the bytes on the
 /// wire, so any legitimate column count (SQL Server wide tables allow up to
-/// 30,000 columns) is handled without an artificial cap.
+/// 30,000 columns) is handled without an artificial cap. With today's 640-byte
+/// `ColumnMetadata`, this limits the eager allocation to 160 KiB.
 const COLUMN_PREALLOC_CAP: usize = 256;
+
+/// Upper bound on the CEK table vector's initial capacity. With today's 48-byte
+/// `CekTableEntry`, this limits the eager allocation to 12 KiB.
+const CEK_TABLE_PREALLOC_CAP: usize = 256;
+
+const fn initial_column_capacity(col_count: u16) -> usize {
+    if (col_count as usize) < COLUMN_PREALLOC_CAP {
+        col_count as usize
+    } else {
+        COLUMN_PREALLOC_CAP
+    }
+}
+
+const fn initial_cek_table_capacity(table_size: u16) -> usize {
+    if (table_size as usize) < CEK_TABLE_PREALLOC_CAP {
+        table_size as usize
+    } else {
+        CEK_TABLE_PREALLOC_CAP
+    }
+}
 
 /// Cipher algorithm id signalling a custom (named) algorithm whose name follows
 /// inline in the crypto metadata.
@@ -161,7 +182,7 @@ where
         // as columns are parsed, while a malformed count cannot force a huge
         // eager allocation. See `COLUMN_PREALLOC_CAP`.
         let mut column_metadata: Vec<ColumnMetadata> =
-            Vec::with_capacity((col_count as usize).min(COLUMN_PREALLOC_CAP));
+            Vec::with_capacity(initial_column_capacity(col_count));
 
         // Parse each column definition
         for _ in 0..col_count {
@@ -272,7 +293,8 @@ where
     T: TdsPacketReader + Send + Sync,
 {
     let table_size = reader.read_uint16().await?;
-    let mut entries: Vec<CekTableEntry> = Vec::with_capacity(table_size as usize);
+    let mut entries: Vec<CekTableEntry> =
+        Vec::with_capacity(initial_cek_table_capacity(table_size));
     for _ in 0..table_size {
         entries.push(parse_cek_table_entry(reader).await?);
     }
@@ -642,6 +664,21 @@ mod tests {
 
         let result = parser.parse(&mut reader, &context).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_initial_column_capacity_is_bounded() {
+        assert_eq!(initial_column_capacity(0), 0);
+        assert_eq!(initial_column_capacity(10), 10);
+        assert_eq!(initial_column_capacity(5000), COLUMN_PREALLOC_CAP);
+        assert_eq!(initial_column_capacity(0xFFFE), COLUMN_PREALLOC_CAP);
+    }
+
+    #[test]
+    fn test_initial_cek_table_capacity_is_bounded() {
+        assert_eq!(initial_cek_table_capacity(0), 0);
+        assert_eq!(initial_cek_table_capacity(10), 10);
+        assert_eq!(initial_cek_table_capacity(u16::MAX), CEK_TABLE_PREALLOC_CAP);
     }
 
     #[tokio::test]
