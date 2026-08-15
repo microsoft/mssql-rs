@@ -280,6 +280,73 @@ pub(crate) struct GenericDecoder {
     string_decoder: StringDecoder,
 }
 
+struct BufferedSlice<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> BufferedSlice<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let end = self.position.checked_add(N)?;
+        let value = self.bytes.get(self.position..end)?.try_into().ok()?;
+        self.position = end;
+        Some(value)
+    }
+
+    fn take_bytes(&mut self, len: usize) -> Option<Vec<u8>> {
+        let end = self.position.checked_add(len)?;
+        let value = self.bytes.get(self.position..end)?.to_vec();
+        self.position = end;
+        Some(value)
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        self.take().map(|[value]| value)
+    }
+
+    fn i16(&mut self) -> Option<i16> {
+        self.take().map(i16::from_le_bytes)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        self.take().map(u16::from_le_bytes)
+    }
+
+    fn u24(&mut self) -> Option<u32> {
+        let [b0, b1, b2] = self.take()?;
+        Some(u32::from_le_bytes([b0, b1, b2, 0]))
+    }
+
+    fn i32(&mut self) -> Option<i32> {
+        self.take().map(i32::from_le_bytes)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        self.take().map(u32::from_le_bytes)
+    }
+
+    fn u40(&mut self) -> Option<u64> {
+        let [b0, b1, b2, b3, b4] = self.take()?;
+        Some(u64::from_le_bytes([b0, b1, b2, b3, b4, 0, 0, 0]))
+    }
+
+    fn i64(&mut self) -> Option<i64> {
+        self.take().map(i64::from_le_bytes)
+    }
+
+    fn f32(&mut self) -> Option<f32> {
+        self.take().map(f32::from_le_bytes)
+    }
+
+    fn f64(&mut self) -> Option<f64> {
+        self.take().map(f64::from_le_bytes)
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlpChunkReadLength {
@@ -596,6 +663,334 @@ impl PlpColumnStream {
 }
 
 impl GenericDecoder {
+    /// Decodes one complete non-PLP column from `bytes` without awaiting.
+    ///
+    /// `None` means the buffered bytes are incomplete or this type still
+    /// requires the async decoder. The caller must consume `used` bytes only
+    /// after receiving `Some`, so a miss is non-destructive.
+    ///
+    /// Each supported arm must remain wire-compatible with [`Self::decode_into`].
+    pub(crate) fn try_decode_buffered(
+        &self,
+        bytes: &[u8],
+        metadata: &ColumnMetadata,
+    ) -> TdsResult<Option<(ColumnValues, usize)>> {
+        if metadata.is_plp() || metadata.crypto_metadata.is_some() {
+            return Ok(None);
+        }
+
+        let mut reader = BufferedSlice::new(bytes);
+        let value = match metadata.data_type {
+            TdsDataType::Int1 => ColumnValues::TinyInt(match reader.byte() {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+            TdsDataType::Int2 => ColumnValues::SmallInt(match reader.i16() {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+            TdsDataType::Int4 => ColumnValues::Int(match reader.i32() {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+            TdsDataType::Int8 => ColumnValues::BigInt(match reader.i64() {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+            TdsDataType::Flt4 => ColumnValues::Real(match reader.f32() {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+            TdsDataType::Flt8 => ColumnValues::Float(match reader.f64() {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+            TdsDataType::Bit => ColumnValues::Bit(match reader.byte() {
+                Some(value) => value == 1,
+                None => return Ok(None),
+            }),
+            TdsDataType::IntN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                match length {
+                    0 => ColumnValues::Null,
+                    1 => ColumnValues::TinyInt(match reader.byte() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
+                    2 => ColumnValues::SmallInt(match reader.i16() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
+                    4 => ColumnValues::Int(match reader.i32() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
+                    8 => ColumnValues::BigInt(match reader.i64() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
+                    _ => {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid IntN length: {length}"
+                        )));
+                    }
+                }
+            }
+            TdsDataType::FltN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                match length {
+                    0 => ColumnValues::Null,
+                    4 => ColumnValues::Real(match reader.f32() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
+                    _ => ColumnValues::Float(match reader.f64() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
+                }
+            }
+            TdsDataType::BitN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                match length {
+                    0 => ColumnValues::Null,
+                    _ => ColumnValues::Bit(match reader.byte() {
+                        Some(value) => value == 1,
+                        None => return Ok(None),
+                    }),
+                }
+            }
+            TdsDataType::Money4 => ColumnValues::SmallMoney(SqlSmallMoney {
+                int_val: match reader.i32() {
+                    Some(value) => value,
+                    None => return Ok(None),
+                },
+            }),
+            TdsDataType::Money => {
+                let Some(msb_part) = reader.i32() else {
+                    return Ok(None);
+                };
+                let Some(lsb_part) = reader.i32() else {
+                    return Ok(None);
+                };
+                ColumnValues::Money(SqlMoney { lsb_part, msb_part })
+            }
+            TdsDataType::MoneyN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                match length {
+                    0 => ColumnValues::Null,
+                    4 => ColumnValues::SmallMoney(SqlSmallMoney {
+                        int_val: match reader.i32() {
+                            Some(value) => value,
+                            None => return Ok(None),
+                        },
+                    }),
+                    8 => {
+                        let Some(msb_part) = reader.i32() else {
+                            return Ok(None);
+                        };
+                        let Some(lsb_part) = reader.i32() else {
+                            return Ok(None);
+                        };
+                        ColumnValues::Money(SqlMoney { lsb_part, msb_part })
+                    }
+                    _ => {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid MoneyN length: {length}"
+                        )));
+                    }
+                }
+            }
+            TdsDataType::DateTim4 => {
+                let Some(days) = reader.u16() else {
+                    return Ok(None);
+                };
+                let Some(time) = reader.u16() else {
+                    return Ok(None);
+                };
+                ColumnValues::SmallDateTime(SqlSmallDateTime { days, time })
+            }
+            TdsDataType::DateTime => {
+                let Some(days) = reader.i32() else {
+                    return Ok(None);
+                };
+                let Some(time) = reader.u32() else {
+                    return Ok(None);
+                };
+                ColumnValues::DateTime(SqlDateTime { days, time })
+            }
+            TdsDataType::DateTimeN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                match length {
+                    0 => ColumnValues::Null,
+                    4 => {
+                        let Some(days) = reader.u16() else {
+                            return Ok(None);
+                        };
+                        let Some(time) = reader.u16() else {
+                            return Ok(None);
+                        };
+                        ColumnValues::SmallDateTime(SqlSmallDateTime { days, time })
+                    }
+                    _ => {
+                        let Some(days) = reader.i32() else {
+                            return Ok(None);
+                        };
+                        let Some(time) = reader.u32() else {
+                            return Ok(None);
+                        };
+                        ColumnValues::DateTime(SqlDateTime { days, time })
+                    }
+                }
+            }
+            TdsDataType::DateN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                match length {
+                    0 => ColumnValues::Null,
+                    _ => ColumnValues::Date(SqlDate::unchecked_create(match reader.u24() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    })),
+                }
+            }
+            TdsDataType::TimeN | TdsDataType::DateTime2N | TdsDataType::DateTimeOffsetN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                if length == 0 {
+                    ColumnValues::Null
+                } else {
+                    let scale = metadata.get_scale().ok_or_else(|| {
+                        crate::error::Error::ImplementationError(format!(
+                            "{:?} type should have scale",
+                            metadata.data_type
+                        ))
+                    })?;
+                    let trailing = match metadata.data_type {
+                        TdsDataType::TimeN => 0,
+                        TdsDataType::DateTime2N => 3,
+                        TdsDataType::DateTimeOffsetN => 5,
+                        _ => {
+                            return Err(crate::error::Error::ImplementationError(
+                                "unexpected buffered time type".to_string(),
+                            ));
+                        }
+                    };
+                    let time_length = length.checked_sub(trailing).ok_or_else(|| {
+                        crate::error::Error::ProtocolError(format!(
+                            "Invalid {:?} length: {length}",
+                            metadata.data_type
+                        ))
+                    })?;
+                    let scaled = match time_length {
+                        3 => reader.u24().map(u64::from),
+                        4 => reader.u32().map(u64::from),
+                        _ => reader.u40(),
+                    };
+                    let Some(scaled) = scaled else {
+                        return Ok(None);
+                    };
+                    let time = SqlTime {
+                        time_nanoseconds: scaled * 10_u64.pow(u32::from(7 - scale.min(7))),
+                        scale,
+                    };
+                    match metadata.data_type {
+                        TdsDataType::TimeN => ColumnValues::Time(time),
+                        TdsDataType::DateTime2N => {
+                            let Some(days) = reader.u24() else {
+                                return Ok(None);
+                            };
+                            ColumnValues::DateTime2(SqlDateTime2 { days, time })
+                        }
+                        TdsDataType::DateTimeOffsetN => {
+                            let Some(days) = reader.u24() else {
+                                return Ok(None);
+                            };
+                            let Some(offset) = reader.i16() else {
+                                return Ok(None);
+                            };
+                            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                                datetime2: SqlDateTime2 { days, time },
+                                offset,
+                            })
+                        }
+                        _ => {
+                            return Err(crate::error::Error::ImplementationError(
+                                "unexpected buffered time type".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            TdsDataType::Guid => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                if length == 0 {
+                    ColumnValues::Null
+                } else {
+                    if length != 16 {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid GUID length: expected 16 bytes, got {length}"
+                        )));
+                    }
+                    let Some(bytes) = reader.take_bytes(16) else {
+                        return Ok(None);
+                    };
+                    ColumnValues::Uuid(uuid::Uuid::from_slice_le(&bytes).map_err(|error| {
+                        crate::error::Error::ProtocolError(format!("Failed to parse UUID: {error}"))
+                    })?)
+                }
+            }
+            TdsDataType::NChar
+            | TdsDataType::NVarChar
+            | TdsDataType::BigChar
+            | TdsDataType::BigVarChar
+            | TdsDataType::Char
+            | TdsDataType::VarChar => {
+                let Some(length) = reader.u16() else {
+                    return Ok(None);
+                };
+                if length == u16::MAX {
+                    ColumnValues::Null
+                } else {
+                    let Some(bytes) = reader.take_bytes(usize::from(length)) else {
+                        return Ok(None);
+                    };
+                    ColumnValues::String(SqlString::new(bytes, get_encoding_type(metadata)))
+                }
+            }
+            TdsDataType::BigBinary | TdsDataType::BigVarBinary => {
+                let Some(length) = reader.u16() else {
+                    return Ok(None);
+                };
+                if length == u16::MAX {
+                    ColumnValues::Null
+                } else {
+                    let Some(bytes) = reader.take_bytes(usize::from(length)) else {
+                        return Ok(None);
+                    };
+                    ColumnValues::Bytes(bytes)
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        Ok(Some((value, reader.position)))
+    }
+
     #[cfg(test)]
     const SHORTLEN_MAXVALUE: usize = 65535;
     const SQL_PLP_NULL: usize = 0xffffffffffffffff;
@@ -3655,7 +4050,9 @@ mod test {
         use std::borrow::Cow;
 
         use crate::core::TdsResult;
-        use crate::datatypes::column_values::{ColumnValues, SqlDateTime, SqlSmallDateTime};
+        use crate::datatypes::column_values::{
+            ColumnValues, SqlDateTime, SqlMoney, SqlSmallDateTime, SqlTime,
+        };
         use crate::datatypes::decoder::{
             DecimalParts, GenericDecoder, MAX_PLP_SIZE, PlpChunkReadLength, PlpChunkStreamReader,
             PlpColumnStream, SqlTypeDecode,
@@ -3878,6 +4275,114 @@ mod test {
                 multi_part_name: None,
                 crypto_metadata: None,
             }
+        }
+
+        fn buffered_value(bytes: &[u8], metadata: &ColumnMetadata) -> (ColumnValues, usize) {
+            GenericDecoder::default()
+                .try_decode_buffered(bytes, metadata)
+                .unwrap()
+                .expect("complete buffered value")
+        }
+
+        #[test]
+        fn buffered_decode_intn_handles_null_value_and_partial_payload() {
+            let metadata = varlen_metadata(TdsDataType::IntN, 4);
+            assert_eq!(buffered_value(&[0], &metadata), (ColumnValues::Null, 1));
+            assert_eq!(
+                GenericDecoder::default()
+                    .try_decode_buffered(&[4, 0x78, 0x56], &metadata)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                buffered_value(&[4, 0x78, 0x56, 0x34, 0x12], &metadata),
+                (ColumnValues::Int(0x1234_5678), 5)
+            );
+        }
+
+        #[test]
+        fn buffered_decode_money_preserves_wire_word_order() {
+            let metadata = fixed_metadata(TdsDataType::Money, 8);
+            let mut bytes = 7_i32.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&11_i32.to_le_bytes());
+            assert_eq!(
+                buffered_value(&bytes, &metadata),
+                (
+                    ColumnValues::Money(SqlMoney {
+                        lsb_part: 11,
+                        msb_part: 7,
+                    }),
+                    8,
+                )
+            );
+        }
+
+        #[test]
+        fn buffered_decode_time_applies_fractional_scale() {
+            let metadata = ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::TimeN,
+                type_info: TypeInfo::var_len_scale(TdsDataType::TimeN, 4, 3).unwrap(),
+                column_name: String::new(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            };
+            let mut bytes = vec![4];
+            bytes.extend_from_slice(&1234_u32.to_le_bytes());
+            assert_eq!(
+                buffered_value(&bytes, &metadata),
+                (
+                    ColumnValues::Time(SqlTime {
+                        time_nanoseconds: 12_340_000,
+                        scale: 3,
+                    }),
+                    5,
+                )
+            );
+        }
+
+        #[test]
+        fn buffered_decode_guid_uses_tds_little_endian_layout() {
+            let metadata = varlen_metadata(TdsDataType::Guid, 16);
+            let expected = uuid::Uuid::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+            let mut bytes = vec![16];
+            bytes.extend_from_slice(&expected.to_bytes_le());
+            assert_eq!(
+                buffered_value(&bytes, &metadata),
+                (ColumnValues::Uuid(expected), 17)
+            );
+        }
+
+        #[test]
+        fn buffered_decode_nvarchar_waits_for_the_complete_payload() {
+            let metadata = ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::NVarChar,
+                type_info: TypeInfo::var_len_string(TdsDataType::NVarChar, 100, None).unwrap(),
+                column_name: String::new(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            };
+            let payload = "row_1"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            let mut bytes = u16::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
+            bytes.extend_from_slice(&payload);
+            assert_eq!(
+                GenericDecoder::default()
+                    .try_decode_buffered(&bytes[..bytes.len() - 1], &metadata)
+                    .unwrap(),
+                None
+            );
+            let (value, used) = buffered_value(&bytes, &metadata);
+            let ColumnValues::String(value) = value else {
+                panic!("expected string");
+            };
+            assert_eq!(value.to_utf8_string(), "row_1");
+            assert_eq!(used, bytes.len());
         }
 
         /// Runs both decode() and decode_into() on the same bytes and asserts
