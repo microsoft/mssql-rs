@@ -4761,6 +4761,7 @@ mod tests {
     };
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes as client_over_bytes;
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes_with_column_encryption as client_over_bytes_with_ae;
+    use crate::test_packet_support::{TestPacketBuilder, create_network_transport_with_gated_data};
     use crate::token::tokens::{
         ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
     };
@@ -5120,6 +5121,85 @@ mod tests {
                 "{name} future is {size} B, expected <= {MAX} B"
             );
         }
+    }
+
+    #[test]
+    fn sync_first_cursor_continues_across_packet_boundary() {
+        use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
+        use crate::message::messages::PacketType;
+        use crate::query::metadata::ColumnMetadata;
+        use crate::runtime::block_on_sync_first;
+        use crate::token::tokens::TokenType;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let value = 0x1234_5678_i32;
+        let bytes = value.to_le_bytes();
+        let first = TestPacketBuilder::new(PacketType::TabularResult)
+            .end_of_message(false)
+            .append_byte(TokenType::Row as u8)
+            .append_bytes(&bytes[..2])
+            .build();
+        let second = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&bytes[2..])
+            .build();
+        let (transport, release_second_packet) = {
+            let _guard = runtime.enter();
+            create_network_transport_with_gated_data(&first, &second)
+        };
+        let negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let execution_context = crate::connection::execution_context::ExecutionContext::new();
+        let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        let mut client = TdsClient::new(
+            Box::new(transport),
+            negotiated_settings,
+            execution_context,
+            client_context,
+        );
+        client.current_metadata = Some(Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                type_info: TypeInfo::fixed_len(TdsDataType::Int4).expect("Int4 is fixed length"),
+                data_type: TdsDataType::Int4,
+                column_name: "value".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            }],
+            cek_table: Vec::new(),
+        }));
+
+        let positioned = block_on_sync_first(&runtime, client.next_row_cursor())
+            .expect("outside runtime")
+            .expect("position row");
+        assert!(positioned);
+        let mut column_future = std::pin::pin!(client.read_row_column(0));
+        let mut release_second_packet = Some(release_second_packet);
+        let mut polls = 0;
+        let counted_column = std::future::poll_fn(|context| {
+            polls += 1;
+            let result = column_future.as_mut().poll(context);
+            if result.is_pending()
+                && let Some(release) = release_second_packet.take()
+            {
+                release.send(()).expect("release second packet");
+            }
+            result
+        });
+        let column = block_on_sync_first(&runtime, counted_column)
+            .expect("outside runtime")
+            .expect("decode split column");
+
+        assert!(
+            polls >= 2,
+            "the gated second packet must force the same column future to resume"
+        );
+        assert_eq!(column, CursorColumn::Value(ColumnValues::Int(value)));
     }
 
     #[test]
