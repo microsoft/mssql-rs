@@ -184,6 +184,18 @@ pub enum CursorColumn {
     RowEnded,
 }
 
+/// Result of a non-blocking pull-cursor attempt.
+#[derive(Debug, PartialEq)]
+pub enum CursorPoll<T> {
+    /// The operation completed entirely from bytes already buffered by the
+    /// transport.
+    Ready(T),
+    /// The existing async cursor method must continue the operation.
+    ///
+    /// No transport bytes or cursor state were consumed by the attempt.
+    Pending,
+}
+
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -3690,6 +3702,53 @@ impl TdsClient {
         }
     }
 
+    /// Attempts to position the cursor from bytes already buffered by the transport.
+    ///
+    /// Returns [`CursorPoll::Pending`] without consuming bytes or cursor state
+    /// when the current row must first be drained, the next token needs async
+    /// parsing, encryption keys need resolving, or the row header is incomplete.
+    pub fn try_next_row_cursor(&mut self) -> TdsResult<CursorPoll<bool>> {
+        let Some(metadata) = self.current_metadata.as_ref().map(Arc::clone) else {
+            return Err(UsageError(
+                "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
+            ));
+        };
+        if self.current_result_set_has_been_read_till_end {
+            return Ok(CursorPoll::Ready(false));
+        }
+        if !matches!(self.active_row_read_state, ActiveRowReadState::Idle)
+            || self
+                .cancel_handle
+                .as_ref()
+                .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(CursorPoll::Pending);
+        }
+
+        // Resolving a CEK can call an async key-store provider. Keep encrypted
+        // result sets on the existing async path.
+        if !metadata.cek_table.is_empty()
+            || metadata
+                .columns
+                .iter()
+                .any(|column| column.crypto_metadata.is_some())
+        {
+            return Ok(CursorPoll::Pending);
+        }
+
+        let context = ParserContext::ColumnMetadata(metadata, None);
+        let start = self.request_timeout_start();
+        let pause_state = self.transport.try_receive_row_header(&context)?;
+        let Some(pause_state) = pause_state else {
+            return Ok(CursorPoll::Pending);
+        };
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+        Ok(CursorPoll::Ready(true))
+    }
+
     /// Positions the cursor on the next row without decoding any column
     /// (ODBC `SQLFetch`). Returns `Ok(true)` when positioned on a row and
     /// `Ok(false)` when the result set is exhausted.
@@ -3697,7 +3756,8 @@ impl TdsClient {
     /// After this returns `true`, individual columns are pulled with
     /// [`read_row_column`](Self::read_row_column). Any previously positioned row
     /// is drained first; its remaining column bytes are read and discarded rather
-    /// than returned to the caller.
+    /// than returned to the caller. Use this directly, or after
+    /// [`Self::try_next_row_cursor`] returns [`CursorPoll::Pending`].
     #[instrument(skip(self), level = "info")]
     pub async fn next_row_cursor(&mut self) -> TdsResult<bool> {
         if self.current_metadata.is_none() {
@@ -3751,38 +3811,76 @@ impl TdsClient {
         }
     }
 
+    /// Attempts to decode the next sequential column from buffered bytes.
+    ///
+    /// Returns [`CursorPoll::Pending`] without consuming bytes or cursor state
+    /// for PLP, encrypted, skipped, unsupported, or incomplete columns. The
+    /// caller then continues with [`Self::read_row_column`].
+    pub fn try_read_row_column(&mut self, target: usize) -> TdsResult<CursorPoll<CursorColumn>> {
+        let (next_column, column_count) = match &self.active_row_read_state {
+            ActiveRowReadState::Idle => return Ok(CursorPoll::Ready(CursorColumn::RowEnded)),
+            ActiveRowReadState::PlpPaused(_) => return Ok(CursorPoll::Pending),
+            ActiveRowReadState::RowPaused(pause_state) => {
+                (pause_state.next_column_index, pause_state.columns().len())
+            }
+        };
+        if self
+            .cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(CursorPoll::Pending);
+        }
+        if target >= column_count {
+            return Err(UsageError(format!(
+                "read_row_column target column {target} is out of range (row has {column_count} columns)"
+            )));
+        }
+        if target < next_column {
+            return Ok(CursorPoll::Ready(CursorColumn::AlreadyConsumed));
+        }
+        if target != next_column {
+            // Skipping intervening columns can require arbitrarily shaped
+            // decoders. The async path remains authoritative for that case.
+            return Ok(CursorPoll::Pending);
+        }
+
+        let start = self.request_timeout_start();
+        let value = match &self.active_row_read_state {
+            ActiveRowReadState::RowPaused(pause_state) => self
+                .transport
+                .try_read_buffered_column(pause_state, target)?,
+            ActiveRowReadState::Idle | ActiveRowReadState::PlpPaused(_) => None,
+        };
+        let Some(value) = value else {
+            return Ok(CursorPoll::Pending);
+        };
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+
+        let ActiveRowReadState::RowPaused(mut pause_state) =
+            std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle)
+        else {
+            return Err(crate::error::Error::ImplementationError(
+                "buffered column decode lost its row pause state".to_string(),
+            ));
+        };
+        pause_state.next_column_index = target + 1;
+        if pause_state.next_column_index < column_count {
+            self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+        }
+        Ok(CursorPoll::Ready(CursorColumn::Value(value)))
+    }
+
     /// Pulls column `target` (0-based) of the currently positioned row,
     /// skipping any intervening columns (ODBC `SQLGetData`). Forward-only:
     /// `target` must be at or after the cursor's next undecoded column.
     ///
-    /// Returns:
-    /// - [`CursorColumn::Value`] with the decoded value for non-PLP columns,
-    /// - [`CursorColumn::PlpStreaming`] when `target` is a PLP column whose
-    ///   bytes must be pulled via [`read_active_plp_chunk`](Self::read_active_plp_chunk),
-    /// - [`CursorColumn::AlreadyConsumed`] if `target` was already read/skipped
-    ///   (including after the whole row has been consumed),
-    /// - [`CursorColumn::RowEnded`] when no row is positioned.
-    ///
-    /// # Errors
-    ///
-    /// Returns `UsageError` when `target` is out of range **and** a row is
-    /// still positioned with unread columns (partially read). When no row is
-    /// positioned — including after the final column has been read — an
-    /// out-of-range or backward `target` yields [`CursorColumn::RowEnded`]
-    /// instead of an error.
-    ///
-    /// # Notes
-    ///
-    /// Reading the final column advances the cursor to idle, so a subsequent
-    /// backward or out-of-range request returns [`CursorColumn::RowEnded`]. A
-    /// caller that needs to distinguish "I rewound past the last column" from
-    /// "no row is positioned" must track the column it last read itself (as the
-    /// ODBC layer does).
-    ///
-    /// A `true` return from [`next_row_cursor`](Self::next_row_cursor) does not
-    /// guarantee `read_row_column(0)` yields a value: a zero-column row is
-    /// positioned with a column count of 0, so `read_row_column(0)` is
-    /// out-of-range and returns `UsageError`.
+    /// Returns [`CursorColumn::PlpStreaming`] for a PLP target,
+    /// [`CursorColumn::AlreadyConsumed`] for a backward target, and
+    /// [`CursorColumn::RowEnded`] when no row is positioned. Use this directly,
+    /// or after [`Self::try_read_row_column`] returns [`CursorPoll::Pending`].
     // Avoid a span for every SQLGetData column; row and token events retain observability.
     pub async fn read_row_column(&mut self, target: usize) -> TdsResult<CursorColumn> {
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
@@ -4783,6 +4881,8 @@ mod tests {
         /// `read_row_column` down a specific arm (e.g. a `PlpPaused` result that
         /// makes the cursor emit `CursorColumn::PlpStreaming`).
         resume_results: VecDeque<RowReadResult>,
+        sync_header_available: bool,
+        sync_columns: VecDeque<ColumnValues>,
     }
 
     impl TestTransport {
@@ -4795,6 +4895,8 @@ mod tests {
                 packet_data: Vec::new(),
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                sync_header_available: false,
+                sync_columns: VecDeque::new(),
             }
         }
 
@@ -4807,6 +4909,8 @@ mod tests {
                 packet_data: Vec::new(),
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                sync_header_available: false,
+                sync_columns: VecDeque::new(),
             }
         }
 
@@ -4819,6 +4923,8 @@ mod tests {
                 packet_data,
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                sync_header_available: false,
+                sync_columns: VecDeque::new(),
             }
         }
 
@@ -4837,6 +4943,33 @@ mod tests {
 
     #[async_trait]
     impl TdsTokenStreamReader for TestTransport {
+        fn try_receive_row_header(
+            &mut self,
+            context: &ParserContext,
+        ) -> TdsResult<Option<RowPauseState>> {
+            if !self.sync_header_available {
+                return Ok(None);
+            }
+            self.sync_header_available = false;
+            let ParserContext::ColumnMetadata(metadata, decryptor) = context else {
+                return Ok(None);
+            };
+            Ok(Some(RowPauseState {
+                next_column_index: 0,
+                metadata: Arc::clone(metadata),
+                nbc_null_bitmap: None,
+                decryptor: decryptor.clone(),
+            }))
+        }
+
+        fn try_read_buffered_column(
+            &mut self,
+            _pause_state: &RowPauseState,
+            _target: usize,
+        ) -> TdsResult<Option<ColumnValues>> {
+            Ok(self.sync_columns.pop_front())
+        }
+
         async fn receive_token(
             &mut self,
             _context: &ParserContext,
@@ -5227,6 +5360,28 @@ mod tests {
         Arc::new(ColMetadataToken::default())
     }
 
+    fn int_column_metadata(column_count: usize) -> Arc<ColMetadataToken> {
+        let columns = (0..column_count)
+            .map(|index| crate::query::metadata::ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                type_info: crate::datatypes::sqldatatypes::TypeInfo::fixed_len(
+                    crate::datatypes::sqldatatypes::TdsDataType::Int4,
+                )
+                .unwrap(),
+                data_type: crate::datatypes::sqldatatypes::TdsDataType::Int4,
+                column_name: format!("c{index}"),
+                multi_part_name: None,
+                crypto_metadata: None,
+            })
+            .collect();
+        Arc::new(ColMetadataToken {
+            column_count: u16::try_from(column_count).unwrap(),
+            columns,
+            cek_table: vec![],
+        })
+    }
+
     fn done_more() -> Tokens {
         Tokens::Done(DoneToken {
             status: DoneStatus::MORE,
@@ -5393,6 +5548,113 @@ mod tests {
         let resolved = budget.into_timeout().unwrap();
         assert_eq!(resolved.seconds(), None);
         assert_eq!(resolved.duration(), None);
+    }
+
+    #[test]
+    fn sync_cursor_attempt_reads_buffered_header_and_columns_in_order() {
+        let metadata = int_column_metadata(2);
+        let mut transport = TestTransport::new();
+        transport.sync_header_available = true;
+        transport.sync_columns = VecDeque::from([ColumnValues::Int(10), ColumnValues::Int(20)]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+
+        assert_eq!(
+            client.try_next_row_cursor().unwrap(),
+            CursorPoll::Ready(true)
+        );
+        assert_eq!(
+            client.try_read_row_column(0).unwrap(),
+            CursorPoll::Ready(CursorColumn::Value(ColumnValues::Int(10)))
+        );
+        assert_eq!(
+            client.try_read_row_column(1).unwrap(),
+            CursorPoll::Ready(CursorColumn::Value(ColumnValues::Int(20)))
+        );
+        assert_eq!(
+            client.try_read_row_column(1).unwrap(),
+            CursorPoll::Ready(CursorColumn::RowEnded)
+        );
+    }
+
+    #[test]
+    fn sync_cursor_pending_leaves_cursor_state_untouched() {
+        let mut client = create_test_client();
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+
+        assert_eq!(client.try_next_row_cursor().unwrap(), CursorPoll::Pending);
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: int_column_metadata(1),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        assert_eq!(client.try_read_row_column(0).unwrap(), CursorPoll::Pending);
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 0
+        ));
+    }
+
+    #[test]
+    fn sync_cursor_ready_preserves_explicit_zero_timeout() {
+        let metadata = int_column_metadata(1);
+        let mut transport = TestTransport::new();
+        transport.sync_header_available = true;
+        transport.sync_columns.push_back(ColumnValues::Int(42));
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        client.remaining_request_timeout = Some(Duration::ZERO);
+
+        assert_eq!(
+            client.try_next_row_cursor().unwrap(),
+            CursorPoll::Ready(true)
+        );
+        assert_eq!(
+            client.try_read_row_column(0).unwrap(),
+            CursorPoll::Ready(CursorColumn::Value(ColumnValues::Int(42)))
+        );
+        assert_eq!(client.remaining_request_timeout, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn sync_cursor_defers_cancelled_operations_without_consuming_state() {
+        let metadata = int_column_metadata(1);
+        let mut transport = TestTransport::new();
+        transport.sync_header_available = true;
+        transport.sync_columns.push_back(ColumnValues::Int(42));
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(Arc::clone(&metadata));
+        client.current_result_set_has_been_read_till_end = false;
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+
+        assert_eq!(client.try_next_row_cursor().unwrap(), CursorPoll::Pending);
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata,
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        assert_eq!(client.try_read_row_column(0).unwrap(), CursorPoll::Pending);
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 0
+        ));
     }
 
     // ── PLP streaming lifecycle contract tests ──
