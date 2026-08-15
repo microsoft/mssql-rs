@@ -30,6 +30,8 @@ use crate::{query::metadata::ColumnMetadata, token::tokens::SqlCollation};
 
 use super::row_writer::{RowWriter, write_column_value};
 
+// Avoid constructing a read future when the complete scalar is already buffered.
+// Probe misses consume nothing; the async method remains the authoritative refill path.
 macro_rules! read_sync_first {
     ($reader:expr, $try_method:ident, $read_method:ident) => {
         match ($reader).$try_method() {
