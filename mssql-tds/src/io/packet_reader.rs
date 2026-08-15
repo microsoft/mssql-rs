@@ -16,15 +16,57 @@ pub(crate) trait TdsPacketReader {
         None
     }
 
+    /// Returns a buffered little-endian `i16`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_int16(&mut self) -> Option<i16> {
+        None
+    }
+
     /// Returns a buffered little-endian `u16`, or `None` without consuming partial data.
     #[inline]
     fn try_read_uint16(&mut self) -> Option<u16> {
         None
     }
 
+    /// Returns a buffered little-endian 24-bit integer, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_uint24(&mut self) -> Option<u32> {
+        None
+    }
+
     /// Returns a buffered little-endian `i32`, or `None` without consuming partial data.
     #[inline]
     fn try_read_int32(&mut self) -> Option<i32> {
+        None
+    }
+
+    /// Returns a buffered little-endian `u32`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_uint32(&mut self) -> Option<u32> {
+        None
+    }
+
+    /// Returns a buffered little-endian 40-bit integer, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_uint40(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// Returns a buffered little-endian `i64`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_int64(&mut self) -> Option<i64> {
+        None
+    }
+
+    /// Returns a buffered little-endian `f32`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_float32(&mut self) -> Option<f32> {
+        None
+    }
+
+    /// Returns a buffered little-endian `f64`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_float64(&mut self) -> Option<f64> {
         None
     }
 
@@ -73,15 +115,57 @@ pub trait TdsPacketReader {
         None
     }
 
+    /// Returns a buffered little-endian `i16`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_int16(&mut self) -> Option<i16> {
+        None
+    }
+
     /// Returns a buffered little-endian `u16`, or `None` without consuming partial data.
     #[inline]
     fn try_read_uint16(&mut self) -> Option<u16> {
         None
     }
 
+    /// Returns a buffered little-endian 24-bit integer, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_uint24(&mut self) -> Option<u32> {
+        None
+    }
+
     /// Returns a buffered little-endian `i32`, or `None` without consuming partial data.
     #[inline]
     fn try_read_int32(&mut self) -> Option<i32> {
+        None
+    }
+
+    /// Returns a buffered little-endian `u32`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_uint32(&mut self) -> Option<u32> {
+        None
+    }
+
+    /// Returns a buffered little-endian 40-bit integer, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_uint40(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// Returns a buffered little-endian `i64`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_int64(&mut self) -> Option<i64> {
+        None
+    }
+
+    /// Returns a buffered little-endian `f32`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_float32(&mut self) -> Option<f32> {
+        None
+    }
+
+    /// Returns a buffered little-endian `f64`, or `None` without consuming partial data.
+    #[inline]
+    fn try_read_float64(&mut self) -> Option<f64> {
         None
     }
 
