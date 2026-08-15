@@ -1750,9 +1750,19 @@ impl NetworkTransport {
         let Some(bitmap_bytes) = buffered.get(1..1 + bitmap_len) else {
             return Ok(None);
         };
-        let bitmap: Arc<[u8]> = Arc::from(bitmap_bytes);
+        let bitmap = if let Some(mut cached) = self.nbc_bitmap_scratch.take()
+            && cached.len() == bitmap_len
+            && let Some(buffer) = Arc::get_mut(&mut cached)
+        {
+            buffer.copy_from_slice(bitmap_bytes);
+            self.nbc_bitmap_scratch = Some(Arc::clone(&cached));
+            cached
+        } else {
+            let bitmap: Arc<[u8]> = Arc::from(bitmap_bytes);
+            self.nbc_bitmap_scratch = Some(Arc::clone(&bitmap));
+            bitmap
+        };
         self.tds_read_buffer.consume_bytes(1 + bitmap_len)?;
-        self.nbc_bitmap_scratch = Some(Arc::clone(&bitmap));
         Ok(Some(RowPauseState {
             next_column_index: 0,
             metadata: Arc::clone(metadata),
@@ -3374,6 +3384,43 @@ pub(crate) mod tests {
             Some(ColumnValues::Null)
         );
         assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_nbcrow_reuses_unaliased_bitmap_allocation() {
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let payload = [
+            TokenType::NbcRow as u8,
+            0b0000_0001,
+            0b0000_0010,
+            TokenType::NbcRow as u8,
+            0b0000_0100,
+            0b0000_1000,
+        ];
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+        let context = int4_row_context(9);
+
+        let first = reader
+            .try_receive_row_header(&context)
+            .unwrap()
+            .expect("first NBCROW header");
+        let first_bitmap = first.nbc_null_bitmap.as_ref().expect("first bitmap");
+        assert_eq!(first_bitmap.as_ref(), &[0b0000_0001, 0b0000_0010]);
+        let first_allocation = first_bitmap.as_ptr();
+        drop(first);
+
+        let second = reader
+            .try_receive_row_header(&context)
+            .unwrap()
+            .expect("second NBCROW header");
+        let second_bitmap = second.nbc_null_bitmap.as_ref().expect("second bitmap");
+        assert_eq!(second_bitmap.as_ref(), &[0b0000_0100, 0b0000_1000]);
+        assert_eq!(
+            second_bitmap.as_ptr(),
+            first_allocation,
+            "the uniquely owned scratch bitmap should be refilled in place"
+        );
     }
 
     #[tokio::test]
