@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use bigdecimal::num_bigint::BigUint;
-use bigdecimal::num_traits::ToPrimitive;
 use core::fmt;
 use std::future::Future;
 use std::mem::MaybeUninit;
@@ -193,6 +191,9 @@ const MAX_PLP_SIZE: usize = i32::MAX as usize;
 /// the widest value the TDS wire format carries is 17 bytes (sign byte plus four
 /// words), so anything longer is malformed.
 const MAX_DECIMAL_INT_PARTS: usize = 4;
+
+/// Byte width of a `decimal`/`numeric` magnitude: four little-endian 32-bit words.
+const DECIMAL_MAGNITUDE_BYTES: usize = MAX_DECIMAL_INT_PARTS * 4;
 
 // Helper function to validate allocation size before allocating
 #[inline]
@@ -826,25 +827,18 @@ impl GenericDecoder {
             )));
         }
 
-        validate_alloc_size(number_of_int_parts * 4, "read_decimal int_parts")?;
-        let mut magnitude = vec![0u8; number_of_int_parts * 4];
+        // The check above bounds the payload at 16 bytes, so it is read onto the
+        // stack. TDS is little-endian and the array is zero-filled, which both
+        // reassembles the magnitude and zero-pads a partial trailing word.
+        let mut magnitude = [0u8; DECIMAL_MAGNITUDE_BYTES];
         reader.read_bytes(&mut magnitude[..magnitude_len]).await?;
 
-        let int_parts = magnitude
-            .chunks_exact(4)
-            .map(|chunk| {
-                let mut word = [0u8; 4];
-                word.copy_from_slice(chunk);
-                i32::from_le_bytes(word)
-            })
-            .collect();
-
-        Ok(Some(DecimalParts {
+        Ok(Some(DecimalParts::new(
             is_positive,
-            scale,
             precision,
-            int_parts,
-        }))
+            scale,
+            u128::from_le_bytes(magnitude),
+        )))
     }
 
     async fn read_datetime<T>(&self, reader: &mut T) -> TdsResult<SqlDateTime>
@@ -2148,8 +2142,12 @@ impl SqlTypeDecode for StringDecoder {
     }
 }
 
+/// Bytes needed to render any `decimal`/`numeric`: sign, 38 digits, decimal
+/// point, and slack for a scale that exceeds the digit count (`0.000…`).
+pub const DECIMAL_STR_LEN: usize = 48;
+
 /// TDS representation of Decimal and Numeric types.
-#[derive(Clone)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DecimalParts {
     /// `true` for non-negative values.
     pub is_positive: bool,
@@ -2157,17 +2155,41 @@ pub struct DecimalParts {
     pub scale: u8,
     /// Total number of significant digits.
     pub precision: u8,
-    /// 32-bit integer parts of the value (little-endian order).
-    pub int_parts: Vec<i32>,
+    /// The magnitude, as two 64-bit halves, least significant first.
+    ///
+    /// Split rather than held as a `u128` because a `u128` field would give
+    /// `DecimalParts` — and through it `ColumnValues` — 16-byte alignment,
+    /// which propagates into the row-fetch async state machines and grows them
+    /// by ~4%. As two halves the struct is 24 bytes at align 8, against 32 at
+    /// align 16; [`Self::magnitude`] recombines them with a shift and an or.
+    magnitude: [u64; 2],
 }
 
 impl fmt::Display for DecimalParts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_decimal_string())
+        f.write_str(self.format_into(&mut [0u8; DECIMAL_STR_LEN]))
     }
 }
 
 impl DecimalParts {
+    /// Builds a value from its unsigned magnitude, already scaled by `10^scale`.
+    ///
+    /// SQL Server's maximum precision of 38 digits keeps the magnitude below
+    /// `10^38 < 2^127`, so every valid `decimal`/`numeric` fits.
+    pub const fn new(is_positive: bool, precision: u8, scale: u8, magnitude: u128) -> Self {
+        DecimalParts {
+            is_positive,
+            scale,
+            precision,
+            magnitude: [magnitude as u64, (magnitude >> 64) as u64],
+        }
+    }
+
+    /// The unsigned magnitude, already scaled by `10^scale`.
+    pub const fn magnitude(&self) -> u128 {
+        (self.magnitude[0] as u128) | ((self.magnitude[1] as u128) << 64)
+    }
+
     /// Create a DecimalParts from a decimal string using BigDecimal.
     ///
     /// Supports SQL Server's full 38-digit precision using arbitrary-precision arithmetic.
@@ -2211,12 +2233,7 @@ impl DecimalParts {
 
         // Handle zero case (but preserve sign from original string)
         if decimal.is_zero() {
-            return Ok(DecimalParts {
-                is_positive: !has_negative_sign,
-                scale,
-                precision,
-                int_parts: vec![0],
-            });
+            return Ok(Self::new(!has_negative_sign, precision, scale, 0));
         }
 
         // Extract sign for non-zero values
@@ -2250,55 +2267,40 @@ impl DecimalParts {
             )));
         }
 
-        // Convert BigInt to Vec<i32> for TDS wire format (little-endian 32-bit chunks)
+        // Convert BigInt to the little-endian 128-bit magnitude. A precision <= 38
+        // value never needs more than 16 bytes; a caller that declares a wider
+        // precision is refused rather than silently truncated.
         let bytes = final_bigint.to_signed_bytes_le();
-        let mut int_parts = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            let mut part: i32 = 0;
-            for j in 0..4 {
-                if i + j < bytes.len() {
-                    part |= (bytes[i + j] as i32) << (j * 8);
-                }
-            }
-            int_parts.push(part);
-            i += 4;
+        if bytes.len() > DECIMAL_MAGNITUDE_BYTES {
+            return Err(crate::error::Error::TypeConversionError(format!(
+                "Decimal value '{s}' does not fit in a 128-bit magnitude"
+            )));
         }
+        let mut magnitude_bytes = [0u8; DECIMAL_MAGNITUDE_BYTES];
+        magnitude_bytes[..bytes.len()].copy_from_slice(&bytes);
 
-        if int_parts.is_empty() {
-            int_parts.push(0);
-        }
-
-        Ok(DecimalParts {
+        Ok(Self::new(
             is_positive,
-            scale,
             precision,
-            int_parts,
-        })
+            scale,
+            u128::from_le_bytes(magnitude_bytes),
+        ))
     }
 
     /// Create a DecimalParts from an i64 value.
     pub fn from_i64(value: i64, precision: u8, scale: u8) -> TdsResult<Self> {
         let is_positive = value >= 0;
-        let abs_value = value.unsigned_abs();
 
-        // Scale the value by multiplying by 10^scale
-        let scaled_value = abs_value as u128 * 10u128.pow(scale as u32);
+        let magnitude = 10u128
+            .checked_pow(u32::from(scale))
+            .and_then(|factor| u128::from(value.unsigned_abs()).checked_mul(factor))
+            .ok_or_else(|| {
+                crate::error::Error::TypeConversionError(format!(
+                    "Decimal value {value} scaled by 10^{scale} does not fit in a 128-bit magnitude"
+                ))
+            })?;
 
-        // Convert to int_parts
-        let mut int_parts = Vec::new();
-        let mut remaining = scaled_value;
-        while remaining > 0 || int_parts.is_empty() {
-            int_parts.push((remaining & 0xFFFFFFFF) as i32);
-            remaining >>= 32;
-        }
-
-        Ok(DecimalParts {
-            is_positive,
-            scale,
-            precision,
-            int_parts,
-        })
+        Ok(Self::new(is_positive, precision, scale, magnitude))
     }
 
     /// Create a DecimalParts from an f64 value.
@@ -2308,99 +2310,141 @@ impl DecimalParts {
         Self::from_string(&s, precision, scale)
     }
 
-    /// Convert DecimalParts to a string representation suitable for Python Decimal.
-    /// Returns a string like "123.45", "-0.01", etc.
-    fn to_decimal_string(&self) -> String {
-        let value_str = match self.magnitude() {
-            Some(magnitude) => magnitude.to_string(),
-            None => self.magnitude_big().to_string(),
-        };
+    /// Renders the value into `buf` and returns the populated suffix, without
+    /// allocating. The output is the same text [`Display`](fmt::Display)
+    /// produces: `"123.45"`, `"-0.01"`, `"0.000"`.
+    ///
+    /// Digits are emitted least significant first, so a caller-owned buffer
+    /// avoids the intermediate `String` the sign and decimal point would
+    /// otherwise need.
+    pub fn format_into<'a>(&self, buf: &'a mut [u8; DECIMAL_STR_LEN]) -> &'a str {
+        // Every digit below is produced with `u64` arithmetic: a `u128 % 10`
+        // loop emits a `__udivti3` libcall per digit and loses to
+        // `u128::to_string` on wide values. Splitting into limbs of `10^19`
+        // (the largest power of ten a `u64` holds) costs at most two `u128`
+        // divisions, and none at all when the magnitude already fits a `u64`.
+        // Three limbs are needed, not two: a `u128` reaches 39 digits.
+        const LIMB: u128 = 10_000_000_000_000_000_000;
+        const LIMB_DIGITS: usize = 19;
 
-        // Insert decimal point at the correct position
-        let result = if self.scale == 0 {
-            value_str
+        let magnitude = self.magnitude();
+        let mut limbs = [0u64; 3];
+        let limb_count;
+        if magnitude <= u64::MAX as u128 {
+            limbs[0] = magnitude as u64;
+            limb_count = 1;
         } else {
-            let scale_pos = self.scale as usize;
-            if value_str.len() <= scale_pos {
-                // Need to pad with leading zeros
-                format!("0.{}{}", "0".repeat(scale_pos - value_str.len()), value_str)
+            limbs[0] = (magnitude % LIMB) as u64;
+            let rest = magnitude / LIMB;
+            if rest <= u64::MAX as u128 {
+                limbs[1] = rest as u64;
+                limb_count = 2;
             } else {
-                let split_pos = value_str.len() - scale_pos;
-                format!("{}.{}", &value_str[..split_pos], &value_str[split_pos..])
+                limbs[1] = (rest % LIMB) as u64;
+                limbs[2] = (rest / LIMB) as u64;
+                limb_count = 3;
             }
-        };
-
-        if self.is_positive {
-            result
-        } else {
-            format!("-{}", result)
         }
+
+        // `scale` is wire-supplied and unvalidated. A `decimal` never exceeds
+        // 38, but the loop is bounded by the buffer rather than by trusting it,
+        // so a malformed value renders short instead of overrunning.
+        let scale = (self.scale as usize).min(DECIMAL_STR_LEN - 3);
+        let mut pos = buf.len();
+        let mut emitted = 0usize;
+        let mut limb = 0usize;
+        let mut taken = 0usize;
+        let mut current = limbs[0];
+
+        loop {
+            if scale > 0 && emitted == scale {
+                pos -= 1;
+                buf[pos] = b'.';
+            }
+
+            let digit = (current % 10) as u8;
+            current /= 10;
+            taken += 1;
+            pos -= 1;
+            buf[pos] = b'0' + digit;
+            emitted += 1;
+
+            // A limb always contributes all 19 of its digits, zeros included,
+            // while a more significant one is still to come.
+            if taken == LIMB_DIGITS && limb + 1 < limb_count {
+                limb += 1;
+                current = limbs[limb];
+                taken = 0;
+            }
+
+            // Leading zeros are otherwise only emitted to fill the fractional
+            // part, so a value narrower than its scale renders as `0.00…`.
+            if limb + 1 == limb_count && current == 0 && emitted > scale {
+                break;
+            }
+        }
+
+        if !self.is_positive {
+            pos -= 1;
+            buf[pos] = b'-';
+        }
+
+        // Every byte written above is ASCII.
+        core::str::from_utf8(&buf[pos..]).unwrap_or_default()
     }
 
-    fn to_f64(&self) -> f64 {
-        let magnitude = match self.magnitude() {
-            Some(magnitude) => magnitude as f64,
-            None => self.magnitude_big().to_f64().unwrap_or(f64::INFINITY),
-        };
+    /// Renders the value into a new `String`.
+    ///
+    /// Equivalent to [`ToString::to_string`], but it copies a known-length
+    /// `&str` instead of going through [`fmt::Formatter`], so it costs one
+    /// allocation and nothing else. Callers that can supply their own buffer
+    /// should use [`Self::format_into`] and pay nothing.
+    pub fn to_decimal_string(&self) -> String {
+        self.format_into(&mut [0u8; DECIMAL_STR_LEN]).to_owned()
+    }
+
+    fn to_f64(self) -> f64 {
+        let magnitude = self.magnitude() as f64;
 
         let d_ret = magnitude / 10.0_f64.powi(self.scale as i32);
 
         if self.is_positive { d_ret } else { -d_ret }
     }
 
-    /// Reassembles `int_parts` into the unsigned magnitude.
+    /// The `index`-th little-endian 32-bit word of the magnitude, counting from
+    /// the least significant. Words past the fourth are always zero.
     ///
-    /// `int_parts[0]` is the least significant word. Returns `None` when the
-    /// value does not fit in a `u128`. A valid `decimal`/`numeric`
-    /// (precision <= 38) fits in four words, so only a malformed payload or a
-    /// hand-built [`DecimalParts`] can exceed that; the alternative would be to
-    /// shift past the width of the accumulator.
-    pub fn magnitude(&self) -> Option<u128> {
-        let significant = self
-            .int_parts
+    /// This is the form the TDS wire and every reference driver's normalized
+    /// decimal use.
+    pub const fn word(&self, index: usize) -> i32 {
+        if index >= MAX_DECIMAL_INT_PARTS {
+            return 0;
+        }
+        (self.magnitude() >> (index * 32)) as u32 as i32
+    }
+
+    /// Number of little-endian 32-bit words needed to hold the magnitude, at
+    /// least one so that zero still has a word.
+    pub fn word_count(&self) -> usize {
+        (128 - self.magnitude().leading_zeros() as usize)
+            .div_ceil(32)
+            .max(1)
+    }
+
+    /// Builds a value from little-endian 32-bit words, least significant first.
+    ///
+    /// Words past the fourth are ignored: a `decimal`/`numeric` with precision
+    /// <= 38 never sets them, and every encoder here already emits at most four.
+    pub fn from_words(is_positive: bool, precision: u8, scale: u8, words: &[i32]) -> Self {
+        let magnitude = words
             .iter()
-            .rposition(|&part| part != 0)
-            .map_or(0, |i| i + 1);
-        if significant > MAX_DECIMAL_INT_PARTS {
-            return None;
-        }
-        Some(
-            self.int_parts[..significant]
-                .iter()
-                .enumerate()
-                .fold(0u128, |acc, (i, &part)| {
-                    acc | ((part as u32 as u128) << (i * 32))
-                }),
-        )
-    }
+            .take(MAX_DECIMAL_INT_PARTS)
+            .enumerate()
+            .fold(0u128, |acc, (i, &word)| {
+                acc | ((word as u32 as u128) << (i * 32))
+            });
 
-    /// Reassembles `int_parts` into an arbitrary-precision magnitude, for values
-    /// too wide for [`Self::magnitude`].
-    fn magnitude_big(&self) -> BigUint {
-        BigUint::new(self.int_parts.iter().map(|&part| part as u32).collect())
-    }
-}
-
-impl PartialEq for DecimalParts {
-    fn eq(&self, other: &Self) -> bool {
-        let min_len = self.int_parts.len().min(other.int_parts.len());
-        for i in 0..min_len {
-            if self.int_parts[i] != other.int_parts[i] {
-                return false;
-            }
-        }
-        if self.int_parts.len() > other.int_parts.len() {
-            if self.int_parts[min_len..].iter().any(|&x| x != 0) {
-                return false;
-            }
-        } else if other.int_parts.len() > self.int_parts.len()
-            && other.int_parts[min_len..].iter().any(|&x| x != 0)
-        {
-            return false;
-        }
-        self.is_positive == other.is_positive
-            && self.scale == other.scale
-            && self.precision == other.precision
+        Self::new(is_positive, precision, scale, magnitude)
     }
 }
 
@@ -2408,13 +2452,8 @@ impl Debug for DecimalParts {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "Decimal: {}{} Precision {} Scale {} F64 value: {}",
-            if self.is_positive { "" } else { "-" },
-            self.int_parts
-                .iter()
-                .map(|part| part.to_string())
-                .collect::<Vec<String>>()
-                .join(" "),
+            "Decimal: {} Precision {} Scale {} F64 value: {}",
+            self,
             self.precision,
             self.scale,
             self.to_f64()
@@ -2524,13 +2563,8 @@ mod test {
         let expected: f64 = 123456.322;
 
         // Represents 123456.322 as observed over TDS wire.
-        let int_parts = vec![-539269688, 2];
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 5,
-            precision: 18,
-            int_parts,
-        };
+        let magnitude = 12345632200;
+        let parts = DecimalParts::new(true, 18, 5, magnitude);
 
         assert_eq!(expected, parts.to_f64());
     }
@@ -2540,13 +2574,8 @@ mod test {
         let expected: f64 = -123456.322;
 
         // Represents -123456.322 as observed over TDS wire.
-        let int_parts = vec![-539269688, 2];
-        let parts = DecimalParts {
-            is_positive: false,
-            scale: 5,
-            precision: 18,
-            int_parts,
-        };
+        let magnitude = 12345632200;
+        let parts = DecimalParts::new(false, 18, 5, magnitude);
 
         assert_eq!(expected, parts.to_f64());
     }
@@ -2555,13 +2584,8 @@ mod test {
     fn test_f64_conversion_zero() {
         let expected: f64 = 0.0;
 
-        let int_parts = vec![0];
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 1,
-            int_parts,
-        };
+        let magnitude = 0;
+        let parts = DecimalParts::new(true, 1, 0, magnitude);
 
         assert_eq!(expected, parts.to_f64());
     }
@@ -2569,13 +2593,8 @@ mod test {
     #[test]
     fn test_f64_conversion_large_number() {
         // Test conversion with larger numbers
-        let int_parts = vec![100000, 0];
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 7,
-            int_parts,
-        };
+        let magnitude = 100000;
+        let parts = DecimalParts::new(true, 7, 2, magnitude);
 
         let result = parts.to_f64();
         // With scale of 2, int value 100000 should become 1000.00
@@ -2583,15 +2602,10 @@ mod test {
     }
 
     #[test]
-    fn test_decimal_parts_with_multiple_int_parts() {
+    fn test_decimal_parts_with_multi_word_magnitude() {
         // Test with multiple integer parts to ensure full conversion
-        let int_parts = vec![1000000000, 1];
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 19,
-            int_parts,
-        };
+        let magnitude = 5294967296;
+        let parts = DecimalParts::new(true, 19, 0, magnitude);
 
         // Should successfully convert to f64
         let result = parts.to_f64();
@@ -2640,12 +2654,7 @@ mod test {
 
     #[test]
     fn test_decimal_parts_debug() {
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![123, 456],
-        };
+        let parts = DecimalParts::new(true, 10, 2, 1958505087099);
         let debug_str = format!("{parts:?}");
         // Just verify the debug trait works - don't assert on exact format
         assert!(!debug_str.is_empty());
@@ -2661,12 +2670,7 @@ mod test {
 
     #[test]
     fn test_decimal_parts_scale_precision() {
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 5,
-            precision: 18,
-            int_parts: vec![100000],
-        };
+        let parts = DecimalParts::new(true, 18, 5, 100000);
 
         // Test that scale affects the decimal conversion
         let result = parts.to_f64();
@@ -2675,13 +2679,8 @@ mod test {
     }
 
     #[test]
-    fn test_decimal_parts_empty_int_parts() {
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 1,
-            int_parts: vec![],
-        };
+    fn test_decimal_parts_zero_magnitude() {
+        let parts = DecimalParts::new(true, 1, 0, 0);
 
         let result = parts.to_f64();
         assert_eq!(result, 0.0);
@@ -2689,12 +2688,7 @@ mod test {
 
     #[test]
     fn test_decimal_parts_single_int_part() {
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 5,
-            int_parts: vec![12345],
-        };
+        let parts = DecimalParts::new(true, 5, 0, 12345);
 
         let result = parts.to_f64();
         assert_eq!(result, 12345.0);
@@ -2780,160 +2774,76 @@ mod test {
 
     #[test]
     fn test_decimal_parts_equality_same() {
-        let parts1 = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![100, 200],
-        };
-        let parts2 = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![100, 200],
-        };
+        let parts1 = DecimalParts::new(true, 10, 2, 858993459300);
+        let parts2 = DecimalParts::new(true, 10, 2, 858993459300);
         assert_eq!(parts1, parts2);
     }
 
     #[test]
     fn test_decimal_parts_equality_different_sign() {
-        let parts1 = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![100],
-        };
-        let parts2 = DecimalParts {
-            is_positive: false,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![100],
-        };
+        let parts1 = DecimalParts::new(true, 10, 2, 100);
+        let parts2 = DecimalParts::new(false, 10, 2, 100);
         assert_ne!(parts1, parts2);
     }
 
     #[test]
     fn test_decimal_parts_equality_different_scale() {
-        let parts1 = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![100],
-        };
-        let parts2 = DecimalParts {
-            is_positive: true,
-            scale: 3,
-            precision: 10,
-            int_parts: vec![100],
-        };
+        let parts1 = DecimalParts::new(true, 10, 2, 100);
+        let parts2 = DecimalParts::new(true, 10, 3, 100);
         assert_ne!(parts1, parts2);
     }
 
     #[test]
     fn test_decimal_parts_equality_different_precision() {
-        let parts1 = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![100],
-        };
-        let parts2 = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 12,
-            int_parts: vec![100],
-        };
+        let parts1 = DecimalParts::new(true, 10, 2, 100);
+        let parts2 = DecimalParts::new(true, 12, 2, 100);
         assert_ne!(parts1, parts2);
     }
 
     #[test]
     fn test_decimal_parts_equality_different_length_with_zeros() {
-        let parts1 = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![100, 0, 0],
-        };
-        let parts2 = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![100],
-        };
+        let parts1 = DecimalParts::new(true, 10, 2, 100);
+        let parts2 = DecimalParts::new(true, 10, 2, 100);
         assert_eq!(parts1, parts2);
     }
 
     #[test]
     fn test_decimal_parts_equality_different_length_with_nonzeros() {
-        let parts1 = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![100, 200],
-        };
-        let parts2 = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![100],
-        };
+        let parts1 = DecimalParts::new(true, 10, 2, 858993459300);
+        let parts2 = DecimalParts::new(true, 10, 2, 100);
         assert_ne!(parts1, parts2);
     }
 
     #[test]
     fn test_decimal_parts_debug_format_positive() {
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![12345],
-        };
+        let parts = DecimalParts::new(true, 10, 2, 12345);
         let debug_str = format!("{parts:?}");
-        assert!(debug_str.contains("Decimal:"));
-        assert!(debug_str.contains("12345"));
+        assert!(debug_str.starts_with("Decimal: 123.45 "));
         assert!(debug_str.contains("Precision 10"));
         assert!(debug_str.contains("Scale 2"));
-        assert!(!debug_str.starts_with("Decimal: -"));
     }
 
     #[test]
     fn test_decimal_parts_debug_format_negative() {
-        let parts = DecimalParts {
-            is_positive: false,
-            scale: 3,
-            precision: 15,
-            int_parts: vec![54321],
-        };
+        let parts = DecimalParts::new(false, 15, 3, 54321);
         let debug_str = format!("{parts:?}");
-        assert!(debug_str.contains("Decimal: -"));
-        assert!(debug_str.contains("54321"));
+        assert!(debug_str.starts_with("Decimal: -54.321 "));
         assert!(debug_str.contains("Precision 15"));
         assert!(debug_str.contains("Scale 3"));
     }
 
     #[test]
-    fn test_decimal_parts_debug_format_multiple_parts() {
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 20,
-            int_parts: vec![100, 200, 300],
-        };
+    fn test_decimal_parts_debug_format_multi_word_magnitude() {
+        // Three 32-bit words: 100 | 200 << 32 | 300 << 64.
+        let parts = DecimalParts::new(true, 20, 0, 5534023222971858944100);
         let debug_str = format!("{parts:?}");
-        assert!(debug_str.contains("100"));
-        assert!(debug_str.contains("200"));
-        assert!(debug_str.contains("300"));
+        assert!(debug_str.starts_with("Decimal: 5534023222971858944100 "));
     }
 
     #[test]
     fn test_f64_conversion_high_scale() {
-        let int_parts = vec![12345];
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 10,
-            precision: 15,
-            int_parts,
-        };
+        let magnitude = 12345;
+        let parts = DecimalParts::new(true, 15, 10, magnitude);
         let result = parts.to_f64();
         // With scale of 10, 12345 should become 0.0000012345
         assert!((result - 0.0000012345).abs() < 0.0000000001);
@@ -2941,24 +2851,14 @@ mod test {
 
     #[test]
     fn test_f64_conversion_single_zero() {
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 5,
-            precision: 10,
-            int_parts: vec![0],
-        };
+        let parts = DecimalParts::new(true, 10, 5, 0);
         let result = parts.to_f64();
         assert_eq!(result, 0.0);
     }
 
     #[test]
     fn test_f64_conversion_negative_zero() {
-        let parts = DecimalParts {
-            is_positive: false,
-            scale: 0,
-            precision: 1,
-            int_parts: vec![0],
-        };
+        let parts = DecimalParts::new(false, 1, 0, 0);
         let result = parts.to_f64();
         assert_eq!(result, -0.0);
     }
@@ -2981,14 +2881,9 @@ mod test {
     }
 
     #[test]
-    fn test_decimal_parts_f64_conversion_with_many_int_parts() {
+    fn test_decimal_parts_f64_conversion_with_wide_magnitude() {
         // Test with 3 int parts
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 30,
-            int_parts: vec![1, 2, 3],
-        };
+        let parts = DecimalParts::new(true, 30, 0, 55340232229718589441);
         let result = parts.to_f64();
         // Just verify it doesn't panic and produces a value
         assert!(result > 0.0);
@@ -2997,36 +2892,16 @@ mod test {
     #[test]
     fn test_decimal_parts_equality_reversed_order() {
         // Test that order matters for trailing zeros
-        let parts1 = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![100],
-        };
-        let parts2 = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![0, 100],
-        };
+        let parts1 = DecimalParts::new(true, 10, 2, 100);
+        let parts2 = DecimalParts::new(true, 10, 2, 429496729600);
         // These should not be equal as trailing zeros are in different positions
         assert_ne!(parts1, parts2);
     }
 
     #[test]
     fn test_decimal_parts_equality_both_empty() {
-        let parts1 = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 1,
-            int_parts: vec![],
-        };
-        let parts2 = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 1,
-            int_parts: vec![],
-        };
+        let parts1 = DecimalParts::new(true, 1, 0, 0);
+        let parts2 = DecimalParts::new(true, 1, 0, 0);
         assert_eq!(parts1, parts2);
     }
 
@@ -3040,12 +2915,7 @@ mod test {
     #[test]
     fn test_decimal_parts_f64_negative_with_scale() {
         // Test negative number with scale
-        let parts = DecimalParts {
-            is_positive: false,
-            scale: 3,
-            precision: 10,
-            int_parts: vec![123456],
-        };
+        let parts = DecimalParts::new(false, 10, 3, 123456);
         let result = parts.to_f64();
         assert!((result + 123.456).abs() < 0.001);
     }
@@ -3053,18 +2923,8 @@ mod test {
     #[test]
     fn test_decimal_parts_equality_one_empty_one_zero() {
         // Test equality between empty vec and vec with zero
-        let parts1 = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 1,
-            int_parts: vec![],
-        };
-        let parts2 = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 1,
-            int_parts: vec![0],
-        };
+        let parts1 = DecimalParts::new(true, 1, 0, 0);
+        let parts2 = DecimalParts::new(true, 1, 0, 0);
         // Empty should equal to [0]
         assert_eq!(parts1, parts2);
     }
@@ -3072,12 +2932,7 @@ mod test {
     #[test]
     fn test_decimal_parts_debug_with_zero() {
         // Test Debug formatting with zero value
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 1,
-            int_parts: vec![0],
-        };
+        let parts = DecimalParts::new(true, 1, 0, 0);
         let debug_str = format!("{parts:?}");
         assert!(debug_str.contains("0"));
         assert!(debug_str.contains("F64 value: 0"));
@@ -3307,59 +3162,276 @@ mod test {
     #[test]
     fn test_decimal_parts_max_width_magnitude() {
         // Four words of all-ones is the widest magnitude a u128 holds.
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 38,
-            int_parts: vec![-1, -1, -1, -1],
-        };
+        let parts = DecimalParts::new(true, 38, 0, u128::MAX);
         assert_eq!(parts.to_decimal_string(), u128::MAX.to_string());
-        assert_eq!(parts.magnitude(), Some(u128::MAX));
+        assert_eq!(parts.word_count(), 4);
+        assert_eq!(parts.word(3), -1);
     }
 
     #[test]
-    fn test_decimal_parts_oversized_magnitude_does_not_overflow() {
-        // A malformed 5-word magnitude used to shift a u128 by 128 bits: a panic
-        // in debug builds and a wrapped, wrong value in release builds.
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 38,
-            int_parts: vec![1, 0, 0, 0, 1],
-        };
-        // 2^128 + 1, rendered exactly rather than wrapping onto the low word.
-        assert_eq!(
-            parts.to_decimal_string(),
-            "340282366920938463463374607431768211457"
-        );
-        assert!((parts.to_f64() - 3.402_823_669_209_385e38).abs() < 1e23);
-        assert_eq!(parts.magnitude(), None);
+    fn test_decimal_parts_from_words_ignores_oversized_words() {
+        // A 5-word magnitude used to shift a u128 by 128 bits: a panic in debug
+        // builds and a wrapped, wrong value in release builds. The fifth word is
+        // now dropped, which is what every wire encoder here already did.
+        let parts = DecimalParts::from_words(true, 38, 0, &[1, 0, 0, 0, 1]);
+        assert_eq!(parts.magnitude(), 1);
+        assert_eq!(parts.to_decimal_string(), "1");
     }
 
     #[test]
-    fn test_decimal_parts_oversized_magnitude_with_trailing_zero_words() {
-        // Zero-padded words past the fourth carry no magnitude, so the value
-        // still fits a u128 and both the string and typed paths agree on it.
-        let parts = DecimalParts {
-            is_positive: false,
-            scale: 2,
-            precision: 38,
-            int_parts: vec![12345, 0, 0, 0, 0, 0],
-        };
+    fn test_decimal_parts_from_words_with_trailing_zero_words() {
+        // Zero-padded words past the fourth carry no magnitude.
+        let parts = DecimalParts::from_words(false, 38, 2, &[12345, 0, 0, 0, 0, 0]);
+        assert_eq!(parts.magnitude(), 12345);
         assert_eq!(parts.to_decimal_string(), "-123.45");
-        assert_eq!(parts.magnitude(), Some(12345));
     }
 
     #[test]
     fn test_decimal_parts_empty_magnitude_is_zero() {
-        let parts = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 38,
-            int_parts: vec![],
-        };
-        assert_eq!(parts.magnitude(), Some(0));
+        let parts = DecimalParts::from_words(true, 38, 0, &[]);
+        assert_eq!(parts.magnitude(), 0);
+        assert_eq!(parts.word_count(), 1);
         assert_eq!(parts.to_decimal_string(), "0");
+    }
+
+    // Rendering equivalence against an independent oracle
+    mod decimal_format_tests {
+        use super::*;
+        use crate::datatypes::decoder::DECIMAL_STR_LEN;
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+
+        /// The pre-existing rendering algorithm, kept verbatim as the oracle.
+        ///
+        /// It shares no arithmetic with [`DecimalParts::format_into`]: digits
+        /// come from `u128::to_string`, the point is spliced by index, and the
+        /// sign is prepended. A formatter bug therefore cannot hide behind an
+        /// identical bug in the oracle.
+        fn reference(is_positive: bool, scale: u8, magnitude: u128) -> String {
+            let value_str = magnitude.to_string();
+
+            let result = if scale == 0 {
+                value_str
+            } else {
+                let scale_pos = scale as usize;
+                if value_str.len() <= scale_pos {
+                    format!("0.{}{}", "0".repeat(scale_pos - value_str.len()), value_str)
+                } else {
+                    let split_pos = value_str.len() - scale_pos;
+                    format!("{}.{}", &value_str[..split_pos], &value_str[split_pos..])
+                }
+            };
+
+            if is_positive {
+                result
+            } else {
+                format!("-{result}")
+            }
+        }
+
+        #[track_caller]
+        fn assert_matches_reference(is_positive: bool, precision: u8, scale: u8, magnitude: u128) {
+            let parts = DecimalParts::new(is_positive, precision, scale, magnitude);
+            let expected = reference(is_positive, scale, magnitude);
+
+            let mut buf = [0u8; DECIMAL_STR_LEN];
+            assert_eq!(
+                parts.format_into(&mut buf),
+                expected,
+                "format_into({is_positive}, {scale}, {magnitude})"
+            );
+            assert_eq!(parts.to_decimal_string(), expected);
+            assert_eq!(parts.to_string(), expected);
+        }
+
+        #[test]
+        fn exhaustive_small_magnitudes_match_reference() {
+            for magnitude in 0u128..=4096 {
+                for scale in 0u8..=6 {
+                    assert_matches_reference(true, 38, scale, magnitude);
+                    assert_matches_reference(false, 38, scale, magnitude);
+                }
+            }
+        }
+
+        #[test]
+        fn powers_of_ten_match_reference_at_every_scale() {
+            // 10^k and 10^k - 1 straddle every digit-count change, including the
+            // u64/u128 split the formatter pivots on.
+            let mut boundaries = vec![0u128, u128::MAX];
+            for k in 1..=38u32 {
+                let power = 10u128.pow(k);
+                boundaries.push(power);
+                boundaries.push(power - 1);
+            }
+            boundaries.push(u64::MAX as u128);
+            boundaries.push(u64::MAX as u128 + 1);
+            boundaries.push(10_000_000_000_000_000_000u128);
+
+            for &magnitude in &boundaries {
+                // Every scale, so `s % 4 != 0` at maximum magnitude is covered:
+                // that is the shape the deferred base-10000 export must not
+                // pre-multiply, because 10^38 * 100 wraps a u128.
+                for scale in 0..=38u8 {
+                    assert_matches_reference(true, 38, scale, magnitude);
+                    assert_matches_reference(false, 38, scale, magnitude);
+                }
+            }
+        }
+
+        #[test]
+        fn randomized_magnitudes_match_reference() {
+            let mut rng = StdRng::seed_from_u64(0x5EED_D3C1);
+            for _ in 0..20_000 {
+                // Uniform over widths, not over u128, so the one-, two-, three-
+                // and four-word wire shapes are all exercised.
+                let bits = rng.random_range(1..=128u32);
+                let magnitude = if bits == 128 {
+                    rng.random::<u128>()
+                } else {
+                    rng.random::<u128>() & ((1u128 << bits) - 1)
+                };
+                let scale = rng.random_range(0..=38u8);
+                let precision = rng.random_range(1..=38u8);
+                assert_matches_reference(rng.random(), precision, scale, magnitude);
+            }
+        }
+
+        #[test]
+        fn precision_one_to_thirty_eight_match_reference() {
+            for precision in 1..=38u8 {
+                // The largest magnitude the precision admits, and one below it.
+                let max = 10u128.pow(precision as u32) - 1;
+                for scale in 0..=precision {
+                    assert_matches_reference(true, precision, scale, max);
+                    assert_matches_reference(false, precision, scale, max);
+                    assert_matches_reference(true, precision, scale, max / 10);
+                }
+            }
+        }
+
+        #[test]
+        fn negative_zero_renders_with_sign() {
+            let parts = DecimalParts::new(false, 18, 0, 0);
+            assert_eq!(parts.to_string(), "-0");
+            assert_eq!(DecimalParts::new(false, 18, 4, 0).to_string(), "-0.0000");
+        }
+
+        #[test]
+        fn zero_with_scale_renders_padded() {
+            let parts = DecimalParts::new(true, 18, 6, 0);
+            assert_eq!(parts.to_string(), "0.000000");
+        }
+
+        #[test]
+        fn magnitude_narrower_than_scale_is_zero_padded() {
+            let parts = DecimalParts::new(true, 18, 3, 5);
+            assert_eq!(parts.to_string(), "0.005");
+        }
+
+        #[test]
+        fn out_of_domain_scale_does_not_overrun_the_buffer() {
+            // `scale` comes off the wire unvalidated. No `decimal` reaches 255,
+            // but the formatter must not index past its buffer if one claims to.
+            let parts = DecimalParts::new(false, 38, u8::MAX, u128::MAX);
+            let mut buf = [0u8; DECIMAL_STR_LEN];
+            assert!(parts.format_into(&mut buf).len() <= DECIMAL_STR_LEN);
+        }
+
+        #[test]
+        fn format_into_leaves_the_buffer_reusable() {
+            let mut buf = [0u8; DECIMAL_STR_LEN];
+            for (magnitude, scale, expected) in [
+                (1u128, 0u8, "1"),
+                (123456u128, 4u8, "12.3456"),
+                (0u128, 0u8, "0"),
+            ] {
+                let parts = DecimalParts::new(true, 38, scale, magnitude);
+                assert_eq!(parts.format_into(&mut buf), expected);
+            }
+        }
+    }
+
+    // Constructors that used to wrap silently
+    mod decimal_constructor_tests {
+        use super::*;
+
+        #[test]
+        fn from_i64_rejects_a_scale_that_overflows_the_magnitude() {
+            // 10^38 fits, but i64::MAX * 10^38 does not. This used to wrap.
+            assert!(DecimalParts::from_i64(1, 38, 38).is_ok());
+            let err = DecimalParts::from_i64(i64::MAX, 38, 38).unwrap_err();
+            assert!(matches!(err, crate::error::Error::TypeConversionError(_)));
+            assert!(DecimalParts::from_i64(1, 38, 39).is_err());
+        }
+
+        #[test]
+        fn from_i64_round_trips_through_the_formatter() {
+            let parts = DecimalParts::from_i64(-12345, 18, 3).unwrap();
+            assert_eq!(parts.magnitude(), 12_345_000);
+            assert_eq!(parts.to_string(), "-12345.000");
+        }
+
+        #[test]
+        fn from_string_rejects_a_magnitude_wider_than_128_bits() {
+            // Only reachable by declaring a precision past SQL Server's 38.
+            let wide = "1".repeat(40);
+            assert!(DecimalParts::from_string(&wide, 40, 0).is_err());
+        }
+
+        #[test]
+        fn from_string_accepts_the_widest_valid_decimal() {
+            let max = "9".repeat(38);
+            let parts = DecimalParts::from_string(&max, 38, 0).unwrap();
+            assert_eq!(parts.magnitude(), 10u128.pow(38) - 1);
+            assert_eq!(parts.to_string(), max);
+        }
+    }
+
+    // Little-endian word view used by the wire encoders and the JS FFI
+    mod decimal_word_tests {
+        use super::*;
+
+        #[test]
+        fn words_round_trip_through_from_words() {
+            for magnitude in [
+                0u128,
+                1,
+                u32::MAX as u128,
+                u32::MAX as u128 + 1,
+                u64::MAX as u128,
+                u64::MAX as u128 + 1,
+                u128::MAX,
+                12_345_678_901_234_567_890,
+            ] {
+                let parts = DecimalParts::new(false, 38, 7, magnitude);
+                let words: Vec<i32> = (0..parts.word_count()).map(|i| parts.word(i)).collect();
+                assert_eq!(DecimalParts::from_words(false, 38, 7, &words), parts);
+            }
+        }
+
+        #[test]
+        fn word_count_covers_the_significant_words() {
+            let cases = [
+                (0u128, 1usize),
+                (1, 1),
+                (u32::MAX as u128, 1),
+                (u32::MAX as u128 + 1, 2),
+                (u64::MAX as u128, 2),
+                (u64::MAX as u128 + 1, 3),
+                (u128::MAX, 4),
+            ];
+            for (magnitude, expected) in cases {
+                let parts = DecimalParts::new(true, 38, 0, magnitude);
+                assert_eq!(parts.word_count(), expected, "magnitude {magnitude}");
+            }
+        }
+
+        #[test]
+        fn words_past_the_fourth_are_zero() {
+            let parts = DecimalParts::new(true, 38, 0, u128::MAX);
+            assert_eq!(parts.word(4), 0);
+            assert_eq!(parts.word(usize::MAX), 0);
+        }
     }
 
     // Vector deserialization tests
@@ -4805,7 +4877,44 @@ mod test {
             assert_eq!(reader.read_int32().await.unwrap(), trailing);
         }
 
-        // ── Time scale branches ────────────────────────────────────────
+        #[tokio::test]
+        async fn decimal_wire_widths_reassemble_the_magnitude() {
+            // The four lengths a real server emits: 1 sign byte plus 4, 8, 12 or
+            // 16 magnitude bytes.
+            let cases: [(u8, u128); 4] = [
+                (5, 0xDEAD_BEEF),
+                (9, 0x0123_4567_89AB_CDEF),
+                (13, 0x0000_0009_8765_4321_0FED_CBA9),
+                (17, u128::MAX >> 1),
+            ];
+
+            for (length, magnitude) in cases {
+                let md = precision_scale_metadata(TdsDataType::DecimalN, length.into(), 38, 0);
+                let mut buf = vec![length, 1u8];
+                let bytes = magnitude.to_le_bytes();
+                buf.extend_from_slice(&bytes[..(length - 1) as usize]);
+
+                match assert_decode_equivalence(buf, &md).await {
+                    ColumnValues::Decimal(parts) => {
+                        assert_eq!(parts.magnitude(), magnitude, "wire length {length}");
+                        assert!(parts.is_positive);
+                    }
+                    other => panic!("expected Decimal, got {other:?}"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn decimal_negative_sign_byte_is_honored() {
+            let md = precision_scale_metadata(TdsDataType::DecimalN, 5, 18, 2);
+            let mut buf = vec![5u8, 0u8];
+            buf.extend_from_slice(&12345i32.to_le_bytes());
+
+            match assert_decode_equivalence(buf, &md).await {
+                ColumnValues::Decimal(parts) => assert_eq!(parts.to_string(), "-123.45"),
+                other => panic!("expected Decimal, got {other:?}"),
+            }
+        }
 
         #[tokio::test]
         async fn time_scale_0() {

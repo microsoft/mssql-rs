@@ -463,16 +463,11 @@ mod always_encrypted {
     async fn roundtrip_decimal_and_money_types() {
         ae_test!(|h| {
             // 1234.5678 as decimal(18,4).
-            let decimal = DecimalParts {
-                is_positive: true,
-                int_parts: vec![12_345_678],
-                scale: 4,
-                precision: 18,
-            };
+            let decimal = DecimalParts::new(true, 18, 4, 12345678);
             h.roundtrip(
                 "DECIMAL(18,4)",
                 "DETERMINISTIC",
-                SqlType::Decimal(Some(decimal.clone())),
+                SqlType::Decimal(Some(decimal)),
                 |v| match v {
                     ColumnValues::Decimal(value) => assert_eq!(value, &decimal),
                     other => panic!("expected decimal, got {other:?}"),
@@ -480,16 +475,11 @@ mod always_encrypted {
             )
             .await;
 
-            let numeric = DecimalParts {
-                is_positive: false,
-                int_parts: vec![98_765],
-                scale: 2,
-                precision: 12,
-            };
+            let numeric = DecimalParts::new(false, 12, 2, 98765);
             h.roundtrip(
                 "NUMERIC(12,2)",
                 "DETERMINISTIC",
-                SqlType::Numeric(Some(numeric.clone())),
+                SqlType::Numeric(Some(numeric)),
                 |v| match v {
                     ColumnValues::Numeric(value) => assert_eq!(value, &numeric),
                     other => panic!("expected numeric, got {other:?}"),
@@ -1789,18 +1779,13 @@ mod always_encrypted {
             assert_eq!(rows[0][0], ColumnValues::BigInt(9_000_000_000_000_i64));
 
             // decimal(18,4) round-trip (1234.5678).
-            let decimal = DecimalParts {
-                is_positive: true,
-                int_parts: vec![12_345_678],
-                scale: 4,
-                precision: 18,
-            };
+            let decimal = DecimalParts::new(true, 18, 4, 12345678);
             let table = h
                 .bulk_copy_vals(
                     "DECIMAL(18,4)",
                     "DETERMINISTIC",
                     "NOT NULL",
-                    vec![ColumnValues::Decimal(decimal.clone())],
+                    vec![ColumnValues::Decimal(decimal)],
                 )
                 .await;
             let rows = h

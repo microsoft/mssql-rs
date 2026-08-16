@@ -222,9 +222,9 @@ impl RowWriter for BinaryRowWriter {
         self.row_data.push(val.is_positive as u8);
         self.row_data.push(val.scale);
         self.row_data.push(val.precision);
-        self.row_data.push(val.int_parts.len() as u8);
-        for part in &val.int_parts {
-            self.row_data.extend_from_slice(&part.to_le_bytes());
+        self.row_data.push(val.word_count() as u8);
+        for i in 0..val.word_count() {
+            self.row_data.extend_from_slice(&val.word(i).to_le_bytes());
         }
     }
 
@@ -234,9 +234,9 @@ impl RowWriter for BinaryRowWriter {
         self.row_data.push(val.is_positive as u8);
         self.row_data.push(val.scale);
         self.row_data.push(val.precision);
-        self.row_data.push(val.int_parts.len() as u8);
-        for part in &val.int_parts {
-            self.row_data.extend_from_slice(&part.to_le_bytes());
+        self.row_data.push(val.word_count() as u8);
+        for i in 0..val.word_count() {
+            self.row_data.extend_from_slice(&val.word(i).to_le_bytes());
         }
     }
 

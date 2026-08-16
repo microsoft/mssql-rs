@@ -429,7 +429,7 @@ mod tests {
     fn write_column_value_bridges_numeric() {
         let mut writer = DefaultRowWriter::new(1);
         let parts = DecimalParts::from_i64(12345, 5, 0).unwrap();
-        write_column_value(&mut writer, 0, ColumnValues::Numeric(parts.clone()));
+        write_column_value(&mut writer, 0, ColumnValues::Numeric(parts));
         let row = writer.take_row();
         assert_eq!(row[0], ColumnValues::Numeric(parts));
     }
