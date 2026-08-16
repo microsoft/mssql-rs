@@ -212,10 +212,20 @@ def isolation(cur):
 # Pool of size 1 so both acquisitions land on the same physical connection.
 mssql_python.pooling(max_size=1, idle_timeout=30)
 
+from mssql_python.constants import ConstantsDDBC
+
 c1 = mssql_python.connect(CONN)
 cur1 = c1.cursor()
 cur1.execute("SELECT @@SPID"); spid1 = cur1.fetchone()[0]
-cur1.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")  # via T-SQL: see (f) caveat
+# Set isolation through the ODBC attribute, which is the path mssql-python PR #343
+# re-applies on checkout. Raw `SET TRANSACTION ISOLATION LEVEL` T-SQL is the
+# documented non-goal (see (f)): it leaves the driver's cached level stale, so
+# the checkout SET can short-circuit and the assertion below would legitimately
+# fail with SERIALIZABLE.
+c1.set_attr(
+    ConstantsDDBC.SQL_ATTR_TXN_ISOLATION.value,
+    ConstantsDDBC.SQL_TXN_SERIALIZABLE.value,
+)
 c1.close()  # returns to pool
 
 c2 = mssql_python.connect(CONN)

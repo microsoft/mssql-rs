@@ -172,7 +172,12 @@ TEST_F(ConnectionPoolLiveTest, ResetRestoresCleanStateForNextBorrower) {
     Exec("CREATE TABLE #pool_probe(i int)");
     Exec("INSERT INTO #pool_probe VALUES (1), (2)");
     ASSERT_TRUE(TempTableExists("#pool_probe"));
-    Exec("USE master");
+    // Switch to a database that is genuinely different from the login default,
+    // so the "database restored" assertion below cannot pass vacuously when the
+    // test connects to master (a supported ODBC_TEST_DATABASE).
+    const SQLINTEGER master_db = Scalar("SELECT DB_ID('master')");
+    Exec(login_db == master_db ? "USE tempdb" : "USE master");
+    ASSERT_NE(login_db, DatabaseId()) << "borrower A must actually change database";
     EXPECT_EQ(4, ServerIsolation()) << "A raised isolation to SERIALIZABLE";
     ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
     Exec("INSERT INTO #pool_probe VALUES (3)");

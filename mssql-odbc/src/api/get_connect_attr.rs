@@ -159,12 +159,25 @@ fn sql_get_connect_attr_w_safe(
             // healthy"; a connection that failed silently while idle is
             // recovered on the next operation. Disconnected/never-connected
             // reads DEAD so a pool discards it.
-            let alive = state.connection_state == ConnectionState::Connected
-                && state
+            //
+            // A connected DBC whose client is momentarily absent is mid-claim:
+            // another thread owns it for I/O (`claim_dbc_client` /
+            // `claim_connection`). That is an in-flight healthy connection, not
+            // a dead one, so it reads "not known dead" — reporting DEAD here
+            // would let a concurrent pool liveness check discard a connection
+            // that is merely busy.
+            let known_dead = match state.connection_state {
+                ConnectionState::Connected => state
                     .client
                     .as_ref()
-                    .is_some_and(|client| !client.is_connection_dead());
-            let value = if alive { SQL_CD_FALSE } else { SQL_CD_TRUE };
+                    .is_some_and(|client| client.is_connection_dead()),
+                _ => true,
+            };
+            let value = if known_dead {
+                SQL_CD_TRUE
+            } else {
+                SQL_CD_FALSE
+            };
             unsafe { write_if_some(value_ptr as *mut u32, value) };
             debug!(value, "SQLGetConnectAttrW: connection-dead returned");
             SQL_SUCCESS
@@ -367,9 +380,11 @@ mod tests {
     }
 
     #[test]
-    fn connection_dead_reports_true_when_marked_connected_without_client() {
-        // `Connected` state but no client (mid-operation, taken) still reads
-        // DEAD: liveness is a property of the client, not the state flag.
+    fn connection_dead_reports_false_when_connected_with_client_claimed() {
+        // `Connected` with the client momentarily taken means another thread
+        // owns it for I/O (`claim_dbc_client`). That is a busy-but-healthy
+        // connection, so it must read "not known dead" — reporting DEAD would
+        // let a concurrent pool liveness check discard an in-flight connection.
         let h = TestHandles::with_env_dbc();
         h.mark_dbc_connected();
         let mut out: u32 = 0;
@@ -383,7 +398,7 @@ mod tests {
             )
         };
         assert_eq!(get, SQL_SUCCESS);
-        assert_eq!(out, SQL_CD_TRUE);
+        assert_eq!(out, SQL_CD_FALSE);
     }
 
     #[test]

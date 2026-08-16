@@ -406,7 +406,14 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // step with the server.
     let started = match dbc.inner.lock() {
         Ok(state) => state.local_tran_started,
-        Err(_) => false,
+        Err(_) => {
+            // A poisoned mutex leaves the transaction flag unreadable, so a
+            // required rollback could be skipped. Fail deterministically like
+            // every other DBC lock site rather than resetting on a DBC whose
+            // state is already compromised.
+            error!("{OP}: dbc mutex poisoned");
+            return SQL_ERROR;
+        }
     };
     let result = if started && client.has_active_transaction() {
         debug!("{OP}: rolling back live local transaction before reset");
