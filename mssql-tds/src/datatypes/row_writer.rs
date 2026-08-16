@@ -7,7 +7,7 @@ use crate::datatypes::column_values::{
 };
 use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sql_json::SqlJson;
-use crate::datatypes::sql_string::SqlString;
+use crate::datatypes::sql_string::{EncodingType, SqlString};
 use crate::datatypes::sql_vector::SqlVector;
 use crate::datatypes::sqldatatypes::TdsDataType;
 use uuid::Uuid;
@@ -72,6 +72,71 @@ pub trait RowWriter {
     fn write_variant_base_type(&mut self, _col: usize, _base: TdsDataType) {}
     /// Signals the end of the current row.
     fn end_row(&mut self);
+
+    /// Offers the writer the chance to supply the final storage for a
+    /// known-length PLP string or binary value, so the decoder reads the
+    /// payload straight from the wire into it.
+    ///
+    /// This is the sink half of the trait. It exists for consumers that own a
+    /// destination buffer already — a PostgreSQL FDW writing into `palloc`ed
+    /// varlena memory, an Arrow builder, an N-API byte encoder — and lets them
+    /// take the payload without `mssql-tds` allocating a `Vec` per value that
+    /// the consumer then copies out of and drops.
+    ///
+    /// Returning `None` is the default and leaves the value on the owned
+    /// [`Self::write_bytes`] / [`Self::write_string`] path, so writers that do
+    /// not opt in are unaffected.
+    ///
+    /// # Which values are offered
+    ///
+    /// Only the `MAX` types, and only when the server frames them with a known
+    /// total length. `USHORTLEN` values (`varchar(n)`, `varbinary(n)`), the
+    /// legacy `TEXT`/`NTEXT`/`IMAGE` `LONGLEN` types, `PLP_UNKNOWNLEN` streams
+    /// and NULLs all stay on the owned path unconditionally.
+    ///
+    /// The short types are excluded on measured grounds rather than principle:
+    /// offering a destination there costs every writer that declines, because
+    /// the payload read then sits behind a branch on the hottest path in the
+    /// decoder. On a 39-int + 9-`varchar(6)` scan that cost `DefaultRowWriter`
+    /// ~5%, which is not worth paying for a per-value saving of a few bytes.
+    /// Confining the hook to PLP puts it where a single value can be megabytes
+    /// and where the surrounding chunk loop already dominates the branch.
+    ///
+    /// # Contract
+    ///
+    /// A writer that returns `Some` must return a slice of exactly `length`
+    /// bytes and receives exactly one matching [`Self::commit_value`] call for
+    /// the same `col`. It does not additionally receive `write_bytes` or
+    /// `write_string` for that value.
+    ///
+    /// `length` counts bytes as framed on the wire, not characters. Raw wire
+    /// bytes are handed over as-is together with their [`ValueKind`], so a
+    /// consumer that transcodes downstream never pays for a transcode here.
+    /// A writer whose storage cannot hold the wire form — because it needs to
+    /// transcode from, say, [`EncodingType::Utf16`] first — returns `None` for
+    /// that value and receives it through [`Self::write_string`] as before.
+    fn value_destination<'a>(
+        &'a mut self,
+        _col: usize,
+        _kind: ValueKind<'_>,
+        _length: usize,
+    ) -> Option<&'a mut [u8]> {
+        None
+    }
+
+    /// Completes a value whose storage came from [`Self::value_destination`].
+    ///
+    /// `complete` is `false` when decoding failed partway through; the slice
+    /// contents are then unspecified and the writer must discard the value.
+    fn commit_value(&mut self, _col: usize, _complete: bool) {}
+}
+
+/// The kind of value a [`RowWriter::value_destination`] request is for.
+pub enum ValueKind<'a> {
+    /// A binary value, handed over verbatim.
+    Bytes,
+    /// A character value, handed over as raw wire bytes in this encoding.
+    String(&'a EncodingType),
 }
 
 /// Default implementation that assembles `Vec<ColumnValues>`, preserving
