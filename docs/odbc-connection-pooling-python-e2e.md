@@ -77,23 +77,29 @@ Run each scenario twice — once against this string, once against
 msodbcsql18 is the pass criterion, mirroring the `-CompareWithMsodbcsql` gate the
 C++ e2e already uses.
 
-### Which reset attribute the pool must send (platform-dependent)
+### Which reset attribute reaches the driver (depends on the caller, not the OS)
 
-`SQL_ATTR_RESET_CONNECTION` (116) is reserved for **Driver Manager → driver** use;
-an application cannot set it directly, and the Windows DM rejects an app that tries
-with `HY092` before the call reaches any driver (msodbcsql18 fails identically — see
-plan D10). Applications use the vendor attribute `SQL_COPT_SS_RESET_CONNECTION`
-(1246, value `SQL_RESET_YES`) on Windows instead; unixODBC has no such gate, so 116
-works on Linux/macOS. Our driver accepts **both** identifiers on every platform, so
-either spelling exercises the same reset path.
+`SQL_ATTR_RESET_CONNECTION` (116) is an ODBC 3.8 attribute reserved for **Driver
+Manager → driver** use, and the Windows DM enforces that: a DM-mediated application
+that sets it gets `HY092` back before the call reaches any driver (msodbcsql18 fails
+identically — see plan D10). Such applications use the msodbcsql vendor attribute
+`SQL_COPT_SS_RESET_CONNECTION` (1246, value `SQL_RESET_YES`) instead, which the DM
+passes through untouched. unixODBC applies no such gate, so 116 reaches the driver on
+Linux/macOS.
 
-`mssql-python` currently defines only `SQL_ATTR_RESET_CONNECTION = 116`
-(`mssql_python/constants.py`) and sends it from `Connection::reset()`. When running
-these scenarios on **Windows**, verify what its `reset()` actually returns: if it
-surfaces `HY092`, that is the DM gate and is *not* a defect in this driver —
-reproduce it against msodbcsql18 to confirm, and file it against `mssql-python` to
-add the vendor spelling for Windows. On Linux/macOS the existing call works
-unchanged.
+**`mssql-python` is not affected by that gate: it does not use a Driver Manager.** It
+loads the driver library directly (`LoadDriverLibrary()` in
+`mssql_python/pybind/ddbc_bindings.cpp` — `LoadLibraryW` on Windows, `dlopen`
+elsewhere), resolves the exports via `GetProcAddress`/`dlsym` into pointers like
+`SQLSetConnectAttr_ptr`, and calls them itself. Its
+`SQL_ATTR_RESET_CONNECTION = 116` (`mssql_python/constants.py`) therefore lands on our
+exported `SQLSetConnectAttrW` unchanged on **every** platform, Windows included. No
+change is needed on the mssql-python side, and `HY092` is not an expected outcome for
+these scenarios — if one appears, it came from our driver and is a real defect.
+
+The driver accepts **both** identifiers on every platform, so the direct-loading
+consumer (116) and DM-mediated callers such as the C++ e2e suite (1246 on Windows)
+exercise the same reset path.
 
 ## Scenarios
 

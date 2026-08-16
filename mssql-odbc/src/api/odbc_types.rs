@@ -77,8 +77,10 @@ pub const SQL_ATTR_ANSI_APP: SqlInteger = 115;
 // out.
 pub const SQL_ATTR_RESET_CONNECTION: SqlInteger = 116;
 pub const SQL_ATTR_CONNECTION_DEAD: SqlInteger = 1209;
-// Windows applications use the msodbcsql spelling because the Driver Manager
-// reserves SQL_ATTR_RESET_CONNECTION for its own pooling protocol.
+// Callers reaching us through the Windows Driver Manager must use the msodbcsql
+// spelling: the DM reserves SQL_ATTR_RESET_CONNECTION for its own pooling
+// protocol and rejects it from applications. Callers that load this driver
+// directly (mssql-python) send SQL_ATTR_RESET_CONNECTION on every platform.
 pub const SQL_COPT_SS_RESET_CONNECTION: SqlInteger = 1246;
 
 // `SQL_ATTR_RESET_CONNECTION` value. Only `SQL_RESET_CONNECTION_YES` is defined;
