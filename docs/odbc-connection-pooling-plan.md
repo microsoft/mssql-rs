@@ -45,6 +45,7 @@ Reviewed the real driver: `Sql/Ntdbms/sqlncli/odbc/{sqlcmisc.cpp, sqlcfunc.cpp, 
 - **D8 — recovery lock (minor).** `SQL_ATTR_CONNECTION_DEAD` get takes the recovery critical section when session recovery is enabled (`sqlcmisc.cpp:2995-2998`). In mssql-rs, peeking liveness under the short DBC mutex is the equivalent — do not `take()` the client.
 - **D9 — `sp_reset_connection` does NOT reset transaction isolation level (VERIFIED against `mssql-python` tip + msodbcsql).** This is a documented SQL Server limitation. **mssql-python's pool works around it explicitly:** `Connection::reset()` on GitHub `main` (SHA `3502aba`, from **[PR #343](https://github.com/microsoft/mssql-python/pull/343)** / AB#40573 / GH #337) issues **two** ODBC calls on every checkout — first `SQLSetConnectAttr(SQL_ATTR_RESET_CONNECTION, YES)` (lines 500-501), then `SQLSetConnectAttr(SQL_ATTR_TXN_ISOLATION, SQL_TXN_READ_COMMITTED)` (lines 514-515) — with the comment *"SQL_ATTR_RESET_CONNECTION does NOT reset the transaction isolation level."* **msodbcsql matches this:** the driver re-emits `SET TRANSACTION ISOLATION LEVEL <x>` itself (`sqlcstr.cpp:54-60`, `sqlcfunc.cpp:2007` startup, `sqlcmisc.cpp:1760-1827` on set-attr); the login default it restores to is READ COMMITTED (`sqlcconn.cpp:5494`, `sqlcfunc.cpp:3463`). **Impact on mssql-rs:** our `SQL_ATTR_TXN_ISOLATION` handler already emits a real `SET TRANSACTION ISOLATION LEVEL` batch and caches the level (`api/txn.rs:462`), so it satisfies the workaround — **B4 must keep this path working and ensure the checkout SET carries the armed reset bit.** **Caveat:** if a borrower changed isolation via raw T-SQL (not the attribute), our cache is stale and the checkout READ COMMITTED short-circuits (`txn.rs:487`) → isolation leaks. mssql-python's fix/test only cover the attribute path, so this is a **shared, documented limitation** (see Non-goals), not a regression we introduce.
   - **Stale-local-clone note:** my local `C:\work\mssql-python` is the ADO mirror at tip `e645151 (RELEASE 1.0.0)`, which predates #343 — its `reset()` has only the single reset call. **Authoritative source is GitHub `main`.** Refresh the local clone before future reads.
+- **D10 — on Windows an application cannot set `SQL_ATTR_RESET_CONNECTION` (VERIFIED against both drivers on the Windows e2e legs).** Attribute 116 is reserved for **Driver Manager → driver** communication: the DM sets it itself just before returning a connection to *its own* pool, and the ODBC 3.8 driver guidance states an application cannot set it directly. The Windows DM enforces that, answering `HY092` ("Option type out of range") before the call reaches any driver — the installed msodbcsql18 fails identically, so this is not a gap in our driver. This is why msodbcsql defines the vendor attribute `SQL_COPT_SS_RESET_CONNECTION` (`SQL_COPT_SS_BASE_EX+6` = 1246, value `SQL_RESET_YES`, `odbcss.h`): vendor-range attributes are passed through untouched, so that is the spelling an application uses on Windows. unixODBC applies no such gate, so 116 reaches the driver on Linux/macOS. **Impact:** B1/B3 must accept **both** identifiers on every platform so a client-side pool works whichever one it sends, and e2e tests must select the platform-appropriate spelling. Note the DM gate is about *who may set the attribute*, not about the driver's advertised ODBC version — registering `DriverODBCVer = "03.80"` does **not** lift it.
 
 ## The actual gaps
 1. `mssql-tds`: ResetConnection ENVCHANGE **acknowledgement** is handled in ~5 token-draining spots (`tds_client.rs:1232, 2431, 2607, 3975, 4429`) and each only calls `session_state_table.reset()`. On a real server reset the session-bound client caches are now stale but are **not** cleared, and negotiated login defaults are not restored.
@@ -83,7 +84,7 @@ Reviewed the real driver: `Sql/Ntdbms/sqlncli/odbc/{sqlcmisc.cpp, sqlcfunc.cpp, 
 
 ### B1. Constants & bookkeeping (`api/odbc_types.rs`)
 - Add `SQL_ATTR_CONNECTION_DEAD = 1209`, `SQL_CD_TRUE = 1`, `SQL_CD_FALSE = 0`.
-- Add `SQL_ATTR_RESET_CONNECTION = 116`, `SQL_RESET_CONNECTION_YES = 1`.
+- Add `SQL_ATTR_RESET_CONNECTION = 116`, `SQL_RESET_CONNECTION_YES = 1`, and the msodbcsql vendor spelling `SQL_COPT_SS_RESET_CONNECTION = 1246` (D10 — the only one a Windows application can set).
 - No new `DbcState` fields needed for liveness/reset (they read through to the client); autocommit/isolation bookkeeping already present.
 
 ### B2. `SQLGetConnectAttr(SQL_ATTR_CONNECTION_DEAD)` (`api/get_connect_attr.rs`)
@@ -92,7 +93,8 @@ Reviewed the real driver: `Sql/Ntdbms/sqlncli/odbc/{sqlcmisc.cpp, sqlcfunc.cpp, 
 - **Disconnected/never-connected ⇒ `SQL_CD_TRUE`** (D1: msodbcsql defaults this attribute to DEAD until a successful token read). Pool must discard.
 - Do not hold the mutex across I/O — cached read, so a short lock is fine; **peek the client without `take`** (D8: msodbcsql takes the recovery lock; the brief DBC mutex is the mssql-rs equivalent).
 
-### B3. `SQLSetConnectAttr(SQL_ATTR_RESET_CONNECTION, SQL_RESET_CONNECTION_YES)` (`api/set_connect_attr.rs` + `api/txn.rs`)
+### B3. `SQLSetConnectAttr(<reset attribute>, YES)` (`api/set_connect_attr.rs` + `api/txn.rs`)
+- **Accept both spellings (D10):** `SQL_ATTR_RESET_CONNECTION` (116, the route unixODBC allows an app to use) and `SQL_COPT_SS_RESET_CONNECTION` (1246, the only route the Windows DM lets an app use). Both dispatch to the same handler.
 - **Value validation (D7):** accept only `SQL_RESET_CONNECTION_YES(1)`; any other value ⇒ `HY024`.
 - Claim the idle client via `claim_dbc_client` (rejects busy/`active_stmt`/open-cursor and disconnected — reuse its diagnostics: `ERR_CONNECTION_BUSY`, `ERR_CONNECTION_DOES_NOT_EXIST`). **D7:** verify `ERR_CONNECTION_DOES_NOT_EXIST` surfaces `08003` for the disconnected case, matching msodbcsql.
 - Call `client.prepare_reset_connection(false)` (full reset, no txn preservation — pool checkout does not preserve).
@@ -142,7 +144,7 @@ Reviewed the real driver: `Sql/Ntdbms/sqlncli/odbc/{sqlcmisc.cpp, sqlcfunc.cpp, 
 Maps to the work item acceptance criteria:
 1. `mssql-python` reuses a physical Rust connection with no second Rust pool.
 2. `SQL_ATTR_CONNECTION_DEAD` returns cached known-dead status, no probe.
-3. `SQL_ATTR_RESET_CONNECTION` arms a real TDS reset; fails cleanly when disconnected/busy.
+3. The reset attribute arms a real TDS reset (under both the standard and vendor spellings, D10); fails cleanly when disconnected/busy.
 4. Reset processed & acknowledged before checkout succeeds; borrower B sees no leaked temp table / txn / db / isolation / SET options.
 5. `SQL_ATTR_TXN_ISOLATION` applies real server-side change incl. reset to READ COMMITTED.
 6. Autocommit set/get + commit/rollback lifecycle functional.

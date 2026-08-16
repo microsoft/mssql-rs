@@ -77,6 +77,24 @@ Run each scenario twice — once against this string, once against
 msodbcsql18 is the pass criterion, mirroring the `-CompareWithMsodbcsql` gate the
 C++ e2e already uses.
 
+### Which reset attribute the pool must send (platform-dependent)
+
+`SQL_ATTR_RESET_CONNECTION` (116) is reserved for **Driver Manager → driver** use;
+an application cannot set it directly, and the Windows DM rejects an app that tries
+with `HY092` before the call reaches any driver (msodbcsql18 fails identically — see
+plan D10). Applications use the vendor attribute `SQL_COPT_SS_RESET_CONNECTION`
+(1246, value `SQL_RESET_YES`) on Windows instead; unixODBC has no such gate, so 116
+works on Linux/macOS. Our driver accepts **both** identifiers on every platform, so
+either spelling exercises the same reset path.
+
+`mssql-python` currently defines only `SQL_ATTR_RESET_CONNECTION = 116`
+(`mssql_python/constants.py`) and sends it from `Connection::reset()`. When running
+these scenarios on **Windows**, verify what its `reset()` actually returns: if it
+surfaces `HY092`, that is the DM gate and is *not* a defect in this driver —
+reproduce it against msodbcsql18 to confirm, and file it against `mssql-python` to
+add the vendor spelling for Windows. On Linux/macOS the existing call works
+unchanged.
+
 ## Scenarios
 
 Each maps to the plan's Definition of Done. "Expected" is the behavior that must
@@ -117,7 +135,9 @@ match msodbcsql18.
   cleared the client's session-bound prepared-handle cache, so the driver
   re-prepares against the fresh session instead of aliasing a dropped or unrelated
   server handle. No `08S01` / invalid-handle error.
-- **Backing in-repo:** `connection_pool_test.cpp::PreparedStatementSurvivesResetViaReprepare`;
+- **Backing in-repo:** `connection_pool_test.cpp::PreparedStatementUsableAcrossReset` (shared
+  contract, runs on both drivers) and `::PreparedStatementSurvivesResetViaReprepare` (the
+  mssql-odbc-specific transparent re-prepare);
   `reset_connection_ack_clears_caches_and_restores_login_defaults` (TDS unit).
 
 ### (d) Concurrent checkout
