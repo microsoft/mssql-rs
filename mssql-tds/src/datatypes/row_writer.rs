@@ -83,6 +83,12 @@ pub trait RowWriter {
     /// take the payload without `mssql-tds` allocating a `Vec` per value that
     /// the consumer then copies out of and drops.
     ///
+    /// The saving is the redundant allocation and copy, not the initialization:
+    /// the returned slice must already be initialized memory (see the contract
+    /// below), so a consumer allocating fresh storage still pays to establish
+    /// it once — `palloc0` rather than `palloc`. What it stops paying for is a
+    /// second buffer and the copy between them.
+    ///
     /// Returning `None` is the default and leaves the value on the owned
     /// [`Self::write_bytes`] / [`Self::write_string`] path, so writers that do
     /// not opt in are unaffected.
@@ -109,6 +115,13 @@ pub trait RowWriter {
     /// the same `col`. It does not additionally receive `write_bytes` or
     /// `write_string` for that value.
     ///
+    /// The slice must be a valid `&mut [u8]`, which means the `length` bytes
+    /// are already initialized. Handing back a slice built over uninitialized
+    /// allocation — `slice::from_raw_parts_mut` on fresh `palloc`ed memory, an
+    /// unfilled `Vec`'s spare capacity — is undefined behaviour regardless of
+    /// the decoder overwriting every byte afterwards. Use `palloc0`,
+    /// `vec![0; length]`, or `Vec::resize` to establish the bytes first.
+    ///
     /// `length` counts bytes as framed on the wire, not characters. Raw wire
     /// bytes are handed over as-is together with their [`ValueKind`], so a
     /// consumer that transcodes downstream never pays for a transcode here.
@@ -128,6 +141,20 @@ pub trait RowWriter {
     ///
     /// `complete` is `false` when decoding failed partway through; the slice
     /// contents are then unspecified and the writer must discard the value.
+    ///
+    /// # Cancellation
+    ///
+    /// Errors that return through the transport — operation timeout, an
+    /// explicit cancel, a malformed token — reach this method with `complete`
+    /// set to `false`. Dropping the row-decode future outright does not: no
+    /// further decoder code runs, so an offered destination is left
+    /// uncommitted. An RAII guard cannot close that gap here, because the guard
+    /// and the destination slice would both have to borrow the writer at once.
+    ///
+    /// A writer must therefore treat a destination that is still pending at the
+    /// next [`Self::end_row`], or at the next `value_destination` for the same
+    /// column, as abandoned rather than asserting that it was committed. The
+    /// row it belonged to is not delivered in that case.
     fn commit_value(&mut self, _col: usize, _complete: bool) {}
 }
 
