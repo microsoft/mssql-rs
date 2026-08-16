@@ -858,21 +858,22 @@ mod tests {
     fn reset_connection_rejects_non_yes_value() {
         // D7: only SQL_RESET_CONNECTION_YES(1) is valid; anything else is HY024.
         // Value validation runs before the connection is claimed.
-        use crate::api::odbc_types::SQL_ATTR_RESET_CONNECTION;
+        use crate::api::odbc_types::{SQL_ATTR_RESET_CONNECTION, SQL_COPT_SS_RESET_CONNECTION};
         use crate::api::set_connect_attr::sql_set_connect_attr_w;
         use crate::api::sqlstate::SQLSTATE_HY024;
         use crate::error::HasDiagnostics;
         use crate::test_support::TestHandles;
 
         let h = TestHandles::with_env_dbc();
-        let ret =
-            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_RESET_CONNECTION, 2usize as _, 0) };
-        assert_eq!(ret, SQL_ERROR);
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        assert_eq!(
-            dbc.inner.lock().unwrap().diag_records()[0].sql_state,
-            SQLSTATE_HY024
-        );
+        for attribute in [SQL_ATTR_RESET_CONNECTION, SQL_COPT_SS_RESET_CONNECTION] {
+            let ret = unsafe { sql_set_connect_attr_w(h.dbc, attribute, 2usize as _, 0) };
+            assert_eq!(ret, SQL_ERROR);
+            assert_eq!(
+                dbc.inner.lock().unwrap().diag_records()[0].sql_state,
+                SQLSTATE_HY024
+            );
+        }
     }
 
     #[test]

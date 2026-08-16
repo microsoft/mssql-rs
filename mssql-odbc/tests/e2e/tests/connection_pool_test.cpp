@@ -26,6 +26,14 @@
 #ifndef SQL_RESET_CONNECTION_YES
 #define SQL_RESET_CONNECTION_YES 1
 #endif
+#ifdef _WIN32
+#include <odbcss.h>
+#define POOL_RESET_CONNECTION_ATTR SQL_COPT_SS_RESET_CONNECTION
+#define POOL_RESET_CONNECTION_YES SQL_RESET_YES
+#else
+#define POOL_RESET_CONNECTION_ATTR SQL_ATTR_RESET_CONNECTION
+#define POOL_RESET_CONNECTION_YES SQL_RESET_CONNECTION_YES
+#endif
 
 // SQL_ATTR_CONNECTION_DEAD and its SQL_CD_* values.
 #ifndef SQL_ATTR_CONNECTION_DEAD
@@ -78,8 +86,8 @@ protected:
 
     static SQLRETURN ResetConnection(SQLHDBC dbc) {
         return SQLSetConnectAttr(
-            dbc, SQL_ATTR_RESET_CONNECTION,
-            reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(SQL_RESET_CONNECTION_YES)),
+            dbc, POOL_RESET_CONNECTION_ATTR,
+            reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(POOL_RESET_CONNECTION_YES)),
             SQL_IS_UINTEGER);
     }
 
@@ -230,18 +238,18 @@ TEST_F(ConnectionPoolLiveTest, PreparedStatementUsableAcrossReset) {
 
     CheckInAndReset();
 
-    // Freshly prepare the statement again after the reset (a new prepare, not a
-    // reuse of the old server-side handle): the connection stays usable on both
-    // drivers.
-    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS), SQL_HANDLE_STMT,
-                  stmt_);
-    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    // Use a new statement handle so msodbcsql cannot optimize the identical
+    // SQLPrepare call into reuse of the pre-reset server-side handle.
+    SQLHSTMT fresh_stmt = AllocStmt();
+    ASSERT_SQL_OK(SQLPrepare(fresh_stmt, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, fresh_stmt);
+    ASSERT_SQL_OK(SQLExecute(fresh_stmt), SQL_HANDLE_STMT, fresh_stmt);
     value = 0;
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr), SQL_HANDLE_STMT,
-                  stmt_);
+    ASSERT_SQL_OK(SQLFetch(fresh_stmt), SQL_HANDLE_STMT, fresh_stmt);
+    ASSERT_SQL_OK(SQLGetData(fresh_stmt, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, fresh_stmt);
     EXPECT_EQ(42, value) << "a freshly prepared statement must work after the pool reset";
-    SQLCloseCursor(stmt_);
+    SQLCloseCursor(fresh_stmt);
 }
 
 // Isolates ONLY the mssql-odbc-specific transparent-re-prepare divergence: after
@@ -289,7 +297,7 @@ TEST_F(ConnectionPoolLiveTest, PreparedStatementSurvivesResetViaReprepare) {
 // untouched (D7). No server round trip is needed, so this holds without a live
 // connection too, but it runs here alongside the rest of the pool surface.
 TEST_F(ConnectionPoolLiveTest, ResetRejectsNonYesValue) {
-    EXPECT_SQL_ERROR(SQLSetConnectAttr(dbc_, SQL_ATTR_RESET_CONNECTION,
+    EXPECT_SQL_ERROR(SQLSetConnectAttr(dbc_, POOL_RESET_CONNECTION_ATTR,
                                        reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(2)),
                                        SQL_IS_UINTEGER));
     EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY024");

@@ -139,8 +139,6 @@ $script:OrigSetup  = $null
 $script:HadExistingKey = $false
 $script:HadDriverValue = $false
 $script:HadSetupValue = $false
-$script:HadDriverODBCVerValue = $false
-$script:OrigDriverODBCVer      = $null
 $script:HadDriversListEntry = $false
 $script:OrigDriversListValue = $null
 $script:Registered = $false
@@ -163,8 +161,6 @@ function Save-OriginalRegistration {
         if ($null -ne $d) { $script:HadDriverValue = $true; $script:OrigDriver = $d.Driver }
         $s = Get-ItemProperty -Path $RustDriverRegKey -Name "Setup" -ErrorAction SilentlyContinue
         if ($null -ne $s) { $script:HadSetupValue = $true; $script:OrigSetup = $s.Setup }
-        $v = Get-ItemProperty -Path $RustDriverRegKey -Name "DriverODBCVer" -ErrorAction SilentlyContinue
-        if ($null -ne $v) { $script:HadDriverODBCVerValue = $true; $script:OrigDriverODBCVer = $v.DriverODBCVer }
     }
     if (Test-Path $DriversRegKey) {
         $e = Get-ItemProperty -Path $DriversRegKey -Name $RustDriverName -ErrorAction SilentlyContinue
@@ -186,19 +182,12 @@ function Register-RustDriver([string]$DriverPath) {
     }
     Set-ItemProperty -Path $RustDriverRegKey -Name "Driver" -Value $DriverPath
     Set-ItemProperty -Path $RustDriverRegKey -Name "Setup"  -Value $DriverPath
-    # The Windows ODBC Driver Manager gates ODBC 3.8-only connection attributes
-    # (e.g. SQL_ATTR_RESET_CONNECTION) on this registry value, read at load time —
-    # not on the runtime SQLGetInfo(SQL_DRIVER_ODBC_VER). If it is missing or
-    # < "03.80" the DM returns HY092 before dispatching to the driver. Advertise
-    # 03.80 so the attribute is forwarded, mirroring msodbcsql's sqlnclidrv.rgs.
-    Set-ItemProperty -Path $RustDriverRegKey -Name "DriverODBCVer" -Value "03.80"
-
     if (-not (Test-Path $DriversRegKey)) {
         New-Item -Path $DriversRegKey -Force | Out-Null
     }
     Set-ItemProperty -Path $DriversRegKey -Name $RustDriverName -Value "Installed"
 
-    Write-Host "[  DRIVER ] Registered '$RustDriverName' (DriverODBCVer=03.80) in HKLM: $DriverPath"
+    Write-Host "[  DRIVER ] Registered '$RustDriverName' in HKLM: $DriverPath"
 }
 
 # Resolve the installed reference driver from its own registry key.
@@ -285,11 +274,6 @@ function Restore-Registration {
             Set-ItemProperty -Path $RustDriverRegKey -Name "Setup" -Value $script:OrigSetup
         } else {
             Remove-ItemProperty -Path $RustDriverRegKey -Name "Setup" -ErrorAction SilentlyContinue
-        }
-        if ($script:HadDriverODBCVerValue) {
-            Set-ItemProperty -Path $RustDriverRegKey -Name "DriverODBCVer" -Value $script:OrigDriverODBCVer
-        } else {
-            Remove-ItemProperty -Path $RustDriverRegKey -Name "DriverODBCVer" -ErrorAction SilentlyContinue
         }
         Write-Host "[  DRIVER ] Restored original HKLM registration for '$RustDriverName'"
     } else {
