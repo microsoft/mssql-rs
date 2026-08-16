@@ -13,7 +13,7 @@ mod common;
 
 mod streamed_plp_write {
     use crate::common::{build_tcp_datasource, create_context, init_tracing};
-    use mssql_tds::connection::tds_client::{ResultSet, StreamedParamStatus};
+    use mssql_tds::connection::tds_client::{ResultSet, StatementResult, StreamedParamStatus};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::datatypes::sqltypes::SqlType;
@@ -63,7 +63,7 @@ mod streamed_plp_write {
             .await?;
         match status {
             StreamedParamStatus::NeedData { param_name } => assert_eq!(param_name, "@v"),
-            StreamedParamStatus::Done => panic!("expected NeedData for the first streamed param"),
+            other => panic!("expected NeedData for the first streamed param, got {other:?}"),
         }
 
         // Stream the value in two chunks split on an even (code-unit) boundary.
@@ -72,7 +72,10 @@ mod streamed_plp_write {
         client.write_streamed_chunk(&wire[split..]).await?;
 
         let status = client.end_streamed_param().await?;
-        assert!(matches!(status, StreamedParamStatus::Done));
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(StatementResult::NoRows { .. } | StatementResult::End)
+        ));
         client.close_query().await?;
 
         client
@@ -145,7 +148,10 @@ mod streamed_plp_write {
 
         client.write_streamed_chunk(&wire).await?;
         let status = client.end_streamed_param().await?;
-        assert!(matches!(status, StreamedParamStatus::Done));
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(StatementResult::NoRows { .. } | StatementResult::End)
+        ));
         client.close_query().await?;
 
         client
@@ -205,7 +211,10 @@ mod streamed_plp_write {
         }
 
         let status = client.end_streamed_param().await?;
-        assert!(matches!(status, StreamedParamStatus::Done));
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(StatementResult::NoRows { .. } | StatementResult::End)
+        ));
         client.close_query().await?;
 
         client
@@ -279,7 +288,10 @@ mod streamed_plp_write {
 
         client.write_streamed_chunk(&utf16le(&b)).await?;
         let status = client.end_streamed_param().await?;
-        assert!(matches!(status, StreamedParamStatus::Done));
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(StatementResult::NoRows { .. } | StatementResult::End)
+        ));
         client.close_query().await?;
 
         client
@@ -291,6 +303,96 @@ mod streamed_plp_write {
         {
             let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 2);
+        }
+        client.close_query().await?;
+        Ok(())
+    }
+
+    /// Streams two PLP parameters with a materialized integer parameter between
+    /// them, verifying that streamed parameters resume in the original RPC order.
+    #[tokio::test]
+    async fn stream_plp_int_plp_round_trips() -> mssql_tds::core::TdsResult<()> {
+        init_tracing();
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute(
+                "CREATE TABLE #plp_int_plp (a NVARCHAR(MAX), id INT, b NVARCHAR(MAX))".to_string(),
+                (),
+            )
+            .await?;
+        client.close_query().await?;
+
+        let a = "A".repeat(8_000);
+        let b = "B".repeat(6_000);
+        let params = vec![
+            RpcParameter::new(
+                Some("@a".to_string()),
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(None),
+            )
+            .data_at_exec(),
+            RpcParameter::new(
+                Some("@id".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(42)),
+            ),
+            RpcParameter::new(
+                Some("@b".to_string()),
+                StatusFlags::NONE,
+                SqlType::NVarcharMax(None),
+            )
+            .data_at_exec(),
+        ];
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO #plp_int_plp (a, id, b) VALUES (@a, @id, @b)".to_string(),
+                params,
+                None,
+                None,
+            )
+            .await?;
+        assert!(
+            matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@a")
+        );
+
+        client.write_streamed_chunk(&utf16le(&a)).await?;
+        let status = client.end_streamed_param().await?;
+        assert!(
+            matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@b")
+        );
+
+        client.write_streamed_chunk(&utf16le(&b)).await?;
+        let status = client.end_streamed_param().await?;
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(StatementResult::NoRows { .. } | StatementResult::End)
+        ));
+        client.close_query().await?;
+
+        client
+            .execute("SELECT a, id, b FROM #plp_int_plp".to_string(), ())
+            .await?;
+        {
+            let row = client.next_row().await?.expect("expected a row");
+            assert_eq!(row.len(), 3);
+            match &row[0] {
+                ColumnValues::String(value) => assert_eq!(value.to_utf8_string(), a),
+                other => panic!("Expected String for column a, got {other:?}"),
+            }
+            match &row[1] {
+                ColumnValues::Int(value) => assert_eq!(*value, 42),
+                other => panic!("Expected I32 for column id, got {other:?}"),
+            }
+            match &row[2] {
+                ColumnValues::String(value) => assert_eq!(value.to_utf8_string(), b),
+                other => panic!("Expected String for column b, got {other:?}"),
+            }
         }
         client.close_query().await?;
         Ok(())
@@ -346,7 +448,12 @@ mod streamed_plp_write {
                 client.write_streamed_chunk(chunk).await?;
             }
             let status = client.end_streamed_param().await?;
-            assert!(matches!(status, StreamedParamStatus::Done));
+            assert!(matches!(
+                status,
+                StreamedParamStatus::Complete(
+                    StatementResult::NoRows { .. } | StatementResult::End
+                )
+            ));
             client.close_query().await?;
         }
 
@@ -408,7 +515,7 @@ mod streamed_plp_write {
         client.close_query().await?;
 
         // A NULL max parameter is materialized (value None -> PLP_NULL), so
-        // begin_sp_executesql completes atomically with no NeedData.
+        // execute_sp_executesql completes atomically with no NeedData.
         let null_param = RpcParameter::new(
             Some("@v".to_string()),
             StatusFlags::NONE,
@@ -416,15 +523,17 @@ mod streamed_plp_write {
         );
 
         let status = client
-            .begin_sp_executesql(
+            .execute_sp_executesql(
                 "INSERT INTO #plp_null (id, val) VALUES (1, @v)".to_string(),
                 vec![null_param],
-                None,
-                None,
+                (),
             )
             .await?;
         assert!(
-            matches!(status, StreamedParamStatus::Done),
+            matches!(
+                status,
+                StatementResult::NoRows { .. } | StatementResult::End
+            ),
             "a materialized NULL parameter must not request streamed data"
         );
         client.close_query().await?;
@@ -486,7 +595,10 @@ mod streamed_plp_write {
         // Signal NULL instead of streaming chunks.
         client.write_streamed_null()?;
         let status = client.end_streamed_param().await?;
-        assert!(matches!(status, StreamedParamStatus::Done));
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(StatementResult::NoRows { .. } | StatementResult::End)
+        ));
         client.close_query().await?;
 
         client
@@ -539,7 +651,10 @@ mod streamed_plp_write {
 
         // No chunks: close the value immediately.
         let status = client.end_streamed_param().await?;
-        assert!(matches!(status, StreamedParamStatus::Done));
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(StatementResult::NoRows { .. } | StatementResult::End)
+        ));
         client.close_query().await?;
 
         client
@@ -602,7 +717,10 @@ mod streamed_plp_write {
         }
 
         let status = client.end_streamed_param().await?;
-        assert!(matches!(status, StreamedParamStatus::Done));
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(StatementResult::NoRows { .. } | StatementResult::End)
+        ));
         client.close_query().await?;
 
         client
@@ -659,7 +777,10 @@ mod streamed_plp_write {
         assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
         client.write_streamed_chunk(&value).await?;
         let status = client.end_streamed_param().await?;
-        assert!(matches!(status, StreamedParamStatus::Done));
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(StatementResult::NoRows { .. } | StatementResult::End)
+        ));
         client.close_query().await?;
 
         // Reuse the same client for a plain query.
