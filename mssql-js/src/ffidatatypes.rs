@@ -189,19 +189,21 @@ impl From<DecimalParts> for NapiDecimalParts {
             is_positive: decimal_parts.is_positive,
             scale: decimal_parts.scale,
             precision: decimal_parts.precision,
-            int_parts: decimal_parts.int_parts,
+            int_parts: (0..decimal_parts.word_count())
+                .map(|i| decimal_parts.word(i))
+                .collect(),
         }
     }
 }
 
 impl From<NapiDecimalParts> for DecimalParts {
     fn from(napi_decimal_parts: NapiDecimalParts) -> Self {
-        DecimalParts {
-            is_positive: napi_decimal_parts.is_positive,
-            scale: napi_decimal_parts.scale,
-            precision: napi_decimal_parts.precision,
-            int_parts: napi_decimal_parts.int_parts,
-        }
+        DecimalParts::from_words(
+            napi_decimal_parts.is_positive,
+            napi_decimal_parts.precision,
+            napi_decimal_parts.scale,
+            &napi_decimal_parts.int_parts,
+        )
     }
 }
 

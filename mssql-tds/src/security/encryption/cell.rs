@@ -350,8 +350,7 @@ fn read_decimal(bytes: &[u8], base_type_info: &TypeInfo) -> TdsResult<DecimalPar
 
     // A valid decimal/numeric magnitude (precision <= 38) fits in 128 bits, so
     // it is at most 16 bytes (four 32-bit words). Reject anything longer: it
-    // signals wire-format drift or corrupted plaintext, and would allocate an
-    // unbounded `int_parts`.
+    // signals wire-format drift or corrupted plaintext.
     if magnitude.len() > DECIMAL_MAGNITUDE_BYTES {
         return Err(Error::ColumnEncryptionError(format!(
             "Invalid decimal magnitude length {} (max {DECIMAL_MAGNITUDE_BYTES} bytes for \
@@ -362,26 +361,20 @@ fn read_decimal(bytes: &[u8], base_type_info: &TypeInfo) -> TdsResult<DecimalPar
 
     // Reference AE readers are length-tolerant: .NET reads `length >> 2` 32-bit
     // groups and ignores any trailing partial group, and JDBC uses the actual
-    // length (its bulk-copy path writes a 15-byte magnitude). We zero-pad a
-    // short trailing group into a full 32-bit word rather than rejecting it, and
-    // — unlike .NET — we preserve those trailing bytes instead of dropping them,
-    // so no significant magnitude bits are lost. This lets us read magnitudes
-    // produced by every reference driver.
-    let int_parts = magnitude
-        .chunks(4)
-        .map(|chunk| {
-            let mut word = [0u8; 4];
-            word[..chunk.len()].copy_from_slice(chunk);
-            i32::from_le_bytes(word)
-        })
-        .collect();
+    // length (its bulk-copy path writes a 15-byte magnitude). Zero-filling the
+    // fixed-width buffer pads a short trailing group into a full 32-bit word
+    // rather than rejecting it and — unlike .NET — preserves those trailing
+    // bytes instead of dropping them, so no significant magnitude bits are lost.
+    // This lets us read magnitudes produced by every reference driver.
+    let mut bytes = [0u8; DECIMAL_MAGNITUDE_BYTES];
+    bytes[..magnitude.len()].copy_from_slice(magnitude);
 
-    Ok(DecimalParts {
-        is_positive: *sign == 1,
-        scale,
+    Ok(DecimalParts::new(
+        *sign == 1,
         precision,
-        int_parts,
-    })
+        scale,
+        u128::from_le_bytes(bytes),
+    ))
 }
 
 /// Determines the encoding for an encrypted character column from its base type.
@@ -754,23 +747,7 @@ fn normalize_small_money(m: &SqlSmallMoney) -> Vec<u8> {
 fn normalize_decimal(d: &DecimalParts) -> Vec<u8> {
     let mut out = Vec::with_capacity(DECIMAL_NORMALIZED_LEN);
     out.push(u8::from(d.is_positive));
-    // A valid decimal/numeric magnitude (precision <= 38) fits in four 32-bit
-    // words, so any words beyond the first four are zero. Emitting only the
-    // first four therefore never loses data for a valid value; assert that
-    // invariant in debug/test builds so a malformed `DecimalParts` (e.g. built
-    // for a > 38-digit value) is caught here rather than silently truncated into
-    // wrong ciphertext. The reader rejects the oversized case at runtime.
-    debug_assert!(
-        d.int_parts
-            .get(DECIMAL_MAGNITUDE_WORDS..)
-            .is_none_or(|extra| extra.iter().all(|&word| word == 0)),
-        "decimal magnitude exceeds 128 bits (precision <= 38): {:?}",
-        d.int_parts
-    );
-    for i in 0..DECIMAL_MAGNITUDE_WORDS {
-        let word = d.int_parts.get(i).copied().unwrap_or(0);
-        out.extend_from_slice(&word.to_le_bytes());
-    }
+    out.extend_from_slice(&d.magnitude().to_le_bytes());
     out
 }
 
@@ -1014,7 +991,7 @@ mod tests {
                 assert!(parts.is_positive);
                 assert_eq!(parts.scale, 2);
                 assert_eq!(parts.precision, 5);
-                assert_eq!(parts.int_parts, vec![12345]);
+                assert_eq!(parts.magnitude(), 12345);
             }
             other => panic!("expected Decimal, got {other:?}"),
         }
@@ -1302,12 +1279,7 @@ mod tests {
         // The magnitude is emitted as a fixed 16-byte (four 32-bit words),
         // zero-extended form, so two significant words are followed by two zero
         // words. Total length is 1 sign byte + 16 magnitude bytes = 17.
-        let d = DecimalParts {
-            is_positive: false,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![1, 2],
-        };
+        let d = DecimalParts::new(false, 10, 2, 1 | (2 << 32));
         let mut expected = vec![0u8];
         expected.extend_from_slice(&1i32.to_le_bytes());
         expected.extend_from_slice(&2i32.to_le_bytes());
@@ -1323,12 +1295,7 @@ mod tests {
         // A value that needs only one 32-bit word must still be emitted as the
         // canonical 17-byte form (sign + four words) so deterministic ciphertext
         // matches .NET/msodbcsql, which always zero-extend to 16 magnitude bytes.
-        let d = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 5,
-            int_parts: vec![12345],
-        };
+        let d = DecimalParts::new(true, 5, 2, 12345);
         let mut expected = vec![1u8];
         expected.extend_from_slice(&12345i32.to_le_bytes());
         expected.extend_from_slice(&0i32.to_le_bytes());
@@ -1338,22 +1305,6 @@ mod tests {
             normalize(&SqlType::Numeric(Some(d))).unwrap().unwrap(),
             expected
         );
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "decimal magnitude exceeds 128 bits")]
-    fn normalize_decimal_asserts_bounded_magnitude() {
-        // A malformed DecimalParts carrying a non-zero word beyond the 128-bit
-        // limit must trip the debug-only invariant check rather than silently
-        // truncating into wrong ciphertext.
-        let d = DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 38,
-            int_parts: vec![0, 0, 0, 0, 1],
-        };
-        let _ = normalize(&SqlType::Decimal(Some(d)));
     }
 
     #[test]
@@ -1383,8 +1334,8 @@ mod tests {
     #[test]
     fn read_decimal_rejects_oversized_magnitude() {
         // A valid decimal magnitude is at most 16 bytes (128 bits). A longer
-        // magnitude must be rejected rather than allocating an unbounded
-        // `int_parts`.
+        // magnitude must be rejected rather than silently dropping the bytes
+        // that do not fit.
         let info = type_info(
             TdsDataType::DecimalN,
             5,
@@ -1400,12 +1351,7 @@ mod tests {
     fn normalize_then_read_decimal_roundtrips() {
         // The fixed-width write form must read back to the same value through the
         // (now length-tolerant) reader.
-        let d = DecimalParts {
-            is_positive: false,
-            scale: 3,
-            precision: 12,
-            int_parts: vec![987654],
-        };
+        let d = DecimalParts::new(false, 12, 3, 987654);
         let normalized = normalize(&SqlType::Decimal(Some(d))).unwrap().unwrap();
         let info = type_info(
             TdsDataType::DecimalN,
