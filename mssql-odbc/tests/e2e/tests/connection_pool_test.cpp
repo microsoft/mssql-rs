@@ -210,18 +210,51 @@ TEST_F(ConnectionPoolLiveTest, IsolationReturnsToReadCommittedEachCheckout) {
     }
 }
 
-// Stage 1 clears session-bound prepared-statement handles on the reset ack, so a
-// server-side handle a previous borrower prepared is never blindly reused for
-// the next borrower. A statement prepared and executed before the reset must
-// still execute correctly afterwards (the driver transparently re-prepares
-// against the fresh session) rather than aliasing a stale or dropped handle.
-//
-// This is an intended, mssql-odbc-specific divergence: sp_reset_connection drops
-// the server-side prepared handles, and msodbcsql blindly re-executes the dropped
+// Parity-safe portion: both drivers must keep the connection usable across a pool
+// reset for newly prepared statements. A statement prepared and executed before
+// the reset works, and after the reset a freshly prepared statement (a new
+// prepare, not a reuse of the old server-side handle) also works. This holds on
+// both mssql-odbc and msodbcsql, so it runs on both legs with no skip.
+TEST_F(ConnectionPoolLiveTest, PreparedStatementUsableAcrossReset) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 42");
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS), SQL_HANDLE_STMT,
+                  stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(42, value);
+    SQLCloseCursor(stmt_);
+
+    CheckInAndReset();
+
+    // Freshly prepare the statement again after the reset (a new prepare, not a
+    // reuse of the old server-side handle): the connection stays usable on both
+    // drivers.
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    value = 0;
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(42, value) << "a freshly prepared statement must work after the pool reset";
+    SQLCloseCursor(stmt_);
+}
+
+// Isolates ONLY the mssql-odbc-specific transparent-re-prepare divergence: after
+// the reset, re-executing the SAME already-prepared handle without re-preparing
+// must succeed. Stage 1 clears session-bound prepared-statement handles on the
+// reset ack, so the driver transparently re-prepares against the fresh session
+// rather than aliasing a stale or dropped handle. sp_reset_connection drops the
+// server-side prepared handles, so msodbcsql blindly re-executes the dropped
 // handle and fails with native error 8179 ("Could not find prepared statement
-// with handle N"). Our driver is deliberately more robust here, so the test only
-// asserts on the mssql-odbc leg — SKIP_IF_COMPARING_MSODBCSQL() keeps the parity
-// comparison honest (see transaction_test.cpp / get_data_test.cpp).
+// with handle N"). SKIP_IF_COMPARING_MSODBCSQL() keeps the parity comparison
+// honest (see transaction_test.cpp / get_data_test.cpp); the shared "usable
+// across reset" behavior is covered by PreparedStatementUsableAcrossReset, which
+// runs on both legs.
 TEST_F(ConnectionPoolLiveTest, PreparedStatementSurvivesResetViaReprepare) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
@@ -239,8 +272,9 @@ TEST_F(ConnectionPoolLiveTest, PreparedStatementSurvivesResetViaReprepare) {
 
     CheckInAndReset();
 
-    // Re-execute the same prepared handle after the reset: it must re-prepare and
-    // return the correct result, not fail on a dropped server-side handle.
+    // Re-execute the same prepared handle after the reset without re-preparing: it
+    // must transparently re-prepare and return the correct result, not fail on a
+    // dropped server-side handle.
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     value = 0;
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
