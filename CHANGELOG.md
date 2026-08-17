@@ -31,6 +31,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
+- `mssql-tds`: `TdsClient::read_row_column` now returns `CursorColumn::Value` as a
+  struct variant, `CursorColumn::Value { value, variant_base }`, where
+  `variant_base` is the underlying `TdsDataType` a `sql_variant` value carried
+  (`None` for non-variant columns and for NULL variants). The value cannot always
+  recover the declared base type — `varchar` and `nvarchar` both decode to a
+  string — so it has to come from the wire header. This replaces the
+  `CursorColumn::Value(ColumnValues)` tuple variant; pattern matches need
+  `CursorColumn::Value { value, .. }` and constructors need the field form.
+
 - `mssql-tds`: `Error::SqlServerError` now carries a `SqlServerDiagnostics`
   (`{ diagnostics }`) grouping server errors *and* informational messages,
   replacing the previous `{ errors: Vec<SqlErrorInfo> }` shape. The

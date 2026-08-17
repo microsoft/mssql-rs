@@ -9,10 +9,10 @@ use tracing::{debug, error};
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DECIMAL, SQL_DOUBLE, SQL_ERROR, SQL_GUID,
     SQL_INTEGER, SQL_INVALID_HANDLE, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NO_NULLS,
-    SQL_NULLABLE, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIMESTAMP, SQL_UNKNOWN_TYPE,
-    SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlHandle, SqlReturn,
-    SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_NULLABLE, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT,
+    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIMESTAMP,
+    SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR,
+    SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_INDEX, ERR_STRING_RIGHT_TRUNCATION, post_diag,
@@ -161,7 +161,7 @@ fn sql_describe_col_w_safe(
     }
 }
 
-fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallInt {
+pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallInt {
     match meta.data_type {
         TdsDataType::Int1 => SQL_TINYINT,
         TdsDataType::Int2 => SQL_SMALLINT,
@@ -210,12 +210,15 @@ fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallI
         TdsDataType::Image => SQL_LONGVARBINARY,
         TdsDataType::Guid => SQL_GUID,
         TdsDataType::Xml | TdsDataType::Json => SQL_WLONGVARCHAR,
-        TdsDataType::Vector | TdsDataType::SsVariant | TdsDataType::Udt => SQL_VARCHAR,
+        // mssql-python keys its sql_variant handling off this exact type, so
+        // reporting the column as character data hides the variant entirely.
+        TdsDataType::SsVariant => SQL_SS_VARIANT,
+        TdsDataType::Vector | TdsDataType::Udt => SQL_VARCHAR,
         _ => SQL_UNKNOWN_TYPE,
     }
 }
 
-fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
+pub(crate) fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
     // PLP / `*(max)` / xml / json: ColumnSize is "unbounded". Report 0 per ODBC spec
     if meta.is_plp() {
         return 0;
@@ -282,7 +285,7 @@ fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
     }
 }
 
-fn decimal_digits(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallInt {
+pub(crate) fn decimal_digits(meta: &mssql_tds::query::metadata::ColumnMetadata) -> SqlSmallInt {
     match meta.data_type {
         // T-SQL `money` and `smallmoney` both have a fixed scale of 4. They are stored
         // as FixedLen/VarLen variants without a scale field, so `get_scale()` returns
