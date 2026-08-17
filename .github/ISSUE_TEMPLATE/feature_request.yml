@@ -29,10 +29,13 @@ body:
       label: Affected crate
       options:
         - mssql-tds
+        - mssql-odbc
         - mssql-js
+        - mssql-py-core
         - mssql-tds-cli
         - mssql-mock-tds
-        - mssql-py-core
+        - mssql-mock-tds-py
+        - mssql-tds-bench
         - Not sure / Multiple
     validations:
       required: false
