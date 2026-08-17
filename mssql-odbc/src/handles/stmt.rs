@@ -11,7 +11,7 @@ use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 
 use super::desc::{DescHandle, DescKind};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
-use crate::api::odbc_types::{SqlSmallInt, SqlULen, SqlUSmallInt};
+use crate::api::odbc_types::{SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -32,6 +32,27 @@ pub(crate) struct ActivePlpStream {
     /// High surrogate whose low half lands in the next chunk. Held back so the
     /// pair is transcoded together instead of each half becoming U+FFFD.
     pub(crate) pending_high_surrogate: Option<u16>,
+}
+
+/// An application buffer bound to a result-set column by `SQLBindCol`.
+///
+/// The pointers belong to the application, which must keep them valid until it
+/// unbinds the column, rebinds it, or frees the statement. They are written
+/// only during a bound fetch, never at bind time.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ColumnBinding {
+    /// 1-based column number, as passed to `SQLBindCol`.
+    pub(crate) column_number: SqlUSmallInt,
+    /// The requested `SQL_C_*` target type.
+    pub(crate) target_type: SqlSmallInt,
+    /// Start of the application's buffer, or of its array when the rowset holds
+    /// more than one row.
+    pub(crate) target_value_ptr: SqlPointer,
+    /// Capacity of one element of `target_value_ptr`, in bytes.
+    pub(crate) buffer_length: SqlLen,
+    /// Receives the length/indicator for each row, or null if the application
+    /// does not want one.
+    pub(crate) strlen_or_ind_ptr: *mut SqlLen,
 }
 
 pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
@@ -141,6 +162,14 @@ pub(crate) struct StmtState {
     /// Row binding orientation (`SQL_ATTR_ROW_BIND_TYPE`): `SQL_BIND_BY_COLUMN`
     /// (0) for column-wise arrays, otherwise a row-struct byte size.
     pub(crate) row_bind_type: SqlULen,
+    /// Columns bound by `SQLBindCol`, in binding order. A column appears at
+    /// most once: rebinding replaces its entry, unbinding removes it. Bindings
+    /// outlive a result set, so they are cleared by `SQLFreeStmt(SQL_UNBIND)`
+    /// rather than by closing the cursor.
+    ///
+    /// Staying empty is a legal state: an unbound `SQLFetchScroll` still
+    /// advances the rowset and reports counts, it just delivers no data.
+    pub(crate) bindings: Vec<ColumnBinding>,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
 }
@@ -177,9 +206,38 @@ impl StmtState {
         self.state_flags &= !mask;
     }
 
+    /// Binds, or rebinds, one column. A column can only be bound once, so an
+    /// existing entry for the same column is replaced in place rather than
+    /// shadowed.
+    //
+    // Written by SQLBindCol (AB#47359); the fetch path only reads `bindings`.
+    #[allow(dead_code)]
+    pub(crate) fn set_binding(&mut self, binding: ColumnBinding) {
+        match self
+            .bindings
+            .iter_mut()
+            .find(|b| b.column_number == binding.column_number)
+        {
+            Some(existing) => *existing = binding,
+            None => self.bindings.push(binding),
+        }
+    }
+
+    /// Removes one column's binding, which is what `SQLBindCol` does when the
+    /// application passes a null `TargetValuePtr`.
+    #[allow(dead_code)]
+    pub(crate) fn clear_binding(&mut self, column_number: SqlUSmallInt) {
+        self.bindings.retain(|b| b.column_number != column_number);
+    }
+
+    /// Drops every column binding — `SQLFreeStmt(SQL_UNBIND)`.
+    #[allow(dead_code)]
+    pub(crate) fn clear_bindings(&mut self) {
+        self.bindings.clear();
+    }
+
     /// Clears all row-stream state (cursor invalidated, no PLP in progress).
-    pub(crate) fn reset_row_stream(&mut self) {
-        self.row_positioned = false;
+    pub(crate) fn reset_row_stream(&mut self) {        self.row_positioned = false;
         self.last_captured = None;
         self.last_variant_base = None;
         self.row_exhausted = false;
@@ -226,8 +284,7 @@ impl StmtState {
     }
 }
 
-impl HasDiagnostics for StmtState {
-    fn diag_records(&self) -> &[DiagRecord] {
+impl HasDiagnostics for StmtState {    fn diag_records(&self) -> &[DiagRecord] {
         &self.diag_records
     }
     fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
@@ -271,6 +328,7 @@ impl StmtHandle {
                 rows_fetched_ptr: std::ptr::null_mut(),
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                bindings: Vec::new(),
                 state_flags: 0,
             }),
         }
