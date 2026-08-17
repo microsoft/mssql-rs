@@ -10,6 +10,7 @@ mod client_based_iterators {
     use mssql_tds::connection::tds_client::{CursorColumn, ResultSet};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::datatypes::column_values::ColumnValues;
+    use mssql_tds::datatypes::sqldatatypes::TdsDataType;
     use mssql_tds::datatypes::sqltypes::SqlType;
     use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
     use std::sync::Arc;
@@ -896,7 +897,7 @@ mod client_based_iterators {
             let c2 = client.read_row_column(1).await?;
             assert!(matches!(
                 &c2,
-                CursorColumn::Value(ColumnValues::String(s)) if s.to_utf8_string() == "row1-c2"
+                CursorColumn::Value { value: ColumnValues::String(s), .. } if s.to_utf8_string() == "row1-c2"
             ));
             assert!(matches!(
                 client.read_row_column(3).await?,
@@ -924,7 +925,7 @@ mod client_based_iterators {
             let c2b = client.read_row_column(1).await?;
             assert!(matches!(
                 &c2b,
-                CursorColumn::Value(ColumnValues::String(s)) if s.to_utf8_string() == "row2-c2"
+                CursorColumn::Value { value: ColumnValues::String(s), .. } if s.to_utf8_string() == "row2-c2"
             ));
             assert!(matches!(
                 client.read_row_column(3).await?,
@@ -951,6 +952,88 @@ mod client_based_iterators {
         }
 
         client.close_query().await?;
+        Ok(())
+    }
+
+    /// A `sql_variant` value's declared base type is only on the wire — `varchar`
+    /// and `nvarchar` both decode to `ColumnValues::String`, so the value alone
+    /// cannot distinguish them. The variant is the *second* column so a base type
+    /// captured for it cannot be mistaken for column 0's, and the rows differ so
+    /// the base is proven to be re-read per row rather than latched.
+    #[tokio::test]
+    async fn read_row_column_reports_the_variant_base_type() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "
+            SELECT CAST(1 AS INT) AS c1, CAST(CAST('abc' AS VARCHAR(10)) AS SQL_VARIANT) AS c2
+            UNION ALL
+            SELECT CAST(2 AS INT), CAST(CAST(N'xyz' AS NVARCHAR(10)) AS SQL_VARIANT)
+            UNION ALL
+            SELECT CAST(3 AS INT), CAST(NULL AS SQL_VARIANT)
+        "
+        .to_string();
+        client.execute(query, ()).await?;
+        assert!(client.on_rows());
+
+        // Row 1: varchar under the variant.
+        assert!(client.next_row_cursor().await?);
+        assert_eq!(
+            client.read_row_column(0).await?,
+            CursorColumn::Value {
+                value: ColumnValues::Int(1),
+                variant_base: None
+            },
+            "a non-variant column has no base type"
+        );
+        match client.read_row_column(1).await? {
+            CursorColumn::Value {
+                value: ColumnValues::String(s),
+                variant_base,
+            } => {
+                assert_eq!(s.to_utf8_string(), "abc");
+                assert_eq!(variant_base, Some(TdsDataType::BigVarChar));
+            }
+            other => panic!("expected a varchar variant, got {other:?}"),
+        }
+
+        // Row 2: nvarchar decodes to the same ColumnValues shape as row 1, so
+        // only the base type tells them apart.
+        assert!(client.next_row_cursor().await?);
+        assert_eq!(
+            client.read_row_column(0).await?,
+            CursorColumn::Value {
+                value: ColumnValues::Int(2),
+                variant_base: None
+            }
+        );
+        match client.read_row_column(1).await? {
+            CursorColumn::Value {
+                value: ColumnValues::String(s),
+                variant_base,
+            } => {
+                assert_eq!(s.to_utf8_string(), "xyz");
+                assert_eq!(variant_base, Some(TdsDataType::NVarChar));
+            }
+            other => panic!("expected an nvarchar variant, got {other:?}"),
+        }
+
+        // Row 3: a NULL variant carries no base type, and must not report the
+        // previous row's.
+        assert!(client.next_row_cursor().await?);
+        assert_eq!(
+            client.read_row_column(1).await?,
+            CursorColumn::Value {
+                value: ColumnValues::Null,
+                variant_base: None
+            },
+            "a NULL variant has no base type to report"
+        );
+
+        assert!(!client.next_row_cursor().await?);
         Ok(())
     }
 
@@ -987,7 +1070,10 @@ mod client_based_iterators {
             assert!(client.next_row_cursor().await?);
             assert_eq!(
                 client.read_row_column(0).await?,
-                CursorColumn::Value(ColumnValues::Null)
+                CursorColumn::Value {
+                    value: ColumnValues::Null,
+                    variant_base: None
+                }
             );
             assert!(matches!(
                 client.read_row_column(1).await?,
@@ -1014,7 +1100,10 @@ mod client_based_iterators {
             assert!(client.next_row_cursor().await?);
             assert_eq!(
                 client.read_row_column(0).await?,
-                CursorColumn::Value(ColumnValues::Null)
+                CursorColumn::Value {
+                    value: ColumnValues::Null,
+                    variant_base: None
+                }
             );
             assert!(matches!(
                 client.read_row_column(1).await?,
@@ -1097,7 +1186,13 @@ mod client_based_iterators {
             assert!(first_row_c2.chunks_exact(2).all(|c| c == [b'X', 0]));
 
             let c4 = client.read_row_column(3).await?;
-            assert_eq!(c4, CursorColumn::Value(ColumnValues::Int(24)));
+            assert_eq!(
+                c4,
+                CursorColumn::Value {
+                    value: ColumnValues::Int(24),
+                    variant_base: None
+                }
+            );
 
             // Row 2.
             assert!(client.next_row_cursor().await?);
@@ -1122,7 +1217,13 @@ mod client_based_iterators {
             assert!(second_row_c2.chunks_exact(2).all(|c| c == [b'Y', 0]));
 
             let c4b = client.read_row_column(3).await?;
-            assert_eq!(c4b, CursorColumn::Value(ColumnValues::Int(34)));
+            assert_eq!(
+                c4b,
+                CursorColumn::Value {
+                    value: ColumnValues::Int(34),
+                    variant_base: None
+                }
+            );
 
             assert!(!client.next_row_cursor().await?);
         }
@@ -1210,7 +1311,10 @@ mod client_based_iterators {
         // Cursor re-parked: a valid pull still returns the column value.
         assert_eq!(
             client.read_row_column(0).await?,
-            CursorColumn::Value(ColumnValues::Int(10))
+            CursorColumn::Value {
+                value: ColumnValues::Int(10),
+                variant_base: None
+            }
         );
 
         assert!(!client.next_row_cursor().await?);
@@ -1245,7 +1349,10 @@ mod client_based_iterators {
         // the row stays paused (not fully consumed).
         assert_eq!(
             client.read_row_column(1).await?,
-            CursorColumn::Value(ColumnValues::Int(20))
+            CursorColumn::Value {
+                value: ColumnValues::Int(20),
+                variant_base: None
+            }
         );
 
         // c1 (0-based 0) is now behind the cursor: forward-only violation.
@@ -1287,7 +1394,10 @@ mod client_based_iterators {
         // Read the last column (0-based 1); the cursor advances to idle.
         assert_eq!(
             client.read_row_column(1).await?,
-            CursorColumn::Value(ColumnValues::Int(20))
+            CursorColumn::Value {
+                value: ColumnValues::Int(20),
+                variant_base: None
+            }
         );
 
         // Out-of-range and backward pulls both collapse to RowEnded once idle.

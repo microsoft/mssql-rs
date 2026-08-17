@@ -537,7 +537,28 @@ impl GenericDecoder {
     where
         T: TdsPacketReader + Send + Sync,
     {
+        self.read_sql_variant_with_base(reader)
+            .await
+            .map(|(_, value)| value)
+    }
+
+    /// As [`Self::read_sql_variant`], but also returns the base type the variant
+    /// declared on the wire. The decoded value alone cannot always recover it —
+    /// `varchar` and `nvarchar` both arrive as [`ColumnValues::String`]. The base
+    /// is `None` for a NULL variant, which carries no type on the wire.
+    async fn read_sql_variant_with_base<T>(
+        &self,
+        reader: &mut T,
+    ) -> TdsResult<(Option<TdsDataType>, ColumnValues)>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
         let length = reader.read_uint32().await?;
+        // A NULL variant is the zero length and nothing else: reading a base type
+        // and property byte here would consume the next token's bytes.
+        if length == 0 {
+            return Ok((None, ColumnValues::Null));
+        }
         let variant_base_type = reader.read_byte().await?;
         let tds_type = TdsDataType::try_from(variant_base_type)?;
         let variant_prop_bytes = reader.read_byte().await?;
@@ -577,7 +598,7 @@ impl GenericDecoder {
                 )));
             }
         };
-        Ok(col_value)
+        Ok((Some(tds_type), col_value))
     }
 
     async fn decode_zero_propbyte_variant<T>(
@@ -1395,6 +1416,18 @@ impl GenericDecoder {
                     })?;
                     writer.write_uuid(col, uuid);
                 }
+            }
+
+            // A variant carries its own base type, which the caller may need in
+            // order to report the underlying type; the decoded value cannot
+            // always recover it.
+            TdsDataType::SsVariant => {
+                let (base, value) = self.read_sql_variant_with_base(reader).await?;
+                // A NULL variant has no base type to report.
+                if let Some(base) = base {
+                    writer.write_variant_base_type(col, base);
+                }
+                write_column_value(writer, col, value);
             }
 
             // === Fallback: rare types go through decode() → write_column_value() ===
@@ -3447,6 +3480,55 @@ mod test {
             let md = fixed_metadata(TdsDataType::Int1, 1);
             let val = assert_decode_equivalence(vec![42], &md).await;
             assert_eq!(val, ColumnValues::TinyInt(42));
+        }
+
+        /// A NULL `sql_variant` is a zero length and nothing else. Reading a
+        /// base type and property byte anyway would consume the following
+        /// column's bytes, so the sentinel after it is what proves the guard.
+        ///
+        /// Not reachable through a normal SQL Server response, which carries
+        /// NULLs in the NBCROW null bitmap and skips the column entirely, so it
+        /// has to be exercised here rather than end to end.
+        #[tokio::test]
+        async fn decode_into_null_sql_variant_leaves_following_bytes() {
+            let md = fixed_metadata(TdsDataType::SsVariant, 0);
+            let mut reader = ByteReader::new(vec![0, 0, 0, 0, 0xAB, 0xCD]);
+            let decoder = GenericDecoder::default();
+            let mut writer = DefaultRowWriter::new(1);
+            decoder
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await
+                .unwrap();
+
+            assert_eq!(writer.take_row()[0], ColumnValues::Null);
+            assert_eq!(
+                reader.read_byte().await.unwrap(),
+                0xAB,
+                "the NULL variant consumed the following column's bytes"
+            );
+        }
+
+        /// A non-NULL variant reports its base type alongside the value, which
+        /// is the whole reason the base type is threaded through the writer:
+        /// an `int` and a `varchar` variant both decode to distinct
+        /// `ColumnValues`, but only the wire header says what the column was
+        /// declared to hold.
+        #[tokio::test]
+        async fn decode_into_sql_variant_reports_the_base_type() {
+            let md = fixed_metadata(TdsDataType::SsVariant, 0);
+            // 6-byte payload: base type INT4 (0x38), zero property bytes, then
+            // the four value bytes. 0xAB trails to prove nothing overreads.
+            let mut reader = ByteReader::new(vec![6, 0, 0, 0, 0x38, 0x00, 42, 0, 0, 0, 0xAB]);
+            let decoder = GenericDecoder::default();
+            let mut writer = DefaultRowWriter::new(1);
+            decoder
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await
+                .unwrap();
+
+            assert_eq!(writer.variant_base(0), Some(TdsDataType::Int4));
+            assert_eq!(writer.take_row()[0], ColumnValues::Int(42));
+            assert_eq!(reader.read_byte().await.unwrap(), 0xAB);
         }
 
         #[tokio::test]

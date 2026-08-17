@@ -4,6 +4,7 @@
 pub(crate) mod alloc_handle;
 mod bind_param;
 mod close_cursor;
+mod col_attribute;
 mod connect;
 mod describe_col;
 mod disconnect;
