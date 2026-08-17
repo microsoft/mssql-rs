@@ -310,10 +310,7 @@ mod streamed_plp_write {
         client.close_query().await?;
 
         client
-            .execute(
-                "SELECT a, b FROM #plp_two WHERE id = 1".to_string(),
-                (),
-            )
+            .execute("SELECT a, b FROM #plp_two WHERE id = 1".to_string(), ())
             .await?;
         {
             let row = client.next_row().await?.expect("expected a row");
