@@ -129,12 +129,22 @@ Reading a `sql_variant` column takes three things, not one, and mssql-python nee
 
 The underlying type is a property of the **value**, not the column — a variant column can hold a different type in every row — so it is carried up from the decoder rather than derived from metadata: `RowWriter` gained a defaulted `write_variant_base_type`, `CursorColumn::Value` carries the base type alongside the value, and `StmtState` clears it with the rest of the row-stream state. `ColumnValues` is deliberately untouched, which is what keeps this change out of the Python and Node bindings.
 
-### P3 — SQLBindCol + block SQLFetchScroll — Task [46580](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46580)
+### P3a — SQLBindCol — Task [47359](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47359)
 
-- `SQLBindCol`: store per-column binding (col, target C type, buffer ptr, buffer len, indicator ptr); support unbind (null ptr) and `SQLFreeStmt(SQL_UNBIND)`.
-- `SQLFetchScroll(SQL_FETCH_NEXT)`: fetch up to `row_array_size` rows into a rowset; fill each bound-column array + indicator array (default column-wise); set `*rows_fetched_ptr`; return `SQL_NO_DATA` at end with partial-rowset handling. Forward-only.
+The binding half, owned separately from the fetch half.
+
+- `SQLBindCol`: store per-column binding (col, target C type, buffer ptr, buffer len, indicator ptr); unbind a single column on a null `TargetValuePtr`.
+- `SQLFreeStmt(SQL_UNBIND)`, currently a `TODO` in `api/exports.rs`. On the critical path: `mssql-python` calls it before every fetch.
+- Export `SQLBindCol`, and advertise `SQL_API_SQLBINDCOL` in `SQLGetFunctions` — the Windows DM returns `IM001` for an entry point it is not told about, even when the export exists.
+
+### P3b — block SQLFetchScroll — Task [46580](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46580)
+
+- Define the shared `ColumnBinding` type and the `StmtState` field holding the binding table. The fill loop is the consumer, so it shapes the structure; P3a implements `SQLBindCol` against it. Lands early so P3a is not blocked behind the rest of this task.
+- `SQLFetchScroll(SQL_FETCH_NEXT)`: fetch up to `row_array_size` rows into a rowset; fill each bound-column array + indicator array (default column-wise); set `*rows_fetched_ptr`; write the row status array; return `SQL_NO_DATA` at end with partial-rowset handling. Forward-only.
 - Reuse the P1 conversion core. Ensure `SQLGetData` still works after a bound fetch (mixed access).
-- Export `SQLBindCol` and `SQLFetchScroll`.
+- Export `SQLFetchScroll`.
+
+The rowset attributes (`SQL_ATTR_ROW_ARRAY_SIZE`, `SQL_ATTR_ROWS_FETCHED_PTR`, `SQL_ATTR_ROW_STATUS_PTR`) and the `SQL_ROW_*` status constants already landed in P0, so this is wiring rather than invention.
 
 ### P4 — Exports & driver-load compatibility — Task [46581](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46581)
 
@@ -169,6 +179,7 @@ Both of those landed with the fetch rework in [#153](https://github.com/microsof
 | P1 — Typed SQLGetData | 46578 | Implemented (int/float/guid/date-time C targets + char/wchar rendering; 491 tests pass). Chunked retrieval and incremental PLP streaming are owned by #153 (merged), on top of which the typed targets are dispatched; missing source-type conversions tracked as P1a; `SQL_C_BINARY` and binary→char hex are **not** implemented (see the P1 section); `sql_variant` underlying-type resolution deferred to P2. |
 | P1a — Mandatory source-type conversions | 47107 | Implemented (decimal, money and character sources into the numeric and date/time C targets; `01S07` on lossy numeric conversion, `22018` on an invalid character literal). |
 | P2 — SQLColAttributeW | 46579 | Implemented (common descriptor fields + `SQL_CA_SS_VARIANT_TYPE`, plus the `SQL_SS_VARIANT` type mapping and the zero-length `SQL_C_BINARY` probe the variant path depends on). Binary *delivery* remains unimplemented (Task 47239). |
-| P3 — SQLBindCol + SQLFetchScroll | 46580 | Not started |
-| P4 — Exports & driver-load compat | 46581 | Not started |
+| P3a — SQLBindCol | 47359 | Not started |
+| P3b — block SQLFetchScroll | 46580 | Not started |
+| P4 — Exports & driver-load compat | 46581 | Partly done — `SQLColAttributeW` exported and advertised in P2; `SQLBindCol` and `SQLFetchScroll` remain. |
 | P5 — Testing & end-to-end | 46582 | Not started |
