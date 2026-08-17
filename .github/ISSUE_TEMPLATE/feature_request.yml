@@ -36,7 +36,7 @@ body:
         - mssql-mock-tds
         - mssql-mock-tds-py
         - mssql-tds-bench
-        - Not sure / Multiple
+        - Not applicable / Multiple
     validations:
       required: false
 
