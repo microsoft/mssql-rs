@@ -1027,12 +1027,6 @@ impl TdsClient {
 
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.ensure_force_column_encryption_supported(named_params.iter())?;
-        if self.should_encrypt_parameters() {
-            return Err(UsageError(
-                "Streamed PLP parameter writes are not supported with Always Encrypted."
-                    .to_string(),
-            ));
-        }
 
         let (streamed_params, materialized_params) =
             Self::split_and_validate_streamed_params(named_params)?;
@@ -1050,6 +1044,13 @@ impl TdsClient {
                 )
                 .await?;
             return Ok(StreamedParamStatus::Complete(result));
+        }
+
+        if self.should_encrypt_parameters() {
+            return Err(UsageError(
+                "Streamed PLP parameter writes are not supported with Always Encrypted."
+                    .to_string(),
+            ));
         }
 
         let mut declaration_params = materialized_params.clone();
@@ -1174,9 +1175,9 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         // Write the RPC prefix (headers, proc, positional + materialized named
         // params) then the first streamed parameter's header. The data-at-exec
-        // branch of `serialize` writes name + status + TYPE_INFO + PLP_UNKNOWN_LEN
-        // and stops at the value — the same method that serialized the
-        // materialized params, parked partway through.
+        // branch of `serialize` writes name + status + TYPE_INFO and stops before
+        // the value. The PLP opener is written lazily with the first chunk so the
+        // parameter can still resolve to NULL.
         let serialization_result = async {
             rpc.serialize_prefix(&mut packet_writer).await?;
             first
@@ -1191,7 +1192,7 @@ impl TdsClient {
         .await;
         if let Err(error) = serialization_result {
             drop(packet_writer);
-            self.abort_streamed_write();
+            self.abort_streamed_write().await;
             return Err(error);
         }
         let message = packet_writer.suspend();
@@ -1304,7 +1305,7 @@ impl TdsClient {
                 // longer be continued safely. Drop it and abort the streamed
                 // write rather than re-parking it as resumable.
                 drop(message);
-                self.abort_streamed_write();
+                self.abort_streamed_write().await;
                 Err(e)
             }
         }
@@ -1315,15 +1316,15 @@ impl TdsClient {
     /// The half-written RPC message is dropped rather than re-parked, so a
     /// subsequent [`write_streamed_chunk`](Self::write_streamed_chunk) or
     /// [`end_streamed_param`](Self::end_streamed_param) fails cleanly (no active
-    /// stream) instead of appending to a corrupt message, and the connection is
-    /// marked for reset so the desynced wire stream cannot leak into the next
-    /// command. Mirrors msodbcsql, which tears down data-at-execution state on a
-    /// failed DAE send (`FlushStmt` / `ClearNonBLOBDAEParam`) rather than leaving
-    /// the value resumable.
-    fn abort_streamed_write(&mut self) {
+    /// stream) instead of appending to a corrupt message. The transport is closed
+    /// because RESETCONNECTION applies only to a subsequent request and cannot
+    /// terminate this incomplete RPC.
+    async fn abort_streamed_write(&mut self) {
         self.streamed_write_state = StreamedWriteState::Idle;
         self.execution_context.set_has_open_batch(false);
-        self.prepare_reset_connection(false);
+        if let Err(error) = self.transport.close_transport().await {
+            warn!(%error, "Failed to close transport after streamed write abort");
+        }
     }
 
     /// Marks the streamed parameter currently open for data as SQL NULL.
@@ -1384,7 +1385,6 @@ impl TdsClient {
         Ok(())
     }
 
-    /// Closes the streamed parameter currently open for data.
     /// Closes the streamed parameter currently open for data.
     ///
     /// The current parameter's value is closed on the wire:
@@ -1489,7 +1489,7 @@ impl TdsClient {
                 match self.position_on_first_result().await {
                     Ok(result) => Ok(StreamedParamStatus::Complete(result)),
                     Err(e) => {
-                        self.abort_streamed_write();
+                        self.abort_streamed_write().await;
                         Err(e)
                     }
                 }
@@ -1498,7 +1498,7 @@ impl TdsClient {
             // the half-written message and abort rather than leave it resumable.
             Err(e) => {
                 drop(packet_writer);
-                self.abort_streamed_write();
+                self.abort_streamed_write().await;
                 Err(e)
             }
         }
@@ -5447,6 +5447,11 @@ mod tests {
     #[async_trait]
     impl NetworkWriter for TestTransport {
         async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
+            if self.closed {
+                return Err(crate::error::Error::ConnectionClosed(
+                    "test transport is closed".to_string(),
+                ));
+            }
             if self
                 .send_should_fail
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -5496,7 +5501,10 @@ mod tests {
             Ok(false)
         }
         fn is_connection_dead(&self) -> bool {
-            true
+            self.closed
+        }
+        fn connection_known_dead(&self) -> bool {
+            self.closed
         }
     }
 
@@ -8769,12 +8777,33 @@ mod tests {
         );
     }
 
+    /// Always Encrypted does not block the atomic fallback when there are no
+    /// data-at-execution parameters.
+    #[tokio::test]
+    async fn begin_without_data_at_exec_allows_always_encrypted_atomic_fallback() {
+        let mut client = client_over_bytes_with_ae(done_bytes(DONE_FINAL));
+
+        let status = client
+            .begin_sp_executesql("SELECT 1".to_string(), Vec::new(), None, None)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
     /// A mid-value send failure aborts the streamed write: the error is
     /// surfaced, the parked message is dropped (state returns to `Idle`, not left
-    /// `Active`/resumable), the connection is flagged for reset so the desynced
-    /// wire stream cannot leak into the next command, and further streamed calls
-    /// fail cleanly. Mirrors msodbcsql tearing down data-at-execution state on a
-    /// failed DAE send rather than leaving the value resumable.
+    /// `Active`/resumable), and the transport is closed so the incomplete RPC
+    /// cannot desynchronize a later command.
     #[tokio::test]
     async fn streamed_write_chunk_send_failure_aborts_stream() {
         let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
@@ -8808,11 +8837,10 @@ mod tests {
             client.streamed_write_state,
             StreamedWriteState::Idle
         ));
-        // The connection is flagged for reset so the next command re-syncs.
-        assert!(matches!(
-            client.transport.as_writer().take_reset_mode(),
-            ResetConnectionMode::Reset
-        ));
+        assert!(
+            client.is_connection_dead(),
+            "an incomplete RPC must make the connection non-reusable"
+        );
 
         // Further streamed calls now fail cleanly (no active stream) rather than
         // appending to the corrupt message.
@@ -8830,7 +8858,7 @@ mod tests {
 
     /// A send failure while finalizing the last streamed parameter (flushing the
     /// terminator + message) aborts the same way: error surfaced, state `Idle`,
-    /// connection flagged for reset.
+    /// transport closed.
     #[tokio::test]
     async fn end_streamed_param_send_failure_aborts_stream() {
         let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
@@ -8862,10 +8890,10 @@ mod tests {
             client.streamed_write_state,
             StreamedWriteState::Idle
         ));
-        assert!(matches!(
-            client.transport.as_writer().take_reset_mode(),
-            ResetConnectionMode::Reset
-        ));
+        assert!(
+            client.is_connection_dead(),
+            "a failed final send must make the connection non-reusable"
+        );
     }
 
     /// Beginning a streamed execution while one is already active is rejected.
