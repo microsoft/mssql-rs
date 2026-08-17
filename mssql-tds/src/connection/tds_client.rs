@@ -2266,8 +2266,7 @@ impl TdsClient {
         self.return_values.push(return_value);
     }
 
-    // `#[instrument]` adds 88 B to this state machine and pushes the row-fetch
-    // future over its 4096 B budget. The per-row loop already emits an info event.
+    #[instrument(skip(self), level = "info")]
     async fn drain_rows(&mut self) -> TdsResult<()> {
         if self.maybe_has_unread_rows() {
             // A pull cursor (`next_row_cursor`) may have left the current row
@@ -3589,15 +3588,14 @@ impl TdsClient {
     /// never pauses. If the pull cursor
     /// ([`next_row_cursor`](Self::next_row_cursor)) left a row *partially* read,
     /// this returns a [`UsageError`] rather than silently draining and skipping
-    /// that row; a fully-consumed or absent row is drained as a no-op.
+    /// that row; a fully-consumed or absent row is accepted.
     ///
     /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
     /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
     /// Concrete writers stay concrete through the production transport and
     /// decode chain. Calling the object-safe [`ResultSet::next_row_into`] method
     /// remains supported for callers that intentionally hold a trait object.
-    // `#[instrument]` adds enough state to exceed the 4096 B budget once the
-    // lazy timeout future is inlined. Successful rows still emit `Row Received`.
+    #[instrument(skip(self, writer), level = "info")]
     pub async fn next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
     where
         W: RowWriter + Send + ?Sized,
@@ -3620,18 +3618,17 @@ impl TdsClient {
         // while the pull cursor has a row *partially* read: silently draining it
         // would discard that row and return the *next* one, mapping the caller's
         // earlier `next_row_cursor() == true` to a row it never sees. An absent
-        // (`Idle`) row is fine — there is nothing left to skip, so it drains to a
-        // no-op below.
-        if matches!(
-            self.active_row_read_state,
-            ActiveRowReadState::RowPaused(_) | ActiveRowReadState::PlpPaused(_)
-        ) {
-            self.abort_pending_prepare_capture();
-            return Err(UsageError(
-                "next_row_into called while a pull-cursor row is still active; \
-                 advance the cursor with next_row_cursor before using the push row API"
-                    .to_string(),
-            ));
+        // (`Idle`) row is fine because there is nothing left to skip.
+        match &self.active_row_read_state {
+            ActiveRowReadState::Idle => {}
+            ActiveRowReadState::RowPaused(_) | ActiveRowReadState::PlpPaused(_) => {
+                self.abort_pending_prepare_capture();
+                return Err(UsageError(
+                    "next_row_into called while a pull-cursor row is still active; \
+                     advance the cursor with next_row_cursor before using the push row API"
+                        .to_string(),
+                ));
+            }
         }
 
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
@@ -3702,8 +3699,7 @@ impl TdsClient {
     /// [`read_row_column`](Self::read_row_column). Any previously positioned row
     /// is drained first; its remaining column bytes are read and discarded rather
     /// than returned to the caller.
-    // `#[instrument]` makes this target-dependent future exceed the 4096 B
-    // budget on Linux. Row positioning still emits its existing row/token events.
+    #[instrument(skip(self), level = "info")]
     pub async fn next_row_cursor(&mut self) -> TdsResult<bool> {
         if self.current_metadata.is_none() {
             return Err(UsageError(
@@ -3746,7 +3742,7 @@ impl TdsClient {
                     return Ok(true);
                 }
                 RowHeader::Token(token) => {
-                    if let Some(has_row) = self.handle_row_read_token(token).await? {
+                    if let Some(has_row) = Box::pin(self.handle_row_read_token(token)).await? {
                         return Ok(has_row);
                     }
                 }
@@ -4520,6 +4516,7 @@ impl ResultSet for TdsClient {
         result
     }
 
+    #[instrument(skip(self, writer), level = "info")]
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool> {
         TdsClient::next_row_into(self, writer).await
     }
@@ -4739,6 +4736,9 @@ pub trait ResultSet {
     /// This is the bulk push path: it decodes a full row into `writer` and does
     /// not pause. The ODBC column-at-a-time pull path uses the client cursor
     /// (`next_row_cursor` / `read_row_column`) instead.
+    /// Concrete [`TdsClient`] receivers use [`TdsClient::next_row_into`] to keep
+    /// the writer statically dispatched; this object-safe method is the fallback
+    /// for callers that hold a `dyn ResultSet`.
     ///
     /// # Errors
     ///
@@ -5069,6 +5069,11 @@ mod tests {
     /// Guards the fix for #225: a large local held across an `.await` in
     /// `drain_active_plp` is stored inline in that future and propagates into
     /// every caller in the await chain, costing a memcpy per row on the hot path.
+    ///
+    /// Under `cfg(test)`, `AnyTransport` includes its dynamic fallback, so these
+    /// sizes conservatively include the larger `Either` representation. A
+    /// regression can therefore originate in the test-only arm even when the
+    /// production future remains smaller.
     #[test]
     fn row_fetch_futures_stay_small() {
         const MAX: usize = 4096;
