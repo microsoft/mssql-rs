@@ -58,6 +58,10 @@ struct Execution {
 fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
+    // msodbcsql parity: implicitly close a fully-consumed cursor so a re-execute
+    // on this handle is allowed instead of hitting the 24000 guard below.
+    super::close_cursor::implicit_cursor_close_if_exhausted(stmt, statement_handle);
+
     let Execution {
         named_params,
         mut prepared,

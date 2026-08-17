@@ -11,7 +11,7 @@ use crate::api::odbc_types::{
     SqlReturn,
 };
 use crate::error::free_errors;
-use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
+use crate::handles::stmt::{STMT_STATE_CURSOR_EXHAUSTED, STMT_STATE_CURSOR_OPEN};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Implements SQLFetch for the current forward-only result set.
@@ -169,35 +169,20 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             }
         }
         Ok(false) => {
-            // End of current rowset. SQLFetch must return SQL_NO_DATA here per the
-            // cursor contract, and SQL_NO_DATA cannot be upgraded to
-            // SQL_SUCCESS_WITH_INFO — so this call has no way to signal "there are
-            // diagnostic records worth reading", and many applications only pump
-            // diagnostics after SQL_SUCCESS_WITH_INFO or SQL_ERROR.
+            // End of current rowset — return SQL_NO_DATA. That code can't be
+            // upgraded to SQL_SUCCESS_WITH_INFO, so any INFO captured reaching
+            // this DONE is left on the client's buffer (nothing resets it) and
+            // surfaced by the next call that can carry it — SQLMoreResults or
+            // SQLCloseCursor/SQLFreeStmt(SQL_CLOSE); nothing is lost.
             //
-            // Therefore any INFO captured while reaching this DONE (e.g. a warning
-            // emitted after the last row but before the result set's DONE) is
-            // intentionally LEFT on the client's info buffer instead of being
-            // posted here under SQL_NO_DATA. It is surfaced — with a return-code
-            // hint — by whichever call the application makes next:
-            //   * SQLMoreResults advancing to a further result set returns
-            //     SQL_SUCCESS_WITH_INFO (its Ok(true) arm), or
-            //   * SQLCloseCursor / SQLFreeStmt(SQL_CLOSE) returns
-            //     SQL_SUCCESS_WITH_INFO (DrainOutcome::InfoPosted).
-            // Neither `move_to_column_metadata`/`move_to_next` nor `close_query`
-            // resets the info buffer, so nothing is lost by deferring; the
-            // messages are simply attributed to the call that reports on the
-            // batch boundary, mirroring msodbcsql's between-result surfacing.
+            // Don't drain the rest of the batch: the cursor stays open (and
+            // active_stmt set) so the app can advance with SQLMoreResults.
             //
-            // (If the batch has no further result set and the application calls
-            // SQLMoreResults rather than closing the cursor, that call also
-            // returns SQL_NO_DATA — an unavoidable consequence of the ODBC
-            // contract, not message loss: the records are still posted there.)
-            //
-            // Do NOT drain the rest of the batch here either: the application may
-            // call SQLMoreResults to advance to a subsequent result set. Cursor
-            // stays open; active_stmt stays set so the connection remains "busy"
-            // with this statement.
+            // If this was the batch's final result set (terminating DONE had no
+            // more-results flag), mark the cursor exhausted so a re-execute can
+            // implicitly close it (msodbcsql parity); if result sets are still
+            // pending, leave it unset so a re-execute returns 24000.
+            let batch_done = !client.has_open_batch();
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLFetch: stmt mutex poisoned at end of rowset");
                 if let Ok(mut ds) = dbc.inner.lock() {
@@ -208,6 +193,9 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             stmt_state.reset_row_stream();
             // Don't clear CURSOR_OPEN here: the cursor stays open until
             // SQLMoreResults / SQLCloseCursor / SQLFreeStmt(SQL_CLOSE).
+            if batch_done {
+                stmt_state.set_state(STMT_STATE_CURSOR_EXHAUSTED);
+            }
             drop(stmt_state);
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);

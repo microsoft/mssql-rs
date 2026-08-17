@@ -82,6 +82,10 @@ fn sql_exec_direct_w_safe(
 
     let dbc = stmt.parent_dbc();
 
+    // msodbcsql parity: implicitly close a fully-consumed cursor so a re-execute
+    // on this handle is allowed instead of hitting the 24000 guard below.
+    super::close_cursor::implicit_cursor_close_if_exhausted(stmt, statement_handle);
+
     // Check STMT state, gather parameter values, and reset prior context.
     let (named_params, rewritten_sql, marker_count) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {

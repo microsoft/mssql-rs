@@ -384,6 +384,59 @@ TEST_F(PrepareExecuteLiveTest, ReExecuteWhileCursorOpenReturns24000) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// Reaching end-of-data via SQLFetch (SQL_NO_DATA) fully consumes a single-result
+// batch, so the next SQLExecute is allowed WITHOUT an intervening SQLCloseCursor:
+// the driver implicitly closes the finished cursor. This mirrors msodbcsql, whose
+// re-execute precondition blocks (24000) only while results are still un-read on
+// the wire — contrast ReExecuteWhileCursorOpenReturns24000, which re-executes
+// while positioned mid-rowset and gets 24000.
+TEST_F(PrepareExecuteLiveTest, ReExecuteAfterFetchToEndSucceedsWithoutClose) {
+    ASSERT_SQL_OK(Prepare("SELECT 1 AS v"), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1", GetColumnChar(1));
+    // Fetch to end — SQL_NO_DATA fully consumes the result set.
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    // Re-execute with NO intervening SQLCloseCursor — must succeed.
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1", GetColumnChar(1));
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A multi-statement batch is NOT fully consumed after fetching only the first
+// result set to SQL_NO_DATA — the second result set is still pending on the wire.
+// msodbcsql stays "busy" in that state, so re-executing before the rest of the
+// batch is drained is a cursor-state error (24000). Closing the cursor drains the
+// remainder and makes the statement reusable again. Counterpart to
+// ReExecuteAfterFetchToEndSucceedsWithoutClose (single result set, fully consumed
+// at SQL_NO_DATA).
+TEST_F(PrepareExecuteLiveTest, ReExecuteWithPendingResultSetReturns24000) {
+    ASSERT_SQL_OK(Prepare("SELECT 1 AS v; SELECT 2 AS v"), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1", GetColumnChar(1));
+    // Fetch the FIRST result set to end — the second is still pending.
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    // Re-execute with a result set still pending — cursor-state error.
+    SQLRETURN rc = SQLExecute(stmt_);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+
+    // Closing the cursor drains the rest of the batch; the statement is reusable.
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // SQLExecDirect with a bound parameter executes directly (sp_executesql) and
 // substitutes the value, with no persistent prepared handle.
 TEST_F(PrepareExecuteLiveTest, ExecDirectWithParam) {
@@ -396,6 +449,59 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectWithParam) {
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("direct", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A direct (unprepared) statement is also re-runnable after fetching its single
+// result set to end without an intervening SQLCloseCursor: the driver implicitly
+// closes the exhausted cursor. Counterpart to
+// ReExecuteAfterFetchToEndSucceedsWithoutClose for the SQLExecDirect entry point
+TEST_F(PrepareExecuteLiveTest, ExecDirectReExecuteAfterFetchToEndSucceeds) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1 AS v");
+
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1", GetColumnChar(1));
+    // Fetch to end — SQL_NO_DATA fully consumes the result set.
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    // Re-execute directly with NO intervening SQLCloseCursor — must succeed.
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1", GetColumnChar(1));
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// SQLExecDirect counterpart of ReExecuteWithPendingResultSetReturns24000: a
+// multi-statement batch is not fully consumed after fetching only the first
+// result set to end, so a direct re-execute before the rest is drained is a
+// cursor-state error (24000). Closing the cursor drains the remainder and makes
+// the statement reusable.
+TEST_F(PrepareExecuteLiveTest, ExecDirectReExecuteWithPendingResultSetReturns24000) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1 AS v; SELECT 2 AS v");
+
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1", GetColumnChar(1));
+    // Fetch the FIRST result set to end — the second is still pending.
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    // Re-execute with a result set still pending — cursor-state error.
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+
+    // Closing the cursor drains the rest of the batch; the statement is reusable.
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1", GetColumnChar(1));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 

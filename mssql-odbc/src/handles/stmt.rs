@@ -37,6 +37,14 @@ pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
 pub(crate) const STMT_STATE_PREPARED: u32 = 0x0000_0200;
 pub(crate) const STMT_STATE_CURSOR_OPEN: u32 = 0x0000_0800;
 pub(crate) const STMT_STATE_EXEC_CONTEXT: u32 = 0x0000_1000;
+/// Set once `SQLFetch` has returned `SQL_NO_DATA` for the current result set
+/// AND the whole batch has been drained (the terminating DONE carried no
+/// more-results flag). Distinguishes "cursor open, more to read" (un-fetched
+/// rows or pending result sets) from "cursor open, batch fully consumed", so a
+/// re-execute can implicitly close a finished cursor (msodbcsql parity) while a
+/// re-execute with un-read results still returns 24000. Always set together
+/// with `STMT_STATE_CURSOR_OPEN` and cleared with it in `reset_cursor_state`.
+pub(crate) const STMT_STATE_CURSOR_EXHAUSTED: u32 = 0x0000_2000;
 
 /// Statement handle
 ///
@@ -159,6 +167,14 @@ impl StmtState {
 
     pub(crate) fn clear_state(&mut self, mask: u32) {
         self.state_flags &= !mask;
+    }
+
+    /// True when the cursor is open but its whole batch has been consumed
+    /// (`STMT_STATE_CURSOR_EXHAUSTED`, only ever set alongside
+    /// `STMT_STATE_CURSOR_OPEN`) — the precondition for implicitly closing it on
+    /// re-execute.
+    pub(crate) fn cursor_is_exhausted(&self) -> bool {
+        self.has_state(STMT_STATE_CURSOR_OPEN) && self.has_state(STMT_STATE_CURSOR_EXHAUSTED)
     }
 
     /// Clears all row-stream state (cursor invalidated, no PLP in progress).
