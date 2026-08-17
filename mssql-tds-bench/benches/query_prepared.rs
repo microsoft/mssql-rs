@@ -9,11 +9,22 @@
 //! - `prepared_execute`  — prepare once, execute many via `sp_execute`.
 //! - `prepared_prepexec` — one-shot prepare+execute via `sp_prepexec`.
 //! - `batched_statements` — three statements in one round-trip.
+//!
+//! THROWAWAY BRANCH — measures #148 itself. #148 renamed and reshaped the
+//! prepared-statement entry points, so the pre-#148 baseline and the candidate
+//! expose different APIs. The call sites below are gated on `bench_baseline`
+//! (the perf-lab runner passes `--cfg bench_baseline` when it compiles the
+//! baseline side) so one bench source still builds against both. Note this
+//! relaxes the harness's usual "identical bench source" invariant for these two
+//! benchmarks: each side calls its own idiomatic form, so the delta includes any
+//! cost of the API reshape, not just the library internals.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 use mssql_tds_bench::{bench_env, connect, criterion_config, drain, runtime, try_connect};
+#[cfg(bench_baseline)]
+use mssql_tds_bench::drain_capture_handle;
 
 fn prepared_execute(c: &mut Criterion) {
     let rt = runtime();
@@ -27,6 +38,19 @@ fn prepared_execute(c: &mut Criterion) {
     // execution — the prepare-once/execute-many pattern that pooled clients and
     // ORMs use. Reusing one handle keeps server state constant so the
     // measurement isolates the `sp_execute` round-trip and row decode.
+    #[cfg(bench_baseline)]
+    let statement = rt.block_on(async {
+        let decls = vec![RpcParameter::new(
+            Some("@id".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(None),
+        )];
+        client
+            .execute_sp_prepare("SELECT @id AS v".to_string(), decls, ())
+            .await
+            .expect("sp_prepare failed")
+    });
+    #[cfg(not(bench_baseline))]
     let statement = rt.block_on(async {
         let decls = vec![RpcParameter::new(
             Some("@id".to_string()),
@@ -47,6 +71,12 @@ fn prepared_execute(c: &mut Criterion) {
                     StatusFlags::NONE,
                     SqlType::Int(Some(42)),
                 )];
+                #[cfg(bench_baseline)]
+                client
+                    .execute_sp_execute(statement, None, Some(params), ())
+                    .await
+                    .expect("sp_execute failed");
+                #[cfg(not(bench_baseline))]
                 client
                     .execute_sp_execute_for_test(statement, None, Some(params), ())
                     .await
@@ -58,6 +88,12 @@ fn prepared_execute(c: &mut Criterion) {
 
     // Release the handle (un-measured).
     rt.block_on(async {
+        #[cfg(bench_baseline)]
+        client
+            .execute_sp_unprepare(statement, ())
+            .await
+            .expect("sp_unprepare failed");
+        #[cfg(not(bench_baseline))]
         client
             .execute_sp_unprepare_for_test(statement, ())
             .await
@@ -86,21 +122,36 @@ fn prepared_prepexec(c: &mut Criterion) {
                     StatusFlags::NONE,
                     SqlType::Int(Some(42)),
                 )];
-                let mut orphan = None;
-                let (statement_id, _) = client
-                    .execute_sp_prepexec_for_test(
-                        "SELECT @id AS v".to_string(),
-                        params,
-                        &mut orphan,
-                        (),
-                    )
-                    .await
-                    .expect("sp_prepexec failed");
-                drain(&mut client).await;
-                client
-                    .execute_sp_unprepare_for_test(statement_id, ())
-                    .await
-                    .expect("sp_unprepare failed");
+                #[cfg(bench_baseline)]
+                {
+                    client
+                        .execute_sp_prepexec("SELECT @id AS v".to_string(), params, None, ())
+                        .await
+                        .expect("sp_prepexec failed");
+                    let handle = drain_capture_handle(&mut client).await;
+                    client
+                        .execute_sp_unprepare(handle, ())
+                        .await
+                        .expect("sp_unprepare failed");
+                }
+                #[cfg(not(bench_baseline))]
+                {
+                    let mut orphan = None;
+                    let (statement_id, _) = client
+                        .execute_sp_prepexec_for_test(
+                            "SELECT @id AS v".to_string(),
+                            params,
+                            &mut orphan,
+                            (),
+                        )
+                        .await
+                        .expect("sp_prepexec failed");
+                    drain(&mut client).await;
+                    client
+                        .execute_sp_unprepare_for_test(statement_id, ())
+                        .await
+                        .expect("sp_unprepare failed");
+                }
             });
         });
     });

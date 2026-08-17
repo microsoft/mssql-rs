@@ -283,8 +283,13 @@ swap_to_baseline
 # set -e on anything else) would otherwise leave mssql-tds/ holding the baseline
 # source and the candidate stranded in .mssql-tds-candidate.
 trap 'restore_candidate 2>/dev/null || true; git worktree remove --force "$BASELINE_TREE" 2>/dev/null || true' EXIT
+# THROWAWAY BRANCH: the baseline predates #148's prepared-statement rename, so
+# the gated call sites in query_prepared.rs need this cfg to select the old API.
+# Scoped to the baseline build only; the candidate compiles unflagged.
+export RUSTFLAGS="${RUSTFLAGS:-} --cfg bench_baseline"
 compile_benches "$REPO_ROOT/target-base" "baseline"
 BASE_BINS="$(bench_bins "$REPO_ROOT/target-base")"
+unset RUSTFLAGS
 restore_candidate
 git worktree remove --force "$BASELINE_TREE" || true
 trap - EXIT

@@ -443,9 +443,14 @@ Set-BaselineSource
 # finally, so a baseline compile failure cannot leave the checkout holding the
 # baseline source with the candidate stranded in the stash directory.
 try {
+    # THROWAWAY BRANCH: the baseline predates #148's prepared-statement rename,
+    # so the gated call sites in query_prepared.rs need this cfg to select the
+    # old API. Scoped to the baseline build; the candidate compiles unflagged.
+    $env:RUSTFLAGS = ((($env:RUSTFLAGS, '--cfg bench_baseline') -ne '') -join ' ').Trim()
     Invoke-CompileBenches (Join-Path $RepoRoot 'target-base') 'baseline'
     $script:BaseBins = Get-BenchBinaries (Join-Path $RepoRoot 'target-base')
 } finally {
+    Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
     Restore-CandidateSource
     git worktree remove --force $BaselineTree 2>&1 | Out-Null
 }

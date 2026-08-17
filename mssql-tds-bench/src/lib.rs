@@ -206,6 +206,29 @@ pub async fn drain(client: &mut TdsClient) -> u64 {
     rows
 }
 
+/// Like [`drain`], but captures the prepared-statement handle the pre-#148
+/// `sp_prepexec` funnelled into its dedicated slot. Restored on this throwaway
+/// branch (and gated to the baseline build) only so the gated `query_prepared`
+/// bench can drive the old API; #148 returns the statement id directly.
+#[cfg(bench_baseline)]
+pub async fn drain_capture_handle(client: &mut TdsClient) -> i32 {
+    loop {
+        while client.next_row().await.expect("next_row failed").is_some() {}
+        if !client
+            .advance_to_rows()
+            .await
+            .expect("advance_to_rows failed")
+        {
+            break;
+        }
+    }
+    let handle = client
+        .take_prepared_statement_handle()
+        .expect("sp_prepexec did not capture a prepared handle");
+    client.close_query().await.expect("close_query failed");
+    handle
+}
+
 /// Create a session temp table `table` filled with `rows` deterministic rows of
 /// eight mixed-type columns, using a single set-based `GENERATE_SERIES` insert.
 ///
