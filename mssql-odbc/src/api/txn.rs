@@ -390,31 +390,36 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
         }
     }
 
+    // D4: read the transaction flag *before* claiming the client. Every other
+    // claim site in this file does the same, and the ordering matters: if this
+    // lock were taken after the claim and turned out to be poisoned, the early
+    // return would drop the owned client, leaving `state.client == None` while
+    // `connection_state` is still `Connected` — which the cached liveness read
+    // interprets as "busy but healthy", so the pool would keep handing out a
+    // connection that can never serve a request again.
+    let started = match dbc.inner.lock() {
+        Ok(state) => state.local_tran_started,
+        Err(_) => {
+            error!("{OP}: dbc mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+
     // Claim the idle client: this rejects a busy connection (open cursor /
     // `active_stmt`) with ERR_CONNECTION_BUSY and a disconnected DBC with
-    // ERR_CONNECTION_DOES_NOT_EXIST (08003, D7).
+    // ERR_CONNECTION_DOES_NOT_EXIST (08003, D7). From here until
+    // `release_dbc_client` the DBC mutex is never taken again.
     let mut client = match claim_dbc_client(dbc, OP) {
         Ok(c) => c,
         Err(ret) => return ret,
     };
 
-    // D4: roll back a live local transaction before the reset so the next
-    // borrower cannot inherit it. Guard on the server actually having one, the
-    // same way `end_transaction` does — the flag can be stale. A full
-    // RESETCONNECTION would discard the transaction server-side regardless, but
-    // rolling back explicitly keeps the client's own transaction tracking in
-    // step with the server.
-    let started = match dbc.inner.lock() {
-        Ok(state) => state.local_tran_started,
-        Err(_) => {
-            // A poisoned mutex leaves the transaction flag unreadable, so a
-            // required rollback could be skipped. Fail deterministically like
-            // every other DBC lock site rather than resetting on a DBC whose
-            // state is already compromised.
-            error!("{OP}: dbc mutex poisoned");
-            return SQL_ERROR;
-        }
-    };
+    // Roll back a live local transaction before the reset so the next borrower
+    // cannot inherit it. Guard on the server actually having one, the same way
+    // `end_transaction` does — the flag can be stale. A full RESETCONNECTION
+    // would discard the transaction server-side regardless, but rolling back
+    // explicitly keeps the client's own transaction tracking in step with the
+    // server.
     let result = if started && client.has_active_transaction() {
         debug!("{OP}: rolling back live local transaction before reset");
         dbc.runtime
@@ -966,6 +971,57 @@ mod tests {
             !client.is_connection_dead(),
             "a reset that was acknowledged must leave the connection reusable"
         );
+        assert!(state.diag_records().is_empty());
+    }
+
+    #[test]
+    fn reset_connection_rolls_back_live_transaction_first() {
+        // D4: when the borrower left a live local transaction, the reset rolls it
+        // back before resetting so the next borrower cannot inherit it. This is
+        // the defense-in-depth branch mssql-python's own SQLEndTran normally
+        // pre-empts, so it needs its own coverage: script a BeginTransaction
+        // ENVCHANGE so `has_active_transaction()` is true, then assert the client
+        // ends with no active transaction and an acknowledged reset.
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{
+            done_no_more, env_change_reset_connection, env_change_rollback_transaction,
+            tds_client_from_tokens_in_transaction,
+        };
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            let client = tds_client_from_tokens_in_transaction(
+                vec![
+                    // Rollback leg: the TM request the reset issues first.
+                    env_change_rollback_transaction(),
+                    done_no_more(),
+                    // Reset leg: the acknowledging ENVCHANGE for the reset itself.
+                    env_change_reset_connection(),
+                    done_no_more(),
+                ],
+                0xDEAD_BEEF,
+            );
+            assert!(
+                client.has_active_transaction(),
+                "precondition: the client must start with a live transaction"
+            );
+            state.client = Some(client);
+            state.local_tran_started = true;
+        }
+
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+        let state = dbc.inner.lock().unwrap();
+        assert!(!state.local_tran_started);
+        let client = state.client.as_ref().expect("client restored after reset");
+        assert!(
+            !client.has_active_transaction(),
+            "the live transaction must be rolled back before the reset"
+        );
+        assert!(!client.is_connection_dead());
         assert!(state.diag_records().is_empty());
     }
 

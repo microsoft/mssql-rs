@@ -66,7 +66,10 @@ impl ExecutionContext {
         self.has_open_result_set = has_open_result_set;
     }
 
-    #[cfg(test)]
+    /// Test-only descriptor injection. Also available under the `test-util`
+    /// feature so downstream crates can build a client that already reports an
+    /// active transaction (see `test_client_support`).
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn set_transaction_descriptor(&mut self, descriptor: u64) {
         self.transaction_descriptor = descriptor;
     }

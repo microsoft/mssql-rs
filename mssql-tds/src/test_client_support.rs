@@ -215,6 +215,32 @@ pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
     )
 }
 
+/// Like [`tds_client_from_tokens`], but the returned client already reports an
+/// active local transaction with `descriptor`, as though the server had sent a
+/// `BeginTransaction` ENVCHANGE.
+///
+/// Consumer tests use this to reach paths guarded by `has_active_transaction()`
+/// — notably the connection-pool reset's rollback-before-reset branch — which
+/// otherwise cannot be entered, because the scripted transport only surfaces
+/// tokens during a round trip that happens after the guard is evaluated.
+pub fn tds_client_from_tokens_in_transaction(
+    tokens: Vec<ScriptedToken>,
+    descriptor: u64,
+) -> TdsClient {
+    let tokens: Vec<Tokens> = tokens.into_iter().map(|t| t.0).collect();
+    let transport = Box::new(TokenReplayTransport::new(tokens));
+    let negotiated_settings = create_test_negotiated_settings_internal();
+    let mut execution_context = ExecutionContext::new();
+    execution_context.set_transaction_descriptor(descriptor);
+    let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+    TdsClient::new(
+        transport,
+        negotiated_settings,
+        execution_context,
+        client_context,
+    )
+}
+
 /// An empty COLMETADATA token — a row-returning result set with zero columns.
 pub fn col_metadata_empty() -> ScriptedToken {
     ScriptedToken(Tokens::ColMetadata(ColMetadataToken::default()))
@@ -254,6 +280,16 @@ pub fn done_no_more() -> ScriptedToken {
         status: DoneStatus::FINAL,
         cur_cmd: CurrentCommand::Insert,
         row_count: 0,
+    }))
+}
+
+/// A `RollbackTransaction` ENVCHANGE token — the acknowledgement the server
+/// emits for a Transaction Manager rollback request, clearing the client's
+/// transaction descriptor.
+pub fn env_change_rollback_transaction() -> ScriptedToken {
+    ScriptedToken(Tokens::EnvChange(EnvChangeToken {
+        sub_type: EnvChangeTokenSubType::RollbackTransaction,
+        change_type: EnvChangeContainer::from((0u64, 0u64)),
     }))
 }
 

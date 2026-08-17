@@ -208,6 +208,12 @@ pub struct TdsClient {
     pub(crate) negotiated_settings: NegotiatedSettings,
     pub(crate) execution_context: ExecutionContext,
     pub(crate) recovery_context: Box<RecoveryContext>,
+    /// Set by [`on_reset_connection_ack`](TdsClient::on_reset_connection_ack)
+    /// when the server's `ResetConnection` ENVCHANGE arrives. Cleared by
+    /// [`reset_connection`](TdsClient::reset_connection) before its round trip
+    /// so that call can verify the reset was genuinely acknowledged rather than
+    /// assuming a successful batch implies one.
+    reset_acked: bool,
 
     // pub(crate) batch_result: Option<BatchResult<'static>>,
     pub(crate) current_metadata: Option<Arc<ColMetadataToken>>,
@@ -334,6 +340,7 @@ impl TdsClient {
             negotiated_settings,
             execution_context,
             recovery_context: Box::new(recovery_context),
+            reset_acked: false,
             current_metadata: None,
             current_decryptor: None,
             count_map: HashMap::new(),
@@ -540,6 +547,7 @@ impl TdsClient {
     /// values so a borrower's `USE otherdb` / `SET LANGUAGE` does not persist
     /// across the reset.
     fn on_reset_connection_ack(&mut self) {
+        self.reset_acked = true;
         self.recovery_context.session_state_table.reset();
         self.clear_session_bound_caches();
         self.negotiated_settings.restore_login_defaults();
@@ -860,6 +868,13 @@ impl TdsClient {
     /// `SELECT 1` is the cheapest batch that reliably carries the reset bit and
     /// forces the acknowledging ENVCHANGE.
     ///
+    /// Returns [`ProtocolError`](crate::error::Error::ProtocolError) if the
+    /// round trip completes without the server acknowledging the reset. The
+    /// batch succeeding is not sufficient evidence: without the ENVCHANGE,
+    /// `on_reset_connection_ack` never ran, so the session-bound caches are
+    /// still stale and the session was not returned to its login defaults.
+    /// Reporting success there would break the guarantee a pool relies on.
+    ///
     /// The reset is the *same physical login*: it never re-runs the LOGIN7 /
     /// fedauth handshake and never re-sends the access token, so the
     /// authentication and session-recovery context (the `client_context` held in
@@ -868,9 +883,17 @@ impl TdsClient {
     /// rotating credentials means a fresh connection (new LOGIN7), not a re-auth
     /// of this live session.
     pub async fn reset_connection(&mut self) -> TdsResult<()> {
+        self.reset_acked = false;
         self.prepare_reset_connection(false);
         self.execute("SELECT 1".to_string(), ()).await?;
-        self.close_query().await
+        self.close_query().await?;
+        if !self.reset_acked {
+            error!("Connection reset was not acknowledged by the server");
+            return Err(crate::error::Error::ProtocolError(
+                "connection reset was not acknowledged by the server".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Executes a SQL batch and positions on its **first navigable result**,

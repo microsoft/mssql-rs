@@ -182,6 +182,7 @@ function Register-RustDriver([string]$DriverPath) {
     }
     Set-ItemProperty -Path $RustDriverRegKey -Name "Driver" -Value $DriverPath
     Set-ItemProperty -Path $RustDriverRegKey -Name "Setup"  -Value $DriverPath
+
     if (-not (Test-Path $DriversRegKey)) {
         New-Item -Path $DriversRegKey -Force | Out-Null
     }
