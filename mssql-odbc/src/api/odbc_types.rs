@@ -370,6 +370,7 @@ pub const SQL_DESC_LENGTH: SqlUSmallInt = 1003;
 pub const SQL_DESC_PRECISION: SqlUSmallInt = 1005;
 pub const SQL_DESC_SCALE: SqlUSmallInt = 1006;
 pub const SQL_DESC_NULLABLE: SqlUSmallInt = 1008;
+pub const SQL_DESC_DATETIME_INTERVAL_CODE: SqlUSmallInt = 1007;
 pub const SQL_DESC_NAME: SqlUSmallInt = 1011;
 pub const SQL_DESC_UNNAMED: SqlUSmallInt = 1012;
 pub const SQL_DESC_OCTET_LENGTH: SqlUSmallInt = 1013;
@@ -378,6 +379,10 @@ pub const SQL_DESC_OCTET_LENGTH: SqlUSmallInt = 1013;
 pub const SQL_NULLABLE_UNKNOWN: SqlLen = 2;
 pub const SQL_NAMED: SqlLen = 0;
 pub const SQL_UNNAMED: SqlLen = 1;
+// SQL_DESC_DATETIME_INTERVAL_CODE, valid when the verbose type is SQL_DATETIME.
+pub const SQL_CODE_DATE: SqlLen = 1;
+pub const SQL_CODE_TIME: SqlLen = 2;
+pub const SQL_CODE_TIMESTAMP: SqlLen = 3;
 // SQL_DESC_SEARCHABLE
 pub const SQL_PRED_NONE: SqlLen = 0;
 pub const SQL_PRED_CHAR: SqlLen = 1;

@@ -12,17 +12,19 @@ use tracing::{debug, error};
 
 use crate::api::describe_col::{column_size, decimal_digits, odbc_sql_type};
 use crate::api::odbc_types::{
-    SQL_ATTR_READWRITE_UNKNOWN, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT,
-    SQL_C_GUID, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT,
-    SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR, SQL_CA_SS_VARIANT_TYPE,
+    SQL_ATTR_READWRITE_UNKNOWN, SQL_BIGINT, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE,
+    SQL_C_FLOAT, SQL_C_GUID, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
+    SQL_C_SSHORT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR,
+    SQL_CA_SS_VARIANT_TYPE, SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL,
     SQL_DESC_AUTO_UNIQUE_VALUE, SQL_DESC_BASE_COLUMN_NAME, SQL_DESC_CASE_SENSITIVE,
-    SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DISPLAY_SIZE, SQL_DESC_FIXED_PREC_SCALE,
-    SQL_DESC_LABEL, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE, SQL_DESC_NUM_PREC_RADIX,
-    SQL_DESC_OCTET_LENGTH, SQL_DESC_PRECISION, SQL_DESC_SCALE, SQL_DESC_SEARCHABLE, SQL_DESC_TYPE,
-    SQL_DESC_TYPE_NAME, SQL_DESC_UNNAMED, SQL_DESC_UNSIGNED, SQL_DESC_UPDATABLE, SQL_ERROR,
-    SQL_INVALID_HANDLE, SQL_NAMED, SQL_NO_NULLS, SQL_NULLABLE, SQL_PRED_SEARCHABLE, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SQL_UNNAMED, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
-    SqlUSmallInt, SqlWChar,
+    SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_DISPLAY_SIZE,
+    SQL_DESC_FIXED_PREC_SCALE, SQL_DESC_LABEL, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE,
+    SQL_DESC_NUM_PREC_RADIX, SQL_DESC_OCTET_LENGTH, SQL_DESC_PRECISION, SQL_DESC_SCALE,
+    SQL_DESC_SEARCHABLE, SQL_DESC_TYPE, SQL_DESC_TYPE_NAME, SQL_DESC_UNNAMED, SQL_DESC_UNSIGNED,
+    SQL_DESC_UPDATABLE, SQL_DOUBLE, SQL_ERROR, SQL_FLOAT, SQL_INTEGER, SQL_INVALID_HANDLE,
+    SQL_NAMED, SQL_NO_NULLS, SQL_NULLABLE, SQL_NUMERIC, SQL_PRED_BASIC, SQL_PRED_CHAR,
+    SQL_PRED_NONE, SQL_PRED_SEARCHABLE, SQL_REAL, SQL_SMALLINT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SQL_UNNAMED, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX,
@@ -210,14 +212,12 @@ fn sql_col_attribute_w_safe(
 /// Maps a field identifier to its value, or `None` when the field is not one
 /// this driver reports.
 fn column_attribute(meta: &ColumnMetadata, field_identifier: SqlUSmallInt) -> Option<Attr> {
-    let sql_type = odbc_sql_type(meta);
     let attr = match field_identifier {
-        // `SQL_DESC_TYPE` and `SQL_DESC_CONCISE_TYPE` differ only for the
-        // datetime/interval types, which this driver reports as concise types.
-        SQL_DESC_TYPE | SQL_DESC_CONCISE_TYPE => Attr::Numeric(SqlLen::from(sql_type)),
-        SQL_DESC_LENGTH | SQL_DESC_DISPLAY_SIZE => {
-            Attr::Numeric(SqlLen::try_from(column_size(meta)).unwrap_or(SqlLen::MAX))
-        }
+        SQL_DESC_CONCISE_TYPE => Attr::Numeric(SqlLen::from(concise_type(meta))),
+        SQL_DESC_TYPE => Attr::Numeric(SqlLen::from(verbose_type(meta))),
+        SQL_DESC_DATETIME_INTERVAL_CODE => Attr::Numeric(datetime_interval_code(meta)),
+        SQL_DESC_LENGTH => Attr::Numeric(desc_length(meta)),
+        SQL_DESC_DISPLAY_SIZE => Attr::Numeric(display_size(meta)),
         SQL_DESC_OCTET_LENGTH => Attr::Numeric(octet_length(meta)),
         SQL_DESC_PRECISION => Attr::Numeric(SqlLen::from(precision(meta))),
         SQL_DESC_SCALE => Attr::Numeric(SqlLen::from(decimal_digits(meta))),
@@ -240,38 +240,244 @@ fn column_attribute(meta: &ColumnMetadata, field_identifier: SqlUSmallInt) -> Op
         } else {
             SQL_NAMED
         }),
-        // The result set is not known to be updatable, and no column here is a
-        // known auto-increment column; report the "unknown"/false forms rather
-        // than claiming either way.
+        // COLMETADATA carries no updatability flag, so the result set is not
+        // known to be updatable either way.
         SQL_DESC_UPDATABLE => Attr::Numeric(SQL_ATTR_READWRITE_UNKNOWN),
-        SQL_DESC_AUTO_UNIQUE_VALUE => Attr::Numeric(SqlLen::from(false)),
-        SQL_DESC_SEARCHABLE => Attr::Numeric(SQL_PRED_SEARCHABLE),
-        SQL_DESC_NAME | SQL_DESC_LABEL | SQL_DESC_BASE_COLUMN_NAME => {
-            Attr::Text(meta.column_name.clone())
-        }
+        SQL_DESC_AUTO_UNIQUE_VALUE => Attr::Numeric(SqlLen::from(meta.is_identity())),
+        SQL_DESC_SEARCHABLE => Attr::Numeric(searchable(meta)),
+        SQL_DESC_NAME | SQL_DESC_LABEL => Attr::Text(meta.column_name.clone()),
+        // `column_name` is the result-set label, which for `SELECT c AS alias`
+        // is the alias. COLMETADATA carries no base-column name unless the query
+        // is FOR BROWSE, so ODBC's "provenance unknown" answer is the right one.
+        SQL_DESC_BASE_COLUMN_NAME => Attr::Text(String::new()),
         SQL_DESC_TYPE_NAME => Attr::Text(type_name(meta).to_string()),
         _ => return None,
     };
     Some(attr)
 }
 
-/// Storage size in bytes of the column's value on the wire.
+/// True for the types SQL Server reports as `datetime`/`smalldatetime`/
+/// `datetime2`, which are the only ones ODBC folds into the verbose
+/// `SQL_DATETIME` type. `date` is deliberately excluded: msodbcsql remaps it to
+/// `SQL_TYPE_DATE` before the verbose fold, so it reports the concise type for
+/// both fields, and `time`/`datetimeoffset` use SQL Server-specific types that
+/// are outside the ODBC datetime range.
+fn is_odbc_timestamp(meta: &ColumnMetadata) -> bool {
+    match meta.data_type {
+        TdsDataType::DateTime | TdsDataType::DateTim4 | TdsDataType::DateTime2N => true,
+        TdsDataType::DateTimeN => matches!(meta.type_info.length, 4 | 8),
+        _ => false,
+    }
+}
+
+fn concise_type(meta: &ColumnMetadata) -> SqlSmallInt {
+    odbc_sql_type(meta)
+}
+
+/// `SQL_DESC_TYPE` is the verbose type: the timestamp family collapses to
+/// `SQL_DATETIME`, with the member identified by `SQL_DESC_DATETIME_INTERVAL_CODE`.
+fn verbose_type(meta: &ColumnMetadata) -> SqlSmallInt {
+    if is_odbc_timestamp(meta) {
+        SQL_DATETIME
+    } else {
+        odbc_sql_type(meta)
+    }
+}
+
+/// Only meaningful when the verbose type is `SQL_DATETIME`; zero otherwise.
+fn datetime_interval_code(meta: &ColumnMetadata) -> SqlLen {
+    if is_odbc_timestamp(meta) {
+        SQL_CODE_TIMESTAMP
+    } else {
+        0
+    }
+}
+
+/// `SQL_DESC_LENGTH`: the column size, except that the approximate numerics
+/// report binary precision.
+fn desc_length(meta: &ColumnMetadata) -> SqlLen {
+    if let Some(binary) = binary_precision(meta) {
+        return SqlLen::from(binary);
+    }
+    SqlLen::try_from(column_size(meta)).unwrap_or(SqlLen::MAX)
+}
+
+/// `real` and `float` report binary precision (24 and 53) rather than the
+/// decimal precision `SQLDescribeCol` reports as the column size.
+fn binary_precision(meta: &ColumnMetadata) -> Option<SqlSmallInt> {
+    match meta.data_type {
+        TdsDataType::Flt4 => Some(24),
+        TdsDataType::Flt8 => Some(53),
+        TdsDataType::FltN => match meta.type_info.length {
+            4 => Some(24),
+            8 => Some(53),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `SQL_DESC_DISPLAY_SIZE`: the character count needed to render the value.
+///
+/// This is not the column size: an `int` needs 11 characters (sign plus ten
+/// digits) for a column size of 10, a GUID needs 36, and binary renders as two
+/// hex characters per byte.
+fn display_size(meta: &ColumnMetadata) -> SqlLen {
+    // `*(max)`, xml and json are unbounded; ODBC reports zero.
+    if meta.is_plp() {
+        return 0;
+    }
+    let size: u64 = match meta.data_type {
+        TdsDataType::Bit | TdsDataType::BitN => 1,
+        TdsDataType::Int1 => 3,
+        TdsDataType::Int2 => 6,
+        TdsDataType::Int4 => 11,
+        TdsDataType::Int8 => 20,
+        TdsDataType::IntN => match meta.type_info.length {
+            1 => 3,
+            2 => 6,
+            4 => 11,
+            8 => 20,
+            _ => 0,
+        },
+        // Sign, leading digit, decimal point, exponent.
+        TdsDataType::Flt4 => 14,
+        TdsDataType::Flt8 => 24,
+        TdsDataType::FltN => match meta.type_info.length {
+            4 => 14,
+            8 => 24,
+            _ => 0,
+        },
+        // Precision plus the sign and the decimal point.
+        TdsDataType::Decimal
+        | TdsDataType::DecimalN
+        | TdsDataType::Numeric
+        | TdsDataType::NumericN => u64::from(meta.get_precision().unwrap_or(0)) + 2,
+        TdsDataType::Money => 21,
+        TdsDataType::Money4 => 12,
+        TdsDataType::MoneyN => match meta.type_info.length {
+            8 => 21,
+            4 => 12,
+            _ => 0,
+        },
+        // 32 hex digits plus 4 dashes.
+        TdsDataType::Guid => 36,
+        // The temporal display widths are the rendered literal lengths, which is
+        // exactly what the column size already reports.
+        TdsDataType::DateN
+        | TdsDataType::TimeN
+        | TdsDataType::DateTime
+        | TdsDataType::DateTime2N
+        | TdsDataType::DateTimeOffsetN => column_size(meta),
+        // smalldatetime renders seconds even though it does not store them.
+        TdsDataType::DateTim4 => 19,
+        TdsDataType::DateTimeN => match meta.type_info.length {
+            8 => 23,
+            4 => 19,
+            _ => 0,
+        },
+        // Two hex characters per byte.
+        TdsDataType::Binary
+        | TdsDataType::BigBinary
+        | TdsDataType::VarBinary
+        | TdsDataType::BigVarBinary
+        | TdsDataType::Image => 2 * meta.type_info.length as u64,
+        // A variant's display size depends on the value it carries; msodbcsql
+        // reports the widest non-max character column instead.
+        TdsDataType::SsVariant => 8000,
+        // Character types render one character per character, which for the
+        // national types is half the wire byte count.
+        _ => column_size(meta),
+    };
+    SqlLen::try_from(size).unwrap_or(SqlLen::MAX)
+}
+
+/// `SQL_DESC_OCTET_LENGTH`: the size in bytes of the value's ODBC *transfer*
+/// representation, which for the temporal types is the C struct the driver
+/// hands back, not the TDS payload width.
 fn octet_length(meta: &ColumnMetadata) -> SqlLen {
     if meta.is_plp() {
         return 0;
     }
-    // `type_info.length` is already a byte count for every type, including the
-    // national character types.
-    SqlLen::try_from(meta.type_info.length).unwrap_or(SqlLen::MAX)
+    match meta.data_type {
+        // SQL_DATE_STRUCT.
+        TdsDataType::DateN => 6,
+        // SQL_SS_TIME2_STRUCT.
+        TdsDataType::TimeN => 12,
+        // SQL_TIMESTAMP_STRUCT.
+        TdsDataType::DateTime
+        | TdsDataType::DateTim4
+        | TdsDataType::DateTimeN
+        | TdsDataType::DateTime2N => 16,
+        // SQL_SS_TIMESTAMPOFFSET_STRUCT.
+        TdsDataType::DateTimeOffsetN => 20,
+        // The exact numerics transfer as characters, so the octet length is the
+        // rendered width.
+        TdsDataType::Decimal
+        | TdsDataType::DecimalN
+        | TdsDataType::Numeric
+        | TdsDataType::NumericN
+        | TdsDataType::Money
+        | TdsDataType::Money4
+        | TdsDataType::MoneyN => display_size(meta),
+        TdsDataType::SsVariant => 8000,
+        // Everything else transfers at its wire width, and `type_info.length` is
+        // already a byte count for every type including the national ones.
+        _ => SqlLen::try_from(meta.type_info.length).unwrap_or(SqlLen::MAX),
+    }
 }
 
-/// `SQL_DESC_PRECISION`: the number of significant digits for the exact and
-/// approximate numeric types, otherwise the column size.
+/// `SQL_DESC_PRECISION`: fractional-seconds precision for the temporal types,
+/// binary precision for the approximate numerics, otherwise the number of
+/// significant digits.
 fn precision(meta: &ColumnMetadata) -> SqlSmallInt {
+    if matches!(
+        meta.data_type,
+        TdsDataType::DateN
+            | TdsDataType::TimeN
+            | TdsDataType::DateTime
+            | TdsDataType::DateTim4
+            | TdsDataType::DateTimeN
+            | TdsDataType::DateTime2N
+            | TdsDataType::DateTimeOffsetN
+    ) {
+        return decimal_digits(meta);
+    }
+    if let Some(binary) = binary_precision(meta) {
+        return binary;
+    }
     if let Some(p) = meta.get_precision() {
         return SqlSmallInt::from(p);
     }
     SqlSmallInt::try_from(column_size(meta)).unwrap_or(SqlSmallInt::MAX)
+}
+
+/// `SQL_DESC_SEARCHABLE`: which predicates the server accepts for the column.
+fn searchable(meta: &ColumnMetadata) -> SqlLen {
+    match meta.data_type {
+        // The legacy LOB text types accept `LIKE` but not comparison.
+        TdsDataType::Text | TdsDataType::NText => SQL_PRED_CHAR,
+        // Not usable in a `WHERE` clause without a conversion or a method call.
+        TdsDataType::Image | TdsDataType::Xml | TdsDataType::Udt | TdsDataType::Vector => {
+            SQL_PRED_NONE
+        }
+        // Character and calendar types take every predicate including `LIKE`.
+        TdsDataType::Char
+        | TdsDataType::BigChar
+        | TdsDataType::VarChar
+        | TdsDataType::BigVarChar
+        | TdsDataType::NChar
+        | TdsDataType::NVarChar
+        | TdsDataType::DateN
+        | TdsDataType::TimeN
+        | TdsDataType::DateTime
+        | TdsDataType::DateTim4
+        | TdsDataType::DateTimeN
+        | TdsDataType::DateTime2N
+        | TdsDataType::DateTimeOffsetN => SQL_PRED_SEARCHABLE,
+        // Numerics, binary, bit, GUID and sql_variant compare but do not `LIKE`.
+        _ => SQL_PRED_BASIC,
+    }
 }
 
 fn num_prec_radix(meta: &ColumnMetadata) -> SqlLen {
@@ -341,13 +547,25 @@ fn variant_c_type(base: TdsDataType) -> SqlSmallInt {
     }
 }
 
-/// `tinyint` is the only unsigned integer SQL Server exposes.
+/// `SQL_DESC_UNSIGNED` is `SQL_FALSE` only for the signed numeric types. Every
+/// nonnumeric column — character, binary, temporal, GUID, bit, sql_variant —
+/// reports `SQL_TRUE`, as does `tinyint`, the one unsigned integer SQL Server
+/// exposes.
+///
+/// The test is on the ODBC type rather than the TDS type, which is what makes
+/// `money` come out signed: it is reported as `SQL_DECIMAL`.
 fn is_unsigned(meta: &ColumnMetadata) -> bool {
-    match meta.data_type {
-        TdsDataType::Int1 => true,
-        TdsDataType::IntN => meta.type_info.length == 1,
-        _ => false,
-    }
+    !matches!(
+        odbc_sql_type(meta),
+        SQL_SMALLINT
+            | SQL_INTEGER
+            | SQL_BIGINT
+            | SQL_REAL
+            | SQL_FLOAT
+            | SQL_DOUBLE
+            | SQL_DECIMAL
+            | SQL_NUMERIC
+    )
 }
 
 fn type_name(meta: &ColumnMetadata) -> &'static str {
@@ -410,7 +628,9 @@ mod tests {
     use std::ptr;
 
     use super::*;
-    use crate::api::odbc_types::{SQL_INTEGER, SQL_NULLABLE};
+    use crate::api::odbc_types::{
+        SQL_NULLABLE, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_TYPE_DATE, SQL_TYPE_TIMESTAMP,
+    };
     use crate::api::sqlstate::ERR_INVALID_DESCRIPTOR_FIELD;
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sqldatatypes::TypeInfo;
@@ -440,6 +660,25 @@ mod tests {
         };
         assert_eq!(rc, SQL_SUCCESS, "field {field}");
         out
+    }
+
+    /// Reads a string attribute, asserting the call succeeded.
+    fn text(h: &TestHandles, col: SqlUSmallInt, field: SqlUSmallInt) -> String {
+        let mut buf = [0u16; 64];
+        let mut written: SqlSmallInt = 0;
+        let rc = unsafe {
+            sql_col_attribute_w(
+                h.stmt,
+                col,
+                field,
+                buf.as_mut_ptr() as SqlPointer,
+                (buf.len() * 2) as SqlSmallInt,
+                &mut written,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS, "field {field}");
+        String::from_utf16_lossy(&buf[..(written as usize) / 2])
     }
 
     #[test]
@@ -658,7 +897,8 @@ mod tests {
         stmt_with_int_columns(&h, 1);
 
         assert_eq!(numeric(&h, 1, SQL_DESC_LENGTH), 10);
-        assert_eq!(numeric(&h, 1, SQL_DESC_DISPLAY_SIZE), 10);
+        // Display size is the column size plus a character for the sign.
+        assert_eq!(numeric(&h, 1, SQL_DESC_DISPLAY_SIZE), 11);
         assert_eq!(numeric(&h, 1, SQL_DESC_OCTET_LENGTH), 4);
         assert_eq!(numeric(&h, 1, SQL_DESC_PRECISION), 10);
         assert_eq!(numeric(&h, 1, SQL_DESC_SCALE), 0);
@@ -669,7 +909,10 @@ mod tests {
             SQL_ATTR_READWRITE_UNKNOWN
         );
         assert_eq!(numeric(&h, 1, SQL_DESC_AUTO_UNIQUE_VALUE), 0);
-        assert_eq!(numeric(&h, 1, SQL_DESC_SEARCHABLE), SQL_PRED_SEARCHABLE);
+        // An int compares but does not take LIKE.
+        assert_eq!(numeric(&h, 1, SQL_DESC_SEARCHABLE), SQL_PRED_BASIC);
+        // A signed numeric is the one shape that is not "unsigned".
+        assert_eq!(numeric(&h, 1, SQL_DESC_UNSIGNED), 0);
     }
 
     /// A column with no name reports `SQL_UNNAMED`; `int_columns` names them.
@@ -723,43 +966,246 @@ mod tests {
         for (ty, len, name, radix) in cases {
             retype_column(&h, 1, *ty, *len);
             assert_eq!(numeric(&h, 1, SQL_DESC_NUM_PREC_RADIX), *radix, "{ty:?}");
-            assert_eq!(
-                numeric(&h, 1, SQL_DESC_OCTET_LENGTH),
-                *len as SqlLen,
-                "{ty:?}"
-            );
-
-            let mut buf = [0u16; 32];
-            let mut written: SqlSmallInt = 0;
-            let rc = unsafe {
-                sql_col_attribute_w(
-                    h.stmt,
-                    1,
-                    SQL_DESC_TYPE_NAME,
-                    buf.as_mut_ptr() as SqlPointer,
-                    (buf.len() * 2) as SqlSmallInt,
-                    &mut written,
-                    ptr::null_mut(),
-                )
-            };
-            assert_eq!(rc, SQL_SUCCESS, "{ty:?}");
-            let got = String::from_utf16_lossy(&buf[..(written as usize) / 2]);
-            assert_eq!(got, *name, "{ty:?}");
+            assert_eq!(text(&h, 1, SQL_DESC_TYPE_NAME), *name, "{ty:?}");
         }
     }
 
-    /// `tinyint` is the only unsigned integer, and it is the one type this
-    /// driver deliberately reports as unsigned.
+    /// `SQL_DESC_UNSIGNED` is false only for the signed numerics. Everything
+    /// nonnumeric is "unsigned" by the ODBC definition, which is the opposite of
+    /// the intuitive reading.
     #[test]
-    fn unsigned_is_reported_only_for_tinyint() {
+    fn unsigned_is_false_only_for_signed_numerics() {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_int_columns(&h, 1);
-        retype_column(&h, 1, TdsDataType::Int1, 1);
-        assert_eq!(numeric(&h, 1, SQL_DESC_UNSIGNED), 1);
-        retype_column(&h, 1, TdsDataType::IntN, 1);
-        assert_eq!(numeric(&h, 1, SQL_DESC_UNSIGNED), 1);
-        retype_column(&h, 1, TdsDataType::IntN, 4);
-        assert_eq!(numeric(&h, 1, SQL_DESC_UNSIGNED), 0);
+
+        let signed: &[(TdsDataType, usize)] = &[
+            (TdsDataType::Int2, 2),
+            (TdsDataType::Int4, 4),
+            (TdsDataType::Int8, 8),
+            (TdsDataType::IntN, 4),
+            (TdsDataType::Flt4, 4),
+            (TdsDataType::Flt8, 8),
+            (TdsDataType::DecimalN, 9),
+            (TdsDataType::NumericN, 9),
+            // money is reported as SQL_DECIMAL, which is a signed numeric.
+            (TdsDataType::MoneyN, 8),
+        ];
+        for (ty, len) in signed {
+            retype_column(&h, 1, *ty, *len);
+            assert_eq!(numeric(&h, 1, SQL_DESC_UNSIGNED), 0, "{ty:?}");
+        }
+
+        let unsigned: &[(TdsDataType, usize)] = &[
+            (TdsDataType::Int1, 1),
+            (TdsDataType::IntN, 1),
+            (TdsDataType::Bit, 1),
+            (TdsDataType::BigVarChar, 10),
+            (TdsDataType::NVarChar, 20),
+            (TdsDataType::BigVarBinary, 8),
+            (TdsDataType::DateN, 3),
+            (TdsDataType::DateTime2N, 8),
+            (TdsDataType::Guid, 16),
+            (TdsDataType::SsVariant, 8),
+        ];
+        for (ty, len) in unsigned {
+            retype_column(&h, 1, *ty, *len);
+            assert_eq!(numeric(&h, 1, SQL_DESC_UNSIGNED), 1, "{ty:?}");
+        }
+    }
+
+    /// Display size is the rendered width, which differs from the column size
+    /// for every type that needs a sign, a separator, or hex expansion.
+    #[test]
+    fn display_size_is_the_rendered_width() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+
+        let cases: &[(TdsDataType, usize, SqlLen)] = &[
+            (TdsDataType::Bit, 1, 1),
+            // tinyint has no sign, so it stays at three digits.
+            (TdsDataType::Int1, 1, 3),
+            (TdsDataType::Int2, 2, 6),
+            (TdsDataType::Int4, 4, 11),
+            (TdsDataType::Int8, 8, 20),
+            (TdsDataType::Flt4, 4, 14),
+            (TdsDataType::Flt8, 8, 24),
+            (TdsDataType::MoneyN, 8, 21),
+            (TdsDataType::MoneyN, 4, 12),
+            // 32 hex digits and 4 dashes.
+            (TdsDataType::Guid, 16, 36),
+            // Two hex characters per byte.
+            (TdsDataType::BigVarBinary, 8, 16),
+            // Characters, not bytes.
+            (TdsDataType::NVarChar, 20, 10),
+            (TdsDataType::BigVarChar, 10, 10),
+            (TdsDataType::DateN, 3, 10),
+            (TdsDataType::SsVariant, 8, 8000),
+        ];
+        for (ty, len, expected) in cases {
+            retype_column(&h, 1, *ty, *len);
+            assert_eq!(numeric(&h, 1, SQL_DESC_DISPLAY_SIZE), *expected, "{ty:?}");
+        }
+    }
+
+    /// Octet length is the size of the ODBC transfer representation, so the
+    /// temporal types report their C struct size rather than the TDS payload
+    /// width, and the exact numerics report their rendered width.
+    #[test]
+    fn octet_length_is_the_transfer_size() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+
+        let cases: &[(TdsDataType, usize, SqlLen)] = &[
+            // SQL_DATE_STRUCT, against a 3-byte wire payload.
+            (TdsDataType::DateN, 3, 6),
+            // SQL_SS_TIME2_STRUCT, against a 5-byte wire payload.
+            (TdsDataType::TimeN, 5, 12),
+            // SQL_TIMESTAMP_STRUCT.
+            (TdsDataType::DateTime, 8, 16),
+            (TdsDataType::DateTim4, 4, 16),
+            (TdsDataType::DateTime2N, 8, 16),
+            // SQL_SS_TIMESTAMPOFFSET_STRUCT, against a 10-byte wire payload.
+            (TdsDataType::DateTimeOffsetN, 10, 20),
+            // The exact numerics transfer as characters.
+            (TdsDataType::MoneyN, 8, 21),
+            (TdsDataType::MoneyN, 4, 12),
+            // The fixed-width and character types transfer at their wire width.
+            (TdsDataType::Int4, 4, 4),
+            (TdsDataType::Guid, 16, 16),
+            (TdsDataType::BigVarChar, 10, 10),
+            // Bytes, not characters.
+            (TdsDataType::NVarChar, 20, 20),
+        ];
+        for (ty, len, expected) in cases {
+            retype_column(&h, 1, *ty, *len);
+            assert_eq!(numeric(&h, 1, SQL_DESC_OCTET_LENGTH), *expected, "{ty:?}");
+        }
+    }
+
+    /// The timestamp family reports the verbose `SQL_DATETIME` for
+    /// `SQL_DESC_TYPE` and the concise type separately; every other type reports
+    /// the same value for both.
+    #[test]
+    fn verbose_type_differs_from_concise_only_for_timestamps() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+
+        for (ty, len) in [
+            (TdsDataType::DateTime, 8),
+            (TdsDataType::DateTim4, 4),
+            (TdsDataType::DateTime2N, 8),
+        ] {
+            retype_column(&h, 1, ty, len);
+            assert_eq!(numeric(&h, 1, SQL_DESC_TYPE), SqlLen::from(SQL_DATETIME));
+            assert_eq!(
+                numeric(&h, 1, SQL_DESC_CONCISE_TYPE),
+                SqlLen::from(SQL_TYPE_TIMESTAMP)
+            );
+            assert_eq!(
+                numeric(&h, 1, SQL_DESC_DATETIME_INTERVAL_CODE),
+                SQL_CODE_TIMESTAMP
+            );
+        }
+
+        // date, time and datetimeoffset use types outside the ODBC datetime
+        // range, so the verbose and concise fields agree and no subtype applies.
+        for (ty, len, expected) in [
+            (TdsDataType::DateN, 3, SQL_TYPE_DATE),
+            (TdsDataType::TimeN, 5, SQL_SS_TIME2),
+            (TdsDataType::DateTimeOffsetN, 10, SQL_SS_TIMESTAMPOFFSET),
+            (TdsDataType::Int4, 4, SQL_INTEGER),
+        ] {
+            retype_column(&h, 1, ty, len);
+            assert_eq!(numeric(&h, 1, SQL_DESC_TYPE), SqlLen::from(expected));
+            assert_eq!(
+                numeric(&h, 1, SQL_DESC_CONCISE_TYPE),
+                SqlLen::from(expected)
+            );
+            assert_eq!(numeric(&h, 1, SQL_DESC_DATETIME_INTERVAL_CODE), 0);
+        }
+    }
+
+    /// Precision is fractional-seconds for the temporal types and binary
+    /// precision for the approximate numerics, not the display width.
+    #[test]
+    fn precision_is_type_specific() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+
+        let cases: &[(TdsDataType, usize, SqlSmallInt)] = &[
+            (TdsDataType::Flt4, 4, 24),
+            (TdsDataType::Flt8, 8, 53),
+            // datetime is fixed at three fractional digits, smalldatetime at none.
+            (TdsDataType::DateTime, 8, 3),
+            (TdsDataType::DateTim4, 4, 0),
+            (TdsDataType::DateN, 3, 0),
+            (TdsDataType::Int4, 4, 10),
+        ];
+        for (ty, len, expected) in cases {
+            retype_column(&h, 1, *ty, *len);
+            assert_eq!(
+                numeric(&h, 1, SQL_DESC_PRECISION),
+                SqlLen::from(*expected),
+                "{ty:?}"
+            );
+        }
+    }
+
+    /// Searchability is derived from the type: the LOB text types take only
+    /// `LIKE`, xml and image take neither, and the rest compare.
+    #[test]
+    fn searchable_is_derived_from_the_type() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+
+        let cases: &[(TdsDataType, usize, SqlLen)] = &[
+            (TdsDataType::Text, 16, SQL_PRED_CHAR),
+            (TdsDataType::NText, 16, SQL_PRED_CHAR),
+            (TdsDataType::Image, 16, SQL_PRED_NONE),
+            (TdsDataType::Xml, 0, SQL_PRED_NONE),
+            (TdsDataType::Udt, 0, SQL_PRED_NONE),
+            (TdsDataType::BigVarChar, 10, SQL_PRED_SEARCHABLE),
+            (TdsDataType::NVarChar, 20, SQL_PRED_SEARCHABLE),
+            (TdsDataType::DateN, 3, SQL_PRED_SEARCHABLE),
+            (TdsDataType::DateTime2N, 8, SQL_PRED_SEARCHABLE),
+            (TdsDataType::Int4, 4, SQL_PRED_BASIC),
+            (TdsDataType::Guid, 16, SQL_PRED_BASIC),
+            (TdsDataType::BigVarBinary, 8, SQL_PRED_BASIC),
+            (TdsDataType::SsVariant, 8, SQL_PRED_BASIC),
+        ];
+        for (ty, len, expected) in cases {
+            retype_column(&h, 1, *ty, *len);
+            assert_eq!(numeric(&h, 1, SQL_DESC_SEARCHABLE), *expected, "{ty:?}");
+        }
+    }
+
+    /// An IDENTITY column is an auto-unique value.
+    #[test]
+    fn identity_column_reports_auto_unique_value() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.column_metadata[0].flags |= 0x10;
+        }
+        assert_eq!(numeric(&h, 1, SQL_DESC_AUTO_UNIQUE_VALUE), 1);
+    }
+
+    /// COLMETADATA carries no originating column, so ODBC's "provenance
+    /// unknown" answer is an empty string — not the alias the label reports.
+    #[test]
+    fn base_column_name_is_empty_while_the_label_is_the_alias() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.column_metadata[0].column_name = "alias".to_string();
+        }
+        assert_eq!(text(&h, 1, SQL_DESC_NAME), "alias");
+        assert_eq!(text(&h, 1, SQL_DESC_LABEL), "alias");
+        assert_eq!(text(&h, 1, SQL_DESC_BASE_COLUMN_NAME), "");
     }
 
     /// The C type reported for each base type a `sql_variant` can carry.

@@ -14,12 +14,20 @@
 //   6.  ConciseTypePerColumnType          - int/varchar/nvarchar/decimal concise types
 //   7.  TypeNameAndRadix                  - SQL_DESC_TYPE_NAME, SQL_DESC_NUM_PREC_RADIX
 //   8.  PrecisionScaleAndNullable         - DECIMAL(10,2), NOT NULL vs NULL
-//   9.  UnsignedOnlyForTinyint            - tinyint unsigned, int signed
-//   10. NameIsReportedInBytes             - SQL_DESC_NAME length is a byte count
-//   11. NameTruncationReturnsInfo         - short buffer → SUCCESS_WITH_INFO + 01004
-//   12. VariantTypeOnNonVariantColumn     - HY113
-//   13. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
-//   14. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
+//   9.  UnsignedIsFalseOnlyForSignedNumerics - nonnumeric columns are "unsigned"
+//   10. DisplaySizeIsRenderedWidth        - sign, hex expansion, characters not bytes
+//   11. DisplaySizeForApproximateNumerics - real/float exponential form
+//   12. OctetLengthIsTransferSize         - ODBC C struct size, not TDS wire width
+//   13. VerboseTypeDiffersFromConciseForTimestamps - SQL_DATETIME + subtype
+//   14. VerboseTypeMatchesConciseForNonTimestamps
+//   15. SearchableIsDerivedFromTheType    - LIKE-only, unsearchable, full
+//   16. IdentityColumnReportsAutoUniqueValue
+//   17. AliasedColumnDoesNotReportTheAliasAsBaseColumnName
+//   18. NameIsReportedInBytes             - SQL_DESC_NAME length is a byte count
+//   19. NameTruncationReturnsInfo         - short buffer → SUCCESS_WITH_INFO + 01004
+//   20. VariantTypeOnNonVariantColumn     - HY113
+//   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
+//   22. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
 
 #include "odbc_test_fixture.h"
 
@@ -140,11 +148,210 @@ TEST_F(ColAttributeLiveTest, PrecisionScaleAndNullable) {
 }
 
 // `tinyint` is the only unsigned integer SQL Server exposes.
-TEST_F(ColAttributeLiveTest, UnsignedOnlyForTinyint) {
-    ExecDirect("SELECT CAST(1 AS TINYINT) AS t, CAST(1 AS INT) AS i");
-    EXPECT_EQ(SQL_TRUE, NumericAttr(stmt_, 1, SQL_DESC_UNSIGNED));
-    EXPECT_EQ(SQL_FALSE, NumericAttr(stmt_, 2, SQL_DESC_UNSIGNED));
+// SQL_DESC_UNSIGNED is SQL_FALSE only for the signed numeric types. Every
+// nonnumeric column is "unsigned" by the ODBC definition, which is the opposite
+// of the intuitive reading and the easiest field to get backwards.
+TEST_F(ColAttributeLiveTest, UnsignedIsFalseOnlyForSignedNumerics) {
+    ExecDirect(
+        "SELECT CAST(1 AS TINYINT) AS c1, CAST(1 AS SMALLINT) AS c2,"
+        "       CAST(1 AS INT) AS c3, CAST(1 AS BIGINT) AS c4,"
+        "       CAST(1 AS REAL) AS c5, CAST(1 AS FLOAT) AS c6,"
+        "       CAST(1 AS DECIMAL(10,2)) AS c7, CAST(1 AS BIT) AS c8,"
+        "       CAST('a' AS VARCHAR(10)) AS c9, CAST(N'a' AS NVARCHAR(10)) AS c10,"
+        "       CAST(0x01 AS VARBINARY(8)) AS c11, CAST('2020-01-01' AS DATE) AS c12,"
+        "       CAST(SYSDATETIME() AS DATETIME2(3)) AS c13, NEWID() AS c14,"
+        "       CAST(1 AS MONEY) AS c15");
+    // tinyint is the one unsigned integer.
+    EXPECT_EQ(SQL_TRUE, NumericAttr(stmt_, 1, SQL_DESC_UNSIGNED)) << "tinyint";
+    // money is reported as SQL_DECIMAL, so it is a signed numeric too.
+    for (SQLUSMALLINT col : {2, 3, 4, 5, 6, 7, 15}) {
+        EXPECT_EQ(SQL_FALSE, NumericAttr(stmt_, col, SQL_DESC_UNSIGNED))
+            << "signed numeric column " << col;
+    }
+    for (SQLUSMALLINT col : {8, 9, 10, 11, 12, 13, 14}) {
+        EXPECT_EQ(SQL_TRUE, NumericAttr(stmt_, col, SQL_DESC_UNSIGNED))
+            << "nonnumeric column " << col;
+    }
     SQLCloseCursor(stmt_);
+}
+
+// Display size is the rendered width, not the column size: an int needs a
+// character for the sign, a GUID renders as 36, and binary renders as two hex
+// characters per byte.
+TEST_F(ColAttributeLiveTest, DisplaySizeIsRenderedWidth) {
+    ExecDirect(
+        "SELECT CAST(1 AS INT) AS c1, CAST(1 AS TINYINT) AS c2,"
+        "       CAST(1 AS SMALLINT) AS c3, CAST(1 AS BIGINT) AS c4,"
+        "       NEWID() AS c5, CAST(0x01 AS BINARY(8)) AS c6,"
+        "       CAST(1 AS DECIMAL(10,2)) AS c7, CAST(1 AS BIT) AS c8,"
+        "       CAST('a' AS VARCHAR(10)) AS c9, CAST(N'a' AS NVARCHAR(10)) AS c10");
+    EXPECT_EQ(11, NumericAttr(stmt_, 1, SQL_DESC_DISPLAY_SIZE)) << "int";
+    EXPECT_EQ(3, NumericAttr(stmt_, 2, SQL_DESC_DISPLAY_SIZE)) << "tinyint";
+    EXPECT_EQ(6, NumericAttr(stmt_, 3, SQL_DESC_DISPLAY_SIZE)) << "smallint";
+    EXPECT_EQ(20, NumericAttr(stmt_, 4, SQL_DESC_DISPLAY_SIZE)) << "bigint";
+    EXPECT_EQ(36, NumericAttr(stmt_, 5, SQL_DESC_DISPLAY_SIZE)) << "uniqueidentifier";
+    EXPECT_EQ(16, NumericAttr(stmt_, 6, SQL_DESC_DISPLAY_SIZE)) << "binary(8)";
+    // Precision plus the sign and the decimal point.
+    EXPECT_EQ(12, NumericAttr(stmt_, 7, SQL_DESC_DISPLAY_SIZE)) << "decimal(10,2)";
+    EXPECT_EQ(1, NumericAttr(stmt_, 8, SQL_DESC_DISPLAY_SIZE)) << "bit";
+    EXPECT_EQ(10, NumericAttr(stmt_, 9, SQL_DESC_DISPLAY_SIZE)) << "varchar(10)";
+    // Characters, not bytes.
+    EXPECT_EQ(10, NumericAttr(stmt_, 10, SQL_DESC_DISPLAY_SIZE)) << "nvarchar(10)";
+    SQLCloseCursor(stmt_);
+}
+
+// The approximate numerics report the width of their rendered exponential form,
+// which is unrelated to both the column size and the wire width.
+TEST_F(ColAttributeLiveTest, DisplaySizeForApproximateNumerics) {
+    ExecDirect("SELECT CAST(1 AS REAL) AS c1, CAST(1 AS FLOAT) AS c2");
+    EXPECT_EQ(14, NumericAttr(stmt_, 1, SQL_DESC_DISPLAY_SIZE)) << "real";
+    EXPECT_EQ(24, NumericAttr(stmt_, 2, SQL_DESC_DISPLAY_SIZE)) << "float";
+    SQLCloseCursor(stmt_);
+}
+
+// SQL_DESC_OCTET_LENGTH is the size of the ODBC transfer representation, so the
+// temporal types report their C struct size, not the TDS payload width. A date
+// is 3 bytes on the wire but transfers as a 6-byte SQL_DATE_STRUCT; reporting
+// the wire width would have callers allocate short.
+TEST_F(ColAttributeLiveTest, OctetLengthIsTransferSize) {
+    ExecDirect(
+        "SELECT CAST('2020-01-01' AS DATE) AS c1,"
+        "       CAST(SYSDATETIME() AS TIME(3)) AS c2,"
+        "       CAST(SYSDATETIME() AS DATETIME) AS c3,"
+        "       CAST(SYSDATETIME() AS SMALLDATETIME) AS c4,"
+        "       CAST(SYSDATETIME() AS DATETIME2(7)) AS c5,"
+        "       CAST(SYSDATETIMEOFFSET() AS DATETIMEOFFSET(7)) AS c6,"
+        "       CAST(1 AS INT) AS c7, NEWID() AS c8,"
+        "       CAST('a' AS VARCHAR(10)) AS c9, CAST(N'a' AS NVARCHAR(10)) AS c10");
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQL_DATE_STRUCT)),
+              NumericAttr(stmt_, 1, SQL_DESC_OCTET_LENGTH))
+        << "date";
+    EXPECT_EQ(12, NumericAttr(stmt_, 2, SQL_DESC_OCTET_LENGTH)) << "time(3)";
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQL_TIMESTAMP_STRUCT)),
+              NumericAttr(stmt_, 3, SQL_DESC_OCTET_LENGTH))
+        << "datetime";
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQL_TIMESTAMP_STRUCT)),
+              NumericAttr(stmt_, 4, SQL_DESC_OCTET_LENGTH))
+        << "smalldatetime";
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQL_TIMESTAMP_STRUCT)),
+              NumericAttr(stmt_, 5, SQL_DESC_OCTET_LENGTH))
+        << "datetime2(7)";
+    EXPECT_EQ(20, NumericAttr(stmt_, 6, SQL_DESC_OCTET_LENGTH)) << "datetimeoffset(7)";
+    // The non-temporal types transfer at their wire width.
+    EXPECT_EQ(4, NumericAttr(stmt_, 7, SQL_DESC_OCTET_LENGTH)) << "int";
+    EXPECT_EQ(16, NumericAttr(stmt_, 8, SQL_DESC_OCTET_LENGTH)) << "uniqueidentifier";
+    EXPECT_EQ(10, NumericAttr(stmt_, 9, SQL_DESC_OCTET_LENGTH)) << "varchar(10)";
+    // Bytes, not characters.
+    EXPECT_EQ(20, NumericAttr(stmt_, 10, SQL_DESC_OCTET_LENGTH)) << "nvarchar(10)";
+    SQLCloseCursor(stmt_);
+}
+
+// SQL_DESC_TYPE is the verbose field: the timestamp family collapses to
+// SQL_DATETIME with the member in SQL_DESC_DATETIME_INTERVAL_CODE, while
+// SQL_DESC_CONCISE_TYPE keeps SQL_TYPE_TIMESTAMP.
+TEST_F(ColAttributeLiveTest, VerboseTypeDiffersFromConciseForTimestamps) {
+    ExecDirect(
+        "SELECT CAST(SYSDATETIME() AS DATETIME) AS c1,"
+        "       CAST(SYSDATETIME() AS SMALLDATETIME) AS c2,"
+        "       CAST(SYSDATETIME() AS DATETIME2(3)) AS c3");
+    for (SQLUSMALLINT col : {1, 2, 3}) {
+        EXPECT_EQ(SQL_DATETIME, NumericAttr(stmt_, col, SQL_DESC_TYPE))
+            << "verbose type, column " << col;
+        EXPECT_EQ(SQL_TYPE_TIMESTAMP, NumericAttr(stmt_, col, SQL_DESC_CONCISE_TYPE))
+            << "concise type, column " << col;
+    }
+    SQLCloseCursor(stmt_);
+}
+
+// Having collapsed the verbose type to SQL_DATETIME, the driver still answers
+// which member it was. msodbcsql rejects this field through SQLColAttribute, so
+// only our leg is compared.
+TEST_F(ColAttributeLiveTest, DatetimeSubtypeAccompaniesTheVerboseType) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExecDirect(
+        "SELECT CAST(SYSDATETIME() AS DATETIME) AS c1,"
+        "       CAST(SYSDATETIME() AS DATETIME2(3)) AS c2,"
+        "       CAST(1 AS INT) AS c3");
+    EXPECT_EQ(SQL_CODE_TIMESTAMP, NumericAttr(stmt_, 1, SQL_DESC_DATETIME_INTERVAL_CODE));
+    EXPECT_EQ(SQL_CODE_TIMESTAMP, NumericAttr(stmt_, 2, SQL_DESC_DATETIME_INTERVAL_CODE));
+    // Not a datetime, so there is no subtype.
+    EXPECT_EQ(0, NumericAttr(stmt_, 3, SQL_DESC_DATETIME_INTERVAL_CODE));
+    SQLCloseCursor(stmt_);
+}
+
+// date, time and datetimeoffset sit outside the ODBC datetime range, so the
+// verbose and concise fields agree.
+TEST_F(ColAttributeLiveTest, VerboseTypeMatchesConciseForNonTimestamps) {
+    ExecDirect(
+        "SELECT CAST('2020-01-01' AS DATE) AS c1,"
+        "       CAST(SYSDATETIME() AS TIME(3)) AS c2,"
+        "       CAST(SYSDATETIMEOFFSET() AS DATETIMEOFFSET(3)) AS c3,"
+        "       CAST(1 AS INT) AS c4");
+    for (SQLUSMALLINT col : {1, 2, 3, 4}) {
+        EXPECT_EQ(NumericAttr(stmt_, col, SQL_DESC_CONCISE_TYPE),
+                  NumericAttr(stmt_, col, SQL_DESC_TYPE))
+            << "column " << col;
+    }
+    SQLCloseCursor(stmt_);
+}
+
+// Searchability is derived from the type: the LOB text types take only LIKE and
+// xml/image take neither, so a blanket SQL_PRED_SEARCHABLE overstates them.
+TEST_F(ColAttributeLiveTest, SearchableIsDerivedFromTheType) {
+    ExecDirect(
+        "SELECT CAST('a' AS VARCHAR(10)) AS c1, CAST(N'a' AS NVARCHAR(10)) AS c2,"
+        "       CAST('2020-01-01' AS DATE) AS c3, CAST(1 AS INT) AS c4,"
+        "       CAST(0x01 AS VARBINARY(8)) AS c5, NEWID() AS c6,"
+        "       CAST('a' AS TEXT) AS c7, CAST(N'a' AS NTEXT) AS c8,"
+        "       CAST(0x01 AS IMAGE) AS c9, CAST('<x/>' AS XML) AS c10");
+    EXPECT_EQ(SQL_PRED_SEARCHABLE, NumericAttr(stmt_, 1, SQL_DESC_SEARCHABLE)) << "varchar";
+    EXPECT_EQ(SQL_PRED_SEARCHABLE, NumericAttr(stmt_, 2, SQL_DESC_SEARCHABLE)) << "nvarchar";
+    EXPECT_EQ(SQL_PRED_SEARCHABLE, NumericAttr(stmt_, 3, SQL_DESC_SEARCHABLE)) << "date";
+    EXPECT_EQ(SQL_PRED_BASIC, NumericAttr(stmt_, 4, SQL_DESC_SEARCHABLE)) << "int";
+    EXPECT_EQ(SQL_PRED_BASIC, NumericAttr(stmt_, 5, SQL_DESC_SEARCHABLE)) << "varbinary";
+    EXPECT_EQ(SQL_PRED_BASIC, NumericAttr(stmt_, 6, SQL_DESC_SEARCHABLE)) << "uniqueidentifier";
+    EXPECT_EQ(SQL_PRED_CHAR, NumericAttr(stmt_, 7, SQL_DESC_SEARCHABLE)) << "text";
+    EXPECT_EQ(SQL_PRED_CHAR, NumericAttr(stmt_, 8, SQL_DESC_SEARCHABLE)) << "ntext";
+    EXPECT_EQ(SQL_PRED_NONE, NumericAttr(stmt_, 9, SQL_DESC_SEARCHABLE)) << "image";
+    EXPECT_EQ(SQL_PRED_NONE, NumericAttr(stmt_, 10, SQL_DESC_SEARCHABLE)) << "xml";
+    SQLCloseCursor(stmt_);
+}
+
+// SQL_DESC_AUTO_UNIQUE_VALUE reflects IDENTITY, which needs a real table since
+// a projected expression is never an identity column.
+TEST_F(ColAttributeLiveTest, IdentityColumnReportsAutoUniqueValue) {
+    ExecDirect("CREATE TABLE #colattr_identity (id INT IDENTITY(1,1), val INT)");
+    ExecDirect("SELECT id, val FROM #colattr_identity");
+    EXPECT_EQ(SQL_TRUE, NumericAttr(stmt_, 1, SQL_DESC_AUTO_UNIQUE_VALUE)) << "identity";
+    EXPECT_EQ(SQL_FALSE, NumericAttr(stmt_, 2, SQL_DESC_AUTO_UNIQUE_VALUE)) << "plain int";
+    SQLCloseCursor(stmt_);
+    ExecDirect("DROP TABLE #colattr_identity");
+}
+
+// SQL_DESC_NAME and SQL_DESC_LABEL report the alias; SQL_DESC_BASE_COLUMN_NAME
+// must not. Without FOR BROWSE the server sends no base-column name, so ODBC
+// asks for an empty string rather than the alias.
+TEST_F(ColAttributeLiveTest, AliasedColumnDoesNotReportTheAliasAsBaseColumnName) {
+    ExecDirect("CREATE TABLE #colattr_alias (source_col INT)");
+    ExecDirect("SELECT source_col AS alias_col FROM #colattr_alias");
+
+    SQLTCHAR buf[64] = {};
+    SQLSMALLINT len = 0;
+    ASSERT_SQL_OK(
+        SQLColAttribute(stmt_, 1, SQL_DESC_NAME, buf, sizeof(buf), &len, nullptr),
+        SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("alias_col", ODBCTestUtils::ToNarrow(SqlTString(buf)));
+
+    len = 0;
+    std::fill(std::begin(buf), std::end(buf), 0);
+    ASSERT_SQL_OK(
+        SQLColAttribute(stmt_, 1, SQL_DESC_BASE_COLUMN_NAME, buf, sizeof(buf), &len, nullptr),
+        SQL_HANDLE_STMT, stmt_);
+    EXPECT_NE("alias_col", ODBCTestUtils::ToNarrow(SqlTString(buf)))
+        << "the alias must not be reported as the base column name";
+
+    SQLCloseCursor(stmt_);
+    ExecDirect("DROP TABLE #colattr_alias");
 }
 
 // The wide entry point reports string lengths in bytes, not characters.

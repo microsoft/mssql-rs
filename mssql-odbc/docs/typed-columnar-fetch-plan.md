@@ -105,6 +105,15 @@ These were found by reading `Sql/Ntdbms/sqlncli/odbc/sqlccnvt.cpp` while reviewi
 | Any source into `SQL_C_NUMERIC` | converts, per Appendix D | `HYC00` | **Deliberate, and permanent.** Decimal is delivered as character data, which is what mssql-python requests, so `SQL_NUMERIC_STRUCT` is not scheduled to become supported. Anchored by `UnsupportedCTypeReturnsHyc00ThenValueReadable`. |
 | `SQL_CA_SS_VARIANT_TYPE` for a variant holding `decimal` / `numeric` / `money` | `SQL_C_NUMERIC` | `SQL_C_CHAR` | **Deliberate**, and follows from the row above: reporting `SQL_C_NUMERIC` would make the caller request a `SQL_NUMERIC_STRUCT` this driver refuses. Character is how those values are actually delivered. |
 | `SQL_CA_SS_VARIANT_TYPE` on a column that is not `sql_variant` | `SQL_SUCCESS` | `HY113` | **Deliberate.** msodbcsql prepares `IDS_S1_113` and then `break`s without returning it, where the adjacent `SQL_CA_SS_VARIANT_SERVER_TYPE` case does `SETRC_SERR_GOTO` with the same error — so its success looks like an oversight rather than a contract. Telling the caller it asked the wrong question is more useful than answering it. |
+| `SQL_DESC_DATETIME_INTERVAL_CODE` through `SQLColAttribute` | rejected — the field is not in the `GetIRDField` switch | `SQL_CODE_TIMESTAMP` for the `datetime`/`smalldatetime`/`datetime2` family, `0` otherwise | **Deliberate**, and additive. Having collapsed `SQL_DESC_TYPE` to the verbose `SQL_DATETIME` to match msodbcsql, refusing to say which member it was leaves the caller with strictly less information than before. Anchored by `DatetimeSubtypeAccompaniesTheVerboseType`, which skips the comparison leg. |
+
+##### Descriptor fields verified against msodbcsql
+
+The per-type tables behind `SQL_DESC_DISPLAY_SIZE`, `SQL_DESC_OCTET_LENGTH`, `SQL_DESC_PRECISION`, `SQL_DESC_UNSIGNED` and `SQL_DESC_SEARCHABLE` were taken from `GetIRDField` in `Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp` and are asserted on *both* legs of the parity run, so they are checked against the real driver rather than against a reading of it. Three are easy to get wrong:
+
+- **Display size is not the column size.** An `int` is 11 (sign plus ten digits), a GUID is 36, binary is two hex characters per byte, and the national character types report characters while their octet length reports bytes.
+- **Octet length is the ODBC transfer size, not the TDS payload width.** A `date` is 3 bytes on the wire but transfers as a 6-byte `SQL_DATE_STRUCT`; `time` is 12, the `datetime` family 16, and `datetimeoffset` 20. Reporting the wire width would have callers allocate short.
+- **`SQL_DESC_UNSIGNED` keys off the ODBC type, not the TDS type.** msodbcsql's `IsUnsigned()` is a bitmask over the *SQL* type, so it is `SQL_FALSE` only for the signed numerics and `SQL_TRUE` for every nonnumeric column. `money` therefore comes out **signed**, because it is reported as `SQL_DECIMAL` — which is the one case a TDS-type-based implementation gets backwards.
 
 ### P2 — SQLColAttributeW — Task [46579](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46579)
 
