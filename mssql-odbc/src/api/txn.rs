@@ -362,18 +362,35 @@ pub(super) fn set_autocommit(dbc: &DbcHandle, value: u64) -> SqlReturn {
 ///
 /// Mirrors msodbcsql's `SQL_COPT_SS_RESET_CONNECTION` handler
 /// (`sqlcmisc.cpp:2373-2461`): reject any value but `SQL_RESET_CONNECTION_YES`
-/// with HY024 (D7), roll back a live local transaction first (D4), then reset
-/// the session to its login defaults. Pool checkout does not preserve
-/// transactions, so this never uses RESETCONNECTIONSKIPTRAN.
+/// with HY024 (D7), roll back a live local transaction first (D4), then arm the
+/// session reset. Pool checkout does not preserve transactions, so this never
+/// uses RESETCONNECTIONSKIPTRAN.
 ///
-/// The reset is driven eagerly (A2): rather than only arming the bit for the
-/// next request, it drives a minimal round trip so the server processes the
-/// reset and acknowledges it before this call returns. That way a failed reset
-/// is caught at pool checkout — the connection is poisoned and surfaces `08S01`
-/// so `mssql-python` discards it — instead of failing the next borrower's first
-/// query. The acknowledging round trip also clears the client's session-bound
-/// caches (`on_reset_connection_ack`), so a later short-circuited isolation SET
-/// cannot leave the reset unacknowledged.
+/// The reset is **armed, not round-tripped**. RESETCONNECTION is a TDS
+/// packet-header bit (MS-TDS 2.2.3.1.2): the server returns the session to its
+/// login defaults *before* processing the request that carries it, so the next
+/// borrower never sees the previous borrower's state regardless of which request
+/// that turns out to be. Driving a dedicated `SELECT 1` here would roughly double
+/// checkout cost (measured ~1.65 ms vs ~0.80 ms on loopback, and the delta is a
+/// full RTT so it grows with network latency) to buy nothing for state
+/// correctness.
+///
+/// The two properties that would otherwise be lost to deferral are kept without
+/// the round trip:
+/// - **No stale client-side state.** `prepare_reset_connection` drops the
+///   session-bound caches at arm time, so a borrower can never be served from a
+///   prepared handle the reset is about to invalidate.
+/// - **Fail at checkout.** `pending_reset_ack` suppresses the same-value
+///   short circuit in `set_txn_isolation`, so the pool's checkout
+///   `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` (D9/#343) always emits and
+///   carries the armed bit. A failed reset therefore surfaces inside the pool's
+///   `reset()` — before the connection is handed out — and that handler verifies
+///   the server acknowledged it rather than assuming the batch succeeding
+///   implies it.
+///
+/// A consumer that never issues the checkout isolation SET simply gets
+/// msodbcsql's behavior: the bit rides the borrower's first request, which is
+/// still reset-before-execute, only without the early discard.
 pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     const OP: &str = "SQLSetConnectAttrW(SQL_ATTR_RESET_CONNECTION)";
 
@@ -414,12 +431,12 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
         Err(ret) => return ret,
     };
 
-    // Roll back a live local transaction before the reset so the next borrower
-    // cannot inherit it. Guard on the server actually having one, the same way
-    // `end_transaction` does — the flag can be stale. A full RESETCONNECTION
-    // would discard the transaction server-side regardless, but rolling back
-    // explicitly keeps the client's own transaction tracking in step with the
-    // server.
+    // Roll back a live local transaction before arming the reset so the next
+    // borrower cannot inherit it. Guard on the server actually having one, the
+    // same way `end_transaction` does — the flag can be stale. A full
+    // RESETCONNECTION would discard the transaction server-side regardless, but
+    // rolling back explicitly keeps the client's own transaction tracking in
+    // step with the server.
     let result = if started && client.has_active_transaction() {
         debug!("{OP}: rolling back live local transaction before reset");
         dbc.runtime
@@ -428,13 +445,17 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
         Ok(())
     };
 
-    // A2: drive the reset to completion so it is acknowledged before checkout.
-    // The mutex is not held across this I/O — the client is owned here.
-    let result = result.and_then(|()| dbc.runtime.block_on(client.reset_connection()));
+    // Arm the reset. This costs no I/O: the bit rides the next request, and the
+    // session-bound caches are dropped here so nothing stale can be used before
+    // then.
+    if result.is_ok() {
+        client.prepare_reset_connection(false);
+    }
 
-    // A failed reset leaves the session in an unknown state; poison the client
-    // so a subsequent SQL_ATTR_CONNECTION_DEAD read reports it dead and the pool
-    // discards it, then restore it so SQLDisconnect can still tear it down.
+    // A failed rollback leaves the session in an unknown state; poison the
+    // client so a subsequent SQL_ATTR_CONNECTION_DEAD read reports it dead and
+    // the pool discards it, then restore it so SQLDisconnect can still tear it
+    // down.
     if result.is_err() {
         client.mark_connection_dead();
     }
@@ -447,10 +468,13 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     state.local_tran_started = false;
     if let Err(e) = result {
         error!(%e, "{OP}: connection reset failed");
+        state.pending_reset_ack = false;
         post_tds_error(&mut state, &e, SQLSTATE_08S01);
         return SQL_ERROR;
     }
-    debug!("{OP}: reset processed and acknowledged");
+    // The checkout isolation SET must now emit so it carries the armed bit.
+    state.pending_reset_ack = true;
+    debug!("{OP}: reset armed; it will be carried by the next request");
     SQL_SUCCESS
 }
 
@@ -587,10 +611,13 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         // can short-circuit here and leak the borrower's level. This mirrors
         // mssql-python's own coverage gap (#343 only tracks the attribute path);
         // `sp_reset_connection` does not reset isolation, so it is a shared,
-        // documented limitation (see the plan's Non-goals), not fixed here. The
-        // eager reset does not paper over it: it clears session-bound caches, not
-        // the server's isolation level.
-        if level == state.txn_isolation {
+        // documented limitation (see the plan's Non-goals), not fixed here.
+        //
+        // The short circuit is suppressed while a pooling reset is armed: this
+        // SET is the request that carries the RESETCONNECTION bit, so skipping
+        // it would defer the reset to the borrower's first query and give up
+        // fail-at-checkout.
+        if level == state.txn_isolation && !state.pending_reset_ack {
             debug!(value, "{OP}: already at this isolation level");
             return SQL_SUCCESS;
         }
@@ -640,6 +667,14 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
             .runtime
             .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None));
     }
+    // If a pooling reset was armed, this batch carried its RESETCONNECTION bit.
+    // Confirm the server actually acknowledged it: the batch succeeding is not
+    // evidence on its own, and an unacknowledged reset means the session was
+    // never returned to its login defaults.
+    let reset_unacknowledged = result.is_ok() && client.reset_pending();
+    if reset_unacknowledged {
+        client.mark_connection_dead();
+    }
     release_dbc_client(dbc, client);
 
     let Ok(mut state) = dbc.inner.lock() else {
@@ -648,9 +683,22 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
     };
     if let Err(e) = result {
         error!(%e, "{OP}: could not apply isolation level");
+        state.pending_reset_ack = false;
         post_tds_error(&mut state, &e, SQLSTATE_HY000);
         return SQL_ERROR;
     }
+    if reset_unacknowledged {
+        error!("{OP}: the armed connection reset was not acknowledged by the server");
+        state.pending_reset_ack = false;
+        post_sql_error(
+            &mut state,
+            SQLSTATE_08S01,
+            0,
+            "The connection reset was not acknowledged by the server",
+        );
+        return SQL_ERROR;
+    }
+    state.pending_reset_ack = false;
     // `value` was validated into `level` above.
     state.txn_isolation = level;
     debug!(tsql, "{OP}: isolation level applied");
@@ -1026,12 +1074,11 @@ mod tests {
     }
 
     #[test]
-    fn reset_connection_poisons_client_on_failure() {
-        // A reset whose round trip fails (the server never acknowledges) leaves
-        // the session in an unknown state: surface 08S01 so the pool discards it
-        // and poison the client so a later SQL_ATTR_CONNECTION_DEAD read reports
-        // dead, while restoring it so SQLDisconnect can still tear it down.
-        use crate::api::sqlstate::SQLSTATE_08S01;
+    fn reset_connection_arms_without_any_io() {
+        // Arming performs no round trip, so it succeeds even against a client
+        // with no queued tokens — that is the whole point of the no-RTT design.
+        // It leaves the ack outstanding so the checkout isolation SET cannot
+        // short-circuit, and drops session-bound state immediately.
         use crate::error::HasDiagnostics;
         use crate::test_support::TestHandles;
         use mssql_tds::test_client_support::tds_client_from_tokens;
@@ -1041,18 +1088,109 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            // No tokens: the reset round trip runs dry and fails.
             state.client = Some(tds_client_from_tokens(vec![]));
         }
 
-        assert_eq!(reset_connection(dbc, 1), SQL_ERROR);
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.diag_records().is_empty());
+        assert!(
+            state.pending_reset_ack,
+            "the armed reset must force the checkout isolation SET to emit"
+        );
+        let client = state.client.as_ref().expect("client restored after arming");
+        assert!(
+            client.reset_pending(),
+            "the acknowledgement is outstanding until the carrying request completes"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "arming must not poison a healthy connection"
+        );
+    }
+
+    #[test]
+    fn unacknowledged_reset_poisons_client_on_the_carrying_request() {
+        // The carrying request is where a failed reset now surfaces. If the
+        // checkout isolation SET completes but the server never sent the
+        // ResetConnection ENVCHANGE, the session was never reset: surface 08S01
+        // so the pool discards the connection and poison the client so a later
+        // SQL_ATTR_CONNECTION_DEAD read reports dead, while restoring it so
+        // SQLDisconnect can still tear it down.
+        use crate::api::sqlstate::SQLSTATE_08S01;
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            // The batch completes, but with no ResetConnection acknowledgement.
+            state.client = Some(tds_client_from_tokens(vec![done_no_more()]));
+        }
+
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+        // The pool's checkout re-apply of READ COMMITTED carries the armed bit.
+        assert_eq!(
+            set_txn_isolation(dbc, u64::from(SQL_TXN_READ_COMMITTED)),
+            SQL_ERROR
+        );
+
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_08S01);
+        assert!(
+            !state.pending_reset_ack,
+            "the pending flag must not survive a failed checkout"
+        );
         let client = state.client.as_ref().expect("client restored for teardown");
         assert!(
             client.is_connection_dead(),
-            "a failed reset must poison the client so the pool discards it"
+            "an unacknowledged reset must poison the client so the pool discards it"
         );
+    }
+
+    #[test]
+    fn armed_reset_suppresses_the_isolation_short_circuit() {
+        // The same-value short circuit would normally skip the checkout SET when
+        // the borrower never changed isolation (D6). While a reset is armed that
+        // SET is the request carrying the bit, so it must emit anyway — proven
+        // here by the reset being acknowledged, which only happens on a real
+        // round trip.
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{
+            done_no_more, env_change_reset_connection, tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(tds_client_from_tokens(vec![
+                env_change_reset_connection(),
+                done_no_more(),
+            ]));
+            // The borrower never changed isolation: the cache already holds the
+            // value the pool is about to re-apply.
+            state.txn_isolation = SQL_TXN_READ_COMMITTED;
+        }
+
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+        assert_eq!(
+            set_txn_isolation(dbc, u64::from(SQL_TXN_READ_COMMITTED)),
+            SQL_SUCCESS
+        );
+
+        let state = dbc.inner.lock().unwrap();
+        assert!(!state.pending_reset_ack);
+        let client = state.client.as_ref().expect("client restored");
+        assert!(
+            !client.reset_pending(),
+            "the SET must have emitted and collected the reset acknowledgement"
+        );
+        assert!(!client.is_connection_dead());
     }
 
     #[test]

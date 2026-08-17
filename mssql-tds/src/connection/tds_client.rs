@@ -208,12 +208,14 @@ pub struct TdsClient {
     pub(crate) negotiated_settings: NegotiatedSettings,
     pub(crate) execution_context: ExecutionContext,
     pub(crate) recovery_context: Box<RecoveryContext>,
-    /// Set by [`on_reset_connection_ack`](TdsClient::on_reset_connection_ack)
-    /// when the server's `ResetConnection` ENVCHANGE arrives. Cleared by
-    /// [`reset_connection`](TdsClient::reset_connection) before its round trip
-    /// so that call can verify the reset was genuinely acknowledged rather than
-    /// assuming a successful batch implies one.
-    reset_acked: bool,
+    /// Set by [`prepare_reset_connection`](TdsClient::prepare_reset_connection)
+    /// and cleared by
+    /// [`on_reset_connection_ack`](TdsClient::on_reset_connection_ack). While
+    /// true, a RESETCONNECTION bit has been armed but the server has not yet
+    /// confirmed it. A pool uses [`reset_pending`](TdsClient::reset_pending)
+    /// after the request that carries the bit to verify the reset was actually
+    /// processed, rather than inferring it from the request succeeding.
+    reset_pending: bool,
 
     // pub(crate) batch_result: Option<BatchResult<'static>>,
     pub(crate) current_metadata: Option<Arc<ColMetadataToken>>,
@@ -340,7 +342,7 @@ impl TdsClient {
             negotiated_settings,
             execution_context,
             recovery_context: Box::new(recovery_context),
-            reset_acked: false,
+            reset_pending: false,
             current_metadata: None,
             current_decryptor: None,
             count_map: HashMap::new(),
@@ -547,10 +549,23 @@ impl TdsClient {
     /// values so a borrower's `USE otherdb` / `SET LANGUAGE` does not persist
     /// across the reset.
     fn on_reset_connection_ack(&mut self) {
-        self.reset_acked = true;
+        self.reset_pending = false;
         self.recovery_context.session_state_table.reset();
         self.clear_session_bound_caches();
         self.negotiated_settings.restore_login_defaults();
+    }
+
+    /// True when a RESETCONNECTION bit has been armed but the server has not yet
+    /// acknowledged it with a `ResetConnection` ENVCHANGE.
+    ///
+    /// A connection pool checks this *after* the request that carries the bit
+    /// (for a client-side pool, the checkout `SET TRANSACTION ISOLATION LEVEL`)
+    /// to confirm the reset was genuinely processed. A request completing
+    /// successfully is not evidence on its own: without the ENVCHANGE the server
+    /// never reset the session, so the connection must be discarded rather than
+    /// handed to the next borrower.
+    pub fn reset_pending(&self) -> bool {
+        self.reset_pending
     }
 
     /// Converts a server `ERROR` token into [`SqlErrorInfo`], marking the
@@ -844,56 +859,41 @@ impl TdsClient {
     ///   Callers (typically a connection pool) should pass `true` only when the
     ///   pooled connection is enlisted in a transaction that must outlive the
     ///   reset.
+    ///
+    /// # Client-side state is dropped immediately
+    /// The session-bound caches (prepared handles, their Always Encrypted
+    /// describe metadata, in-flight capture state), the accumulated
+    /// session-recovery state, and the negotiated DATABASE / LANGUAGE /
+    /// COLLATION are reset here, at arm time, rather than when the
+    /// acknowledgement arrives. The server *will* reset the session before it
+    /// processes the next request, so continuing to serve a borrower from those
+    /// caches in the meantime is never correct: a cached prepared handle would
+    /// be sent on a request whose own header bit is about to drop it
+    /// server-side, which is how msodbcsql produces "Could not find prepared
+    /// statement with handle N" (native 8179) across a pool reset.
+    ///
+    /// Dropping them eagerly is conservative — the worst case is re-preparing a
+    /// statement that a deferred reset had not yet invalidated — and it removes
+    /// the window without costing a round trip. msodbcsql does the same for its
+    /// cached database/language/collation (`sqlcmisc.cpp:2373-2461`); it simply
+    /// does not extend it to prepared handles.
+    ///
+    /// The acknowledgement is still tracked: [`reset_pending`](Self::reset_pending)
+    /// stays true until the server's `ResetConnection` ENVCHANGE arrives, so the
+    /// caller can verify the reset actually happened once the carrying request
+    /// completes.
     pub fn prepare_reset_connection(&mut self, preserve_transaction: bool) {
         let mode = match preserve_transaction {
             true => ResetConnectionMode::ResetSkipTran,
             false => ResetConnectionMode::Reset,
         };
         self.transport.as_writer().set_reset_mode(mode);
-    }
-
-    /// Arms the full RESETCONNECTION bit and drives a minimal round trip so the
-    /// server processes the reset and returns its `ResetConnection` ENVCHANGE
-    /// within this call — the eager, self-acking counterpart to
-    /// [`prepare_reset_connection`](Self::prepare_reset_connection).
-    ///
-    /// A connection pool uses this at checkout so the reset is processed and its
-    /// session-bound caches cleared (via
-    /// [`on_reset_connection_ack`](Self::on_reset_connection_ack)) *before* the
-    /// connection is handed out, instead of riding whatever request the borrower
-    /// issues next. A failed round trip surfaces as an error so the caller can
-    /// discard the connection rather than leak stale session state to the next
-    /// borrower.
-    ///
-    /// `SELECT 1` is the cheapest batch that reliably carries the reset bit and
-    /// forces the acknowledging ENVCHANGE.
-    ///
-    /// Returns [`ProtocolError`](crate::error::Error::ProtocolError) if the
-    /// round trip completes without the server acknowledging the reset. The
-    /// batch succeeding is not sufficient evidence: without the ENVCHANGE,
-    /// `on_reset_connection_ack` never ran, so the session-bound caches are
-    /// still stale and the session was not returned to its login defaults.
-    /// Reporting success there would break the guarantee a pool relies on.
-    ///
-    /// The reset is the *same physical login*: it never re-runs the LOGIN7 /
-    /// fedauth handshake and never re-sends the access token, so the
-    /// authentication and session-recovery context (the `client_context` held in
-    /// [`recovery_context`](Self::recovery_context)) is preserved untouched. A
-    /// new or rotated access token is only ever consumed at connect time, so
-    /// rotating credentials means a fresh connection (new LOGIN7), not a re-auth
-    /// of this live session.
-    pub async fn reset_connection(&mut self) -> TdsResult<()> {
-        self.reset_acked = false;
-        self.prepare_reset_connection(false);
-        self.execute("SELECT 1".to_string(), ()).await?;
-        self.close_query().await?;
-        if !self.reset_acked {
-            error!("Connection reset was not acknowledged by the server");
-            return Err(crate::error::Error::ProtocolError(
-                "connection reset was not acknowledged by the server".to_string(),
-            ));
-        }
-        Ok(())
+        self.reset_pending = true;
+        // Mirror the reset the server will apply before the next request, so no
+        // borrower is served from state the reset is about to invalidate.
+        self.recovery_context.session_state_table.reset();
+        self.clear_session_bound_caches();
+        self.negotiated_settings.restore_login_defaults();
     }
 
     /// Executes a SQL batch and positions on its **first navigable result**,
@@ -7973,12 +7973,11 @@ mod tests {
         );
     }
 
-    /// A2: `reset_connection()` arms the RESETCONNECTION bit on the wire and
-    /// drives the round trip whose `ResetConnection` ENVCHANGE clears the
-    /// session-bound caches, so the reset is acknowledged before the call
-    /// returns rather than riding a later request.
+    /// Arming the reset drops the session-bound caches immediately, without a
+    /// round trip, and leaves the acknowledgement outstanding until the server
+    /// confirms it on the request that carries the bit.
     #[tokio::test]
-    async fn reset_connection_arms_bit_and_acks_within_the_call() {
+    async fn prepare_reset_connection_clears_caches_and_arms_bit() {
         use crate::message::messages::PacketStatusFlags;
         use crate::token::tokens::{EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType};
 
@@ -7991,20 +7990,37 @@ mod tests {
         ]);
         client.prepared_handles.insert(sid(1), 55);
 
+        client.prepare_reset_connection(false);
+
+        assert!(
+            client.prepared_handles.is_empty(),
+            "arming must drop session-bound caches without waiting for the ack"
+        );
+        assert!(
+            client.reset_pending(),
+            "the acknowledgement is still outstanding until the server confirms"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "arming must not send anything on its own"
+        );
+
+        // The next request carries the bit and collects the acknowledgement.
         client
-            .reset_connection()
+            .execute("SELECT 1".to_string(), ())
             .await
-            .expect("reset round trip should succeed against the queued ack");
+            .expect("the carrying request should succeed");
+        client.close_query().await.expect("drain the ack");
 
         let sent = sent.lock().unwrap();
         assert_eq!(
             sent[1] & PacketStatusFlags::ResetConnection as u8,
             PacketStatusFlags::ResetConnection as u8,
-            "the round trip must carry the RESETCONNECTION bit in its first packet"
+            "the next request must carry the RESETCONNECTION bit in its first packet"
         );
         assert!(
-            client.prepared_handles.is_empty(),
-            "the ResetConnection ack must clear session-bound caches within the call"
+            !client.reset_pending(),
+            "the ResetConnection ack must clear the pending flag"
         );
     }
 
