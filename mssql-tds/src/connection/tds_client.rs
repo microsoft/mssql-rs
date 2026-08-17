@@ -2795,7 +2795,7 @@ impl TdsClient {
     /// This functions returns to the next row in the result set.
     /// If there are no more rows, it returns None.
     // Not instrumented: the span pushes ResultSet::next_row over the 4 KiB
-    // hot-path future budget. next_row_into still carries the row span.
+    // hot-path future budget. Successful rows still emit `Row Received`.
     pub(crate) async fn get_next_row(&mut self) -> TdsResult<Option<Vec<ColumnValues>>> {
         let col_count = self
             .current_metadata
@@ -3604,7 +3604,8 @@ impl TdsClient {
     /// Concrete writers stay concrete through the production transport and
     /// decode chain. [`ResultSet::next_row_into`] provides the same operation
     /// through statically dispatched trait calls.
-    #[instrument(skip(self, writer), level = "info")]
+    // `#[instrument]` adds enough state to exceed the 4096 B budget once the
+    // lazy timeout future is inlined. Successful rows still emit `Row Received`.
     pub async fn next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
     where
         W: RowWriter + Send + ?Sized,
@@ -4755,8 +4756,8 @@ pub trait ResultSet {
     /// not pause. The ODBC column-at-a-time pull path uses the client cursor
     /// (`next_row_cursor` / `read_row_column`) instead.
     /// Concrete [`TdsClient`] receivers use [`TdsClient::next_row_into`] to keep
-    /// the writer statically dispatched; this object-safe method is the fallback
-    /// for callers that hold a `dyn ResultSet`.
+    /// the writer statically dispatched. Calls through this trait remain
+    /// statically dispatched because [`ResultSet`] is not dyn-compatible.
     ///
     /// # Errors
     ///
