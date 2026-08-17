@@ -330,7 +330,7 @@ async fn create_transport_for_version(
     transport_context: &TransportContext,
     encryption_options: EncryptionOptions,
     encryption_mode: EncryptionSetting,
-) -> TdsResult<Box<NetworkTransport>> {
+) -> TdsResult<NetworkTransport> {
     let ssl_handler = SslHandler {
         server_host_name: transport_context.get_server_name().to_string(),
         encryption_options,
@@ -342,13 +342,13 @@ async fn create_transport_for_version(
             // negotiation. TLS must be wrapped in TDS packets for this version.
             info!("Creating NetworkTransport for TDS 7.4 with TLS wrapping");
 
-            Ok(Box::new(NetworkTransport::new(
+            Ok(NetworkTransport::new(
                 stream,
                 ssl_handler,
                 PRE_NEGOTIATED_PACKET_SIZE,
                 encryption_mode,
                 true, // Use TDS 7.4 TLS wrapping
-            )))
+            ))
         }
         TdsVersion::V8_0 => {
             // Enable TLS immediately for TDS 8.0 (before any TDS packets are exchanged)
@@ -358,13 +358,13 @@ async fn create_transport_for_version(
                 .enable_ssl_async(stream, NegotiatedEncryptionSetting::Strict)
                 .await?;
 
-            Ok(Box::new(NetworkTransport::new(
+            Ok(NetworkTransport::new(
                 encrypted_stream,
                 ssl_handler,
                 PRE_NEGOTIATED_PACKET_SIZE,
                 encryption_mode,
                 false, // TDS 8.0 uses standard TLS (no TDS wrapping)
-            )))
+            ))
         }
         TdsVersion::Unknown(version_value) => Err(crate::error::Error::ProtocolError(format!(
             "Unsupported TDS version: 0x{version_value:08X}. Only TDS 7.4 and TDS 8.0 are supported."
@@ -394,7 +394,7 @@ pub(crate) async fn create_transport(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
-) -> TdsResult<Box<NetworkTransport>> {
+) -> TdsResult<NetworkTransport> {
     let encryption_mode = encryption_options.mode;
 
     // Step 1: Create the base stream (transport-specific)
@@ -1350,9 +1350,8 @@ impl TdsPacketReader for NetworkTransport {
     }
 }
 
-#[async_trait]
-impl TdsTokenStreamReader for NetworkTransport {
-    async fn receive_token(
+impl NetworkTransport {
+    pub(crate) async fn receive_token(
         &mut self,
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
@@ -1376,7 +1375,7 @@ impl TdsTokenStreamReader for NetworkTransport {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
@@ -1384,14 +1383,17 @@ impl TdsTokenStreamReader for NetworkTransport {
         token_result
     }
 
-    async fn receive_row_into(
+    pub(crate) async fn receive_row_into<W>(
         &mut self,
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
         plan: ColumnPolicy,
-        writer: &mut (dyn RowWriter + Send),
-    ) -> TdsResult<RowReadResult> {
+        writer: &mut W,
+    ) -> TdsResult<RowReadResult>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
         // `self` is the packet reader, so the scratch slot has to be moved out
         // for the duration of the read and put back afterwards. The restore
         // below must stay unconditional, and no `?` may be introduced between
@@ -1418,7 +1420,7 @@ impl TdsTokenStreamReader for NetworkTransport {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
@@ -1426,7 +1428,7 @@ impl TdsTokenStreamReader for NetworkTransport {
         result
     }
 
-    async fn receive_row_header(
+    pub(crate) async fn receive_row_header(
         &mut self,
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
@@ -1453,7 +1455,7 @@ impl TdsTokenStreamReader for NetworkTransport {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
@@ -1461,14 +1463,17 @@ impl TdsTokenStreamReader for NetworkTransport {
         result
     }
 
-    async fn resume_row_into(
+    pub(crate) async fn resume_row_into<W>(
         &mut self,
         pause_state: RowPauseState,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
         plan: ColumnPolicy,
-        writer: &mut (dyn RowWriter + Send),
-    ) -> TdsResult<RowReadResult> {
+        writer: &mut W,
+    ) -> TdsResult<RowReadResult>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
         let result = await_within_request_timeout!(
             remaining_request_timeout,
             CancelHandle::run_until_cancelled(
@@ -1481,7 +1486,7 @@ impl TdsTokenStreamReader for NetworkTransport {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
@@ -1489,7 +1494,7 @@ impl TdsTokenStreamReader for NetworkTransport {
         result
     }
 
-    async fn read_active_plp_bytes(
+    pub(crate) async fn read_active_plp_bytes(
         &mut self,
         plp_state: &mut PlpPauseState,
         remaining_request_timeout: Option<Duration>,
@@ -1508,12 +1513,95 @@ impl TdsTokenStreamReader for NetworkTransport {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
         }
         result
+    }
+}
+
+#[async_trait]
+impl TdsTokenStreamReader for NetworkTransport {
+    async fn receive_token(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Tokens> {
+        NetworkTransport::receive_token(self, context, remaining_request_timeout, cancel_handle)
+            .await
+    }
+
+    async fn receive_row_into(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        plan: ColumnPolicy,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult> {
+        NetworkTransport::receive_row_into(
+            self,
+            context,
+            remaining_request_timeout,
+            cancel_handle,
+            plan,
+            writer,
+        )
+        .await
+    }
+
+    async fn receive_row_header(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<RowHeader> {
+        NetworkTransport::receive_row_header(
+            self,
+            context,
+            remaining_request_timeout,
+            cancel_handle,
+        )
+        .await
+    }
+
+    async fn resume_row_into(
+        &mut self,
+        pause_state: RowPauseState,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        plan: ColumnPolicy,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult> {
+        NetworkTransport::resume_row_into(
+            self,
+            pause_state,
+            remaining_request_timeout,
+            cancel_handle,
+            plan,
+            writer,
+        )
+        .await
+    }
+
+    async fn read_active_plp_bytes(
+        &mut self,
+        plp_state: &mut PlpPauseState,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        out: &mut [u8],
+    ) -> TdsResult<usize> {
+        NetworkTransport::read_active_plp_bytes(
+            self,
+            plp_state,
+            remaining_request_timeout,
+            cancel_handle,
+            out,
+        )
+        .await
     }
 }
 
