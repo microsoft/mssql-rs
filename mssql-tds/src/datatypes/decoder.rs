@@ -33,12 +33,43 @@ use super::row_writer::{RowWriter, write_column_value};
 // Avoid constructing a read future when the complete scalar is already buffered.
 // Probe misses consume nothing; the async method remains the authoritative refill path.
 macro_rules! read_sync_first {
-    ($reader:expr, $try_method:ident, $read_method:ident) => {
-        match ($reader).$try_method() {
-            Some(value) => value,
-            None => ($reader).$read_method().await?,
-        }
+    ($reader:expr, try_read_byte, read_byte) => {
+        read_sync_first!(@pair $reader, try_read_byte, read_byte)
     };
+    ($reader:expr, try_read_int16, read_int16) => {
+        read_sync_first!(@pair $reader, try_read_int16, read_int16)
+    };
+    ($reader:expr, try_read_uint16, read_uint16) => {
+        read_sync_first!(@pair $reader, try_read_uint16, read_uint16)
+    };
+    ($reader:expr, try_read_uint24, read_uint24) => {
+        read_sync_first!(@pair $reader, try_read_uint24, read_uint24)
+    };
+    ($reader:expr, try_read_int32, read_int32) => {
+        read_sync_first!(@pair $reader, try_read_int32, read_int32)
+    };
+    ($reader:expr, try_read_uint32, read_uint32) => {
+        read_sync_first!(@pair $reader, try_read_uint32, read_uint32)
+    };
+    ($reader:expr, try_read_uint40, read_uint40) => {
+        read_sync_first!(@pair $reader, try_read_uint40, read_uint40)
+    };
+    ($reader:expr, try_read_int64, read_int64) => {
+        read_sync_first!(@pair $reader, try_read_int64, read_int64)
+    };
+    ($reader:expr, try_read_float32, read_float32) => {
+        read_sync_first!(@pair $reader, try_read_float32, read_float32)
+    };
+    ($reader:expr, try_read_float64, read_float64) => {
+        read_sync_first!(@pair $reader, try_read_float64, read_float64)
+    };
+    (@pair $reader:expr, $try_method:ident, $read_method:ident) => {{
+        let reader = &mut *($reader);
+        match reader.$try_method() {
+            Some(value) => value,
+            None => reader.$read_method().await?,
+        }
+    }};
 }
 
 /// Reads an encrypted column's cipher bytes from the wire and turns them back
@@ -3352,9 +3383,48 @@ mod test {
                 self.pos += n;
                 Ok(slice)
             }
+
+            fn try_take<const N: usize>(&mut self) -> Option<[u8; N]> {
+                let end = self.pos.checked_add(N)?;
+                let bytes = self.data.get(self.pos..end)?.try_into().ok()?;
+                self.pos = end;
+                Some(bytes)
+            }
         }
 
         impl TdsPacketReader for ByteReader {
+            fn try_read_byte(&mut self) -> Option<u8> {
+                self.try_take().map(|[value]| value)
+            }
+            fn try_read_int16(&mut self) -> Option<i16> {
+                self.try_take().map(i16::from_le_bytes)
+            }
+            fn try_read_uint16(&mut self) -> Option<u16> {
+                self.try_take().map(u16::from_le_bytes)
+            }
+            fn try_read_uint24(&mut self) -> Option<u32> {
+                let [b0, b1, b2] = self.try_take()?;
+                Some(u32::from_le_bytes([b0, b1, b2, 0]))
+            }
+            fn try_read_int32(&mut self) -> Option<i32> {
+                self.try_take().map(i32::from_le_bytes)
+            }
+            fn try_read_uint32(&mut self) -> Option<u32> {
+                self.try_take().map(u32::from_le_bytes)
+            }
+            fn try_read_uint40(&mut self) -> Option<u64> {
+                let [b0, b1, b2, b3, b4] = self.try_take()?;
+                Some(u64::from_le_bytes([b0, b1, b2, b3, b4, 0, 0, 0]))
+            }
+            fn try_read_int64(&mut self) -> Option<i64> {
+                self.try_take().map(i64::from_le_bytes)
+            }
+            fn try_read_float32(&mut self) -> Option<f32> {
+                self.try_take().map(f32::from_le_bytes)
+            }
+            fn try_read_float64(&mut self) -> Option<f64> {
+                self.try_take().map(f64::from_le_bytes)
+            }
             async fn read_byte(&mut self) -> TdsResult<u8> {
                 Ok(self.take(1)?[0])
             }
