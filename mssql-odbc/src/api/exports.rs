@@ -564,6 +564,39 @@ pub unsafe extern "C" fn SQLDescribeColW(
     }
 }
 
+/// Gets a descriptor field for a result set column.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle.
+/// - `column_number` must be a valid column index (1-based), except for
+///   `SQL_DESC_COUNT`, which describes the result set.
+/// - `character_attribute_ptr` must be writable for `buffer_length` bytes when
+///   non-null; `string_length_ptr` and `numeric_attribute_ptr` must be null or
+///   writable for their types.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLColAttributeW(
+    statement_handle: SqlHandle,
+    column_number: SqlUSmallInt,
+    field_identifier: SqlUSmallInt,
+    character_attribute_ptr: SqlPointer,
+    buffer_length: SqlSmallInt,
+    string_length_ptr: *mut SqlSmallInt,
+    numeric_attribute_ptr: *mut SqlLen,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::col_attribute::sql_col_attribute_w(
+            statement_handle,
+            column_number,
+            field_identifier,
+            character_attribute_ptr,
+            buffer_length,
+            string_length_ptr,
+            numeric_attribute_ptr,
+        )
+    }
+}
+
 /// Retrieves data for a single column in the current fetched row.
 ///
 /// # Safety
