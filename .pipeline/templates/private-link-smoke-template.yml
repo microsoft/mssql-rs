@@ -41,11 +41,11 @@ parameters:
 
 - name: vnet
   type: string
-  default: vnet-sqldrivers-trusted-westus3
+  default: vnet-sqldrivers-trusted-westus3-01
 
 - name: subnet
   type: string
-  default: default2
+  default: snet-aci-01
 
 - name: miName
   type: string
@@ -70,9 +70,9 @@ jobs:
 - job: PrivateLink_Smoke
   displayName: Private Link Smoke Test (ACI)
   pool:
-    name: RUST-1ES-POOL-WUS3
+    name: RUST-X64-WUS3
     demands:
-      - imageOverride -equals RUST-1ES-UBUSLIM
+      - imageOverride -equals RUST-UBUSLIM
   timeoutInMinutes: 30
   steps:
   # --- Login ---

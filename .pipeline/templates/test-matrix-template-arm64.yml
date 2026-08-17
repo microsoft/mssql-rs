@@ -75,7 +75,7 @@ jobs:
               entry: ${{ target.entry }}
               sentinelName: ${{ target.name }}
       pool:
-        name: RUST-1ES-POOL-ARM-WUS3
+        name: RUST-ARM64-WUS3
         demands:
           - imageOverride -equals RUST-UBUNTU-ARM64
       steps:
@@ -190,7 +190,7 @@ jobs:
         displayName: 'Linux arm64 ${{ target.name }}'
         # Intentionally no `dependsOn`: see sql-host-template.yml header.
         pool:
-          name: RUST-1ES-POOL-ARM-WUS3
+          name: RUST-ARM64-WUS3
           demands:
             - imageOverride -equals RUST-UBUNTU-ARM64
         steps:
