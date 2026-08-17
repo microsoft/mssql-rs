@@ -906,7 +906,8 @@ fn write_string_result<T: Copy + Default>(
 }
 
 /// Why a column value could not be rendered as text.
-enum TextError {
+// Shared with the bound fetch path in `fetch_scroll`.
+pub(crate) enum TextError {
     /// No text rendering is defined for this column type.
     Unsupported,
     /// The server payload could not be decoded (bad UTF-8/UTF-16 or a truncated
@@ -935,7 +936,7 @@ fn binary_length(value: &ColumnValues) -> SqlLen {
     SqlLen::try_from(len).unwrap_or(SqlLen::MAX)
 }
 
-fn is_typed_c_target(target_type: SqlSmallInt) -> bool {
+pub(crate) fn is_typed_c_target(target_type: SqlSmallInt) -> bool {
     is_integer_c_target(target_type)
         || is_float_c_target(target_type)
         || target_type == SQL_C_GUID
@@ -947,7 +948,7 @@ fn is_typed_c_target(target_type: SqlSmallInt) -> bool {
 /// # Safety
 /// `target_value_ptr` must be valid for the target C type's size when non-null,
 /// and `strlen_or_ind_ptr` null or valid for a `SqlLen` write.
-unsafe fn convert_typed_c(
+pub(crate) unsafe fn convert_typed_c(
     value: &ColumnValues,
     target_type: SqlSmallInt,
     target_value_ptr: SqlPointer,
@@ -1046,7 +1047,7 @@ fn xml_to_text(bytes: &[u8]) -> Result<String, TextError> {
     String::from_utf16(&units).map_err(|_| TextError::Malformed)
 }
 
-fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError> {
+pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError> {
     match v {
         ColumnValues::TinyInt(x) => Ok(x.to_string()),
         ColumnValues::SmallInt(x) => Ok(x.to_string()),

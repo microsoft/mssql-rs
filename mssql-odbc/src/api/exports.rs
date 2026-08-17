@@ -544,6 +544,25 @@ pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
     unsafe { super::fetch::sql_fetch(statement_handle) }
 }
 
+/// Fetches a rowset of rows into the columns bound by `SQLBindCol`.
+///
+/// The cursor is forward-only, so `SQL_FETCH_NEXT` is the only orientation
+/// served; anything else returns `HY106`.
+///
+/// # Safety
+/// `statement_handle` must be a valid statement handle or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLFetchScroll(
+    statement_handle: SqlHandle,
+    fetch_orientation: SqlSmallInt,
+    fetch_offset: SqlLen,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::fetch_scroll::sql_fetch_scroll(statement_handle, fetch_orientation, fetch_offset)
+    }
+}
+
 /// Returns the number of columns in the result set.
 ///
 /// # Safety

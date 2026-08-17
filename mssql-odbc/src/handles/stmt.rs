@@ -237,7 +237,8 @@ impl StmtState {
     }
 
     /// Clears all row-stream state (cursor invalidated, no PLP in progress).
-    pub(crate) fn reset_row_stream(&mut self) {        self.row_positioned = false;
+    pub(crate) fn reset_row_stream(&mut self) {
+        self.row_positioned = false;
         self.last_captured = None;
         self.last_variant_base = None;
         self.row_exhausted = false;
@@ -284,7 +285,8 @@ impl StmtState {
     }
 }
 
-impl HasDiagnostics for StmtState {    fn diag_records(&self) -> &[DiagRecord] {
+impl HasDiagnostics for StmtState {
+    fn diag_records(&self) -> &[DiagRecord] {
         &self.diag_records
     }
     fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {

@@ -16,6 +16,7 @@ mod exec_common;
 mod exec_direct;
 mod execute;
 pub(crate) mod fetch;
+pub(crate) mod fetch_scroll;
 pub(crate) mod free_handle;
 pub(crate) mod get_connect_attr;
 mod get_data;

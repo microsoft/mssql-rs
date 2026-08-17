@@ -40,6 +40,7 @@ pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
 pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
 pub(crate) const SQLSTATE_HY091: [u8; 5] = *b"HY091";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
+pub(crate) const SQLSTATE_HY106: [u8; 5] = *b"HY106";
 pub(crate) const SQLSTATE_HY096: [u8; 5] = *b"HY096";
 pub(crate) const SQLSTATE_HY104: [u8; 5] = *b"HY104";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
@@ -81,6 +82,10 @@ pub(crate) const ERR_CONNECTION_BUSY: DiagMsg = DiagMsg {
 pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "Function sequence error",
+};
+pub(crate) const ERR_FETCH_TYPE_OUT_OF_RANGE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY106,
+    text: "Fetch type out of range",
 };
 pub(crate) const ERR_INVALID_DESCRIPTOR_INDEX: DiagMsg = DiagMsg {
     state: SQLSTATE_07009,

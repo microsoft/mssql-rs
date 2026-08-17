@@ -168,6 +168,7 @@ pub const SQL_API_SQLDISCONNECT: SqlUSmallInt = 9;
 pub const SQL_API_SQLEXECDIRECT: SqlUSmallInt = 11;
 pub const SQL_API_SQLEXECUTE: SqlUSmallInt = 12;
 pub const SQL_API_SQLFETCH: SqlUSmallInt = 13;
+pub const SQL_API_SQLFETCHSCROLL: SqlUSmallInt = 1021;
 pub const SQL_API_SQLFREESTMT: SqlUSmallInt = 16;
 pub const SQL_API_SQLNUMRESULTCOLS: SqlUSmallInt = 18;
 pub const SQL_API_SQLPREPARE: SqlUSmallInt = 19;
@@ -489,6 +490,17 @@ pub const SQL_CONCUR_READ_ONLY: SqlULen = 1;
 pub const SQL_ROW_SUCCESS: SqlUSmallInt = 0;
 pub const SQL_ROW_SUCCESS_WITH_INFO: SqlUSmallInt = 6;
 pub const SQL_ROW_NOROW: SqlUSmallInt = 3;
+pub const SQL_ROW_ERROR: SqlUSmallInt = 5;
+
+// ---- SQLFetchScroll orientations --------------------------------------------
+// Only SQL_FETCH_NEXT is served; the rest exist so the driver can tell an
+// unsupported orientation from a garbage one.
+pub const SQL_FETCH_NEXT: SqlSmallInt = 1;
+pub const SQL_FETCH_FIRST: SqlSmallInt = 2;
+pub const SQL_FETCH_LAST: SqlSmallInt = 3;
+pub const SQL_FETCH_PRIOR: SqlSmallInt = 4;
+pub const SQL_FETCH_ABSOLUTE: SqlSmallInt = 5;
+pub const SQL_FETCH_RELATIVE: SqlSmallInt = 6;
 
 // ---- ODBC C interop structs (SQLBindCol / SQLGetData targets) ---------------
 /// Maximum byte length of a `SQL_NUMERIC_STRUCT` mantissa.
