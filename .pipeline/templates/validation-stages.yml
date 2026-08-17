@@ -601,6 +601,7 @@ stages:
   jobs:
     - template: test-matrix-template-alpine.yml
       parameters:
+        poolName: ${{ parameters.poolName }}
         artifactName: 'Build_Linux'
         matrix:
           Alpine3_18:
@@ -620,6 +621,7 @@ stages:
     # build image and rerun on every listed tag (all ship libssl.so.3 + unixODBC).
     - template: test-matrix-odbc-template.yml
       parameters:
+        poolName: ${{ parameters.poolName }}
         artifactName: 'Odbc_Musl_x64'
         nameSuffix: _musl
         matrix:
@@ -677,6 +679,7 @@ stages:
               entry: alpine.sh
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
+          poolName: ${{ parameters.armPoolName }}
           manageSqlHost: false
           sqlReadyInstanceId: shared_musl
           sentinelPrefix: 'odbc_'
@@ -721,6 +724,7 @@ stages:
               entry: alpine.sh
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
+          poolName: ${{ parameters.armPoolName }}
           sqlInstanceMode: per-job
           sentinelPrefix: 'odbc_'
           sqlImageTag: ${{ parameters.sqlImageTag }}
@@ -747,6 +751,7 @@ stages:
   jobs:
     - template: test-matrix-template.yml
       parameters:
+        poolName: ${{ parameters.poolName }}
         matrix:
           DebianBookworm:
             container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
@@ -777,6 +782,7 @@ stages:
     # excluded; RHEL 8 is covered by the glibc-2.28 track below.
     - template: test-matrix-odbc-template.yml
       parameters:
+        poolName: ${{ parameters.poolName }}
         artifactName: 'Odbc_Linux_x64'
         matrix:
           DebianBookworm:
@@ -796,6 +802,7 @@ stages:
     # (libssl.so.1.1), where the modern glibc 2.35 / OpenSSL 3 binaries would not.
     - template: test-matrix-odbc-template.yml
       parameters:
+        poolName: ${{ parameters.poolName }}
         artifactName: 'Odbc_glibc228_x64'
         nameSuffix: _glibc228
         matrix:
@@ -824,6 +831,7 @@ stages:
           expectedSentinels: 'DebianBookworm,AzLinux3,RHEL9,OracleLinux9,SLES15,Ubuntu22,Ubuntu24,odbc_DebianBookworm,odbc_Ubuntu22,odbc_Ubuntu24,odbc_AzLinux3,odbc_RHEL8'
       - template: test-matrix-template-arm64.yml
         parameters:
+          poolName: ${{ parameters.armPoolName }}
           manageSqlHost: false
           sqlInstanceMode: shared
           sqlImageTag: ${{ parameters.sqlImageTag }}
@@ -851,6 +859,7 @@ stages:
               entry: deb-bookworm.sh
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
+          poolName: ${{ parameters.armPoolName }}
           manageSqlHost: false
           sqlReadyInstanceId: shared
           sentinelPrefix: 'odbc_'
@@ -876,6 +885,7 @@ stages:
       # in the shared host's expectedSentinels above.
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
+          poolName: ${{ parameters.armPoolName }}
           manageSqlHost: false
           sqlReadyInstanceId: shared
           sentinelPrefix: 'odbc_'
@@ -892,6 +902,7 @@ stages:
     - ${{ if eq(parameters.sqlInstanceMode, 'per-job') }}:
       - template: test-matrix-template-arm64.yml
         parameters:
+          poolName: ${{ parameters.armPoolName }}
           sqlInstanceMode: per-job
           sqlImageTag: ${{ parameters.sqlImageTag }}
           targets:
@@ -918,6 +929,7 @@ stages:
               entry: deb-bookworm.sh
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
+          poolName: ${{ parameters.armPoolName }}
           sqlInstanceMode: per-job
           sentinelPrefix: 'odbc_'
           sqlImageTag: ${{ parameters.sqlImageTag }}
@@ -939,6 +951,7 @@ stages:
       # manylinux_2_28 aarch64 so it loads on RHEL 8 / UBI 8 arm64.
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
+          poolName: ${{ parameters.armPoolName }}
           sqlInstanceMode: per-job
           sentinelPrefix: 'odbc_'
           nameSuffix: _glibc228
@@ -1131,3 +1144,5 @@ stages:
     condition: and(succeeded('Build'), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
     jobs:
       - template: private-link-smoke-template.yml
+        parameters:
+          poolName: ${{ parameters.poolName }}

@@ -10,6 +10,7 @@ parameters:
   matrix: {}
   artifactName: 'Odbc_Linux_x64'
   nameSuffix: ''
+  poolName: 'RUST-X64-WUS3'
 
 jobs:
   - job: Test_Odbc_Matrix${{ parameters.nameSuffix }}
@@ -17,7 +18,7 @@ jobs:
     strategy:
       matrix: ${{ parameters.matrix }}
     pool:
-      name: RUST-X64-WUS3
+      name: ${{ parameters.poolName }}
       demands:
         - imageOverride -equals RUST-UBUSLIM
     steps:

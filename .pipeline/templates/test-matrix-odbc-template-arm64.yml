@@ -11,6 +11,9 @@
 # sql-ready artifact in, teardown sentinel out, derived SA password).
 
 parameters:
+  - name: poolName
+    type: string
+    default: 'RUST-ARM64-WUS3'
   - name: targets
     # Each entry: { name, container, entry }
     type: object
@@ -79,7 +82,7 @@ jobs:
               entry: ${{ target.entry }}
               sentinelName: ${{ parameters.sentinelPrefix }}${{ target.name }}
       pool:
-        name: RUST-ARM64-WUS3
+        name: ${{ parameters.poolName }}
         demands:
           - imageOverride -equals RUST-UBUNTU-ARM64
       steps:
@@ -191,7 +194,7 @@ jobs:
         displayName: 'ODBC e2e Linux arm64 ${{ target.name }}'
         # Intentionally no `dependsOn`: see sql-host-template.yml header.
         pool:
-          name: RUST-ARM64-WUS3
+          name: ${{ parameters.poolName }}
           demands:
             - imageOverride -equals RUST-UBUNTU-ARM64
         steps:

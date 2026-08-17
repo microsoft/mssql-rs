@@ -1,6 +1,7 @@
 # filepath: .pipeline/templates/test-matrix-template.yml
 parameters:
   matrix: {}
+  poolName: 'RUST-X64-WUS3'
 
 jobs:
   - job: Test_Matrix
@@ -8,7 +9,7 @@ jobs:
     strategy:
       matrix: ${{ parameters.matrix }}
     pool:
-      name: RUST-X64-WUS3
+      name: ${{ parameters.poolName }}
       demands:
         - imageOverride -equals RUST-UBUSLIM
     steps:
