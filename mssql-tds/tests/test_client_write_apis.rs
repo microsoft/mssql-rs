@@ -280,13 +280,28 @@ mod streamed_plp_write {
             matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@a")
         );
 
-        client.write_streamed_chunk(&utf16le(&a)).await?;
+        // Send @a in chunks
+        let chunk_size = 3_000;
+        let a_utf16 = utf16le(&a);
+        let mut offset = 0;
+        while offset < a_utf16.len() {
+            let end = std::cmp::min(offset + chunk_size, a_utf16.len());
+            client.write_streamed_chunk(&a_utf16[offset..end]).await?;
+            offset = end;
+        }
         let status = client.end_streamed_param().await?;
         assert!(
             matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@b")
         );
 
-        client.write_streamed_chunk(&utf16le(&b)).await?;
+        // Send @b in chunks
+        let b_utf16 = utf16le(&b);
+        offset = 0;
+        while offset < b_utf16.len() {
+            let end = std::cmp::min(offset + chunk_size, b_utf16.len());
+            client.write_streamed_chunk(&b_utf16[offset..end]).await?;
+            offset = end;
+        }
         let status = client.end_streamed_param().await?;
         assert!(matches!(
             status,
@@ -296,13 +311,24 @@ mod streamed_plp_write {
 
         client
             .execute(
-                "SELECT LEN(a), LEN(b) FROM #plp_two WHERE id = 1".to_string(),
+                "SELECT a, b FROM #plp_two WHERE id = 1".to_string(),
                 (),
             )
             .await?;
         {
             let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 2);
+            // Verify the actual values match what we sent
+            if let ColumnValues::String(sql_str) = &row[0] {
+                assert_eq!(sql_str.to_utf8_string(), a);
+            } else {
+                panic!("Expected String column value");
+            }
+            if let ColumnValues::String(sql_str) = &row[1] {
+                assert_eq!(sql_str.to_utf8_string(), b);
+            } else {
+                panic!("Expected String column value");
+            }
         }
         client.close_query().await?;
         Ok(())
