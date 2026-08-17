@@ -5,22 +5,25 @@
 //!
 //! Preview API — unstable. First use emits a `FutureWarning`.
 //!
-//! Invariant: one async connection ↔ one async cursor ↔ one `TdsClient`.
+//! Invariant: one `TdsClient` and one TDS wire session per async connection.
+//! All cursors share that client and serialize access through the async mutex.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use pyo3::exceptions::{PyFutureWarning, PyRuntimeError};
+use pyo3::exceptions::{PyFutureWarning, PyOverflowError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use tokio::sync::Mutex;
+use tracing::instrument::WithSubscriber;
 
 use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 
 use crate::async_cursor::PyAsyncCursor;
 use crate::connection::PyCoreConnection;
-use crate::python_logger_adapter::scoped_tracing_bridge;
+use crate::python_logger_adapter::python_logger_dispatch;
 
 /// One-shot `FutureWarning` per process; silenceable via `warnings.filterwarnings`.
 static PREVIEW_WARNED: AtomicBool = AtomicBool::new(false);
@@ -51,6 +54,16 @@ fn map_tds_error(op: &str, user_msg: &str, e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(format!("{user_msg}: {e}"))
 }
 
+async fn with_optional_dispatch<F>(future: F, dispatch: Option<tracing::Dispatch>) -> F::Output
+where
+    F: Future,
+{
+    match dispatch {
+        Some(dispatch) => future.with_subscriber(dispatch).await,
+        None => future.await,
+    }
+}
+
 /// Asynchronous Python connection backed by the Core TDS client.
 ///
 /// Preview API — unstable.
@@ -64,6 +77,7 @@ fn map_tds_error(op: &str, user_msg: &str, e: impl std::fmt::Display) -> PyErr {
 pub struct PyAsyncConnection {
     /// `Option` so `close()` can `take()`; `Arc<Mutex<>>` for cursor sharing.
     tds_client: Option<Arc<Mutex<TdsClient>>>,
+    tracing_dispatch: Option<tracing::Dispatch>,
     /// Default query timeout (seconds) applied to cursors created from this
     /// connection. `0` = no timeout, per pyodbc/ODBC `SQL_ATTR_QUERY_TIMEOUT`.
     /// Pure Python-side state — the setter performs no I/O.
@@ -83,15 +97,13 @@ impl PyAsyncConnection {
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = cls.py();
 
-        // `DefaultGuard` is `!Send`, so its coverage ends when this method returns.
-        let _guard = python_logger
-            .map(|logger| scoped_tracing_bridge(Arc::new(logger.clone().unbind()), file!()));
+        let dispatch = python_logger
+            .map(|logger| python_logger_dispatch(Arc::new(logger.clone().unbind()), file!()));
+        let _guard = dispatch.as_ref().map(tracing::dispatcher::set_default);
 
         emit_preview_warning(py)?;
 
-        tracing::info!("PyAsyncConnection::connect: initiating async connection");
-
-        tracing::info!("PyAsyncConnection::connect: extracting client context");
+        tracing::debug!("PyAsyncConnection::connect: extracting client context");
         let context = PyCoreConnection::dict_to_client_context(client_context_dict)?;
         let datasource = context.data_source.clone();
 
@@ -113,24 +125,34 @@ impl PyAsyncConnection {
             datasource
         );
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let provider = TdsConnectionProvider {};
-            let client = provider
-                .create_client(context, &datasource, None)
-                .await
-                .map_err(|e| map_tds_error("connect", "Failed to connect to SQL Server", e))?;
+        let future_dispatch = dispatch.clone();
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            with_optional_dispatch(
+                async move {
+                    let provider = TdsConnectionProvider {};
+                    let client = provider
+                        .create_client(context, &datasource, None)
+                        .await
+                        .map_err(|e| {
+                            map_tds_error("connect", "Failed to connect to SQL Server", e)
+                        })?;
 
-            tracing::info!("PyAsyncConnection::connect: connection established");
-            Python::attach(|py| {
-                Py::new(
-                    py,
-                    PyAsyncConnection {
-                        tds_client: Some(Arc::new(Mutex::new(client))),
-                        default_query_timeout: 0,
-                    },
-                )
-            })
-        })
+                    tracing::info!("PyAsyncConnection::connect: connection established");
+                    Python::attach(|py| {
+                        Py::new(
+                            py,
+                            PyAsyncConnection {
+                                tds_client: Some(Arc::new(Mutex::new(client))),
+                                tracing_dispatch: dispatch,
+                                default_query_timeout: 0,
+                            },
+                        )
+                    })
+                },
+                future_dispatch,
+            ),
+        )
     }
 
     /// Default query timeout (seconds) inherited by cursors created from this
@@ -141,19 +163,29 @@ impl PyAsyncConnection {
     }
 
     /// Set the default query timeout (seconds) for future cursors. Existing
-    /// cursors and in-flight queries are unaffected. Negative values are
-    /// rejected by PyO3's `u32` extractor (`OverflowError`).
+    /// cursors and in-flight queries are unaffected. Negative values raise
+    /// `ValueError`; values above `u32::MAX` raise `OverflowError`.
     #[setter]
-    fn set_timeout(&mut self, value: u32) {
+    fn set_timeout(&mut self, value: i64) -> PyResult<()> {
+        if value < 0 {
+            return Err(PyValueError::new_err("Timeout cannot be negative"));
+        }
+        let value = u32::try_from(value)
+            .map_err(|_| PyOverflowError::new_err("Timeout exceeds maximum supported value"))?;
+
+        let _guard = self
+            .tracing_dispatch
+            .as_ref()
+            .map(tracing::dispatcher::set_default);
         tracing::info!(
             "PyAsyncConnection::set_timeout: default query timeout set to {}s",
             value
         );
         self.default_query_timeout = value;
+        Ok(())
     }
 
-    /// True after `close()` has been awaited (or if `connect()` never produced a
-    /// live client). Cheap LBYL check; performs no I/O.
+    /// True after `close()` has been called. Cheap LBYL check; performs no I/O.
     #[getter]
     fn closed(&self) -> bool {
         self.tds_client.is_none()
@@ -174,34 +206,45 @@ impl PyAsyncConnection {
 
     /// Close the connection. Idempotent. Shutdown errors are logged and swallowed.
     fn close<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let dispatch = self.tracing_dispatch.clone();
+        let _guard = dispatch.as_ref().map(tracing::dispatcher::set_default);
         tracing::info!("PyAsyncConnection::close: initiating close");
         // `take()` before spawning: gives the future 'static ownership; marks conn closed.
         let client_opt = self.tds_client.take();
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let Some(client) = client_opt else {
-                tracing::debug!("PyAsyncConnection::close: already closed, no-op");
-                return Python::attach(|py| Ok(py.None()));
-            };
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            with_optional_dispatch(
+                async move {
+                    let Some(client) = client_opt else {
+                        tracing::debug!("PyAsyncConnection::close: already closed, no-op");
+                        return Python::attach(|py| Ok(py.None()));
+                    };
 
-            tracing::info!(
-                "PyAsyncConnection::close: sending TDS logout and tearing down transport"
-            );
-            let mut guard = client.lock().await;
-            if let Err(e) = guard.close_connection().await {
-                // Log and swallow; connection is closed regardless.
-                tracing::warn!(
-                    "PyAsyncConnection::close: error during graceful shutdown: {}",
-                    e
-                );
-            }
-            tracing::info!("PyAsyncConnection::close: connection closed");
-            Python::attach(|py| Ok(py.None()))
-        })
+                    tracing::info!(
+                        "PyAsyncConnection::close: sending TDS logout and tearing down transport"
+                    );
+                    let mut guard = client.lock().await;
+                    if let Err(e) = guard.close_connection().await {
+                        // Log and swallow; connection is closed regardless.
+                        tracing::warn!(
+                            "PyAsyncConnection::close: error during graceful shutdown: {}",
+                            e
+                        );
+                    }
+                    tracing::info!("PyAsyncConnection::close: connection closed");
+                    Python::attach(|py| Ok(py.None()))
+                },
+                dispatch,
+            ),
+        )
     }
 
     /// Async context manager entry. Resolves to `self` with no I/O.
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if slf.borrow(py).tds_client.is_none() {
+            return Err(PyRuntimeError::new_err("Connection is closed"));
+        }
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
     }
 
@@ -226,17 +269,24 @@ impl PyAsyncConnection {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Connection is closed"))?
             .clone();
+        let dispatch = self.tracing_dispatch.clone();
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            tracing::info!("PyAsyncConnection::commit: sending TM_COMMIT");
-            let mut guard = client.lock().await;
-            guard
-                .commit_transaction(None, None)
-                .await
-                .map_err(|e| map_tds_error("commit", "Commit failed", e))?;
-            tracing::info!("PyAsyncConnection::commit: transaction committed");
-            Python::attach(|py| Ok(py.None()))
-        })
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            with_optional_dispatch(
+                async move {
+                    tracing::info!("PyAsyncConnection::commit: sending TM_COMMIT");
+                    let mut guard = client.lock().await;
+                    guard
+                        .commit_transaction(None, None)
+                        .await
+                        .map_err(|e| map_tds_error("commit", "Commit failed", e))?;
+                    tracing::info!("PyAsyncConnection::commit: transaction committed");
+                    Python::attach(|py| Ok(py.None()))
+                },
+                dispatch,
+            ),
+        )
     }
 
     /// Roll back the current transaction. If none is open, surfaces SQL Server 3903.
@@ -247,20 +297,28 @@ impl PyAsyncConnection {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Connection is closed"))?
             .clone();
+        let dispatch = self.tracing_dispatch.clone();
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            tracing::info!("PyAsyncConnection::rollback: sending TM_ROLLBACK");
-            let mut guard = client.lock().await;
-            guard
-                .rollback_transaction(None, None)
-                .await
-                .map_err(|e| map_tds_error("rollback", "Rollback failed", e))?;
-            tracing::info!("PyAsyncConnection::rollback: transaction rolled back");
-            Python::attach(|py| Ok(py.None()))
-        })
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            with_optional_dispatch(
+                async move {
+                    tracing::info!("PyAsyncConnection::rollback: sending TM_ROLLBACK");
+                    let mut guard = client.lock().await;
+                    guard
+                        .rollback_transaction(None, None)
+                        .await
+                        .map_err(|e| map_tds_error("rollback", "Rollback failed", e))?;
+                    tracing::info!("PyAsyncConnection::rollback: transaction rolled back");
+                    Python::attach(|py| Ok(py.None()))
+                },
+                dispatch,
+            ),
+        )
     }
 
-    /// Sync per DB-API 2.0. A second cursor is allowed; both share the same
+    /// Create an async cursor. Sync per DB-API 2.0. Raises `RuntimeError` if the
+    /// connection is closed. Additional cursors are allowed; all share the same
     /// TDS session and serialize on the same async mutex.
     fn cursor(&self) -> PyResult<PyAsyncCursor> {
         let client = self

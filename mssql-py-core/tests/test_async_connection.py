@@ -14,6 +14,14 @@ import pytest
 import mssql_py_core
 
 
+class RecordingLogger:
+    def __init__(self):
+        self.messages = []
+
+    def py_core_log(self, _level, message, _module_name, _line):
+        self.messages.append(message)
+
+
 # ---------------------------------------------------------------------------
 # Preview warning
 # ---------------------------------------------------------------------------
@@ -67,6 +75,77 @@ def test_connect_returns_pyasyncconnection(client_context):
                 assert isinstance(conn, mssql_py_core.PyAsyncConnection)
             finally:
                 await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_successful_connect_logs_while_awaitable_is_polled(client_context):
+    async def run():
+        logger = RecordingLogger()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(
+                client_context, logger
+            )
+            try:
+                assert any(
+                    "PyAsyncConnection::connect: connection established" in message
+                    for message in logger.messages
+                )
+            finally:
+                await conn.close()
+
+    asyncio.run(run())
+
+
+def test_failed_connect_logs_while_awaitable_is_polled():
+    async def run():
+        logger = RecordingLogger()
+        invalid_context = {
+            "server": "127.0.0.1,1",
+            "database": "master",
+            "user_name": "sa",
+            "password": "invalid",
+            "trust_server_certificate": True,
+            "encryption": "Optional",
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            with pytest.raises(Exception, match="Failed to connect to SQL Server"):
+                await mssql_py_core.PyAsyncConnection.connect(invalid_context, logger)
+        assert any(
+            "PyAsyncConnection::connect: failed" in message
+            for message in logger.messages
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_connection_operations_reuse_connect_logger(client_context):
+    async def run():
+        logger = RecordingLogger()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(
+                client_context, logger
+            )
+
+        logger.messages.clear()
+        with pytest.raises(Exception, match="3902"):
+            await conn.commit()
+        assert any(
+            "PyAsyncConnection::commit: failed" in message
+            for message in logger.messages
+        )
+
+        logger.messages.clear()
+        await conn.close()
+        assert any(
+            "PyAsyncConnection::close: connection closed" in message
+            for message in logger.messages
+        )
 
     asyncio.run(run())
 
@@ -179,14 +258,32 @@ def test_timeout_default_and_setter_roundtrip(client_context):
 
 @pytest.mark.integration
 def test_timeout_setter_rejects_negative(client_context):
-    """Negative values overflow the u32 extractor and raise OverflowError."""
+    """Negative values match the Python wrapper's ValueError contract."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             try:
-                with pytest.raises(OverflowError):
+                with pytest.raises(ValueError, match="Timeout cannot be negative"):
                     conn.timeout = -1
+                assert conn.timeout == 0
+            finally:
+                await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_timeout_setter_rejects_non_integer_and_overflow(client_context):
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            try:
+                with pytest.raises(TypeError):
+                    conn.timeout = "30"
+                with pytest.raises(OverflowError):
+                    conn.timeout = 2**32
                 assert conn.timeout == 0
             finally:
                 await conn.close()
@@ -254,6 +351,23 @@ def test_async_context_manager_yields_same_object(client_context):
             finally:
                 if not outer.closed:
                     await outer.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_async_context_manager_rejects_closed_connection(client_context):
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            await conn.close()
+
+            entered = False
+            with pytest.raises(RuntimeError, match="Connection is closed"):
+                async with conn:
+                    entered = True
+            assert entered is False
 
     asyncio.run(run())
 

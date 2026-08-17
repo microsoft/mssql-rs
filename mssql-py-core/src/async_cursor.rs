@@ -51,7 +51,6 @@ pub struct PyAsyncCursor {
     /// Snapshot of the parent connection's default query timeout at
     /// `cursor()` time (`0` = no timeout). Applied by the future `execute`
     /// path unless overridden per-call.
-    #[allow(dead_code)] // Consumed by upcoming async execute API.
     default_query_timeout: u32,
 }
 
@@ -69,5 +68,11 @@ impl PyAsyncCursor {
 
 #[pymethods]
 impl PyAsyncCursor {
+    /// Query timeout (seconds) snapshotted from the parent connection. `0` means no timeout.
+    #[getter]
+    fn timeout(&self) -> u32 {
+        self.default_query_timeout
+    }
+
     // Async execute/fetch/close APIs land here as they are added.
 }
