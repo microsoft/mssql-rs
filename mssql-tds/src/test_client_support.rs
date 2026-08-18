@@ -229,7 +229,7 @@ pub fn tds_client_from_tokens_in_transaction(
     descriptor: u64,
 ) -> TdsClient {
     let tokens: Vec<Tokens> = tokens.into_iter().map(|t| t.0).collect();
-    let transport = Box::new(TokenReplayTransport::new(tokens));
+    let transport = AnyTransport::dynamic(TokenReplayTransport::new(tokens));
     let negotiated_settings = create_test_negotiated_settings_internal();
     let mut execution_context = ExecutionContext::new();
     execution_context.set_transaction_descriptor(descriptor);
