@@ -7,6 +7,14 @@ set -e
 PYTHON_VERSIONS=("3.10" "3.11" "3.12" "3.13" "3.14")
 WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 OUTPUT_DIR="${OUTPUT_DIR:-$WORKSPACE_DIR/target/wheels}"
+# Optional: when set, a separate .debug file plus the stripped .so it belongs
+# to are written to "$SYMBOLS_OUTPUT_DIR/<pytag>/" after each maturin build.
+SYMBOLS_OUTPUT_DIR="${SYMBOLS_OUTPUT_DIR:-}"
+
+# Split DWARF (.dwp) cannot be consumed once the skeleton units are stripped
+# out of the shipped .so, so Linux links with debug info in the binary and the
+# split happens below via objcopy. macOS/Windows keep the Cargo.toml default.
+export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=off
 
 echo "==> Building Python wheels in container"
 echo "Workspace: $WORKSPACE_DIR"
@@ -74,13 +82,52 @@ for PY_VERSION in "${PYTHON_VERSIONS[@]}"; do
     echo ""
     echo "==> Building wheel for Python $PY_VERSION using $PYTHON_BIN"
     $PYTHON_BIN --version
-    
+
+    # Stage into a private directory: $OUTPUT_DIR is shared across the manylinux
+    # and musllinux steps of the same job, so wheels already sitting there would
+    # otherwise be indistinguishable from the one we are about to build.
+    PY_TAG="cp${PY_VERSION//./}"
+    STAGE_DIR="$OUTPUT_DIR/.staging-$PY_TAG"
+    rm -rf "$STAGE_DIR"
+    mkdir -p "$STAGE_DIR"
+
     $FIRST_PYTHON -m maturin build --release \
         --interpreter "$PYTHON_BIN" \
-        --out "$OUTPUT_DIR" \
+        --out "$STAGE_DIR" \
         --manifest-path "$WORKSPACE_DIR/mssql-py-core/Cargo.toml"
     
     echo "✅ Wheel built successfully for Python $PY_VERSION"
+
+    # -----------------------------------------------------------------------
+    # Split debug info out of the freshly built wheel.
+    #
+    # Operating on the .so *inside* the wheel guarantees the published debug
+    # file belongs to exactly the binary we ship, and sidesteps the fact that
+    # target/release/deps is overwritten by the next interpreter's build.
+    # The helper rewrites the wheel entry-by-entry (preserving filename,
+    # permissions, timestamps and compression) rather than repacking it.
+    # -----------------------------------------------------------------------
+    if [ -n "$SYMBOLS_OUTPUT_DIR" ]; then
+        SYM_DEST="$SYMBOLS_OUTPUT_DIR/$PY_TAG"
+        mkdir -p "$SYM_DEST"
+
+        if ! command -v objcopy &> /dev/null || ! command -v readelf &> /dev/null; then
+            echo "❌ ERROR: binutils (objcopy/readelf) not found; cannot split debug info."
+            exit 1
+        fi
+
+        WHEEL_PATH=$(find "$STAGE_DIR" -maxdepth 1 -name '*.whl' | head -n1)
+        if [ -z "$WHEEL_PATH" ]; then
+            echo "❌ ERROR: no wheel produced for $PY_TAG in $STAGE_DIR"
+            exit 1
+        fi
+
+        $FIRST_PYTHON "$WORKSPACE_DIR/scripts/split-wheel-debuginfo.py" "$WHEEL_PATH" "$SYM_DEST"
+        ls -lh "$SYM_DEST"
+    fi
+
+    mv "$STAGE_DIR"/*.whl "$OUTPUT_DIR"/
+    rmdir "$STAGE_DIR"
 done
 
 # auditwheel=skip in pyproject.toml means maturin won't vendor shared libs

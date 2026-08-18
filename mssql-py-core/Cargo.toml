@@ -28,3 +28,25 @@ arrow = { version = "55", default-features = false, features = ["ffi"] }
 
 [build-dependencies]
 pyo3-build-config = "0.29.0"
+
+# Release profile: generate full debug info so the build pipeline can extract
+# a separate .pdb / .debug / .dSYM for symbolication of customer crash dumps,
+# while the shipped binary stays small. See work item 45990.
+#
+# - debug = "full": full DWARF / PDB info generated.
+# - split-debuginfo = "packed": on macOS produces a .dSYM bundle; ignored on
+#   Windows-MSVC which always emits a separate .pdb. Linux overrides this to
+#   "off" via CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO in
+#   scripts/build-python-wheels-in-container.sh — a .dwp is unusable once the
+#   skeleton DWARF is stripped out of the shipped .so, so Linux instead uses
+#   the conventional objcopy --only-keep-debug / --add-gnu-debuglink flow.
+# - strip = "none": the linked artifact must keep its debug info so the
+#   pipeline can split it out; stripping of the shipped .so happens after the
+#   debug file has been extracted, with --strip-debug (keeps .symtab and the
+#   GNU build-id) rather than --strip-all.
+# - lto = true: mirrors the workspace release profile.
+[profile.release]
+lto = true
+debug = "full"
+split-debuginfo = "packed"
+strip = "none"

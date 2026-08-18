@@ -34,6 +34,9 @@ Cargo.lock
 **/venv
 .venv-pycore/
 
+__pycache__/
+*.pyc
+
 
 # pipenv files
 Pipfile

@@ -30,6 +30,14 @@ parameters:
   displayName: 'Publish NuGet package to Azure Artifacts feed'
   type: boolean
   default: true
+- name: publishSymbolsToADO
+  displayName: 'Publish debug symbols to SqlClientDrivers ADO org symbol server'
+  type: boolean
+  default: true
+- name: symbolsExpirationDays
+  displayName: 'Retention (days) for symbols on the ADO org symbol server. 0 = never expire.'
+  type: number
+  default: 30
 
 variables:
   CDP_DEFINITION_BUILD_COUNT: $[counter('', 0)]  # For onebranch.pipeline.version task
@@ -72,3 +80,5 @@ extends:
         buildPythonWheels: true
         isOfficial: false
         publishToFeed: ${{ parameters.publishToFeed }}
+        publishSymbolsToADO: ${{ parameters.publishSymbolsToADO }}
+        symbolsExpirationDays: ${{ parameters.symbolsExpirationDays }}
