@@ -33,6 +33,7 @@ pub fn build_insert_bulk_command(
 }
 
 // Import types we need internally
+use crate::connection::transport::any_transport::AnyTransport;
 use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::NegotiatedEncryptionSetting;
 use crate::datatypes::row_writer::RowWriter;
@@ -947,7 +948,7 @@ pub fn create_fuzz_tds_client(packet_reader: FuzzPacketReader, packet_size: u32)
         crate::connection::client_context::ClientContext::with_data_source("tcp:localhost,1433");
 
     TdsClient::new(
-        Box::new(mock_transport),
+        AnyTransport::dynamic(mock_transport),
         negotiated_settings,
         execution_context,
         client_context,

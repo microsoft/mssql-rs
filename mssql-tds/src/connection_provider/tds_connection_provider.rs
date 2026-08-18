@@ -12,7 +12,9 @@ use crate::connection::connection_actions::{
 use crate::connection::instance_cache::InstanceCache;
 use crate::connection::session_recovery::SessionRecoveryData;
 use crate::connection::tds_client::TdsClient;
+use crate::connection::transport::any_transport::AnyTransport;
 use crate::connection::transport::network_transport;
+#[cfg(fuzzing)]
 use crate::connection::transport::tds_transport::TdsTransport;
 #[cfg(windows)]
 use crate::core::EncryptionSetting;
@@ -540,7 +542,7 @@ impl TdsConnectionProvider {
         transport_context: &TransportContext,
         recovery_data: Option<Box<SessionRecoveryData>>,
     ) -> TdsResult<(
-        Box<dyn TdsTransport>,
+        AnyTransport,
         crate::handler::handler_factory::NegotiatedSettings,
         crate::connection::execution_context::ExecutionContext,
         Vec<SqlInfoMessage>,
@@ -566,7 +568,7 @@ impl TdsConnectionProvider {
         };
         let session_result = factory
             .session_handler(transport_context)
-            .execute(&mut *transport)
+            .execute(&mut transport)
             .await;
 
         match session_result {
@@ -576,7 +578,7 @@ impl TdsConnectionProvider {
                     crate::connection::execution_context::ExecutionContext::new();
 
                 Ok((
-                    transport as Box<dyn TdsTransport>,
+                    AnyTransport::network(transport),
                     negotiated_settings,
                     execution_context,
                     info_messages,
@@ -599,7 +601,7 @@ impl TdsConnectionProvider {
         transport_context: &TransportContext,
         mut transport: T,
     ) -> TdsResult<(
-        Box<dyn TdsTransport>,
+        AnyTransport,
         crate::handler::handler_factory::NegotiatedSettings,
         crate::connection::execution_context::ExecutionContext,
         Vec<SqlInfoMessage>,
@@ -627,7 +629,7 @@ impl TdsConnectionProvider {
                     crate::connection::execution_context::ExecutionContext::new();
 
                 Ok((
-                    Box::new(transport) as Box<dyn TdsTransport>,
+                    AnyTransport::dynamic(transport),
                     negotiated_settings,
                     execution_context,
                     info_messages,

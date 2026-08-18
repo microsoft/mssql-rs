@@ -199,6 +199,9 @@ pub(crate) trait TdsTokenStreamReader {
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Tokens>;
 
+    // Object-safe fallbacks for cfg-gated dynamic transports. Production calls
+    // the native inherent methods on its concrete transport representation.
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
     async fn receive_row_into(
         &mut self,
         context: &ParserContext,
@@ -212,6 +215,7 @@ pub(crate) trait TdsTokenStreamReader {
     /// NBCROW null bitmap — pausing before column 0 without decoding columns.
     /// Non-row tokens are returned as [`RowHeader::Token`]. Used by the pull
     /// cursor to position on a row (`SQLFetch`) before pulling columns.
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
     async fn receive_row_header(
         &mut self,
         context: &ParserContext,
@@ -224,6 +228,7 @@ pub(crate) trait TdsTokenStreamReader {
     ///
     /// The caller is responsible for passing back the exact [`RowPauseState`]
     /// that was returned inside `RowReadResult::RowPaused`.
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
     async fn resume_row_into(
         &mut self,
         pause_state: RowPauseState,
@@ -235,6 +240,7 @@ pub(crate) trait TdsTokenStreamReader {
 
     /// Reads bytes from an active PLP stream captured by
     /// [`RowReadResult::PlpPaused`].
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
     async fn read_active_plp_bytes(
         &mut self,
         plp_state: &mut PlpPauseState,
@@ -1144,10 +1150,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    /// Companion to `row_fetch_futures_stay_small` (#225) for the decode chain below
-    /// `Box<dyn TdsTransport>`. That guard measures futures built on `TdsClient`, which
-    /// re-boxes at the transport boundary, so it cannot observe anything in this file:
-    /// its four futures are byte-identical before and after this chain roughly doubled.
+    /// Companion to `row_fetch_futures_stay_small` (#225) for the internal
+    /// decode-chain futures below the transport boundary.
     #[test]
     fn row_decode_futures_stay_small() {
         const MAX: usize = 4096;

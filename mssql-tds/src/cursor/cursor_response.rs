@@ -6,7 +6,7 @@
 //! These structs carry the protocol-level output parameters extracted from
 //! `ReturnValue` tokens. They do **not** contain row data — if the caller
 //! set `AUTO_FETCH` or `RETURN_METADATA`, rows/metadata are available in the
-//! token stream via `get_next_row_into()`.
+//! token stream via `next_row_into()`.
 
 use super::cursor_types::{CursorConcurrency, CursorScrollOption, CursorStatus};
 
