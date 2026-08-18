@@ -11,7 +11,9 @@ use crate::api::odbc_types::{
     SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_SUCCESS, SqlHandle, SqlLen,
     SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
-use crate::api::type_rules::{is_valid_c_type, is_valid_sql_type, resolve_default_c_type};
+use crate::api::type_rules::{
+    SqlTypeSupport, classify_sql_type, is_valid_c_type, resolve_default_c_type,
+};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use crate::params::BoundParam;
@@ -139,10 +141,21 @@ fn sql_bind_parameter_safe(
         post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
         return SQL_ERROR;
     }
-    if !is_valid_sql_type(parameter_type) {
-        error!(parameter_type, "SQLBindParameter: invalid SQL data type");
-        post_diag(&mut stmt_state, ERR_INVALID_SQL_DATA_TYPE);
-        return SQL_ERROR;
+    match classify_sql_type(parameter_type) {
+        SqlTypeSupport::Supported => {}
+        SqlTypeSupport::NotImplemented => {
+            error!(
+                parameter_type,
+                "SQLBindParameter: unsupported SQL data type"
+            );
+            post_diag(&mut stmt_state, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
+            return SQL_ERROR;
+        }
+        SqlTypeSupport::Invalid => {
+            error!(parameter_type, "SQLBindParameter: invalid SQL data type");
+            post_diag(&mut stmt_state, ERR_INVALID_SQL_DATA_TYPE);
+            return SQL_ERROR;
+        }
     }
 
     // Resolve SQL_C_DEFAULT here so the execute path never sees the placeholder,
@@ -510,8 +523,9 @@ mod tests {
     }
 
     #[test]
-    fn default_c_type_without_a_mapping_returns_07006() {
-        // Interval SQL types are valid identifiers with no default C type.
+    fn interval_sql_type_returns_hyc00() {
+        // SQL Server has no interval type: a real ODBC identifier the driver
+        // cannot implement is HYC00, not a conversion failure.
         let h = TestHandles::with_env_dbc_stmt();
         let mut ind: SqlLen = 0;
         let ret = unsafe {
@@ -531,7 +545,7 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
 
     #[test]

@@ -18,7 +18,9 @@
 //! Validity here means only that an identifier names a real ODBC type. Whether a
 //! particular pairing can be converted is decided per direction — for input
 //! parameters by [`crate::params::conversion_matrix`], and for fetch inside the
-//! converters themselves.
+//! converters themselves. SQL types are the exception: a real ODBC identifier
+//! SQL Server has no counterpart for is rejected outright by
+//! [`classify_sql_type`], never reaching a conversion check.
 
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DATE,
@@ -77,43 +79,60 @@ pub(crate) fn is_valid_c_type(c_type: SqlSmallInt) -> bool {
     )
 }
 
-/// Known ODBC SQL data type identifiers, plus the SQL Server extensions. This
-/// is the `HY004` gate only; conversion support is checked separately.
-pub(crate) fn is_valid_sql_type(sql_type: SqlSmallInt) -> bool {
-    matches!(
-        sql_type,
+/// How a SQL type identifier is treated at bind time.
+///
+/// Mirrors the tri-state return of msodbcsql's `IsValidSqlType` (`sqlcprot.h`),
+/// which yields `SQL_SUCCESS`, `IDS_S1_C00` (`HYC00`), or `IDS_S1_004`
+/// (`HY004`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlTypeSupport {
+    /// A SQL type this driver and SQL Server can carry.
+    Supported,
+    /// A real ODBC identifier with no SQL Server counterpart (`HYC00`).
+    NotImplemented,
+    /// Not a known ODBC SQL type identifier (`HY004`).
+    Invalid,
+}
+
+/// Classifies a `ParameterType` before any conversion check.
+pub(crate) fn classify_sql_type(sql_type: SqlSmallInt) -> SqlTypeSupport {
+    match sql_type {
         SQL_CHAR
-            | SQL_VARCHAR
-            | SQL_LONGVARCHAR
-            | SQL_WCHAR
-            | SQL_WVARCHAR
-            | SQL_WLONGVARCHAR
-            | SQL_BINARY
-            | SQL_VARBINARY
-            | SQL_LONGVARBINARY
-            | SQL_DECIMAL
-            | SQL_NUMERIC
-            | SQL_SMALLINT
-            | SQL_INTEGER
-            | SQL_BIGINT
-            | SQL_TINYINT
-            | SQL_BIT
-            | SQL_REAL
-            | SQL_FLOAT
-            | SQL_DOUBLE
-            | SQL_GUID
-            | SQL_TYPE_DATE
-            | SQL_TYPE_TIME
-            | SQL_TYPE_TIMESTAMP
-            | SQL_SS_TIME2
-            | SQL_SS_TIMESTAMPOFFSET
-            | SQL_SS_VARIANT
-            | SQL_SS_UDT
-            | SQL_SS_XML
-            | SQL_SS_TABLE
-            | SQL_SS_VECTOR
-            | SQL_INTERVAL_YEAR..=SQL_INTERVAL_MINUTE_TO_SECOND
-    )
+        | SQL_VARCHAR
+        | SQL_LONGVARCHAR
+        | SQL_WCHAR
+        | SQL_WVARCHAR
+        | SQL_WLONGVARCHAR
+        | SQL_BINARY
+        | SQL_VARBINARY
+        | SQL_LONGVARBINARY
+        | SQL_DECIMAL
+        | SQL_NUMERIC
+        | SQL_SMALLINT
+        | SQL_INTEGER
+        | SQL_BIGINT
+        | SQL_TINYINT
+        | SQL_BIT
+        | SQL_REAL
+        | SQL_FLOAT
+        | SQL_DOUBLE
+        | SQL_GUID
+        | SQL_TYPE_DATE
+        | SQL_TYPE_TIME
+        | SQL_TYPE_TIMESTAMP
+        | SQL_SS_TIME2
+        | SQL_SS_TIMESTAMPOFFSET
+        | SQL_SS_VARIANT
+        | SQL_SS_UDT
+        | SQL_SS_XML
+        | SQL_SS_TABLE
+        | SQL_SS_VECTOR => SqlTypeSupport::Supported,
+        // SQL Server has no interval type, so no conversion could ever succeed.
+        // msodbcsql returns IDS_S1_C00 for this whole range from IsValidSqlType,
+        // before IsValidSQLConversion is consulted.
+        SQL_INTERVAL_YEAR..=SQL_INTERVAL_MINUTE_TO_SECOND => SqlTypeSupport::NotImplemented,
+        _ => SqlTypeSupport::Invalid,
+    }
 }
 
 /// Resolves `SQL_C_DEFAULT` to the C type implied by `sql_type`.
@@ -126,9 +145,8 @@ pub(crate) fn is_valid_sql_type(sql_type: SqlSmallInt) -> bool {
 /// default is an ANSI-transfer artifact with no equivalent here, and resolving
 /// UTF-16 input to this driver's UTF-8 `SQL_C_CHAR` would silently corrupt data.
 ///
-/// Intervals are deliberately unmapped: the ODBC default is the identity
-/// `SQL_C_INTERVAL_*`, but SQL Server has no interval type so nothing can
-/// convert one. The caller reports the `None` as `07006`.
+/// Every [`SqlTypeSupport::Supported`] type has a mapping; `None` means the
+/// caller passed a type that should already have been rejected.
 pub(crate) fn resolve_default_c_type(sql_type: SqlSmallInt) -> Option<SqlSmallInt> {
     Some(match sql_type {
         SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR => SQL_C_CHAR,
@@ -185,8 +203,8 @@ mod tests {
 
     #[test]
     fn unknown_sql_type_is_invalid() {
-        assert!(is_valid_sql_type(SQL_VARCHAR));
-        assert!(!is_valid_sql_type(9999));
+        assert_eq!(classify_sql_type(SQL_VARCHAR), SqlTypeSupport::Supported);
+        assert_eq!(classify_sql_type(9999), SqlTypeSupport::Invalid);
     }
 
     #[test]
@@ -216,8 +234,17 @@ mod tests {
     }
 
     #[test]
-    fn interval_sql_types_are_valid_but_unresolved() {
-        assert!(is_valid_sql_type(SQL_INTERVAL_YEAR));
-        assert_eq!(resolve_default_c_type(SQL_INTERVAL_YEAR), None);
+    fn interval_sql_types_are_not_implemented() {
+        for sql_type in [
+            SQL_INTERVAL_YEAR,
+            SQL_INTERVAL_MINUTE_TO_SECOND,
+            SQL_INTERVAL_YEAR + 1,
+        ] {
+            assert_eq!(
+                classify_sql_type(sql_type),
+                SqlTypeSupport::NotImplemented,
+                "{sql_type} should be HYC00, not a conversion failure"
+            );
+        }
     }
 }

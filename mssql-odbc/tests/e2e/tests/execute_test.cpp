@@ -215,6 +215,20 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeUnsupportedConversionIsRejected) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07006");
 }
 
+// SQL Server has no interval type, so a real-but-unsupported ParameterType is
+// HYC00 ("optional feature not implemented") rather than a conversion failure.
+// msodbcsql's IsValidSqlType returns IDS_S1_C00 for the whole interval range
+// before IsValidSQLConversion is reached, so both drivers agree here.
+TEST_F(PrepareExecuteLiveTest, IntervalSqlTypeIsRejectedWithHyc00) {
+    SQL_INTERVAL_STRUCT value = {};
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
+                                    SQL_INTERVAL_YEAR, 0, 0, &value,
+                                    sizeof(value), &ind);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+}
+
 // A NULL-indicator parameter produces a SQL NULL result.
 TEST_F(PrepareExecuteLiveTest, NullParam) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);

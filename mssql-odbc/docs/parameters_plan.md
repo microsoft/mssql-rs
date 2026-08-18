@@ -56,15 +56,16 @@ transparent reconnects.
   rewritten SQL and marker count, so repeated `SQLExecute` calls do not re-scan
   the text.
 - **Bind-time type validation** - `api::type_rules` owns the `HY003` gate (every
-  real ODBC C type, including the SQL Server extensions) and the `HY004` gate
-  (SQL data types). `params::conversion_matrix` owns the C -> SQL conversion
-  table, shaped like msodbcsql's `fValidConversion` (one row per C type). A C
-  type that is real but not yet convertible returns `07006`, not `HY003`.
+  real ODBC C type, including the SQL Server extensions) and classifies SQL data
+  types three ways, like msodbcsql's `IsValidSqlType`: supported, real but with
+  no SQL Server counterpart (`HYC00` - the interval types), or unknown
+  (`HY004`). `params::conversion_matrix` owns the C -> SQL conversion table,
+  shaped like msodbcsql's `fValidConversion` (one row per C type). A C type that
+  is real but not yet convertible returns `07006`, not `HY003`.
 - **`SQL_C_DEFAULT` resolution** - resolved at bind time to the C type implied
   by `ParameterType` (msodbcsql `Sql2CDefault`, which reads `rgbTRANSTYPE380`
   for ODBC 3.8+ applications) and stored resolved in `BoundParam`, so the
-  execute path never sees the placeholder. Interval SQL types have no default
-  and return `07006`.
+  execute path never sees the placeholder.
 - **Value conversion** - `SQL_C_CHAR` maps to varchar and `SQL_C_WCHAR` to
   nvarchar. Indicators support `SQL_NULL_DATA`, `SQL_NTS`, and explicit byte
   length.
