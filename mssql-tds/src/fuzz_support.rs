@@ -65,9 +65,58 @@ impl FuzzReader {
             position: 0,
         }
     }
+
+    fn try_read_array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let end = self.position.checked_add(N)?;
+        let bytes = self.data.get(self.position..end)?.try_into().ok()?;
+        self.position = end;
+        Some(bytes)
+    }
 }
 
 impl TdsPacketReader for FuzzReader {
+    fn try_read_byte(&mut self) -> Option<u8> {
+        self.try_read_array().map(|[value]| value)
+    }
+
+    fn try_read_int16(&mut self) -> Option<i16> {
+        self.try_read_array().map(i16::from_le_bytes)
+    }
+
+    fn try_read_uint16(&mut self) -> Option<u16> {
+        self.try_read_array().map(u16::from_le_bytes)
+    }
+
+    fn try_read_uint24(&mut self) -> Option<u32> {
+        let [b0, b1, b2] = self.try_read_array()?;
+        Some(u32::from_le_bytes([b0, b1, b2, 0]))
+    }
+
+    fn try_read_int32(&mut self) -> Option<i32> {
+        self.try_read_array().map(i32::from_le_bytes)
+    }
+
+    fn try_read_uint32(&mut self) -> Option<u32> {
+        self.try_read_array().map(u32::from_le_bytes)
+    }
+
+    fn try_read_uint40(&mut self) -> Option<u64> {
+        let [b0, b1, b2, b3, b4] = self.try_read_array()?;
+        Some(u64::from_le_bytes([b0, b1, b2, b3, b4, 0, 0, 0]))
+    }
+
+    fn try_read_int64(&mut self) -> Option<i64> {
+        self.try_read_array().map(i64::from_le_bytes)
+    }
+
+    fn try_read_float32(&mut self) -> Option<f32> {
+        self.try_read_array().map(f32::from_le_bytes)
+    }
+
+    fn try_read_float64(&mut self) -> Option<f64> {
+        self.try_read_array().map(f64::from_le_bytes)
+    }
+
     async fn read_byte(&mut self) -> TdsResult<u8> {
         if self.position >= self.data.len() {
             return Err(mssql_tds_error_eof());
@@ -456,6 +505,76 @@ impl FuzzPacketReader {
 }
 
 impl TdsPacketReader for FuzzPacketReader {
+    fn try_read_byte(&mut self) -> Option<u8> {
+        match self {
+            Self::Fuzz(r) => r.try_read_byte(),
+            Self::Empty(r) => r.try_read_byte(),
+        }
+    }
+
+    fn try_read_int16(&mut self) -> Option<i16> {
+        match self {
+            Self::Fuzz(r) => r.try_read_int16(),
+            Self::Empty(r) => r.try_read_int16(),
+        }
+    }
+
+    fn try_read_uint16(&mut self) -> Option<u16> {
+        match self {
+            Self::Fuzz(r) => r.try_read_uint16(),
+            Self::Empty(r) => r.try_read_uint16(),
+        }
+    }
+
+    fn try_read_uint24(&mut self) -> Option<u32> {
+        match self {
+            Self::Fuzz(r) => r.try_read_uint24(),
+            Self::Empty(r) => r.try_read_uint24(),
+        }
+    }
+
+    fn try_read_int32(&mut self) -> Option<i32> {
+        match self {
+            Self::Fuzz(r) => r.try_read_int32(),
+            Self::Empty(r) => r.try_read_int32(),
+        }
+    }
+
+    fn try_read_uint32(&mut self) -> Option<u32> {
+        match self {
+            Self::Fuzz(r) => r.try_read_uint32(),
+            Self::Empty(r) => r.try_read_uint32(),
+        }
+    }
+
+    fn try_read_uint40(&mut self) -> Option<u64> {
+        match self {
+            Self::Fuzz(r) => r.try_read_uint40(),
+            Self::Empty(r) => r.try_read_uint40(),
+        }
+    }
+
+    fn try_read_int64(&mut self) -> Option<i64> {
+        match self {
+            Self::Fuzz(r) => r.try_read_int64(),
+            Self::Empty(r) => r.try_read_int64(),
+        }
+    }
+
+    fn try_read_float32(&mut self) -> Option<f32> {
+        match self {
+            Self::Fuzz(r) => r.try_read_float32(),
+            Self::Empty(r) => r.try_read_float32(),
+        }
+    }
+
+    fn try_read_float64(&mut self) -> Option<f64> {
+        match self {
+            Self::Fuzz(r) => r.try_read_float64(),
+            Self::Empty(r) => r.try_read_float64(),
+        }
+    }
+
     async fn read_byte(&mut self) -> TdsResult<u8> {
         match self {
             Self::Fuzz(r) => r.read_byte().await,
@@ -801,6 +920,46 @@ impl TdsTransport for MockTransport {
 }
 
 impl TdsPacketReader for MockTransport {
+    fn try_read_byte(&mut self) -> Option<u8> {
+        self.token_stream_reader.packet_reader.try_read_byte()
+    }
+
+    fn try_read_int16(&mut self) -> Option<i16> {
+        self.token_stream_reader.packet_reader.try_read_int16()
+    }
+
+    fn try_read_uint16(&mut self) -> Option<u16> {
+        self.token_stream_reader.packet_reader.try_read_uint16()
+    }
+
+    fn try_read_uint24(&mut self) -> Option<u32> {
+        self.token_stream_reader.packet_reader.try_read_uint24()
+    }
+
+    fn try_read_int32(&mut self) -> Option<i32> {
+        self.token_stream_reader.packet_reader.try_read_int32()
+    }
+
+    fn try_read_uint32(&mut self) -> Option<u32> {
+        self.token_stream_reader.packet_reader.try_read_uint32()
+    }
+
+    fn try_read_uint40(&mut self) -> Option<u64> {
+        self.token_stream_reader.packet_reader.try_read_uint40()
+    }
+
+    fn try_read_int64(&mut self) -> Option<i64> {
+        self.token_stream_reader.packet_reader.try_read_int64()
+    }
+
+    fn try_read_float32(&mut self) -> Option<f32> {
+        self.token_stream_reader.packet_reader.try_read_float32()
+    }
+
+    fn try_read_float64(&mut self) -> Option<f64> {
+        self.token_stream_reader.packet_reader.try_read_float64()
+    }
+
     async fn read_byte(&mut self) -> TdsResult<u8> {
         self.token_stream_reader.packet_reader.read_byte().await
     }
