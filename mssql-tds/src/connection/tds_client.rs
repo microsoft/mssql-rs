@@ -36,8 +36,8 @@ use crate::{
     message::{batch::SqlBatch, messages::Request},
     token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, EnvChangeTokenSubType, Tokens},
 };
-use async_trait::async_trait;
 use std::collections::HashMap;
+use std::future::Future;
 use std::num::NonZeroU32;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -2794,7 +2794,8 @@ impl TdsClient {
 
     /// This functions returns to the next row in the result set.
     /// If there are no more rows, it returns None.
-    #[instrument(skip(self), level = "info")]
+    // Not instrumented: the span pushes ResultSet::next_row over the 4 KiB
+    // hot-path future budget. Successful rows still emit `Row Received`.
     pub(crate) async fn get_next_row(&mut self) -> TdsResult<Option<Vec<ColumnValues>>> {
         let col_count = self
             .current_metadata
@@ -3601,9 +3602,10 @@ impl TdsClient {
     /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
     /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
     /// Concrete writers stay concrete through the production transport and
-    /// decode chain. Calling the object-safe [`ResultSet::next_row_into`] method
-    /// remains supported for callers that intentionally hold a trait object.
-    #[instrument(skip(self, writer), level = "info")]
+    /// decode chain. [`ResultSet::next_row_into`] provides the same operation
+    /// through statically dispatched trait calls.
+    // `#[instrument]` adds enough state to exceed the 4096 B budget once the
+    // lazy timeout future is inlined. Successful rows still emit `Row Received`.
     pub async fn next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
     where
         W: RowWriter + Send + ?Sized,
@@ -4507,7 +4509,6 @@ impl TdsClient {
     }
 }
 
-#[async_trait]
 impl ResultSet for TdsClient {
     fn get_metadata(&self) -> &Vec<ColumnMetadata> {
         // If no metadata is available, return an empty vector
@@ -4519,31 +4520,23 @@ impl ResultSet for TdsClient {
             .unwrap_or(&self.empty_metadata)
     }
 
-    #[instrument(skip(self), level = "info")]
-    async fn next_row(&mut self) -> TdsResult<Option<Vec<ColumnValues>>> {
-        let result = if self.maybe_has_unread_rows() {
-            self.get_next_row().await
-        } else {
-            Ok(None)
-        };
-        if result.is_err() {
-            self.abort_pending_prepare_capture();
-        }
-        result
+    fn next_row(&mut self) -> impl Future<Output = TdsResult<Option<Vec<ColumnValues>>>> + Send {
+        self.get_next_row()
     }
 
-    #[instrument(skip(self, writer), level = "info")]
-    async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool> {
-        TdsClient::next_row_into(self, writer).await
+    fn next_row_into(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> impl Future<Output = TdsResult<bool>> + Send {
+        TdsClient::next_row_into(self, writer)
     }
 
     fn maybe_has_unread_rows(&self) -> bool {
         !self.current_result_set_has_been_read_till_end
     }
 
-    #[instrument(skip(self), level = "info")]
-    async fn close(&mut self) -> TdsResult<()> {
-        self.close_query().await
+    fn close(&mut self) -> impl Future<Output = TdsResult<()>> + Send {
+        self.close_query()
     }
 }
 
@@ -4735,8 +4728,18 @@ enum ResultBoundaryKind {
     End,
 }
 
-/// Async result set iteration.
-#[async_trait]
+/// Async result set iteration through statically dispatched futures.
+///
+/// The returned futures are native, unboxed futures with an explicit [`Send`]
+/// guarantee.
+///
+/// # Dyn compatibility
+///
+/// This trait is intentionally not dyn-compatible and cannot be used through
+/// `dyn ResultSet`. This is a breaking change for trait-object consumers and for
+/// implementations written with `#[async_trait]`; concrete call sites can keep
+/// awaiting the methods unchanged, while implementations must return native
+/// `Send` futures.
 pub trait ResultSet {
     /// Returns the metadata of the result set.
     /// This metadata includes information about the columns in the result set.
@@ -4744,7 +4747,7 @@ pub trait ResultSet {
 
     /// Returns the next row of data as a vector of column values.
     /// If there is no more data, it returns None.
-    async fn next_row(&mut self) -> TdsResult<Option<Vec<ColumnValues>>>;
+    fn next_row(&mut self) -> impl Future<Output = TdsResult<Option<Vec<ColumnValues>>>> + Send;
 
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
@@ -4753,8 +4756,8 @@ pub trait ResultSet {
     /// not pause. The ODBC column-at-a-time pull path uses the client cursor
     /// (`next_row_cursor` / `read_row_column`) instead.
     /// Concrete [`TdsClient`] receivers use [`TdsClient::next_row_into`] to keep
-    /// the writer statically dispatched; this object-safe method is the fallback
-    /// for callers that hold a `dyn ResultSet`.
+    /// the writer statically dispatched. Calls through this trait remain
+    /// statically dispatched because [`ResultSet`] is not dyn-compatible.
     ///
     /// # Errors
     ///
@@ -4762,14 +4765,17 @@ pub trait ResultSet {
     /// partially read. Draining that row here would silently discard it and
     /// return the *next* one, so callers must first finish the row with
     /// `next_row_cursor`. A fully-consumed or absent row is fine.
-    async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool>;
+    fn next_row_into(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> impl Future<Output = TdsResult<bool>> + Send;
 
     /// Returns `true` if the result set may still contain unread rows.
     fn maybe_has_unread_rows(&self) -> bool;
 
     /// Iterates over the result set, and marks it as closed. After calling close, the next_row method,
     /// will always return None.
-    async fn close(&mut self) -> TdsResult<()>;
+    fn close(&mut self) -> impl Future<Output = TdsResult<()>> + Send;
 }
 
 #[cfg(test)]
@@ -5116,6 +5122,34 @@ mod tests {
             ("next_row_into", next_row_into),
             ("next_row_into (dyn writer)", next_row_into_dyn),
             ("read_active_plp_chunk", read_active_plp_chunk),
+        ] {
+            assert!(
+                size <= MAX,
+                "{name} future is {size} B, expected <= {MAX} B"
+            );
+        }
+
+        let native_next_row = std::mem::size_of_val(&client.get_next_row());
+        let result_set_next_row = std::mem::size_of_val(&ResultSet::next_row(&mut client));
+        let native_next_row_into =
+            std::mem::size_of_val(&client.next_row_into(&mut sink as &mut (dyn RowWriter + Send)));
+        let result_set_next_row_into =
+            std::mem::size_of_val(&ResultSet::next_row_into(&mut client, &mut sink));
+
+        assert_eq!(
+            result_set_next_row, native_next_row,
+            "ResultSet::next_row must forward the native future without boxing"
+        );
+        assert_eq!(
+            result_set_next_row_into, native_next_row_into,
+            "ResultSet::next_row_into must forward the native future without boxing"
+        );
+
+        // `close` is not checked against the per-row budget because it runs only
+        // once per result set; its larger future does not affect row iteration.
+        for (name, size) in [
+            ("ResultSet::next_row", result_set_next_row),
+            ("ResultSet::next_row_into", result_set_next_row_into),
         ] {
             assert!(
                 size <= MAX,
@@ -5565,7 +5599,11 @@ mod tests {
         client.current_result_set_has_been_read_till_end = true;
         let mut sink = DiscardRowWriter;
 
-        assert!(!client.next_row_into(&mut sink).await.unwrap());
+        assert!(
+            !ResultSet::next_row_into(&mut client, &mut sink)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -6757,7 +6795,7 @@ mod tests {
         client.current_result_set_has_been_read_till_end = false;
         client.pending_capture = Some(sid(1));
 
-        assert!(client.next_row().await.is_err());
+        assert!(ResultSet::next_row(&mut client).await.is_err());
         assert!(client.pending_capture.is_none());
     }
 
@@ -6768,7 +6806,11 @@ mod tests {
         client.pending_capture = Some(sid(1));
         let mut writer = DiscardRowWriter;
 
-        assert!(client.next_row_into(&mut writer).await.is_err());
+        assert!(
+            ResultSet::next_row_into(&mut client, &mut writer)
+                .await
+                .is_err()
+        );
         assert!(client.pending_capture.is_none());
     }
 
