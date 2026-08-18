@@ -22,6 +22,7 @@ use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 
 use crate::async_cursor::PyAsyncCursor;
+use crate::async_session::AsyncConnectionState;
 use crate::connection::PyCoreConnection;
 use crate::python_logger_adapter::python_logger_dispatch;
 
@@ -64,6 +65,29 @@ where
     }
 }
 
+async fn close_client(client: Arc<Mutex<TdsClient>>, autocommit: bool) -> bool {
+    let mut guard = client.lock().await;
+    if !autocommit
+        && guard.has_active_transaction()
+        && let Err(error) = guard.rollback_transaction(None, None).await
+    {
+        tracing::warn!(
+            "PyAsyncConnection::close: failed to roll back active transaction: {}",
+            error
+        );
+    }
+    match guard.close_connection().await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                "PyAsyncConnection::close: error during graceful shutdown: {}",
+                error
+            );
+            false
+        }
+    }
+}
+
 /// Asynchronous Python connection backed by the Core TDS client.
 ///
 /// Preview API — unstable.
@@ -78,6 +102,9 @@ pub struct PyAsyncConnection {
     /// `Option` so `close()` can `take()`; `Arc<Mutex<>>` for cursor sharing.
     tds_client: Option<Arc<Mutex<TdsClient>>>,
     tracing_dispatch: Option<tracing::Dispatch>,
+    /// Shared now so future cursor execution observes the connection mode.
+    autocommit: Arc<AtomicBool>,
+    session_state: Arc<AsyncConnectionState>,
     /// Default query timeout (seconds) applied to cursors created from this
     /// connection. `0` = no timeout, per pyodbc/ODBC `SQL_ATTR_QUERY_TIMEOUT`.
     /// Pure Python-side state — the setter performs no I/O.
@@ -89,11 +116,12 @@ impl PyAsyncConnection {
     /// Establish a TDS connection. Dict parsing is synchronous; the network
     /// handshake runs on the shared Tokio runtime.
     #[classmethod]
-    #[pyo3(signature = (client_context_dict, python_logger=None))]
+    #[pyo3(signature = (client_context_dict, python_logger=None, autocommit=false))]
     fn connect<'py>(
         cls: &Bound<'py, PyType>,
         client_context_dict: &Bound<'_, PyDict>,
         python_logger: Option<&Bound<'_, PyAny>>,
+        autocommit: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = cls.py();
 
@@ -145,6 +173,8 @@ impl PyAsyncConnection {
                             PyAsyncConnection {
                                 tds_client: Some(Arc::new(Mutex::new(client))),
                                 tracing_dispatch: dispatch,
+                                autocommit: Arc::new(AtomicBool::new(autocommit)),
+                                session_state: Arc::new(AsyncConnectionState::new()),
                                 default_query_timeout: 0,
                             },
                         )
@@ -185,6 +215,13 @@ impl PyAsyncConnection {
         Ok(())
     }
 
+    /// Whether statements use SQL Server autocommit mode. The mode is fixed at
+    /// connection time until async transition semantics are implemented.
+    #[getter]
+    fn autocommit(&self) -> bool {
+        self.autocommit.load(Ordering::Relaxed)
+    }
+
     /// True after `close()` has been called. Cheap LBYL check; performs no I/O.
     #[getter]
     fn closed(&self) -> bool {
@@ -204,13 +241,19 @@ impl PyAsyncConnection {
         }
     }
 
-    /// Close the connection. Idempotent. Shutdown errors are logged and swallowed.
+    /// Close the connection. Rolls back active work when autocommit is disabled.
+    /// Idempotent; rollback and shutdown errors are logged and swallowed.
     fn close<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let dispatch = self.tracing_dispatch.clone();
         let _guard = dispatch.as_ref().map(tracing::dispatcher::set_default);
         tracing::info!("PyAsyncConnection::close: initiating close");
         // `take()` before spawning: gives the future 'static ownership; marks conn closed.
         let client_opt = self.tds_client.take();
+        let autocommit = self.autocommit.load(Ordering::Relaxed);
+        let session_state = self.session_state.clone();
+        if client_opt.is_some() {
+            session_state.begin_close();
+        }
 
         pyo3_async_runtimes::tokio::future_into_py(
             py,
@@ -224,13 +267,10 @@ impl PyAsyncConnection {
                     tracing::info!(
                         "PyAsyncConnection::close: sending TDS logout and tearing down transport"
                     );
-                    let mut guard = client.lock().await;
-                    if let Err(e) = guard.close_connection().await {
-                        // Log and swallow; connection is closed regardless.
-                        tracing::warn!(
-                            "PyAsyncConnection::close: error during graceful shutdown: {}",
-                            e
-                        );
+                    if close_client(client, autocommit).await {
+                        session_state.mark_closed();
+                    } else {
+                        session_state.mark_broken();
                     }
                     tracing::info!("PyAsyncConnection::close: connection closed");
                     Python::attach(|py| Ok(py.None()))
@@ -248,20 +288,90 @@ impl PyAsyncConnection {
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
     }
 
-    /// Async context manager exit. Delegates to `close()`; exception info is
-    /// ignored and never suppressed (`close()` resolves to `None`, which is
-    /// falsy per Python's `__aexit__` contract).
+    /// Commit on clean exit or roll back on exceptional exit when autocommit is
+    /// disabled, then always close. Cleanup never masks the block's exception.
     fn __aexit__<'py>(
         &mut self,
         py: Python<'py>,
-        _exc_type: &Bound<'_, PyAny>,
+        exc_type: &Bound<'_, PyAny>,
         _exc_val: &Bound<'_, PyAny>,
         _exc_tb: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.close(py)
+        let client_opt = self.tds_client.take();
+        let autocommit = self.autocommit.load(Ordering::Relaxed);
+        let has_block_error = !exc_type.is_none();
+        let dispatch = self.tracing_dispatch.clone();
+        let session_state = self.session_state.clone();
+        if client_opt.is_some() {
+            session_state.begin_close();
+        }
+
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            with_optional_dispatch(
+                async move {
+                    let Some(client) = client_opt else {
+                        session_state.mark_closed();
+                        return Python::attach(|py| Ok(py.None()));
+                    };
+
+                    let mut guard = client.lock().await;
+                    let finalize_result = if !autocommit && guard.has_active_transaction() {
+                        if has_block_error {
+                            guard
+                                .rollback_transaction(None, None)
+                                .await
+                                .map_err(|error| {
+                                    map_tds_error(
+                                        "__aexit__",
+                                        "Rollback on context exit failed",
+                                        error,
+                                    )
+                                })
+                        } else {
+                            guard.commit_transaction(None, None).await.map_err(|error| {
+                                map_tds_error("__aexit__", "Commit on context exit failed", error)
+                            })
+                        }
+                    } else {
+                        Ok(())
+                    };
+
+                    let close_result = guard.close_connection().await.map_err(|error| {
+                        map_tds_error("__aexit__", "Close on context exit failed", error)
+                    });
+                    if close_result.is_ok() {
+                        session_state.mark_closed();
+                    } else {
+                        session_state.mark_broken();
+                    }
+
+                    if has_block_error {
+                        if let Err(error) = finalize_result {
+                            tracing::warn!(
+                                "PyAsyncConnection::__aexit__: cleanup failed while preserving block exception: {}",
+                                error
+                            );
+                        }
+                        if let Err(error) = close_result {
+                            tracing::warn!(
+                                "PyAsyncConnection::__aexit__: close failed while preserving block exception: {}",
+                                error
+                            );
+                        }
+                        return Python::attach(|py| Ok(py.None()));
+                    }
+
+                    finalize_result?;
+                    close_result?;
+                    Python::attach(|py| Ok(py.None()))
+                },
+                dispatch,
+            ),
+        )
     }
 
-    /// Commit the current transaction. If none is open, surfaces SQL Server 3902.
+    /// Commit the current transaction. No-op if none is active.
     fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         // Clone the Arc so the future is `'static + Send`.
         let client = self
@@ -275,8 +385,11 @@ impl PyAsyncConnection {
             py,
             with_optional_dispatch(
                 async move {
-                    tracing::info!("PyAsyncConnection::commit: sending TM_COMMIT");
                     let mut guard = client.lock().await;
+                    if !guard.has_active_transaction() {
+                        return Python::attach(|py| Ok(py.None()));
+                    }
+                    tracing::info!("PyAsyncConnection::commit: sending TM_COMMIT");
                     guard
                         .commit_transaction(None, None)
                         .await
@@ -289,7 +402,7 @@ impl PyAsyncConnection {
         )
     }
 
-    /// Roll back the current transaction. If none is open, surfaces SQL Server 3903.
+    /// Roll back the current transaction. No-op if none is active.
     fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         // Clone the Arc so the future is `'static + Send`.
         let client = self
@@ -303,8 +416,11 @@ impl PyAsyncConnection {
             py,
             with_optional_dispatch(
                 async move {
-                    tracing::info!("PyAsyncConnection::rollback: sending TM_ROLLBACK");
                     let mut guard = client.lock().await;
+                    if !guard.has_active_transaction() {
+                        return Python::attach(|py| Ok(py.None()));
+                    }
+                    tracing::info!("PyAsyncConnection::rollback: sending TM_ROLLBACK");
                     guard
                         .rollback_transaction(None, None)
                         .await
@@ -326,6 +442,12 @@ impl PyAsyncConnection {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Connection is closed"))?
             .clone();
-        Ok(PyAsyncCursor::new(client, self.default_query_timeout))
+        Ok(PyAsyncCursor::new(
+            client,
+            self.autocommit.clone(),
+            self.session_state.clone(),
+            self.session_state.allocate_cursor_id(),
+            self.default_query_timeout,
+        ))
     }
 }

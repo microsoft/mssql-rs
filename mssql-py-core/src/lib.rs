@@ -10,6 +10,7 @@ mod arrow_bulkcopy;
 mod async_connection;
 mod async_cursor;
 mod async_runtime;
+mod async_session;
 mod bulkcopy;
 mod connection;
 mod cursor;

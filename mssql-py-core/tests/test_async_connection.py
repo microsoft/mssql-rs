@@ -133,12 +133,7 @@ def test_connection_operations_reuse_connect_logger(client_context):
             )
 
         logger.messages.clear()
-        with pytest.raises(Exception, match="3902"):
-            await conn.commit()
-        assert any(
-            "PyAsyncConnection::commit: failed" in message
-            for message in logger.messages
-        )
+        assert await conn.commit() is None
 
         logger.messages.clear()
         await conn.close()
@@ -146,6 +141,25 @@ def test_connection_operations_reuse_connect_logger(client_context):
             "PyAsyncConnection::close: connection closed" in message
             for message in logger.messages
         )
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_autocommit_defaults_false_and_can_be_enabled(client_context):
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            default_conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            autocommit_conn = await mssql_py_core.PyAsyncConnection.connect(
+                client_context, autocommit=True
+            )
+            try:
+                assert default_conn.autocommit is False
+                assert autocommit_conn.autocommit is True
+            finally:
+                await default_conn.close()
+                await autocommit_conn.close()
 
     asyncio.run(run())
 
@@ -172,17 +186,13 @@ def test_close_resolves_to_none(client_context):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
-def test_commit_without_active_transaction_raises_3902(client_context):
-    """PyAsyncConnection has no begin_transaction; TM_COMMIT deterministically
-    yields SQL Server error 3902. Matching the server error number keeps this
-    valid after the DB-API error taxonomy lands."""
+def test_commit_without_active_transaction_is_noop(client_context):
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             try:
-                with pytest.raises(Exception, match="3902"):
-                    await conn.commit()
+                assert await conn.commit() is None
             finally:
                 await conn.close()
 
@@ -190,15 +200,13 @@ def test_commit_without_active_transaction_raises_3902(client_context):
 
 
 @pytest.mark.integration
-def test_rollback_without_active_transaction_raises_3903(client_context):
-    """Same rationale as commit: TM_ROLLBACK deterministically yields 3903."""
+def test_rollback_without_active_transaction_is_noop(client_context):
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             try:
-                with pytest.raises(Exception, match="3903"):
-                    await conn.rollback()
+                assert await conn.rollback() is None
             finally:
                 await conn.close()
 
