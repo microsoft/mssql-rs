@@ -163,7 +163,8 @@ Maps to the work item acceptance criteria:
 - Driver Manager pooling or any second pool in `mssql-odbc`/`mssql-tds`.
 - Replacing TDS idle-connection resiliency with pooling.
 - Refreshing an access token on an already-authenticated session.
-- **Resetting isolation set via raw T-SQL** (not the `SQL_ATTR_TXN_ISOLATION` attribute). `sp_reset_connection` does not reset isolation (D9), and both mssql-python's #343 workaround and our driver track isolation only through the attribute — a borrower that runs `SET TRANSACTION ISOLATION LEVEL ...` directly can leak it across checkout. Shared, documented limitation; not addressed here.
+- **Reporting isolation set via raw T-SQL** (not the `SQL_ATTR_TXN_ISOLATION` attribute). Our `state.txn_isolation` cache tracks only the attribute path, so a borrower that runs `SET TRANSACTION ISOLATION LEVEL ...` directly leaves the cache stale and a later `SQLGetConnectAttr` reports the cached value rather than the session's. Matching mssql-python's own coverage gap (#343 tracks only the attribute path); not addressed here.
+  - **The pooled-checkout *leak* is closed, however.** `sp_reset_connection` does not reset isolation (D9, verified on SQL 2022: `LOCK_TIMEOUT` returns to its login default across RESETCONNECTION while `transaction_isolation_level` does not), so historically a raw-T-SQL SERIALIZABLE could survive into the next borrower whenever the checkout re-apply short-circuited on a matching cached value. Since the armed reset now suppresses that short circuit (B4), the checkout `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` always reaches the server, restoring the level regardless of how the previous borrower changed it. The stale *cache* remains; the cross-borrower leak does not.
 
 ## Rough sequencing
 1. A1 + A3 (tds reset-ack centralization + tests) — unblocks safe reuse.

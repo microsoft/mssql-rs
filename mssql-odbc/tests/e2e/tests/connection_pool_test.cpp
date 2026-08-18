@@ -194,6 +194,28 @@ TEST_F(ConnectionPoolLiveTest, ResetRestoresCleanStateForNextBorrower) {
     EXPECT_EQ(login_db, DatabaseId()) << "database must return to the login default";
 }
 
+// The pooled-checkout isolation leak is closed even when the borrower changed
+// isolation with raw T-SQL instead of the ODBC attribute. `sp_reset_connection`
+// does not restore the isolation level (D9), and the driver's cached level is
+// untouched by a raw `SET`, so the checkout re-apply of READ COMMITTED would
+// normally short-circuit on the matching cached value and let SERIALIZABLE leak
+// to the next borrower. The armed reset suppresses that short circuit, so the
+// SET always reaches the server.
+TEST_F(ConnectionPoolLiveTest, RawTsqlIsolationDoesNotLeakAcrossCheckout) {
+    const SQLINTEGER spid_before = Spid();
+
+    // Borrower A raises isolation *without* the attribute, so the driver's
+    // cached level still reads READ COMMITTED.
+    Exec("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    ASSERT_EQ(4, ServerIsolation()) << "A raised isolation via raw T-SQL";
+
+    CheckInAndReset();
+
+    EXPECT_EQ(2, ServerIsolation())
+        << "the checkout re-apply must reach the server even though the cached level matched";
+    EXPECT_EQ(spid_before, Spid()) << "same physical connection";
+}
+
 // The reset itself keeps the connection usable: CONNECTION_DEAD reads FALSE on a
 // healthy connection both before and after the reset, so a pool does not discard
 // a perfectly good connection.

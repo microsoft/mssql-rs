@@ -607,16 +607,17 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         //
         // D9 caveat: this cache tracks only isolation set through this attribute.
         // A borrower that ran `SET TRANSACTION ISOLATION LEVEL ...` as raw T-SQL
-        // leaves the cache stale, so a pool checkout re-applying READ COMMITTED
-        // can short-circuit here and leak the borrower's level. This mirrors
-        // mssql-python's own coverage gap (#343 only tracks the attribute path);
-        // `sp_reset_connection` does not reset isolation, so it is a shared,
-        // documented limitation (see the plan's Non-goals), not fixed here.
+        // leaves the cache stale, so a later get reports the cached value rather
+        // than the session's. This mirrors mssql-python's own coverage gap (#343
+        // only tracks the attribute path) and is not fixed here.
         //
         // The short circuit is suppressed while a pooling reset is armed: this
         // SET is the request that carries the RESETCONNECTION bit, so skipping
         // it would defer the reset to the borrower's first query and give up
-        // fail-at-checkout.
+        // fail-at-checkout. That also closes the cross-borrower isolation leak:
+        // `sp_reset_connection` does not restore the isolation level (D9), so
+        // forcing this batch to emit is what returns the session to READ
+        // COMMITTED even when the previous borrower changed it via raw T-SQL.
         if level == state.txn_isolation && !state.pending_reset_ack {
             debug!(value, "{OP}: already at this isolation level");
             return SQL_SUCCESS;
