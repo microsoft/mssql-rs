@@ -153,6 +153,10 @@ TEST_F(PrepareExecuteLiveTest, ExplicitLengthWideCharParam) {
 // SQL_C_DEFAULT reaches the driver unresolved (the Driver Manager does not
 // substitute it), and the driver resolves it from ParameterType. SQL_VARCHAR
 // yields SQL_C_CHAR on both drivers.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the RPC parameter was
+// declared varchar with a single-byte payload; the round-tripped text alone
+// cannot show which C type the driver resolved.
 TEST_F(PrepareExecuteLiveTest, DefaultCTypeNarrowCharParam) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
@@ -174,6 +178,10 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeNarrowCharParam) {
 // character SQL types to SQL_C_WCHAR, per the ODBC 3.x default-C-type table.
 // msodbcsql's rgbTRANSTYPE380 resolves them to SQL_C_CHAR and would read this
 // UTF-16 buffer as narrow text, so the round trip differs there.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the RPC parameter was
+// declared nvarchar carrying the full UTF-16 payload, which is the deviation
+// itself; the round-tripped ASCII text alone cannot show it.
 TEST_F(PrepareExecuteLiveTest, DefaultCTypeWideCharParam) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
