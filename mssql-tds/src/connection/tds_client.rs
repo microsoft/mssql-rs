@@ -6575,6 +6575,7 @@ mod tests {
     async fn check_and_reconnect_returns_error_when_dead_and_not_recoverable() {
         let mut client = create_test_client();
         client.recovery_context.session_recovery_negotiated = true;
+        client.transport.close_transport().await.unwrap();
         // Make it not recoverable by starting a transaction
         client.execution_context.set_transaction_descriptor(42);
 
@@ -6591,7 +6592,8 @@ mod tests {
     async fn check_and_reconnect_attempts_reconnect_when_dead_and_recoverable() {
         let mut client = create_test_client();
         client.recovery_context.session_recovery_negotiated = true;
-        // Transport (TestTransport) returns is_connection_dead() = true,
+        client.transport.close_transport().await.unwrap();
+        // The closed TestTransport returns is_connection_dead() = true,
         // recovery is possible (no txn, no open batch, negotiated=true).
         // reconnect() will fail because TestTransport can't actually connect,
         // but it should be *attempted* — we'll get SessionRecoveryFailed.
