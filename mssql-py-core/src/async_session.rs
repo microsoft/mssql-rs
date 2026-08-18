@@ -97,6 +97,8 @@ impl AsyncConnectionState {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{AsyncConnectionState, ConnectionLifecycle};
 
     #[test]
@@ -108,15 +110,47 @@ mod tests {
     }
 
     #[test]
+    fn allocates_unique_operation_ids() {
+        let state = AsyncConnectionState::new();
+
+        assert_eq!(state.allocate_operation_id(), 1);
+        assert_eq!(state.allocate_operation_id(), 2);
+    }
+
+    #[test]
     fn tracks_connection_lifecycle() {
         let state = AsyncConnectionState::new();
 
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Open);
         state.begin_close();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Closing);
+        state.begin_close();
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Closing);
         state.mark_closed();
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Closed);
+        state.begin_close();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Closed);
         state.mark_broken();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
+        state.begin_close();
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
+    }
+
+    #[test]
+    fn recovers_from_poisoned_state_mutex() {
+        let state = Arc::new(AsyncConnectionState::new());
+        let state_to_poison = Arc::clone(&state);
+
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = state_to_poison.inner.lock().unwrap();
+                panic!("poison session state mutex");
+            })
+            .join()
+            .is_err()
+        );
+
+        state.begin_close();
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Closing);
     }
 }
