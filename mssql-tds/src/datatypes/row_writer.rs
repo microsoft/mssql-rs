@@ -7,7 +7,7 @@ use crate::datatypes::column_values::{
 };
 use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sql_json::SqlJson;
-use crate::datatypes::sql_string::SqlString;
+use crate::datatypes::sql_string::{EncodingType, SqlString};
 use crate::datatypes::sql_vector::SqlVector;
 use crate::datatypes::sqldatatypes::TdsDataType;
 use uuid::Uuid;
@@ -72,6 +72,95 @@ pub trait RowWriter {
     fn write_variant_base_type(&mut self, _col: usize, _base: TdsDataType) {}
     /// Signals the end of the current row.
     fn end_row(&mut self);
+
+    /// Offers the writer the chance to supply the final storage for a
+    /// known-length PLP string or binary value, so the decoder reads the
+    /// payload straight from the wire into it.
+    ///
+    /// This is the sink half of the trait. It exists for consumers that own a
+    /// destination buffer already — a PostgreSQL FDW writing into `palloc`ed
+    /// varlena memory, an Arrow builder, an N-API byte encoder — and lets them
+    /// take the payload without `mssql-tds` allocating a `Vec` per value that
+    /// the consumer then copies out of and drops.
+    ///
+    /// The saving is the redundant allocation and copy, not the initialization:
+    /// the returned slice must already be initialized memory (see the contract
+    /// below), so a consumer allocating fresh storage still pays to establish
+    /// it once — `palloc0` rather than `palloc`. What it stops paying for is a
+    /// second buffer and the copy between them.
+    ///
+    /// Returning `None` is the default and leaves the value on the owned
+    /// [`Self::write_bytes`] / [`Self::write_string`] path, so writers that do
+    /// not opt in are unaffected.
+    ///
+    /// # Which values are offered
+    ///
+    /// Only the `MAX` types, and only when the server frames them with a known
+    /// total length. `USHORTLEN` values (`varchar(n)`, `varbinary(n)`), the
+    /// legacy `TEXT`/`NTEXT`/`IMAGE` `LONGLEN` types, `PLP_UNKNOWNLEN` streams
+    /// and NULLs all stay on the owned path unconditionally.
+    ///
+    /// Short values remain on the existing hot path so writers that decline
+    /// destinations do not pay for an extra branch on every small payload.
+    /// PLP values are the useful boundary because they can be large or numerous
+    /// and already require chunked decoding.
+    ///
+    /// # Contract
+    ///
+    /// A writer that returns `Some` must return a slice of exactly `length`
+    /// bytes and receives exactly one matching [`Self::commit_value`] call for
+    /// the same `col`. It does not additionally receive `write_bytes` or
+    /// `write_string` for that value.
+    ///
+    /// The slice must be a valid `&mut [u8]`, which means the `length` bytes
+    /// are already initialized. Handing back a slice built over uninitialized
+    /// allocation — `slice::from_raw_parts_mut` on fresh `palloc`ed memory, an
+    /// unfilled `Vec`'s spare capacity — is undefined behaviour regardless of
+    /// the decoder overwriting every byte afterwards. Use `palloc0`,
+    /// `vec![0; length]`, or `Vec::resize` to establish the bytes first.
+    ///
+    /// `length` counts bytes as framed on the wire, not characters. Raw wire
+    /// bytes are handed over as-is together with their [`ValueKind`], so a
+    /// consumer that transcodes downstream never pays for a transcode here.
+    /// A writer whose storage cannot hold the wire form — because it needs to
+    /// transcode from, say, [`EncodingType::Utf16`] first — returns `None` for
+    /// that value and receives it through [`Self::write_string`] as before.
+    fn value_destination<'a>(
+        &'a mut self,
+        _col: usize,
+        _kind: ValueKind<'_>,
+        _length: usize,
+    ) -> Option<&'a mut [u8]> {
+        None
+    }
+
+    /// Completes a value whose storage came from [`Self::value_destination`].
+    ///
+    /// `complete` is `false` when decoding failed partway through; the slice
+    /// contents are then unspecified and the writer must discard the value.
+    ///
+    /// # Cancellation
+    ///
+    /// Errors that return through the transport — operation timeout, an
+    /// explicit cancel, a malformed token — reach this method with `complete`
+    /// set to `false`. Dropping the row-decode future outright does not: no
+    /// further decoder code runs, so an offered destination is left
+    /// uncommitted. An RAII guard cannot close that gap here, because the guard
+    /// and the destination slice would both have to borrow the writer at once.
+    ///
+    /// A writer must therefore treat a destination that is still pending at the
+    /// next [`Self::end_row`], or at the next `value_destination` for the same
+    /// column, as abandoned rather than asserting that it was committed. The
+    /// row it belonged to is not delivered in that case.
+    fn commit_value(&mut self, _col: usize, _complete: bool) {}
+}
+
+/// The kind of value a [`RowWriter::value_destination`] request is for.
+pub enum ValueKind<'a> {
+    /// A binary value, handed over verbatim.
+    Bytes,
+    /// A character value, handed over as raw wire bytes in this encoding.
+    String(&'a EncodingType),
 }
 
 /// Default implementation that assembles `Vec<ColumnValues>`, preserving
@@ -343,7 +432,7 @@ mod tests {
     fn write_column_value_bridges_numeric() {
         let mut writer = DefaultRowWriter::new(1);
         let parts = DecimalParts::from_i64(12345, 5, 0).unwrap();
-        write_column_value(&mut writer, 0, ColumnValues::Numeric(parts.clone()));
+        write_column_value(&mut writer, 0, ColumnValues::Numeric(parts));
         let row = writer.take_row();
         assert_eq!(row[0], ColumnValues::Numeric(parts));
     }

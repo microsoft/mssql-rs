@@ -49,6 +49,72 @@ impl TdsReadBuffer {
         self.buffer_length - self.buffer_position
     }
 
+    #[inline(always)]
+    fn try_read_array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        if !self.do_we_have_enough_data(N) {
+            return None;
+        }
+
+        let position = self.buffer_position;
+        let bytes = self.working_buffer[position..position + N]
+            .try_into()
+            .expect("slice length is fixed by N");
+        self.consume_bytes(N);
+        Some(bytes)
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_read_byte(&mut self) -> Option<u8> {
+        self.try_read_array().map(|[value]| value)
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_read_int16(&mut self) -> Option<i16> {
+        self.try_read_array().map(i16::from_le_bytes)
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_read_uint16(&mut self) -> Option<u16> {
+        self.try_read_array().map(u16::from_le_bytes)
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_read_uint24(&mut self) -> Option<u32> {
+        let [b0, b1, b2] = self.try_read_array()?;
+        Some(u32::from_le_bytes([b0, b1, b2, 0]))
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_read_int32(&mut self) -> Option<i32> {
+        self.try_read_array().map(i32::from_le_bytes)
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_read_uint32(&mut self) -> Option<u32> {
+        self.try_read_array().map(u32::from_le_bytes)
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_read_uint40(&mut self) -> Option<u64> {
+        let [b0, b1, b2, b3, b4] = self.try_read_array()?;
+        Some(u64::from_le_bytes([b0, b1, b2, b3, b4, 0, 0, 0]))
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_read_int64(&mut self) -> Option<i64> {
+        self.try_read_array().map(i64::from_le_bytes)
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_read_float32(&mut self) -> Option<f32> {
+        self.try_read_array().map(f32::from_le_bytes)
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_read_float64(&mut self) -> Option<f64> {
+        self.try_read_array().map(f64::from_le_bytes)
+    }
+
     pub(crate) fn consume_bytes(&mut self, byte_count: usize) {
         if byte_count > (self.buffer_length - self.buffer_position) {
             panic!("Not enough data to consume");
@@ -424,6 +490,74 @@ mod tests {
         assert!(buf.do_we_have_enough_data(400));
         assert!(buf.do_we_have_enough_data(1));
         assert!(!buf.do_we_have_enough_data(401));
+    }
+
+    #[test]
+    fn test_fixed_scalar_probes_read_complete_values() {
+        let expected_byte = 0xAB;
+        let expected_int16 = -0x1234i16;
+        let expected_uint16 = 0x1234u16;
+        let expected_uint24 = 0x00A1_B2C3u32;
+        let expected_int32 = -0x0123_4567i32;
+        let expected_uint32 = 0x89AB_CDEFu32;
+        let expected_uint40 = 0xAB_CDEF_0123u64;
+        let expected_int64 = -0x0102_0304_0506_0708i64;
+        let expected_float32 = 1.5f32;
+        let expected_float64 = -2.25f64;
+
+        let mut bytes = Vec::new();
+        bytes.push(expected_byte);
+        bytes.extend_from_slice(&expected_int16.to_le_bytes());
+        bytes.extend_from_slice(&expected_uint16.to_le_bytes());
+        bytes.extend_from_slice(&expected_uint24.to_le_bytes()[..3]);
+        bytes.extend_from_slice(&expected_int32.to_le_bytes());
+        bytes.extend_from_slice(&expected_uint32.to_le_bytes());
+        bytes.extend_from_slice(&expected_uint40.to_le_bytes()[..5]);
+        bytes.extend_from_slice(&expected_int64.to_le_bytes());
+        bytes.extend_from_slice(&expected_float32.to_le_bytes());
+        bytes.extend_from_slice(&expected_float64.to_le_bytes());
+
+        let mut buf = TdsReadBuffer::new(4096);
+        buf.working_buffer[..bytes.len()].copy_from_slice(&bytes);
+        buf.reset_to_length(bytes.len());
+
+        assert_eq!(buf.try_read_byte(), Some(expected_byte));
+        assert_eq!(buf.try_read_int16(), Some(expected_int16));
+        assert_eq!(buf.try_read_uint16(), Some(expected_uint16));
+        assert_eq!(buf.try_read_uint24(), Some(expected_uint24));
+        assert_eq!(buf.try_read_int32(), Some(expected_int32));
+        assert_eq!(buf.try_read_uint32(), Some(expected_uint32));
+        assert_eq!(buf.try_read_uint40(), Some(expected_uint40));
+        assert_eq!(buf.try_read_int64(), Some(expected_int64));
+        assert_eq!(buf.try_read_float32(), Some(expected_float32));
+        assert_eq!(buf.try_read_float64(), Some(expected_float64));
+        assert_eq!(buf.get_remaining_byte_count(), 0);
+    }
+
+    #[test]
+    fn test_fixed_scalar_probe_misses_do_not_consume() {
+        let mut buf = TdsReadBuffer::new(4096);
+
+        macro_rules! assert_miss_does_not_consume {
+            ($partial_len:expr, $method:ident) => {{
+                buf.working_buffer[..$partial_len].fill(0xA5);
+                buf.reset_to_length($partial_len);
+                assert_eq!(buf.$method(), None);
+                assert_eq!(buf.buffer_position, 0);
+                assert_eq!(buf.get_remaining_byte_count(), $partial_len);
+            }};
+        }
+
+        assert_miss_does_not_consume!(0, try_read_byte);
+        assert_miss_does_not_consume!(1, try_read_int16);
+        assert_miss_does_not_consume!(1, try_read_uint16);
+        assert_miss_does_not_consume!(2, try_read_uint24);
+        assert_miss_does_not_consume!(3, try_read_int32);
+        assert_miss_does_not_consume!(3, try_read_uint32);
+        assert_miss_does_not_consume!(4, try_read_uint40);
+        assert_miss_does_not_consume!(7, try_read_int64);
+        assert_miss_does_not_consume!(3, try_read_float32);
+        assert_miss_does_not_consume!(7, try_read_float64);
     }
 
     #[test]

@@ -50,12 +50,7 @@ mod rpc_datatypes {
 
         let guid = "123e4567-e89b-12d3-a456-426614174000".to_string();
 
-        let decimal = DecimalParts {
-            is_positive: true,
-            int_parts: vec![-123, 0, 0, 0],
-            scale: 38,
-            precision: 38,
-        };
+        let decimal = DecimalParts::new(true, 38, 38, 4294967173);
 
         let columns = vec![
             ("int", SqlType::Int(Some(int_value))),
@@ -108,8 +103,8 @@ mod rpc_datatypes {
                 })),
             ),
             ("guid", SqlType::Uuid(Some(Uuid::from_str(&guid).unwrap()))),
-            ("decimal", SqlType::Decimal(Some(decimal.clone()))),
-            ("numeric", SqlType::Numeric(Some(decimal.clone()))),
+            ("decimal", SqlType::Decimal(Some(decimal))),
+            ("numeric", SqlType::Numeric(Some(decimal))),
             (
                 "smallmoney",
                 SqlType::SmallMoney(Some(SqlSmallMoney { int_val: 12345 })),
