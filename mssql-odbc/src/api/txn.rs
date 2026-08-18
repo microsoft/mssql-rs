@@ -1075,6 +1075,64 @@ mod tests {
     }
 
     #[test]
+    fn armed_reset_clears_the_transaction_descriptor_so_checkout_sends_no_rollback() {
+        // Regression: a full RESETCONNECTION discards the server-side
+        // transaction, so the driver must stop believing one is open. The
+        // reachable case is mssql-python's default autocommit=False: the
+        // bookkeeping transaction from `switch_to_manual_commit` leaves a live
+        // descriptor with `local_tran_started == false`, so neither check-in
+        // `SQLEndTran` nor the reset's own D4 rollback sends a TM request. If the
+        // descriptor survived, `set_txn_isolation`'s `reopen` branch would send a
+        // rollback carrying the reset bit; the server honors the bit first,
+        // discards the transaction, and answers 3903 — failing every checkout.
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{
+            done_no_more, env_change_reset_connection, tds_client_from_tokens_in_transaction,
+        };
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            // Only the isolation SET should reach the wire: one batch, then the
+            // reset acknowledgement. A stray rollback would consume these first
+            // and strand the SET.
+            let client = tds_client_from_tokens_in_transaction(
+                vec![env_change_reset_connection(), done_no_more()],
+                0xDEAD_BEEF,
+            );
+            assert!(client.has_active_transaction());
+            state.client = Some(client);
+            // The driver-begun transaction carries no user work.
+            state.local_tran_started = false;
+        }
+
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+        {
+            let state = dbc.inner.lock().unwrap();
+            let client = state.client.as_ref().expect("client restored after arming");
+            assert!(
+                !client.has_active_transaction(),
+                "arming a full reset must drop the transaction the reset discards"
+            );
+        }
+
+        // The pool's checkout re-apply: it must send only the SET.
+        assert_eq!(
+            set_txn_isolation(dbc, u64::from(SQL_TXN_READ_COMMITTED)),
+            SQL_SUCCESS
+        );
+        let state = dbc.inner.lock().unwrap();
+        let client = state.client.as_ref().expect("client restored");
+        assert!(
+            !client.reset_pending(),
+            "the SET must have carried the bit and collected the acknowledgement"
+        );
+        assert!(!client.is_connection_dead());
+    }
+
+    #[test]
     fn reset_connection_arms_without_any_io() {
         // Arming performs no round trip, so it succeeds even against a client
         // with no queued tokens — that is the whole point of the no-RTT design.

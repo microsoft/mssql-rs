@@ -889,6 +889,16 @@ impl TdsClient {
         };
         self.transport.as_writer().set_reset_mode(mode);
         self.reset_pending = true;
+        // A full reset discards the server-side transaction, so mirror that here.
+        // Leaving a stale descriptor would make `has_active_transaction()` report
+        // a transaction the carrying request is itself about to destroy, and the
+        // next caller would send a TM rollback for it — which the server answers
+        // with 3903 ("no corresponding BEGIN TRANSACTION"), failing the checkout.
+        // RESETCONNECTIONSKIPTRAN deliberately preserves the transaction, so the
+        // descriptor must survive in that mode.
+        if !preserve_transaction {
+            self.execution_context.set_transaction_descriptor(0);
+        }
         // Mirror the reset the server will apply before the next request, so no
         // borrower is served from state the reset is about to invalidate.
         self.recovery_context.session_state_table.reset();
