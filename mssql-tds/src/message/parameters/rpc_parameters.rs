@@ -81,6 +81,50 @@ pub(crate) struct EncryptedRpcValue {
     pub(crate) metadata: RpcEncryptionMetadata,
 }
 
+/// Wire-type selector for a data-at-execution (streamed) PLP parameter.
+///
+/// Limited to the MAX types, whose TYPE_INFO is fully determined by the variant
+/// itself and whose value body is plain PLP framing: unknown-length opener,
+/// length-prefixed chunks, terminator. That is what lets the parameter header be
+/// written before the total value length is known. Callers buffer any other type
+/// and send it materialized.
+///
+/// TODO: extend to the remaining PLP types (`xml`, `json`, `udt`, `text`, `ntext`,
+/// `image`) for parity with the incremental read path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamedSqlType {
+    /// Unicode MAX text.
+    NVarcharMax,
+    /// Single-byte MAX text.
+    VarcharMax,
+    /// MAX binary data.
+    VarBinaryMax,
+}
+
+impl StreamedSqlType {
+    fn sql_name(self) -> &'static str {
+        match self {
+            Self::NVarcharMax => "nvarchar(MAX)",
+            Self::VarcharMax => "varchar(MAX)",
+            Self::VarBinaryMax => "varbinary(MAX)",
+        }
+    }
+
+    fn as_sql_type(self) -> SqlType {
+        match self {
+            Self::NVarcharMax => SqlType::NVarcharMax(None),
+            Self::VarcharMax => SqlType::VarcharMax(None),
+            Self::VarBinaryMax => SqlType::VarBinaryMax(None),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RpcValue {
+    Materialized(SqlType),
+    Streamed(StreamedSqlType),
+}
+
 /// A single parameter in a TDS RPC request.
 ///
 /// Construct with [`RpcParameter::new`], supplying an optional name, status
@@ -99,7 +143,7 @@ pub struct RpcParameter {
 
     /// The data type and value of the parameter.
     ///  This is used to determine how to serialize the value.
-    value: SqlType,
+    value: RpcValue,
 
     /// When present, the parameter is sent encrypted (Always Encrypted): the
     /// ciphertext is serialized as a BIGVARBINARY with the ENCRYPTED status flag
@@ -113,16 +157,6 @@ pub struct RpcParameter {
     /// `SqlParameter.ForceColumnEncryption`; a client-side directive that is
     /// never sent on the wire.
     force_column_encryption: bool,
-
-    /// When `true`, this parameter's value is supplied later, in chunks, via the
-    /// data-at-execution path (ODBC `SQL_DATA_AT_EXEC`). During serialization the
-    /// `value` is treated purely as a type template: [`serialize`](Self::serialize)
-    /// writes the parameter header (status byte + `TYPE_INFO`) and stops *before*
-    /// the PLP length field. The length field (the unknown-length opener, or
-    /// `PLP_NULL`), the value chunks and the terminator are written afterwards by
-    /// the streaming driver. Only the MAX (PLP) types are eligible. Never sent on
-    /// the wire as a flag.
-    data_at_exec: bool,
 }
 
 impl RpcParameter {
@@ -131,29 +165,31 @@ impl RpcParameter {
         Self {
             name,
             options,
-            value,
+            value: RpcValue::Materialized(value),
             encrypted: None,
             force_column_encryption: false,
-            data_at_exec: false,
         }
     }
 
-    /// Marks this parameter as data-at-execution: its value is streamed later in
-    /// chunks rather than materialized up front. The `value` supplied to
-    /// [`new`](Self::new) is used only as a type template (a `None`-valued MAX
-    /// type such as `SqlType::NVarcharMax(None)` is the intended form).
-    ///
-    /// Only `nvarchar(max)`, `varchar(max)` and `varbinary(max)` may be streamed;
-    /// see [`is_streamable_plp`](Self::is_streamable_plp).
-    pub fn data_at_exec(mut self) -> Self {
-        self.data_at_exec = true;
-        self
+    /// Creates a data-at-execution (streamed) RPC parameter.
+    pub fn data_at_exec(
+        name: Option<String>,
+        options: StatusFlags,
+        sql_type: StreamedSqlType,
+    ) -> Self {
+        Self {
+            name,
+            options,
+            value: RpcValue::Streamed(sql_type),
+            encrypted: None,
+            force_column_encryption: false,
+        }
     }
 
     /// Returns `true` if this parameter's value is supplied via the
     /// data-at-execution (streamed) path.
     pub(crate) fn is_data_at_exec(&self) -> bool {
-        self.data_at_exec
+        matches!(self.value, RpcValue::Streamed(_))
     }
 
     /// Requires this parameter to be encrypted under Always Encrypted.
@@ -335,21 +371,14 @@ impl RpcParameter {
         // still resolve to NULL before any data is sent. This is the write
         // analogue of the incremental read's pause point: the same serialize
         // method, parked partway through the value.
-        if self.data_at_exec {
-            if !self.is_streamable_plp() {
-                return Err(Error::UsageError(format!(
-                    "Parameter '{}' is not a streamable PLP (MAX) type; only \
-                     nvarchar(max), varchar(max) and varbinary(max) may be streamed.",
-                    self.name.as_deref().unwrap_or("<positional>")
-                )));
-            }
+        if let RpcValue::Streamed(st) = self.value {
             if self.encrypted.is_some() {
                 return Err(Error::UsageError(
                     "Encrypted parameters cannot be streamed incrementally.".to_string(),
                 ));
             }
             packet_writer.write_byte_async(self.options.bits()).await?;
-            self.value
+            st.as_sql_type()
                 .write_type_info(packet_writer, db_collation, None, None)
                 .await?;
             return Ok(());
@@ -367,20 +396,20 @@ impl RpcParameter {
         // Write the options byte.
         packet_writer.write_byte_async(self.options.bits()).await?;
 
+        let value = match &self.value {
+            RpcValue::Materialized(value) => value,
+            RpcValue::Streamed(_) => unreachable!("streamed value handled above"),
+        };
         encoder
-            .encode_sqlvalue(packet_writer, &self.value, db_collation)
+            .encode_sqlvalue(packet_writer, value, db_collation)
             .await?;
         Ok(())
     }
 
-    /// Returns `true` when this parameter's declared type is a MAX (PLP) type
-    /// eligible for incremental streaming: `nvarchar(max)`, `varchar(max)`, or
-    /// `varbinary(max)`.
+    /// Returns `true` when this parameter's declared type is a PLP type
+    /// eligible for incremental streaming (see [`StreamedSqlType`]).
     pub(crate) fn is_streamable_plp(&self) -> bool {
-        matches!(
-            self.value,
-            SqlType::NVarcharMax(_) | SqlType::VarcharMax(_) | SqlType::VarBinaryMax(_)
-        )
+        matches!(self.value, RpcValue::Streamed(_))
     }
 
     /// Marks this parameter as encrypted, supplying the ciphertext (or `None`
@@ -401,7 +430,12 @@ impl RpcParameter {
     /// Returns the parameter's plaintext value. Used by the parameter-encryption
     /// path to normalize and encrypt the value before sending.
     pub(crate) fn value(&self) -> &SqlType {
-        &self.value
+        match &self.value {
+            RpcValue::Materialized(value) => value,
+            RpcValue::Streamed(_) => unreachable!(
+                "value() called on a streamed parameter; encryption rejects streamed params"
+            ),
+        }
     }
 
     /// Returns `true` when the parameter is passed by reference (an output or
@@ -444,7 +478,7 @@ impl RpcParameter {
         // which the server reads as `tinyint`; for an encrypted `bit` parameter
         // that mismatch raises an "operand type clash" against a `bit` column,
         // so `bit` must be written as `BITN` here instead.
-        match &self.value {
+        match self.value() {
             SqlType::Bit(_) => {
                 packet_writer
                     .write_byte_async(TdsDataType::BitN as u8)
@@ -536,7 +570,7 @@ impl RpcParameter {
     /// Access to the value field for fuzzing
     #[cfg(fuzzing)]
     pub fn get_value(&self) -> &SqlType {
-        &self.value
+        self.value()
     }
 }
 
@@ -567,7 +601,10 @@ fn build_parameter_list_string_impl(
         if let Some(param_name) = &param.name {
             // TODO: while persisting types with length, we need to compute the length and
             // add the length after the type name. e.g. Nvarchar(200), varchar(100) etc.
-            let param_type_name = RpcParameter::get_sql_name(&param.value)?;
+            let param_type_name = match &param.value {
+                RpcValue::Streamed(streamed) => streamed.sql_name().to_string(),
+                RpcValue::Materialized(value) => RpcParameter::get_sql_name(value)?,
+            };
             if first_param {
                 first_param = false;
             } else {
@@ -624,9 +661,11 @@ impl From<&SqlType> for TdsDataType {
 mod tests {
     use crate::datatypes::sqltypes::SqlType;
     use crate::error::Error;
-    use crate::message::parameters::rpc_parameters::RpcParameter;
     use crate::message::parameters::rpc_parameters::{
         EncryptedRpcValue, RpcEncryptionMetadata, StatusFlags,
+    };
+    use crate::message::parameters::rpc_parameters::{
+        RpcParameter, StreamedSqlType, build_parameter_list_string,
     };
 
     use crate::datatypes::encoder::GenericEncoder;
@@ -938,12 +977,11 @@ mod tests {
     /// written later by the streaming driver, not here.
     #[test]
     fn serialize_data_at_exec_named() {
-        let param = RpcParameter::new(
+        let param = RpcParameter::data_at_exec(
             Some("@p".to_string()),
             StatusFlags::NONE,
-            SqlType::NVarcharMax(None),
-        )
-        .data_at_exec();
+            StreamedSqlType::NVarcharMax,
+        );
 
         let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
         expected.push(StatusFlags::NONE.bits()); // status flags
@@ -957,12 +995,11 @@ mod tests {
     /// the third streamable type (nvarchar/varchar/varbinary all supported).
     #[test]
     fn serialize_data_at_exec_varchar_max_named() {
-        let param = RpcParameter::new(
+        let param = RpcParameter::data_at_exec(
             Some("@p".to_string()),
             StatusFlags::NONE,
-            SqlType::VarcharMax(None),
-        )
-        .data_at_exec();
+            StreamedSqlType::VarcharMax,
+        );
 
         let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
         expected.push(StatusFlags::NONE.bits()); // status flags
@@ -976,7 +1013,7 @@ mod tests {
     #[test]
     fn serialize_data_at_exec_positional() {
         let param =
-            RpcParameter::new(None, StatusFlags::NONE, SqlType::VarBinaryMax(None)).data_at_exec();
+            RpcParameter::data_at_exec(None, StatusFlags::NONE, StreamedSqlType::VarBinaryMax);
 
         let mut expected = vec![0x00]; // zero-length name (positional)
         expected.push(StatusFlags::NONE.bits());
@@ -985,36 +1022,49 @@ mod tests {
         assert_eq!(streamed_header_bytes(&param, true), expected);
     }
 
-    /// Non-MAX types are rejected on the data-at-execution path: only
-    /// nvarchar(max)/varchar(max)/varbinary(max) may be streamed.
+    /// Every streamed type declares itself in the `sp_executesql` `@params`
+    /// string under its own T-SQL name, so the server binds the same type it
+    /// sees in TYPE_INFO.
     #[test]
-    fn serialize_data_at_exec_rejects_non_max_type() {
-        let param = RpcParameter::new(
+    fn streamed_params_declare_their_sql_type_name() {
+        let cases = [
+            (StreamedSqlType::NVarcharMax, "nvarchar(MAX)"),
+            (StreamedSqlType::VarcharMax, "varchar(MAX)"),
+            (StreamedSqlType::VarBinaryMax, "varbinary(MAX)"),
+        ];
+
+        for (streamed, expected_name) in cases {
+            let params = vec![RpcParameter::data_at_exec(
+                Some("@p".to_string()),
+                StatusFlags::NONE,
+                streamed,
+            )];
+            let mut list = String::new();
+            build_parameter_list_string(&params, &mut list).unwrap();
+            assert_eq!(list, format!("@p {expected_name} "), "for {streamed:?}");
+        }
+    }
+
+    /// The constructor only accepts streamable wire types.
+    #[test]
+    fn data_at_exec_constructor_requires_streamed_sql_type() {
+        let param = RpcParameter::data_at_exec(
             Some("@p".to_string()),
             StatusFlags::NONE,
-            SqlType::Int(Some(1)),
-        )
-        .data_at_exec();
-        assert!(!param.is_streamable_plp());
-
-        let mut mock = MockNetworkWriter::new(16384);
-        let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
-        let collation = SqlCollation::default();
-        let encoder = GenericEncoder {};
-        let err = block_on(param.serialize(&mut w, &collation, false, &encoder))
-            .expect_err("non-max type must be rejected");
-        assert!(matches!(err, Error::UsageError(_)));
+            StreamedSqlType::VarBinaryMax,
+        );
+        assert!(param.is_streamable_plp());
+        assert!(param.is_data_at_exec());
     }
 
     /// Encrypted parameters cannot be streamed incrementally.
     #[test]
     fn serialize_data_at_exec_rejects_encrypted() {
-        let mut param = RpcParameter::new(
+        let mut param = RpcParameter::data_at_exec(
             Some("@p".to_string()),
             StatusFlags::NONE,
-            SqlType::VarBinaryMax(None),
-        )
-        .data_at_exec();
+            StreamedSqlType::VarBinaryMax,
+        );
         param.set_encrypted(Some(vec![0x01, 0x02]), sample_metadata());
 
         let mut mock = MockNetworkWriter::new(16384);

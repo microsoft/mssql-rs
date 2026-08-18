@@ -238,6 +238,8 @@ struct StreamedWriteContext {
     /// via [`TdsClient::write_streamed_null`]. Closing the parameter then writes
     /// `PLP_NULL` instead of an opener + terminator, and no chunks may follow.
     null_signaled: bool,
+    /// Configured timeout reused for each resumed streaming operation.
+    timeout_sec: Option<u32>,
 }
 
 /// Active TDS connection to a SQL Server instance.
@@ -884,7 +886,7 @@ impl TdsClient {
         } = options;
         self.current_command_ce_setting = column_encryption;
 
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(crate::error::Error::UsageError(
                 ALREADY_EXECUTING_ERROR.to_string(),
             ));
@@ -941,7 +943,7 @@ impl TdsClient {
         } = options.into();
         self.current_command_ce_setting = column_encryption;
 
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
         if named_params.iter().any(RpcParameter::is_data_at_exec) {
@@ -999,10 +1001,10 @@ impl TdsClient {
     /// callers should continue using that method; this method is for
     /// [`RpcParameter::data_at_exec`] parameters.
     ///
-    /// Supported streamed types are `nvarchar(max)`, `varchar(max)`, and
-    /// `varbinary(max)`. Chunks are raw wire bytes: callers must encode
-    /// `nvarchar(max)` chunks as UTF-16LE, while `varchar(max)` and
-    /// `varbinary(max)` chunks use their corresponding single-byte/binary
+    /// Supported streamed types are listed by [`StreamedSqlType`]. Chunks are
+    /// raw wire bytes and are written verbatim, so the caller owns the encoding:
+    /// `nvarchar(max)` chunks must be UTF-16LE, and `varchar(max)`/
+    /// `varbinary(max)` chunks their corresponding single-byte/binary
     /// representation. A zero-length stream is a present empty value; use
     /// [`TdsClient::write_streamed_null`] for SQL `NULL`.
     ///
@@ -1012,8 +1014,9 @@ impl TdsClient {
     /// the final server result is returned as
     /// [`StreamedParamStatus::Complete`].
     ///
-    /// Streamed parameters must be named and must use one of the supported MAX
-    /// types. Streaming is not supported when Always Encrypted is active.
+    /// Streamed parameters must be named and must use one of the
+    /// [`StreamedSqlType`] variants. Streaming is not supported when Always
+    /// Encrypted is active.
     ///
     /// # Errors
     /// Returns a usage error for invalid streamed parameters or an active
@@ -1025,9 +1028,7 @@ impl TdsClient {
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<StreamedParamStatus> {
-        if self.execution_context.has_open_batch()
-            || !matches!(self.streamed_write_state, StreamedWriteState::Idle)
-        {
+        if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
 
@@ -1209,6 +1210,7 @@ impl TdsClient {
             db_collation: database_collation,
             value_opened: false,
             null_signaled: false,
+            timeout_sec,
         }));
 
         Ok(StreamedParamStatus::NeedData {
@@ -1232,6 +1234,11 @@ impl TdsClient {
     /// [`write_streamed_null`](Self::write_streamed_null), or if `chunk` is longer
     /// than [`u32::MAX`] bytes (the PLP chunk-length field is 32-bit).
     pub async fn write_streamed_chunk(&mut self, chunk: &[u8]) -> TdsResult<()> {
+        if matches!(self.streamed_write_state, StreamedWriteState::Idle) {
+            return Err(UsageError(
+                "write_streamed_chunk called with no active streamed parameter.".to_string(),
+            ));
+        }
         if chunk.is_empty() {
             return Ok(());
         }
@@ -1258,7 +1265,9 @@ impl TdsClient {
             db_collation,
             value_opened,
             null_signaled,
+            timeout_sec,
         } = *ctx;
+        self.remaining_request_timeout = timeout_sec.map(|s| Duration::from_secs(u64::from(s)));
 
         // A parameter already signalled NULL cannot carry data. Re-park the
         // (still-clean) message and reject; this is a caller sequencing error,
@@ -1271,6 +1280,7 @@ impl TdsClient {
                     db_collation,
                     value_opened,
                     null_signaled,
+                    timeout_sec,
                 }));
             return Err(UsageError(
                 "write_streamed_chunk called after the parameter was marked NULL.".to_string(),
@@ -1303,6 +1313,7 @@ impl TdsClient {
                         db_collation,
                         value_opened: true,
                         null_signaled: false,
+                        timeout_sec,
                     }));
                 Ok(())
             }
@@ -1364,7 +1375,8 @@ impl TdsClient {
             pending,
             db_collation,
             value_opened,
-            ..
+            null_signaled: _,
+            timeout_sec,
         } = *ctx;
 
         if value_opened {
@@ -1377,6 +1389,7 @@ impl TdsClient {
                     db_collation,
                     value_opened,
                     null_signaled: false,
+                    timeout_sec,
                 }));
             return Err(UsageError(
                 "write_streamed_null called after value chunks were already written.".to_string(),
@@ -1389,6 +1402,7 @@ impl TdsClient {
             db_collation,
             value_opened: false,
             null_signaled: true,
+            timeout_sec,
         }));
         Ok(())
     }
@@ -1427,7 +1441,9 @@ impl TdsClient {
             db_collation,
             value_opened,
             null_signaled,
+            timeout_sec,
         } = *ctx;
+        self.remaining_request_timeout = timeout_sec.map(|s| Duration::from_secs(u64::from(s)));
 
         let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
 
@@ -1483,6 +1499,7 @@ impl TdsClient {
                         // has not been marked NULL.
                         value_opened: false,
                         null_signaled: false,
+                        timeout_sec,
                     }));
                 Ok(StreamedParamStatus::NeedData {
                     param_name: next_name,
@@ -1560,7 +1577,7 @@ impl TdsClient {
     where
         R: BulkLoadRow,
     {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
 
@@ -1871,7 +1888,7 @@ impl TdsClient {
         let mut positional_parameters = positional_parameters;
         let mut named_parameters = named_parameters;
 
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(crate::error::Error::UsageError(
                 ALREADY_EXECUTING_ERROR.to_string(),
             ));
@@ -1998,7 +2015,7 @@ impl TdsClient {
         named_params: Vec<RpcParameter>,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementId> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
@@ -2178,7 +2195,7 @@ impl TdsClient {
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<()> {
         if !command_started {
-            if self.execution_context.has_open_batch() {
+            if self.command_is_busy() {
                 return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
             }
             self.begin_command();
@@ -2275,7 +2292,7 @@ impl TdsClient {
         orphaned: &mut Option<StatementId>,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
 
@@ -2348,7 +2365,7 @@ impl TdsClient {
         statement_id: StatementId,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
 
@@ -2434,7 +2451,7 @@ impl TdsClient {
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
         if !command_started {
-            if self.execution_context.has_open_batch() {
+            if self.command_is_busy() {
                 return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
             }
             self.begin_command();
@@ -2619,7 +2636,7 @@ impl TdsClient {
             ));
         };
         if !command_started {
-            if self.execution_context.has_open_batch() {
+            if self.command_is_busy() {
                 return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
             }
             self.begin_command();
@@ -3274,6 +3291,12 @@ impl TdsClient {
     /// positioning on a no-row statement result.
     pub fn has_open_batch(&self) -> bool {
         self.execution_context.has_open_batch()
+    }
+
+    /// Returns `true` when an open result batch or streamed write blocks a new command.
+    pub(in crate::connection) fn command_is_busy(&self) -> bool {
+        self.execution_context.has_open_batch()
+            || !matches!(self.streamed_write_state, StreamedWriteState::Idle)
     }
 
     /// Returns `true` when the client is currently positioned on a row-returning
@@ -4838,7 +4861,7 @@ impl TdsClient {
         isolation_level: TransactionIsolationLevel,
         name: Option<String>,
     ) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot begin transaction while another batch is executing.".to_string(),
             ));
@@ -4869,7 +4892,7 @@ impl TdsClient {
     /// [`rollback_transaction`](Self::rollback_transaction) to partially undo work.
     #[instrument(skip(self), level = "info")]
     pub async fn save_transaction(&mut self, name: String) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot save transaction while another batch is executing.".to_string(),
             ));
@@ -4898,7 +4921,7 @@ impl TdsClient {
         name: Option<String>,
         create_txn_params: Option<CreateTxnParams>,
     ) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot commit transaction while another batch is executing.".to_string(),
             ));
@@ -4930,7 +4953,7 @@ impl TdsClient {
         name: Option<String>,
         create_txn_params: Option<CreateTxnParams>,
     ) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot rollback transaction while another batch is executing.".to_string(),
             ));
@@ -4957,7 +4980,7 @@ impl TdsClient {
     /// Returns a result set that can be iterated with the normal row-reading API.
     #[instrument(skip(self), level = "info")]
     pub async fn get_dtc_address(&mut self) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot get DTC address while another batch is executing.".to_string(),
             ));
@@ -5340,6 +5363,7 @@ mod tests {
     use crate::io::token_stream::{
         ColumnPolicy, ParserContext, RowHeader, RowPauseState, RowReadResult, TdsTokenStreamReader,
     };
+    use crate::message::parameters::rpc_parameters::StreamedSqlType;
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes as client_over_bytes;
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes_with_column_encryption as client_over_bytes_with_ae;
     use crate::token::tokens::{
@@ -8520,12 +8544,11 @@ mod tests {
     /// varbinary keeps chunk bytes raw (no encoding), so tests can assert the
     /// exact wire bytes they streamed.
     fn streamed_varbinary(name: &str) -> RpcParameter {
-        RpcParameter::new(
+        RpcParameter::data_at_exec(
             Some(name.to_string()),
             StatusFlags::NONE,
-            SqlType::VarBinaryMax(None),
+            StreamedSqlType::VarBinaryMax,
         )
-        .data_at_exec()
     }
 
     /// A single streamed chunk is framed as `[u32 len][bytes]` and the value is
@@ -9052,28 +9075,15 @@ mod tests {
         assert!(matches!(err, UsageError(_)));
     }
 
-    /// A non-MAX data-at-execution parameter is rejected before any wire I/O, and
-    /// the client is left in the Idle state.
+    /// The streaming constructor only permits streamable MAX types.
     #[tokio::test]
-    async fn begin_rejects_non_max_data_at_exec_param() {
-        let mut client = create_test_client_with_tokens(vec![]);
-
-        let bad = RpcParameter::new(
+    async fn begin_only_accepts_streamable_types_via_data_at_exec_constructor() {
+        let param = RpcParameter::data_at_exec(
             Some("@n".to_string()),
             StatusFlags::NONE,
-            SqlType::Int(Some(1)),
-        )
-        .data_at_exec();
-
-        let err = client
-            .begin_sp_executesql("SELECT @n".to_string(), vec![bad], None, None)
-            .await
-            .expect_err("non-max data-at-exec parameter must be rejected");
-        assert!(matches!(err, UsageError(_)));
-        assert!(matches!(
-            client.streamed_write_state,
-            StreamedWriteState::Idle
-        ));
+            StreamedSqlType::NVarcharMax,
+        );
+        assert!(param.is_streamable_plp());
     }
 
     /// An unnamed data-at-execution parameter is rejected: streamed values must
@@ -9083,7 +9093,7 @@ mod tests {
         let mut client = create_test_client_with_tokens(vec![]);
 
         let bad =
-            RpcParameter::new(None, StatusFlags::NONE, SqlType::VarBinaryMax(None)).data_at_exec();
+            RpcParameter::data_at_exec(None, StatusFlags::NONE, StreamedSqlType::VarBinaryMax);
 
         let err = client
             .begin_sp_executesql(
@@ -9123,6 +9133,64 @@ mod tests {
         assert!(matches!(err, UsageError(_)));
     }
 
+    #[tokio::test]
+    async fn write_streamed_chunk_empty_while_idle_is_usage_error() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let err = client
+            .write_streamed_chunk(&[])
+            .await
+            .expect_err("empty chunk while Idle must be a usage error");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    #[tokio::test]
+    async fn normal_command_blocked_while_streamed_write_active() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let err = client
+            .execute_sp_executesql("SELECT 1".to_string(), vec![], ())
+            .await
+            .expect_err("normal command must be blocked while streaming");
+        assert!(matches!(err, UsageError(_)));
+        client.write_streamed_null().unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_streamed_chunk_resets_timeout_to_configured_budget() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                Some(30),
+                None,
+            )
+            .await
+            .unwrap();
+        client.remaining_request_timeout = Some(Duration::from_secs(1));
+        client.write_streamed_chunk(&[0x01]).await.unwrap();
+        assert_eq!(
+            client.remaining_request_timeout,
+            Some(Duration::from_secs(30))
+        );
+        client.remaining_request_timeout = Some(Duration::from_secs(1));
+        client.end_streamed_param().await.unwrap();
+    }
     /// Little-endian UTF-16 encoding of `s`, matching how parameter names are
     /// written on the wire (length-prefixed unicode).
     fn utf16le(s: &str) -> Vec<u8> {

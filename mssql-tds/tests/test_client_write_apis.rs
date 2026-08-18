@@ -17,7 +17,9 @@ mod streamed_plp_write {
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::datatypes::sqltypes::SqlType;
-    use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+    use mssql_tds::message::parameters::rpc_parameters::{
+        RpcParameter, StatusFlags, StreamedSqlType,
+    };
 
     /// Encodes a string to the UTF-16LE wire bytes an `nvarchar(max)` value uses.
     fn utf16le(text: &str) -> Vec<u8> {
@@ -46,12 +48,11 @@ mod streamed_plp_write {
         let value = "Z".repeat(20_000);
         let wire = utf16le(&value);
 
-        let streamed = RpcParameter::new(
+        let streamed = RpcParameter::data_at_exec(
             Some("@v".to_string()),
             StatusFlags::NONE,
-            SqlType::NVarcharMax(None),
-        )
-        .data_at_exec();
+            StreamedSqlType::NVarcharMax,
+        );
 
         let status = client
             .begin_sp_executesql(
@@ -126,12 +127,11 @@ mod streamed_plp_write {
                 StatusFlags::NONE,
                 SqlType::Int(Some(7)),
             ),
-            RpcParameter::new(
+            RpcParameter::data_at_exec(
                 Some("@v".to_string()),
                 StatusFlags::NONE,
-                SqlType::NVarcharMax(None),
-            )
-            .data_at_exec(),
+                StreamedSqlType::NVarcharMax,
+            ),
         ];
 
         let status = client
@@ -189,12 +189,11 @@ mod streamed_plp_write {
 
         let value: Vec<u8> = (0..30_000u32).map(|i| (i % 256) as u8).collect();
 
-        let streamed = RpcParameter::new(
+        let streamed = RpcParameter::data_at_exec(
             Some("@v".to_string()),
             StatusFlags::NONE,
-            SqlType::VarBinaryMax(None),
-        )
-        .data_at_exec();
+            StreamedSqlType::VarBinaryMax,
+        );
 
         let status = client
             .begin_sp_executesql(
@@ -254,18 +253,16 @@ mod streamed_plp_write {
         let b = "B".repeat(9_000);
 
         let params = vec![
-            RpcParameter::new(
+            RpcParameter::data_at_exec(
                 Some("@a".to_string()),
                 StatusFlags::NONE,
-                SqlType::NVarcharMax(None),
-            )
-            .data_at_exec(),
-            RpcParameter::new(
+                StreamedSqlType::NVarcharMax,
+            ),
+            RpcParameter::data_at_exec(
                 Some("@b".to_string()),
                 StatusFlags::NONE,
-                SqlType::NVarcharMax(None),
-            )
-            .data_at_exec(),
+                StreamedSqlType::NVarcharMax,
+            ),
         ];
 
         let status = client
@@ -353,23 +350,21 @@ mod streamed_plp_write {
         let a = "A".repeat(8_000);
         let b = "B".repeat(6_000);
         let params = vec![
-            RpcParameter::new(
+            RpcParameter::data_at_exec(
                 Some("@a".to_string()),
                 StatusFlags::NONE,
-                SqlType::NVarcharMax(None),
-            )
-            .data_at_exec(),
+                StreamedSqlType::NVarcharMax,
+            ),
             RpcParameter::new(
                 Some("@id".to_string()),
                 StatusFlags::NONE,
                 SqlType::Int(Some(42)),
             ),
-            RpcParameter::new(
+            RpcParameter::data_at_exec(
                 Some("@b".to_string()),
                 StatusFlags::NONE,
-                SqlType::NVarcharMax(None),
-            )
-            .data_at_exec(),
+                StreamedSqlType::NVarcharMax,
+            ),
         ];
 
         let status = client
@@ -448,12 +443,11 @@ mod streamed_plp_write {
             // bytes equal the value's UTF-8 bytes, so stream them directly.
             let value = format!("row-{id}-").repeat(3_000);
 
-            let streamed = RpcParameter::new(
+            let streamed = RpcParameter::data_at_exec(
                 Some("@v".to_string()),
                 StatusFlags::NONE,
-                SqlType::VarcharMax(None),
-            )
-            .data_at_exec();
+                StreamedSqlType::VarcharMax,
+            );
 
             let status = client
                 .begin_sp_executesql(
@@ -598,12 +592,11 @@ mod streamed_plp_write {
             .await?;
         client.close_query().await?;
 
-        let streamed = RpcParameter::new(
+        let streamed = RpcParameter::data_at_exec(
             Some("@v".to_string()),
             StatusFlags::NONE,
-            SqlType::NVarcharMax(None),
-        )
-        .data_at_exec();
+            StreamedSqlType::NVarcharMax,
+        );
 
         let status = client
             .begin_sp_executesql(
@@ -655,12 +648,11 @@ mod streamed_plp_write {
             .await?;
         client.close_query().await?;
 
-        let streamed = RpcParameter::new(
+        let streamed = RpcParameter::data_at_exec(
             Some("@v".to_string()),
             StatusFlags::NONE,
-            SqlType::NVarcharMax(None),
-        )
-        .data_at_exec();
+            StreamedSqlType::NVarcharMax,
+        );
 
         let status = client
             .begin_sp_executesql(
@@ -717,12 +709,11 @@ mod streamed_plp_write {
         let value = "abcd".repeat(2_000); // 8000 chars
         let wire = utf16le(&value);
 
-        let streamed = RpcParameter::new(
+        let streamed = RpcParameter::data_at_exec(
             Some("@v".to_string()),
             StatusFlags::NONE,
-            SqlType::NVarcharMax(None),
-        )
-        .data_at_exec();
+            StreamedSqlType::NVarcharMax,
+        );
 
         let status = client
             .begin_sp_executesql(
@@ -782,12 +773,11 @@ mod streamed_plp_write {
         client.close_query().await?;
 
         let value: Vec<u8> = (0..5_000u32).map(|i| (i % 256) as u8).collect();
-        let streamed = RpcParameter::new(
+        let streamed = RpcParameter::data_at_exec(
             Some("@v".to_string()),
             StatusFlags::NONE,
-            SqlType::VarBinaryMax(None),
-        )
-        .data_at_exec();
+            StreamedSqlType::VarBinaryMax,
+        );
 
         let status = client
             .begin_sp_executesql(
