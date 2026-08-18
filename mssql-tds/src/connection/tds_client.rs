@@ -5799,8 +5799,9 @@ mod tests {
     fn create_failing_capturing_client(
         tokens: Vec<Tokens>,
     ) -> (TdsClient, std::sync::Arc<std::sync::atomic::AtomicBool>) {
-        let transport = Box::new(TestTransport::with_tokens(tokens));
+        let transport = TestTransport::with_tokens(tokens);
         let fail = std::sync::Arc::clone(&transport.send_should_fail);
+        let transport = AnyTransport::dynamic(transport);
         let negotiated_settings =
             crate::handler::handler_factory::create_test_negotiated_settings_internal();
         let execution_context = crate::connection::execution_context::ExecutionContext::new();
