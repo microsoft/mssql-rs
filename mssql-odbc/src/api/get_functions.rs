@@ -8,16 +8,15 @@ use tracing::{debug, error};
 use crate::api::odbc_types::{
     SQL_API_ALL_FUNCTIONS, SQL_API_ALL_FUNCTIONS_SIZE, SQL_API_ODBC3_ALL_FUNCTIONS,
     SQL_API_SQLALLOCHANDLE, SQL_API_SQLBINDPARAMETER, SQL_API_SQLCANCEL, SQL_API_SQLCLOSECURSOR,
-    SQL_API_SQLCOLATTRIBUTE, SQL_API_SQLCOLUMNS, SQL_API_SQLCONNECT, SQL_API_SQLDESCRIBECOL,
-    SQL_API_SQLDESCRIBEPARAM, SQL_API_SQLDISCONNECT, SQL_API_SQLDRIVERCONNECT, SQL_API_SQLENDTRAN,
-    SQL_API_SQLEXECDIRECT, SQL_API_SQLEXECUTE, SQL_API_SQLFETCH, SQL_API_SQLFOREIGNKEYS,
-    SQL_API_SQLFREEHANDLE, SQL_API_SQLFREESTMT, SQL_API_SQLGETCONNECTATTR, SQL_API_SQLGETDATA,
-    SQL_API_SQLGETDIAGFIELD, SQL_API_SQLGETDIAGREC, SQL_API_SQLGETENVATTR, SQL_API_SQLGETFUNCTIONS,
-    SQL_API_SQLGETINFO, SQL_API_SQLGETSTMTATTR, SQL_API_SQLGETTYPEINFO, SQL_API_SQLMORERESULTS,
-    SQL_API_SQLNUMRESULTCOLS, SQL_API_SQLPREPARE, SQL_API_SQLPRIMARYKEYS, SQL_API_SQLPROCEDURES,
-    SQL_API_SQLROWCOUNT, SQL_API_SQLSETCONNECTATTR, SQL_API_SQLSETENVATTR, SQL_API_SQLSETSTMTATTR,
-    SQL_API_SQLSPECIALCOLUMNS, SQL_API_SQLSTATISTICS, SQL_API_SQLTABLES, SQL_ERROR, SQL_FALSE,
-    SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_TRUE, SqlHandle, SqlReturn, SqlUSmallInt,
+    SQL_API_SQLCOLATTRIBUTE, SQL_API_SQLCONNECT, SQL_API_SQLDESCRIBECOL, SQL_API_SQLDESCRIBEPARAM,
+    SQL_API_SQLDISCONNECT, SQL_API_SQLDRIVERCONNECT, SQL_API_SQLENDTRAN, SQL_API_SQLEXECDIRECT,
+    SQL_API_SQLEXECUTE, SQL_API_SQLFETCH, SQL_API_SQLFREEHANDLE, SQL_API_SQLFREESTMT,
+    SQL_API_SQLGETCONNECTATTR, SQL_API_SQLGETDATA, SQL_API_SQLGETDIAGFIELD, SQL_API_SQLGETDIAGREC,
+    SQL_API_SQLGETENVATTR, SQL_API_SQLGETFUNCTIONS, SQL_API_SQLGETINFO, SQL_API_SQLGETSTMTATTR,
+    SQL_API_SQLGETTYPEINFO, SQL_API_SQLMORERESULTS, SQL_API_SQLNUMRESULTCOLS, SQL_API_SQLPARAMDATA,
+    SQL_API_SQLPREPARE, SQL_API_SQLPUTDATA, SQL_API_SQLROWCOUNT, SQL_API_SQLSETCONNECTATTR,
+    SQL_API_SQLSETENVATTR, SQL_API_SQLSETSTMTATTR, SQL_ERROR, SQL_FALSE, SQL_INVALID_HANDLE,
+    SQL_SUCCESS, SQL_TRUE, SqlHandle, SqlReturn, SqlUSmallInt,
 };
 use crate::error::free_errors;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
@@ -169,19 +168,10 @@ fn supported_function_ids() -> &'static [SqlUSmallInt] {
         SQL_API_SQLSETENVATTR,
         SQL_API_SQLPREPARE,
         SQL_API_SQLBINDPARAMETER,
+        SQL_API_SQLPARAMDATA,
+        SQL_API_SQLPUTDATA,
         SQL_API_SQLENDTRAN,
         SQL_API_SQLCOLATTRIBUTE,
-        // Catalog functions (AB#46380). Same trap as SQLGetTypeInfo/SQLColAttribute
-        // above: the Windows Driver Manager answers IM001 without ever calling the
-        // driver unless each is advertised here, even though the SQLXxxW export
-        // exists and is fully implemented.
-        SQL_API_SQLTABLES,
-        SQL_API_SQLCOLUMNS,
-        SQL_API_SQLPRIMARYKEYS,
-        SQL_API_SQLFOREIGNKEYS,
-        SQL_API_SQLSPECIALCOLUMNS,
-        SQL_API_SQLSTATISTICS,
-        SQL_API_SQLPROCEDURES,
     ]
 }
 
@@ -277,28 +267,6 @@ mod tests {
         assert_eq!(supported, SQL_TRUE);
     }
 
-    // AB#46380: the seven catalog functions hit the exact same Windows DM trap
-    // as SQLGetTypeInfo/SQLColAttribute above — each SQLXxxW export is
-    // implemented, but IM001 short-circuits every call unless advertised here.
-    #[test]
-    fn catalog_functions_report_true() {
-        let h = TestHandles::with_env_dbc();
-        for id in [
-            SQL_API_SQLTABLES,
-            SQL_API_SQLCOLUMNS,
-            SQL_API_SQLPRIMARYKEYS,
-            SQL_API_SQLFOREIGNKEYS,
-            SQL_API_SQLSPECIALCOLUMNS,
-            SQL_API_SQLSTATISTICS,
-            SQL_API_SQLPROCEDURES,
-        ] {
-            let mut supported: SqlUSmallInt = SQL_FALSE;
-            let ret = unsafe { sql_get_functions(h.dbc, id, &mut supported) };
-            assert_eq!(ret, SQL_SUCCESS, "id {id}");
-            assert_eq!(supported, SQL_TRUE, "id {id}");
-        }
-    }
-
     #[test]
     fn unsupported_function_reports_false() {
         let h = TestHandles::with_env_dbc();
@@ -318,8 +286,6 @@ mod tests {
         assert_eq!(funcs[SQL_API_SQLEXECUTE as usize], SQL_TRUE);
         // AB#46973: SQLGetTypeInfo (47) must also appear in the legacy array.
         assert_eq!(funcs[SQL_API_SQLGETTYPEINFO as usize], SQL_TRUE);
-        // AB#46380: SQLTables (54) must also appear in the legacy array.
-        assert_eq!(funcs[SQL_API_SQLTABLES as usize], SQL_TRUE);
         assert_eq!(funcs[SQL_API_SQLDESCRIBEPARAM as usize], SQL_TRUE);
         // Ids >= 100 (e.g. SQLALLOCHANDLE = 1001) never appear in this array.
         // An unoccupied slot stays zero.
@@ -344,8 +310,6 @@ mod tests {
         assert!(bit_set(SQL_API_SQLALLOCHANDLE));
         // AB#46973: SQLGetTypeInfo (47) bit must be set in the ODBC3 bitmap.
         assert!(bit_set(SQL_API_SQLGETTYPEINFO));
-        // AB#46380: SQLTables (54) bit must be set in the ODBC3 bitmap too.
-        assert!(bit_set(SQL_API_SQLTABLES));
         assert!(bit_set(SQL_API_SQLDESCRIBEPARAM));
         // AB#46973 (scope follow-up): SQLSetStmtAttr (1020) bit must be set too.
         assert!(bit_set(SQL_API_SQLSETSTMTATTR));

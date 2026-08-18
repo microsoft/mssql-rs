@@ -112,6 +112,45 @@ TEST_F(PrepareExecuteLiveTest, SingleCharParam) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// Data-at-execution values are sent through SQLParamData / SQLPutData while
+// ordinary bound values retain their positions before and after the streamed
+// marker.
+TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
+    ASSERT_SQL_OK(Prepare("SELECT ? + ? + ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    std::vector<SQLCHAR> first = {'a', '\0'};
+    std::vector<SQLCHAR> last = {'d', '\0'};
+    SQLLEN first_ind = SQL_NTS;
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLLEN last_ind = SQL_NTS;
+    SQLCHAR streamed_token = 0;
+
+    ASSERT_SQL_OK(BindChar(1, first, first_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindChar(3, last, last_ind), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&streamed_token, value_ptr);
+
+    const char first_chunk[] = "b";
+    const char second_chunk[] = "c";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(first_chunk), 1),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(second_chunk), 1),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("abcd", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // A wide-character parameter binds as nvarchar and round-trips.
 TEST_F(PrepareExecuteLiveTest, WideCharParam) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);

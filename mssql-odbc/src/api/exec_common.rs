@@ -16,8 +16,13 @@ use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::sqlstate::*;
-use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn};
-use crate::conversion::param_convert::{ParamBuildError, bound_param_to_rpc};
+use crate::api::odbc_types::{
+    SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SqlHandle, SqlLen, SqlReturn,
+};
+use crate::conversion::param_convert::{
+    ParamBuildError, bound_param_to_rpc, dae_placeholder_type, is_data_at_exec_indicator,
+};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
@@ -221,6 +226,113 @@ pub(super) unsafe fn build_named_params(
         }
     }
     Ok(named_params)
+}
+
+/// Result of [`build_params_with_dae`]: the full RPC parameter list (with
+/// data-at-execution placeholders) and the 0-based indices of those parameters.
+pub(super) struct ParamsWithDae {
+    /// All `@P1..@Pn` parameters in original order.  DAE entries carry a
+    /// `data_at_exec()` flag and a `None` value; their data arrives later via
+    /// `SQLPutData`.
+    pub(super) params: Vec<RpcParameter>,
+    /// 0-based indices (into `params`) of every DAE entry.
+    pub(super) dae_indices: Vec<usize>,
+    /// Expected byte counts from `SQL_LEN_DATA_AT_EXEC(n)`, parallel to
+    /// `dae_indices`; `None` means `SQL_DATA_AT_EXEC`.
+    pub(super) dae_expected_lengths: Vec<Option<usize>>,
+}
+
+fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
+    if indicator == SQL_DATA_AT_EXEC {
+        None
+    } else {
+        Some((SQL_LEN_DATA_AT_EXEC_OFFSET - indicator) as usize)
+    }
+}
+
+/// Variant of [`build_named_params`] that recognises data-at-execution
+/// indicators and returns them as streaming-placeholder parameters instead of
+/// converting the value buffer eagerly.
+///
+/// Parameters with `SQL_DATA_AT_EXEC` or `SQL_LEN_DATA_AT_EXEC(n)` indicators
+/// are recorded in [`ParamsWithDae::dae_indices`]; all others are converted
+/// immediately.  Returns `Err(SQL_ERROR)` for unbound markers or unsupported
+/// types.
+///
+/// # Safety
+/// Same contract as [`build_named_params`].
+pub(super) unsafe fn build_params_with_dae(
+    stmt_state: &mut StmtState,
+    marker_count: usize,
+    op: &str,
+) -> Result<ParamsWithDae, SqlReturn> {
+    use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+
+    let mut params = Vec::with_capacity(marker_count);
+    let mut dae_indices = Vec::new();
+    let mut dae_expected_lengths = Vec::new();
+
+    for i in 0..marker_count {
+        let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
+            error!("{op}: parameter {} has no bound value", i + 1);
+            post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
+            return Err(SQL_ERROR);
+        };
+
+        let name = format!("@P{}", i + 1);
+
+        // Check for a data-at-execution indicator before dereferencing the
+        // value buffer: DAE params carry no value at bind time.
+        let dae_indicator = if !bound_param.strlen_or_ind_ptr.is_null() {
+            let ind = unsafe { *bound_param.strlen_or_ind_ptr };
+            is_data_at_exec_indicator(ind).then_some(ind)
+        } else {
+            None
+        };
+
+        if let Some(indicator) = dae_indicator {
+            let placeholder_type = match dae_placeholder_type(bound_param.c_type) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(
+                        "{op}: parameter {} DAE type not streamable: {}",
+                        i + 1,
+                        e.diag().text
+                    );
+                    post_diag(stmt_state, e.diag());
+                    return Err(SQL_ERROR);
+                }
+            };
+            let rpc = RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, placeholder_type);
+            dae_indices.push(i);
+            dae_expected_lengths.push(dae_expected_length(indicator));
+            params.push(rpc);
+        } else {
+            match unsafe { bound_param_to_rpc(name, bound_param) } {
+                Ok(param) => params.push(param),
+                Err(ParamBuildError::InvalidLength(len)) => {
+                    error!("{op}: parameter {} has invalid StrLen_or_Ind {len}", i + 1);
+                    post_diag(stmt_state, ParamBuildError::InvalidLength(len).diag());
+                    return Err(SQL_ERROR);
+                }
+                Err(e) => {
+                    error!(
+                        "{op}: parameter {} conversion failed: {}",
+                        i + 1,
+                        e.diag().text
+                    );
+                    post_diag(stmt_state, e.diag());
+                    return Err(SQL_ERROR);
+                }
+            }
+        }
+    }
+
+    Ok(ParamsWithDae {
+        params,
+        dae_indices,
+        dae_expected_lengths,
+    })
 }
 
 /// Captures result metadata after a successful execution and finalizes the

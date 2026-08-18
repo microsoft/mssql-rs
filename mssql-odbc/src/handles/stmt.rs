@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use tracing::error;
 
-use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
+use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClient};
 
 use super::desc::{DescHandle, DescKind};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
@@ -38,6 +38,10 @@ pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
 pub(crate) const STMT_STATE_PREPARED: u32 = 0x0000_0200;
 pub(crate) const STMT_STATE_CURSOR_OPEN: u32 = 0x0000_0800;
 pub(crate) const STMT_STATE_EXEC_CONTEXT: u32 = 0x0000_1000;
+/// Set while the statement is suspended waiting for application calls to
+/// `SQLPutData` / `SQLParamData` to supply data-at-execution parameter values.
+/// Cleared once the final `SQLParamData` completes the execution or on error.
+pub(crate) const STMT_STATE_NEED_DATA: u32 = 0x0000_4000;
 
 /// Statement handle
 ///
@@ -143,6 +147,35 @@ pub(crate) struct StmtState {
     pub(crate) row_bind_type: SqlULen,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
+
+    // ── Data-at-execution (DAE) streaming fields ──────────────────────────
+    // These are only populated while STMT_STATE_NEED_DATA is set.  Cleared
+    // atomically when the DAE sequence completes or is aborted.
+    /// The TDS client held between `SQLExecute` (which returned SQL_NEED_DATA)
+    /// and the final `SQLParamData` call that finishes the streaming RPC.  The
+    /// DBC's `client` field is `None` for the duration; `active_stmt` stays set
+    /// to prevent concurrent access.
+    pub(crate) dae_client: Option<TdsClient>,
+    /// The prepared plan stashed during the DAE sequence; written back to
+    /// `prepared` when execution completes.
+    pub(crate) dae_prepared: Option<PreparedPlan>,
+    /// Orphaned server handle to be released at next-execute time, stashed
+    /// identically to the non-DAE path.
+    pub(crate) dae_orphaned: Option<StatementId>,
+    /// 0-based indices (into `bound_params`) of the parameters that carry a
+    /// data-at-execution indicator, in their original parameter order.  The
+    /// indices control both the `SQLParamData` pointer returned to the
+    /// application and the cursor within the TDS streaming protocol.
+    pub(crate) dae_param_indices: Vec<usize>,
+    /// Which element of `dae_param_indices` the driver is currently streaming.
+    /// Incremented by `SQLParamData` each time `end_streamed_param` returns
+    /// `NeedData` for the next parameter.
+    pub(crate) dae_current_idx: usize,
+    /// `true` immediately after `SQLExecute` returns `SQL_NEED_DATA` and
+    /// before the first `SQLParamData` call.  The first `SQLParamData` just
+    /// delivers the current parameter's `ParameterValuePtr` without calling
+    /// `end_streamed_param`; subsequent calls advance the cursor.
+    pub(crate) dae_param_data_first: bool,
 }
 
 /// A prepared statement bundled with the marker count of its rewritten SQL, so
@@ -224,6 +257,18 @@ impl StmtState {
             );
         }
     }
+    /// Resets all data-at-execution streaming state. Call after a DAE sequence
+    /// completes (success or error). The caller is responsible for returning
+    /// `dae_client` to the DBC before calling this.
+    pub(crate) fn reset_dae(&mut self) {
+        self.dae_client = None;
+        self.dae_prepared = None;
+        self.dae_orphaned = None;
+        self.dae_param_indices.clear();
+        self.dae_current_idx = 0;
+        self.dae_param_data_first = false;
+        self.clear_state(STMT_STATE_NEED_DATA);
+    }
 }
 
 impl HasDiagnostics for StmtState {
@@ -272,6 +317,12 @@ impl StmtHandle {
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
                 state_flags: 0,
+                dae_client: None,
+                dae_prepared: None,
+                dae_orphaned: None,
+                dae_param_indices: Vec::new(),
+                dae_current_idx: 0,
+                dae_param_data_first: false,
             }),
         }
     }

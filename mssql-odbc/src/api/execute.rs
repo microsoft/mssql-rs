@@ -6,16 +6,21 @@
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::{ExecuteOptions, StatementId, StatementResult};
+use mssql_tds::connection::tds_client::{
+    ExecuteOptions, StatementId, StatementResult, StreamedParamStatus,
+};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
-use super::exec_common::{build_named_params, claim_connection, fail_with_tds, finish_execute};
+use super::exec_common::{
+    ParamsWithDae, build_params_with_dae, claim_connection, fail_with_tds, finish_execute,
+};
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
-use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
+use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_NEED_DATA, SqlHandle, SqlReturn};
 use crate::error::free_errors;
 use crate::handles::stmt::{
     PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+    STMT_STATE_NEED_DATA,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -55,94 +60,168 @@ struct Execution {
     orphaned: Option<StatementId>,
 }
 
+/// Values gathered when at least one bound parameter carries a data-at-execution
+/// indicator and the statement will be streamed via `begin_sp_executesql`.
+struct DaeExecution {
+    /// Full parameter list in original order; DAE entries have `data_at_exec()`
+    /// set and carry a `None` value.
+    params: Vec<RpcParameter>,
+    /// 0-based indices (into `params`) of the DAE parameters, in order.
+    dae_indices: Vec<usize>,
+    prepared: PreparedPlan,
+    orphaned: Option<StatementId>,
+}
+
+enum ExecutionStaging {
+    Ready(Execution),
+    NeedData(DaeExecution),
+}
+
 fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
-    let Execution {
-        named_params,
-        mut prepared,
-        mut orphaned,
-    } = match stage_execution(stmt) {
-        Ok(exec) => exec,
+    let staging = match stage_execution(stmt) {
+        Ok(s) => s,
         Err(rc) => return rc,
     };
 
-    let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
-        Ok(client) => client,
-        Err(rc) => {
-            // Staging moved the prepared statement (and any pending orphan) out;
-            // a failed connection claim runs nothing, so put them back so the
-            // statement stays prepared and re-executable. `claim_connection`
-            // already cleared `EXEC_STARTED`.
+    match staging {
+        ExecutionStaging::Ready(Execution {
+            named_params,
+            mut prepared,
+            mut orphaned,
+        }) => {
+            let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
+                Ok(client) => client,
+                Err(rc) => {
+                    if let Ok(mut stmt_state) = stmt.inner.lock() {
+                        stmt_state.prepared = Some(prepared);
+                        stmt_state.pending_unprepare = orphaned;
+                    }
+                    return rc;
+                }
+            };
+
+            if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecute") {
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    stmt_state.prepared = Some(prepared);
+                    stmt_state.pending_unprepare = orphaned;
+                }
+                return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+            }
+
+            let exec_result = dbc.runtime.block_on(client.execute_prepared(
+                &mut prepared.stmt,
+                named_params,
+                &mut orphaned,
+                ExecuteOptions::default(),
+            ));
+
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.prepared = Some(prepared);
                 stmt_state.pending_unprepare = orphaned;
             }
-            return rc;
+
+            let stmt_result = match exec_result {
+                Ok(result) => result,
+                Err(e) => {
+                    error!(%e, "SQLExecute: prepared execution failed");
+                    return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+                }
+            };
+
+            if !matches!(stmt_result, StatementResult::Rows)
+                && let Err(e) = dbc.runtime.block_on(client.advance_to_rows())
+            {
+                error!(%e, "SQLExecute: draining no-row prepared result failed");
+                return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+            }
+
+            finish_execute(dbc, stmt, statement_handle, client, "SQLExecute")
         }
-    };
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecute") {
-        // Nothing ran, so put the staged statement (and any pending orphan)
-        // back before reporting, exactly as the failed-claim path does.
-        if let Ok(mut stmt_state) = stmt.inner.lock() {
-            stmt_state.prepared = Some(prepared);
-            stmt_state.pending_unprepare = orphaned;
+        ExecutionStaging::NeedData(DaeExecution {
+            params,
+            dae_indices,
+            prepared,
+            orphaned,
+        }) => {
+            let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
+                Ok(client) => client,
+                Err(rc) => {
+                    if let Ok(mut stmt_state) = stmt.inner.lock() {
+                        stmt_state.prepared = Some(prepared);
+                        stmt_state.pending_unprepare = orphaned;
+                    }
+                    return rc;
+                }
+            };
+
+            if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecute") {
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    stmt_state.prepared = Some(prepared);
+                    stmt_state.pending_unprepare = orphaned;
+                }
+                return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+            }
+
+            // Use the prepared SQL text with ad-hoc sp_executesql (no caching)
+            // since the streaming API doesn't go through sp_prepexec.
+            let sql = prepared.stmt.sql().to_string();
+            let begin_result = dbc
+                .runtime
+                .block_on(client.begin_sp_executesql(sql, params, None, None));
+
+            match begin_result {
+                Ok(StreamedParamStatus::Complete(result)) => {
+                    // All params happened to be materialized (shouldn't happen
+                    // because staging only produces NeedData when dae_indices is
+                    // non-empty, but handle it defensively).
+                    if let Ok(mut stmt_state) = stmt.inner.lock() {
+                        stmt_state.prepared = Some(prepared);
+                        stmt_state.pending_unprepare = orphaned;
+                    }
+                    let _ = result; // result handled by finish_execute below
+                    finish_execute(dbc, stmt, statement_handle, client, "SQLExecute")
+                }
+                Ok(StreamedParamStatus::NeedData { .. }) => {
+                    // Park the client in the statement for SQLParamData/SQLPutData.
+                    // The DBC keeps active_stmt set (connection appears busy).
+                    let mut stored = false;
+                    if let Ok(mut stmt_state) = stmt.inner.lock() {
+                        stmt_state.dae_client = Some(client);
+                        stmt_state.dae_prepared = Some(prepared);
+                        stmt_state.dae_orphaned = orphaned;
+                        stmt_state.dae_param_indices = dae_indices;
+                        stmt_state.dae_current_idx = 0;
+                        stmt_state.dae_param_data_first = true;
+                        stmt_state.set_state(STMT_STATE_NEED_DATA);
+                        stored = true;
+                    }
+                    if !stored {
+                        error!("SQLExecute: stmt mutex poisoned while parking DAE client");
+                        // client is already consumed into stmt_state attempt; can't recover cleanly
+                        return SQL_ERROR;
+                    }
+                    SQL_NEED_DATA
+                }
+                Err(e) => {
+                    error!(%e, "SQLExecute: begin_sp_executesql failed");
+                    if let Ok(mut stmt_state) = stmt.inner.lock() {
+                        stmt_state.prepared = Some(prepared);
+                        stmt_state.pending_unprepare = orphaned;
+                    }
+                    fail_with_tds(dbc, stmt, statement_handle, client, &e)
+                }
+            }
         }
-        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
-
-    // `execute_prepared` owns the whole recovery sequence: reconnect once up
-    // front (mirrors msodbcsql `GetBatchCtxOrRecover`), charge it against the
-    // command timeout, then reuse the cached handle or transparently re-prepare
-    // when it belongs to a superseded session (msodbcsql `FIsReprepareRequired`).
-    // A still-live orphaned handle is released by piggyback on the re-prepare.
-    //
-    // Command timeout (SQL_ATTR_QUERY_TIMEOUT) isn't wired up yet; the default
-    // `ExecuteOptions` means no per-command limit.
-    let exec_result = dbc.runtime.block_on(client.execute_prepared(
-        &mut prepared.stmt,
-        named_params,
-        &mut orphaned,
-        ExecuteOptions::default(),
-    ));
-
-    // Write the statement back along with any orphan that was not consumed
-    // because execution failed before the prepexec send boundary. The fresh
-    // handle's RETURNVALUE arrives after the result set and is captured later.
-    if let Ok(mut stmt_state) = stmt.inner.lock() {
-        stmt_state.prepared = Some(prepared);
-        stmt_state.pending_unprepare = orphaned;
-    }
-
-    let stmt_result = match exec_result {
-        Ok(result) => result,
-        Err(e) => {
-            error!(%e, "SQLExecute: prepared execution failed");
-            return fail_with_tds(dbc, stmt, statement_handle, client, &e);
-        }
-    };
-
-    // A prepared statement runs a single SQL statement. If it produced no result
-    // set (DML / no-row), drain its trailing tokens so the statement is left idle
-    // and immediately re-executable (msodbcsql parity) instead of leaving a
-    // 0-column cursor open. A row-returning statement keeps its cursor open for
-    // SQLFetch; its `@handle` RETURNVALUE (sp_prepexec) is captured later at
-    // drain time (SQLCloseCursor / the DDL finish path).
-    if !matches!(stmt_result, StatementResult::Rows)
-        && let Err(e) = dbc.runtime.block_on(client.advance_to_rows())
-    {
-        error!(%e, "SQLExecute: draining no-row prepared result failed");
-        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
-    }
-
-    finish_execute(dbc, stmt, statement_handle, client, "SQLExecute")
 }
 
 /// Validates statement state and builds the parameter list under the STMT lock,
 /// setting `EXEC_STARTED` on success. Application value buffers are read here by
 /// reference (no network I/O).
-fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
+fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLExecute: stmt mutex poisoned");
         return Err(SQL_ERROR);
@@ -173,10 +252,14 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
         .as_ref()
         .expect("prepared checked non-None above")
         .marker_count;
-    let named_params = unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
 
-    // All fallible validation passed: move the prepared plan out (written
-    // back after the execute) and take any orphaned handle for piggyback drop.
+    // Scan for data-at-execution parameters.  If any are present, use the
+    // streaming path; otherwise, go through the normal prepared-execute path.
+    let ParamsWithDae {
+        params,
+        dae_indices,
+    } = unsafe { build_params_with_dae(&mut stmt_state, marker_count, "SQLExecute") }?;
+
     let prepared = stmt_state
         .prepared
         .take()
@@ -189,18 +272,30 @@ fn stage_execution(stmt: &StmtHandle) -> Result<Execution, SqlReturn> {
     stmt_state.pending_row_counts.clear();
     stmt_state.set_state(STMT_STATE_EXEC_STARTED);
 
-    Ok(Execution {
-        named_params,
-        prepared,
-        orphaned,
-    })
+    if dae_indices.is_empty() {
+        Ok(ExecutionStaging::Ready(Execution {
+            named_params: params,
+            prepared,
+            orphaned,
+        }))
+    } else {
+        Ok(ExecutionStaging::NeedData(DaeExecution {
+            params,
+            dae_indices,
+            prepared,
+            orphaned,
+        }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::api::odbc_types::{
+        SQL_C_CHAR, SQL_DATA_AT_EXEC, SQL_NULL_HANDLE, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen,
+    };
     use crate::api::util::rewrite_param_markers;
+    use crate::params::BoundParam;
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 
@@ -269,18 +364,14 @@ mod tests {
     }
 
     #[test]
-    fn data_at_exec_parameter_returns_hyc00() {
-        use crate::api::odbc_types::{
-            SQL_C_CHAR, SQL_DATA_AT_EXEC, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen,
-        };
-        use crate::params::BoundParam;
-
+    fn data_at_exec_disconnected_returns_connection_error() {
+        // A DAE parameter is now supported: staging succeeds (produces
+        // NeedData staging), connection is claimed, but the DBC is
+        // disconnected so claim_connection fails with 08003.
         let h = TestHandles::with_env_dbc_stmt();
         set_prepared(h.stmt, "SELECT ?");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
-        // Bind passes (SQL_C_CHAR → SQL_VARCHAR), but the data-at-execution
-        // indicator is only seen at execute time and is unsupported in Phase 1.
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
         stmt.inner
             .lock()
@@ -301,8 +392,14 @@ mod tests {
         let ret = unsafe { sql_execute(h.stmt) };
         assert_eq!(ret, SQL_ERROR);
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+        // Connection is not connected → 08003, not HYC00.
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_CONNECTION_DOES_NOT_EXIST.state
+        );
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+        // The prepared plan must be restored so SQLExecute remains retryable.
+        assert!(state.prepared.is_some());
     }
 
     #[test]
@@ -317,9 +414,13 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().pending_unprepare = Some(orphan);
 
-        let exec = stage_execution(stmt).expect("staging should succeed");
-        assert_eq!(exec.orphaned, Some(orphan));
-        assert_eq!(exec.prepared.stmt.sql(), "SELECT 1");
+        let staging = stage_execution(stmt).expect("staging should succeed");
+        let (exec_prepared_sql, exec_orphaned) = match staging {
+            ExecutionStaging::Ready(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
+            ExecutionStaging::NeedData(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
+        };
+        assert_eq!(exec_orphaned, Some(orphan));
+        assert_eq!(exec_prepared_sql, "SELECT 1");
 
         let state = stmt.inner.lock().unwrap();
         assert!(state.prepared.is_none(), "prepared moved out of state");
@@ -329,15 +430,17 @@ mod tests {
 
     #[test]
     fn stage_execution_without_pending_has_no_orphaned_handle() {
-        // Nothing pending: staging threads no orphan, so the execute won't
-        // piggyback a drop.
         let h = TestHandles::with_env_dbc_stmt();
         set_prepared(h.stmt, "SELECT 1");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
-        let exec = stage_execution(stmt).expect("staging should succeed");
-        assert_eq!(exec.orphaned, None);
-        assert_eq!(exec.prepared.stmt.sql(), "SELECT 1");
+        let staging = stage_execution(stmt).expect("staging should succeed");
+        let (exec_prepared_sql, exec_orphaned) = match staging {
+            ExecutionStaging::Ready(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
+            ExecutionStaging::NeedData(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
+        };
+        assert_eq!(exec_orphaned, None);
+        assert_eq!(exec_prepared_sql, "SELECT 1");
         assert!(stmt.inner.lock().unwrap().prepared.is_none());
     }
 
@@ -373,5 +476,40 @@ mod tests {
             "the pending orphan must be restored so its drop is not lost"
         );
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    #[test]
+    fn dae_param_staging_produces_need_data_variant() {
+        // A bound parameter with SQL_DATA_AT_EXEC indicator must produce
+        // NeedData staging, not the Ready variant.
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut ind: SqlLen = SQL_DATA_AT_EXEC;
+        stmt.inner
+            .lock()
+            .unwrap()
+            .bound_params
+            .push(Some(BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR,
+                column_size: 0,
+                decimal_digits: 0,
+                parameter_value_ptr: std::ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+            }));
+
+        let staging = stage_execution(stmt).expect("staging should succeed");
+        match staging {
+            ExecutionStaging::NeedData(dae) => {
+                // The single param is DAE: its index is in dae_indices.
+                assert_eq!(dae.dae_indices, vec![0]);
+                assert_eq!(dae.params.len(), 1, "one param in list");
+            }
+            ExecutionStaging::Ready(_) => panic!("expected NeedData staging for DAE param"),
+        }
     }
 }

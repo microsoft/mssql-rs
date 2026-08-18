@@ -20,11 +20,13 @@ use std::slice;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
-use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, RpcTypeMetadata, StatusFlags};
+use mssql_tds::message::parameters::rpc_parameters::{
+    RpcParameter, RpcTypeMetadata, StatusFlags, StreamedSqlType,
+};
 
 use crate::api::odbc_types::{
-    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR, SQL_DATA_AT_EXEC,
-    SQL_DECIMAL, SQL_DEFAULT_PARAM, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
+    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR,
+    SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DEFAULT_PARAM, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
     SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NTS, SQL_NULL_DATA,
     SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT,
     SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE,
@@ -167,6 +169,24 @@ pub(crate) unsafe fn bound_param_to_value(
     Ok((value, None))
 }
 
+/// Returns `true` when `indicator` is a data-at-execution value
+/// (`SQL_DATA_AT_EXEC` or any value at or below `SQL_LEN_DATA_AT_EXEC_OFFSET`).
+pub(crate) fn is_data_at_exec_indicator(indicator: SqlLen) -> bool {
+    indicator == SQL_DATA_AT_EXEC || indicator <= SQL_LEN_DATA_AT_EXEC_OFFSET
+}
+
+/// Builds the streaming placeholder type for a data-at-execution bound
+/// parameter. The actual bytes arrive later via `SQLPutData`.
+pub(crate) fn dae_placeholder_type(
+    c_type: SqlSmallInt,
+) -> Result<StreamedSqlType, ParamBuildError> {
+    match c_type {
+        SQL_C_CHAR => Ok(StreamedSqlType::VarcharMax),
+        SQL_C_WCHAR => Ok(StreamedSqlType::NVarcharMax),
+        SQL_C_BINARY => Ok(StreamedSqlType::VarBinaryMax),
+        other => Err(ParamBuildError::UnsupportedCType(other)),
+    }
+}
 /// A TDS value plus the precision/scale the RPC layer must use for both the
 /// `@P1 <type>` declaration and the wire `TYPE_INFO`.
 type TypedValue = (SqlType, Option<RpcTypeMetadata>);
