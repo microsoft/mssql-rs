@@ -500,6 +500,15 @@ impl TdsClient {
                     // Reset session state table for the new session
                     self.recovery_context.session_state_table.reset();
 
+                    // A pending reset is satisfied — more completely than
+                    // RESETCONNECTION would — by the fresh login: the new
+                    // session is already at its login defaults, and the armed
+                    // header bit died with the old transport, so no
+                    // acknowledgement is coming. Leaving the flag set would make
+                    // the carrying request report the reset as unacknowledged
+                    // and discard a healthy, brand-new connection.
+                    self.reset_pending = false;
+
                     self.recovery_context.recovery_count += 1;
                     info!(
                         recovery_count = self.recovery_context.recovery_count,
