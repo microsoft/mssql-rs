@@ -150,6 +150,63 @@ TEST_F(PrepareExecuteLiveTest, ExplicitLengthWideCharParam) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// SQL_C_DEFAULT reaches the driver unresolved (the Driver Manager does not
+// substitute it), and the driver resolves it from ParameterType. SQL_VARCHAR
+// yields SQL_C_CHAR on both drivers.
+TEST_F(PrepareExecuteLiveTest, DefaultCTypeNarrowCharParam) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    std::vector<SQLCHAR> value = {'p', 'l', 'a', 'i', 'n', '\0'};
+    SQLLEN ind = SQL_NTS;
+    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
+                                    SQL_VARCHAR, value.size(), 0, value.data(),
+                                    static_cast<SQLLEN>(value.size()), &ind);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("plain", GetColumnChar(1));
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Accepted parity deviation (AB#47365): SQL_C_DEFAULT resolves the wide
+// character SQL types to SQL_C_WCHAR, per the ODBC 3.x default-C-type table.
+// msodbcsql's rgbTRANSTYPE380 resolves them to SQL_C_CHAR and would read this
+// UTF-16 buffer as narrow text, so the round trip differs there.
+TEST_F(PrepareExecuteLiveTest, DefaultCTypeWideCharParam) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLWCHAR value[] = {'w', 'i', 'd', 'e', 0};
+    SQLLEN ind = SQL_NTS;
+    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
+                                    SQL_WVARCHAR, 4, 0, value, sizeof(value), &ind);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("wide", GetColumnChar(1));
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// SQL_C_DEFAULT + SQL_INTEGER resolves to SQL_C_SLONG, which has no conversion
+// row yet, so the bind is rejected up front instead of failing at execute.
+// msodbcsql supports the pairing, hence the skip. The skip will be removed soon
+// when we implement the conversion.
+TEST_F(PrepareExecuteLiveTest, DefaultCTypeUnsupportedConversionIsRejected) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    SQLINTEGER value = 42;
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
+                                    SQL_INTEGER, 0, 0, &value, 0, &ind);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07006");
+}
+
 // A NULL-indicator parameter produces a SQL NULL result.
 TEST_F(PrepareExecuteLiveTest, NullParam) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);

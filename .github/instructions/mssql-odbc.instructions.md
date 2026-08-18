@@ -28,6 +28,14 @@ authoritative parity reference for this crate. Its source lives in the
 - When reporting a parity finding, cite the msodbcsql source (file + what it does),
   and state explicitly whether the decision **matches**, **exceeds**, or **diverges
   from** msodbcsql so the trade-off is visible.
+- **This driver targets ODBC 3.x only.** msodbcsql also serves ODBC 2.x
+  applications, so parts of its source exist purely for backward compatibility:
+  deprecated 2.x entry points, 2.x identifier spellings and attribute values,
+  2.x-era internal representations, and branches keyed on the application's
+  declared version. The Driver Manager maps a 2.x application onto the 3.x
+  interface before the call reaches a 3.x driver, so those paths are out of
+  scope here — a msodbcsql code path that exists solely for 2.x compatibility is
+  not a parity gap. Say so rather than porting it.
 - Deliberate deviations (exceed-parity) are allowed with product-owner sign-off;
   record the rationale in code comments and the tracking work item.
 - Deliberate deviations are listed below:
@@ -36,6 +44,13 @@ authoritative parity reference for this crate. Its source lives in the
     (`Sql/Ntdbms/sqlncli/msdart/inc/dlgattr.h` → `OPTIONADMSI L"ActiveDirectoryMSI"`);
     `ActiveDirectoryManagedIdentity` does not appear anywhere in the msodbcsql source.
     Added to match MS Learn and the sibling drivers (JDBC/.NET/go-sqlcmd). Tracked in AB#46066.
+  - `SQL_C_DEFAULT` in SQLBindParameter resolves the wide character SQL types to `SQL_C_WCHAR`, and
+    `SQL_GUID` to `SQL_C_GUID`, following the ODBC 3.x default-C-type table.
+    msodbcsql's `Sql2CDefault` reads `rgbTRANSTYPE380`
+    (`Sql/Ntdbms/sqlncli/odbc/sqlcmisc.cpp`), which resolves both to `SQL_C_CHAR`
+    — an ANSI-transfer default this driver has no equivalent for, since its
+    `SQL_C_CHAR` is UTF-8. Resolving UTF-16 application input to a UTF-8 buffer
+    type would silently corrupt data. Tracked in AB#47365.
 
 ## No panics
 

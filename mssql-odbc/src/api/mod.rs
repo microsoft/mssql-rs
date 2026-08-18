@@ -33,6 +33,7 @@ pub(crate) mod set_env_attr;
 pub(crate) mod set_stmt_attr;
 pub(crate) mod sqlstate;
 mod txn;
+pub(crate) mod type_rules;
 pub(crate) mod util;
 
 // Exported ODBC entry points — the driver's public API surface.
