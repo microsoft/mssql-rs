@@ -75,11 +75,8 @@ macro_rules! read_sync_first {
 // Offers the writer a destination for a PLP value's payload, falling back to an
 // owned `Vec` when it declines.
 //
-// Only used for known-length PLP values. Offering a destination at the
-// short USHORTLEN sites costs every writer that declines: on a 39-int +
-// 9-varchar(6) scan, hooking the u16-length string site alone moved
-// `DefaultRowWriter` from 85.5 ms to 90.1 ms. The branch is not the problem —
-// the read is — so the fix is to not put one on the short-value path.
+// Only used for known-length PLP values. Short USHORTLEN values remain on the
+// existing path so writers that decline destinations avoid an extra branch.
 //
 // The `None` arm expands to exactly the code that preceded this hook — allocate,
 // fill, hand over — so a writer that does not opt in decodes through an
@@ -94,10 +91,8 @@ macro_rules! read_sync_first {
 // `$fill` reads the payload into `$dest` and yields `TdsResult<()>`; `$owned`
 // hands the fallback buffer `$bytes` to the writer.
 //
-// The fallback allocates and fills inline rather than delegating to a helper
-// that returns a `Vec`: an extra async frame on the owned path costs far more
-// than the wider caller frame it would save (measured ~20% on a 24-column
-// small-value PLP scan, on every writer including ones that never opt in).
+// The fallback allocates and fills inline rather than adding another async
+// frame to the owned path.
 macro_rules! read_value_into {
     (
         $writer:expr, $col:expr, $kind:expr, $length:expr,

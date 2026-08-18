@@ -100,13 +100,10 @@ pub trait RowWriter {
     /// legacy `TEXT`/`NTEXT`/`IMAGE` `LONGLEN` types, `PLP_UNKNOWNLEN` streams
     /// and NULLs all stay on the owned path unconditionally.
     ///
-    /// The short types are excluded on measured grounds rather than principle:
-    /// offering a destination there costs every writer that declines, because
-    /// the payload read then sits behind a branch on the hottest path in the
-    /// decoder. On a 39-int + 9-`varchar(6)` scan that cost `DefaultRowWriter`
-    /// ~5%, which is not worth paying for a per-value saving of a few bytes.
-    /// Confining the hook to PLP puts it where a single value can be megabytes
-    /// and where the surrounding chunk loop already dominates the branch.
+    /// Short values remain on the existing hot path so writers that decline
+    /// destinations do not pay for an extra branch on every small payload.
+    /// PLP values are the useful boundary because they can be large or numerous
+    /// and already require chunked decoding.
     ///
     /// # Contract
     ///

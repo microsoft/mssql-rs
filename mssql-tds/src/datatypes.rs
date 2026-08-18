@@ -17,10 +17,6 @@ pub(crate) mod encoder;
 pub(crate) mod lcid_encoding;
 /// Trait for pluggable row decoding sinks.
 pub mod row_writer;
-/// Timing harness for the `RowWriter` value-sink path. Every bench in it is
-/// `#[ignore]`d, so the normal suite only runs its self-check.
-#[cfg(test)]
-mod sink_bench;
 /// SQL Server `json` column type.
 pub mod sql_json;
 /// SQL Server character string type with encoding.
