@@ -243,6 +243,7 @@ impl PyAsyncConnection {
 
     /// Close the connection. Rolls back active work when autocommit is disabled.
     /// Idempotent; rollback and shutdown errors are logged and swallowed.
+    /// Returns an awaitable that resolves to `None`.
     fn close<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let dispatch = self.tracing_dispatch.clone();
         let _guard = dispatch.as_ref().map(tracing::dispatcher::set_default);
@@ -372,6 +373,7 @@ impl PyAsyncConnection {
     }
 
     /// Commit the current transaction. No-op if none is active.
+    /// Raises `RuntimeError` synchronously if the connection is closed.
     fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         // Clone the Arc so the future is `'static + Send`.
         let client = self
@@ -403,6 +405,7 @@ impl PyAsyncConnection {
     }
 
     /// Roll back the current transaction. No-op if none is active.
+    /// Raises `RuntimeError` synchronously if the connection is closed.
     fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         // Clone the Arc so the future is `'static + Send`.
         let client = self
