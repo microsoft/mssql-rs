@@ -330,7 +330,7 @@ async fn create_transport_for_version(
     transport_context: &TransportContext,
     encryption_options: EncryptionOptions,
     encryption_mode: EncryptionSetting,
-) -> TdsResult<Box<NetworkTransport>> {
+) -> TdsResult<NetworkTransport> {
     let ssl_handler = SslHandler {
         server_host_name: transport_context.get_server_name().to_string(),
         encryption_options,
@@ -342,13 +342,13 @@ async fn create_transport_for_version(
             // negotiation. TLS must be wrapped in TDS packets for this version.
             info!("Creating NetworkTransport for TDS 7.4 with TLS wrapping");
 
-            Ok(Box::new(NetworkTransport::new(
+            Ok(NetworkTransport::new(
                 stream,
                 ssl_handler,
                 PRE_NEGOTIATED_PACKET_SIZE,
                 encryption_mode,
                 true, // Use TDS 7.4 TLS wrapping
-            )))
+            ))
         }
         TdsVersion::V8_0 => {
             // Enable TLS immediately for TDS 8.0 (before any TDS packets are exchanged)
@@ -358,13 +358,13 @@ async fn create_transport_for_version(
                 .enable_ssl_async(stream, NegotiatedEncryptionSetting::Strict)
                 .await?;
 
-            Ok(Box::new(NetworkTransport::new(
+            Ok(NetworkTransport::new(
                 encrypted_stream,
                 ssl_handler,
                 PRE_NEGOTIATED_PACKET_SIZE,
                 encryption_mode,
                 false, // TDS 8.0 uses standard TLS (no TDS wrapping)
-            )))
+            ))
         }
         TdsVersion::Unknown(version_value) => Err(crate::error::Error::ProtocolError(format!(
             "Unsupported TDS version: 0x{version_value:08X}. Only TDS 7.4 and TDS 8.0 are supported."
@@ -394,7 +394,7 @@ pub(crate) async fn create_transport(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
-) -> TdsResult<Box<NetworkTransport>> {
+) -> TdsResult<NetworkTransport> {
     let encryption_mode = encryption_options.mode;
 
     // Step 1: Create the base stream (transport-specific)
@@ -1115,13 +1115,63 @@ impl TdsPacketReader for NetworkTransport {
         self.tds_read_buffer.reset_to_length(0);
     }
 
+    #[inline(always)]
+    fn try_read_byte(&mut self) -> Option<u8> {
+        self.tds_read_buffer.try_read_byte()
+    }
+
+    #[inline(always)]
+    fn try_read_int16(&mut self) -> Option<i16> {
+        self.tds_read_buffer.try_read_int16()
+    }
+
+    #[inline(always)]
+    fn try_read_uint16(&mut self) -> Option<u16> {
+        self.tds_read_buffer.try_read_uint16()
+    }
+
+    #[inline(always)]
+    fn try_read_uint24(&mut self) -> Option<u32> {
+        self.tds_read_buffer.try_read_uint24()
+    }
+
+    #[inline(always)]
+    fn try_read_int32(&mut self) -> Option<i32> {
+        self.tds_read_buffer.try_read_int32()
+    }
+
+    #[inline(always)]
+    fn try_read_uint32(&mut self) -> Option<u32> {
+        self.tds_read_buffer.try_read_uint32()
+    }
+
+    #[inline(always)]
+    fn try_read_uint40(&mut self) -> Option<u64> {
+        self.tds_read_buffer.try_read_uint40()
+    }
+
+    #[inline(always)]
+    fn try_read_int64(&mut self) -> Option<i64> {
+        self.tds_read_buffer.try_read_int64()
+    }
+
+    #[inline(always)]
+    fn try_read_float32(&mut self) -> Option<f32> {
+        self.tds_read_buffer.try_read_float32()
+    }
+
+    #[inline(always)]
+    fn try_read_float64(&mut self) -> Option<f64> {
+        self.tds_read_buffer.try_read_float64()
+    }
+
     async fn read_byte(&mut self) -> TdsResult<u8> {
-        while !self.tds_read_buffer.do_we_have_enough_data(1) {
+        loop {
+            if let Some(value) = self.try_read_byte() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-        let result: u8 = self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position];
-        self.tds_read_buffer.consume_bytes(1);
-        Ok(result)
     }
 
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
@@ -1142,80 +1192,79 @@ impl TdsPacketReader for NetworkTransport {
     }
 
     async fn read_uint40(&mut self) -> TdsResult<u64> {
-        while !self.tds_read_buffer.do_we_have_enough_data(5) {
+        loop {
+            if let Some(value) = self.try_read_uint40() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-
-        let result = LittleEndian::read_uint(self.tds_read_buffer.get_slice(), 5);
-        self.tds_read_buffer.consume_bytes(5);
-        Ok(result)
     }
 
     async fn read_float32(&mut self) -> TdsResult<f32> {
-        while !self.tds_read_buffer.do_we_have_enough_data(4) {
+        loop {
+            if let Some(value) = self.try_read_float32() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_f32(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(4);
-        Ok(result)
     }
     async fn read_float64(&mut self) -> TdsResult<f64> {
-        while !self.tds_read_buffer.do_we_have_enough_data(8) {
+        loop {
+            if let Some(value) = self.try_read_float64() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_f64(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(8);
-        Ok(result)
     }
     async fn read_int16(&mut self) -> TdsResult<i16> {
-        while !self.tds_read_buffer.do_we_have_enough_data(2) {
+        loop {
+            if let Some(value) = self.try_read_int16() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_i16(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(2);
-        Ok(result)
     }
     async fn read_uint16(&mut self) -> TdsResult<u16> {
-        while !self.tds_read_buffer.do_we_have_enough_data(2) {
+        loop {
+            if let Some(value) = self.try_read_uint16() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_u16(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(2);
-        Ok(result)
     }
     async fn read_uint24(&mut self) -> TdsResult<u32> {
-        while !self.tds_read_buffer.do_we_have_enough_data(3) {
+        loop {
+            if let Some(value) = self.try_read_uint24() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_u24(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(3);
-        Ok(result)
     }
 
     async fn read_int32(&mut self) -> TdsResult<i32> {
-        while !self.tds_read_buffer.do_we_have_enough_data(4) {
+        loop {
+            if let Some(value) = self.try_read_int32() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_i32(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(4);
-        Ok(result)
     }
 
     async fn read_uint32(&mut self) -> TdsResult<u32> {
-        while !self.tds_read_buffer.do_we_have_enough_data(4) {
+        loop {
+            if let Some(value) = self.try_read_uint32() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_u32(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(4);
-        Ok(result)
     }
     async fn read_int64(&mut self) -> TdsResult<i64> {
-        while !self.tds_read_buffer.do_we_have_enough_data(8) {
+        loop {
+            if let Some(value) = self.try_read_int64() {
+                return Ok(value);
+            }
             self.read_tds_packet().await?;
         }
-        let result = LittleEndian::read_i64(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(8);
-        Ok(result)
     }
     async fn read_uint64(&mut self) -> TdsResult<u64> {
         while !self.tds_read_buffer.do_we_have_enough_data(8) {
@@ -1350,9 +1399,8 @@ impl TdsPacketReader for NetworkTransport {
     }
 }
 
-#[async_trait]
-impl TdsTokenStreamReader for NetworkTransport {
-    async fn receive_token(
+impl NetworkTransport {
+    pub(crate) async fn receive_token(
         &mut self,
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
@@ -1376,7 +1424,7 @@ impl TdsTokenStreamReader for NetworkTransport {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
@@ -1384,14 +1432,17 @@ impl TdsTokenStreamReader for NetworkTransport {
         token_result
     }
 
-    async fn receive_row_into(
+    pub(crate) async fn receive_row_into<W>(
         &mut self,
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
         plan: ColumnPolicy,
-        writer: &mut (dyn RowWriter + Send),
-    ) -> TdsResult<RowReadResult> {
+        writer: &mut W,
+    ) -> TdsResult<RowReadResult>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
         // `self` is the packet reader, so the scratch slot has to be moved out
         // for the duration of the read and put back afterwards. The restore
         // below must stay unconditional, and no `?` may be introduced between
@@ -1418,7 +1469,7 @@ impl TdsTokenStreamReader for NetworkTransport {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
@@ -1426,7 +1477,7 @@ impl TdsTokenStreamReader for NetworkTransport {
         result
     }
 
-    async fn receive_row_header(
+    pub(crate) async fn receive_row_header(
         &mut self,
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
@@ -1453,7 +1504,7 @@ impl TdsTokenStreamReader for NetworkTransport {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
@@ -1461,14 +1512,17 @@ impl TdsTokenStreamReader for NetworkTransport {
         result
     }
 
-    async fn resume_row_into(
+    pub(crate) async fn resume_row_into<W>(
         &mut self,
         pause_state: RowPauseState,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
         plan: ColumnPolicy,
-        writer: &mut (dyn RowWriter + Send),
-    ) -> TdsResult<RowReadResult> {
+        writer: &mut W,
+    ) -> TdsResult<RowReadResult>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
         let result = await_within_request_timeout!(
             remaining_request_timeout,
             CancelHandle::run_until_cancelled(
@@ -1481,7 +1535,7 @@ impl TdsTokenStreamReader for NetworkTransport {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
@@ -1489,7 +1543,7 @@ impl TdsTokenStreamReader for NetworkTransport {
         result
     }
 
-    async fn read_active_plp_bytes(
+    pub(crate) async fn read_active_plp_bytes(
         &mut self,
         plp_state: &mut PlpPauseState,
         remaining_request_timeout: Option<Duration>,
@@ -1508,12 +1562,95 @@ impl TdsTokenStreamReader for NetworkTransport {
             Ok(_) => {}
             Err(err) => match err {
                 OperationCancelledError(_) | TimeoutError(_) => {
-                    self.cancel_read_stream_and_wait().await?;
+                    Box::pin(self.cancel_read_stream_and_wait()).await?;
                 }
                 _ => {}
             },
         }
         result
+    }
+}
+
+#[async_trait]
+impl TdsTokenStreamReader for NetworkTransport {
+    async fn receive_token(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Tokens> {
+        NetworkTransport::receive_token(self, context, remaining_request_timeout, cancel_handle)
+            .await
+    }
+
+    async fn receive_row_into(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        plan: ColumnPolicy,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult> {
+        NetworkTransport::receive_row_into(
+            self,
+            context,
+            remaining_request_timeout,
+            cancel_handle,
+            plan,
+            writer,
+        )
+        .await
+    }
+
+    async fn receive_row_header(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<RowHeader> {
+        NetworkTransport::receive_row_header(
+            self,
+            context,
+            remaining_request_timeout,
+            cancel_handle,
+        )
+        .await
+    }
+
+    async fn resume_row_into(
+        &mut self,
+        pause_state: RowPauseState,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        plan: ColumnPolicy,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult> {
+        NetworkTransport::resume_row_into(
+            self,
+            pause_state,
+            remaining_request_timeout,
+            cancel_handle,
+            plan,
+            writer,
+        )
+        .await
+    }
+
+    async fn read_active_plp_bytes(
+        &mut self,
+        plp_state: &mut PlpPauseState,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        out: &mut [u8],
+    ) -> TdsResult<usize> {
+        NetworkTransport::read_active_plp_bytes(
+            self,
+            plp_state,
+            remaining_request_timeout,
+            cancel_handle,
+            out,
+        )
+        .await
     }
 }
 
@@ -2716,6 +2853,94 @@ pub(crate) mod tests {
         let mut reader = create_network_transport_with_chunked_data(&stream, 3);
 
         assert_eq!(reader.read_uint32().await.unwrap(), 0x4433_2211);
+    }
+
+    #[tokio::test]
+    async fn test_sync_scalar_probe_fallback_across_packet_boundaries() {
+        let expected_uint16 = 0x1234u16;
+        let expected_int16 = -0x1234i16;
+        let expected_uint24 = 0x00A1_B2C3u32;
+        let expected_int32 = -0x0123_4567i32;
+        let expected_uint32 = 0x89AB_CDEFu32;
+        let expected_uint40 = 0xAB_CDEF_0123u64;
+        let expected_int64 = -0x0102_0304_0506_0708i64;
+        let expected_float32 = 1.5f32;
+        let expected_float64 = -2.25f64;
+
+        let uint16 = expected_uint16.to_le_bytes();
+        let int16 = expected_int16.to_le_bytes();
+        let uint24 = expected_uint24.to_le_bytes();
+        let int32 = expected_int32.to_le_bytes();
+        let uint32 = expected_uint32.to_le_bytes();
+        let uint40 = expected_uint40.to_le_bytes();
+        let int64 = expected_int64.to_le_bytes();
+        let float32 = expected_float32.to_le_bytes();
+        let float64 = expected_float64.to_le_bytes();
+
+        let payloads = [
+            vec![0xAB, uint16[0]],
+            vec![uint16[1], int16[0]],
+            vec![int16[1], uint24[0], uint24[1]],
+            vec![uint24[2], int32[0], int32[1], int32[2]],
+            vec![int32[3], uint32[0], uint32[1], uint32[2]],
+            vec![uint32[3], uint40[0], uint40[1], uint40[2], uint40[3]],
+            vec![
+                uint40[4], int64[0], int64[1], int64[2], int64[3], int64[4], int64[5], int64[6],
+            ],
+            vec![int64[7], float32[0], float32[1], float32[2]],
+            vec![
+                float32[3], float64[0], float64[1], float64[2], float64[3], float64[4], float64[5],
+                float64[6],
+            ],
+            vec![float64[7]],
+        ];
+
+        let mut stream = Vec::new();
+        for payload in payloads {
+            let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+            stream.extend_from_slice(&packet.append_bytes(&payload).build());
+        }
+
+        let mut reader = create_network_transport_with_data(&stream);
+
+        assert_eq!(reader.try_read_byte(), None);
+        assert_eq!(reader.read_byte().await.unwrap(), 0xAB);
+
+        assert_eq!(reader.try_read_uint16(), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 1);
+        assert_eq!(reader.read_uint16().await.unwrap(), expected_uint16);
+
+        assert_eq!(reader.try_read_int16(), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 1);
+        assert_eq!(reader.read_int16().await.unwrap(), expected_int16);
+
+        assert_eq!(reader.try_read_uint24(), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 2);
+        assert_eq!(reader.read_uint24().await.unwrap(), expected_uint24);
+
+        assert_eq!(reader.try_read_int32(), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 3);
+        assert_eq!(reader.read_int32().await.unwrap(), expected_int32);
+
+        assert_eq!(reader.try_read_uint32(), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 3);
+        assert_eq!(reader.read_uint32().await.unwrap(), expected_uint32);
+
+        assert_eq!(reader.try_read_uint40(), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 4);
+        assert_eq!(reader.read_uint40().await.unwrap(), expected_uint40);
+
+        assert_eq!(reader.try_read_int64(), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 7);
+        assert_eq!(reader.read_int64().await.unwrap(), expected_int64);
+
+        assert_eq!(reader.try_read_float32(), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 3);
+        assert_eq!(reader.read_float32().await.unwrap(), expected_float32);
+
+        assert_eq!(reader.try_read_float64(), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 7);
+        assert_eq!(reader.read_float64().await.unwrap(), expected_float64);
     }
 
     /// A payload-free non-EOM packet is malformed: it neither carries payload

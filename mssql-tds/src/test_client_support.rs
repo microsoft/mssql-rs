@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use crate::connection::client_context::ClientContext;
 use crate::connection::execution_context::ExecutionContext;
 use crate::connection::tds_client::TdsClient;
+use crate::connection::transport::any_transport::AnyTransport;
 use crate::connection::transport::network_transport::TransportSslHandler;
 use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult};
@@ -194,7 +195,7 @@ impl TdsTransport for TokenReplayTransport {
 /// consumer under test.
 pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
     let tokens: Vec<Tokens> = tokens.into_iter().map(|t| t.0).collect();
-    let transport = Box::new(TokenReplayTransport::new(tokens));
+    let transport = AnyTransport::dynamic(TokenReplayTransport::new(tokens));
     let negotiated_settings = create_test_negotiated_settings_internal();
     let execution_context = ExecutionContext::new();
     let client_context = ClientContext::with_data_source("tcp:localhost,1433");
@@ -438,7 +439,7 @@ pub(crate) mod byte_stream {
     /// Builds a [`TdsClient`] whose transport replays raw TDS `bytes` through the
     /// real token parsers.
     pub(crate) fn tds_client_over_raw_bytes(bytes: Vec<u8>) -> TdsClient {
-        let transport = Box::new(ByteStreamTransport::new(bytes));
+        let transport = AnyTransport::dynamic(ByteStreamTransport::new(bytes));
         let negotiated_settings = create_test_negotiated_settings_internal();
         let execution_context = ExecutionContext::new();
         let client_context = ClientContext::with_data_source("tcp:localhost,1433");
@@ -458,7 +459,7 @@ pub(crate) mod byte_stream {
         use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
         use crate::message::login::Feature;
 
-        let transport = Box::new(ByteStreamTransport::new(bytes));
+        let transport = AnyTransport::dynamic(ByteStreamTransport::new(bytes));
         let mut negotiated_settings = create_test_negotiated_settings_internal();
         let mut feature = AlwaysEncryptedFeature::default();
         feature.set_acknowledged(true);
