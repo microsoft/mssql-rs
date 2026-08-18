@@ -372,41 +372,12 @@ stages:
       - template: install-dependencies.yml
         parameters:
           osType: MacOS
-      - script: |
-          set -euo pipefail
-          colima status
-          docker ps -a
-          docker inspect sqlserver --format \
-            'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}'
-          docker exec sqlserver \
-            /opt/mssql-tools18/bin/sqlcmd \
-            -S localhost -U SA -P "$SQL_PASSWORD" \
-            -C -b -Q "SELECT 1"
-          nc -zv localhost 1433
-        displayName: 'Temporary: verify macOS SQL Server before tests'
-        env:
-          SQL_PASSWORD: $(SQL_PASSWORD)
       - template: build-template.yml
         parameters:
           osType: MacOS
           buildType: ${{ parameters.buildType }}
           testFilter: -E 'not (test(connectivity))'
           enableClippy: false
-      - script: |
-          set +e
-          echo "=== Colima status ==="
-          colima status
-          echo "=== Docker containers ==="
-          docker ps -a
-          echo "=== SQL Server state ==="
-          docker inspect sqlserver --format \
-            'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}'
-          echo "=== SQL Server logs ==="
-          docker logs --tail 500 sqlserver
-          echo "=== Host port 1433 ==="
-          lsof -nP -iTCP:1433 -sTCP:LISTEN
-        displayName: 'Temporary: diagnose macOS SQL Server failure'
-        condition: failed()
 
 # Kerberos tests for PRs (fast - 2 distros: ubuntu22 + alpine318)
 - stage: Kerberos_Test_PR
