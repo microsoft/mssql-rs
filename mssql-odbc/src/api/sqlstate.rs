@@ -15,6 +15,7 @@ pub(crate) const SQLSTATE_01S07: [u8; 5] = *b"01S07";
 pub(crate) const SQLSTATE_07002: [u8; 5] = *b"07002";
 pub(crate) const SQLSTATE_07006: [u8; 5] = *b"07006";
 pub(crate) const SQLSTATE_07009: [u8; 5] = *b"07009";
+pub(crate) const SQLSTATE_07S01: [u8; 5] = *b"07S01";
 pub(crate) const SQLSTATE_08001: [u8; 5] = *b"08001";
 pub(crate) const SQLSTATE_08003: [u8; 5] = *b"08003";
 /// Connection failure during a transaction — ODBC's precise state for a
@@ -111,6 +112,21 @@ pub(crate) const ERR_INVALID_C_DATA_TYPE: DiagMsg = DiagMsg {
 pub(crate) const ERR_RESTRICTED_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_07006,
     text: "Restricted data type attribute violation",
+};
+// `SQL_DEFAULT_PARAM` is only legal for a canonical procedure call, which this
+// driver does not support, so the state is terminal rather than "not yet"
+// (msodbcsql `sqlccmd.cpp` -> IDS_07_S01 on a non-canonical call statement).
+pub(crate) const ERR_INVALID_USE_OF_DEFAULT_PARAM: DiagMsg = DiagMsg {
+    state: SQLSTATE_07S01,
+    text: "Invalid use of default parameter",
+};
+pub(crate) const ERR_DATA_AT_EXEC_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HYC00,
+    text: "Data-at-execution parameters not yet implemented",
+};
+pub(crate) const ERR_PARAM_C_TYPE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HYC00,
+    text: "Parameter C type not yet implemented",
 };
 pub(crate) const ERR_NUMERIC_OUT_OF_RANGE: DiagMsg = DiagMsg {
     state: SQLSTATE_22003,
