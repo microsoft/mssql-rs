@@ -1712,6 +1712,10 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
     fn connection_known_dead(&self) -> bool {
         self.known_dead
     }
+
+    fn mark_known_dead(&mut self) {
+        self.known_dead = true;
+    }
 }
 
 #[cfg(test)]

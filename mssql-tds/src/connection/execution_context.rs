@@ -66,7 +66,12 @@ impl ExecutionContext {
         self.has_open_result_set = has_open_result_set;
     }
 
-    #[cfg(test)]
+    /// Sets the transaction descriptor directly.
+    ///
+    /// Used by the connection-reset path to mirror the server discarding the
+    /// transaction on a full RESETCONNECTION, and by tests (including downstream
+    /// crates via `test-util`) to reach guards that depend on an active
+    /// transaction.
     pub(crate) fn set_transaction_descriptor(&mut self, descriptor: u64) {
         self.transaction_descriptor = descriptor;
     }
@@ -180,12 +185,12 @@ impl ExecutionContext {
             EnvChangeTokenSubType::ResetConnection => {
                 // Server acknowledgement that the connection was reset to login
                 // defaults (in response to a RESETCONNECTION / RESETCONNECTIONSKIPTRAN
-                // request). The server does not emit individual Database/Language
-                // ENVCHANGE tokens for the revert, so restore the cached session
-                // state to the login defaults here to keep the pool-facing getters
-                // accurate.
+                // request). The full client-side transition — restoring the
+                // negotiated database/language/collation and clearing
+                // session-bound caches — is applied by
+                // `TdsClient::on_reset_connection_ack`, which runs before this
+                // token is captured, so nothing is done here beyond logging.
                 info!("Connection reset acknowledged by server");
-                negotiated_settings.restore_login_defaults();
                 Ok(())
             }
             EnvChangeTokenSubType::UserInstanceName => {
