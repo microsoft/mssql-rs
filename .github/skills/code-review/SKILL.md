@@ -83,7 +83,7 @@ Check these in addition to the general areas above.
 
 ## Output Format
 
-1. **Summary** — 1-3 sentences: what the PR does and overall assessment.
+1. **Summary** — 1-3 sentences: what the PR does and overall assessment. For new features, include what you referenced to verify correctness.
 2. **Findings grouped by severity:**
    - **Blocking** — must fix before merge (bugs, security, breaking changes without
      handling).
