@@ -63,7 +63,7 @@ sequenceDiagram
         ODBC->>Server: Roll back transaction
     end
     ODBC->>TDS: prepare_reset_connection(false)
-    TDS->>TDS: Arm bit; invalidate session-bound state
+    TDS->>TDS: Arm bit and invalidate session-bound state
     ODBC-->>Pool: SQL_SUCCESS (no reset I/O)
     Pool->>ODBC: SQL_ATTR_TXN_ISOLATION = READ_COMMITTED
     ODBC->>ODBC: Suppress same-value short circuit
@@ -73,10 +73,10 @@ sequenceDiagram
     TDS->>TDS: Clear reset_pending
     ODBC->>ODBC: Verify reset_pending is false
     alt Acknowledged
-        ODBC-->>Pool: SQL_SUCCESS; connection may be reused
+        ODBC-->>Pool: SQL_SUCCESS, connection may be reused
     else Not acknowledged
         ODBC->>TDS: Mark connection known dead
-        ODBC-->>Pool: 08S01; discard connection
+        ODBC-->>Pool: 08S01, discard connection
     end
 ```
 
