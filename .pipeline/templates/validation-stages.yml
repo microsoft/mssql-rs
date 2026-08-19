@@ -382,7 +382,7 @@ stages:
             /opt/mssql-tools18/bin/sqlcmd \
             -S localhost -U SA -P "$SQL_PASSWORD" \
             -C -b -Q "SELECT 1"
-          nc -zv localhost 1433
+          nc -z -v 127.0.0.1 1433
         displayName: 'Verify macOS SQL Server before tests'
         env:
           SQL_PASSWORD: $(SQL_PASSWORD)
