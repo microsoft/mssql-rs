@@ -114,7 +114,28 @@ caller sends on that statement.
 
 Non-NULL `SQL_C_DEFAULT` conversion and binding NULL values for server types
 whose required type names are not exposed by `SQLDescribeParam` are outside this
-work item.
+work item. That exclusion is enforced in code: `bound_param_to_value` rejects a
+non-NULL defaulted bind unless `sql_type` is one of the six character SQL types.
+Without that guard the `c_type` match would read the buffer as text for the four
+SQL types `resolve_default_c_type` maps onto a character C type -- `SQL_DECIMAL`,
+`SQL_NUMERIC`, `SQL_SS_VARIANT` and `SQL_SS_XML` -- and send `varchar(max)` /
+`nvarchar(max)`. `sql_variant` is the sharp edge, since the server cannot assign
+`varchar(max)` to it, so the application would see an opaque server-side error
+instead of `HYC00`.
+
+### Accepted parity deviations and confirmed matches
+
+- **Zero `ColumnSize` on `char`/`nchar`/`binary`** -- *matches* msodbcsql for
+  ODBC 3.x applications. `CheckSqlPrec` (`sqlcdesc.cpp`) treats a zero precision
+  as invalid and returns `HY104`, clamping to the maximum only for a 2.x
+  application (`IS2xAPP`). We report the same `HY104`, at execute rather than at
+  bind. `varchar`/`nvarchar` accept zero and widen to `max`, which also matches:
+  msodbcsql skips precision validation entirely for `SQL_VARCHAR`/`SQL_WVARCHAR`
+  (`sqlcmisc.cpp`) and uses the data length instead.
+- **Unbounded sizes reported as `0`** -- matches msodbcsql 18.6.2.1, which
+  reports `0` rather than `SQL_PREC_UNLIMITED` for `nvarchar(max)` /
+  `varbinary(max)`; the `SQL_PREC_UNLIMITED` pass-through in `GetIPDRec` is gated
+  off for the describe path.
 
 ## Test plan
 
@@ -126,7 +147,21 @@ work item.
 - Representative TDS-to-ODBC type mappings and malformed metadata.
 - Cache invalidation when prepared SQL is superseded.
 - Typed NULL conversion and exact SQL declaration generation.
+- Rejection of non-NULL defaulted binds outside the character SQL types.
 - `SQLGetFunctions` advertisement.
+
+#### Deferred coverage
+
+The RPC orchestration in `sql_describe_param_safe` -- issuing the call, the
+drain-on-bad-row path, `fail_metadata_response`, and the info-message path -- has
+no Rust test; it is exercised only by the C++ e2e suite, which does not feed
+`cargo-llvm-cov`. Closing this needs test infrastructure that does not exist
+today in either crate: a way to attach a scripted `TdsClient` to a `Dbc`
+(`TestHandles::mark_dbc_connected` is explicitly documented as valid only for
+paths that never touch the client) and ROW-token scripting in
+`mssql_tds::test_client_support`, which today can script COLMETADATA, DONE, INFO
+and ENVCHANGE but not rows. Tracked as follow-up rather than done here, since it
+is a change to two crates' test surfaces rather than to `SQLDescribeParam`.
 
 ### ODBC end-to-end parity tests
 

@@ -204,6 +204,11 @@ fn sql_describe_param_safe(
     }
 
     let mut collector = DescriptionCollector::new(marker_count);
+    // INVARIANT: a row that cannot be mapped must not leave this loop early.
+    // The result set has to be drained and `close_query()` called below, or the
+    // connection is left mid-result and every later operation on it fails. That
+    // is why the mapping error is carried out in `parse_result` and inspected
+    // *after* the drain, rather than propagated with `?` or an early `return`.
     let parse_result = loop {
         match dbc.runtime.block_on(client.next_row()) {
             Ok(Some(row)) => match parse_parameter_row(&row, marker_count, is_odbc3) {
@@ -443,6 +448,17 @@ fn describe_tds_type(
         TdsDataType::Udt => (SQL_SS_UDT, 0, 0),
         TdsDataType::Xml => (SQL_SS_XML, 0, 0),
         TdsDataType::SqlTable => (SQL_SS_TABLE, 0, 0),
+        // Neither of the next two arms fires against a shipping server. On SQL
+        // Server 2025 RTM-CU1 (17.0.4006) `sp_describe_undeclared_parameters`
+        // reports both `json` and `vector(n)` as `varchar(max)` (TDS id 167),
+        // whether inferred from a column or from an explicit `CAST`; only `xml`
+        // comes back as its own id (241). These arms are forward-looking, which
+        // is also why there is no e2e case for either -- and it means the
+        // `ColumnSize` <-> dimension round trip between `vector_user_size` here
+        // and `vector_metadata` in `conversion::param_convert` has not been
+        // checked against real server output. Do not "fix" the mapping against
+        // an assumption about what the server emits.
+        //
         // msodbcsql has no dedicated `json` ODBC type, so `json` surfaces as an
         // unbounded wide character type, matching how the value is exchanged.
         TdsDataType::Json => (SQL_WLONGVARCHAR, 0, 0),
@@ -471,12 +487,18 @@ fn describe_tds_type(
     })
 }
 
+/// ODBC 3.x reports binary precision for the approximate numeric types, ODBC 2.x
+/// decimal digits.
 fn float_precision(data_type: SqlSmallInt, is_odbc3: bool) -> SqlULen {
     match (data_type, is_odbc3) {
         (SQL_REAL, true) => 24,
         (SQL_FLOAT, true) => 53,
         (SQL_REAL, false) => 7,
-        _ => 15,
+        (SQL_FLOAT, false) => 15,
+        _ => {
+            debug_assert!(false, "float_precision called with {data_type}");
+            15
+        }
     }
 }
 
@@ -586,6 +608,9 @@ impl DescriptionCollector {
     }
 
     fn accept(&mut self, index: usize, description: ParameterDescription) -> Result<(), String> {
+        // Unreachable in production: `parse_parameter_row` already filters on
+        // the same `marker_count` this collector was built with. Kept so
+        // `accept` is total rather than panicking if that filter ever moves.
         let Some(slot) = self.slots.get_mut(index) else {
             return Err(format!("parameter ordinal {} is out of range", index + 1));
         };

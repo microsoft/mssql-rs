@@ -131,6 +131,22 @@ pub(crate) unsafe fn bound_param_to_value(
     // For string C types a null indicator pointer means "null-terminated".
     let len_spec = indicator.unwrap_or(SQL_NTS as SqlLen);
 
+    // A defaulted binding describes its value through `sql_type`, but the match
+    // below reads only `c_type`. `resolve_default_c_type` maps `decimal`,
+    // `numeric`, `sql_variant` and `xml` onto a character C type, so without
+    // this guard those would be read as text and sent as `varchar(max)` /
+    // `nvarchar(max)` -- a type the application never asked for, and one the
+    // server cannot assign to a `sql_variant` at all. Only the character SQL
+    // types genuinely describe a character buffer.
+    if param.c_type_defaulted
+        && !matches!(
+            param.sql_type,
+            SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR | SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR
+        )
+    {
+        return Err(ParamBuildError::UnsupportedCType(param.c_type));
+    }
+
     let value = match param.c_type {
         SQL_C_CHAR => {
             let bytes =
@@ -143,9 +159,8 @@ pub(crate) unsafe fn bound_param_to_value(
                 unsafe { read_wchar_bytes(param.parameter_value_ptr as *const u16, len_spec) };
             SqlType::NVarcharMax(Some(SqlString::new(bytes, EncodingType::Utf16)))
         }
-        // A defaulted binding is described entirely by its SQL type, and the
-        // buffer is only read for non-NULL data, which this driver does not yet
-        // convert for the non-character default C types.
+        // Non-character default C types reach here only through an explicit
+        // binding; this driver does not yet convert their buffers.
         other => return Err(ParamBuildError::UnsupportedCType(other)),
     };
 
@@ -264,6 +279,12 @@ fn default_typed_null(
 
 /// Length of a fixed-width `char`/`nchar`/`binary` declaration. Zero-length and
 /// oversized declarations are invalid T-SQL and have no `max` spelling.
+///
+/// Matches msodbcsql for ODBC 3.x applications: `CheckSqlPrec`
+/// (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`) rejects a zero `ColumnSize` on these
+/// types with `HY104`, and only clamps it to the maximum for a 2.x application
+/// (`IS2xAPP`). We report the same `HY104`, at execute rather than at bind.
+/// `varchar`/`nvarchar` differ deliberately -- see [`variable_length`].
 fn fixed_length(column_size: usize, max: usize) -> Result<u16, ParamBuildError> {
     u16::try_from(column_size)
         .ok()
@@ -278,6 +299,11 @@ fn fixed_length(column_size: usize, max: usize) -> Result<u16, ParamBuildError> 
 /// legitimately pass a `ColumnSize` past the non-`max` limit or the
 /// `SQL_PREC_UNLIMITED` sentinel; all widen to `max` rather than erroring,
 /// matching `RpcParameter::get_sql_name`.
+///
+/// Also matches msodbcsql, which skips precision validation entirely for
+/// `SQL_VARCHAR`/`SQL_WVARCHAR` and uses the data length instead
+/// (`Sql/Ntdbms/sqlncli/odbc/sqlcmisc.cpp`, the `wSqlType != SQL_WVARCHAR &&
+/// wSqlType != SQL_VARCHAR` guard before `FixupColumnSizeDecimalDigits`).
 fn variable_length(column_size: usize, max: usize) -> Option<u16> {
     if column_size == 0 || column_size > max {
         None
@@ -521,6 +547,52 @@ mod tests {
         p.column_size = 40;
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         assert!(matches!(value, SqlType::NVarchar(None, 40)));
+    }
+
+    /// Non-NULL defaulted binds are only readable for the character SQL types.
+    ///
+    /// `resolve_default_c_type` maps `decimal`, `numeric`, `sql_variant` and
+    /// `xml` onto `SQL_C_CHAR`/`SQL_C_WCHAR`, so without an explicit guard the
+    /// `c_type` match would read their buffers as text and send `varchar(max)`
+    /// or `nvarchar(max)`. `sql_variant` is the sharp edge: the server cannot
+    /// assign `varchar(max)` to it, so the application would see an opaque
+    /// server error instead of `HYC00`.
+    #[test]
+    fn default_non_null_rejects_sql_types_that_borrow_a_character_c_type() {
+        let mut buf: Vec<u8> = b"1.5\0".to_vec();
+        for (sql_type, c_type) in [
+            (SQL_DECIMAL, SQL_C_CHAR),
+            (SQL_NUMERIC, SQL_C_CHAR),
+            (SQL_SS_VARIANT, SQL_C_CHAR),
+            (SQL_SS_XML, SQL_C_WCHAR),
+        ] {
+            let mut ind: SqlLen = SQL_NTS as SqlLen;
+            let mut p = default_param(sql_type, &mut ind);
+            p.c_type = c_type;
+            p.parameter_value_ptr = buf.as_mut_ptr() as *mut c_void;
+            assert!(
+                matches!(
+                    unsafe { bound_param_to_value(&p) },
+                    Err(ParamBuildError::UnsupportedCType(_))
+                ),
+                "sql_type {sql_type} should not be read as a character buffer"
+            );
+        }
+    }
+
+    /// The guard above must not reject the character SQL types, which are the
+    /// ones a defaulted bind really can describe with a character buffer.
+    #[test]
+    fn default_non_null_reads_character_sql_types() {
+        let mut buf: Vec<u8> = b"hello\0".to_vec();
+        let mut ind: SqlLen = SQL_NTS as SqlLen;
+        let mut p = default_param(SQL_VARCHAR, &mut ind);
+        p.parameter_value_ptr = buf.as_mut_ptr() as *mut c_void;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::VarcharMax(Some(s)) => assert_eq!(s.to_utf8_string(), "hello"),
+            other => panic!("expected VarcharMax(Some), got {other:?}"),
+        }
     }
 
     /// The typed NULL and the precision/scale metadata must be produced
