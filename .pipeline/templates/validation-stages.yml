@@ -395,16 +395,17 @@ stages:
       - script: |
           set +e
           echo "=== Colima status ==="
-          colima status
+          colima status || true
           echo "=== Docker containers ==="
-          docker ps -a
+          docker ps -a || true
           echo "=== SQL Server state ==="
           docker inspect sqlserver --format \
-            'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}'
+            'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}' || true
           echo "=== SQL Server logs ==="
-          docker logs --tail 500 sqlserver
+          docker logs --tail 500 sqlserver || true
           echo "=== Host port 1433 ==="
-          lsof -nP -iTCP:1433 -sTCP:LISTEN
+          lsof -nP -iTCP:1433 -sTCP:LISTEN || true
+          exit 0
         displayName: 'Diagnose macOS SQL Server failure'
         condition: or(failed(), canceled())
 
