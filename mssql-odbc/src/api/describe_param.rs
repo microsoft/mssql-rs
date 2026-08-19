@@ -750,6 +750,74 @@ mod tests {
         assert_eq!(rc, SQL_SUCCESS);
     }
 
+    /// A metadata result set that carries no rows exercises the whole error
+    /// tail against a scripted server: `advance_to_rows`, the drain loop,
+    /// `close_query()`, `collector.finish()` reporting the absent marker, and
+    /// `fail_metadata_response`. The connection assertions matter most - a
+    /// regression that skips the drain or the client hand-back strands the
+    /// connection mid-result and wedges every later operation on it, rather
+    /// than merely returning a wrong answer for this call.
+    #[test]
+    fn empty_metadata_result_set_reports_hy000_and_returns_connection() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, info, tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = tds_client_from_tokens(vec![
+            info(50000, 0, "a server message"),
+            col_metadata_empty(),
+            done_no_more(),
+        ]);
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+        }
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                marker_count: 1,
+            });
+        }
+
+        let rc = unsafe {
+            sql_describe_param(
+                h.stmt,
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_ERROR);
+
+        let ss = stmt.inner.lock().unwrap();
+        assert_eq!(ss.diag_records[0].sql_state, SQLSTATE_HY000);
+        assert!(
+            ss.diag_records[0]
+                .message
+                .contains("missing metadata for parameter 1")
+        );
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("a server message"))
+        );
+        assert!(!ss.has_state(STMT_STATE_EXEC_STARTED));
+        drop(ss);
+
+        let ds = dbc.inner.lock().unwrap();
+        assert!(ds.client.is_some());
+        assert_eq!(ds.active_stmt, None);
+    }
+
     #[test]
     fn parses_mssql_python_integer_metadata() {
         let (_, description) =

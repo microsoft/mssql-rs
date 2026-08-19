@@ -148,20 +148,30 @@ instead of `HYC00`.
 - Cache invalidation when prepared SQL is superseded.
 - Typed NULL conversion and exact SQL declaration generation.
 - Rejection of non-NULL defaulted binds outside the character SQL types.
+- The metadata-RPC error tail against a scripted server: an empty result set
+  reports `HY000`, surfaces the server's info message, and hands the connection
+  back idle.
 - `SQLGetFunctions` advertisement.
 
 #### Deferred coverage
 
-The RPC orchestration in `sql_describe_param_safe` -- issuing the call, the
-drain-on-bad-row path, `fail_metadata_response`, and the info-message path -- has
-no Rust test; it is exercised only by the C++ e2e suite, which does not feed
-`cargo-llvm-cov`. Closing this needs test infrastructure that does not exist
-today in either crate: a way to attach a scripted `TdsClient` to a `Dbc`
-(`TestHandles::mark_dbc_connected` is explicitly documented as valid only for
-paths that never touch the client) and ROW-token scripting in
+The error tail of the RPC orchestration in `sql_describe_param_safe` is covered
+by `empty_metadata_result_set_reports_hy000_and_returns_connection`, which
+scripts a `TdsClient` onto the `Dbc` and drives `advance_to_rows`, the drain
+loop, `close_query()`, `collector.finish()`, `fail_metadata_response`, the
+info-message path, and the client hand-back that keeps the connection usable
+after a failure.
+
+What remains deferred is the **success** path: mapping real metadata rows end to
+end in Rust. That one needs ROW-token scripting in
 `mssql_tds::test_client_support`, which today can script COLMETADATA, DONE, INFO
-and ENVCHANGE but not rows. Tracked as follow-up rather than done here, since it
-is a change to two crates' test surfaces rather than to `SQLDescribeParam`.
+and ENVCHANGE but not rows -- `ScriptedToken`'s inner field is private, so there
+is no way to emit a ROW without adding a helper to that crate. Row *mapping*
+itself is unit-tested directly through `parse_parameter_row`, so the untested
+remainder is only the wiring between `next_row()` and that function; the success
+path is otherwise exercised by the C++ e2e suite, which does not feed
+`cargo-llvm-cov`. Tracked as follow-up rather than done here, since it is a
+change to another crate's test surface rather than to `SQLDescribeParam`.
 
 ### ODBC end-to-end parity tests
 
