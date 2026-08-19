@@ -678,13 +678,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_large_column_count_without_data_fails_fast() {
-        // Regression for the fuzz_token_stream timeout (build 164079): a
-        // COLMETADATA token declaring col_count 0xB884 (47236) forced a ~30 MB
-        // eager `Vec<ColumnMetadata>` reservation from 2 bytes. The initial
-        // capacity is now bounded by COLUMN_PREALLOC_CAP regardless of col_count,
-        // so an implausible count with no backing bytes fails fast on the first
-        // per-column read (EOF) instead of amplifying into a huge allocation.
+    async fn test_large_column_count_without_data_returns_error() {
+        // A large declared count with no column bytes returns an error when the
+        // first column read cannot be satisfied.
         let data = vec![0x84, 0xB8]; // col_count = 0xB884 = 47236
         let mut reader = MockReader::new(data);
         let parser = ColMetadataTokenParser;
@@ -694,11 +690,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_large_valid_column_count_without_data_fails_fast() {
-        // A plausible wide-table col_count with no column bytes must also fail on
-        // the first per-column read rather than pre-allocating for the full count:
-        // capacity is bounded by COLUMN_PREALLOC_CAP, so this cannot amplify a
-        // 2-byte token into a huge Vec.
+    async fn test_large_valid_column_count_without_data_returns_error() {
+        // A plausible wide-table count follows the same error path when its
+        // column bytes are absent.
         let data = vec![0x88, 0x13]; // col_count = 0x1388 = 5000
         let mut reader = MockReader::new(data);
         let parser = ColMetadataTokenParser;
