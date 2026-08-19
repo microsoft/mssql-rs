@@ -118,17 +118,13 @@ macro_rules! read_value_into {
                 outcome?;
             }
             None => {
-                let mut $bytes: Vec<u8> = vec![0u8; length];
+                let mut $bytes: Vec<u8> = Vec::with_capacity(length);
                 {
-                    // SAFETY: initialized bytes are valid `MaybeUninit<u8>` values.
-                    let $dest: &mut [MaybeUninit<u8>] = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            $bytes.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-                            $bytes.len(),
-                        )
-                    };
+                    let $dest: &mut [MaybeUninit<u8>] = &mut $bytes.spare_capacity_mut()[..length];
                     $fill?;
                 }
+                // SAFETY: `$fill` initialized all `length` bytes on the success path.
+                unsafe { $bytes.set_len(length) };
                 $owned;
             }
         }
@@ -1294,7 +1290,7 @@ impl GenericDecoder {
             chunk_count += 1;
             #[cfg(fuzzing)]
             eprintln!(
-                "[ALLOC] read_plp_chunks_into_slice: chunk #{chunk_count}, chunk_len={chunk_len}, declared_len={}",
+                "[ALLOC] read_plp_chunks_into_slice: chunk #{chunk_count}, chunk_len={chunk_len}, wire_declared_len={declared_len}, destination_len={}",
                 dest.len()
             );
             Self::check_plp_chunk(chunk_count, chunk_len)?;
@@ -1304,7 +1300,7 @@ impl GenericDecoder {
                     "PLP chunk offset would overflow: {offset} + {chunk_len}"
                 ))
             })?;
-            if end_offset > dest.len() {
+            if end_offset > declared_len || end_offset > dest.len() {
                 return Err(crate::error::Error::ProtocolError(format!(
                     "PLP chunk exceeds wire-declared length: offset={offset}, chunk_len={chunk_len}, wire_declared_len={declared_len}, destination_len={}",
                     dest.len(),
@@ -5526,6 +5522,21 @@ mod test {
                 .decode_into(&mut reader, &md, 0, &mut writer)
                 .await
                 .unwrap();
+        }
+
+        #[tokio::test]
+        async fn overlong_destination_does_not_relax_wire_declared_length() {
+            let mut wire = 4u32.to_le_bytes().to_vec();
+            wire.extend_from_slice(&[1, 2, 3, 4]);
+            wire.extend_from_slice(&0u32.to_le_bytes());
+            let mut reader = ByteReader::new(wire);
+            let mut destination = [MaybeUninit::uninit(); 4];
+
+            let err = GenericDecoder::read_plp_chunks_into_slice(&mut reader, &mut destination, 2)
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().contains("wire_declared_len=2"));
         }
 
         #[tokio::test]

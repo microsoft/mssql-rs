@@ -130,8 +130,9 @@ pub trait RowWriter {
 
     /// Completes a value whose storage came from [`Self::value_destination`].
     ///
-    /// `complete` is `false` when decoding failed partway through; the slice
-    /// contents are then unspecified and the writer must discard the value.
+    /// `complete` is `false` when decoding failed partway through; the destination
+    /// may then contain uninitialized bytes, so the writer must discard it without
+    /// reading it.
     ///
     /// # Cancellation
     ///
