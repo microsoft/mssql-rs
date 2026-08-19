@@ -190,13 +190,17 @@ fn sql_set_stmt_attr_w_safe(
                 SQL_SUCCESS_WITH_INFO
             }
         }
+        SQL_ATTR_ROW_BIND_OFFSET_PTR => {
+            state.row_bind_offset_ptr = value_ptr as *mut SqlULen;
+            debug!("SQLSetStmtAttrW: SQL_ATTR_ROW_BIND_OFFSET_PTR set");
+            SQL_SUCCESS
+        }
         // Recognized attributes accepted without tracking: these param /
         // descriptor controls have no effect on the implemented forward-only,
         // read-only behavior.
         SQL_ATTR_PARAM_BIND_TYPE
         | SQL_ATTR_PARAM_STATUS_PTR
         | SQL_ATTR_PARAMS_PROCESSED_PTR
-        | SQL_ATTR_ROW_BIND_OFFSET_PTR
         | SQL_ATTR_APP_ROW_DESC
         | SQL_ATTR_APP_PARAM_DESC => {
             debug!(attribute, "SQLSetStmtAttrW: attribute accepted as no-op");
@@ -388,6 +392,20 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(stmt.inner.lock().unwrap().rows_fetched_ptr, ptr);
+    }
+
+    /// Previously accepted as a no-op, which silently misplaced every bound
+    /// column once a nonzero offset was in play.
+    #[test]
+    fn set_row_bind_offset_ptr_stored() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut offset: SqlULen = 64;
+        let ptr: *mut SqlULen = &mut offset;
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_BIND_OFFSET_PTR, ptr.cast(), 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(stmt.inner.lock().unwrap().row_bind_offset_ptr, ptr);
     }
 
     #[test]

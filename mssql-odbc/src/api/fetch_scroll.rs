@@ -21,6 +21,7 @@ use tracing::{debug, error};
 
 use mssql_tds::connection::tds_client::CursorColumn;
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::error::Error as TdsError;
 
 use super::sqlstate::*;
 use crate::conversion::fetch_convert::{ConvError, ConvOk};
@@ -36,7 +37,7 @@ use crate::api::odbc_types::{
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::stmt::{ColumnBinding, STMT_STATE_CURSOR_OPEN};
+use crate::handles::stmt::{ColumnBinding, STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Implements SQLFetchScroll for the current forward-only result set.
@@ -50,7 +51,7 @@ pub(crate) unsafe fn sql_fetch_scroll(
 ) -> SqlReturn {
     debug!(
         ?statement_handle,
-        fetch_orientation, "SQLFetchScroll called"
+        fetch_orientation, fetch_offset, "SQLFetchScroll called"
     );
     crate::ffi_entry!("SQLFetchScroll", unsafe {
         sql_fetch_scroll_impl(statement_handle, fetch_orientation, fetch_offset)
@@ -71,28 +72,77 @@ unsafe fn sql_fetch_scroll_impl(
     fetch_scroll_safe(statement_handle, stmt, fetch_orientation, fetch_offset)
 }
 
+/// Why a bound column write did not land exactly, so the row can report the
+/// same SQLSTATE `SQLGetData` would have for the identical value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowIssue {
+    /// 01004 — the value did not fit the bound buffer.
+    StringTruncated,
+    /// 01S07 — fractional digits were dropped to fit the target.
+    FractionalTruncated,
+    /// 22003 — numeric value out of the target's range.
+    OutOfRange,
+    /// 07006 — the source type cannot convert to the requested target.
+    Restricted,
+    /// 22018 — the payload is not a valid literal for the target.
+    InvalidCharacter,
+    /// 22002 — NULL arrived with no indicator to report it through.
+    IndicatorRequired,
+    /// HYC00 — a target or source this driver does not deliver yet.
+    Unsupported,
+}
+
+impl RowIssue {
+    fn post(self, stmt_state: &mut StmtState) {
+        match self {
+            RowIssue::StringTruncated => post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION),
+            RowIssue::FractionalTruncated => post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION),
+            RowIssue::OutOfRange => post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE),
+            RowIssue::Restricted => post_diag(stmt_state, ERR_RESTRICTED_DATA_TYPE),
+            RowIssue::InvalidCharacter => post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE),
+            RowIssue::IndicatorRequired => post_diag(stmt_state, ERR_INDICATOR_REQUIRED),
+            RowIssue::Unsupported => post_sql_error(
+                stmt_state,
+                SQLSTATE_HYC00,
+                0,
+                "Column type conversion not yet implemented",
+            ),
+        }
+    }
+}
+
 /// The per-row outcome recorded in the row status array.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RowOutcome {
     Success,
-    Info,
-    Error,
+    Info(RowIssue),
+    Error(RowIssue),
 }
 
 impl RowOutcome {
     fn status(self) -> SqlUSmallInt {
         match self {
             RowOutcome::Success => SQL_ROW_SUCCESS,
-            RowOutcome::Info => SQL_ROW_SUCCESS_WITH_INFO,
-            RowOutcome::Error => SQL_ROW_ERROR,
+            RowOutcome::Info(_) => SQL_ROW_SUCCESS_WITH_INFO,
+            RowOutcome::Error(_) => SQL_ROW_ERROR,
         }
     }
 
-    /// Keeps the worst outcome seen while filling one row.
+    fn issue(self) -> Option<RowIssue> {
+        match self {
+            RowOutcome::Success => None,
+            RowOutcome::Info(i) | RowOutcome::Error(i) => Some(i),
+        }
+    }
+
+    /// Keeps the worst outcome seen while filling one row, so a row that both
+    /// truncated one column and failed another reports the failure.
     fn merge(self, other: RowOutcome) -> RowOutcome {
         match (self, other) {
-            (RowOutcome::Error, _) | (_, RowOutcome::Error) => RowOutcome::Error,
-            (RowOutcome::Info, _) | (_, RowOutcome::Info) => RowOutcome::Info,
+            (e @ RowOutcome::Error(_), _) => e,
+            (_, e @ RowOutcome::Error(_)) => e,
+            (i @ RowOutcome::Info(_), _) => i,
+            (_, i @ RowOutcome::Info(_)) => i,
             _ => RowOutcome::Success,
         }
     }
@@ -108,7 +158,14 @@ fn fetch_scroll_safe(
     // statement lock: the fill loop below blocks on the network and must not
     // hold it. The application is not allowed to rebind concurrently with a
     // fetch on the same statement, so the snapshot cannot go stale under us.
-    let (row_array_size, mut bindings, rows_fetched_ptr, row_status_ptr, column_count) = {
+    let (
+        row_array_size,
+        mut bindings,
+        rows_fetched_ptr,
+        row_status_ptr,
+        column_count,
+        row_bind_offset_ptr,
+    ) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
             return SQL_ERROR;
@@ -149,6 +206,7 @@ fn fetch_scroll_safe(
             stmt_state.rows_fetched_ptr,
             stmt_state.row_status_ptr,
             stmt_state.column_metadata.len(),
+            stmt_state.row_bind_offset_ptr,
         )
     };
 
@@ -164,6 +222,7 @@ fn fetch_scroll_safe(
         column_count,
         rows_fetched_ptr,
         row_status_ptr,
+        row_bind_offset_ptr,
     );
     debug!(?rc, "SQLFetchScroll returning");
     rc
@@ -178,6 +237,7 @@ fn fill_rowset(
     column_count: usize,
     rows_fetched_ptr: *mut SqlULen,
     row_status_ptr: *mut SqlUSmallInt,
+    row_bind_offset_ptr: *mut SqlULen,
 ) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
@@ -233,15 +293,19 @@ fn fill_rowset(
 
     let mut rows_filled: SqlULen = 0;
     let mut worst = RowOutcome::Success;
-    let mut fetch_error: Option<String> = None;
+    let mut fetch_error: Option<TdsError> = None;
     let mut last_column_read = 0usize;
+
+    // Read once per fetch, not once per bind, so an application can move the
+    // whole rowset between calls by updating the pointed-to value.
+    let bind_offset = unsafe { read_bind_offset(row_bind_offset_ptr) };
 
     while rows_filled < row_array_size {
         match dbc.runtime.block_on(client.next_row_cursor()) {
             Ok(true) => {}
             Ok(false) => break,
             Err(e) => {
-                fetch_error = Some(e.to_string());
+                fetch_error = Some(e);
                 break;
             }
         }
@@ -253,25 +317,27 @@ fn fill_rowset(
             if column == 0 || column > column_count {
                 // A binding left over from a wider result set must not read past
                 // the end of this one.
-                outcome = outcome.merge(RowOutcome::Error);
+                outcome = outcome.merge(RowOutcome::Error(RowIssue::Restricted));
                 continue;
             }
             let pulled = dbc.runtime.block_on(client.read_row_column(column - 1));
             columns_read = column;
             let result = match pulled {
                 Ok(CursorColumn::Value { value, .. }) => unsafe {
-                    deliver_bound(binding, rows_filled as usize, &value)
+                    deliver_bound(binding, rows_filled as usize, bind_offset, &value)
                 },
                 // A bound long/LOB column would have to be drained into the
                 // fixed buffer here; that path is owned by SQLGetData today, so
                 // report the row rather than deliver a wrong value (AB#47361).
-                Ok(CursorColumn::PlpStreaming { .. }) => RowOutcome::Error,
+                Ok(CursorColumn::PlpStreaming { .. }) => RowOutcome::Error(RowIssue::Unsupported),
                 // Reading ascending and once per column, neither of these is
                 // reachable; treat them as a row error rather than assuming.
-                Ok(CursorColumn::RowEnded) | Ok(CursorColumn::AlreadyConsumed) => RowOutcome::Error,
+                Ok(CursorColumn::RowEnded) | Ok(CursorColumn::AlreadyConsumed) => {
+                    RowOutcome::Error(RowIssue::Restricted)
+                }
                 Err(e) => {
-                    fetch_error = Some(e.to_string());
-                    RowOutcome::Error
+                    fetch_error = Some(e);
+                    RowOutcome::Error(RowIssue::Restricted)
                 }
             };
             outcome = outcome.merge(result);
@@ -290,7 +356,16 @@ fn fill_rowset(
         }
     }
 
-    let info_messages = client.take_info_messages();
+    // A zero-row end of set returns SQL_NO_DATA, which cannot carry
+    // SQL_SUCCESS_WITH_INFO, so anything drained here would be posted under a
+    // code most applications never inspect and cleared by the next call. Leave
+    // those messages on the client for SQLMoreResults or the cursor close to
+    // surface, exactly as SQLFetch does.
+    let info_messages = if rows_filled > 0 || fetch_error.is_some() {
+        client.take_info_messages()
+    } else {
+        Vec::new()
+    };
 
     // Hand the connection back before touching the statement, mirroring
     // SQLFetch's lock order.
@@ -300,12 +375,16 @@ fn fill_rowset(
             return SQL_ERROR;
         };
         dbc_state.client = Some(client);
-        if rows_filled == 0 && fetch_error.is_none() {
-            // End of result set: leave active_stmt set so the connection stays
-            // busy with this statement until SQLMoreResults or a cursor close,
-            // matching SQLFetch.
+        // A failed protocol read leaves the connection with no usable cursor,
+        // so it stops being busy with this statement; otherwise it stays busy
+        // until SQLMoreResults or a cursor close, matching SQLFetch.
+        if fetch_error.is_some() {
+            if dbc_state.active_stmt == Some(statement_handle) {
+                dbc_state.active_stmt = None;
+            }
+        } else {
+            dbc_state.active_stmt = Some(statement_handle);
         }
-        dbc_state.active_stmt = Some(statement_handle);
     }
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -316,13 +395,20 @@ fn fill_rowset(
     unsafe { write_if_some(rows_fetched_ptr, rows_filled) };
     mark_no_rows(row_status_ptr, rows_filled, row_array_size);
 
-    let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
-
-    if let Some(message) = fetch_error {
-        error!(%message, "SQLFetchScroll: row fetch failed");
-        post_sql_error(&mut stmt_state, SQLSTATE_HY000, 0, &message);
+    if let Some(e) = fetch_error {
+        error!(%e, "SQLFetchScroll: row fetch failed");
+        // The cursor cannot be resumed after a protocol failure, so tear the
+        // row stream down rather than leaving it addressable.
+        stmt_state.reset_row_stream();
+        stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
+        // Fans a server error out into one diagnostic per record, keeping each
+        // SQLSTATE and native error rather than flattening them into HY000.
+        post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+        post_tds_info_messages(&mut stmt_state, &info_messages);
         return SQL_ERROR;
     }
+
+    let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
 
     if rows_filled == 0 {
         stmt_state.reset_row_stream();
@@ -344,11 +430,14 @@ fn fill_rowset(
         stmt_state.reset_row_stream();
     }
 
-    if worst == RowOutcome::Error {
-        post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+    // Report why the rowset was imperfect with the SQLSTATE that value would
+    // have produced through SQLGetData, rather than a blanket truncation
+    // warning. Per-row detail lives in the row status array.
+    if let Some(issue) = worst.issue() {
+        issue.post(&mut stmt_state);
         return SQL_SUCCESS_WITH_INFO;
     }
-    if worst == RowOutcome::Info || has_server_info {
+    if has_server_info {
         return SQL_SUCCESS_WITH_INFO;
     }
     SQL_SUCCESS
@@ -375,60 +464,87 @@ unsafe fn write_row_status(row_status_ptr: *mut SqlUSmallInt, row: SqlULen, stat
 
 /// Byte stride between consecutive elements of a column-wise bound array.
 ///
-/// ODBC lets an application pass `BufferLength` 0 for a fixed-width target,
-/// where the C type's own size is the stride; the character and binary targets
-/// always carry a real buffer length.
+/// ODBC ignores `BufferLength` for a fixed-width target — an application may
+/// legitimately pass anything, including 0 — so the stride there comes from the
+/// C type. Only the character and binary targets are sized by the application.
 fn element_stride(target_type: SqlSmallInt, buffer_length: SqlLen) -> usize {
-    if buffer_length > 0 {
-        return buffer_length as usize;
-    }
     match target_type {
         SQL_C_BIT | SQL_C_TINYINT | SQL_C_STINYINT | SQL_C_UTINYINT => 1,
         SQL_C_SSHORT | SQL_C_USHORT => 2,
         SQL_C_SLONG | SQL_C_ULONG | SQL_C_FLOAT => 4,
         SQL_C_SBIGINT | SQL_C_UBIGINT | SQL_C_DOUBLE => 8,
         SQL_C_GUID => 16,
-        SQL_C_TYPE_DATE => 6,
-        SQL_C_TYPE_TIME => 6,
+        SQL_C_TYPE_DATE | SQL_C_TYPE_TIME => 6,
         SQL_C_TYPE_TIMESTAMP => 16,
         SQL_C_SS_TIME2 => 12,
         SQL_C_SS_TIMESTAMPOFFSET => 20,
-        _ => 0,
+        // Character and binary: the application sizes the slot.
+        _ => buffer_length.max(0) as usize,
     }
+}
+
+/// Current value of `SQL_ATTR_ROW_BIND_OFFSET_PTR`, in bytes.
+///
+/// ODBC adds this to the data and length/indicator base addresses alike, so an
+/// application is expected to use a whole-rowset displacement that keeps both
+/// naturally aligned; a ragged offset would misalign the indicator write.
+///
+/// # Safety
+/// `ptr` must be null or point to a readable `SqlULen`.
+unsafe fn read_bind_offset(ptr: *mut SqlULen) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+    unsafe { ptr.read() }
 }
 
 /// Writes one column value into its bound buffer slot for row `row_index`.
 ///
 /// # Safety
-/// The binding's pointers must address at least `row_index + 1` elements, which
-/// is the contract `SQLBindCol` places on the application together with
-/// `SQL_ATTR_ROW_ARRAY_SIZE`.
+/// The binding's pointers, displaced by `bind_offset`, must address at least
+/// `row_index + 1` elements — the contract `SQLBindCol` places on the
+/// application together with `SQL_ATTR_ROW_ARRAY_SIZE`.
 unsafe fn deliver_bound(
     binding: &ColumnBinding,
     row_index: usize,
+    bind_offset: usize,
     value: &ColumnValues,
 ) -> RowOutcome {
     let stride = element_stride(binding.target_type, binding.buffer_length);
     if stride == 0 {
-        return RowOutcome::Error;
+        return RowOutcome::Error(RowIssue::Unsupported);
     }
 
+    // SQL_ATTR_ROW_BIND_OFFSET_PTR displaces both bases by the same byte count.
     let indicator = if binding.strlen_or_ind_ptr.is_null() {
         std::ptr::null_mut()
     } else {
-        unsafe { binding.strlen_or_ind_ptr.add(row_index) }
+        unsafe {
+            (binding.strlen_or_ind_ptr as *mut u8)
+                .add(bind_offset)
+                .cast::<SqlLen>()
+                .add(row_index)
+        }
     };
+
+    let is_null = matches!(value, ColumnValues::Null);
+    if is_null && indicator.is_null() {
+        // There is nowhere to report the NULL, and leaving the slot untouched
+        // would read back as the previous row's value.
+        return RowOutcome::Error(RowIssue::IndicatorRequired);
+    }
 
     if binding.target_value_ptr.is_null() {
         // Bound for its indicator only; report the length without a data write.
-        if matches!(value, ColumnValues::Null) {
+        if is_null {
             unsafe { write_if_some(indicator, SQL_NULL_DATA) };
         }
         return RowOutcome::Success;
     }
-    let slot = unsafe { (binding.target_value_ptr as *mut u8).add(row_index * stride) };
+    let slot =
+        unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
 
-    if matches!(value, ColumnValues::Null) {
+    if is_null {
         unsafe { write_if_some(indicator, SQL_NULL_DATA) };
         // A character target still gets a terminator so the slot does not read
         // back as whatever the previous row left there.
@@ -446,20 +562,24 @@ unsafe fn deliver_bound(
             unsafe { convert_typed_c(value, binding.target_type, slot as SqlPointer, indicator) };
         return match converted {
             Ok(ConvOk::Exact) => RowOutcome::Success,
-            Ok(ConvOk::Truncated) => RowOutcome::Info,
-            Err(ConvError::NotHandledHere) | Err(_) => RowOutcome::Error,
+            Ok(ConvOk::Truncated) => RowOutcome::Info(RowIssue::FractionalTruncated),
+            Err(ConvError::OutOfRange) => RowOutcome::Error(RowIssue::OutOfRange),
+            Err(ConvError::Restricted) => RowOutcome::Error(RowIssue::Restricted),
+            Err(ConvError::InvalidCharacterValue) => RowOutcome::Error(RowIssue::InvalidCharacter),
+            Err(ConvError::NotHandledHere) => RowOutcome::Error(RowIssue::Unsupported),
         };
     }
 
     if binding.target_type != SQL_C_CHAR && binding.target_type != SQL_C_WCHAR {
         // SQL_C_BINARY delivery is still unimplemented (AB#47239); anything else
         // is an unsupported target.
-        return RowOutcome::Error;
+        return RowOutcome::Error(RowIssue::Unsupported);
     }
 
     let text = match column_value_to_text(value) {
         Ok(t) => t,
-        Err(TextError::Malformed) | Err(TextError::Unsupported) => return RowOutcome::Error,
+        Err(TextError::Malformed) => return RowOutcome::Error(RowIssue::InvalidCharacter),
+        Err(TextError::Unsupported) => return RowOutcome::Error(RowIssue::Unsupported),
     };
 
     let buf_elements = char_buf_elements(binding.target_type, stride);
@@ -468,14 +588,14 @@ unsafe fn deliver_bound(
         unsafe { write_if_some(indicator, (utf16.len() * 2) as SqlLen) };
         let truncated = unsafe { copy_with_nul(slot as *mut SqlWChar, buf_elements, &utf16) };
         if truncated {
-            return RowOutcome::Info;
+            return RowOutcome::Info(RowIssue::StringTruncated);
         }
     } else {
         let bytes = text.as_bytes();
         unsafe { write_if_some(indicator, bytes.len() as SqlLen) };
         let truncated = unsafe { copy_with_nul(slot, buf_elements, bytes) };
         if truncated {
-            return RowOutcome::Info;
+            return RowOutcome::Info(RowIssue::StringTruncated);
         }
     }
     RowOutcome::Success
@@ -497,12 +617,15 @@ mod tests {
 
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_SLONG, SQL_FETCH_ABSOLUTE, SQL_FETCH_FIRST, SQL_FETCH_LAST, SQL_FETCH_PRIOR,
-        SQL_FETCH_RELATIVE,
+        SQL_C_BINARY, SQL_C_SLONG, SQL_FETCH_ABSOLUTE, SQL_FETCH_FIRST, SQL_FETCH_LAST,
+        SQL_FETCH_PRIOR, SQL_FETCH_RELATIVE,
     };
     use crate::api::sqlstate::SQLSTATE_HY106;
+    use crate::api::sqlstate::{ERR_CONNECTION_BUSY, SQLSTATE_24000, SQLSTATE_HY000};
+    use crate::handles::dbc::DbcHandle;
     use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
     use crate::test_support::TestHandles;
+    use mssql_tds::test_client_support::int_columns;
 
     fn binding(
         column_number: SqlUSmallInt,
@@ -614,7 +737,7 @@ mod tests {
             ind.as_mut_ptr(),
         );
         for (row, value) in [10i32, 20, 30].iter().enumerate() {
-            let outcome = unsafe { deliver_bound(&b, row, &ColumnValues::Int(*value)) };
+            let outcome = unsafe { deliver_bound(&b, row, 0, &ColumnValues::Int(*value)) };
             assert!(matches!(outcome, RowOutcome::Success));
         }
         assert_eq!(buf, [10, 20, 30, 0]);
@@ -634,7 +757,7 @@ mod tests {
             0,
             ind.as_mut_ptr(),
         );
-        let outcome = unsafe { deliver_bound(&b, 1, &ColumnValues::Null) };
+        let outcome = unsafe { deliver_bound(&b, 1, 0, &ColumnValues::Null) };
         assert!(matches!(outcome, RowOutcome::Success));
         assert_eq!(ind[1], SQL_NULL_DATA);
         assert_eq!(buf[1], 7, "a NULL must not disturb the data slot");
@@ -654,8 +777,11 @@ mod tests {
             ind.as_mut_ptr(),
         );
         let value = ColumnValues::Int(1234567890);
-        let outcome = unsafe { deliver_bound(&b, 0, &value) };
-        assert!(matches!(outcome, RowOutcome::Info));
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &value) };
+        assert!(matches!(
+            outcome,
+            RowOutcome::Info(RowIssue::StringTruncated)
+        ));
         // The indicator reports the untruncated length.
         assert_eq!(ind[0], 10);
         assert_eq!(&buf[..7], b"1234567");
@@ -667,9 +793,226 @@ mod tests {
     fn indicator_only_binding_reports_null_without_writing_data() {
         let mut ind = [0 as SqlLen; 1];
         let b = binding(1, SQL_C_SLONG, ptr::null_mut(), 0, ind.as_mut_ptr());
-        let outcome = unsafe { deliver_bound(&b, 0, &ColumnValues::Null) };
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Null) };
         assert!(matches!(outcome, RowOutcome::Success));
         assert_eq!(ind[0], SQL_NULL_DATA);
+    }
+
+    /// A drained cursor is not an error: the result set ended on an earlier
+    /// fetch and the cursor stays open until it is explicitly closed. The rowset
+    /// counters still have to be written so the caller sees zero rows.
+    #[test]
+    fn fetch_after_the_cursor_drained_reports_an_empty_rowset() {
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        let mut rows_fetched: SqlULen = 999;
+        let mut status = [SQL_ROW_SUCCESS; 3];
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.row_array_size = 3;
+            s.rows_fetched_ptr = &mut rows_fetched;
+            s.row_status_ptr = status.as_mut_ptr();
+            s.column_metadata = int_columns(1);
+        }
+        // active_stmt stays None: an earlier fetch drained the connection.
+        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        assert_eq!(rc, SQL_NO_DATA);
+        assert_eq!(rows_fetched, 0);
+        assert_eq!(status, [SQL_ROW_NOROW; 3]);
+    }
+
+    /// The connection can only serve one statement's results at a time.
+    #[test]
+    fn fetch_while_another_statement_owns_the_connection_is_rejected() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other_stmt = h.alloc_extra_stmt();
+        open_cursor(&h);
+        {
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let mut d = dbc.inner.lock().unwrap();
+            d.active_stmt = Some(other_stmt);
+        }
+        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        assert_eq!(rc, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        assert_eq!(
+            s.diag_records.last().unwrap().sql_state,
+            ERR_CONNECTION_BUSY.state
+        );
+    }
+
+    /// A statement positioned on a no-row result (DDL / DML / PRINT) has no
+    /// columns to fetch, which is 24000 rather than an empty rowset.
+    #[test]
+    fn fetch_on_a_no_column_result_is_a_cursor_state_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        {
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let mut d = dbc.inner.lock().unwrap();
+            d.active_stmt = Some(h.stmt);
+        }
+        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        assert_eq!(rc, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        // No TDS client is attached either, so the no-client guard fires first;
+        // both are cursor-state failures rather than a silent empty rowset.
+        assert!(matches!(
+            s.diag_records.last().unwrap().sql_state,
+            SQLSTATE_HY000 | SQLSTATE_24000
+        ));
+    }
+
+    /// The exported entry point is what the Driver Manager calls, so it needs
+    /// its own guard against a null handle.
+    #[test]
+    fn the_exported_entry_point_rejects_a_null_handle() {
+        let rc =
+            unsafe { crate::api::exports::SQLFetchScroll(std::ptr::null_mut(), SQL_FETCH_NEXT, 0) };
+        assert_eq!(rc, SQL_INVALID_HANDLE);
+    }
+
+    /// ODBC ignores BufferLength for a fixed-width target, so the stride has to
+    /// come from the C type. Honouring a bogus length would place later rows
+    /// outside the application's array.
+    #[test]
+    fn fixed_width_stride_ignores_the_buffer_length() {
+        // A caller that passes the whole array size rather than one element.
+        assert_eq!(element_stride(SQL_C_SLONG, 400), 4);
+        assert_eq!(element_stride(SQL_C_SBIGINT, 1), 8);
+        assert_eq!(element_stride(SQL_C_TYPE_TIMESTAMP, 999), 16);
+        // Character and binary targets are sized by the application.
+        assert_eq!(element_stride(SQL_C_CHAR, 32), 32);
+        assert_eq!(element_stride(SQL_C_WCHAR, 64), 64);
+        // A negative length cannot become a huge stride.
+        assert_eq!(element_stride(SQL_C_CHAR, -8), 0);
+    }
+
+    /// NULL with nowhere to report it is 22002: leaving the slot untouched
+    /// would read back as the previous row's value with no way to tell.
+    #[test]
+    fn null_without_an_indicator_is_an_error() {
+        let mut buf = [7i32; 1];
+        let b = binding(
+            1,
+            SQL_C_SLONG,
+            buf.as_mut_ptr() as SqlPointer,
+            0,
+            ptr::null_mut(),
+        );
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Null) };
+        assert_eq!(outcome.issue(), Some(RowIssue::IndicatorRequired));
+        assert_eq!(outcome.status(), SQL_ROW_ERROR);
+        assert_eq!(
+            buf[0], 7,
+            "the stale value is left visible, not overwritten"
+        );
+    }
+
+    /// A non-NULL value still delivers without an indicator; only NULL needs one.
+    #[test]
+    fn a_value_without_an_indicator_still_delivers() {
+        let mut buf = [0i32; 1];
+        let b = binding(
+            1,
+            SQL_C_SLONG,
+            buf.as_mut_ptr() as SqlPointer,
+            0,
+            ptr::null_mut(),
+        );
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Int(42)) };
+        assert!(matches!(outcome, RowOutcome::Success));
+        assert_eq!(buf[0], 42);
+    }
+
+    /// SQL_ATTR_ROW_BIND_OFFSET_PTR displaces the data and indicator bases by
+    /// the same byte count, so the application can move a whole rowset.
+    #[test]
+    fn the_bind_offset_displaces_both_bases() {
+        let mut buf = [0i32; 4];
+        let mut ind = [0 as SqlLen; 4];
+        let b = binding(
+            1,
+            SQL_C_SLONG,
+            buf.as_mut_ptr() as SqlPointer,
+            0,
+            ind.as_mut_ptr(),
+        );
+        // A whole-rowset displacement, which is what the attribute is for: a
+        // byte count that leaves both arrays naturally aligned.
+        let offset = std::mem::size_of::<SqlLen>();
+        let outcome = unsafe { deliver_bound(&b, 0, offset, &ColumnValues::Int(99)) };
+        assert!(matches!(outcome, RowOutcome::Success));
+        assert_eq!(buf[0], 0, "the offset must skip past the first slots");
+        assert_eq!(buf[offset / std::mem::size_of::<i32>()], 99);
+        assert_eq!(ind[0], 0, "the indicator base moves too");
+        assert_eq!(ind[offset / std::mem::size_of::<SqlLen>()], 4);
+    }
+
+    #[test]
+    fn a_zero_offset_reads_as_zero_from_a_null_pointer() {
+        assert_eq!(unsafe { read_bind_offset(ptr::null_mut()) }, 0);
+        let mut value: SqlULen = 24;
+        assert_eq!(unsafe { read_bind_offset(&mut value) }, 24);
+    }
+
+    /// Each conversion failure keeps its own SQLSTATE rather than being
+    /// flattened into one truncation warning.
+    #[test]
+    fn conversion_failures_map_to_their_own_sqlstate() {
+        let mut buf = [0u8; 1];
+        let mut ind = [0 as SqlLen; 1];
+        // A bigint that cannot fit a tinyint target is 22003.
+        let b = binding(
+            1,
+            SQL_C_TINYINT,
+            buf.as_mut_ptr() as SqlPointer,
+            0,
+            ind.as_mut_ptr(),
+        );
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::BigInt(i64::MAX)) };
+        assert_eq!(outcome.issue(), Some(RowIssue::OutOfRange));
+
+        // A target this driver does not deliver is HYC00, not a truncation.
+        let mut bin = [0u8; 8];
+        let unsupported = binding(
+            1,
+            SQL_C_BINARY,
+            bin.as_mut_ptr() as SqlPointer,
+            8,
+            ind.as_mut_ptr(),
+        );
+        let outcome = unsafe { deliver_bound(&unsupported, 0, 0, &ColumnValues::Int(1)) };
+        assert_eq!(outcome.issue(), Some(RowIssue::Unsupported));
+    }
+
+    /// Each issue posts the SQLSTATE the same value would have produced through
+    /// SQLGetData.
+    #[test]
+    fn each_issue_posts_its_own_sqlstate() {
+        let cases: &[(RowIssue, [u8; 5])] = &[
+            (RowIssue::StringTruncated, *b"01004"),
+            (RowIssue::FractionalTruncated, *b"01S07"),
+            (RowIssue::OutOfRange, *b"22003"),
+            (RowIssue::Restricted, *b"07006"),
+            (RowIssue::InvalidCharacter, *b"22018"),
+            (RowIssue::IndicatorRequired, *b"22002"),
+            (RowIssue::Unsupported, *b"HYC00"),
+        ];
+        for (issue, state) in cases {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            issue.post(&mut s);
+            assert_eq!(
+                s.diag_records.last().unwrap().sql_state,
+                *state,
+                "{issue:?}"
+            );
+        }
     }
 
     /// The rows the fetch did not fill must be marked, or the application reads
@@ -692,20 +1035,31 @@ mod tests {
 
     #[test]
     fn row_status_and_outcome_merge_keeps_the_worst() {
+        let info = RowOutcome::Info(RowIssue::StringTruncated);
+        let err = RowOutcome::Error(RowIssue::OutOfRange);
         assert_eq!(RowOutcome::Success.status(), SQL_ROW_SUCCESS);
-        assert_eq!(RowOutcome::Info.status(), SQL_ROW_SUCCESS_WITH_INFO);
-        assert_eq!(RowOutcome::Error.status(), SQL_ROW_ERROR);
+        assert_eq!(info.status(), SQL_ROW_SUCCESS_WITH_INFO);
+        assert_eq!(err.status(), SQL_ROW_ERROR);
         assert!(matches!(
-            RowOutcome::Success.merge(RowOutcome::Info),
-            RowOutcome::Info
+            RowOutcome::Success.merge(info),
+            RowOutcome::Info(_)
+        ));
+        assert!(matches!(info.merge(err), RowOutcome::Error(_)));
+        assert!(matches!(
+            err.merge(RowOutcome::Success),
+            RowOutcome::Error(_)
+        ));
+        // An issue survives being merged with a clean row from either side.
+        assert!(matches!(
+            info.merge(RowOutcome::Success),
+            RowOutcome::Info(_)
         ));
         assert!(matches!(
-            RowOutcome::Info.merge(RowOutcome::Error),
-            RowOutcome::Error
+            RowOutcome::Success.merge(RowOutcome::Success),
+            RowOutcome::Success
         ));
-        assert!(matches!(
-            RowOutcome::Error.merge(RowOutcome::Success),
-            RowOutcome::Error
-        ));
+        // The reason survives the merge so the statement can report it.
+        assert_eq!(info.merge(err).issue(), Some(RowIssue::OutOfRange));
+        assert_eq!(RowOutcome::Success.issue(), None);
     }
 }

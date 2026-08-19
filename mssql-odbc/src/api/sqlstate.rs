@@ -24,6 +24,7 @@ pub(crate) const SQLSTATE_08007: [u8; 5] = *b"08007";
 /// Communication link failure — the connection to the server broke, so a
 /// connection pool must discard the connection rather than reuse it.
 pub(crate) const SQLSTATE_08S01: [u8; 5] = *b"08S01";
+pub(crate) const SQLSTATE_22002: [u8; 5] = *b"22002";
 pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
 pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
@@ -145,6 +146,12 @@ pub(crate) const ERR_INVALID_PARAM_COLUMN_SIZE: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_PARAM_DECIMAL_DIGITS: DiagMsg = DiagMsg {
     state: SQLSTATE_HY104,
     text: "Invalid parameter DecimalDigits for the SQL type",
+};
+/// A bound column delivered NULL but the application supplied no indicator to
+/// receive it, so the value cannot be reported at all.
+pub(crate) const ERR_INDICATOR_REQUIRED: DiagMsg = DiagMsg {
+    state: SQLSTATE_22002,
+    text: "Indicator variable required but not supplied",
 };
 pub(crate) const ERR_NUMERIC_OUT_OF_RANGE: DiagMsg = DiagMsg {
     state: SQLSTATE_22003,

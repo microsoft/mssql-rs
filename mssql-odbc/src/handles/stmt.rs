@@ -162,6 +162,11 @@ pub(crate) struct StmtState {
     /// Row binding orientation (`SQL_ATTR_ROW_BIND_TYPE`): `SQL_BIND_BY_COLUMN`
     /// (0) for column-wise arrays, otherwise a row-struct byte size.
     pub(crate) row_bind_type: SqlULen,
+    /// Application-supplied byte offset added to every bound column's data and
+    /// indicator pointer at fetch time (`SQL_ATTR_ROW_BIND_OFFSET_PTR`); null
+    /// when unset. Read at fetch rather than at bind, so the application can
+    /// move the whole rowset by updating the pointed-to value.
+    pub(crate) row_bind_offset_ptr: *mut SqlULen,
     /// Columns bound by `SQLBindCol`, in binding order. A column appears at
     /// most once: rebinding replaces its entry, unbinding removes it. Bindings
     /// outlive a result set, so they are cleared by `SQLFreeStmt(SQL_UNBIND)`
@@ -330,6 +335,7 @@ impl StmtHandle {
                 rows_fetched_ptr: std::ptr::null_mut(),
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                row_bind_offset_ptr: std::ptr::null_mut(),
                 bindings: Vec::new(),
                 state_flags: 0,
             }),
@@ -366,5 +372,82 @@ impl Drop for StmtHandle {
         for raw in [self.ard, self.apd, self.ird, self.ipd] {
             unsafe { free_handle::<DescHandle>(raw) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG};
+
+    fn binding(column_number: SqlUSmallInt, target_type: SqlSmallInt) -> ColumnBinding {
+        ColumnBinding {
+            column_number,
+            target_type,
+            target_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: std::ptr::null_mut(),
+        }
+    }
+
+    /// Runs `f` against a fresh statement's state. The handle owns descriptor
+    /// allocations it frees on drop, so it has to outlive the borrow.
+    fn with_state(f: impl FnOnce(&mut StmtState)) {
+        let handle = StmtHandle::new(std::ptr::null_mut());
+        let mut state = handle.inner.lock().unwrap();
+        f(&mut state);
+    }
+
+    /// A column can only be bound once, so rebinding replaces the entry rather
+    /// than shadowing it — otherwise the fetch loop would write the column
+    /// twice, once through a stale pointer.
+    #[test]
+    fn rebinding_a_column_replaces_its_entry() {
+        with_state(|s| {
+            s.set_binding(binding(1, SQL_C_SLONG));
+            s.set_binding(binding(2, SQL_C_SLONG));
+            s.set_binding(binding(1, SQL_C_CHAR));
+
+            assert_eq!(s.bindings.len(), 2);
+            let first = s.bindings.iter().find(|b| b.column_number == 1).unwrap();
+            assert_eq!(first.target_type, SQL_C_CHAR);
+        });
+    }
+
+    /// Unbinding one column leaves the others in place; this is what SQLBindCol
+    /// does with a null TargetValuePtr.
+    #[test]
+    fn clearing_one_binding_leaves_the_others() {
+        with_state(|s| {
+            s.set_binding(binding(1, SQL_C_SLONG));
+            s.set_binding(binding(2, SQL_C_SLONG));
+            s.clear_binding(1);
+
+            assert_eq!(s.bindings.len(), 1);
+            assert_eq!(s.bindings[0].column_number, 2);
+            // Unbinding a column that was never bound is a no-op, not a panic.
+            s.clear_binding(99);
+            assert_eq!(s.bindings.len(), 1);
+        });
+    }
+
+    /// SQLFreeStmt(SQL_UNBIND) drops the whole table.
+    #[test]
+    fn clearing_all_bindings_empties_the_table() {
+        with_state(|s| {
+            s.set_binding(binding(1, SQL_C_SLONG));
+            s.set_binding(binding(2, SQL_C_SLONG));
+            s.clear_bindings();
+            assert!(s.bindings.is_empty());
+        });
+    }
+
+    /// Bindings start empty, which is what makes an unbound fetch legal.
+    #[test]
+    fn a_fresh_statement_has_no_bindings() {
+        with_state(|s| {
+            assert!(s.bindings.is_empty());
+            assert!(s.row_bind_offset_ptr.is_null());
+        });
     }
 }
