@@ -47,7 +47,8 @@ use super::exec_common::{
     claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
 };
 use super::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt,
+    SqlWChar,
 };
 use super::sqlstate::{ERR_INVALID_CURSOR_STATE, post_diag};
 use super::txn::begin_transaction_if_manual;
@@ -86,6 +87,12 @@ unsafe fn opt_arg(ptr: *const SqlWChar, len: SqlSmallInt) -> Arg {
     if ptr.is_null() {
         None
     } else {
+        // The DM validates this before calling the driver (see SQLTables/
+        // SQLColumns/... spec); matches the identical guard in prepare.rs.
+        debug_assert!(
+            len == SQL_NTS || len >= 0,
+            "catalog function: invalid argument length ({len}) — DM should have rejected this"
+        );
         Some(unsafe { read_utf16(ptr, len) })
     }
 }
@@ -1505,7 +1512,7 @@ mod tests {
                 std::ptr::null(),
                 0,
                 name.as_ptr(),
-                SQL_NTS_TEST,
+                SQL_NTS,
                 std::ptr::null(),
                 0,
             )
@@ -1635,7 +1642,7 @@ mod tests {
                     std::ptr::null(),
                     0,
                     name.as_ptr(),
-                    SQL_NTS_TEST,
+                    SQL_NTS,
                     std::ptr::null(),
                     0,
                 )
@@ -1798,8 +1805,4 @@ mod tests {
             );
         }
     }
-
-    /// `SQL_NTS` re-declared locally to avoid pulling in the full
-    /// `odbc_types` glob just for this constant in tests.
-    const SQL_NTS_TEST: SqlSmallInt = super::super::odbc_types::SQL_NTS;
 }
