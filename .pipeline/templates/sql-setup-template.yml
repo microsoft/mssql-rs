@@ -292,6 +292,7 @@ steps:
 
       if [ "$ready" != true ]; then
         echo "SQL Server failed readiness checks"
+        set +e
         docker ps -a
         docker inspect sqlserver --format \
           'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}'
