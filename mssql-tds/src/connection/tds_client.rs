@@ -196,6 +196,22 @@ pub enum CursorColumn {
     RowEnded,
 }
 
+/// Where a connection stands in the RESETCONNECTION handshake (MS-TDS
+/// 2.2.3.1.2). The bit is armed on the connection and consumed by the packet
+/// writer, so confirming that the server honored it needs all three states
+/// rather than a single "pending" flag: only [`AwaitingAck`](Self::AwaitingAck)
+/// means an acknowledgement is genuinely owed and its absence is a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetAckState {
+    /// No reset armed or outstanding.
+    Idle,
+    /// Armed on the writer; no request has carried the bit to the server yet.
+    Armed,
+    /// A request carried the bit; its response must contain the
+    /// `ResetConnection` ENVCHANGE.
+    AwaitingAck,
+}
+
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -206,16 +222,11 @@ pub struct TdsClient {
     pub(crate) negotiated_settings: NegotiatedSettings,
     pub(crate) execution_context: ExecutionContext,
     pub(crate) recovery_context: Box<RecoveryContext>,
-    /// Set by [`prepare_reset_connection`](TdsClient::prepare_reset_connection)
-    /// and cleared by
-    /// [`on_reset_connection_ack`](TdsClient::on_reset_connection_ack). While
-    /// true, a RESETCONNECTION bit has been armed but the server has not yet
-    /// confirmed it. A pool uses [`reset_pending`](TdsClient::reset_pending)
-    /// after the request that carries the bit to verify the reset was actually
-    /// processed, rather than inferring it from the request succeeding. A
-    /// successful reconnect also clears it because the fresh session supersedes
-    /// the reset.
-    reset_pending: bool,
+    /// Where this connection stands in the RESETCONNECTION handshake. Driven by
+    /// [`prepare_reset_connection`](TdsClient::prepare_reset_connection),
+    /// [`observe_response_token`](TdsClient::observe_response_token), and
+    /// [`on_reset_connection_ack`](TdsClient::on_reset_connection_ack).
+    reset_state: ResetAckState,
 
     // pub(crate) batch_result: Option<BatchResult<'static>>,
     pub(crate) current_metadata: Option<Arc<ColMetadataToken>>,
@@ -342,7 +353,7 @@ impl TdsClient {
             negotiated_settings,
             execution_context,
             recovery_context: Box::new(recovery_context),
-            reset_pending: false,
+            reset_state: ResetAckState::Idle,
             current_metadata: None,
             current_decryptor: None,
             count_map: HashMap::new(),
@@ -480,36 +491,12 @@ impl TdsClient {
                         return Err(validation_err);
                     }
 
-                    // Replace connection state
-                    self.transport = new_transport;
-                    self.negotiated_settings = new_settings;
-                    self.execution_context = new_exec_ctx;
-
-                    // Reset per-request state
-                    self.current_metadata = None;
-                    self.count_map.clear();
-                    self.return_values.clear();
-                    self.info_messages.clear();
-                    self.info_messages.extend(info_messages);
-                    // Prepared-statement handles belong to the dead session and
-                    // do not survive a reconnect, so drop them and their cached
-                    // Always Encrypted metadata.
-                    self.clear_session_bound_caches();
-                    self.current_result_set_has_been_read_till_end = false;
-                    self.remaining_request_timeout = None;
-                    self.cancel_handle = None;
-
-                    // Reset session state table for the new session
-                    self.recovery_context.session_state_table.reset();
-
-                    // A pending reset is satisfied — more completely than
-                    // RESETCONNECTION would — by the fresh login: the new
-                    // session is already at its login defaults, and the armed
-                    // header bit died with the old transport, so no
-                    // acknowledgement is coming. Leaving the flag set would make
-                    // the carrying request report the reset as unacknowledged
-                    // and discard a healthy, brand-new connection.
-                    self.reset_pending = false;
+                    self.adopt_recovered_session(
+                        new_transport,
+                        new_settings,
+                        new_exec_ctx,
+                        info_messages,
+                    );
 
                     self.recovery_context.recovery_count += 1;
                     info!(
@@ -535,6 +522,48 @@ impl TdsClient {
         })
     }
 
+    /// Adopts a freshly recovered session: swaps in the new transport, settings,
+    /// and execution context, then drops everything bound to the dead one.
+    ///
+    /// Split out of [`reconnect`](Self::reconnect) so the invariants a recovered
+    /// session must satisfy can be asserted without a live server.
+    fn adopt_recovered_session(
+        &mut self,
+        transport: AnyTransport,
+        settings: NegotiatedSettings,
+        execution_context: ExecutionContext,
+        info_messages: Vec<SqlInfoMessage>,
+    ) {
+        self.transport = transport;
+        self.negotiated_settings = settings;
+        self.execution_context = execution_context;
+
+        // Reset per-request state
+        self.current_metadata = None;
+        self.count_map.clear();
+        self.return_values.clear();
+        self.info_messages.clear();
+        self.info_messages.extend(info_messages);
+        // Prepared-statement handles belong to the dead session and do not
+        // survive a reconnect, so drop them and their cached Always Encrypted
+        // metadata.
+        self.clear_session_bound_caches();
+        self.current_result_set_has_been_read_till_end = false;
+        self.remaining_request_timeout = None;
+        self.cancel_handle = None;
+
+        // Reset session state table for the new session
+        self.recovery_context.session_state_table.reset();
+
+        // A pending reset is satisfied — more completely than RESETCONNECTION
+        // would — by the fresh login: the new session is already at its login
+        // defaults, and the armed header bit died with the old transport, so no
+        // acknowledgement is coming. Leaving the state set would make the next
+        // response report the reset as unacknowledged and discard a healthy,
+        // brand-new connection.
+        self.reset_state = ResetAckState::Idle;
+    }
+
     /// Clears the caches bound to a specific server session: managed
     /// prepared-statement handles, their cached Always Encrypted describe
     /// metadata, and any in-flight `sp_prepexec` capture state. Shared by the
@@ -557,23 +586,75 @@ impl TdsClient {
     /// processing path, including resets not coordinated by the ODBC checkout
     /// flow.
     fn on_reset_connection_ack(&mut self) {
-        self.reset_pending = false;
+        self.reset_state = ResetAckState::Idle;
         self.recovery_context.session_state_table.reset();
         self.clear_session_bound_caches();
         self.negotiated_settings.restore_login_defaults();
     }
 
+    /// Advances reset-acknowledgement tracking for one token just read from a
+    /// response, and fails the connection when the acknowledgement is provably
+    /// missing.
+    ///
+    /// The packet writer — not this client — consumes the armed mode, so the
+    /// only way to learn that the bit truly reached the wire is to ask the
+    /// writer. That is done solely while this client still believes a reset is
+    /// armed, so a dispatch record left behind by a response that was never
+    /// read cannot be charged to an unrelated later request.
+    ///
+    /// SQL Server resets the session *before* it parses the carrying request,
+    /// so the `ResetConnection` ENVCHANGE precedes everything that request
+    /// produces. The first token that is evidence the request actually ran is
+    /// therefore the last moment the acknowledgement could still have arrived,
+    /// and its absence means the session was never reset. ERROR is exempt so a
+    /// server diagnostic reaches the caller instead of being masked by this
+    /// one; a reset still unacknowledged after it is caught on the next token.
+    fn observe_response_token(&mut self, token: &Tokens) -> TdsResult<()> {
+        if self.reset_state == ResetAckState::Armed
+            && self.transport.as_writer().take_reset_dispatched()
+        {
+            self.reset_state = ResetAckState::AwaitingAck;
+        }
+
+        if self.reset_state != ResetAckState::AwaitingAck || !Self::proves_request_ran(token) {
+            return Ok(());
+        }
+
+        warn!(
+            ?token,
+            "Request carrying the RESETCONNECTION bit produced output without a ResetConnection \
+             ENVCHANGE; marking connection dead"
+        );
+        // Clearing first keeps the failure to a single report: the caller's
+        // error drain reads more tokens on the same dead connection.
+        self.reset_state = ResetAckState::Idle;
+        self.transport.mark_known_dead();
+        Err(crate::error::Error::ConnectionResetNotAcknowledged)
+    }
+
+    /// Whether a token proves the server started executing the request, and so
+    /// is past the point where a `ResetConnection` ENVCHANGE could still
+    /// arrive. ENVCHANGE, INFO, and SESSIONSTATE can legitimately precede or
+    /// accompany the acknowledgement; ERROR is treated as inconclusive so the
+    /// server's own diagnostic wins.
+    fn proves_request_ran(token: &Tokens) -> bool {
+        !matches!(
+            token,
+            Tokens::EnvChange(_) | Tokens::Info(_) | Tokens::SessionState(_) | Tokens::Error(_)
+        )
+    }
+
     /// True when a RESETCONNECTION bit has been armed but the server has not yet
     /// acknowledged it with a `ResetConnection` ENVCHANGE.
     ///
-    /// A connection pool checks this *after* the request that carries the bit
-    /// (for a client-side pool, the checkout `SET TRANSACTION ISOLATION LEVEL`)
-    /// to confirm the reset was genuinely processed. A request completing
-    /// successfully is not evidence on its own: without the ENVCHANGE the server
-    /// never reset the session, so the connection must be discarded rather than
-    /// handed to the next borrower.
+    /// The client verifies this itself: the response to the request that carried
+    /// the bit must contain the ENVCHANGE, or the connection is marked dead and
+    /// the request fails with
+    /// [`Error::ConnectionResetNotAcknowledged`](crate::error::Error::ConnectionResetNotAcknowledged).
+    /// This is exposed for observability and for a pool that wants to assert the
+    /// reset has been settled; correctness does not depend on anyone calling it.
     pub fn reset_pending(&self) -> bool {
-        self.reset_pending
+        self.reset_state != ResetAckState::Idle
     }
 
     /// Converts a server `ERROR` token into [`SqlErrorInfo`], marking the
@@ -884,17 +965,20 @@ impl TdsClient {
     /// cached database/language/collation (`sqlcmisc.cpp:2373-2461`); it simply
     /// does not extend it to prepared handles.
     ///
-    /// The acknowledgement is still tracked: [`reset_pending`](Self::reset_pending)
-    /// stays true until the server's `ResetConnection` ENVCHANGE arrives, so the
-    /// caller can verify the reset actually happened once the carrying request
-    /// completes.
+    /// The acknowledgement is verified by the client itself: the response to the
+    /// request that carries the bit must contain the server's `ResetConnection`
+    /// ENVCHANGE. If it does not, that request fails with
+    /// [`Error::ConnectionResetNotAcknowledged`](crate::error::Error::ConnectionResetNotAcknowledged)
+    /// and the connection is marked dead, so a pool cannot hand out a session
+    /// that was never reset. Verification therefore does not depend on the
+    /// consumer issuing any particular request after arming.
     pub fn prepare_reset_connection(&mut self, preserve_transaction: bool) {
         let mode = match preserve_transaction {
             true => ResetConnectionMode::ResetSkipTran,
             false => ResetConnectionMode::Reset,
         };
         self.transport.as_writer().set_reset_mode(mode);
-        self.reset_pending = true;
+        self.reset_state = ResetAckState::Armed;
         // A full reset discards the server-side transaction, so mirror that here.
         // Leaving a stale descriptor would make `has_active_transaction()` report
         // a transaction the carrying request is itself about to destroy, and the
@@ -1329,6 +1413,7 @@ impl TdsClient {
                 )
                 .await?;
             self.update_remaining_timeout(start);
+            self.observe_response_token(&token)?;
 
             match token {
                 Tokens::Done(done) | Tokens::DoneProc(done) | Tokens::DoneInProc(done) => {
@@ -2460,6 +2545,7 @@ impl TdsClient {
                 )
                 .await?;
             self.update_remaining_timeout(start);
+            self.observe_response_token(&token)?;
 
             match token {
                 Tokens::Done(done) | Tokens::DoneProc(done) | Tokens::DoneInProc(done) => {
@@ -2651,6 +2737,7 @@ impl TdsClient {
                 )
                 .await?;
             self.update_remaining_timeout(start);
+            self.observe_response_token(&token)?;
             match token {
                 Tokens::ColMetadata(md) => {
                     info!(?md);
@@ -4578,6 +4665,7 @@ impl TdsClient {
                 )
                 .await?;
             self.update_remaining_timeout(start);
+            self.observe_response_token(&token)?;
 
             match token {
                 Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
@@ -4934,6 +5022,10 @@ mod tests {
         closed: bool,
         pending_tokens: VecDeque<Tokens>,
         reset_mode: ResetConnectionMode,
+        /// Mirrors the production writer's dispatch record so client tests can
+        /// drive acknowledgement verification without a real socket.
+        reset_dispatched: bool,
+
         /// Every byte handed to `send` (request framing + payload), so tests can
         /// assert what was actually written to the wire.
         sent: Arc<std::sync::Mutex<Vec<u8>>>,
@@ -4954,6 +5046,7 @@ mod tests {
                 closed: false,
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
+                reset_dispatched: false,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data: Vec::new(),
                 packet_pos: 0,
@@ -4967,6 +5060,7 @@ mod tests {
                 closed: false,
                 pending_tokens: VecDeque::from(tokens),
                 reset_mode: ResetConnectionMode::None,
+                reset_dispatched: false,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data: Vec::new(),
                 packet_pos: 0,
@@ -4980,6 +5074,7 @@ mod tests {
                 closed: false,
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
+                reset_dispatched: false,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data,
                 packet_pos: 0,
@@ -5097,9 +5192,16 @@ mod tests {
         }
         fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
             self.reset_mode = mode;
+            self.reset_dispatched = false;
         }
         fn take_reset_mode(&mut self) -> ResetConnectionMode {
             std::mem::replace(&mut self.reset_mode, ResetConnectionMode::None)
+        }
+        fn note_reset_dispatched(&mut self) {
+            self.reset_dispatched = true;
+        }
+        fn take_reset_dispatched(&mut self) -> bool {
+            std::mem::replace(&mut self.reset_dispatched, false)
         }
     }
 
@@ -8148,6 +8250,143 @@ mod tests {
             !client.reset_pending(),
             "the ResetConnection ack must clear the pending flag"
         );
+    }
+
+    /// The fail-at-checkout guarantee: a request that carried the
+    /// RESETCONNECTION bit and completed without the server's ENVCHANGE ran
+    /// against a session that was never reset. The client fails that request and
+    /// marks itself dead so a pool discards the connection instead of handing a
+    /// dirty session to the next borrower.
+    #[tokio::test]
+    async fn unacknowledged_reset_fails_the_carrying_request_and_marks_it_dead() {
+        // No ResetConnection ENVCHANGE: the batch just completes.
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+
+        let err = client
+            .execute(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                (),
+            )
+            .await
+            .expect_err("an unacknowledged reset must fail the carrying request");
+
+        assert!(
+            matches!(err, crate::error::Error::ConnectionResetNotAcknowledged),
+            "expected ConnectionResetNotAcknowledged, got {err:?}"
+        );
+        assert!(
+            client.is_connection_dead(),
+            "the connection must be marked dead so the pool discards it"
+        );
+        assert!(
+            !client.reset_pending(),
+            "the failure is reported once; the drain that follows must not repeat it"
+        );
+    }
+
+    /// A row-returning carrier fails at its COLMETADATA rather than waiting for
+    /// the rows to be read: the reset ENVCHANGE precedes everything the request
+    /// produces, so the first result-set token already proves it never arrived.
+    #[tokio::test]
+    async fn unacknowledged_reset_fails_a_row_returning_carrier_at_its_metadata() {
+        let mut client = create_test_client_with_tokens(vec![empty_col_metadata(), done_no_more()]);
+        client.prepare_reset_connection(false);
+
+        let err = client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect_err("an unacknowledged reset must fail the carrying request");
+
+        assert!(
+            matches!(err, crate::error::Error::ConnectionResetNotAcknowledged),
+            "expected ConnectionResetNotAcknowledged, got {err:?}"
+        );
+        assert!(client.is_connection_dead());
+    }
+
+    /// The server's own diagnostic must win over the reset verdict: a request
+    /// that fails outright tells the caller something more actionable, and the
+    /// unacknowledged reset is still caught on the next token.
+    #[tokio::test]
+    async fn server_error_on_the_carrier_is_not_masked_by_the_reset_verdict() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            done_no_more(),
+        ]);
+        client.prepare_reset_connection(false);
+
+        let err = client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect_err("the server error must surface");
+
+        assert!(
+            matches!(err, crate::error::Error::SqlServerError { .. }),
+            "the server diagnostic must reach the caller, got {err:?}"
+        );
+        assert!(
+            client.is_connection_dead(),
+            "the unacknowledged reset is not lost: the drain that follows the error \
+             still condemns the connection"
+        );
+    }
+
+    /// The bit is armed on the connection but consumed by the packet writer, so
+    /// an arm that never reached the wire owes nothing. This is the shape a
+    /// transparent reconnect leaves behind — the armed bit died with the old
+    /// transport — and it must never condemn the responses that follow.
+    #[tokio::test]
+    async fn armed_reset_that_never_reached_the_wire_condemns_nothing() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+
+        client
+            .drain_stream()
+            .await
+            .expect("a response no reset bit was sent on must not be condemned");
+
+        assert!(
+            !client.is_connection_dead(),
+            "nothing was ever owed, so nothing may be failed"
+        );
+        assert!(
+            client.reset_pending(),
+            "the reset is still armed and will ride the next request"
+        );
+    }
+
+    /// Session recovery supersedes a pending reset: the new login is already at
+    /// the session defaults and the old bit died with the old transport, so no
+    /// acknowledgement is coming. Adopting the recovered session must clear the
+    /// pending reset, or the first response on a healthy new connection would
+    /// report it as unacknowledged and throw the connection away.
+    #[tokio::test]
+    async fn adopting_a_recovered_session_clears_a_pending_reset() {
+        // A server error is inconclusive about the reset, and the stream ends
+        // there — the shape of a session that errored and then dropped — so the
+        // reset is still outstanding when recovery kicks in.
+        let mut client =
+            create_test_client_with_tokens(vec![Tokens::Error(error_token_with_severity(16))]);
+        client.prepare_reset_connection(false);
+        let _ = client.execute("SELECT 1".to_string(), ()).await;
+        assert!(client.reset_pending());
+
+        client.adopt_recovered_session(
+            AnyTransport::dynamic(TestTransport::with_tokens(vec![done_no_more()])),
+            crate::handler::handler_factory::create_test_negotiated_settings_internal(),
+            ExecutionContext::new(),
+            Vec::new(),
+        );
+
+        assert!(
+            !client.reset_pending(),
+            "a fresh login supersedes the reset it can no longer acknowledge"
+        );
+        client
+            .drain_stream()
+            .await
+            .expect("the recovered session must serve responses normally");
     }
 
     /// D3: a server fatal-error token (severity/class ≥ 20) marks the transport
