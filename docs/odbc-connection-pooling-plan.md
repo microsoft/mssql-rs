@@ -39,6 +39,7 @@ The similar reset flags belong to different layers:
 | `reset_dispatched` | TDS transport | A packet header carrying that bit reached the wire | `TdsClient` takes it, or a new reset is armed |
 | `reset_state` | `TdsClient` | `Idle` / `Armed` (bit set, not yet sent) / `AwaitingAck` (bit sent, ENVCHANGE owed) | ENVCHANGE arrives, verification fails the request, or a successful reconnect creates a clean session |
 | `server_isolation_unknown` | ODBC DBC | The cached isolation level is no longer evidence about the server | An isolation SET reaches the server, or a new login starts from a known state |
+| `reset_generation` | ODBC DBC | Monotonic count of armed resets; an isolation SET only clears the invalidation it actually satisfied | Never (monotonic) |
 | `local_tran_started` | ODBC DBC | The application executed work in a manual-commit transaction | Commit, rollback, disconnect, or pool reset |
 | `transaction_descriptor` | TDS execution context | SQL Server has an active transaction, including an empty driver-begun transaction | Commit, rollback, full reset, or reconnect |
 | `known_dead` | TDS transport | I/O, close, fatal server error, or unacknowledged reset proved the connection unusable | A new transport is created |
@@ -146,6 +147,32 @@ Three cases are deliberately not treated as failures:
 A message the server is told to ignore (the attention/cancel path) is likewise
 never recorded as having delivered the bit.
 
+### Abandoned carriers
+
+A verdict is only ever valid against the response of the request that carried
+the bit. When that response is abandoned before any token is read, the
+suspicion must not be carried forward.
+
+Cancellation and timeout are the reachable case. `NetworkTransport::receive_token`
+answers both by draining to the attention acknowledgement, and that drain
+discards every other token — the `ResetConnection` ENVCHANGE included. The
+carrying request therefore ends with the bit on the wire and nothing observed
+about it.
+
+`begin_command` settles this. It runs at the start of every request path,
+including the transaction-manager ones, and always *before* the current request
+has sent anything, so a dispatch record or outstanding acknowledgement seen
+there necessarily belongs to an earlier request. Without this the next,
+unrelated request would be condemned on its first token — marking a healthy
+connection dead, which is a worse outcome than the gap the verification closes.
+
+The settlement treats the session as reset rather than failed. That is what the
+protocol supports: SQL Server resets before it processes the carrying request,
+the bit demonstrably reached the wire, and `prepare_reset_connection` already
+reconciled every client-side cache at arm time. No pool guarantee is weakened,
+because an abandoned carrier fails its own request — the checkout that issued it
+reports failure and discards the connection.
+
 ## Open cursors at check-in
 
 The reset sweeps open cursors before claiming the connection, matching the five
@@ -228,6 +255,14 @@ The cross-borrower leak does not remain. Arming a reset sets
 `server_isolation_unknown`, which disables the same-value optimization, so the
 checkout SET reaches SQL Server even when the previous borrower changed
 isolation through raw T-SQL.
+
+The invalidation is raised before the client is claimed *and* re-asserted under
+the lock that records the completed arm, which also bumps `reset_generation`. An
+isolation SET captures that generation before it sends and only clears the
+invalidation if it is unchanged. Without the generation, a SET that reached the
+server just before a concurrent reset armed could clear an invalidation it never
+satisfied, and the next same-value checkout SET would short-circuit against a
+session the newer reset had made unknown again.
 
 The driver deliberately does **not** assign `txn_isolation = READ COMMITTED`
 when it arms a reset. The reset does not restore the isolation level, so after

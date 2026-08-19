@@ -99,6 +99,15 @@ pub(crate) struct DbcState {
     /// This is not reset *acknowledgement* state: `TdsClient` verifies that
     /// itself on the request that carries the RESETCONNECTION bit.
     pub(crate) server_isolation_unknown: bool,
+    /// Monotonic count of pool resets armed on this connection.
+    ///
+    /// `set_txn_isolation` captures it before it sends and only clears
+    /// [`server_isolation_unknown`](Self::server_isolation_unknown) afterwards
+    /// if the count is unchanged. Without it a checkout SET already in flight
+    /// could clear an invalidation armed *after* it reached the server, and the
+    /// next same-value SET would short-circuit against a session the newer reset
+    /// had made unknown again.
+    pub(crate) reset_generation: u64,
     /// The application executed a statement in manual-commit mode, so the open
     /// transaction may hold uncommitted user work. Mirrors msodbcsql's
     /// `CONN_ST_LOCALTRANS_STARTED` (`sqlcprot.h:2298`) and is deliberately
@@ -160,6 +169,7 @@ impl DbcHandle {
                 txn_isolation: SQL_TXN_READ_COMMITTED,
                 local_tran_started: false,
                 server_isolation_unknown: false,
+                reset_generation: 0,
             }),
         }
     }

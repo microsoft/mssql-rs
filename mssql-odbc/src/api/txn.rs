@@ -29,7 +29,7 @@ use super::sqlstate::{
 };
 use crate::error::{HasDiagnostics, free_errors, post_sql_error};
 use crate::handles::DbcHandle;
-use crate::handles::dbc::ConnectionState;
+use crate::handles::dbc::{ConnectionState, DbcState};
 use crate::handles::{StmtHandle, handle_from_raw};
 
 /// Maps an ODBC `SQL_TXN_*` bit to the T-SQL clause msodbcsql emits for it
@@ -518,6 +518,15 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // The reset is armed; the server discards the transaction before it
     // processes the carrying request, so the driver's view catches up here.
     state.local_tran_started = false;
+    // Re-assert the invalidation under the lock that records the completed arm,
+    // and bump the generation. The early set above narrows the window before
+    // arming; this pair is what makes the invalidation stick afterwards. A
+    // checkout SET that claimed the client first and is clearing the flag around
+    // now captured an older generation, so it will leave this newer invalidation
+    // alone instead of short-circuiting the next checkout against a session this
+    // reset just made unknown again.
+    state.server_isolation_unknown = true;
+    state.reset_generation = state.reset_generation.wrapping_add(1);
     debug!("{OP}: reset armed; it will be carried by the next request");
     SQL_SUCCESS
 }
@@ -626,7 +635,7 @@ fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
 pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
     const OP: &str = "SQLSetConnectAttrW(SQL_ATTR_TXN_ISOLATION)";
 
-    let (level, tsql) = {
+    let (level, tsql, reset_generation) = {
         let Ok(mut state) = dbc.inner.lock() else {
             error!("{OP}: dbc mutex poisoned");
             return SQL_ERROR;
@@ -674,7 +683,7 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
             debug!(value, "{OP}: stored for next connect");
             return SQL_SUCCESS;
         }
-        (level, tsql)
+        (level, tsql, state.reset_generation)
     };
 
     if close_all_cursors(dbc) == SQL_ERROR {
@@ -723,8 +732,15 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         post_tds_error(&mut state, &e, SQLSTATE_HY000);
         return SQL_ERROR;
     }
-    // The batch reached the server, so the cache and the session agree again.
-    state.server_isolation_unknown = false;
+    // The batch reached the server, so the cache and the session agree again —
+    // unless a reset was armed while it was in flight, which made the server's
+    // level unknown all over again. That newer invalidation is not this batch's
+    // to clear.
+    if !settle_isolation_invalidation(&mut state, reset_generation) {
+        debug!(
+            "{OP}: a reset was armed while this batch was in flight; the server's isolation level is unknown again"
+        );
+    }
     // `value` was validated into `level` above.
     state.txn_isolation = level;
     debug!(tsql, "{OP}: isolation level applied");
@@ -775,6 +791,25 @@ fn mark_server_isolation_known(dbc: &DbcHandle) {
         Ok(mut state) => state.server_isolation_unknown = false,
         Err(_) => error!("dbc mutex poisoned; leaving the isolation cache marked untrusted"),
     }
+}
+
+/// Clears the isolation invalidation on behalf of an isolation SET that reached
+/// the server, but only if no newer pool reset was armed while that SET was in
+/// flight.
+///
+/// `captured_generation` is the value the SET read before it sent. A mismatch
+/// means a reset armed after it went out, which made the server's isolation
+/// level unknown all over again — an invalidation this older SET did not
+/// satisfy and must not clear, or the next same-value checkout SET would
+/// short-circuit and leave the previous borrower's level in place.
+///
+/// Returns whether the cache is trusted on return.
+fn settle_isolation_invalidation(state: &mut DbcState, captured_generation: u64) -> bool {
+    if state.reset_generation != captured_generation {
+        return false;
+    }
+    state.server_isolation_unknown = false;
+    true
 }
 
 /// Applies transaction attributes that were set before `SQLDriverConnect` and so
@@ -1377,6 +1412,65 @@ mod tests {
             "the SET must have emitted and collected the reset acknowledgement"
         );
         assert!(!client.is_connection_dead());
+    }
+
+    #[test]
+    fn a_reset_armed_mid_flight_is_not_cleared_by_the_older_isolation_set() {
+        // Race guard: a checkout SET can read the invalidation, claim the client,
+        // and reach the server *before* a concurrent `reset_connection` arms its
+        // reset. If that older SET then cleared the flag, the next same-value
+        // checkout SET would short-circuit against a session the newer reset had
+        // made unknown again — recreating the cross-borrower isolation leak.
+        //
+        // The interleaving lives inside the SET's own round trip, so the guard is
+        // driven directly: the arm bumps the generation the SET captured before
+        // it sent.
+        use crate::test_support::TestHandles;
+
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut state = dbc.inner.lock().unwrap();
+
+        let captured = state.reset_generation;
+        // A reset arms while the SET is on the wire, exactly as
+        // `reset_connection` does on its success path.
+        state.server_isolation_unknown = true;
+        state.reset_generation = state.reset_generation.wrapping_add(1);
+
+        assert!(
+            !settle_isolation_invalidation(&mut state, captured),
+            "a SET that predates the newer reset must not report the cache trusted"
+        );
+        assert!(
+            state.server_isolation_unknown,
+            "the newer reset's invalidation must survive the older SET"
+        );
+
+        // The SET issued *after* that arm does satisfy it.
+        let captured = state.reset_generation;
+        assert!(settle_isolation_invalidation(&mut state, captured));
+        assert!(!state.server_isolation_unknown);
+    }
+
+    #[test]
+    fn arming_a_reset_bumps_the_generation_and_reasserts_the_invalidation() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let before = {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(tds_client_from_tokens(vec![]));
+            state.reset_generation
+        };
+
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.reset_generation, before.wrapping_add(1));
+        assert!(state.server_isolation_unknown);
     }
 
     #[test]

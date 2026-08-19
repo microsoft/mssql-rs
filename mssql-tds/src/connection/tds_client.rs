@@ -644,6 +644,49 @@ impl TdsClient {
         )
     }
 
+    /// Settles reset tracking left over from an earlier request whose response
+    /// was abandoned before any verdict could be reached.
+    ///
+    /// Cancellation and timeout are the reachable cases. `receive_token`
+    /// answers both by draining to the attention acknowledgement, and that
+    /// drain discards every other token — the `ResetConnection` ENVCHANGE
+    /// included. The carrying request therefore ends with the bit on the wire
+    /// and nothing observed about it.
+    ///
+    /// This runs at the start of every command, before the current request has
+    /// sent anything, so a dispatch record or outstanding acknowledgement seen
+    /// here necessarily belongs to an earlier request. Carrying that suspicion
+    /// forward would mark a healthy connection dead on the first token of a
+    /// request that never had anything to do with the reset — the failure mode
+    /// this verification exists to avoid causing.
+    ///
+    /// Settling as reset rather than as a failure is what the protocol
+    /// supports: the server resets the session *before* it processes the
+    /// carrying request, the bit demonstrably reached the wire, and
+    /// `prepare_reset_connection` already reconciled every client-side cache at
+    /// arm time. No pool guarantee is weakened either — an abandoned carrier
+    /// fails its own request, so the checkout that issued it reports failure and
+    /// discards the connection.
+    fn settle_abandoned_reset_verification(&mut self) {
+        let carried = self.transport.as_writer().take_reset_dispatched();
+        let abandoned = match self.reset_state {
+            ResetAckState::Idle => false,
+            // Still `Armed` with the bit already sent: an earlier request
+            // carried it and its response was abandoned before the first token.
+            ResetAckState::Armed => carried,
+            // The response ended without ever reaching a verdict token.
+            ResetAckState::AwaitingAck => true,
+        };
+        if !abandoned {
+            return;
+        }
+        warn!(
+            "A request carrying the RESETCONNECTION bit was abandoned before its acknowledgement \
+             could be observed; treating the session as reset rather than charging the next request"
+        );
+        self.reset_state = ResetAckState::Idle;
+    }
+
     /// True when a RESETCONNECTION bit has been armed but the server has not yet
     /// acknowledged it with a `ResetConnection` ENVCHANGE.
     ///
@@ -4356,6 +4399,7 @@ impl TdsClient {
     /// new session *after* this point, so those remain visible as part of the
     /// command that triggered the reconnect.
     fn begin_command(&mut self) {
+        self.settle_abandoned_reset_verification();
         self.info_messages.clear();
         // Clear output parameters / return values from the previous command so a
         // fully-navigated prior RPC does not leave `get_return_values()` /
@@ -8353,6 +8397,75 @@ mod tests {
         assert!(
             client.reset_pending(),
             "the reset is still armed and will ride the next request"
+        );
+    }
+
+    /// Regression: a carrying request whose response is abandoned before any
+    /// token is read — the cancellation/timeout shape, where
+    /// `wait_for_attention_ack` drains to the attention DONE and discards the
+    /// `ResetConnection` ENVCHANGE along with everything else — must not leave
+    /// its suspicion behind for the *next* request to answer for. Doing so would
+    /// mark a healthy connection dead on a token that had nothing to do with the
+    /// reset.
+    #[tokio::test]
+    async fn abandoned_carrier_does_not_condemn_the_next_request() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+
+        // Send the carrier but never read its response, exactly as the
+        // attention drain leaves things: the bit is on the wire and no token
+        // was ever observed.
+        client
+            .send_query_batch(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                ().into(),
+            )
+            .await
+            .expect("the carrier is sent");
+        assert!(
+            client.reset_pending(),
+            "precondition: the reset is still outstanding when the response is abandoned"
+        );
+
+        // The next, unrelated request must complete normally.
+        client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect("an unrelated request must not answer for an abandoned reset");
+
+        assert!(
+            !client.is_connection_dead(),
+            "the next request must not be charged for a reset it never carried"
+        );
+        assert!(
+            !client.reset_pending(),
+            "the abandoned reset is settled, not left outstanding forever"
+        );
+    }
+
+    /// The settlement above must not fire on the ordinary armed-but-unsent
+    /// reset: starting a command while a reset is armed is the normal path, and
+    /// that command is the one that carries the bit.
+    #[tokio::test]
+    async fn starting_a_command_leaves_an_unsent_armed_reset_alone() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::EnvChange(crate::token::tokens::EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: crate::token::tokens::EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            done_no_more(),
+        ]);
+        client.prepare_reset_connection(false);
+
+        client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect("the armed reset must still ride this request and be acknowledged");
+
+        assert!(!client.is_connection_dead());
+        assert!(
+            !client.reset_pending(),
+            "the acknowledgement arrived on the carrying request"
         );
     }
 
