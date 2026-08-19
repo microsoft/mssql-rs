@@ -3398,7 +3398,7 @@ impl TdsClient {
         // Positional parameters: synthetic name, bound by position in the EXEC.
         for (ordinal, param) in positional_params.iter().enumerate() {
             let synthetic = format!("@{SYNTHETIC_POSITIONAL_PARAM_PREFIX}{ordinal}");
-            let type_name = RpcParameter::get_sql_name(param.value())?;
+            let type_name = param.sql_declaration()?;
             let output = if param.is_output() { " OUTPUT" } else { "" };
 
             if first {
@@ -3419,7 +3419,7 @@ impl TdsClient {
             let Some(name) = param.name.as_deref() else {
                 continue;
             };
-            let type_name = RpcParameter::get_sql_name(param.value())?;
+            let type_name = param.sql_declaration()?;
             let output = if param.is_output() { " OUTPUT" } else { "" };
 
             if first {

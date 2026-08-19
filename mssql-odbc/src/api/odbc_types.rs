@@ -154,6 +154,7 @@ pub const SQL_API_SQLGETDATA: SqlUSmallInt = 43;
 pub const SQL_API_SQLGETFUNCTIONS: SqlUSmallInt = 44;
 pub const SQL_API_SQLGETINFO: SqlUSmallInt = 45;
 pub const SQL_API_SQLGETTYPEINFO: SqlUSmallInt = 47;
+pub const SQL_API_SQLDESCRIBEPARAM: SqlUSmallInt = 58;
 pub const SQL_API_SQLBINDPARAMETER: SqlUSmallInt = 72;
 pub const SQL_API_SQLMORERESULTS: SqlUSmallInt = 61;
 pub const SQL_API_SQLALLOCHANDLE: SqlUSmallInt = 1001;
@@ -246,6 +247,8 @@ pub const SQL_GUID: SqlSmallInt = -11;
 // SQL Server-specific ODBC-SQL-type identifiers (driver extensions).
 pub const SQL_SS_TIME2: SqlSmallInt = -154;
 pub const SQL_SS_TIMESTAMPOFFSET: SqlSmallInt = -155;
+pub const SQL_SS_TABLE: SqlSmallInt = -153;
+pub const SQL_SS_VECTOR: SqlSmallInt = -156;
 
 // ODBC C types
 pub const SQL_C_CHAR: SqlSmallInt = 1;

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use bitflags::bitflags;
+use std::borrow::Cow;
 
 use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
 use crate::datatypes::encoder::SqlValueEncoder;
@@ -101,6 +102,10 @@ pub struct RpcParameter {
     ///  This is used to determine how to serialize the value.
     value: SqlType,
 
+    /// SQL declaration used by prepared and parameterized statements when it
+    /// must be more specific than the value alone can express.
+    declaration: Option<String>,
+
     /// When present, the parameter is sent encrypted (Always Encrypted): the
     /// ciphertext is serialized as a BIGVARBINARY with the ENCRYPTED status flag
     /// and a trailing CryptoMetaData block, bypassing the plaintext `value`.
@@ -122,8 +127,22 @@ impl RpcParameter {
             name,
             options,
             value,
+            declaration: None,
             encrypted: None,
             force_column_encryption: false,
+        }
+    }
+
+    /// Overrides the SQL declaration generated from the parameter value.
+    pub fn with_declaration(mut self, declaration: String) -> Self {
+        self.declaration = Some(declaration);
+        self
+    }
+
+    pub(crate) fn sql_declaration(&self) -> TdsResult<Cow<'_, str>> {
+        match &self.declaration {
+            Some(declaration) => Ok(Cow::Borrowed(declaration)),
+            None => Ok(Cow::Owned(Self::get_sql_name(&self.value)?)),
         }
     }
 
@@ -499,7 +518,7 @@ fn build_parameter_list_string_impl(
         if let Some(param_name) = &param.name {
             // TODO: while persisting types with length, we need to compute the length and
             // add the length after the type name. e.g. Nvarchar(200), varchar(100) etc.
-            let param_type_name = RpcParameter::get_sql_name(&param.value)?;
+            let param_type_name = param.sql_declaration()?;
             if first_param {
                 first_param = false;
             } else {
@@ -558,7 +577,7 @@ mod tests {
     use crate::error::Error;
     use crate::message::parameters::rpc_parameters::RpcParameter;
     use crate::message::parameters::rpc_parameters::{
-        EncryptedRpcValue, RpcEncryptionMetadata, StatusFlags,
+        EncryptedRpcValue, RpcEncryptionMetadata, StatusFlags, build_parameter_list_string,
     };
 
     use crate::datatypes::encoder::GenericEncoder;
@@ -792,6 +811,19 @@ mod tests {
                 .unwrap_or_else(|e| panic!("get_sql_name failed for {sql_type:?}: {e}"));
             assert_eq!(rpc_param, expected, "case: {sql_type:?}");
         }
+    }
+
+    #[test]
+    fn parameter_declaration_override_is_used() {
+        let param = RpcParameter::new(
+            Some("@P1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Decimal(None),
+        )
+        .with_declaration("decimal(12,3)".to_string());
+        let mut declarations = String::new();
+        build_parameter_list_string(&vec![param], &mut declarations).unwrap();
+        assert_eq!(declarations, "@P1 decimal(12,3) ");
     }
 
     /// `get_sql_name` must surface `Error::ImplementationError` when the underlying
