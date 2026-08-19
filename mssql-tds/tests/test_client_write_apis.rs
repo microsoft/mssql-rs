@@ -58,8 +58,7 @@ mod streamed_plp_write {
             .begin_sp_executesql(
                 "INSERT INTO #plp_nvm (id, val) VALUES (1, @v)".to_string(),
                 vec![streamed],
-                None,
-                None,
+                (),
             )
             .await?;
         match status {
@@ -138,8 +137,7 @@ mod streamed_plp_write {
             .begin_sp_executesql(
                 "INSERT INTO #plp_mix (id, val) VALUES (@id, @v)".to_string(),
                 params,
-                None,
-                None,
+                (),
             )
             .await?;
         assert!(
@@ -199,8 +197,7 @@ mod streamed_plp_write {
             .begin_sp_executesql(
                 "INSERT INTO #plp_vbm (id, val) VALUES (1, @v)".to_string(),
                 vec![streamed],
-                None,
-                None,
+                (),
             )
             .await?;
         assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
@@ -269,8 +266,7 @@ mod streamed_plp_write {
             .begin_sp_executesql(
                 "INSERT INTO #plp_two (id, a, b) VALUES (1, @a, @b)".to_string(),
                 params,
-                None,
-                None,
+                (),
             )
             .await?;
         assert!(
@@ -371,8 +367,7 @@ mod streamed_plp_write {
             .begin_sp_executesql(
                 "INSERT INTO #plp_int_plp (a, id, b) VALUES (@a, @id, @b)".to_string(),
                 params,
-                None,
-                None,
+                (),
             )
             .await?;
         assert!(
@@ -453,8 +448,7 @@ mod streamed_plp_write {
                 .begin_sp_executesql(
                     format!("INSERT INTO #plp_rows (id, val) VALUES ({id}, @v)"),
                     vec![streamed],
-                    None,
-                    None,
+                    (),
                 )
                 .await?;
             assert!(
@@ -602,8 +596,7 @@ mod streamed_plp_write {
             .begin_sp_executesql(
                 "INSERT INTO #plp_snull (id, val) VALUES (1, @v)".to_string(),
                 vec![streamed],
-                None,
-                None,
+                (),
             )
             .await?;
         assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
@@ -658,8 +651,7 @@ mod streamed_plp_write {
             .begin_sp_executesql(
                 "INSERT INTO #plp_empty (id, val) VALUES (1, @v)".to_string(),
                 vec![streamed],
-                None,
-                None,
+                (),
             )
             .await?;
         assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
@@ -719,8 +711,7 @@ mod streamed_plp_write {
             .begin_sp_executesql(
                 "INSERT INTO #plp_small (id, val) VALUES (1, @v)".to_string(),
                 vec![streamed],
-                None,
-                None,
+                (),
             )
             .await?;
         assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
@@ -783,8 +774,7 @@ mod streamed_plp_write {
             .begin_sp_executesql(
                 "INSERT INTO #plp_reuse (id, val) VALUES (1, @v)".to_string(),
                 vec![streamed],
-                None,
-                None,
+                (),
             )
             .await?;
         assert!(matches!(status, StreamedParamStatus::NeedData { .. }));

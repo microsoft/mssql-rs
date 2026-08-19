@@ -946,11 +946,7 @@ impl TdsClient {
         if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
-        if named_params.iter().any(RpcParameter::is_data_at_exec) {
-            return Err(UsageError(
-                "Data-at-execution parameters require begin_sp_executesql.".to_string(),
-            ));
-        }
+        RpcParameter::reject_data_at_exec(named_params.iter())?;
 
         let declaration_params = named_params.clone();
         let mut params_list_as_string = String::new();
@@ -1021,18 +1017,23 @@ impl TdsClient {
     /// # Errors
     /// Returns a usage error for invalid streamed parameters or an active
     /// command, and returns transport/serialization errors from the request.
-    pub async fn begin_sp_executesql(
+    pub async fn begin_sp_executesql<'a>(
         &mut self,
         sql: String,
         named_params: Vec<RpcParameter>,
-        timeout_sec: Option<u32>,
-        cancel_handle: Option<&CancelHandle>,
+        options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StreamedParamStatus> {
+        let ExecuteOptions {
+            timeout: timeout_sec,
+            cancel: cancel_handle,
+            column_encryption,
+        } = options.into();
+
         if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
 
-        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
+        self.current_command_ce_setting = column_encryption;
         self.ensure_force_column_encryption_supported(named_params.iter())?;
 
         let (streamed_params, materialized_params) =
@@ -1046,7 +1047,7 @@ impl TdsClient {
                     ExecuteOptions {
                         timeout: timeout_sec,
                         cancel: cancel_handle,
-                        column_encryption: ExecutionColumnEncryptionSetting::UseConnectionSetting,
+                        column_encryption,
                     },
                 )
                 .await?;
@@ -1146,12 +1147,6 @@ impl TdsClient {
             .partition(RpcParameter::is_data_at_exec);
 
         for param in &streamed_params {
-            if !param.is_streamable_plp() {
-                return Err(UsageError(
-                    "Streamed parameters must be nvarchar(max), varchar(max) or varbinary(max)."
-                        .to_string(),
-                ));
-            }
             if param.name.is_none() {
                 return Err(UsageError("Streamed parameters must be named.".to_string()));
             }
@@ -1239,9 +1234,6 @@ impl TdsClient {
                 "write_streamed_chunk called with no active streamed parameter.".to_string(),
             ));
         }
-        if chunk.is_empty() {
-            return Ok(());
-        }
         if chunk.len() > u32::MAX as usize {
             return Err(UsageError(format!(
                 "Streamed PLP chunk length {} exceeds the maximum chunk size of {} bytes.",
@@ -1271,7 +1263,9 @@ impl TdsClient {
 
         // A parameter already signalled NULL cannot carry data. Re-park the
         // (still-clean) message and reject; this is a caller sequencing error,
-        // not a wire failure, so the stream stays usable.
+        // not a wire failure, so the stream stays usable. Checked before the
+        // empty-chunk short-circuit below so `write_streamed_chunk(&[])` after
+        // `write_streamed_null()` still errors instead of silently succeeding.
         if null_signaled {
             self.streamed_write_state =
                 StreamedWriteState::Active(Box::new(StreamedWriteContext {
@@ -1285,6 +1279,23 @@ impl TdsClient {
             return Err(UsageError(
                 "write_streamed_chunk called after the parameter was marked NULL.".to_string(),
             ));
+        }
+
+        // Empty chunks are ignored: a zero-length PLP chunk header is the value
+        // terminator, so it must never be emitted mid-value. Re-park the
+        // (unchanged) message so a later chunk or the terminator continues
+        // from the same point.
+        if chunk.is_empty() {
+            self.streamed_write_state =
+                StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                    message,
+                    pending,
+                    db_collation,
+                    value_opened,
+                    null_signaled,
+                    timeout_sec,
+                }));
+            return Ok(());
         }
 
         let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
@@ -1344,6 +1355,25 @@ impl TdsClient {
         if let Err(error) = self.transport.close_transport().await {
             warn!(%error, "Failed to close transport after streamed write abort");
         }
+    }
+
+    /// Cancels an in-progress streamed PLP write while the client is parked in
+    /// [`StreamedParamStatus::NeedData`](StreamedParamStatus::NeedData),
+    /// discarding the half-written RPC and closing the transport.
+    ///
+    /// This is the supported way for a caller to bail out of a streamed
+    /// parameter sequence once [`begin_sp_executesql`](Self::begin_sp_executesql)
+    /// has parked a message (for example, to service `SQLCancel` while an ODBC
+    /// driver is between `SQLPutData` calls). After this returns, no streamed
+    /// write is active, so a subsequent [`write_streamed_chunk`](Self::write_streamed_chunk),
+    /// [`write_streamed_null`](Self::write_streamed_null), or
+    /// [`end_streamed_param`](Self::end_streamed_param) fails with a usage
+    /// error. Calling this with no streamed write active is a no-op.
+    pub async fn cancel_streamed_write(&mut self) {
+        if matches!(self.streamed_write_state, StreamedWriteState::Idle) {
+            return;
+        }
+        self.abort_streamed_write().await;
     }
 
     /// Marks the streamed parameter currently open for data as SQL NULL.
@@ -1894,6 +1924,13 @@ impl TdsClient {
             ));
         };
 
+        RpcParameter::reject_data_at_exec(
+            positional_parameters
+                .iter()
+                .flatten()
+                .chain(named_parameters.iter().flatten()),
+        )?;
+
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
         let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
@@ -2295,6 +2332,8 @@ impl TdsClient {
         if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
+
+        RpcParameter::reject_data_at_exec(named_params.iter())?;
 
         // Open the command boundary before recovery so a transparent reconnect's
         // login info messages land in this command's buffer; the inner RPC skips
@@ -3902,7 +3941,7 @@ impl TdsClient {
             let param = &mut *params[index];
 
             let ciphertext = encrypt_parameter(
-                param.value(),
+                param.value()?,
                 plaintext_cek.as_slice(),
                 info.cipher_algorithm_id,
                 info.encryption_type,
@@ -3971,7 +4010,7 @@ impl TdsClient {
         // Positional parameters: synthetic name, bound by position in the EXEC.
         for (ordinal, param) in positional_params.iter().enumerate() {
             let synthetic = format!("@{SYNTHETIC_POSITIONAL_PARAM_PREFIX}{ordinal}");
-            let type_name = RpcParameter::get_sql_name(param.value())?;
+            let type_name = RpcParameter::get_sql_name(param.value()?)?;
             let output = if param.is_output() { " OUTPUT" } else { "" };
 
             if first {
@@ -3992,7 +4031,7 @@ impl TdsClient {
             let Some(name) = param.name.as_deref() else {
                 continue;
             };
-            let type_name = RpcParameter::get_sql_name(param.value())?;
+            let type_name = RpcParameter::get_sql_name(param.value()?)?;
             let output = if param.is_output() { " OUTPUT" } else { "" };
 
             if first {
@@ -8561,8 +8600,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -8608,8 +8646,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -8649,8 +8686,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -8674,6 +8710,36 @@ mod tests {
         ));
     }
 
+    /// An *empty* chunk after marking the parameter NULL must still be a usage
+    /// error, not a silent no-op: the empty-chunk short-circuit runs only after
+    /// the NULL-sequencing check, so it cannot mask this caller mistake.
+    #[tokio::test]
+    async fn streamed_write_empty_chunk_after_null_errors() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+
+        client.write_streamed_null().unwrap();
+        let err = client
+            .write_streamed_chunk(&[])
+            .await
+            .expect_err("an empty chunk after NULL must still error");
+        assert!(matches!(err, UsageError(_)));
+        assert!(matches!(
+            client.end_streamed_param().await.unwrap(),
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+    }
+
     /// Marking a parameter NULL after chunks were already written is a usage
     /// error: a value that has begun streaming cannot become NULL.
     #[tokio::test]
@@ -8684,8 +8750,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -8718,8 +8783,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(a, b) VALUES (@a, @b)".to_string(),
                 vec![streamed_varbinary("@a"), streamed_varbinary("@b")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -8769,8 +8833,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -8806,8 +8869,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -8839,8 +8901,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(a, b) VALUES (@a, @b)".to_string(),
                 vec![streamed_varbinary("@a"), streamed_varbinary("@b")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -8907,8 +8968,7 @@ mod tests {
                     StatusFlags::NONE,
                     SqlType::Int(Some(7)),
                 )],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -8936,7 +8996,7 @@ mod tests {
         let mut client = client_over_bytes_with_ae(done_bytes(DONE_FINAL));
 
         let status = client
-            .begin_sp_executesql("SELECT 1".to_string(), Vec::new(), None, None)
+            .begin_sp_executesql("SELECT 1".to_string(), Vec::new(), ())
             .await
             .unwrap();
 
@@ -8964,8 +9024,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -9019,8 +9078,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -9057,8 +9115,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -9067,23 +9124,11 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .expect_err("cannot begin a second streamed execution while one is active");
         assert!(matches!(err, UsageError(_)));
-    }
-
-    /// The streaming constructor only permits streamable MAX types.
-    #[tokio::test]
-    async fn begin_only_accepts_streamable_types_via_data_at_exec_constructor() {
-        let param = RpcParameter::data_at_exec(
-            Some("@n".to_string()),
-            StatusFlags::NONE,
-            StreamedSqlType::NVarcharMax,
-        );
-        assert!(param.is_streamable_plp());
     }
 
     /// An unnamed data-at-execution parameter is rejected: streamed values must
@@ -9096,12 +9141,7 @@ mod tests {
             RpcParameter::data_at_exec(None, StatusFlags::NONE, StreamedSqlType::VarBinaryMax);
 
         let err = client
-            .begin_sp_executesql(
-                "INSERT INTO t(v) VALUES (@v)".to_string(),
-                vec![bad],
-                None,
-                None,
-            )
+            .begin_sp_executesql("INSERT INTO t(v) VALUES (@v)".to_string(), vec![bad], ())
             .await
             .expect_err("unnamed data-at-exec parameter must be rejected");
         assert!(matches!(err, UsageError(_)));
@@ -9150,8 +9190,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -9177,8 +9216,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                Some(30),
-                None,
+                ExecuteOptions::new().timeout_secs(30),
             )
             .await
             .unwrap();
@@ -9216,8 +9254,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(id, v) VALUES (@id, @v)".to_string(),
                 vec![materialized, streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -9271,8 +9308,7 @@ mod tests {
                     streamed_varbinary("@b"),
                     streamed_varbinary("@c"),
                 ],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -9300,8 +9336,7 @@ mod tests {
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
                 vec![streamed_varbinary("@v")],
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();

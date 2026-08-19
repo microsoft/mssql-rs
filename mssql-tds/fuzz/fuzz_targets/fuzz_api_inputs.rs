@@ -238,8 +238,10 @@ fuzz_target!(|data: &[u8]| {
             // Test RpcParameter::new() constructor
             let param = fuzz_param.to_rpc_parameter();
             
-            // Also test get_sql_name on this parameter's type
-            let _type_name = RpcParameter::get_sql_name(param.get_value());
+            // Also test get_sql_name on this parameter's type. `to_rpc_parameter`
+            // always builds a materialized parameter, so `get_value()` cannot
+            // return the data-at-execution usage error here.
+            let _type_name = RpcParameter::get_sql_name(param.get_value().unwrap());
         }
         
         FuzzScenario::BuildParameterList(mut fuzz_params) => {

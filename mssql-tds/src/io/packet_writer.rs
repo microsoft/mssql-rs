@@ -113,8 +113,12 @@ pub struct PacketWriter<'a> {
 
 /// Owned, detached state of an in-progress outgoing message, produced by
 /// [`PacketWriter::suspend`] and consumed by [`PacketWriter::resume`]. Holds
-/// every field of [`PacketWriter`] except the borrowed network writer, allowing
-/// a partially-written message to be parked as owned state between calls.
+/// every field of [`PacketWriter`] except the borrowed network writer and
+/// `start_time`, allowing a partially-written message to be parked as owned
+/// state between calls. `start_time` is intentionally not preserved:
+/// [`resume`](PacketWriter::resume) always starts a fresh wall-clock write
+/// timeout budget rather than restoring the suspended one — see `resume`'s
+/// doc comment.
 #[derive(Debug)]
 pub(crate) struct SuspendedMessage {
     packet_type: PacketType,
@@ -123,7 +127,6 @@ pub(crate) struct SuspendedMessage {
     payload_cursor: Cursor<Vec<u8>>,
     packet_size: usize,
     is_first_packet: bool,
-    start_time: Instant,
     max_timeout_sec: Option<u32>,
     cancel_handle: Option<CancelHandle>,
     reset_mode: ResetConnectionMode,
@@ -190,7 +193,10 @@ impl<'a> PacketWriter<'a> {
     ///
     /// The timeout budget (`start_time`) and packet accounting (`packet_id`,
     /// `is_first_packet`, `eom_pending`, buffered payload) are preserved so the
-    /// resumed message behaves as one continuous send.
+    /// resumed message behaves as one continuous send, except `start_time`
+    /// itself: [`resume`](Self::resume) always takes a fresh timestamp instead
+    /// of restoring the suspended one (see its doc comment), so it is not
+    /// carried in [`SuspendedMessage`].
     pub(crate) fn suspend(self) -> SuspendedMessage {
         SuspendedMessage {
             packet_type: self.packet_type,
@@ -199,7 +205,6 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: self.payload_cursor,
             packet_size: self.packet_size,
             is_first_packet: self.is_first_packet,
-            start_time: self.start_time,
             max_timeout_sec: self.max_timeout_sec,
             cancel_handle: self.cancel_handle,
             reset_mode: self.reset_mode,
@@ -209,7 +214,12 @@ impl<'a> PacketWriter<'a> {
 
     /// Reattaches a previously [`suspend`](Self::suspend)ed message to a network
     /// writer, restoring all packet/timeout accounting so writing can continue
-    /// exactly where it left off.
+    /// exactly where it left off. `start_time` is refreshed to the moment of
+    /// resumption (it is not part of [`SuspendedMessage`]): each call that
+    /// resumes a message is a fresh write operation with its own budget for the
+    /// hard wall-clock write timeout, mirroring msodbcsql's per-`SQLPutData`
+    /// timeout refresh — application think-time between chunks must not count
+    /// against a single deadline set when the message was first opened.
     pub(crate) fn resume(
         state: SuspendedMessage,
         network_writer: &'a mut dyn NetworkWriter,
@@ -222,7 +232,7 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: state.payload_cursor,
             packet_size: state.packet_size,
             is_first_packet: state.is_first_packet,
-            start_time: state.start_time,
+            start_time: Instant::now(),
             max_timeout_sec: state.max_timeout_sec,
             cancel_handle: state.cancel_handle,
             reset_mode: state.reset_mode,
