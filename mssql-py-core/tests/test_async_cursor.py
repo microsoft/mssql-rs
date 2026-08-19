@@ -56,6 +56,26 @@ def test_two_cursors_can_be_created(client_context):
 
 
 @pytest.mark.integration
+def test_cursor_snapshots_connection_timeout(client_context):
+    async def run():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            try:
+                conn.timeout = 30
+                first_cursor = conn.cursor()
+                assert first_cursor.timeout == 30
+
+                conn.timeout = 5
+                assert first_cursor.timeout == 30
+                assert conn.cursor().timeout == 5
+            finally:
+                await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_conn_cursor_after_close_raises_connection_closed(client_context):
     """cursor() on a closed connection raises RuntimeError."""
     async def run():

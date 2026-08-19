@@ -11,14 +11,13 @@
 
 use std::sync::Arc;
 
-use arrow::array::BinaryArray;
 use arrow::array::{
-    Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use async_trait::async_trait;
@@ -79,8 +78,11 @@ pub enum ColumnPlanKind {
     Utf8VarChar,
     LargeUtf8Nvarchar,
     LargeUtf8VarChar,
+    Utf8ViewNvarchar,
+    Utf8ViewVarChar,
     Binary,
     LargeBinary,
+    BinaryView,
     /// Arrow `date32` → SQL `date`.
     Date32,
     /// Arrow `date64` (ms) → SQL `date`.
@@ -125,11 +127,11 @@ pub enum ColumnPlanKind {
     SmallDateTime {
         unit: TimeUnit,
     },
-    /// Arrow `utf8`/`large_utf8` → SQL `xml`.
+    /// Arrow `utf8`/`large_utf8`/`utf8_view` → SQL `xml`.
     Xml,
-    /// Arrow `utf8`/`large_utf8` → SQL `json`.
+    /// Arrow `utf8`/`large_utf8`/`utf8_view` → SQL `json`.
     Json,
-    /// Arrow `utf8`/`large_utf8` GUID text → SQL `uniqueidentifier`.
+    /// Arrow `utf8`/`large_utf8`/`utf8_view` GUID text → SQL `uniqueidentifier`.
     Utf8Uuid,
     /// All-null arrow column.
     Null,
@@ -207,9 +209,12 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
             ColumnPlanKind::LargeUtf8Nvarchar
         }
         (DataType::LargeUtf8, S::VarChar | S::Char | S::Text) => ColumnPlanKind::LargeUtf8VarChar,
+        (DataType::Utf8View, S::NVarChar | S::NChar | S::NText) => ColumnPlanKind::Utf8ViewNvarchar,
+        (DataType::Utf8View, S::VarChar | S::Char | S::Text) => ColumnPlanKind::Utf8ViewVarChar,
 
         (DataType::Binary, S::VarBinary | S::Binary | S::Image) => ColumnPlanKind::Binary,
         (DataType::LargeBinary, S::VarBinary | S::Binary | S::Image) => ColumnPlanKind::LargeBinary,
+        (DataType::BinaryView, S::VarBinary | S::Binary | S::Image) => ColumnPlanKind::BinaryView,
 
         (DataType::Date32, S::Date) => ColumnPlanKind::Date32,
         (DataType::Date64, S::Date) => ColumnPlanKind::Date64,
@@ -254,11 +259,13 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
         },
 
         (DataType::FixedSizeBinary(16), S::UniqueIdentifier) => ColumnPlanKind::FixedBin16Uuid,
-        // Arrow utf8/large_utf8 GUID text → uniqueidentifier. mssql-python's
+        // Arrow UTF-8 GUID text → uniqueidentifier. mssql-python's
         // cursor.arrow() reads a GUID column as a string, so this enables a
         // read-then-bulkload roundtrip; the binary FixedSizeBinary(16) form is
         // still accepted above.
-        (DataType::Utf8 | DataType::LargeUtf8, S::UniqueIdentifier) => ColumnPlanKind::Utf8Uuid,
+        (DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View, S::UniqueIdentifier) => {
+            ColumnPlanKind::Utf8Uuid
+        }
         // Any-width fixed-size binary loads into BINARY/VARBINARY/IMAGE (the
         // extractor reads FixedSizeBinaryArray of any width; the server enforces
         // the column length), mirroring the variable-width binary arm above.
@@ -290,9 +297,11 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
             ));
         }
 
-        // utf8 → xml / json (Arrow already guarantees valid UTF-8).
-        (DataType::Utf8 | DataType::LargeUtf8, S::Xml) => ColumnPlanKind::Xml,
-        (DataType::Utf8 | DataType::LargeUtf8, S::Json) => ColumnPlanKind::Json,
+        // UTF-8 → xml / json (Arrow already guarantees valid UTF-8).
+        (DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View, S::Xml) => ColumnPlanKind::Xml,
+        (DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View, S::Json) => {
+            ColumnPlanKind::Json
+        }
 
         _ => {
             return Err(Error::UsageError(
@@ -412,20 +421,16 @@ impl ColumnPlan {
                 check_finite(v, dest)?;
                 Ok(ColumnValues::Float(v))
             }
-            ColumnPlanKind::Utf8Nvarchar => {
+            ColumnPlanKind::Utf8Nvarchar | ColumnPlanKind::Utf8VarChar => {
                 let s = downcast::<StringArray>(arr)?.value(row_idx).to_owned();
                 Ok(ColumnValues::String(SqlString::from_utf8_string(s)))
             }
-            ColumnPlanKind::Utf8VarChar => {
-                let s = downcast::<StringArray>(arr)?.value(row_idx).to_owned();
-                Ok(ColumnValues::String(SqlString::from_utf8_string(s)))
-            }
-            ColumnPlanKind::LargeUtf8Nvarchar => {
+            ColumnPlanKind::LargeUtf8Nvarchar | ColumnPlanKind::LargeUtf8VarChar => {
                 let s = downcast::<LargeStringArray>(arr)?.value(row_idx).to_owned();
                 Ok(ColumnValues::String(SqlString::from_utf8_string(s)))
             }
-            ColumnPlanKind::LargeUtf8VarChar => {
-                let s = downcast::<LargeStringArray>(arr)?.value(row_idx).to_owned();
+            ColumnPlanKind::Utf8ViewNvarchar | ColumnPlanKind::Utf8ViewVarChar => {
+                let s = downcast::<StringViewArray>(arr)?.value(row_idx).to_owned();
                 Ok(ColumnValues::String(SqlString::from_utf8_string(s)))
             }
             ColumnPlanKind::Binary => {
@@ -440,6 +445,10 @@ impl ColumnPlan {
             }
             ColumnPlanKind::LargeBinary => {
                 let bytes = downcast::<LargeBinaryArray>(arr)?.value(row_idx).to_vec();
+                Ok(ColumnValues::Bytes(bytes))
+            }
+            ColumnPlanKind::BinaryView => {
+                let bytes = downcast::<BinaryViewArray>(arr)?.value(row_idx).to_vec();
                 Ok(ColumnValues::Bytes(bytes))
             }
             ColumnPlanKind::Date32 => {
@@ -662,14 +671,19 @@ fn timestamp_to_1900_components(ticks_since_epoch: i64) -> (i64, u8, u8, u8, u32
     (days_since_1900, hour, minute, second, microsecond)
 }
 
-/// Read a UTF-8 string cell from either a `StringArray` or `LargeStringArray`.
+/// Read a UTF-8 string cell from any supported variable-width string array.
 fn read_utf8(arr: &dyn Array, row_idx: usize) -> TdsResult<&str> {
     if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
         Ok(a.value(row_idx))
     } else if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
         Ok(a.value(row_idx))
+    } else if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
+        Ok(a.value(row_idx))
     } else {
-        Err(downcast_err::<StringArray>(arr))
+        Err(Error::UsageError(format!(
+            "Arrow array downcast failed: expected a UTF-8 string array (utf8/large_utf8/utf8_view), got {:?}",
+            arr.data_type()
+        )))
     }
 }
 
@@ -1166,6 +1180,60 @@ mod tests {
     }
 
     #[test]
+    fn utf8_view_varchar_and_nvarchar() {
+        let external = "this value exceeds twelve bytes";
+        let array: ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("inline"),
+            Some(external),
+            None,
+        ]));
+        for sql_type in [SqlDbType::VarChar, SqlDbType::NVarChar] {
+            let dest = meta("name", sql_type, true);
+            let plan = one_col_plan(DataType::Utf8View, &dest);
+            match plan.extract_value(array.as_ref(), 0, &dest).unwrap() {
+                ColumnValues::String(value) => assert_eq!(value.to_utf8_string(), "inline"),
+                other => panic!("expected String, got {other:?}"),
+            }
+            match plan.extract_value(array.as_ref(), 1, &dest).unwrap() {
+                ColumnValues::String(value) => assert_eq!(value.to_utf8_string(), external),
+                other => panic!("expected String, got {other:?}"),
+            }
+            assert_eq!(
+                plan.extract_value(array.as_ref(), 2, &dest).unwrap(),
+                ColumnValues::Null
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_view_special_text_destinations() {
+        let guid = "58185e0d-3a91-44d8-bc46-7107217e0a6d";
+        let guid_array: ArrayRef = Arc::new(StringViewArray::from(vec![Some(guid)]));
+        let guid_dest = meta("guid", SqlDbType::UniqueIdentifier, true);
+        let guid_value = one_col_plan(DataType::Utf8View, &guid_dest)
+            .extract_value(guid_array.as_ref(), 0, &guid_dest)
+            .unwrap();
+        assert!(matches!(guid_value, ColumnValues::Uuid(_)));
+
+        for (sql_type, text) in [(SqlDbType::Xml, "<r/>"), (SqlDbType::Json, "{\"a\":1}")] {
+            let array: ArrayRef = Arc::new(StringViewArray::from(vec![Some(text)]));
+            let dest = meta("document", sql_type, true);
+            let value = one_col_plan(DataType::Utf8View, &dest)
+                .extract_value(array.as_ref(), 0, &dest)
+                .unwrap();
+            match (sql_type, value) {
+                (SqlDbType::Xml, ColumnValues::Xml(value)) => {
+                    assert_eq!(value.as_string(), text)
+                }
+                (SqlDbType::Json, ColumnValues::Json(value)) => {
+                    assert_eq!(value.bytes, text.as_bytes())
+                }
+                (_, other) => panic!("expected {sql_type:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn binary_and_large_binary() {
         let dest = meta("b", SqlDbType::VarBinary, true);
         let a: ArrayRef = Arc::new(BinaryArray::from(vec![Some(&b"\x01\x02\x03"[..])]));
@@ -1181,6 +1249,26 @@ mod tests {
                 .extract_value(la.as_ref(), 0, &dest)
                 .unwrap(),
             ColumnValues::Bytes(vec![10, 11])
+        );
+
+        let external = b"more than twelve bytes";
+        let view: ArrayRef = Arc::new(BinaryViewArray::from(vec![
+            Some(&b"\x0c\x0d"[..]),
+            Some(&external[..]),
+            None,
+        ]));
+        let plan = one_col_plan(DataType::BinaryView, &dest);
+        assert_eq!(
+            plan.extract_value(view.as_ref(), 0, &dest).unwrap(),
+            ColumnValues::Bytes(vec![12, 13])
+        );
+        assert_eq!(
+            plan.extract_value(view.as_ref(), 1, &dest).unwrap(),
+            ColumnValues::Bytes(external.to_vec())
+        );
+        assert_eq!(
+            plan.extract_value(view.as_ref(), 2, &dest).unwrap(),
+            ColumnValues::Null
         );
     }
 
