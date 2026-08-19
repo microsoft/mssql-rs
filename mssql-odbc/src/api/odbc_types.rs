@@ -169,6 +169,16 @@ pub const SQL_API_SQLSETCONNECTATTR: SqlUSmallInt = 1016;
 pub const SQL_API_SQLSETENVATTR: SqlUSmallInt = 1019;
 pub const SQL_API_SQLSETSTMTATTR: SqlUSmallInt = 1020;
 
+// Catalog function identifiers (values from the official ODBC-Specification
+// sql.h/sqlext.h: https://github.com/microsoft/ODBC-Specification).
+pub const SQL_API_SQLCOLUMNS: SqlUSmallInt = 40;
+pub const SQL_API_SQLSPECIALCOLUMNS: SqlUSmallInt = 52;
+pub const SQL_API_SQLSTATISTICS: SqlUSmallInt = 53;
+pub const SQL_API_SQLTABLES: SqlUSmallInt = 54;
+pub const SQL_API_SQLFOREIGNKEYS: SqlUSmallInt = 60;
+pub const SQL_API_SQLPRIMARYKEYS: SqlUSmallInt = 65;
+pub const SQL_API_SQLPROCEDURES: SqlUSmallInt = 67;
+
 // SQLGetInfo info-type identifiers.
 pub const SQL_MAX_DRIVER_CONNECTIONS: SqlUSmallInt = 0;
 pub const SQL_ACTIVE_STATEMENTS: SqlUSmallInt = 1;
