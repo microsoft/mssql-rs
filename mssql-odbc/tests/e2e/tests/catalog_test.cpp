@@ -7,6 +7,9 @@
 
 #include "odbc_test_fixture.h"
 
+#include <cstdint>
+#include <cstdio>
+#include <random>
 #include <string>
 
 namespace {
@@ -26,6 +29,24 @@ std::string DescribeColName(SQLHSTMT stmt, SQLUSMALLINT column) {
     return ODBCTestUtils::ToNarrow(SqlTString(name));
 }
 
+// Reads a column's Nullable flag via SQLDescribeCol (SQL_NO_NULLS /
+// SQL_NULLABLE / SQL_NULLABLE_UNKNOWN), exercising the same SQLDescribeCol
+// call as DescribeColName so ClearNullable coverage doesn't need a second
+// round trip.
+SQLSMALLINT DescribeColNullable(SQLHSTMT stmt, SQLUSMALLINT column) {
+    SQLTCHAR name[128] = {};
+    SQLSMALLINT nameLen = 0;
+    SQLSMALLINT dataType = 0;
+    SQLULEN columnSize = 0;
+    SQLSMALLINT decimalDigits = 0;
+    SQLSMALLINT nullable = 0;
+    SQLRETURN rc = SQLDescribeCol(stmt, column, name,
+                                  static_cast<SQLSMALLINT>(sizeof(name) / sizeof(SQLTCHAR)),
+                                  &nameLen, &dataType, &columnSize, &decimalDigits, &nullable);
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    return nullable;
+}
+
 // Drains a cursor to completion and returns the number of rows fetched.
 int DrainRows(SQLHSTMT stmt) {
     int rows = 0;
@@ -35,6 +56,26 @@ int DrainRows(SQLHSTMT stmt) {
     }
     EXPECT_EQ(SQL_NO_DATA, rc);
     return rows;
+}
+
+// A per-process random suffix appended to the catalog tests' fixture table
+// names. These are permanent tables (unlike every other e2e test file's
+// #temp tables — sp_tables et al. would report mangled names for a temp
+// table), dropped and recreated in SetUp/TearDown, so two concurrent runs
+// against the same database (two CI legs, or a developer running locally
+// alongside CI) would otherwise delete each other's fixtures mid-test.
+// Memoized in a function-local static so every call within one process
+// shares the same suffix.
+const std::string& UniqueSuffix() {
+    static const std::string suffix = [] {
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        std::uniform_int_distribution<uint64_t> dist;
+        char buf[17] = {};
+        std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(dist(gen)));
+        return std::string(buf);
+    }();
+    return suffix;
 }
 
 } // namespace
@@ -87,10 +128,12 @@ TEST(CatalogTest, ProceduresNullHandle) {
 
 class CatalogLiveTest : public ODBCTest {
 protected:
-    // Prefixed and specific enough that a collision with an unrelated table in
-    // the test database is unlikely.
-    static constexpr const char* kParentTable = "odbc_e2e_catalog_parent";
-    static constexpr const char* kChildTable = "odbc_e2e_catalog_child";
+    // Permanent tables (unlike other e2e files' #temp tables — catalog
+    // functions need a table sp_tables et al. can actually report by name).
+    // A per-process suffix (UniqueSuffix() above) keeps them collision-free
+    // between concurrent runs against the same database.
+    static inline const std::string kParentTable = "odbc_e2e_catalog_parent_" + UniqueSuffix();
+    static inline const std::string kChildTable = "odbc_e2e_catalog_child_" + UniqueSuffix();
 
     void SetUp() override {
         ODBCTest::SetUp();
@@ -100,18 +143,20 @@ protected:
         Connect();
         DropTestTables();
         ExecDirect(
-            "CREATE TABLE odbc_e2e_catalog_parent ("
+            "CREATE TABLE " + kParentTable +
+            " ("
             "  id INT NOT NULL PRIMARY KEY,"
             "  name VARCHAR(50) NOT NULL,"
             "  note VARCHAR(50) NULL"
             ")");
+        ExecDirect("CREATE UNIQUE INDEX ix_" + kParentTable + "_name ON " + kParentTable +
+                   "(name)");
         ExecDirect(
-            "CREATE UNIQUE INDEX ix_odbc_e2e_catalog_parent_name "
-            "ON odbc_e2e_catalog_parent(name)");
-        ExecDirect(
-            "CREATE TABLE odbc_e2e_catalog_child ("
+            "CREATE TABLE " + kChildTable +
+            " ("
             "  id INT NOT NULL PRIMARY KEY,"
-            "  parent_id INT NOT NULL REFERENCES odbc_e2e_catalog_parent(id)"
+            "  parent_id INT NOT NULL REFERENCES " +
+            kParentTable + "(id)"
             ")");
     }
 
@@ -123,8 +168,8 @@ protected:
     }
 
     void DropTestTables() {
-        ExecDirectIgnoreError("DROP TABLE IF EXISTS odbc_e2e_catalog_child");
-        ExecDirectIgnoreError("DROP TABLE IF EXISTS odbc_e2e_catalog_parent");
+        ExecDirectIgnoreError("DROP TABLE IF EXISTS " + kChildTable);
+        ExecDirectIgnoreError("DROP TABLE IF EXISTS " + kParentTable);
     }
 };
 
@@ -193,6 +238,10 @@ TEST_F(CatalogLiveTest, ColumnsReportsOdbc3ColumnNamesAndAllColumns) {
     EXPECT_EQ("BUFFER_LENGTH", DescribeColName(stmt_, 8));
     EXPECT_EQ("DECIMAL_DIGITS", DescribeColName(stmt_, 9));
     EXPECT_EQ("NUM_PREC_RADIX", DescribeColName(stmt_, 10));
+    // ClearNullable: TABLE_NAME and NULLABLE are ODBC-mandated NOT NULL,
+    // regardless of what sp_columns_100 itself reports for them.
+    EXPECT_EQ(SQL_NO_NULLS, DescribeColNullable(stmt_, 3));  // TABLE_NAME
+    EXPECT_EQ(SQL_NO_NULLS, DescribeColNullable(stmt_, 11)); // NULLABLE
     EXPECT_EQ(3, DrainRows(stmt_)); // id, name, note
 
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);

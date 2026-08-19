@@ -840,15 +840,15 @@ pub unsafe extern "C" fn SQLStatisticsW(
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLSpecialColumnsW(
     statement_handle: SqlHandle,
-    identifier_type: SqlSmallInt,
+    identifier_type: SqlUSmallInt,
     catalog_name: *const SqlWChar,
     name_length_1: SqlSmallInt,
     schema_name: *const SqlWChar,
     name_length_2: SqlSmallInt,
     table_name: *const SqlWChar,
     name_length_3: SqlSmallInt,
-    scope: SqlSmallInt,
-    nullable: SqlSmallInt,
+    scope: SqlUSmallInt,
+    nullable: SqlUSmallInt,
 ) -> SqlReturn {
     crate::init_tracing();
     unsafe {

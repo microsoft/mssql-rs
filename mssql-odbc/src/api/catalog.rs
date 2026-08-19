@@ -50,7 +50,7 @@ use super::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt,
     SqlWChar,
 };
-use super::sqlstate::{ERR_INVALID_CURSOR_STATE, post_diag};
+use super::sqlstate::{ERR_INVALID_CURSOR_STATE, ERR_INVALID_STRING_OR_BUFFER_LENGTH, post_diag};
 use super::txn::begin_transaction_if_manual;
 use super::util::{COLMETA_NULLABLE_FLAG, read_utf16};
 use crate::error::free_errors;
@@ -104,6 +104,39 @@ fn nvarchar(value: Option<&str>, len: u16) -> RpcParameter {
     RpcParameter::new(None, StatusFlags::NONE, SqlType::NVarchar(sql_value, len))
 }
 
+/// Validates that a catalog-function string argument's character count fits
+/// within the length declared for its RPC parameter (`max_len` — [`SYSNAME_LEN`]
+/// for ordinary identifier arguments, [`TABLE_TYPE_LEN`] for `SQLTables`'
+/// `TableType`), posting the ODBC-mandated `HY090` diagnostic and returning
+/// `Err(SQL_ERROR)` for the first violation. Mirrors msodbcsql's upfront
+/// `ValidateArgument` (`sqlcdd.cpp` line ~389), which rejects an oversized
+/// argument before attempting any network call, rather than letting it
+/// surface as an internal RPC-parameter-serialization failure (`HY000`, not
+/// the state the spec mandates for this condition).
+fn check_arg_length(stmt: &StmtHandle, value: &Arg, max_len: u16) -> Result<(), SqlReturn> {
+    if value
+        .as_deref()
+        .is_none_or(|v| v.chars().count() <= max_len as usize)
+    {
+        return Ok(());
+    }
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("catalog function: stmt mutex poisoned validating argument length");
+        return Err(SQL_ERROR);
+    };
+    post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+    Err(SQL_ERROR)
+}
+
+/// Runs [`check_arg_length`] over every `(argument, max_len)` pair, short-
+/// circuiting on the first violation.
+fn check_arg_lengths(stmt: &StmtHandle, args: &[(&Arg, u16)]) -> Result<(), SqlReturn> {
+    for (value, max_len) in args {
+        check_arg_length(stmt, value, *max_len)?;
+    }
+    Ok(())
+}
+
 /// Builds a named `BIT` RPC parameter (`@fUsePattern`). `name` is the bare
 /// parameter name; the leading `@` TDS RPC requires is added here so callers
 /// can't accidentally omit it.
@@ -136,9 +169,34 @@ fn odbc_ver_param() -> RpcParameter {
 /// when no catalog is given.
 fn qualified_proc_name(catalog: &Arg, proc: &str) -> String {
     match catalog.as_deref().filter(|c| !c.is_empty()) {
-        Some(db) => format!("[{}].sys.{proc}", db.replace(']', "]]")),
+        Some(db) => format!(
+            "[{}].sys.{proc}",
+            unescape_search_pattern(db).replace(']', "]]")
+        ),
         None => format!("[sys].{proc}"),
     }
+}
+
+/// Strips the ODBC search-pattern escape character (`\`) when it precedes
+/// `\`, `_`, or `%`, matching msodbcsql's `ValidateSearchPattern`
+/// (`sqlcdd.cpp` line 1308), which performs this same unescape before
+/// bracket-quoting a catalog value to build the three-part qualified
+/// procedure name above. Without it, a catalog argument containing an
+/// escaped wildcard character — e.g. `my\_db`, meaning the literal
+/// identifier `my_db` under the ODBC search-pattern escape convention —
+/// fails to resolve as a database and falls into the nonexistent-catalog
+/// retry instead of finding it.
+fn unescape_search_pattern(pattern: &str) -> String {
+    let mut result = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && matches!(chars.peek(), Some('\\') | Some('_') | Some('%')) {
+            result.push(chars.next().expect("peeked Some above"));
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Renders the `SQLTables` `TableType` argument the way `sp_tables` expects:
@@ -197,14 +255,26 @@ fn is_blank(arg: &Arg) -> bool {
 /// exercises it) and is not implemented here — such a combination is treated
 /// as a literal (and typically nonexistent) catalog name, same as any other
 /// catalog value containing `%`.
+///
+/// Only `sp_tables` recognizes the literal `%` qualifier itself (its
+/// "Special feature #1" branch, gated on blank name/owner exactly like this
+/// check); the other six procedures `raiserror` 15250 on it. Skipping
+/// three-part qualification here is what lets `sp_tables` reach that branch,
+/// but for the other six it merely avoids a spurious `[%].sys.proc`
+/// resolution failure — they still depend on [`run_catalog`]'s
+/// nonexistent-catalog retry (gated on whether the caller supplied a
+/// catalog, not on this function's output) to turn the 15250 into the empty
+/// result set the sentinel is supposed to produce.
 fn is_catalog_enumeration_sentinel(catalog: &Arg, name: &Arg, owner: &Arg) -> bool {
     catalog.as_deref() == Some("%") && is_blank(name) && is_blank(owner)
 }
 
-/// The catalog to use for three-part qualification and the nonexistent-
-/// catalog retry gate in [`run_catalog`] — `catalog` itself unless it is the
-/// enumeration sentinel above, in which case qualification is skipped (`None`)
-/// while the RPC parameter still carries the real value.
+/// The catalog to use for three-part qualification — `catalog` itself unless
+/// it is the enumeration sentinel above, in which case qualification is
+/// skipped (`None`) while the RPC parameter still carries the real value.
+/// Deliberately *not* used to gate [`run_catalog`]'s nonexistent-catalog
+/// retry: that gate must reflect whether the caller supplied a catalog at
+/// all, not whether qualification happened to be skipped for the sentinel.
 fn qualification_catalog(catalog: &Arg, name: &Arg, owner: &Arg) -> Arg {
     if is_catalog_enumeration_sentinel(catalog, name, owner) {
         None
@@ -216,13 +286,16 @@ fn qualification_catalog(catalog: &Arg, name: &Arg, owner: &Arg) -> Arg {
 /// The value to send as the `table_qualifier`/`proc_qualifier` RPC parameter.
 /// SQL Server rejects a non-NULL qualifier that doesn't match the *current*
 /// database with error 15250 ("The database name component of the object
-/// qualifier must be the name of the current database"); NULL and the exact
-/// literal `%` (the enumeration sentinel, which the stored procedures special-
-/// case) both bypass that check. `run_catalog`'s retry always dispatches
-/// unqualified against the current database, so `unmatchable` (`true` only on
-/// that retry) must null out any real catalog value here — otherwise a
-/// nonexistent-catalog call would itself fail with 15250 instead of the empty
-/// result set the retry exists to produce.
+/// qualifier must be the name of the current database"); NULL bypasses that
+/// check, and so does the exact literal `%` for `sp_tables` specifically
+/// (see [`is_catalog_enumeration_sentinel`]) since it special-cases that
+/// value before ever comparing it to the current database name. The other
+/// six procedures have no such exemption and rely entirely on
+/// `run_catalog`'s retry when sent a literal `%`. That retry always
+/// dispatches unqualified against the current database, so `unmatchable`
+/// (`true` only on that retry) must null out any real catalog value here —
+/// otherwise a nonexistent-catalog call would itself fail with 15250 instead
+/// of the empty result set the retry exists to produce.
 fn qualifier_value(catalog: &Arg, unmatchable: bool) -> Option<&str> {
     if unmatchable {
         None
@@ -251,16 +324,36 @@ fn is_2x_app(stmt: &StmtHandle) -> Result<bool, SqlReturn> {
 /// `sqlcdd.cpp` lines 1910-1913).
 ///
 /// `catalog` scopes the call to a specific database via a three-part
-/// qualified procedure name (see [`qualified_proc_name`]). If a catalog was
-/// given and that qualified call fails for any reason, msodbcsql (`DoDD()`,
-/// lines 1883-1895) recovers by re-running the same procedure unqualified
-/// (i.e. against the *current* database) with its primary name filter forced
-/// to [`UNMATCHABLE_NAME`], producing a correctly-shaped empty result set
-/// instead of surfacing the object-resolution error. `build_params(true)`
-/// must build that "unmatchable" parameter set. Only a server-reported SQL
-/// error triggers the retry — a transport-level failure (connection drop,
-/// timeout) is propagated immediately, since retrying on a dead connection
-/// cannot succeed.
+/// qualified procedure name (see [`qualified_proc_name`]) — the
+/// *qualification* catalog from [`qualification_catalog`], which is `None`
+/// for the bare-`%` enumeration sentinel even though a catalog value was
+/// supplied.
+///
+/// `retry_on_error` gates the nonexistent-catalog retry below and must
+/// reflect whether the *caller* supplied a catalog at all, before the
+/// sentinel transform — msodbcsql's own gate (`DoDD()` line ~1880) is
+/// `!(wNBits & QUAL_BIT)`, set only when the argument was a null pointer, not
+/// derived from whether three-part qualification happened. Only `sp_tables`
+/// recognizes the bare-`%` sentinel internally (its "Special feature #1"
+/// branch); the other six procedures `raiserror` 15250 on a literal `%`
+/// qualifier that doesn't match the current database, so gating the retry on
+/// the *qualification* catalog (which the sentinel deliberately nulls) would
+/// skip the very retry that turns that 15250 into the empty result set the
+/// sentinel is supposed to produce.
+///
+/// If a catalog was supplied and that qualified call fails for any reason,
+/// msodbcsql (`DoDD()`, lines 1883-1895) recovers by re-running the same
+/// procedure unqualified (i.e. against the *current* database) with its
+/// primary name filter forced to [`UNMATCHABLE_NAME`], producing a
+/// correctly-shaped empty result set instead of surfacing the object-
+/// resolution error. `build_params(true)` must build that "unmatchable"
+/// parameter set. Only a server-reported SQL error triggers the retry — a
+/// transport-level failure (connection drop, timeout) is propagated
+/// immediately, since retrying on a dead connection cannot succeed. Info
+/// messages captured during the abandoned first call are discarded before
+/// the retry runs, matching msodbcsql's `FreeErrors(lpstmt)` (`sqlcdd.cpp`
+/// line ~1884), so a successful empty retry can't surface stale messages
+/// from a call the application never saw succeed or fail.
 ///
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` allocated by
@@ -272,6 +365,7 @@ fn run_catalog(
     stmt: &StmtHandle,
     proc: &str,
     catalog: &Arg,
+    retry_on_error: bool,
     build_params: impl Fn(bool) -> (Vec<RpcParameter>, Option<Vec<RpcParameter>>),
     not_null_cols: &[usize],
     renames: &[(usize, &'static str)],
@@ -311,7 +405,6 @@ fn run_catalog(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    let has_catalog = catalog.as_deref().is_some_and(|c| !c.is_empty());
     let (positional, named) = build_params(false);
     let mut exec_result = dbc.runtime.block_on(client.execute_stored_procedure(
         qualified_proc_name(catalog, proc),
@@ -320,8 +413,9 @@ fn run_catalog(
         (),
     ));
 
-    if has_catalog && matches!(exec_result, Err(TdsError::SqlServerError { .. })) {
+    if retry_on_error && matches!(exec_result, Err(TdsError::SqlServerError { .. })) {
         debug!(%proc, "{name}: qualified catalog call failed, retrying unqualified");
+        let _ = client.take_info_messages();
         let (retry_positional, retry_named) = build_params(true);
         exec_result = dbc.runtime.block_on(client.execute_stored_procedure(
             qualified_proc_name(&None, proc),
@@ -463,7 +557,19 @@ fn sql_tables_w_safe(
     table_type: Arg,
 ) -> SqlReturn {
     let table_type = table_type_value(&table_type);
+    if let Err(rc) = check_arg_lengths(
+        stmt,
+        &[
+            (&catalog, SYSNAME_LEN),
+            (&schema, SYSNAME_LEN),
+            (&table, SYSNAME_LEN),
+            (&table_type, TABLE_TYPE_LEN),
+        ],
+    ) {
+        return rc;
+    }
     let qualify_catalog = qualification_catalog(&catalog, &table, &schema);
+    let retry_on_error = !is_blank(&catalog);
     let build_params = |unmatchable: bool| {
         let table_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
@@ -495,6 +601,7 @@ fn sql_tables_w_safe(
         stmt,
         "sp_tables",
         &qualify_catalog,
+        retry_on_error,
         build_params,
         &[],
         &[(0, "TABLE_CAT"), (1, "TABLE_SCHEM")],
@@ -587,11 +694,23 @@ fn sql_columns_w_safe(
     table: Arg,
     column: Arg,
 ) -> SqlReturn {
+    if let Err(rc) = check_arg_lengths(
+        stmt,
+        &[
+            (&catalog, SYSNAME_LEN),
+            (&schema, SYSNAME_LEN),
+            (&table, SYSNAME_LEN),
+            (&column, SYSNAME_LEN),
+        ],
+    ) {
+        return rc;
+    }
     let is_2x = match is_2x_app(stmt) {
         Ok(is_2x) => is_2x,
         Err(rc) => return rc,
     };
     let qualify_catalog = qualification_catalog(&catalog, &table, &schema);
+    let retry_on_error = !is_blank(&catalog);
     let build_params = |unmatchable: bool| {
         let table_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
@@ -621,6 +740,7 @@ fn sql_columns_w_safe(
         stmt,
         "sp_columns_100",
         &qualify_catalog,
+        retry_on_error,
         build_params,
         &[2, 3, 4, 5, 10, 13, 16],
         &[
@@ -708,7 +828,18 @@ fn sql_primary_keys_w_safe(
     schema: Arg,
     table: Arg,
 ) -> SqlReturn {
+    if let Err(rc) = check_arg_lengths(
+        stmt,
+        &[
+            (&catalog, SYSNAME_LEN),
+            (&schema, SYSNAME_LEN),
+            (&table, SYSNAME_LEN),
+        ],
+    ) {
+        return rc;
+    }
     let qualify_catalog = qualification_catalog(&catalog, &table, &schema);
+    let retry_on_error = !is_blank(&catalog);
     let build_params = |unmatchable: bool| {
         let table_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
@@ -729,6 +860,7 @@ fn sql_primary_keys_w_safe(
         stmt,
         "sp_pkeys",
         &qualify_catalog,
+        retry_on_error,
         build_params,
         &[2, 3, 4],
         &[(0, "TABLE_CAT"), (1, "TABLE_SCHEM")],
@@ -851,6 +983,19 @@ fn sql_foreign_keys_w_safe(
     fk_schema: Arg,
     fk_table: Arg,
 ) -> SqlReturn {
+    if let Err(rc) = check_arg_lengths(
+        stmt,
+        &[
+            (&pk_catalog, SYSNAME_LEN),
+            (&pk_schema, SYSNAME_LEN),
+            (&pk_table, SYSNAME_LEN),
+            (&fk_catalog, SYSNAME_LEN),
+            (&fk_schema, SYSNAME_LEN),
+            (&fk_table, SYSNAME_LEN),
+        ],
+    ) {
+        return rc;
+    }
     // Both sides must resolve to one database. If only one qualifier was
     // supplied, use it for both; if both were supplied and disagree, force an
     // empty result set by making the PK table name unmatchable rather than
@@ -865,6 +1010,7 @@ fn sql_foreign_keys_w_safe(
         (false, false) => (None, false),
     };
     let qualify_catalog = qualification_catalog(&catalog, &pk_table, &pk_schema);
+    let retry_on_error = pk_has || fk_has;
 
     let build_params = |unmatchable: bool| {
         let pk_table_name = if unmatchable || catalogs_conflict {
@@ -898,6 +1044,7 @@ fn sql_foreign_keys_w_safe(
         stmt,
         "sp_fkeys",
         &qualify_catalog,
+        retry_on_error,
         build_params,
         &[2, 3, 6, 7],
         &[
@@ -1003,6 +1150,16 @@ fn sql_statistics_w_safe(
     unique: SqlUSmallInt,
     reserved: SqlUSmallInt,
 ) -> SqlReturn {
+    if let Err(rc) = check_arg_lengths(
+        stmt,
+        &[
+            (&catalog, SYSNAME_LEN),
+            (&schema, SYSNAME_LEN),
+            (&table, SYSNAME_LEN),
+        ],
+    ) {
+        return rc;
+    }
     // SQL_INDEX_UNIQUE (0) selects unique indexes only; SQL_QUICK (0) permits
     // cached cardinality, SQL_ENSURE (1) forces a scan.
     let is_unique = if unique == super::odbc_types::SQL_INDEX_UNIQUE {
@@ -1017,6 +1174,7 @@ fn sql_statistics_w_safe(
     };
 
     let qualify_catalog = qualification_catalog(&catalog, &table, &schema);
+    let retry_on_error = !is_blank(&catalog);
     let build_params = |unmatchable: bool| {
         let table_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
@@ -1044,6 +1202,7 @@ fn sql_statistics_w_safe(
         stmt,
         "sp_statistics_100",
         &qualify_catalog,
+        retry_on_error,
         build_params,
         &[],
         &[
@@ -1066,15 +1225,15 @@ fn sql_statistics_w_safe(
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_special_columns_w(
     statement_handle: SqlHandle,
-    identifier_type: SqlSmallInt,
+    identifier_type: SqlUSmallInt,
     catalog_name: *const SqlWChar,
     name_length_1: SqlSmallInt,
     schema_name: *const SqlWChar,
     name_length_2: SqlSmallInt,
     table_name: *const SqlWChar,
     name_length_3: SqlSmallInt,
-    scope: SqlSmallInt,
-    nullable: SqlSmallInt,
+    scope: SqlUSmallInt,
+    nullable: SqlUSmallInt,
 ) -> SqlReturn {
     debug!(
         ?statement_handle,
@@ -1108,15 +1267,15 @@ pub(crate) unsafe fn sql_special_columns_w(
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_special_columns_w_impl(
     statement_handle: SqlHandle,
-    identifier_type: SqlSmallInt,
+    identifier_type: SqlUSmallInt,
     catalog_name: *const SqlWChar,
     name_length_1: SqlSmallInt,
     schema_name: *const SqlWChar,
     name_length_2: SqlSmallInt,
     table_name: *const SqlWChar,
     name_length_3: SqlSmallInt,
-    scope: SqlSmallInt,
-    nullable: SqlSmallInt,
+    scope: SqlUSmallInt,
+    nullable: SqlUSmallInt,
 ) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLSpecialColumnsW: statement_handle is null");
@@ -1149,16 +1308,27 @@ unsafe fn sql_special_columns_w_impl(
 fn sql_special_columns_w_safe(
     statement_handle: SqlHandle,
     stmt: &StmtHandle,
-    identifier_type: SqlSmallInt,
+    identifier_type: SqlUSmallInt,
     catalog: Arg,
     schema: Arg,
     table: Arg,
-    scope: SqlSmallInt,
-    nullable: SqlSmallInt,
+    scope: SqlUSmallInt,
+    nullable: SqlUSmallInt,
 ) -> SqlReturn {
     use super::odbc_types::{
         SQL_BEST_ROWID, SQL_NO_NULLS, SQL_SCOPE_CURROW, SQL_SCOPE_TRANSACTION, SQL_TXN_SERIALIZABLE,
     };
+
+    if let Err(rc) = check_arg_lengths(
+        stmt,
+        &[
+            (&catalog, SYSNAME_LEN),
+            (&schema, SYSNAME_LEN),
+            (&table, SYSNAME_LEN),
+        ],
+    ) {
+        return rc;
+    }
 
     let col_type = if identifier_type == SQL_BEST_ROWID {
         "R"
@@ -1166,7 +1336,14 @@ fn sql_special_columns_w_safe(
         "V"
     };
     let scope_char = if scope == SQL_SCOPE_CURROW { "C" } else { "T" };
-    let nullable_char = if nullable == SQL_NO_NULLS { "O" } else { "U" };
+    // `SQL_NO_NULLS` is typed `SqlSmallInt` (`i16`) for its other use as
+    // `SQLDescribeCol`'s signed `Nullable` output; `SQLSpecialColumns`'
+    // `fNullable` is `SQLUSMALLINT` per the ODBC header, hence the cast.
+    let nullable_char = if nullable == SQL_NO_NULLS as SqlUSmallInt {
+        "O"
+    } else {
+        "U"
+    };
 
     // A ROWID's uniqueness cannot be guaranteed beyond the current row unless
     // the requested scope is a serializable transaction, so the ODBC
@@ -1188,6 +1365,7 @@ fn sql_special_columns_w_safe(
         Err(rc) => return rc,
     };
     let qualify_catalog = qualification_catalog(&catalog, &table, &schema);
+    let retry_on_error = !is_blank(&catalog);
     let build_params = move |unmatchable: bool| {
         let table_name = if unmatchable || force_empty {
             Some(UNMATCHABLE_NAME.to_string())
@@ -1216,6 +1394,7 @@ fn sql_special_columns_w_safe(
         stmt,
         "sp_special_columns_100",
         &qualify_catalog,
+        retry_on_error,
         build_params,
         &[1, 2, 3],
         &[
@@ -1300,7 +1479,18 @@ fn sql_procedures_w_safe(
     schema: Arg,
     proc: Arg,
 ) -> SqlReturn {
+    if let Err(rc) = check_arg_lengths(
+        stmt,
+        &[
+            (&catalog, SYSNAME_LEN),
+            (&schema, SYSNAME_LEN),
+            (&proc, SYSNAME_LEN),
+        ],
+    ) {
+        return rc;
+    }
     let qualify_catalog = qualification_catalog(&catalog, &proc, &schema);
+    let retry_on_error = !is_blank(&catalog);
     let build_params = |unmatchable: bool| {
         let proc_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
@@ -1326,6 +1516,7 @@ fn sql_procedures_w_safe(
         stmt,
         "sp_stored_procedures",
         &qualify_catalog,
+        retry_on_error,
         build_params,
         &[2],
         &[(0, "PROCEDURE_CAT"), (1, "PROCEDURE_SCHEM")],
@@ -1423,6 +1614,26 @@ mod tests {
     }
 
     #[test]
+    fn enumeration_sentinel_still_gates_retry_despite_null_qualification_catalog() {
+        // The bug this guards against: gating run_catalog's nonexistent-
+        // catalog retry on the *qualification* catalog (which is `None` for
+        // the bare-`%` enumeration sentinel) would skip the retry for the
+        // six catalog procedures that don't special-case a literal `%`
+        // internally (only `sp_tables` does) — their SQL Server error 15250
+        // would surface as `SQL_ERROR` instead of the empty result set the
+        // retry produces. Each `sql_*_w_safe` function instead derives its
+        // `retry_on_error` argument from `!is_blank(&catalog)` — the raw,
+        // pre-qualification-transform argument — which must stay `true` for
+        // the sentinel even though `qualification_catalog` nulls it out.
+        let percent = Some("%".to_string());
+        assert_eq!(qualification_catalog(&percent, &None, &None), None);
+        assert!(!is_blank(&percent));
+        // No catalog at all: qualification is trivially None, and so is the
+        // retry gate — there is nothing to retry unqualified against.
+        assert!(is_blank(&None));
+    }
+
+    #[test]
     fn qualifier_value_is_real_catalog_on_first_attempt() {
         let real = Some("MyDb".to_string());
         assert_eq!(qualifier_value(&real, false), Some("MyDb"));
@@ -1465,6 +1676,38 @@ mod tests {
         assert_eq!(
             qualified_proc_name(&Some("we]ird".to_string()), "sp_tables"),
             "[we]]ird].sys.sp_tables"
+        );
+    }
+
+    #[test]
+    fn qualified_proc_name_unescapes_search_pattern_before_bracketing() {
+        // `my\_db` under the ODBC search-pattern escape convention means the
+        // literal identifier `my_db`; msodbcsql's `ValidateSearchPattern`
+        // strips the backslash before building the bracketed qualifier
+        // (`sqlcdd.cpp` line 1308), and this must match or the database
+        // fails to resolve.
+        assert_eq!(
+            qualified_proc_name(&Some(r"my\_db".to_string()), "sp_tables"),
+            "[my_db].sys.sp_tables"
+        );
+        assert_eq!(
+            qualified_proc_name(&Some(r"my\%db".to_string()), "sp_tables"),
+            "[my%db].sys.sp_tables"
+        );
+        assert_eq!(
+            qualified_proc_name(&Some(r"my\\db".to_string()), "sp_tables"),
+            r"[my\db].sys.sp_tables"
+        );
+        // A backslash not followed by an escapable character is literal.
+        assert_eq!(
+            qualified_proc_name(&Some(r"my\db".to_string()), "sp_tables"),
+            r"[my\db].sys.sp_tables"
+        );
+        // Unescaping happens before bracket-doubling: the escaped `_`
+        // disappears, then the standalone `]` still gets doubled.
+        assert_eq!(
+            qualified_proc_name(&Some(r"a\_b]c".to_string()), "sp_tables"),
+            "[a_b]]c].sys.sp_tables"
         );
     }
 
