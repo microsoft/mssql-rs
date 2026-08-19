@@ -141,7 +141,7 @@ TEST_F(DescribeParamLiveTest, ExecutesMssqlPythonDefaultNullPath) {
 }
 
 TEST_F(DescribeParamLiveTest, DescribesAllNullsBeforeBinding) {
-    ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, 7), COALESCE(?, N'fallback')"),
+    ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, 7), CAST(? AS NVARCHAR(8))"),
                   SQL_HANDLE_STMT, stmt_);
 
     ParamDescription first = Describe(1);
@@ -157,7 +157,9 @@ TEST_F(DescribeParamLiveTest, DescribesAllNullsBeforeBinding) {
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("7", GetColumn(1));
-    EXPECT_EQ("fallback", GetColumn(2));
+    SQLLEN second_result = 0;
+    GetColumn(2, &second_result);
+    EXPECT_EQ(SQL_NULL_DATA, second_result);
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
