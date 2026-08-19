@@ -29,7 +29,6 @@
 //!   inputs; the cache key itself carries only a digest of the secret.
 
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
@@ -40,7 +39,8 @@ use azure_identity::{
     ClientSecretCredential, ClientSecretCredentialOptions, ManagedIdentityCredential,
     ManagedIdentityCredentialOptions, UserAssignedId,
 };
-use tracing::debug;
+use sha2::{Digest, Sha256};
+use tracing::{debug, warn};
 use url::{Position, Url};
 
 #[cfg(windows)]
@@ -78,12 +78,15 @@ impl EntraTokenFactory {
 
     /// Derives the process-wide cache key for this factory's identity. For a
     /// service principal this is the authority/tenant (from the server-provided
-    /// STS URL), client id, and a digest of the secret — never the secret
-    /// itself, so a hash collision can only merge two different secrets for
-    /// the *same* client, which just fails cleanly at the STS. Managed
-    /// identity keys on client id alone (empty for the system-assigned
-    /// identity): IMDS is scoped to the local machine, so no authority/tenant
-    /// applies.
+    /// STS URL), client id, and a SHA-256 digest of the secret — never the
+    /// secret itself. The digest must be collision-resistant: unlike a
+    /// `DefaultHasher`/SipHash digest, which is only DoS-resistant and would
+    /// let two different secrets alias into the same cache entry, SHA-256
+    /// makes that practically impossible, so a secret rotation always misses
+    /// the old entry instead of silently continuing to authenticate with a
+    /// stale (possibly revoked) secret. Managed identity keys on client id
+    /// alone (empty for the system-assigned identity): IMDS is scoped to the
+    /// local machine, so no authority/tenant applies.
     fn cache_key(&self, sts_url: &str) -> TdsResult<CredentialCacheKey> {
         match &self.config {
             CredentialConfig::ServicePrincipalSecret { client_id, secret } => {
@@ -189,7 +192,7 @@ enum CredentialCacheKey {
         authority_host: String,
         tenant_id: String,
         client_id: String,
-        secret_digest: u64,
+        secret_digest: [u8; 32],
     },
     ManagedIdentity {
         /// Empty for the system-assigned identity.
@@ -209,13 +212,14 @@ impl CredentialCacheKey {
     }
 }
 
-/// Non-cryptographic digest used only as a process-local cache-key
+/// Collision-resistant digest used only as a process-local cache-key
 /// discriminator — never persisted, logged, or compared against
-/// attacker-controlled input.
-fn digest(secret: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    secret.hash(&mut hasher);
-    hasher.finish()
+/// attacker-controlled input. SHA-256 (rather than a `DefaultHasher`/SipHash
+/// digest) is what makes two different secrets practically un-collidable, so
+/// a rotated secret always misses the old cache entry instead of an attacker
+/// — or bad luck — being able to alias a new secret onto a stale credential.
+fn digest(secret: &str) -> [u8; 32] {
+    Sha256::digest(secret.as_bytes()).into()
 }
 
 /// Entra ID credentials, shared process-wide so a burst of new connections for
@@ -253,14 +257,28 @@ static CREDENTIAL_CACHE: OnceLock<Mutex<HashMap<CredentialCacheKey, Arc<dyn Toke
 /// Logs a hit/miss at `debug` (identity kind only — never the tenant, client
 /// id, or secret digest) so a connection storm's throttling behavior can be
 /// correlated against actual cache effectiveness in production traces.
+///
+/// Recovers from a poisoned lock rather than propagating an error, unlike an
+/// ODBC handle's `*.inner` mutex. That rule exists because a poisoned handle
+/// mutex might guard a torn domain object, and erroring out affects only the
+/// one handle that panicked — the application frees it and gets a fresh,
+/// unpoisoned mutex on its next allocation. `CREDENTIAL_CACHE` is a `static`:
+/// once poisoned it never recovers on its own, so treating poison as fatal
+/// here would permanently fail every future connection's Entra auth for the
+/// rest of the process from a single transient panic, instead of just the one
+/// call in flight when it happened. The recovered map cannot be torn in a way
+/// that matters either — the lock is never held across `build()`'s fallible
+/// work in a way that leaves a partial insert (see above), so the worst case
+/// is a missing entry, which is exactly a cache miss.
 fn cached_credential(
     key: CredentialCacheKey,
     build: impl FnOnce() -> TdsResult<Arc<dyn TokenCredential>>,
 ) -> TdsResult<Arc<dyn TokenCredential>> {
     let cache = CREDENTIAL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cache = cache.lock().unwrap_or_else(|poisoned| {
+        warn!("entra: credential cache mutex was poisoned by a prior panic; recovering its state rather than failing Entra auth process-wide");
+        poisoned.into_inner()
+    });
 
     if let Some(existing) = cache.get(&key) {
         debug!(kind = key.label(), "entra: reusing cached credential");
@@ -778,6 +796,23 @@ mod tests {
     }
 
     #[test]
+    fn digest_is_deterministic_sha256_not_a_weak_hash() {
+        // Pins the fix for a real review finding: a `DefaultHasher`/SipHash
+        // digest is only DoS-resistant, not collision-resistant, so a
+        // rotated secret could alias onto a stale cached credential. SHA-256
+        // (32 bytes, deterministic, and distinguishing secrets that differ by
+        // a single character) is what makes that practically impossible.
+        assert_eq!(digest("same-secret"), digest("same-secret"));
+        assert_ne!(digest("secret-a"), digest("secret-b"));
+        assert_ne!(
+            digest("secret"),
+            digest("Secret"),
+            "digest must be case-sensitive over the raw secret bytes"
+        );
+        assert_eq!(digest("x").len(), 32, "SHA-256 output is 32 bytes");
+    }
+
+    #[test]
     fn managed_identity_key_distinguishes_system_and_user_assigned() {
         let system = EntraTokenFactory::new(CredentialConfig::ManagedIdentity { client_id: None });
         let user_a = EntraTokenFactory::new(CredentialConfig::ManagedIdentity {
@@ -807,7 +842,7 @@ mod tests {
             authority_host: "https://login.microsoftonline.com".to_string(),
             tenant_id: "some-tenant".to_string(),
             client_id: "some-client".to_string(),
-            secret_digest: 0xdead_beef,
+            secret_digest: digest("some-secret"),
         };
         let mi = CredentialCacheKey::ManagedIdentity {
             client_id: "some-client".to_string(),
@@ -854,6 +889,33 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&a, &b),
             "distinct identities must never share a credential"
+        );
+    }
+
+    #[test]
+    fn cached_credential_recovers_from_a_poisoned_lock() {
+        // Runs in its own process under nextest, so poisoning the static
+        // cache here cannot affect any other test.
+        let key = CredentialCacheKey::ManagedIdentity {
+            client_id: "cached-credential-poison-recovery".to_string(),
+        };
+
+        let cache = CREDENTIAL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.lock().unwrap();
+            panic!("deliberately poisoning the credential cache lock for this test");
+        }));
+        assert!(poisoned.is_err());
+        assert!(cache.is_poisoned());
+
+        // The reasoning on `cached_credential`: recovering here (instead of
+        // propagating an error, as an ODBC handle mutex would) is what keeps
+        // one unrelated panic from permanently failing Entra auth for the
+        // rest of the process.
+        let credential = cached_credential(key, counting_credential);
+        assert!(
+            credential.is_ok(),
+            "poison recovery must not fail Entra auth process-wide"
         );
     }
 

@@ -26,6 +26,12 @@ azure_core = { version = "1.1", default-features = false, features = [
 ] }
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream"] }
 url = "2"
+# Collision-resistant digest for the Entra credential cache key (AB#46409) —
+# a plain SipHash/DefaultHasher digest is only DoS-resistant, not designed to
+# make two different secrets un-collidable, and a collision would let a new
+# connection silently reuse a stale cached credential built from a different
+# secret.
+sha2 = "0.11.0"
 
 # `ActiveDirectoryInteractive` delegates the sign-in UI to `mssql-auth.dll`
 # (OneAuth), the same library msodbcsql loads. The `windows` crate supplies the
