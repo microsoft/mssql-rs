@@ -69,6 +69,29 @@ pub const SQL_ATTR_PACKET_SIZE: SqlInteger = 112;
 pub const SQL_ATTR_CONNECTION_TIMEOUT: SqlInteger = 113;
 pub const SQL_ATTR_ANSI_APP: SqlInteger = 115;
 
+// Connection-pooling attributes.
+//
+// `SQL_ATTR_RESET_CONNECTION` is armed by the pool at check-in so the next
+// request resets the session to its login defaults; `SQL_ATTR_CONNECTION_DEAD`
+// is a read-only liveness flag the pool consults before handing a connection
+// out.
+pub const SQL_ATTR_RESET_CONNECTION: SqlInteger = 116;
+pub const SQL_ATTR_CONNECTION_DEAD: SqlInteger = 1209;
+// Callers reaching us through the Windows Driver Manager must use the msodbcsql
+// spelling: the DM reserves SQL_ATTR_RESET_CONNECTION for its own pooling
+// protocol and rejects it from applications. Callers that load this driver
+// directly (mssql-python) send SQL_ATTR_RESET_CONNECTION on every platform.
+pub const SQL_COPT_SS_RESET_CONNECTION: SqlInteger = 1246;
+
+// `SQL_ATTR_RESET_CONNECTION` value. Only `SQL_RESET_CONNECTION_YES` is defined;
+// any other value is HY024.
+pub const SQL_RESET_CONNECTION_YES: u32 = 1;
+
+// `SQL_ATTR_CONNECTION_DEAD` values. msodbcsql reports DEAD until a token read
+// succeeds, so disconnected/never-connected reads DEAD.
+pub const SQL_CD_TRUE: u32 = 1;
+pub const SQL_CD_FALSE: u32 = 0;
+
 // `SQL_ATTR_ACCESS_MODE` values.
 pub const SQL_MODE_READ_WRITE: u32 = 0;
 
@@ -302,6 +325,8 @@ pub const SQL_LEN_DATA_AT_EXEC_OFFSET: SqlLen = -100;
 pub const SQL_SS_VARIANT: SqlSmallInt = -150;
 pub const SQL_SS_UDT: SqlSmallInt = -151;
 pub const SQL_SS_XML: SqlSmallInt = -152;
+pub const SQL_SS_TABLE: SqlSmallInt = -153;
+pub const SQL_SS_VECTOR: SqlSmallInt = -156;
 
 // ---- Additional ODBC C type identifiers (SQLBindCol / SQLGetData) -----------
 // Signed/unsigned integer C types are the base numeric type id plus an offset,
@@ -334,11 +359,20 @@ pub const SQL_C_TYPE_DATE: SqlSmallInt = 91;
 pub const SQL_C_TYPE_TIME: SqlSmallInt = 92;
 pub const SQL_C_TYPE_TIMESTAMP: SqlSmallInt = 93;
 
-// SQL Server-specific C types (msodbcsql extensions). `SQL_C_TYPES_EXTENDED`
-// is `0x4000`; the two SS date/time C types are offset from it.
+// SQL Server-specific C types (msodbcsql extensions). Values confirmed against
+// msodbcsql's `msodbcsql.h`: `#define SQL_C_TYPES_EXTENDED 0x04000L`.
 pub const SQL_C_TYPES_EXTENDED: SqlSmallInt = 0x4000; // 16384
 pub const SQL_C_SS_TIME2: SqlSmallInt = SQL_C_TYPES_EXTENDED; // 0x4000
 pub const SQL_C_SS_TIMESTAMPOFFSET: SqlSmallInt = SQL_C_TYPES_EXTENDED + 1; // 0x4001
+pub const SQL_C_SS_VECTOR: SqlSmallInt = SQL_C_TYPES_EXTENDED + 2; // 0x4002
+
+// The 13 ODBC 3.x interval C types occupy a contiguous range, 101..=113, and the
+// matching `SQL_INTERVAL_*` SQL types share those values.
+pub const SQL_C_INTERVAL_YEAR: SqlSmallInt = 101;
+pub const SQL_C_INTERVAL_MINUTE_TO_SECOND: SqlSmallInt = 113;
+// The interval SQL types share the C type values above.
+pub const SQL_INTERVAL_YEAR: SqlSmallInt = 101;
+pub const SQL_INTERVAL_MINUTE_TO_SECOND: SqlSmallInt = 113;
 
 // SQLColAttribute field identifier for the underlying type of a `sql_variant`
 // column (msodbcsql: `SQL_CA_SS_BASE + 15`). Required by mssql-python's

@@ -114,6 +114,37 @@ def test_cursor_bulkcopy_arrow_binary_auto_mapping(client_context):
 
 
 @pytest.mark.integration
+def test_cursor_bulkcopy_arrow_varbinary_binary_view(client_context):
+    """Arrow binary_view bulkcopy preserves values and NULLs."""
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "#BulkCopyArrowVarBinaryView"
+    cursor.execute(f"CREATE TABLE {table_name} (id INT, data VARBINARY(50))")
+    source = pa.table(
+        {
+            "id": pa.array([1, 2, 3], type=pa.int32()),
+            "data": pa.array(
+                [b"\x01\x02", None, b"more than twelve bytes"],
+                type=pa.binary_view(),
+            ),
+        }
+    )
+
+    result = cursor.bulkcopy_arrow(table_name, source, batch_size=1000, timeout=30)
+    assert result["rows_copied"] == 3
+
+    cursor.execute(f"SELECT id, data FROM {table_name} ORDER BY id")
+    assert cursor.fetchall() == [
+        (1, b"\x01\x02"),
+        (2, None),
+        (3, b"more than twelve bytes"),
+    ]
+
+    conn.close()
+
+
+@pytest.mark.integration
 def test_cursor_bulkcopy_arrow_binary_null_to_non_nullable_column(client_context):
     """A NULL value into a non-nullable VARBINARY column must raise ValueError."""
     conn = mssql_py_core.PyCoreConnection(client_context)

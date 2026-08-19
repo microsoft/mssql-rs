@@ -141,6 +141,16 @@ pub fn scoped_tracing_bridge(
     logger: Arc<Py<PyAny>>,
     module_name: &'static str,
 ) -> tracing::subscriber::DefaultGuard {
+    let dispatch = python_logger_dispatch(logger, module_name);
+    tracing::dispatcher::set_default(&dispatch)
+}
+
+/// Create an owned tracing dispatch that can follow asynchronous work across
+/// executor threads.
+pub(crate) fn python_logger_dispatch(
+    logger: Arc<Py<PyAny>>,
+    module_name: &'static str,
+) -> tracing::Dispatch {
     use tracing_subscriber::Registry;
     use tracing_subscriber::filter::filter_fn;
 
@@ -153,5 +163,5 @@ pub fn scoped_tracing_bridge(
 
     let subscriber = Registry::default().with(filtered_layer);
 
-    tracing::subscriber::set_default(subscriber)
+    tracing::Dispatch::new(subscriber)
 }

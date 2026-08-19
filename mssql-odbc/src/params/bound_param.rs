@@ -22,7 +22,8 @@ use crate::api::odbc_types::{SqlLen, SqlSmallInt, SqlULen};
 pub(crate) struct BoundParam {
     /// `SQL_PARAM_INPUT` / `SQL_PARAM_INPUT_OUTPUT` / `SQL_PARAM_OUTPUT`.
     pub(crate) input_output_type: SqlSmallInt,
-    /// C data type of the application buffer (ODBC `ValueType`, `SQL_C_*`).
+    /// C data type of the application buffer (ODBC `ValueType`, `SQL_C_*`),
+    /// with `SQL_C_DEFAULT` already resolved to a concrete type.
     pub(crate) c_type: SqlSmallInt,
     /// SQL data type of the column/expression (ODBC `ParameterType`, `SQL_*`).
     pub(crate) sql_type: SqlSmallInt,

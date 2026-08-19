@@ -257,6 +257,17 @@ impl AnyTransport {
             Self::Dynamic(transport) => transport.connection_known_dead(),
         }
     }
+
+    /// Flags the connection as known-dead without touching the socket, so a
+    /// later pool checkout discards it. See
+    /// [`TdsTransport::mark_known_dead`].
+    pub(crate) fn mark_known_dead(&mut self) {
+        match self {
+            Self::Network(transport) => TdsTransport::mark_known_dead(transport),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => transport.mark_known_dead(),
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-util", fuzzing))]
