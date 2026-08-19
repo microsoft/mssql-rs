@@ -20,6 +20,9 @@ pub(crate) const SQLSTATE_08003: [u8; 5] = *b"08003";
 /// Connection failure during a transaction — ODBC's precise state for a
 /// commit or rollback that could not reach the server.
 pub(crate) const SQLSTATE_08007: [u8; 5] = *b"08007";
+/// Communication link failure — the connection to the server broke, so a
+/// connection pool must discard the connection rather than reuse it.
+pub(crate) const SQLSTATE_08S01: [u8; 5] = *b"08S01";
 pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
 pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";

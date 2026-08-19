@@ -80,4 +80,15 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     fn connection_known_dead(&self) -> bool {
         false
     }
+
+    /// Marks the connection as known-dead so [`connection_known_dead`] reports
+    /// `true` without touching the socket.
+    ///
+    /// Used when a server fatal-error token (severity/class ≥ 20) is observed on
+    /// a still-open socket: the session is unusable even though the transport
+    /// has not seen a socket-level failure, so a later pool checkout must
+    /// discard the connection.
+    ///
+    /// [`connection_known_dead`]: TdsTransport::connection_known_dead
+    fn mark_known_dead(&mut self) {}
 }

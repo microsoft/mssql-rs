@@ -90,6 +90,13 @@ pub(crate) struct DbcState {
     /// distinct from `TdsClient::has_active_transaction()`, which also reports
     /// driver-begun *piggyback* transactions that carry no user work. Only this
     /// flag blocks `SQLDisconnect` (25000) and `SQL_ATTR_TXN_ISOLATION` (HY011).
+    /// Set when a pooling reset is armed and cleared once the request that
+    /// carries the RESETCONNECTION bit has been sent. While true,
+    /// `SQL_ATTR_TXN_ISOLATION` must not take its same-value short circuit: that
+    /// checkout `SET TRANSACTION ISOLATION LEVEL` is the request the armed bit
+    /// rides, so short-circuiting it would defer the reset to the borrower's
+    /// first query and lose fail-at-checkout.
+    pub(crate) pending_reset_ack: bool,
     pub(crate) local_tran_started: bool,
 }
 
@@ -144,6 +151,7 @@ impl DbcHandle {
                 autocommit: true,
                 txn_isolation: SQL_TXN_READ_COMMITTED,
                 local_tran_started: false,
+                pending_reset_ack: false,
             }),
         }
     }

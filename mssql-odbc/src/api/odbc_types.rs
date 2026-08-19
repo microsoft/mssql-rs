@@ -69,6 +69,29 @@ pub const SQL_ATTR_PACKET_SIZE: SqlInteger = 112;
 pub const SQL_ATTR_CONNECTION_TIMEOUT: SqlInteger = 113;
 pub const SQL_ATTR_ANSI_APP: SqlInteger = 115;
 
+// Connection-pooling attributes.
+//
+// `SQL_ATTR_RESET_CONNECTION` is armed by the pool at check-in so the next
+// request resets the session to its login defaults; `SQL_ATTR_CONNECTION_DEAD`
+// is a read-only liveness flag the pool consults before handing a connection
+// out.
+pub const SQL_ATTR_RESET_CONNECTION: SqlInteger = 116;
+pub const SQL_ATTR_CONNECTION_DEAD: SqlInteger = 1209;
+// Callers reaching us through the Windows Driver Manager must use the msodbcsql
+// spelling: the DM reserves SQL_ATTR_RESET_CONNECTION for its own pooling
+// protocol and rejects it from applications. Callers that load this driver
+// directly (mssql-python) send SQL_ATTR_RESET_CONNECTION on every platform.
+pub const SQL_COPT_SS_RESET_CONNECTION: SqlInteger = 1246;
+
+// `SQL_ATTR_RESET_CONNECTION` value. Only `SQL_RESET_CONNECTION_YES` is defined;
+// any other value is HY024.
+pub const SQL_RESET_CONNECTION_YES: u32 = 1;
+
+// `SQL_ATTR_CONNECTION_DEAD` values. msodbcsql reports DEAD until a token read
+// succeeds, so disconnected/never-connected reads DEAD.
+pub const SQL_CD_TRUE: u32 = 1;
+pub const SQL_CD_FALSE: u32 = 0;
+
 // `SQL_ATTR_ACCESS_MODE` values.
 pub const SQL_MODE_READ_WRITE: u32 = 0;
 
