@@ -91,3 +91,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   payload nor terminates a message — but was previously consumed as a
   zero-length packet. Empty end-of-message packets remain legal.
 
+- `mssql-odbc`: Entra ID credentials for service-principal and managed-identity
+  authentication are now cached process-wide (keyed by tenant/authority,
+  client id, and a digest of the secret, or by client id alone for managed
+  identity) instead of being rebuilt for every connection. A burst of new
+  connections for the same identity now triggers a single token acquisition,
+  reused until near expiry, instead of one AAD/IMDS round-trip per connection —
+  avoiding Managed Identity (IMDS) throttling and added login latency during
+  connection-pool warm-up.
+

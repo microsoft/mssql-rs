@@ -21,8 +21,16 @@
 //!   service-principal auth.
 //! - The service-principal secret travels in the Azure SDK token-request body;
 //!   do not enable `azure_*` trace-level logging in production.
+//! - Credentials (including the service-principal secret) are cached
+//!   process-wide, keyed by identity (see `CREDENTIAL_CACHE`), so a secret can
+//!   now outlive the connection that first supplied it for as long as the
+//!   process runs — the standard trade-off for avoiding a per-connection AAD
+//!   round-trip. Never `Debug`-format a `CredentialConfig` or log a cache key's
+//!   inputs; the cache key itself carries only a digest of the secret.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use azure_core::cloud::{CloudConfiguration, CustomConfiguration};
@@ -32,7 +40,7 @@ use azure_identity::{
     ClientSecretCredential, ClientSecretCredentialOptions, ManagedIdentityCredential,
     ManagedIdentityCredentialOptions, UserAssignedId,
 };
-use tokio::sync::OnceCell;
+use tracing::debug;
 use url::{Position, Url};
 
 #[cfg(windows)]
@@ -61,18 +69,37 @@ pub(crate) enum CredentialConfig {
 #[derive(Clone)]
 pub(crate) struct EntraTokenFactory {
     config: CredentialConfig,
-    /// The Azure SDK credential, built lazily on the first token request and
-    /// reused for the remaining requests on this connection so the credential's
-    /// in-memory token cache is shared across repeated logins (e.g. session
-    /// recovery). Cross-connection reuse is tracked in AB#46409.
-    credential: Arc<OnceCell<Arc<dyn TokenCredential>>>,
 }
 
 impl EntraTokenFactory {
     pub(crate) fn new(config: CredentialConfig) -> Self {
-        Self {
-            config,
-            credential: Arc::new(OnceCell::new()),
+        Self { config }
+    }
+
+    /// Derives the process-wide cache key for this factory's identity. For a
+    /// service principal this is the authority/tenant (from the server-provided
+    /// STS URL), client id, and a digest of the secret — never the secret
+    /// itself, so a hash collision can only merge two different secrets for
+    /// the *same* client, which just fails cleanly at the STS. Managed
+    /// identity keys on client id alone (empty for the system-assigned
+    /// identity): IMDS is scoped to the local machine, so no authority/tenant
+    /// applies.
+    fn cache_key(&self, sts_url: &str) -> TdsResult<CredentialCacheKey> {
+        match &self.config {
+            CredentialConfig::ServicePrincipalSecret { client_id, secret } => {
+                let (authority_host, tenant_id) = split_sts_url(sts_url)?;
+                Ok(CredentialCacheKey::ServicePrincipal {
+                    authority_host,
+                    tenant_id,
+                    client_id: client_id.clone(),
+                    secret_digest: digest(secret.secret()),
+                })
+            }
+            CredentialConfig::ManagedIdentity { client_id } => {
+                Ok(CredentialCacheKey::ManagedIdentity {
+                    client_id: client_id.clone().unwrap_or_default(),
+                })
+            }
         }
     }
 
@@ -139,13 +166,10 @@ impl EntraIdTokenFactory for EntraTokenFactory {
         let scope = normalize_scope(&spn);
         let scopes: &[&str] = &[scope.as_str()];
 
-        // Build the credential once per connection and reuse it, so the Azure
-        // SDK credential's own token cache is shared across this connection's
-        // token requests instead of re-authenticating every login.
-        let credential = self
-            .credential
-            .get_or_try_init(|| async { self.build_credential(&sts_url) })
-            .await?;
+        // Reuse the process-wide credential for this identity instead of
+        // building a new one (and re-authenticating) on every connection.
+        let key = self.cache_key(&sts_url)?;
+        let credential = cached_credential(key, || self.build_credential(&sts_url))?;
 
         let access_token = credential.get_token(scopes, None).await.map_err(|e| {
             Error::ConnectionError(format!("Entra ID token acquisition failed: {e}"))
@@ -153,6 +177,103 @@ impl EntraIdTokenFactory for EntraTokenFactory {
 
         Ok(encode_utf16le(access_token.token.secret()))
     }
+}
+
+/// Identifies a distinct Entra ID identity for the process-wide credential
+/// cache ([`CREDENTIAL_CACHE`]). Two factories that produce equal keys are
+/// guaranteed to represent the same tenant/client/secret (or the same managed
+/// identity) and may safely share one credential instance.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum CredentialCacheKey {
+    ServicePrincipal {
+        authority_host: String,
+        tenant_id: String,
+        client_id: String,
+        secret_digest: u64,
+    },
+    ManagedIdentity {
+        /// Empty for the system-assigned identity.
+        client_id: String,
+    },
+}
+
+impl CredentialCacheKey {
+    /// A static, identifier-free label for tracing: enough to tell which
+    /// auth method a cache hit/miss was for without logging any part of the
+    /// identity itself (tenant, client id, or secret digest).
+    fn label(&self) -> &'static str {
+        match self {
+            CredentialCacheKey::ServicePrincipal { .. } => "service principal",
+            CredentialCacheKey::ManagedIdentity { .. } => "managed identity",
+        }
+    }
+}
+
+/// Non-cryptographic digest used only as a process-local cache-key
+/// discriminator — never persisted, logged, or compared against
+/// attacker-controlled input.
+fn digest(secret: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    secret.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Entra ID credentials, shared process-wide so a burst of new connections for
+/// the same identity triggers one token acquisition instead of one per
+/// connection (AB#46409). Each `azure_identity` credential already carries its
+/// own per-scope, expiry-aware token cache internally, so sharing the
+/// credential *instance* is enough to share tokens too — this map never
+/// stores raw tokens itself, which keeps expiry/refresh entirely in the
+/// already-tested Azure SDK code path.
+///
+/// This is a deliberate improvement beyond msodbcsql parity, not a gap versus
+/// it: the classic C++ driver's `AzureADAuth` has no equivalent cache either —
+/// `Parse.cpp:3655` constructs a stack-local `AzureADAuth auth;` and
+/// re-authenticates on every connection for service principal and managed
+/// identity. Only its interactive/WAM path caches (`MSQAAuthContextCache`),
+/// mirrored here by the interactive path's own process-wide cache in
+/// `msqa.rs`.
+///
+/// Unbounded like that interactive cache: entries are never evicted, so a
+/// process that cycles through many distinct identities (e.g. a multi-tenant
+/// service impersonating many different service principals) or rotates a
+/// secret repeatedly retains one entry per identity/secret it has ever seen
+/// for the life of the process. Acceptable for the same reason as the
+/// interactive cache — realistic deployments use a small, stable set of
+/// identities — but a candidate for follow-up if that stops holding.
+static CREDENTIAL_CACHE: OnceLock<Mutex<HashMap<CredentialCacheKey, Arc<dyn TokenCredential>>>> =
+    OnceLock::new();
+
+/// Returns the cached credential for `key`, building and caching one via
+/// `build` on a miss. Held across `build` deliberately: constructing a
+/// credential is local config assembly (no I/O, no `.await`), so the lock is
+/// never held across a blocking or network operation — the token request
+/// itself always runs after this returns.
+///
+/// Logs a hit/miss at `debug` (identity kind only — never the tenant, client
+/// id, or secret digest) so a connection storm's throttling behavior can be
+/// correlated against actual cache effectiveness in production traces.
+fn cached_credential(
+    key: CredentialCacheKey,
+    build: impl FnOnce() -> TdsResult<Arc<dyn TokenCredential>>,
+) -> TdsResult<Arc<dyn TokenCredential>> {
+    let cache = CREDENTIAL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(existing) = cache.get(&key) {
+        debug!(kind = key.label(), "entra: reusing cached credential");
+        return Ok(Arc::clone(existing));
+    }
+
+    debug!(
+        kind = key.label(),
+        "entra: credential cache miss, acquiring a new credential"
+    );
+    let credential = build()?;
+    cache.insert(key, Arc::clone(&credential));
+    Ok(credential)
 }
 
 /// Normalizes an SPN/resource into a v2 scope by ensuring a single `/.default`
@@ -580,6 +701,192 @@ mod tests {
                 TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow
             )),
             "a method that resolves to itself reports itself"
+        );
+    }
+
+    // --- Process-wide credential cache (AB#46409) ---
+
+    use azure_core::credentials::{AccessToken, TokenRequestOptions};
+    use azure_core::time::{Duration, OffsetDateTime};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A [`TokenCredential`] that counts calls and mints a distinct token each
+    /// time, so a test can prove whether it was reused or rebuilt, and whether
+    /// `get_token` was actually invoked (vs. a stale value cached above it).
+    #[derive(Debug, Default)]
+    struct CountingCredential {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TokenCredential for CountingCredential {
+        async fn get_token(
+            &self,
+            _scopes: &[&str],
+            _options: Option<TokenRequestOptions<'_>>,
+        ) -> azure_core::Result<AccessToken> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(AccessToken::new(
+                format!("token-{call}"),
+                OffsetDateTime::now_utc() + Duration::seconds(3600),
+            ))
+        }
+    }
+
+    fn counting_credential() -> TdsResult<Arc<dyn TokenCredential>> {
+        Ok(Arc::new(CountingCredential::default()))
+    }
+
+    #[test]
+    fn service_principal_key_differs_by_tenant_client_and_secret() {
+        let sts = "https://login.microsoftonline.com/tenant-a";
+        let base = EntraTokenFactory::new(CredentialConfig::ServicePrincipalSecret {
+            client_id: "cache-key-client".to_string(),
+            secret: Secret::from("cache-key-secret-1".to_string()),
+        });
+        let same_again = EntraTokenFactory::new(CredentialConfig::ServicePrincipalSecret {
+            client_id: "cache-key-client".to_string(),
+            secret: Secret::from("cache-key-secret-1".to_string()),
+        });
+        let different_secret = EntraTokenFactory::new(CredentialConfig::ServicePrincipalSecret {
+            client_id: "cache-key-client".to_string(),
+            secret: Secret::from("cache-key-secret-2".to_string()),
+        });
+        let different_client = EntraTokenFactory::new(CredentialConfig::ServicePrincipalSecret {
+            client_id: "cache-key-client-2".to_string(),
+            secret: Secret::from("cache-key-secret-1".to_string()),
+        });
+        let different_tenant_sts = "https://login.microsoftonline.com/tenant-b";
+
+        let base_key = base.cache_key(sts).unwrap();
+        assert_eq!(base_key, same_again.cache_key(sts).unwrap());
+        assert_ne!(
+            base_key,
+            different_secret.cache_key(sts).unwrap(),
+            "different secrets must not share a cache entry"
+        );
+        assert_ne!(
+            base_key,
+            different_client.cache_key(sts).unwrap(),
+            "different client ids must not share a cache entry"
+        );
+        assert_ne!(
+            base_key,
+            base.cache_key(different_tenant_sts).unwrap(),
+            "different tenants must not share a cache entry"
+        );
+    }
+
+    #[test]
+    fn managed_identity_key_distinguishes_system_and_user_assigned() {
+        let system = EntraTokenFactory::new(CredentialConfig::ManagedIdentity { client_id: None });
+        let user_a = EntraTokenFactory::new(CredentialConfig::ManagedIdentity {
+            client_id: Some("uid-cache-key-a".to_string()),
+        });
+        let user_b = EntraTokenFactory::new(CredentialConfig::ManagedIdentity {
+            client_id: Some("uid-cache-key-b".to_string()),
+        });
+
+        let system_key = system.cache_key("unused").unwrap();
+        let user_a_key = user_a.cache_key("unused").unwrap();
+        assert_ne!(system_key, user_a_key);
+        assert_ne!(user_a_key, user_b.cache_key("unused").unwrap());
+        // The STS URL is ignored for managed identity: IMDS is machine-local.
+        assert_eq!(
+            system_key,
+            system.cache_key("https://any.example/tenant").unwrap()
+        );
+    }
+
+    #[test]
+    fn cache_key_label_is_identity_free() {
+        // The label feeds a `debug!` trace: it must say which auth method a
+        // cache hit/miss was for without ever including the tenant, client
+        // id, or secret digest.
+        let sp = CredentialCacheKey::ServicePrincipal {
+            authority_host: "https://login.microsoftonline.com".to_string(),
+            tenant_id: "some-tenant".to_string(),
+            client_id: "some-client".to_string(),
+            secret_digest: 0xdead_beef,
+        };
+        let mi = CredentialCacheKey::ManagedIdentity {
+            client_id: "some-client".to_string(),
+        };
+        assert_eq!(sp.label(), "service principal");
+        assert_eq!(mi.label(), "managed identity");
+        assert!(!sp.label().contains("some-tenant"));
+        assert!(!sp.label().contains("some-client"));
+    }
+
+    #[test]
+    fn cached_credential_reuses_the_same_instance_on_a_hit() {
+        let key = CredentialCacheKey::ManagedIdentity {
+            client_id: "cached-credential-hit".to_string(),
+        };
+        let build_calls = AtomicUsize::new(0);
+        let build = || {
+            build_calls.fetch_add(1, Ordering::SeqCst);
+            counting_credential()
+        };
+
+        let first = cached_credential(key.clone(), build).unwrap();
+        let second = cached_credential(key, build).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a cache hit must return the same credential instance"
+        );
+        assert_eq!(build_calls.load(Ordering::SeqCst), 1, "build must run once");
+    }
+
+    #[test]
+    fn cached_credential_never_shares_across_distinct_identities() {
+        let key_a = CredentialCacheKey::ManagedIdentity {
+            client_id: "cached-credential-distinct-a".to_string(),
+        };
+        let key_b = CredentialCacheKey::ManagedIdentity {
+            client_id: "cached-credential-distinct-b".to_string(),
+        };
+
+        let a = cached_credential(key_a, counting_credential).unwrap();
+        let b = cached_credential(key_b, counting_credential).unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "distinct identities must never share a credential"
+        );
+    }
+
+    #[test]
+    fn cached_credential_does_not_freeze_the_token_it_returns() {
+        // Caching the *credential* must not accidentally cache the *token*:
+        // each call through the shared instance should still reach the
+        // delegate, which is what lets it refresh an expiring token. This is
+        // the property that stands in for expiry here — actual expiry/refresh
+        // timing is delegated to azure_identity's own tested token cache
+        // (`azure_identity::cache::TokenCache`), not reimplemented locally.
+        let key = CredentialCacheKey::ManagedIdentity {
+            client_id: "cached-credential-refresh".to_string(),
+        };
+        let credential = cached_credential(key.clone(), counting_credential).unwrap();
+        let same_credential =
+            cached_credential(key, || panic!("must be a cache hit, not a rebuild")).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+        let scopes = ["https://database.windows.net/.default"];
+        let token1 = runtime
+            .block_on(same_credential.get_token(&scopes, None))
+            .expect("first token request succeeds");
+        let token2 = runtime
+            .block_on(credential.get_token(&scopes, None))
+            .expect("second token request succeeds");
+
+        assert_ne!(
+            token1.token.secret(),
+            token2.token.secret(),
+            "each call must reach the shared credential rather than a frozen cached token"
         );
     }
 }
