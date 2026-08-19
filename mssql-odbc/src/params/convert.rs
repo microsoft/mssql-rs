@@ -264,9 +264,10 @@ fn fixed_length(column_size: usize, max: usize) -> Result<u16, ParamConvError> {
 /// Length of a `varchar`/`nvarchar`/`varbinary` declaration, or `None` for the
 /// `max` spelling.
 ///
-/// `SQLDescribeParam` reports `SQL_PREC_UNLIMITED` for `*(max)` parameters, and
-/// an application may legitimately pass a `ColumnSize` past the non-`max` limit;
-/// both widen to `max` rather than erroring, matching `RpcParameter::get_sql_name`.
+/// `SQLDescribeParam` reports 0 for `*(max)` parameters, and an application may
+/// legitimately pass a `ColumnSize` past the non-`max` limit or the
+/// `SQL_PREC_UNLIMITED` sentinel; all widen to `max` rather than erroring,
+/// matching `RpcParameter::get_sql_name`.
 fn variable_length(column_size: usize, max: usize) -> Option<u16> {
     if column_size == 0 || column_size > max {
         None

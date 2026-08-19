@@ -437,15 +437,15 @@ fn describe_tds_type(
         }
         TdsDataType::Image => (SQL_LONGVARBINARY, parameter_length(length, false)?, 0),
         TdsDataType::SsVariant => (SQL_SS_VARIANT, 8000, 0),
-        // msodbcsql reports the unbounded types as `SQL_PREC_UNLIMITED`
-        // (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`, `GetIPDRec`); a table type
-        // has no meaningful column size at all.
-        TdsDataType::Udt => (SQL_SS_UDT, SQL_PREC_UNLIMITED, 0),
-        TdsDataType::Xml => (SQL_SS_XML, SQL_PREC_UNLIMITED, 0),
+        // Unbounded types report a size of 0, the same "unbounded" convention
+        // `describe_col::column_size` already uses for PLP. A table type has no
+        // meaningful column size at all.
+        TdsDataType::Udt => (SQL_SS_UDT, 0, 0),
+        TdsDataType::Xml => (SQL_SS_XML, 0, 0),
         TdsDataType::SqlTable => (SQL_SS_TABLE, 0, 0),
         // msodbcsql has no dedicated `json` ODBC type, so `json` surfaces as an
         // unbounded wide character type, matching how the value is exchanged.
-        TdsDataType::Json => (SQL_WLONGVARCHAR, SQL_PREC_UNLIMITED, 0),
+        TdsDataType::Json => (SQL_WLONGVARCHAR, 0, 0),
         TdsDataType::Vector => {
             let base_type = scale.ok_or("suggested_scale is NULL for a vector")?;
             (
@@ -504,13 +504,15 @@ fn required_temporal_scale(scale: Option<u8>) -> Result<u8, String> {
 
 /// Converts a TDS wire length into the ODBC `ParameterSize`.
 ///
-/// A PLP length (`0xFFFF`, or `-1` once widened) means `*(max)`, which msodbcsql
-/// reports as `SQL_PREC_UNLIMITED` (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`,
-/// `GetIPDRec`). `unicode` lengths are byte counts, so they halve into
-/// characters.
+/// A PLP length (`0xFFFF`, or `-1` once widened) means `*(max)`. msodbcsql
+/// reports 0 for these, verified against msodbcsql 18.6.2.1 in the e2e parity
+/// run; `SQL_PREC_UNLIMITED` in `sqlcdesc.cpp` (`GetIPDRec`) only passes through
+/// a precision that is already unlimited and is not reached from a PLP wire
+/// length. This matches `describe_col::column_size`.
+/// `unicode` lengths are byte counts, so they halve into characters.
 fn parameter_length(length: i32, unicode: bool) -> Result<SqlULen, String> {
     if length == -1 || length == i32::from(u16::MAX) {
-        return Ok(SQL_PREC_UNLIMITED);
+        return Ok(0);
     }
     let length = SqlULen::try_from(length).map_err(|_| format!("invalid TDS length {length}"))?;
     Ok(if unicode { length / 2 } else { length })
@@ -772,7 +774,8 @@ mod tests {
                 row(1, TdsDataType::BigVarBinary, -1, 0, 0),
                 ParameterDescription {
                     data_type: SQL_VARBINARY,
-                    parameter_size: SQL_PREC_UNLIMITED,
+                    // `varbinary(max)`: unbounded reports 0, matching msodbcsql.
+                    parameter_size: 0,
                     decimal_digits: 0,
                     nullable: SQL_NULLABLE,
                 },

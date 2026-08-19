@@ -69,8 +69,11 @@ The mapping must follow msodbcsql for:
 - Integer widths and floating-point precision.
 - Decimal/numeric precision and scale.
 - Unicode byte lengths versus ODBC character lengths.
-- MAX/PLP types, which msodbcsql reports as `SQL_PREC_UNLIMITED`
-  (2147483647), not 0 (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`).
+- MAX/PLP types, which msodbcsql reports as 0. The `SQL_PREC_UNLIMITED`
+  (2147483647) path in `Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp` only passes
+  through a precision that is already unlimited and is not reached from a PLP
+  wire length; a parity run against msodbcsql 18.6.2.1 confirmed 0. This
+  matches the existing `describe_col::column_size`.
 - GUID and scale-dependent temporal display sizes.
 - SQL Server extension types, including variant, XML, UDT, table, and vector.
 

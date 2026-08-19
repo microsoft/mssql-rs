@@ -197,8 +197,8 @@ TEST_F(DescribeParamLiveTest, ReprepareInvalidatesMetadata) {
     EXPECT_EQ(8U, second.size);
 }
 
-// `*(max)` parameters have no bounded length; both drivers report
-// SQL_PREC_UNLIMITED, and a bind from that description must round-trip.
+// `*(max)` parameters have no bounded length; both drivers report a size of 0,
+// and a bind from that description must still round-trip.
 TEST_F(DescribeParamLiveTest, DescribesMaxLengthParameters) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS NVARCHAR(MAX)), CAST(? AS VARBINARY(MAX))"),
                   SQL_HANDLE_STMT, stmt_);
@@ -208,9 +208,9 @@ TEST_F(DescribeParamLiveTest, DescribesMaxLengthParameters) {
     ASSERT_TRUE(Describe(1, wide));
     ASSERT_TRUE(Describe(2, binary));
     EXPECT_EQ(SQL_WVARCHAR, wide.data_type);
-    EXPECT_EQ(static_cast<SQLULEN>(2147483647), wide.size);
+    EXPECT_EQ(static_cast<SQLULEN>(0), wide.size);
     EXPECT_EQ(SQL_VARBINARY, binary.data_type);
-    EXPECT_EQ(static_cast<SQLULEN>(2147483647), binary.size);
+    EXPECT_EQ(static_cast<SQLULEN>(0), binary.size);
 
     SQLLEN wide_indicator = SQL_NULL_DATA;
     SQLLEN binary_indicator = SQL_NULL_DATA;
