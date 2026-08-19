@@ -109,6 +109,18 @@ reconciles the client with the confirmed server reset.
 Server-owned state such as temp tables and SET options is reset by SQL Server
 before it executes the carrying request.
 
+## Open cursors at check-in
+
+The reset sweeps open cursors before claiming the connection, matching the five
+other connection-scoped operations and `claim_dbc_client`'s stated precondition.
+An application that closes its connection without closing a cursor is the
+ordinary check-in case; rejecting it would make that connection non-poolable and
+force the pool to discard a recyclable connection. msodbcsql reaches the same
+outcome by a different route — its reset runs on an internal driver statement and
+never contends with user cursors — but with a single `TdsClient` and no MARS,
+sweeping is how this driver gets there. A connection that is busy for a reason the
+sweep cannot clear is still rejected.
+
 ## Transaction behavior
 
 Pool reuse always requests a full `RESETCONNECTION`; transactions must not cross
@@ -241,6 +253,23 @@ sqlctokn.cpp, sqlcerr.cpp, dbcinfotoken.cpp}`.
   re-prepares instead.
 - Explicit acknowledgement verification also exceeds msodbcsql by rejecting a
   request that completed without the expected reset ENVCHANGE.
+- **msodbcsql does not piggyback.** After arming, it immediately sends a re-sync
+  batch on its own driver statement (`sqlcmisc.cpp:2410-2446`), and
+  `BuildServerSideConnectOptions` (`sqlcfunc.cpp:2007+`) re-emits
+  `SET TRANSACTION ISOLATION LEVEL` for any non-READ-COMMITTED cached level, plus
+  ANSI_NPW / CONCAT_NULL and QUOTED_IDENTIFIER when non-default. So msodbcsql pays
+  a round trip this driver does not, and re-applies settings this driver leaves to
+  the consumer's checkout SET. Do not describe the piggyback design as "matching
+  msodbcsql" — it is a deliberate divergence.
+- **Follow-up as session settings grow.** `apply_post_connect_txn_settings`
+  (`txn.rs`) is this driver's analogue of `BuildServerSideConnectOptions`, and the
+  reset path does not call it. Today that is harmless: the isolation level is the
+  only session setting emitted post-login, and the checkout SET re-applies it.
+  When `QuotedId`, `AnsiNPW`, `CONCAT_NULL`, `SQL_ATTR_MAX_LENGTH`/`MAX_ROWS` are
+  added, each will silently desync across a reset unless the reset routes through
+  that function. Tracked as a follow-up rather than done here, because letting its
+  batch carry the bit reintroduces I/O into the reset handler — the cost this
+  design deliberately removed.
 
 ## Validation requirements
 
