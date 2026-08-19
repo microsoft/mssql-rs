@@ -84,7 +84,7 @@
 //!   5. DONE        ← End of result set
 //! ```
 
-use std::io::Error;
+use std::{io::Error, mem::size_of};
 
 use async_trait::async_trait;
 
@@ -103,35 +103,30 @@ use crate::{
 /// Column-flag bit indicating the column is protected by Always Encrypted.
 const FLAG_ENCRYPTED: u16 = 0x0800;
 
-/// Upper bound on the column vector's initial capacity. `col_count` is attacker-
-/// controlled, so reserving the full count up front lets a tiny token drive a
-/// large eager allocation (`col_count * size_of::<ColumnMetadata>()`) — a memory-
-/// amplification DoS the fuzzer surfaced as a timeout (build 164079: a 3-byte
-/// token reserving ~42 MB). Reserving conservatively and letting the vector grow
-/// as columns are actually parsed keeps work proportional to the bytes on the
-/// wire, so any legitimate column count (SQL Server wide tables allow up to
-/// 30,000 columns) is handled without an artificial cap. With today's 640-byte
-/// `ColumnMetadata`, this limits the eager allocation to 160 KiB.
-const COLUMN_PREALLOC_CAP: usize = 256;
+/// Byte budget for the column vector's initial allocation. `col_count` is
+/// attacker-controlled, so reserving the full count up front lets a tiny token
+/// drive a large eager allocation — a memory-amplification DoS the fuzzer
+/// surfaced as a timeout (build 164079: a 3-byte token reserving ~42 MB).
+/// Reserving conservatively and letting the vector grow as columns are actually
+/// parsed keeps work proportional to the bytes on the wire, so any legitimate
+/// column count is handled without an artificial cap.
+const COLUMN_PREALLOC_BYTES: usize = 160 * 1024;
+const COLUMN_PREALLOC_CAP: usize = COLUMN_PREALLOC_BYTES / size_of::<ColumnMetadata>();
 
-/// Upper bound on the CEK table vector's initial capacity. With today's 48-byte
-/// `CekTableEntry`, this limits the eager allocation to 12 KiB.
-const CEK_TABLE_PREALLOC_CAP: usize = 256;
+/// Byte budget for the CEK table vector's initial allocation.
+const CEK_TABLE_PREALLOC_BYTES: usize = 12 * 1024;
+const CEK_TABLE_PREALLOC_CAP: usize = CEK_TABLE_PREALLOC_BYTES / size_of::<CekTableEntry>();
 
-const fn initial_column_capacity(col_count: u16) -> usize {
-    if (col_count as usize) < COLUMN_PREALLOC_CAP {
-        col_count as usize
-    } else {
-        COLUMN_PREALLOC_CAP
-    }
+fn bounded_capacity(count: u16, cap: usize) -> usize {
+    (count as usize).min(cap)
 }
 
-const fn initial_cek_table_capacity(table_size: u16) -> usize {
-    if (table_size as usize) < CEK_TABLE_PREALLOC_CAP {
-        table_size as usize
-    } else {
-        CEK_TABLE_PREALLOC_CAP
-    }
+fn new_column_vec(col_count: u16) -> Vec<ColumnMetadata> {
+    Vec::with_capacity(bounded_capacity(col_count, COLUMN_PREALLOC_CAP))
+}
+
+fn new_cek_table_vec(entry_count: u16) -> Vec<CekTableEntry> {
+    Vec::with_capacity(bounded_capacity(entry_count, CEK_TABLE_PREALLOC_CAP))
 }
 
 /// Cipher algorithm id signalling a custom (named) algorithm whose name follows
@@ -181,8 +176,7 @@ where
         // Reserve conservatively; a large but valid `col_count` grows the vector
         // as columns are parsed, while a malformed count cannot force a huge
         // eager allocation. See `COLUMN_PREALLOC_CAP`.
-        let mut column_metadata: Vec<ColumnMetadata> =
-            Vec::with_capacity(initial_column_capacity(col_count));
+        let mut column_metadata = new_column_vec(col_count);
 
         // Parse each column definition
         for _ in 0..col_count {
@@ -292,10 +286,9 @@ async fn parse_cek_table<T>(reader: &mut T) -> TdsResult<Vec<CekTableEntry>>
 where
     T: TdsPacketReader + Send + Sync,
 {
-    let table_size = reader.read_uint16().await?;
-    let mut entries: Vec<CekTableEntry> =
-        Vec::with_capacity(initial_cek_table_capacity(table_size));
-    for _ in 0..table_size {
+    let entry_count = reader.read_uint16().await?;
+    let mut entries = new_cek_table_vec(entry_count);
+    for _ in 0..entry_count {
         entries.push(parse_cek_table_entry(reader).await?);
     }
     Ok(entries)
@@ -667,18 +660,21 @@ mod tests {
     }
 
     #[test]
-    fn test_initial_column_capacity_is_bounded() {
-        assert_eq!(initial_column_capacity(0), 0);
-        assert_eq!(initial_column_capacity(10), 10);
-        assert_eq!(initial_column_capacity(5000), COLUMN_PREALLOC_CAP);
-        assert_eq!(initial_column_capacity(0xFFFE), COLUMN_PREALLOC_CAP);
+    fn test_column_vec_capacity_is_bounded() {
+        assert_eq!(new_column_vec(0).capacity(), 0);
+        assert_eq!(new_column_vec(10).capacity(), 10);
+        assert_eq!(new_column_vec(5000).capacity(), COLUMN_PREALLOC_CAP);
+        assert_eq!(new_column_vec(0xFFFE).capacity(), COLUMN_PREALLOC_CAP);
     }
 
     #[test]
-    fn test_initial_cek_table_capacity_is_bounded() {
-        assert_eq!(initial_cek_table_capacity(0), 0);
-        assert_eq!(initial_cek_table_capacity(10), 10);
-        assert_eq!(initial_cek_table_capacity(u16::MAX), CEK_TABLE_PREALLOC_CAP);
+    fn test_cek_table_vec_capacity_is_bounded() {
+        assert_eq!(new_cek_table_vec(0).capacity(), 0);
+        assert_eq!(new_cek_table_vec(10).capacity(), 10);
+        assert_eq!(
+            new_cek_table_vec(u16::MAX).capacity(),
+            CEK_TABLE_PREALLOC_CAP
+        );
     }
 
     #[tokio::test]
