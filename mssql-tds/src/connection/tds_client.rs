@@ -8443,10 +8443,54 @@ mod tests {
         );
     }
 
+    /// The other abandonment shape: the response *was* partially read — a
+    /// non-verdict token advanced tracking to `AwaitingAck` — and then ended
+    /// before any token could settle it. Cancellation landing mid-response
+    /// produces this, and like the never-read case it must not be carried into
+    /// the next request.
+    #[tokio::test]
+    async fn abandoned_carrier_that_reached_awaiting_ack_is_settled_too() {
+        // One INFO token, then the stream ends: INFO is not evidence the
+        // request ran, so tracking advances to `AwaitingAck` and stops there.
+        let mut client = create_test_client_with_tokens(vec![info_token(0, 0, "mid-response")]);
+        client.prepare_reset_connection(false);
+
+        client
+            .execute(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                (),
+            )
+            .await
+            .expect_err("the scripted stream ends before the batch completes");
+        assert!(
+            !client.is_connection_dead(),
+            "an inconclusive token must not condemn the carrier itself"
+        );
+        assert!(
+            client.reset_pending(),
+            "precondition: the acknowledgement is still outstanding when the response ends"
+        );
+
+        client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect_err("the scripted transport has no tokens left");
+
+        assert!(
+            !client.is_connection_dead(),
+            "the next request must not be charged for the abandoned reset"
+        );
+        assert!(
+            !client.reset_pending(),
+            "the abandoned reset is settled at the start of the next command"
+        );
+    }
+
     /// The settlement above must not fire on the ordinary armed-but-unsent
     /// reset: starting a command while a reset is armed is the normal path, and
     /// that command is the one that carries the bit.
     #[tokio::test]
+
     async fn starting_a_command_leaves_an_unsent_armed_reset_alone() {
         let mut client = create_test_client_with_tokens(vec![
             Tokens::EnvChange(crate::token::tokens::EnvChangeToken {
