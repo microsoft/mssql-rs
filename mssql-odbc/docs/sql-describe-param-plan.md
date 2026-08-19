@@ -89,6 +89,21 @@ mssql-python describes unresolved `None` values and then binds them with
 - Use the exact declaration when building `sp_prepexec`, `sp_execute`, or
   `sp_executesql` parameter lists.
 
+`SQLBindParameter` resolves `SQL_C_DEFAULT` to the SQL type's default C type
+(`type_rules::resolve_default_c_type`) before storing the binding, so conversion
+never sees `SQL_C_DEFAULT` itself. Keying the typed NULL off the resolved C type
+would be wrong - a `decimal` resolves to `SQL_C_CHAR`, and would go out as a NULL
+`varchar`. `BoundParam` therefore records a `c_type_defaulted` flag, and the NULL
+path builds the value from `sql_type` whenever it is set.
+
+The same flag exempts defaulted bindings from the character conversion matrix.
+`resolve_default_c_type` returns the C type ODBC *defines* as that SQL type's
+default, so the pairing is supported by construction; the matrix only enumerates
+the explicit character pairings implemented so far and would otherwise reject the
+describe-then-bind flow outright. `SQL_SS_UDT` and `SQL_SS_TABLE` stay rejected at
+bind time because they need a fully qualified server type name that
+`SQLDescribeParam` does not report.
+
 Precision and scale that a NULL `SqlType` cannot carry (decimal
 precision/scale lives inside the `Option` payload, temporal scale likewise)
 travel in a single `RpcTypeMetadata` value attached to the RPC parameter. That

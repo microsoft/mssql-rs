@@ -4,9 +4,16 @@
 //! Conversion from a bound application parameter buffer (`BoundParam`) to a
 //! TDS RPC parameter (`RpcParameter`).
 //!
-//! Non-NULL values currently support character C types. A `SQL_NULL_DATA`
-//! parameter also supports `SQL_C_DEFAULT`, producing a typed TDS NULL from the
-//! SQL type supplied by `SQLBindParameter`.
+//! Which C/SQL pairings reach this module is decided at bind time by
+//! [`crate::api::type_rules`] and [`crate::params::conversion_matrix`];
+//! `SQL_C_DEFAULT` has already been resolved to a concrete C type by then.
+//! Data-at-execution and default parameters are rejected with `HYC00`, and an
+//! invalid negative `StrLen_or_Ind` with `HY090`.
+//!
+//! A `SQL_NULL_DATA` parameter that was bound with `SQL_C_DEFAULT` is
+//! materialised as a typed TDS NULL from `sql_type`, because a defaulted
+//! binding describes its value through the SQL type rather than through the
+//! resolved C type.
 
 use std::slice;
 
@@ -16,13 +23,13 @@ use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, RpcTypeMetadata, StatusFlags};
 
 use crate::api::odbc_types::{
-    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_LONG, SQL_C_WCHAR, SQL_CHAR,
-    SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DEFAULT_PARAM, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
+    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR, SQL_DATA_AT_EXEC,
+    SQL_DECIMAL, SQL_DEFAULT_PARAM, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
     SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NTS, SQL_NULL_DATA,
-    SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TABLE, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
-    SQL_SS_UDT, SQL_SS_VARIANT, SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT,
-    SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR,
-    SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlLen, SqlSmallInt, SqlSsVectorLayout,
+    SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT,
+    SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE,
+    SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
+    SQL_WVARCHAR, SqlLen, SqlSmallInt, SqlSsVectorLayout,
 };
 use crate::api::sqlstate::ERR_INVALID_STRING_OR_BUFFER_LENGTH;
 use crate::params::BoundParam;
@@ -100,12 +107,7 @@ pub(crate) unsafe fn bound_param_to_value(
 
     if let Some(ind) = indicator {
         if ind == SQL_NULL_DATA {
-            return null_value(
-                param.c_type,
-                param.sql_type,
-                param.column_size,
-                param.decimal_digits,
-            );
+            return null_value(param);
         }
         if ind == SQL_DEFAULT_PARAM {
             return Err(ParamConvError::DefaultParamUnsupported);
@@ -134,11 +136,9 @@ pub(crate) unsafe fn bound_param_to_value(
                 unsafe { read_wchar_bytes(param.parameter_value_ptr as *const u16, len_spec) };
             SqlType::NVarcharMax(Some(SqlString::new(bytes, EncodingType::Utf16)))
         }
-        // msodbcsql resolves `SQL_C_DEFAULT` to a concrete C type at bind time
-        // via `Sql2CDefault` and reads the buffer with it
-        // (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`). This driver only implements
-        // the NULL path, which never touches the buffer, so a non-NULL
-        // `SQL_C_DEFAULT` is rejected here rather than silently misread.
+        // A defaulted binding is described entirely by its SQL type, and the
+        // buffer is only read for non-NULL data, which this driver does not yet
+        // convert for the non-character default C types.
         other => return Err(ParamConvError::UnsupportedCType(other)),
     };
 
@@ -158,17 +158,20 @@ const PRECISION_RANGE: std::ops::RangeInclusive<usize> = 1..=38;
 /// Largest fractional-seconds scale of `time`/`datetime2`/`datetimeoffset`.
 const MAX_DATETIME_SCALE: u8 = 7;
 
-/// Typed NULL for the supported C types.
-fn null_value(
-    c_type: SqlSmallInt,
-    sql_type: SqlSmallInt,
-    column_size: usize,
-    decimal_digits: SqlSmallInt,
-) -> Result<TypedValue, ParamConvError> {
-    match c_type {
+/// Typed NULL for a bound parameter.
+///
+/// A binding made with `SQL_C_DEFAULT` carries its type in `sql_type`, so the
+/// NULL is built from that: `SQL_DECIMAL` resolves to a `SQL_C_CHAR` buffer, and
+/// declaring that parameter `varchar` would send the server the wrong type.
+/// An explicit character binding keeps its C type, which the conversion matrix
+/// has already paired with a character SQL type.
+fn null_value(param: &BoundParam) -> Result<TypedValue, ParamConvError> {
+    if param.c_type_defaulted {
+        return default_typed_null(param.sql_type, param.column_size, param.decimal_digits);
+    }
+    match param.c_type {
         SQL_C_CHAR => Ok((SqlType::VarcharMax(None), None)),
         SQL_C_WCHAR => Ok((SqlType::NVarcharMax(None), None)),
-        SQL_C_DEFAULT => default_typed_null(sql_type, column_size, decimal_digits),
         other => Err(ParamConvError::UnsupportedCType(other)),
     }
 }
@@ -305,48 +308,6 @@ fn datetime_metadata(decimal_digits: SqlSmallInt) -> Result<RpcTypeMetadata, Par
     })
 }
 
-/// Known ODBC SQL data type identifiers (plus SQL Server extensions) accepted
-/// at bind time. Conversion support is checked separately.
-pub(crate) fn is_valid_sql_type(sql_type: SqlSmallInt) -> bool {
-    matches!(
-        sql_type,
-        SQL_CHAR
-            | SQL_VARCHAR
-            | SQL_LONGVARCHAR
-            | SQL_WCHAR
-            | SQL_WVARCHAR
-            | SQL_WLONGVARCHAR
-            | SQL_BINARY
-            | SQL_VARBINARY
-            | SQL_LONGVARBINARY
-            | SQL_DECIMAL
-            | SQL_NUMERIC
-            | SQL_SMALLINT
-            | SQL_INTEGER
-            | SQL_BIGINT
-            | SQL_TINYINT
-            | SQL_BIT
-            | SQL_REAL
-            | SQL_FLOAT
-            | SQL_DOUBLE
-            | SQL_GUID
-            | SQL_TYPE_DATE
-            | SQL_TYPE_TIME
-            | SQL_TYPE_TIMESTAMP
-            | SQL_SS_TIME2
-            | SQL_SS_TIMESTAMPOFFSET
-            | SQL_SS_VARIANT
-            | SQL_SS_VECTOR
-            | SQL_SS_XML
-            // msodbcsql accepts both at bind time (`SQLBindParameter` routes
-            // `SQL_SS_TABLE` through the IPD, `Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`),
-            // so they are valid identifiers here too. The conversion check
-            // below is what rejects them, giving `07006` instead of `HY004`.
-            | SQL_SS_UDT
-            | SQL_SS_TABLE
-    )
-}
-
 /// Recovers a vector's dimension count and base type from the `ColumnSize` and
 /// `DecimalDigits` that `SQLDescribeParam` reported.
 ///
@@ -373,34 +334,6 @@ fn vector_metadata(
         _ => return Err(ParamConvError::InvalidDecimalDigits(base_type)),
     };
     Ok((dimensions, base_type))
-}
-
-/// Known ODBC C type identifiers accepted at bind time.
-pub(crate) fn is_valid_c_type(c_type: SqlSmallInt) -> bool {
-    matches!(
-        c_type,
-        SQL_C_CHAR | SQL_C_WCHAR | SQL_C_LONG | SQL_C_DEFAULT
-    )
-}
-
-/// Whether the C type → SQL type conversion is supported. Phase 1 only allows
-/// same-family character conversions: `SQL_C_CHAR` → narrow character SQL types
-/// (`CHAR`/`VARCHAR`/`LONGVARCHAR`) and `SQL_C_WCHAR` → the wide character SQL
-/// types (`WCHAR`/`WVARCHAR`/`WLONGVARCHAR`). Every other pairing is rejected
-/// (`07006`).
-///
-/// `SQL_C_DEFAULT` is the pairing `SQLDescribeParam` callers use: they hand the
-/// described `DataType` straight back to `SQLBindParameter`. It is accepted for
-/// exactly the SQL types [`default_typed_null`] can materialise, so an
-/// unsupported one fails on the `SQLBindParameter` call the application can see
-/// rather than at execute time.
-pub(crate) fn is_valid_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt) -> bool {
-    match c_type {
-        SQL_C_CHAR => matches!(sql_type, SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR),
-        SQL_C_WCHAR => matches!(sql_type, SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR),
-        SQL_C_DEFAULT => !matches!(sql_type, SQL_SS_UDT | SQL_SS_TABLE),
-        _ => false,
-    }
 }
 
 /// Reads narrow (`SQL_C_CHAR`) bytes. `len_spec` is a byte count, or `SQL_NTS`
@@ -455,13 +388,16 @@ unsafe fn read_wchar_bytes(ptr: *const u16, len_spec: SqlLen) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_LONG, SQL_NO_TOTAL, SQL_PARAM_INPUT, SQL_PREC_UNLIMITED};
+    use crate::api::odbc_types::{
+        SQL_C_LONG, SQL_NO_TOTAL, SQL_PARAM_INPUT, SQL_PREC_UNLIMITED, SQL_SS_UDT,
+    };
     use std::ffi::c_void;
 
     fn param(c_type: SqlSmallInt, ptr: *mut c_void, ind: *mut SqlLen) -> BoundParam {
         BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type,
+            c_type_defaulted: false,
             sql_type: 0,
             column_size: 0,
             decimal_digits: 0,
@@ -469,6 +405,16 @@ mod tests {
             buffer_length: 0,
             strlen_or_ind_ptr: ind,
         }
+    }
+
+    /// A parameter bound with `SQL_C_DEFAULT`. `SQLBindParameter` has already
+    /// resolved `c_type` to the SQL type's default C type, so only the flag
+    /// distinguishes it from an explicit bind of that same C type.
+    fn default_param(sql_type: SqlSmallInt, ind: *mut SqlLen) -> BoundParam {
+        let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), ind);
+        p.c_type_defaulted = true;
+        p.sql_type = sql_type;
+        p
     }
 
     #[test]
@@ -529,24 +475,6 @@ mod tests {
     }
 
     #[test]
-    fn conversion_allows_same_family_only() {
-        assert!(is_valid_conversion(SQL_C_CHAR, SQL_VARCHAR));
-        assert!(is_valid_conversion(SQL_C_WCHAR, SQL_WVARCHAR));
-        // Cross-family, non-character, and unsupported C types are rejected.
-        assert!(!is_valid_conversion(SQL_C_CHAR, SQL_WVARCHAR));
-        assert!(!is_valid_conversion(SQL_C_WCHAR, SQL_VARCHAR));
-        assert!(!is_valid_conversion(SQL_C_CHAR, SQL_INTEGER));
-        assert!(!is_valid_conversion(SQL_C_LONG, SQL_INTEGER));
-        assert!(is_valid_conversion(SQL_C_DEFAULT, SQL_INTEGER));
-        // `SQLDescribeParam` can report these, but this driver has no way to
-        // build a value for them, so they fail on the bind call.
-        assert!(is_valid_sql_type(SQL_SS_UDT));
-        assert!(is_valid_sql_type(SQL_SS_TABLE));
-        assert!(!is_valid_conversion(SQL_C_DEFAULT, SQL_SS_UDT));
-        assert!(!is_valid_conversion(SQL_C_DEFAULT, SQL_SS_TABLE));
-    }
-
-    #[test]
     fn default_param_indicator_is_rejected() {
         let mut ind: SqlLen = SQL_DEFAULT_PARAM;
         let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
@@ -573,8 +501,7 @@ mod tests {
     #[test]
     fn default_null_uses_described_sql_type() {
         let mut ind: SqlLen = SQL_NULL_DATA;
-        let mut p = param(SQL_C_DEFAULT, std::ptr::null_mut(), &mut ind);
-        p.sql_type = SQL_INTEGER;
+        let mut p = default_param(SQL_INTEGER, &mut ind);
         p.column_size = 10;
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         assert!(matches!(value, SqlType::Int(None)));
@@ -649,8 +576,7 @@ mod tests {
         ];
         for (sql_type, column_size, decimal_digits, expected_value, expected_metadata) in cases {
             let mut ind: SqlLen = SQL_NULL_DATA;
-            let mut p = param(SQL_C_DEFAULT, std::ptr::null_mut(), &mut ind);
-            p.sql_type = *sql_type;
+            let mut p = default_param(*sql_type, &mut ind);
             p.column_size = *column_size;
             p.decimal_digits = *decimal_digits;
             let (value, metadata) = unsafe { bound_param_to_value(&p) }
@@ -698,8 +624,7 @@ mod tests {
         ];
         for &(sql_type, column_size, decimal_digits, expected) in cases {
             let mut ind: SqlLen = SQL_NULL_DATA;
-            let mut p = param(SQL_C_DEFAULT, std::ptr::null_mut(), &mut ind);
-            p.sql_type = sql_type;
+            let mut p = default_param(sql_type, &mut ind);
             p.column_size = column_size;
             p.decimal_digits = decimal_digits;
             let err = unsafe { bound_param_to_value(&p) }
