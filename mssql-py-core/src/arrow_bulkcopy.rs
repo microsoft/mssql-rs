@@ -1218,12 +1218,17 @@ mod tests {
         for (sql_type, text) in [(SqlDbType::Xml, "<r/>"), (SqlDbType::Json, "{\"a\":1}")] {
             let array: ArrayRef = Arc::new(StringViewArray::from(vec![Some(text)]));
             let dest = meta("document", sql_type, true);
-            match one_col_plan(DataType::Utf8View, &dest)
+            let value = one_col_plan(DataType::Utf8View, &dest)
                 .extract_value(array.as_ref(), 0, &dest)
-                .unwrap()
-            {
-                ColumnValues::Xml(_) | ColumnValues::Json(_) => {}
-                other => panic!("expected Xml/Json, got {other:?}"),
+                .unwrap();
+            match (sql_type, value) {
+                (SqlDbType::Xml, ColumnValues::Xml(value)) => {
+                    assert_eq!(value.as_string(), text)
+                }
+                (SqlDbType::Json, ColumnValues::Json(value)) => {
+                    assert_eq!(value.bytes, text.as_bytes())
+                }
+                (_, other) => panic!("expected {sql_type:?}, got {other:?}"),
             }
         }
     }
