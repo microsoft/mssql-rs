@@ -57,19 +57,29 @@ fi
 #     sleep $((5 * i))
 # done
 
+apt_update_ok=false
 for i in {1..5}; do
-    sudo apt update && break
+    sudo apt update && { apt_update_ok=true; break; }
     echo "apt update failed, retrying in 5 seconds... (attempt $i/5)"
     sleep $((30 * i))
 done
+if [ "$apt_update_ok" != true ]; then
+    echo "ERROR: apt update failed after 5 attempts"
+    exit 1
+fi
 
 # Needed for msrustup download and essentials for building rust binaries.
 # Try installing dependencies up to 5 times if it fails
+apt_install_ok=false
 for i in {1..5}; do
-    sudo apt install $DEPS -y && break
+    sudo apt install $DEPS -y && { apt_install_ok=true; break; }
     echo "apt install failed, retrying in 5 seconds... (attempt $i/5)"
     sleep $((30 * i))
 done
+if [ "$apt_install_ok" != true ]; then
+    echo "ERROR: apt install failed after 5 attempts"
+    exit 1
+fi
 
 pip --version && pip install pipenv
 
