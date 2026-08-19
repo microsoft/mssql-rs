@@ -28,6 +28,36 @@ authoritative parity reference for this crate. Its source lives in the
 - When reporting a parity finding, cite the msodbcsql source (file + what it does),
   and state explicitly whether the decision **matches**, **exceeds**, or **diverges
   from** msodbcsql so the trade-off is visible.
+- **This driver targets ODBC 3.x only.** That scopes out support for ODBC 2.x
+  *applications* — deprecated 2.x entry points, 2.x-only attribute values, and
+  the paths msodbcsql keeps for them. The Driver Manager maps a 2.x application
+  onto the 3.x interface before the call reaches a 3.x driver, so a msodbcsql
+  code path that exists solely for 2.x compatibility is not a parity gap. Say so
+  rather than porting it.
+  - **It does not scope out 2.x-era identifiers.** `SQL_C_DATE` / `SQL_C_TIME` /
+    `SQL_C_TIMESTAMP` are deprecated but still defined in the ODBC 3.x headers, so
+    a 3.x application may legally pass them and the DM remaps nothing. Accept
+    them and fold them onto the 3.x form (`api::type_rules::canonical_c_type`).
+    Check each identifier before assuming the rule applies — the SQL side is not
+    symmetric, ODBC 3.x reuses the 2.x date/time SQL values: `9` is both `SQL_DATE`
+    (2.x concise) and `SQL_DATETIME` (3.x verbose), and `10` is both `SQL_TIME` and
+    `SQL_INTERVAL`. A `ParameterType` of `9` is therefore ambiguous, so it is
+    rejected (`HY004`) rather than folded - 3.x applications use `SQL_TYPE_*`
+    (91-93), and the DM remaps a 2.x application's spelling first. msodbcsql
+    accepts both SQL spellings because it also serves 2.x applications and can
+    disambiguate on the declared version.
+  - **It does not cover 3.0/3.5 vs 3.8.** `SQL_OV_ODBC3` and `SQL_OV_ODBC3_80`
+    are both ODBC 3.x and both in scope. msodbcsql branches on this separately —
+    `Sql2CDefault` selects `rgbTRANSTYPE` when `IS351ORLESSAPP(wStatus)` and
+    `rgbTRANSTYPE380` otherwise — so a version-keyed branch is only out of scope
+    once you have checked *which* version boundary it keys on.
+  - Beware that msodbcsql normalizes types to their 2.x values on entry
+    (`SQLBindParameter` in `Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp` maps
+    `SQL_TYPE_*` down to `SQL_DATE`/`SQL_TIME`/`SQL_TIMESTAMP`, and `SQL_DOUBLE`
+    to `SQL_FLOAT`, before validating). Downstream code accepting a 2.x spelling
+    therefore does **not** prove it supports 2.x applications, and a branch that
+    looks reachable in a validator may be dead once the caller's normalization is
+    accounted for. Read the caller before concluding either way.
 - Deliberate deviations (exceed-parity) are allowed with product-owner sign-off;
   record the rationale in code comments and the tracking work item.
 - Deliberate deviations are listed below:
@@ -36,6 +66,13 @@ authoritative parity reference for this crate. Its source lives in the
     (`Sql/Ntdbms/sqlncli/msdart/inc/dlgattr.h` → `OPTIONADMSI L"ActiveDirectoryMSI"`);
     `ActiveDirectoryManagedIdentity` does not appear anywhere in the msodbcsql source.
     Added to match MS Learn and the sibling drivers (JDBC/.NET/go-sqlcmd). Tracked in AB#46066.
+  - `SQL_C_DEFAULT` in SQLBindParameter resolves the wide character SQL types to `SQL_C_WCHAR`, and
+    `SQL_GUID` to `SQL_C_GUID`, following the ODBC 3.x default-C-type table.
+    msodbcsql's `Sql2CDefault` reads `rgbTRANSTYPE380`
+    (`Sql/Ntdbms/sqlncli/odbc/sqlcmisc.cpp`), which resolves both to `SQL_C_CHAR`
+    — an ANSI-transfer default this driver has no equivalent for, since its
+    `SQL_C_CHAR` is UTF-8. Resolving UTF-16 application input to a UTF-8 buffer
+    type would silently corrupt data. Tracked in AB#47365.
 
 ## No panics
 
