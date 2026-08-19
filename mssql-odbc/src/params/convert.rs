@@ -13,15 +13,16 @@ use std::slice;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
-use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, RpcTypeMetadata, StatusFlags};
 
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_LONG, SQL_C_WCHAR, SQL_CHAR,
     SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DEFAULT_PARAM, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
     SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NTS, SQL_NULL_DATA,
-    SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT,
-    SQL_SS_VECTOR, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP,
-    SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlLen, SqlSmallInt,
+    SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TABLE, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
+    SQL_SS_UDT, SQL_SS_VARIANT, SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT,
+    SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR,
+    SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlLen, SqlSmallInt, SqlSsVectorLayout,
 };
 use crate::api::sqlstate::ERR_INVALID_STRING_OR_BUFFER_LENGTH;
 use crate::params::BoundParam;
@@ -43,6 +44,12 @@ pub(crate) enum ParamConvError {
     DefaultParamUnsupported,
     /// `StrLen_or_Ind` is a negative value that is not a valid input length.
     InvalidLength(SqlLen),
+    /// `ColumnSize` cannot be expressed as a T-SQL declaration for `SqlType`.
+    InvalidParameterSize(usize),
+    /// `DecimalDigits` cannot be expressed as a T-SQL scale for `SqlType`.
+    InvalidDecimalDigits(SqlSmallInt),
+    /// The SQL type cannot be materialised as a typed NULL.
+    UnsupportedSqlType(SqlSmallInt),
 }
 
 impl ParamConvError {
@@ -52,6 +59,9 @@ impl ParamConvError {
             Self::DataAtExecUnsupported => "Data-at-execution parameters not yet implemented",
             Self::DefaultParamUnsupported => "Default parameters not yet implemented",
             Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH.text,
+            Self::InvalidParameterSize(_) => "Invalid parameter ColumnSize for the SQL type",
+            Self::InvalidDecimalDigits(_) => "Invalid parameter DecimalDigits for the SQL type",
+            Self::UnsupportedSqlType(_) => "Parameter SQL type not yet implemented",
         }
     }
 }
@@ -64,17 +74,12 @@ pub(crate) unsafe fn bound_param_to_rpc(
     name: String,
     param: &BoundParam,
 ) -> Result<RpcParameter, ParamConvError> {
-    let value = unsafe { bound_param_to_value(param) }?;
+    let (value, type_metadata) = unsafe { bound_param_to_value(param) }?;
     let parameter = RpcParameter::new(Some(name), StatusFlags::NONE, value);
-    if param.c_type == SQL_C_DEFAULT {
-        Ok(parameter.with_declaration(default_sql_declaration(
-            param.sql_type,
-            param.column_size,
-            param.decimal_digits,
-        )?))
-    } else {
-        Ok(parameter)
-    }
+    Ok(match type_metadata {
+        Some(metadata) => parameter.with_type_metadata(metadata),
+        None => parameter,
+    })
 }
 
 /// Reads the application's value buffer and produces the corresponding
@@ -84,7 +89,9 @@ pub(crate) unsafe fn bound_param_to_rpc(
 /// `param.parameter_value_ptr` and `param.strlen_or_ind_ptr` must satisfy the
 /// ODBC binding contract: the value buffer is readable for the indicated
 /// length and the indicator pointer, if non-null, points to one valid `SqlLen`.
-pub(crate) unsafe fn bound_param_to_value(param: &BoundParam) -> Result<SqlType, ParamConvError> {
+pub(crate) unsafe fn bound_param_to_value(
+    param: &BoundParam,
+) -> Result<TypedValue, ParamConvError> {
     let indicator = if param.strlen_or_ind_ptr.is_null() {
         None
     } else {
@@ -127,11 +134,29 @@ pub(crate) unsafe fn bound_param_to_value(param: &BoundParam) -> Result<SqlType,
                 unsafe { read_wchar_bytes(param.parameter_value_ptr as *const u16, len_spec) };
             SqlType::NVarcharMax(Some(SqlString::new(bytes, EncodingType::Utf16)))
         }
+        // msodbcsql resolves `SQL_C_DEFAULT` to a concrete C type at bind time
+        // via `Sql2CDefault` and reads the buffer with it
+        // (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`). This driver only implements
+        // the NULL path, which never touches the buffer, so a non-NULL
+        // `SQL_C_DEFAULT` is rejected here rather than silently misread.
         other => return Err(ParamConvError::UnsupportedCType(other)),
     };
 
-    Ok(value)
+    Ok((value, None))
 }
+
+/// A TDS value plus the precision/scale the RPC layer must use for both the
+/// `@P1 <type>` declaration and the wire `TYPE_INFO`.
+type TypedValue = (SqlType, Option<RpcTypeMetadata>);
+
+/// Longest non-`max` length of the narrow character and binary types.
+const MAX_NARROW_LENGTH: usize = 8000;
+/// Longest non-`max` length of the wide character types.
+const MAX_WIDE_LENGTH: usize = 4000;
+/// T-SQL `decimal`/`numeric` precision bounds.
+const PRECISION_RANGE: std::ops::RangeInclusive<usize> = 1..=38;
+/// Largest fractional-seconds scale of `time`/`datetime2`/`datetimeoffset`.
+const MAX_DATETIME_SCALE: u8 = 7;
 
 /// Typed NULL for the supported C types.
 fn null_value(
@@ -139,21 +164,30 @@ fn null_value(
     sql_type: SqlSmallInt,
     column_size: usize,
     decimal_digits: SqlSmallInt,
-) -> Result<SqlType, ParamConvError> {
+) -> Result<TypedValue, ParamConvError> {
     match c_type {
-        SQL_C_CHAR => Ok(SqlType::VarcharMax(None)),
-        SQL_C_WCHAR => Ok(SqlType::NVarcharMax(None)),
+        SQL_C_CHAR => Ok((SqlType::VarcharMax(None), None)),
+        SQL_C_WCHAR => Ok((SqlType::NVarcharMax(None), None)),
         SQL_C_DEFAULT => default_typed_null(sql_type, column_size, decimal_digits),
         other => Err(ParamConvError::UnsupportedCType(other)),
     }
 }
 
+/// Builds the typed NULL a `SQL_C_DEFAULT` binding describes.
+///
+/// `column_size` and `decimal_digits` come straight from the application, so
+/// every value that participates in the `@P1 <type>` declaration is validated
+/// here: emitting `decimal(0,0)` or `char(0)` would otherwise fail server-side
+/// with an opaque syntax error instead of `HY104` at execute time.
+///
+/// The returned [`RpcTypeMetadata`] is the *only* place precision and scale are
+/// carried. [`RpcParameter`] uses it to render the declaration and to write the
+/// wire `TYPE_INFO`, so the two cannot drift apart.
 fn default_typed_null(
     sql_type: SqlSmallInt,
     column_size: usize,
     decimal_digits: SqlSmallInt,
-) -> Result<SqlType, ParamConvError> {
-    let declared_length = u16::try_from(column_size).unwrap_or(u16::MAX);
+) -> Result<TypedValue, ParamConvError> {
     let value = match sql_type {
         SQL_BIT => SqlType::Bit(None),
         SQL_TINYINT => SqlType::TinyInt(None),
@@ -162,81 +196,112 @@ fn default_typed_null(
         SQL_BIGINT => SqlType::BigInt(None),
         SQL_REAL => SqlType::Real(None),
         SQL_FLOAT | SQL_DOUBLE => SqlType::Float(None),
-        SQL_DECIMAL => SqlType::Decimal(None),
-        SQL_NUMERIC => SqlType::Numeric(None),
-        SQL_CHAR => SqlType::Char(None, declared_length),
-        SQL_VARCHAR if column_size == 0 => SqlType::VarcharMax(None),
-        SQL_VARCHAR => SqlType::Varchar(None, declared_length),
+        SQL_DECIMAL => {
+            let metadata = decimal_metadata(column_size, decimal_digits)?;
+            return Ok((SqlType::Decimal(None), Some(metadata)));
+        }
+        SQL_NUMERIC => {
+            let metadata = decimal_metadata(column_size, decimal_digits)?;
+            return Ok((SqlType::Numeric(None), Some(metadata)));
+        }
+        SQL_CHAR => SqlType::Char(None, fixed_length(column_size, MAX_NARROW_LENGTH)?),
+        SQL_VARCHAR => match variable_length(column_size, MAX_NARROW_LENGTH) {
+            Some(length) => SqlType::Varchar(None, length),
+            None => SqlType::VarcharMax(None),
+        },
         SQL_LONGVARCHAR => SqlType::Text(None),
-        SQL_WCHAR => SqlType::NChar(None, declared_length),
-        SQL_WVARCHAR if column_size == 0 => SqlType::NVarcharMax(None),
-        SQL_WVARCHAR => SqlType::NVarchar(None, declared_length),
+        SQL_WCHAR => SqlType::NChar(None, fixed_length(column_size, MAX_WIDE_LENGTH)?),
+        SQL_WVARCHAR => match variable_length(column_size, MAX_WIDE_LENGTH) {
+            Some(length) => SqlType::NVarchar(None, length),
+            None => SqlType::NVarcharMax(None),
+        },
         SQL_WLONGVARCHAR => SqlType::NText(None),
-        SQL_BINARY => SqlType::Binary(None, declared_length),
-        SQL_VARBINARY if column_size == 0 => SqlType::VarBinaryMax(None),
-        SQL_VARBINARY => SqlType::VarBinary(None, declared_length),
+        SQL_BINARY => SqlType::Binary(None, fixed_length(column_size, MAX_NARROW_LENGTH)?),
+        SQL_VARBINARY => match variable_length(column_size, MAX_NARROW_LENGTH) {
+            Some(length) => SqlType::VarBinary(None, length),
+            None => SqlType::VarBinaryMax(None),
+        },
         SQL_LONGVARBINARY => SqlType::VarBinaryMax(None),
         SQL_GUID => SqlType::Uuid(None),
         SQL_TYPE_DATE => SqlType::Date(None),
-        SQL_TYPE_TIME | SQL_SS_TIME2 => SqlType::Time(None),
-        SQL_TYPE_TIMESTAMP => SqlType::DateTime2(None),
-        SQL_SS_TIMESTAMPOFFSET => SqlType::DateTimeOffset(None),
+        SQL_TYPE_TIME | SQL_SS_TIME2 => {
+            let metadata = datetime_metadata(decimal_digits)?;
+            return Ok((SqlType::Time(None), Some(metadata)));
+        }
+        SQL_TYPE_TIMESTAMP => {
+            let metadata = datetime_metadata(decimal_digits)?;
+            return Ok((SqlType::DateTime2(None), Some(metadata)));
+        }
+        SQL_SS_TIMESTAMPOFFSET => {
+            let metadata = datetime_metadata(decimal_digits)?;
+            return Ok((SqlType::DateTimeOffset(None), Some(metadata)));
+        }
         SQL_SS_XML => SqlType::Xml(None),
+        // A NULL `sql_variant` carries no payload, so the inner type only has to
+        // be a legal one - it never reaches the wire.
         SQL_SS_VARIANT => SqlType::Variant(Box::new(SqlType::Varchar(None, 1))),
         SQL_SS_VECTOR => {
             let (dimensions, base_type) = vector_metadata(column_size, decimal_digits)?;
             SqlType::Vector(None, dimensions, base_type)
         }
-        _ => return Err(ParamConvError::UnsupportedCType(SQL_C_DEFAULT)),
+        // `SQL_SS_UDT` and `SQL_SS_TABLE` need the fully qualified server type
+        // name, which `SQLDescribeParam` does not report and this driver has no
+        // other way to obtain, so they are rejected up front at bind time.
+        other => return Err(ParamConvError::UnsupportedSqlType(other)),
     };
-    Ok(value)
+    Ok((value, None))
 }
 
-fn default_sql_declaration(
-    sql_type: SqlSmallInt,
+/// Length of a fixed-width `char`/`nchar`/`binary` declaration. Zero-length and
+/// oversized declarations are invalid T-SQL and have no `max` spelling.
+fn fixed_length(column_size: usize, max: usize) -> Result<u16, ParamConvError> {
+    u16::try_from(column_size)
+        .ok()
+        .filter(|_| (1..=max).contains(&column_size))
+        .ok_or(ParamConvError::InvalidParameterSize(column_size))
+}
+
+/// Length of a `varchar`/`nvarchar`/`varbinary` declaration, or `None` for the
+/// `max` spelling.
+///
+/// `SQLDescribeParam` reports `SQL_PREC_UNLIMITED` for `*(max)` parameters, and
+/// an application may legitimately pass a `ColumnSize` past the non-`max` limit;
+/// both widen to `max` rather than erroring, matching `RpcParameter::get_sql_name`.
+fn variable_length(column_size: usize, max: usize) -> Option<u16> {
+    if column_size == 0 || column_size > max {
+        None
+    } else {
+        u16::try_from(column_size).ok()
+    }
+}
+
+fn decimal_metadata(
     column_size: usize,
     decimal_digits: SqlSmallInt,
-) -> Result<String, ParamConvError> {
-    let sized = |name: &str| {
-        if column_size == 0 {
-            format!("{name}(max)")
-        } else {
-            format!("{name}({column_size})")
-        }
-    };
-    let declaration = match sql_type {
-        SQL_BIT => "bit".to_string(),
-        SQL_TINYINT => "tinyint".to_string(),
-        SQL_SMALLINT => "smallint".to_string(),
-        SQL_INTEGER => "int".to_string(),
-        SQL_BIGINT => "bigint".to_string(),
-        SQL_REAL => "real".to_string(),
-        SQL_FLOAT | SQL_DOUBLE => "float".to_string(),
-        SQL_DECIMAL => format!("decimal({column_size},{decimal_digits})"),
-        SQL_NUMERIC => format!("numeric({column_size},{decimal_digits})"),
-        SQL_CHAR => format!("char({column_size})"),
-        SQL_VARCHAR => sized("varchar"),
-        SQL_LONGVARCHAR => "text".to_string(),
-        SQL_WCHAR => format!("nchar({column_size})"),
-        SQL_WVARCHAR => sized("nvarchar"),
-        SQL_WLONGVARCHAR => "ntext".to_string(),
-        SQL_BINARY => format!("binary({column_size})"),
-        SQL_VARBINARY => sized("varbinary"),
-        SQL_LONGVARBINARY => "varbinary(max)".to_string(),
-        SQL_GUID => "uniqueidentifier".to_string(),
-        SQL_TYPE_DATE => "date".to_string(),
-        SQL_TYPE_TIME | SQL_SS_TIME2 => format!("time({decimal_digits})"),
-        SQL_TYPE_TIMESTAMP => format!("datetime2({decimal_digits})"),
-        SQL_SS_TIMESTAMPOFFSET => format!("datetimeoffset({decimal_digits})"),
-        SQL_SS_XML => "xml".to_string(),
-        SQL_SS_VARIANT => "sql_variant".to_string(),
-        SQL_SS_VECTOR => {
-            let (dimensions, _) = vector_metadata(column_size, decimal_digits)?;
-            format!("vector({dimensions})")
-        }
-        _ => return Err(ParamConvError::UnsupportedCType(SQL_C_DEFAULT)),
-    };
-    Ok(declaration)
+) -> Result<RpcTypeMetadata, ParamConvError> {
+    let precision = u8::try_from(column_size)
+        .ok()
+        .filter(|_| PRECISION_RANGE.contains(&column_size))
+        .ok_or(ParamConvError::InvalidParameterSize(column_size))?;
+    let scale = u8::try_from(decimal_digits)
+        .ok()
+        .filter(|scale| *scale <= precision)
+        .ok_or(ParamConvError::InvalidDecimalDigits(decimal_digits))?;
+    Ok(RpcTypeMetadata {
+        precision: Some(precision),
+        scale: Some(scale),
+    })
+}
+
+fn datetime_metadata(decimal_digits: SqlSmallInt) -> Result<RpcTypeMetadata, ParamConvError> {
+    let scale = u8::try_from(decimal_digits)
+        .ok()
+        .filter(|scale| *scale <= MAX_DATETIME_SCALE)
+        .ok_or(ParamConvError::InvalidDecimalDigits(decimal_digits))?;
+    Ok(RpcTypeMetadata {
+        precision: None,
+        scale: Some(scale),
+    })
 }
 
 /// Known ODBC SQL data type identifiers (plus SQL Server extensions) accepted
@@ -272,30 +337,39 @@ pub(crate) fn is_valid_sql_type(sql_type: SqlSmallInt) -> bool {
             | SQL_SS_VARIANT
             | SQL_SS_VECTOR
             | SQL_SS_XML
+            // msodbcsql accepts both at bind time (`SQLBindParameter` routes
+            // `SQL_SS_TABLE` through the IPD, `Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`),
+            // so they are valid identifiers here too. The conversion check
+            // below is what rejects them, giving `07006` instead of `HY004`.
+            | SQL_SS_UDT
+            | SQL_SS_TABLE
     )
 }
 
-#[repr(C)]
-struct SqlSsVectorLayout {
-    dimension: SqlSmallInt,
-    vector_type: i32,
-    data: *mut std::ffi::c_void,
-}
-
+/// Recovers a vector's dimension count and base type from the `ColumnSize` and
+/// `DecimalDigits` that `SQLDescribeParam` reported.
+///
+/// `ColumnSize` is the size of the whole client buffer - a
+/// [`SqlSsVectorLayout`] header followed by `dimensions` elements. msodbcsql
+/// always exchanges those elements as 4-byte floats regardless of the
+/// server-side base type, so the element width is
+/// [`SQL_SS_VECTOR_ELEMENT_SIZE`] and not the base type's own width.
+/// `DecimalDigits` carries the base type (`0` = float32, `1` = float16),
+/// mirroring `SQL_SS_VECTOR`'s `SQL_CA_SS_VECTOR_BASE_TYPE` descriptor field.
 fn vector_metadata(
     column_size: usize,
     base_type: SqlSmallInt,
 ) -> Result<(u16, VectorBaseType), ParamConvError> {
     let payload_size = column_size
         .checked_sub(std::mem::size_of::<SqlSsVectorLayout>())
-        .filter(|size| size % std::mem::size_of::<f32>() == 0)
-        .ok_or(ParamConvError::UnsupportedCType(SQL_C_DEFAULT))?;
-    let dimensions = u16::try_from(payload_size / std::mem::size_of::<f32>())
-        .map_err(|_| ParamConvError::UnsupportedCType(SQL_C_DEFAULT))?;
+        .filter(|size| size % SQL_SS_VECTOR_ELEMENT_SIZE == 0)
+        .ok_or(ParamConvError::InvalidParameterSize(column_size))?;
+    let dimensions = u16::try_from(payload_size / SQL_SS_VECTOR_ELEMENT_SIZE)
+        .map_err(|_| ParamConvError::InvalidParameterSize(column_size))?;
     let base_type = match base_type {
         0 => VectorBaseType::Float32,
         1 => VectorBaseType::Float16,
-        _ => return Err(ParamConvError::UnsupportedCType(SQL_C_DEFAULT)),
+        _ => return Err(ParamConvError::InvalidDecimalDigits(base_type)),
     };
     Ok((dimensions, base_type))
 }
@@ -313,11 +387,17 @@ pub(crate) fn is_valid_c_type(c_type: SqlSmallInt) -> bool {
 /// (`CHAR`/`VARCHAR`/`LONGVARCHAR`) and `SQL_C_WCHAR` → the wide character SQL
 /// types (`WCHAR`/`WVARCHAR`/`WLONGVARCHAR`). Every other pairing is rejected
 /// (`07006`).
+///
+/// `SQL_C_DEFAULT` is the pairing `SQLDescribeParam` callers use: they hand the
+/// described `DataType` straight back to `SQLBindParameter`. It is accepted for
+/// exactly the SQL types [`default_typed_null`] can materialise, so an
+/// unsupported one fails on the `SQLBindParameter` call the application can see
+/// rather than at execute time.
 pub(crate) fn is_valid_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt) -> bool {
     match c_type {
         SQL_C_CHAR => matches!(sql_type, SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR),
         SQL_C_WCHAR => matches!(sql_type, SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR),
-        SQL_C_DEFAULT => true,
+        SQL_C_DEFAULT => !matches!(sql_type, SQL_SS_UDT | SQL_SS_TABLE),
         _ => false,
     }
 }
@@ -374,7 +454,7 @@ unsafe fn read_wchar_bytes(ptr: *const u16, len_spec: SqlLen) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_LONG, SQL_NO_TOTAL, SQL_PARAM_INPUT};
+    use crate::api::odbc_types::{SQL_C_LONG, SQL_NO_TOTAL, SQL_PARAM_INPUT, SQL_PREC_UNLIMITED};
     use std::ffi::c_void;
 
     fn param(c_type: SqlSmallInt, ptr: *mut c_void, ind: *mut SqlLen) -> BoundParam {
@@ -395,7 +475,7 @@ mod tests {
         let mut buf: Vec<u8> = b"hello\0".to_vec();
         let mut ind: SqlLen = SQL_NTS as SqlLen;
         let p = param(SQL_C_CHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
-        let value = unsafe { bound_param_to_value(&p) }.unwrap();
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         match value {
             SqlType::VarcharMax(Some(s)) => assert_eq!(s.to_utf8_string(), "hello"),
             other => panic!("expected VarcharMax(Some), got {other:?}"),
@@ -407,7 +487,7 @@ mod tests {
         let mut buf: Vec<u16> = "hi".encode_utf16().collect();
         let mut ind: SqlLen = (buf.len() * 2) as SqlLen;
         let p = param(SQL_C_WCHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
-        let value = unsafe { bound_param_to_value(&p) }.unwrap();
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         match value {
             SqlType::NVarcharMax(Some(s)) => assert_eq!(s.to_utf8_string(), "hi"),
             other => panic!("expected NVarcharMax(Some), got {other:?}"),
@@ -418,7 +498,7 @@ mod tests {
     fn null_indicator_yields_typed_null() {
         let mut ind: SqlLen = SQL_NULL_DATA;
         let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
-        let value = unsafe { bound_param_to_value(&p) }.unwrap();
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         assert!(matches!(value, SqlType::VarcharMax(None)));
     }
 
@@ -457,6 +537,12 @@ mod tests {
         assert!(!is_valid_conversion(SQL_C_CHAR, SQL_INTEGER));
         assert!(!is_valid_conversion(SQL_C_LONG, SQL_INTEGER));
         assert!(is_valid_conversion(SQL_C_DEFAULT, SQL_INTEGER));
+        // `SQLDescribeParam` can report these, but this driver has no way to
+        // build a value for them, so they fail on the bind call.
+        assert!(is_valid_sql_type(SQL_SS_UDT));
+        assert!(is_valid_sql_type(SQL_SS_TABLE));
+        assert!(!is_valid_conversion(SQL_C_DEFAULT, SQL_SS_UDT));
+        assert!(!is_valid_conversion(SQL_C_DEFAULT, SQL_SS_TABLE));
     }
 
     #[test]
@@ -471,7 +557,7 @@ mod tests {
     fn null_indicator_wchar_yields_typed_null() {
         let mut ind: SqlLen = SQL_NULL_DATA;
         let p = param(SQL_C_WCHAR, std::ptr::null_mut(), &mut ind);
-        let value = unsafe { bound_param_to_value(&p) }.unwrap();
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         assert!(matches!(value, SqlType::NVarcharMax(None)));
     }
 
@@ -489,21 +575,164 @@ mod tests {
         let mut p = param(SQL_C_DEFAULT, std::ptr::null_mut(), &mut ind);
         p.sql_type = SQL_INTEGER;
         p.column_size = 10;
-        let value = unsafe { bound_param_to_value(&p) }.unwrap();
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         assert!(matches!(value, SqlType::Int(None)));
 
         p.sql_type = SQL_WVARCHAR;
         p.column_size = 40;
-        let value = unsafe { bound_param_to_value(&p) }.unwrap();
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         assert!(matches!(value, SqlType::NVarchar(None, 40)));
+    }
 
+    /// The typed NULL and the precision/scale metadata must be produced
+    /// together, so the declaration `RpcParameter` renders cannot disagree with
+    /// the value it serializes. (That the metadata then drives both is covered
+    /// by `type_metadata_drives_declaration_and_wire_metadata` in `mssql-tds`.)
+    #[test]
+    fn default_null_pairs_value_with_metadata() {
+        let decimal = |precision, scale| {
+            Some(RpcTypeMetadata {
+                precision: Some(precision),
+                scale: Some(scale),
+            })
+        };
+        let temporal = |scale| {
+            Some(RpcTypeMetadata {
+                precision: None,
+                scale: Some(scale),
+            })
+        };
+        let cases: &[(
+            SqlSmallInt,
+            usize,
+            SqlSmallInt,
+            SqlType,
+            Option<RpcTypeMetadata>,
+        )] = &[
+            (SQL_DECIMAL, 12, 3, SqlType::Decimal(None), decimal(12, 3)),
+            (SQL_NUMERIC, 38, 0, SqlType::Numeric(None), decimal(38, 0)),
+            (SQL_SS_TIME2, 16, 4, SqlType::Time(None), temporal(4)),
+            (
+                SQL_TYPE_TIMESTAMP,
+                27,
+                7,
+                SqlType::DateTime2(None),
+                temporal(7),
+            ),
+            (
+                SQL_SS_TIMESTAMPOFFSET,
+                34,
+                7,
+                SqlType::DateTimeOffset(None),
+                temporal(7),
+            ),
+            (SQL_INTEGER, 10, 0, SqlType::Int(None), None),
+            (SQL_CHAR, 10, 0, SqlType::Char(None, 10), None),
+            (SQL_WVARCHAR, 40, 0, SqlType::NVarchar(None, 40), None),
+            // `SQL_PREC_UNLIMITED` and any oversized length both mean `max`.
+            (
+                SQL_WVARCHAR,
+                SQL_PREC_UNLIMITED,
+                0,
+                SqlType::NVarcharMax(None),
+                None,
+            ),
+            (SQL_VARCHAR, 9000, 0, SqlType::VarcharMax(None), None),
+            (
+                SQL_VARBINARY,
+                SQL_PREC_UNLIMITED,
+                0,
+                SqlType::VarBinaryMax(None),
+                None,
+            ),
+        ];
+        for (sql_type, column_size, decimal_digits, expected_value, expected_metadata) in cases {
+            let mut ind: SqlLen = SQL_NULL_DATA;
+            let mut p = param(SQL_C_DEFAULT, std::ptr::null_mut(), &mut ind);
+            p.sql_type = *sql_type;
+            p.column_size = *column_size;
+            p.decimal_digits = *decimal_digits;
+            let (value, metadata) = unsafe { bound_param_to_value(&p) }
+                .unwrap_or_else(|e| panic!("conversion failed for {sql_type}: {e:?}"));
+            assert_eq!(&value, expected_value, "case: sql_type {sql_type}");
+            assert_eq!(&metadata, expected_metadata, "case: sql_type {sql_type}");
+        }
+    }
+
+    /// A `ColumnSize`/`DecimalDigits` that has no legal T-SQL spelling is
+    /// rejected here rather than sent as a malformed declaration.
+    #[test]
+    fn default_null_rejects_undeclarable_metadata() {
+        let cases: &[(SqlSmallInt, usize, SqlSmallInt, ParamConvError)] = &[
+            (SQL_DECIMAL, 0, 0, ParamConvError::InvalidParameterSize(0)),
+            (SQL_DECIMAL, 39, 0, ParamConvError::InvalidParameterSize(39)),
+            // Scale may not exceed precision.
+            (SQL_NUMERIC, 5, 6, ParamConvError::InvalidDecimalDigits(6)),
+            (SQL_CHAR, 0, 0, ParamConvError::InvalidParameterSize(0)),
+            (
+                SQL_WCHAR,
+                4001,
+                0,
+                ParamConvError::InvalidParameterSize(4001),
+            ),
+            (SQL_BINARY, 0, 0, ParamConvError::InvalidParameterSize(0)),
+            (
+                SQL_TYPE_TIMESTAMP,
+                27,
+                8,
+                ParamConvError::InvalidDecimalDigits(8),
+            ),
+            (
+                SQL_SS_TIME2,
+                16,
+                -1,
+                ParamConvError::InvalidDecimalDigits(-1),
+            ),
+            (
+                SQL_SS_UDT,
+                0,
+                0,
+                ParamConvError::UnsupportedSqlType(SQL_SS_UDT),
+            ),
+        ];
+        for &(sql_type, column_size, decimal_digits, expected) in cases {
+            let mut ind: SqlLen = SQL_NULL_DATA;
+            let mut p = param(SQL_C_DEFAULT, std::ptr::null_mut(), &mut ind);
+            p.sql_type = sql_type;
+            p.column_size = column_size;
+            p.decimal_digits = decimal_digits;
+            let err = unsafe { bound_param_to_value(&p) }
+                .expect_err(&format!("expected rejection for sql_type {sql_type}"));
+            assert_eq!(err, expected, "case: sql_type {sql_type}");
+        }
+    }
+
+    /// A vector's `ColumnSize` is the client buffer size: header + 4 bytes per
+    /// dimension, regardless of the server-side base type.
+    #[test]
+    fn vector_metadata_round_trips_dimensions() {
+        let header = std::mem::size_of::<SqlSsVectorLayout>();
         assert_eq!(
-            default_sql_declaration(SQL_DECIMAL, 12, 3).unwrap(),
-            "decimal(12,3)"
+            vector_metadata(header + 3 * SQL_SS_VECTOR_ELEMENT_SIZE, 0).unwrap(),
+            (3, VectorBaseType::Float32)
         );
         assert_eq!(
-            default_sql_declaration(SQL_SS_TIME2, 12, 4).unwrap(),
-            "time(4)"
+            vector_metadata(header + 3 * SQL_SS_VECTOR_ELEMENT_SIZE, 1).unwrap(),
+            (3, VectorBaseType::Float16)
+        );
+        // Too small for the header, and a payload that is not a whole number of
+        // elements, are both rejected.
+        assert_eq!(
+            vector_metadata(1, 0).unwrap_err(),
+            ParamConvError::InvalidParameterSize(1)
+        );
+        assert_eq!(
+            vector_metadata(header + 3, 0).unwrap_err(),
+            ParamConvError::InvalidParameterSize(header + 3)
+        );
+        assert_eq!(
+            vector_metadata(header, 2).unwrap_err(),
+            ParamConvError::InvalidDecimalDigits(2)
         );
     }
 

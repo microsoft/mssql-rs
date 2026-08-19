@@ -69,7 +69,8 @@ The mapping must follow msodbcsql for:
 - Integer widths and floating-point precision.
 - Decimal/numeric precision and scale.
 - Unicode byte lengths versus ODBC character lengths.
-- MAX/PLP types.
+- MAX/PLP types, which msodbcsql reports as `SQL_PREC_UNLIMITED`
+  (2147483647), not 0 (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`).
 - GUID and scale-dependent temporal display sizes.
 - SQL Server extension types, including variant, XML, UDT, table, and vector.
 
@@ -84,6 +85,14 @@ mssql-python describes unresolved `None` values and then binds them with
   sized character and binary values, and vector dimensions.
 - Use the exact declaration when building `sp_prepexec`, `sp_execute`, or
   `sp_executesql` parameter lists.
+
+Precision and scale that a NULL `SqlType` cannot carry (decimal
+precision/scale lives inside the `Option` payload, temporal scale likewise)
+travel in a single `RpcTypeMetadata` value attached to the RPC parameter. That
+one value feeds both the rendered declaration text and the wire `TYPE_INFO`
+header, so the two can never disagree: declaring `@P1 decimal(12,3)` while
+serializing a `NUMERIC(1,0)` header would truncate the first non-NULL value a
+caller sends on that statement.
 
 Non-NULL `SQL_C_DEFAULT` conversion and binding NULL values for server types
 whose required type names are not exposed by `SQLDescribeParam` are outside this
@@ -113,6 +122,8 @@ observable behavior for:
 - Multiple unresolved NULLs described before any binding.
 - Typed NULL execution.
 - Metadata invalidation after reprepare.
+- `*(max)` parameters and a described decimal round-tripping its precision and
+  scale.
 
 Queries used for execution coverage must be independently inferable by SQL
 Server so a shared inference failure is not mistaken for driver parity.

@@ -2,11 +2,11 @@
 // Licensed under the MIT License.
 
 use bitflags::bitflags;
-use std::borrow::Cow;
 
 use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
 use crate::datatypes::encoder::SqlValueEncoder;
 use crate::datatypes::sql_tvp::TvpTypeName;
+use crate::datatypes::sqldatatypes::VectorBaseType;
 use crate::datatypes::sqltypes::SqlType;
 use crate::{
     core::TdsResult,
@@ -72,6 +72,21 @@ pub(crate) struct RpcEncryptionMetadata {
     pub(crate) normalization_rule_version: u8,
 }
 
+/// Precision and scale for a parameter whose value cannot carry them.
+///
+/// A `None`-valued `Decimal`/`Numeric` or `Time`/`DateTime2`/`DateTimeOffset`
+/// has no value to read precision and scale from, so a typed NULL would
+/// otherwise fall back to the TDS defaults. Supplying this metadata drives both
+/// the SQL declaration text and the wire `TYPE_INFO`, so the two cannot
+/// disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RpcTypeMetadata {
+    /// Decimal/numeric precision.
+    pub precision: Option<u8>,
+    /// Decimal/numeric or temporal scale.
+    pub scale: Option<u8>,
+}
+
 /// An encrypted RPC parameter value: the ciphertext (or `None` for an encrypted
 /// NULL) plus the cipher metadata the server needs to decrypt it.
 #[derive(Debug, Clone)]
@@ -102,9 +117,9 @@ pub struct RpcParameter {
     ///  This is used to determine how to serialize the value.
     value: SqlType,
 
-    /// SQL declaration used by prepared and parameterized statements when it
-    /// must be more specific than the value alone can express.
-    declaration: Option<String>,
+    /// Precision/scale for a value template that cannot carry them itself.
+    /// Applied to both the SQL declaration and the wire `TYPE_INFO`.
+    type_metadata: Option<RpcTypeMetadata>,
 
     /// When present, the parameter is sent encrypted (Always Encrypted): the
     /// ciphertext is serialized as a BIGVARBINARY with the ENCRYPTED status flag
@@ -127,23 +142,24 @@ impl RpcParameter {
             name,
             options,
             value,
-            declaration: None,
+            type_metadata: None,
             encrypted: None,
             force_column_encryption: false,
         }
     }
 
-    /// Overrides the SQL declaration generated from the parameter value.
-    pub fn with_declaration(mut self, declaration: String) -> Self {
-        self.declaration = Some(declaration);
+    /// Supplies precision/scale for a value template that cannot carry them —
+    /// a typed NULL `Decimal`/`Numeric` or `Time`/`DateTime2`/`DateTimeOffset`.
+    ///
+    /// The same metadata drives the SQL declaration and the wire `TYPE_INFO`,
+    /// so a caller cannot declare `decimal(12,3)` while sending `NUMERIC(1,0)`.
+    pub fn with_type_metadata(mut self, metadata: RpcTypeMetadata) -> Self {
+        self.type_metadata = Some(metadata);
         self
     }
 
-    pub(crate) fn sql_declaration(&self) -> TdsResult<Cow<'_, str>> {
-        match &self.declaration {
-            Some(declaration) => Ok(Cow::Borrowed(declaration)),
-            None => Ok(Cow::Owned(Self::get_sql_name(&self.value)?)),
-        }
+    pub(crate) fn sql_declaration(&self) -> TdsResult<String> {
+        Self::get_sql_name(&self.value, self.type_metadata)
     }
 
     /// Requires this parameter to be encrypted under Always Encrypted.
@@ -167,19 +183,26 @@ impl RpcParameter {
     /// Get the SQL type name from a SqlType value for use in parameter declarations.
     /// This is used to build the parameter list string for sp_executesql and sp_prepare.
     ///
+    /// `metadata` supplies precision/scale for a value template that cannot
+    /// carry them itself (a typed NULL `decimal`, `time`, ...); pass `None` when
+    /// the value speaks for itself.
+    ///
     /// Returns [`Error::ImplementationError`] if the `SqlType` maps to a [`TdsDataType`]
     /// variant that has no SQL declaration name (see [`TdsDataType::get_meta_type_name`]).
     #[cfg(fuzzing)]
-    pub fn get_sql_name(value: &SqlType) -> TdsResult<String> {
-        Self::get_sql_name_impl(value)
+    pub fn get_sql_name(value: &SqlType, metadata: Option<RpcTypeMetadata>) -> TdsResult<String> {
+        Self::get_sql_name_impl(value, metadata)
     }
 
     #[cfg(not(fuzzing))]
-    pub(crate) fn get_sql_name(value: &SqlType) -> TdsResult<String> {
-        Self::get_sql_name_impl(value)
+    pub(crate) fn get_sql_name(
+        value: &SqlType,
+        metadata: Option<RpcTypeMetadata>,
+    ) -> TdsResult<String> {
+        Self::get_sql_name_impl(value, metadata)
     }
 
-    fn get_sql_name_impl(value: &SqlType) -> TdsResult<String> {
+    fn get_sql_name_impl(value: &SqlType, metadata: Option<RpcTypeMetadata>) -> TdsResult<String> {
         // Table-valued parameters are declared by their schema-qualified table
         // type name with the mandatory `READONLY` suffix, not via a base TDS
         // type name (which `get_meta_type_name` would reject for `SqlTable`).
@@ -220,38 +243,55 @@ impl RpcParameter {
             }
             SqlType::Time(time) => {
                 // For time, we need to send the scale as the length.
-                match time {
+                match (metadata.and_then(|m| m.scale), time) {
+                    (Some(scale), _) => scale.to_string(),
                     // If the time is not specified, we assume the default scale.
                     // This is a common case for time types.
-                    Some(time) => time.get_scale().to_string(),
+                    (None, Some(time)) => time.get_scale().to_string(),
                     _ => DEFAULT_VARTIME_SCALE.to_string(), // Default scale for Time
                 }
             }
             SqlType::DateTime2(datetime2) => {
                 // For DateTime2, we need to send the scale as the length.
-                match datetime2 {
-                    Some(val) => val.time.get_scale().to_string(),
-                    None => DEFAULT_VARTIME_SCALE.to_string(), // Default scale for DateTime2
+                match (metadata.and_then(|m| m.scale), datetime2) {
+                    (Some(scale), _) => scale.to_string(),
+                    (None, Some(val)) => val.time.get_scale().to_string(),
+                    _ => DEFAULT_VARTIME_SCALE.to_string(), // Default scale for DateTime2
                 }
             }
             SqlType::DateTimeOffset(datetimeoffset) => {
                 // For DateTimeoffset, we need to send the scale as the length.
-                match datetimeoffset {
-                    Some(val) => val.datetime2.time.get_scale().to_string(),
-                    None => DEFAULT_VARTIME_SCALE.to_string(), // Default scale for DateTimeOffset
+                match (metadata.and_then(|m| m.scale), datetimeoffset) {
+                    (Some(scale), _) => scale.to_string(),
+                    (None, Some(val)) => val.datetime2.time.get_scale().to_string(),
+                    _ => DEFAULT_VARTIME_SCALE.to_string(), // Default scale for DateTimeOffset
                 }
             }
             SqlType::Decimal(value) | SqlType::Numeric(value) => {
                 // For Decimal and Numeric, we need to send the precision and scale as the length.
                 // The format is "precision,scale".
-                match value {
-                    Some(parts) => {
+                match (metadata, value) {
+                    (
+                        Some(RpcTypeMetadata {
+                            precision: Some(p),
+                            scale,
+                        }),
+                        _,
+                    ) => {
+                        format!("{},{}", p, scale.unwrap_or(0))
+                    }
+                    (_, Some(parts)) => {
                         format!("{},{}", parts.precision, parts.scale)
                     }
-                    None => "18, 10".to_string(), // Default precision and scale
+                    _ => "18, 10".to_string(), // Default precision and scale
                 }
             }
-            SqlType::Vector(_, dims, _) => dims.to_string(),
+            // `vector(N)` implies the float32 base type; float16 must be spelled
+            // out explicitly (msodbcsql `Sql/Ntdbms/sqlncli/odbc/sqlccmd.cpp`).
+            SqlType::Vector(_, dims, base_type) => match base_type {
+                VectorBaseType::Float32 => dims.to_string(),
+                VectorBaseType::Float16 => format!("{dims}, float16"),
+            },
             _ => "".to_string(),
         };
 
@@ -329,7 +369,7 @@ impl RpcParameter {
         packet_writer.write_byte_async(self.options.bits()).await?;
 
         encoder
-            .encode_sqlvalue(packet_writer, &self.value, db_collation)
+            .encode_sqlvalue(packet_writer, &self.value, db_collation, self.type_metadata)
             .await?;
         Ok(())
     }
@@ -577,7 +617,8 @@ mod tests {
     use crate::error::Error;
     use crate::message::parameters::rpc_parameters::RpcParameter;
     use crate::message::parameters::rpc_parameters::{
-        EncryptedRpcValue, RpcEncryptionMetadata, StatusFlags, build_parameter_list_string,
+        EncryptedRpcValue, RpcEncryptionMetadata, RpcTypeMetadata, StatusFlags,
+        build_parameter_list_string,
     };
 
     use crate::datatypes::encoder::GenericEncoder;
@@ -807,23 +848,82 @@ mod tests {
             ),
         ];
         for (sql_type, expected) in cases {
-            let rpc_param = RpcParameter::get_sql_name(&sql_type)
+            let rpc_param = RpcParameter::get_sql_name(&sql_type, None)
                 .unwrap_or_else(|e| panic!("get_sql_name failed for {sql_type:?}: {e}"));
             assert_eq!(rpc_param, expected, "case: {sql_type:?}");
         }
     }
 
+    /// The declaration text and the wire `TYPE_INFO` must come from the same
+    /// [`RpcTypeMetadata`]: declaring `decimal(12,3)` while serializing
+    /// `NUMERIC(1,0)` would truncate the first non-NULL value sent.
     #[test]
-    fn parameter_declaration_override_is_used() {
+    fn type_metadata_drives_declaration_and_wire_metadata() {
         let param = RpcParameter::new(
             Some("@P1".to_string()),
             StatusFlags::NONE,
             SqlType::Decimal(None),
         )
-        .with_declaration("decimal(12,3)".to_string());
+        .with_type_metadata(RpcTypeMetadata {
+            precision: Some(12),
+            scale: Some(3),
+        });
+
         let mut declarations = String::new();
-        build_parameter_list_string(&vec![param], &mut declarations).unwrap();
+        build_parameter_list_string(&vec![param.clone()], &mut declarations).unwrap();
         assert_eq!(declarations, "@P1 decimal(12,3) ");
+
+        // Layout: name (len 3, "@P1" UTF-16LE), status, then TYPE_INFO
+        // `NUMERICN, max_len, precision, scale`.
+        let bytes = serialize_param(&param);
+        let type_info = &bytes[1 + 3 * 2 + 1..];
+        assert_eq!(
+            type_info[0],
+            crate::datatypes::sqldatatypes::TdsDataType::NumericN as u8
+        );
+        assert_eq!(
+            (type_info[2], type_info[3]),
+            (12, 3),
+            "wire precision/scale must match the declaration"
+        );
+    }
+
+    /// A typed NULL `time`/`datetime2`/`datetimeoffset` has no value to read a
+    /// scale from, so the metadata must drive the declaration.
+    #[test]
+    fn type_metadata_supplies_temporal_scale() {
+        let cases = [
+            (SqlType::Time(None), "time(4)"),
+            (SqlType::DateTime2(None), "datetime2(4)"),
+            (SqlType::DateTimeOffset(None), "datetimeoffset(4)"),
+        ];
+        let metadata = RpcTypeMetadata {
+            precision: None,
+            scale: Some(4),
+        };
+        for (sql_type, expected) in cases {
+            assert_eq!(
+                RpcParameter::get_sql_name(&sql_type, Some(metadata)).unwrap(),
+                expected,
+                "case: {sql_type:?}"
+            );
+        }
+    }
+
+    /// `vector(N)` implies float32; a float16 vector must say so explicitly.
+    #[test]
+    fn vector_declaration_spells_out_float16() {
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+        assert_eq!(
+            RpcParameter::get_sql_name(&SqlType::Vector(None, 3, VectorBaseType::Float32), None)
+                .unwrap(),
+            "vector(3)"
+        );
+        assert_eq!(
+            RpcParameter::get_sql_name(&SqlType::Vector(None, 3, VectorBaseType::Float16), None)
+                .unwrap(),
+            "vector(3, float16)"
+        );
     }
 
     /// `get_sql_name` must surface `Error::ImplementationError` when the underlying
@@ -851,13 +951,13 @@ mod tests {
             None,
         );
         assert_eq!(
-            RpcParameter::get_sql_name(&schema_qualified).unwrap(),
+            RpcParameter::get_sql_name(&schema_qualified, None).unwrap(),
             "[sales].[OrderList] READONLY"
         );
 
         let default_schema = SqlType::Table(TvpTypeName::new(None, "OrderList".to_string()), None);
         assert_eq!(
-            RpcParameter::get_sql_name(&default_schema).unwrap(),
+            RpcParameter::get_sql_name(&default_schema, None).unwrap(),
             "[dbo].[OrderList] READONLY"
         );
     }

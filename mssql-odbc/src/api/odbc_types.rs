@@ -250,6 +250,31 @@ pub const SQL_SS_TIMESTAMPOFFSET: SqlSmallInt = -155;
 pub const SQL_SS_TABLE: SqlSmallInt = -153;
 pub const SQL_SS_VECTOR: SqlSmallInt = -156;
 
+/// Size reported for `*(max)`, `xml` and UDT parameters, whose length is not
+/// bounded at describe time.
+///
+/// Mirrors msodbcsql's `SQL_PREC_UNLIMITED`
+/// (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`, `GetIPDRec`).
+pub const SQL_PREC_UNLIMITED: SqlULen = 2_147_483_647;
+
+/// Header of the `SQL_SS_VECTOR` client buffer that precedes the element array.
+///
+/// Only its size participates in the `ParameterSize` <-> dimension conversion,
+/// so the fields are never read directly.
+#[repr(C)]
+pub(crate) struct SqlSsVectorLayout {
+    pub(crate) dimensions: u32,
+    pub(crate) base_type: u8,
+    pub(crate) reserved: [u8; 3],
+}
+
+/// Client-side element width of a `SQL_SS_VECTOR` buffer.
+///
+/// msodbcsql always materialises vector elements as 4-byte floats regardless of
+/// the server-side base type, so `float16` vectors are widened on the way out
+/// and narrowed on the way in.
+pub(crate) const SQL_SS_VECTOR_ELEMENT_SIZE: usize = std::mem::size_of::<f32>();
+
 // ODBC C types
 pub const SQL_C_CHAR: SqlSmallInt = 1;
 pub const SQL_C_WCHAR: SqlSmallInt = -8;

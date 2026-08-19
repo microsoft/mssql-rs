@@ -3,8 +3,6 @@
 
 //! Implementation of SQLDescribeParam.
 
-use std::ffi::c_void;
-
 use tracing::{debug, error};
 
 use mssql_tds::connection::tds_client::ResultSet;
@@ -134,6 +132,10 @@ fn sql_describe_param_safe(
             return SQL_ERROR;
         }
 
+        // Serving from the cache needs no connection, so it stays available
+        // while a cursor is open - matching msodbcsql, which also answers
+        // `SQLDescribeParam` from cached parameter metadata. The state check
+        // below only guards the path that has to run the metadata RPC.
         if stmt_state.parameter_metadata.len() == marker_count {
             let Some(description) = stmt_state
                 .parameter_metadata
@@ -173,11 +175,7 @@ fn sql_describe_param_safe(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    let command = RpcParameter::new(
-        None,
-        StatusFlags::NONE,
-        SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql))),
-    );
+    let command = RpcParameter::new(None, StatusFlags::NONE, metadata_request_value(sql));
     let execute_result = dbc.runtime.block_on(client.execute_stored_procedure(
         DESCRIBE_PARAMETERS_PROC.to_string(),
         Some(vec![command]),
@@ -205,16 +203,13 @@ fn sql_describe_param_safe(
         }
     }
 
-    let mut descriptions = vec![None; marker_count];
+    let mut collector = DescriptionCollector::new(marker_count);
     let parse_result = loop {
         match dbc.runtime.block_on(client.next_row()) {
             Ok(Some(row)) => match parse_parameter_row(&row, marker_count, is_odbc3) {
                 Ok((index, description)) => {
-                    let Some(slot) = descriptions.get_mut(index) else {
-                        break Err("parameter ordinal is out of range".to_string());
-                    };
-                    if slot.replace(description).is_some() {
-                        break Err(format!("duplicate parameter ordinal {}", index + 1));
+                    if let Err(e) = collector.accept(index, description) {
+                        break Err(e);
                     }
                 }
                 Err(e) => break Err(e),
@@ -228,15 +223,7 @@ fn sql_describe_param_safe(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    let descriptions = match parse_result.and_then(|()| {
-        descriptions
-            .into_iter()
-            .enumerate()
-            .map(|(index, value)| {
-                value.ok_or_else(|| format!("missing metadata for parameter {}", index + 1))
-            })
-            .collect::<Result<Vec<_>, _>>()
-    }) {
+    let descriptions = match parse_result.and_then(|()| collector.finish()) {
         Ok(descriptions) => descriptions,
         Err(e) => {
             return fail_metadata_response(dbc, stmt, statement_handle, client, &e);
@@ -297,6 +284,13 @@ fn fail_metadata_response(
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     }
     SQL_ERROR
+}
+
+/// The `@tsql` argument of `sp_describe_undeclared_parameters`, which is
+/// declared `nvarchar(max)` — a sized `nvarchar` would truncate a long
+/// statement.
+fn metadata_request_value(sql: String) -> SqlType {
+    SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql)))
 }
 
 fn write_description(
@@ -396,6 +390,11 @@ fn describe_tds_type(
             };
             (SQL_SS_TIME2, size, SqlSmallInt::from(scale))
         }
+        // datetime and smalldatetime both surface as `SQL_TYPE_TIMESTAMP` with
+        // the fixed precision/scale msodbcsql reports
+        // (`Sql/Ntdbms/sqlncli/sqlctokn.cpp`). Neither driver records the
+        // original server type name, so re-binding this description declares
+        // `datetime2(3)`/`datetime2(0)` rather than the legacy type.
         TdsDataType::DateTime => (SQL_TYPE_TIMESTAMP, 23, 3),
         TdsDataType::DateTim4 => (SQL_TYPE_TIMESTAMP, 16, 0),
         TdsDataType::DateTimeN => match length {
@@ -438,10 +437,15 @@ fn describe_tds_type(
         }
         TdsDataType::Image => (SQL_LONGVARBINARY, parameter_length(length, false)?, 0),
         TdsDataType::SsVariant => (SQL_SS_VARIANT, 8000, 0),
-        TdsDataType::Udt => (SQL_SS_UDT, 0, 0),
-        TdsDataType::Xml => (SQL_SS_XML, 0, 0),
+        // msodbcsql reports the unbounded types as `SQL_PREC_UNLIMITED`
+        // (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`, `GetIPDRec`); a table type
+        // has no meaningful column size at all.
+        TdsDataType::Udt => (SQL_SS_UDT, SQL_PREC_UNLIMITED, 0),
+        TdsDataType::Xml => (SQL_SS_XML, SQL_PREC_UNLIMITED, 0),
         TdsDataType::SqlTable => (SQL_SS_TABLE, 0, 0),
-        TdsDataType::Json => (SQL_WLONGVARCHAR, 0, 0),
+        // msodbcsql has no dedicated `json` ODBC type, so `json` surfaces as an
+        // unbounded wide character type, matching how the value is exchanged.
+        TdsDataType::Json => (SQL_WLONGVARCHAR, SQL_PREC_UNLIMITED, 0),
         TdsDataType::Vector => (
             SQL_SS_VECTOR,
             vector_user_size(length, scale)?,
@@ -456,6 +460,10 @@ fn describe_tds_type(
         data_type,
         parameter_size,
         decimal_digits,
+        // `sp_describe_undeclared_parameters` never reports an inferred
+        // parameter as NOT NULL, and msodbcsql hard-codes `SQL_NULLABLE` for
+        // every row it processes (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`,
+        // `CImpODBCIObtainParameterMetadata::ProcessRow`).
         nullable: SQL_NULLABLE,
     })
 }
@@ -483,21 +491,27 @@ fn validate_temporal_scale(scale: u8) -> Result<(), String> {
     Ok(())
 }
 
+/// Converts a TDS wire length into the ODBC `ParameterSize`.
+///
+/// A PLP length (`0xFFFF`, or `-1` once widened) means `*(max)`, which msodbcsql
+/// reports as `SQL_PREC_UNLIMITED` (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`,
+/// `GetIPDRec`). `unicode` lengths are byte counts, so they halve into
+/// characters.
 fn parameter_length(length: i32, unicode: bool) -> Result<SqlULen, String> {
     if length == -1 || length == i32::from(u16::MAX) {
-        return Ok(0);
+        return Ok(SQL_PREC_UNLIMITED);
     }
     let length = SqlULen::try_from(length).map_err(|_| format!("invalid TDS length {length}"))?;
     Ok(if unicode { length / 2 } else { length })
 }
 
-#[repr(C)]
-struct SqlSsVectorLayout {
-    dimension: SqlSmallInt,
-    vector_type: i32,
-    data: *mut c_void,
-}
-
+/// Converts a vector's TDS payload length into the client buffer size ODBC
+/// reports: a [`SqlSsVectorLayout`] header plus one
+/// [`SQL_SS_VECTOR_ELEMENT_SIZE`] element per dimension.
+///
+/// The TDS element width follows the server-side base type (4 bytes for
+/// float32, 2 for float16) while the client always exchanges 4-byte floats, so
+/// the two widths are deliberately different.
 fn vector_user_size(length: i32, base_type: u8) -> Result<SqlULen, String> {
     const VECTOR_HEADER_SIZE: SqlULen = 8;
     let tds_element_size = match base_type {
@@ -510,7 +524,8 @@ fn vector_user_size(length: i32, base_type: u8) -> Result<SqlULen, String> {
     let payload = length
         .checked_sub(VECTOR_HEADER_SIZE)
         .ok_or_else(|| format!("invalid vector length {length}"))?;
-    Ok((payload / tds_element_size) * 4 + std::mem::size_of::<SqlSsVectorLayout>())
+    Ok((payload / tds_element_size) * SQL_SS_VECTOR_ELEMENT_SIZE
+        + std::mem::size_of::<SqlSsVectorLayout>())
 }
 
 fn read_i32(row: &[ColumnValues], index: usize, name: &str) -> Result<i32, String> {
@@ -525,6 +540,11 @@ fn read_i32(row: &[ColumnValues], index: usize, name: &str) -> Result<i32, Strin
     }
 }
 
+/// Reads a precision/scale column.
+///
+/// `sp_describe_undeclared_parameters` returns NULL for types that have no
+/// precision or scale. Only callers whose type always carries one read these,
+/// so a NULL there means "not applicable" and maps to the `0` ODBC reports.
 fn read_optional_u8(row: &[ColumnValues], index: usize, name: &str) -> Result<u8, String> {
     match row.get(index) {
         Some(ColumnValues::Null) => Ok(0),
@@ -534,12 +554,49 @@ fn read_optional_u8(row: &[ColumnValues], index: usize, name: &str) -> Result<u8
     }
 }
 
+/// Places parsed metadata rows into their ordinal slots.
+///
+/// `sp_describe_undeclared_parameters` is expected to return exactly one row per
+/// marker; a missing, duplicated, or out-of-range ordinal means the result set
+/// does not describe the statement that was prepared, which must fail rather
+/// than leave a parameter silently undescribed.
+struct DescriptionCollector {
+    slots: Vec<Option<ParameterDescription>>,
+}
+
+impl DescriptionCollector {
+    fn new(marker_count: usize) -> Self {
+        Self {
+            slots: vec![None; marker_count],
+        }
+    }
+
+    fn accept(&mut self, index: usize, description: ParameterDescription) -> Result<(), String> {
+        let Some(slot) = self.slots.get_mut(index) else {
+            return Err(format!("parameter ordinal {} is out of range", index + 1));
+        };
+        if slot.replace(description).is_some() {
+            return Err(format!("duplicate parameter ordinal {}", index + 1));
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<ParameterDescription>, String> {
+        self.slots
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.ok_or_else(|| format!("missing metadata for parameter {}", index + 1))
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::PreparedStatement;
-    use mssql_tds::datatypes::sql_string::SqlString;
 
     fn row(
         ordinal: i32,
@@ -703,7 +760,7 @@ mod tests {
                 row(1, TdsDataType::BigVarBinary, -1, 0, 0),
                 ParameterDescription {
                     data_type: SQL_VARBINARY,
-                    parameter_size: 0,
+                    parameter_size: SQL_PREC_UNLIMITED,
                     decimal_digits: 0,
                     nullable: SQL_NULLABLE,
                 },
@@ -722,10 +779,45 @@ mod tests {
         assert!(parse_parameter_row(&row(1, TdsDataType::TimeN, 5, 0, 8), 1, true).is_err());
     }
 
+    /// The metadata RPC must send the statement text as `nvarchar(max)`:
+    /// `sp_describe_undeclared_parameters`' `@tsql` argument is `nvarchar(max)`,
+    /// and a sized `nvarchar` would silently truncate a long statement.
     #[test]
     fn request_uses_nvarchar_max() {
-        let value =
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string("SELECT @P1".to_string())));
-        assert!(matches!(value, SqlType::NVarcharMax(Some(_))));
+        let sql = "SELECT @P1".to_string();
+        match metadata_request_value(sql.clone()) {
+            SqlType::NVarcharMax(Some(text)) => assert_eq!(text.to_utf8_string(), sql),
+            other => panic!("expected NVarcharMax(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collector_requires_one_row_per_marker() {
+        let description = describe_tds_type(TdsDataType::Int4, 4, 0, 0, true).unwrap();
+
+        let mut collector = DescriptionCollector::new(2);
+        collector.accept(0, description).unwrap();
+        assert_eq!(
+            collector.finish().unwrap_err(),
+            "missing metadata for parameter 2"
+        );
+
+        let mut collector = DescriptionCollector::new(2);
+        collector.accept(0, description).unwrap();
+        assert_eq!(
+            collector.accept(0, description).unwrap_err(),
+            "duplicate parameter ordinal 1"
+        );
+
+        let mut collector = DescriptionCollector::new(1);
+        assert_eq!(
+            collector.accept(5, description).unwrap_err(),
+            "parameter ordinal 6 is out of range"
+        );
+
+        let mut collector = DescriptionCollector::new(2);
+        collector.accept(1, description).unwrap();
+        collector.accept(0, description).unwrap();
+        assert_eq!(collector.finish().unwrap().len(), 2);
     }
 }

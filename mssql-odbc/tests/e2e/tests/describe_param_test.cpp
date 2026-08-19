@@ -38,13 +38,14 @@ protected:
         return SQLPrepare(stmt_, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
     }
 
-    ParamDescription Describe(SQLUSMALLINT ordinal) {
-        ParamDescription description;
-        SQLRETURN rc =
-            SQLDescribeParam(stmt_, ordinal, &description.data_type, &description.size,
-                             &description.scale, &description.nullable);
+    /// Describes a parameter, reporting failure to the caller so a failed
+    /// describe does not cascade into misleading assertions on a zeroed struct.
+    bool Describe(SQLUSMALLINT ordinal, ParamDescription& out) {
+        out = ParamDescription{};
+        SQLRETURN rc = SQLDescribeParam(stmt_, ordinal, &out.data_type, &out.size,
+                                        &out.scale, &out.nullable);
         EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
-        return description;
+        return SQL_SUCCEEDED(rc);
     }
 
     void BindDefaultNull(SQLUSMALLINT ordinal,
@@ -100,6 +101,9 @@ TEST_F(DescribeParamLiveTest, RejectsInvalidOrdinals) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07009");
 }
 
+// Benefits-from-mock-tds: a mock TDS server could assert that
+// sp_describe_undeclared_parameters fired once and carried the prepared
+// statement text, which the returned metadata alone cannot show.
 TEST_F(DescribeParamLiveTest, ReportsRepresentativeMetadata) {
     ASSERT_SQL_OK(
         Prepare("SELECT CAST(? AS INT), CAST(? AS NVARCHAR(40)), "
@@ -116,19 +120,24 @@ TEST_F(DescribeParamLiveTest, ReportsRepresentativeMetadata) {
     }};
 
     for (SQLUSMALLINT ordinal = 1; ordinal <= expected.size(); ++ordinal) {
-        ParamDescription actual = Describe(ordinal);
+        ParamDescription actual;
+        ASSERT_TRUE(Describe(ordinal, actual)) << "ordinal " << ordinal;
         const ParamDescription& wanted = expected[ordinal - 1];
-        EXPECT_EQ(wanted.data_type, actual.data_type);
-        EXPECT_EQ(wanted.size, actual.size);
-        EXPECT_EQ(wanted.scale, actual.scale);
-        EXPECT_EQ(wanted.nullable, actual.nullable);
+        EXPECT_EQ(wanted.data_type, actual.data_type) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.size, actual.size) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.scale, actual.scale) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.nullable, actual.nullable) << "ordinal " << ordinal;
     }
 }
 
+// Benefits-from-mock-tds: a mock TDS server could assert the typed NULL that
+// SQL_C_DEFAULT produces reaches the wire as INTN rather than inferring it from
+// the ISNULL result.
 TEST_F(DescribeParamLiveTest, ExecutesMssqlPythonDefaultNullPath) {
     ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, 42)"), SQL_HANDLE_STMT, stmt_);
 
-    ParamDescription description = Describe(1);
+    ParamDescription description;
+    ASSERT_TRUE(Describe(1, description));
     ASSERT_EQ(SQL_INTEGER, description.data_type);
 
     SQLLEN indicator = SQL_NULL_DATA;
@@ -140,12 +149,19 @@ TEST_F(DescribeParamLiveTest, ExecutesMssqlPythonDefaultNullPath) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// mssql-python describes every parameter before binding any of them, so the
+// second describe must be served from the cache the first one populated.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert only one
+// sp_describe_undeclared_parameters RPC fired for the two describes.
 TEST_F(DescribeParamLiveTest, DescribesAllNullsBeforeBinding) {
     ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, 7), CAST(? AS NVARCHAR(8))"),
                   SQL_HANDLE_STMT, stmt_);
 
-    ParamDescription first = Describe(1);
-    ParamDescription second = Describe(2);
+    ParamDescription first;
+    ParamDescription second;
+    ASSERT_TRUE(Describe(1, first));
+    ASSERT_TRUE(Describe(2, second));
     ASSERT_EQ(SQL_INTEGER, first.data_type);
     ASSERT_EQ(SQL_WVARCHAR, second.data_type);
 
@@ -163,12 +179,70 @@ TEST_F(DescribeParamLiveTest, DescribesAllNullsBeforeBinding) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// Re-preparing must drop the cached metadata; serving the previous statement's
+// description would silently bind the wrong type.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert a second
+// sp_describe_undeclared_parameters RPC fired after the re-prepare.
 TEST_F(DescribeParamLiveTest, ReprepareInvalidatesMetadata) {
     ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, 42)"), SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ(SQL_INTEGER, Describe(1).data_type);
+    ParamDescription first;
+    ASSERT_TRUE(Describe(1, first));
+    EXPECT_EQ(SQL_INTEGER, first.data_type);
 
-    ASSERT_SQL_OK(Prepare("SELECT COALESCE(?, N'fallback')"), SQL_HANDLE_STMT, stmt_);
-    ParamDescription description = Describe(1);
-    EXPECT_EQ(SQL_WVARCHAR, description.data_type);
-    EXPECT_EQ(8U, description.size);
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS NVARCHAR(8))"), SQL_HANDLE_STMT, stmt_);
+    ParamDescription second;
+    ASSERT_TRUE(Describe(1, second));
+    EXPECT_EQ(SQL_WVARCHAR, second.data_type);
+    EXPECT_EQ(8U, second.size);
+}
+
+// `*(max)` parameters have no bounded length; both drivers report
+// SQL_PREC_UNLIMITED, and a bind from that description must round-trip.
+TEST_F(DescribeParamLiveTest, DescribesMaxLengthParameters) {
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS NVARCHAR(MAX)), CAST(? AS VARBINARY(MAX))"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ParamDescription wide;
+    ParamDescription binary;
+    ASSERT_TRUE(Describe(1, wide));
+    ASSERT_TRUE(Describe(2, binary));
+    EXPECT_EQ(SQL_WVARCHAR, wide.data_type);
+    EXPECT_EQ(static_cast<SQLULEN>(2147483647), wide.size);
+    EXPECT_EQ(SQL_VARBINARY, binary.data_type);
+    EXPECT_EQ(static_cast<SQLULEN>(2147483647), binary.size);
+
+    SQLLEN wide_indicator = SQL_NULL_DATA;
+    SQLLEN binary_indicator = SQL_NULL_DATA;
+    BindDefaultNull(1, wide, wide_indicator);
+    BindDefaultNull(2, binary, binary_indicator);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLLEN result = 0;
+    GetColumn(1, &result);
+    EXPECT_EQ(SQL_NULL_DATA, result);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A described decimal must be re-declared with the same precision and scale, or
+// the first non-NULL value bound from that description would be truncated.
+TEST_F(DescribeParamLiveTest, DescribedDecimalRoundTripsPrecisionAndScale) {
+    ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, CAST(1.5 AS DECIMAL(12,3)))"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ParamDescription description;
+    ASSERT_TRUE(Describe(1, description));
+    EXPECT_EQ(SQL_DECIMAL, description.data_type);
+    EXPECT_EQ(12U, description.size);
+    EXPECT_EQ(3, description.scale);
+
+    SQLLEN indicator = SQL_NULL_DATA;
+    BindDefaultNull(1, description, indicator);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    // Compared numerically: a declaration of decimal(1,0) would round 1.5 away,
+    // but the textual form of a decimal is not part of the parity contract.
+    EXPECT_DOUBLE_EQ(1.5, std::stod(GetColumn(1)));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
