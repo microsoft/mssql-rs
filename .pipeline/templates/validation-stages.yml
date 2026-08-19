@@ -383,7 +383,7 @@ stages:
             -S localhost -U SA -P "$SQL_PASSWORD" \
             -C -b -Q "SELECT 1"
           nc -zv localhost 1433
-        displayName: 'Temporary: verify macOS SQL Server before tests'
+        displayName: 'Verify macOS SQL Server before tests'
         env:
           SQL_PASSWORD: $(SQL_PASSWORD)
       - template: build-template.yml
@@ -405,7 +405,7 @@ stages:
           docker logs --tail 500 sqlserver
           echo "=== Host port 1433 ==="
           lsof -nP -iTCP:1433 -sTCP:LISTEN
-        displayName: 'Temporary: diagnose macOS SQL Server failure'
+        displayName: 'Diagnose macOS SQL Server failure'
         condition: failed()
 
 # Kerberos tests for PRs (fast - 2 distros: ubuntu22 + alpine318)
