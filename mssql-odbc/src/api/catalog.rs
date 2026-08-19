@@ -206,6 +206,24 @@ fn qualification_catalog(catalog: &Arg, name: &Arg, owner: &Arg) -> Arg {
     }
 }
 
+/// The value to send as the `table_qualifier`/`proc_qualifier` RPC parameter.
+/// SQL Server rejects a non-NULL qualifier that doesn't match the *current*
+/// database with error 15250 ("The database name component of the object
+/// qualifier must be the name of the current database"); NULL and the exact
+/// literal `%` (the enumeration sentinel, which the stored procedures special-
+/// case) both bypass that check. `run_catalog`'s retry always dispatches
+/// unqualified against the current database, so `unmatchable` (`true` only on
+/// that retry) must null out any real catalog value here — otherwise a
+/// nonexistent-catalog call would itself fail with 15250 instead of the empty
+/// result set the retry exists to produce.
+fn qualifier_value(catalog: &Arg, unmatchable: bool) -> Option<&str> {
+    if unmatchable {
+        None
+    } else {
+        catalog.as_deref()
+    }
+}
+
 /// Whether the application declared ODBC 2.x (`SQLSetEnvAttr(SQL_ATTR_ODBC_VERSION,
 /// SQL_OV_ODBC2)`), read from the parent ENV. Selects `@ODBCVer` / `@fUsePattern`
 /// inclusion exactly as `get_type_info::sql_get_type_info_w_safe` does for
@@ -448,11 +466,12 @@ fn sql_tables_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            // The real catalog value, not just a qualification aid: msodbcsql
+            // The real catalog value (or NULL on the unqualified retry — see
+            // `qualifier_value`), not just a qualification aid: msodbcsql
             // sends it too (`sqlcdd.cpp` lines 1745-1757), and `sp_tables`
             // needs the literal `%` to recognize the catalog-enumeration
             // idiom (see `is_catalog_enumeration_sentinel`).
-            nvarchar(catalog.as_deref(), SYSNAME_LEN),
+            nvarchar(qualifier_value(&catalog, unmatchable), SYSNAME_LEN),
             nvarchar(table_type.as_deref(), TABLE_TYPE_LEN),
         ];
         // `@fUsePattern` is Yukon+ only, sent for every 2.x/3.x app since this
@@ -575,7 +594,7 @@ fn sql_columns_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(catalog.as_deref(), SYSNAME_LEN),
+            nvarchar(qualifier_value(&catalog, unmatchable), SYSNAME_LEN),
             nvarchar(column.as_deref(), SYSNAME_LEN),
         ];
         // `@ODBCVer` / `@fUsePattern` are both sent only for 3.x apps
@@ -692,7 +711,7 @@ fn sql_primary_keys_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(catalog.as_deref(), SYSNAME_LEN),
+            nvarchar(qualifier_value(&catalog, unmatchable), SYSNAME_LEN),
         ];
         (positional, None)
     };
@@ -849,10 +868,19 @@ fn sql_foreign_keys_w_safe(
         let positional = vec![
             nvarchar(pk_table_name.as_deref(), SYSNAME_LEN),
             nvarchar(pk_schema.as_deref(), SYSNAME_LEN),
-            nvarchar(pk_catalog.as_deref(), SYSNAME_LEN),
+            nvarchar(qualifier_value(&pk_catalog, unmatchable), SYSNAME_LEN),
             nvarchar(fk_table.as_deref(), SYSNAME_LEN),
             nvarchar(fk_schema.as_deref(), SYSNAME_LEN),
-            nvarchar(fk_catalog.as_deref(), SYSNAME_LEN),
+            // `fk_catalog` is also nulled when the two sides conflict: the
+            // call qualifies into `pk_catalog`'s context (see `catalog`
+            // above), and a `fk_catalog` that disagrees with the *current*
+            // database would itself raise SQL Server error 15250 rather than
+            // the empty result `catalogs_conflict` (via the unmatchable PK
+            // table name) already forces.
+            nvarchar(
+                qualifier_value(&fk_catalog, unmatchable || catalogs_conflict),
+                SYSNAME_LEN,
+            ),
         ];
         (positional, None)
     };
@@ -991,7 +1019,7 @@ fn sql_statistics_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(catalog.as_deref(), SYSNAME_LEN),
+            nvarchar(qualifier_value(&catalog, unmatchable), SYSNAME_LEN),
             // `SQLStatistics` has no per-index argument at the ODBC API level;
             // msodbcsql always passes '%' here since `sp_statistics_100` filters
             // `index_name LIKE @index_name`, which matches nothing on NULL
@@ -1162,7 +1190,7 @@ fn sql_special_columns_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(catalog.as_deref(), SYSNAME_LEN),
+            nvarchar(qualifier_value(&catalog, unmatchable), SYSNAME_LEN),
             nvarchar(Some(col_type), 1),
             nvarchar(Some(scope_char), 1),
             nvarchar(Some(nullable_char), 1),
@@ -1275,7 +1303,7 @@ fn sql_procedures_w_safe(
         let positional = vec![
             nvarchar(proc_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(catalog.as_deref(), SYSNAME_LEN),
+            nvarchar(qualifier_value(&catalog, unmatchable), SYSNAME_LEN),
         ];
         // `SQLProcedures` supports pattern arguments Yukon+
         // (`g_fYukonPatternAsParamArr[fSQLPROCEDURES] == TRUE`, `sqlcdd.cpp`
@@ -1385,6 +1413,27 @@ mod tests {
             qualification_catalog(&percent, &Some("t".to_string()), &None),
             Some("%".to_string())
         );
+    }
+
+    #[test]
+    fn qualifier_value_is_real_catalog_on_first_attempt() {
+        let real = Some("MyDb".to_string());
+        assert_eq!(qualifier_value(&real, false), Some("MyDb"));
+        assert_eq!(qualifier_value(&None, false), None);
+        // The literal enumeration sentinel is echoed too — it is what tells
+        // the stored procedure to enumerate catalogs.
+        let percent = Some("%".to_string());
+        assert_eq!(qualifier_value(&percent, false), Some("%"));
+    }
+
+    #[test]
+    fn qualifier_value_is_null_on_the_unqualified_retry() {
+        // `run_catalog`'s retry always dispatches unqualified against the
+        // current database: echoing a real (non-matching) catalog value here
+        // would itself raise SQL Server error 15250, defeating the retry.
+        let real = Some("MyDb".to_string());
+        assert_eq!(qualifier_value(&real, true), None);
+        assert_eq!(qualifier_value(&None, true), None);
     }
 
     #[test]
