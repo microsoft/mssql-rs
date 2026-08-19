@@ -335,8 +335,8 @@ fn parse_parameter_row(
 fn describe_tds_type(
     data_type: TdsDataType,
     length: i32,
-    precision: u8,
-    scale: u8,
+    precision: Option<u8>,
+    scale: Option<u8>,
     is_odbc3: bool,
 ) -> Result<ParameterDescription, String> {
     let (data_type, parameter_size, decimal_digits) = match data_type {
@@ -360,7 +360,7 @@ fn describe_tds_type(
             _ => return Err(format!("invalid FLTN length {length}")),
         },
         TdsDataType::Decimal | TdsDataType::DecimalN => {
-            validate_precision_scale(precision, scale)?;
+            let (precision, scale) = required_precision_scale(precision, scale)?;
             (
                 SQL_DECIMAL,
                 SqlULen::from(precision),
@@ -368,7 +368,7 @@ fn describe_tds_type(
             )
         }
         TdsDataType::Numeric | TdsDataType::NumericN => {
-            validate_precision_scale(precision, scale)?;
+            let (precision, scale) = required_precision_scale(precision, scale)?;
             (
                 SQL_NUMERIC,
                 SqlULen::from(precision),
@@ -382,7 +382,7 @@ fn describe_tds_type(
         }
         TdsDataType::DateN => (SQL_TYPE_DATE, 10, 0),
         TdsDataType::TimeN => {
-            validate_temporal_scale(scale)?;
+            let scale = required_temporal_scale(scale)?;
             let size = if scale == 0 {
                 8
             } else {
@@ -403,7 +403,7 @@ fn describe_tds_type(
             _ => return Err(format!("invalid DATETIMN length {length}")),
         },
         TdsDataType::DateTime2N => {
-            validate_temporal_scale(scale)?;
+            let scale = required_temporal_scale(scale)?;
             let size = if scale == 0 {
                 19
             } else {
@@ -412,7 +412,7 @@ fn describe_tds_type(
             (SQL_TYPE_TIMESTAMP, size, SqlSmallInt::from(scale))
         }
         TdsDataType::DateTimeOffsetN => {
-            validate_temporal_scale(scale)?;
+            let scale = required_temporal_scale(scale)?;
             let size = if scale == 0 {
                 26
             } else {
@@ -446,11 +446,14 @@ fn describe_tds_type(
         // msodbcsql has no dedicated `json` ODBC type, so `json` surfaces as an
         // unbounded wide character type, matching how the value is exchanged.
         TdsDataType::Json => (SQL_WLONGVARCHAR, SQL_PREC_UNLIMITED, 0),
-        TdsDataType::Vector => (
-            SQL_SS_VECTOR,
-            vector_user_size(length, scale)?,
-            SqlSmallInt::from(scale),
-        ),
+        TdsDataType::Vector => {
+            let base_type = scale.ok_or("suggested_scale is NULL for a vector")?;
+            (
+                SQL_SS_VECTOR,
+                vector_user_size(length, base_type)?,
+                SqlSmallInt::from(base_type),
+            )
+        }
         TdsDataType::Void | TdsDataType::None => {
             return Err(format!("unsupported inferred TDS type {data_type:?}"));
         }
@@ -477,18 +480,26 @@ fn float_precision(data_type: SqlSmallInt, is_odbc3: bool) -> SqlULen {
     }
 }
 
-fn validate_precision_scale(precision: u8, scale: u8) -> Result<(), String> {
+/// A decimal always carries a precision and scale; a NULL in either column means
+/// the row does not describe the type it claims to, which must not silently
+/// become `decimal(0,0)`.
+fn required_precision_scale(precision: Option<u8>, scale: Option<u8>) -> Result<(u8, u8), String> {
+    let precision = precision.ok_or("suggested_precision is NULL for a decimal")?;
+    let scale = scale.ok_or("suggested_scale is NULL for a decimal")?;
     if !(1..=38).contains(&precision) || scale > precision {
         return Err(format!("invalid precision/scale {precision},{scale}"));
     }
-    Ok(())
+    Ok((precision, scale))
 }
 
-fn validate_temporal_scale(scale: u8) -> Result<(), String> {
+/// Likewise, a scale-bearing temporal type without a scale would silently
+/// report `time(0)`/`datetime2(0)` and the wrong parameter size.
+fn required_temporal_scale(scale: Option<u8>) -> Result<u8, String> {
+    let scale = scale.ok_or("suggested_scale is NULL for a temporal type")?;
     if scale > 7 {
         return Err(format!("invalid temporal scale {scale}"));
     }
-    Ok(())
+    Ok(scale)
 }
 
 /// Converts a TDS wire length into the ODBC `ParameterSize`.
@@ -543,14 +554,15 @@ fn read_i32(row: &[ColumnValues], index: usize, name: &str) -> Result<i32, Strin
 /// Reads a precision/scale column.
 ///
 /// `sp_describe_undeclared_parameters` returns NULL for types that have no
-/// precision or scale. Only callers whose type always carries one read these,
-/// so a NULL there means "not applicable" and maps to the `0` ODBC reports.
-fn read_optional_u8(row: &[ColumnValues], index: usize, name: &str) -> Result<u8, String> {
+/// precision or scale, so the NULL is preserved rather than flattened to `0`:
+/// the arms that genuinely need one reject a missing value instead of
+/// reporting a plausible-looking `decimal(0,0)` or `time(0)`.
+fn read_optional_u8(row: &[ColumnValues], index: usize, name: &str) -> Result<Option<u8>, String> {
     match row.get(index) {
-        Some(ColumnValues::Null) => Ok(0),
-        _ => {
-            u8::try_from(read_i32(row, index, name)?).map_err(|_| format!("{name} is out of range"))
-        }
+        Some(ColumnValues::Null) => Ok(None),
+        _ => u8::try_from(read_i32(row, index, name)?)
+            .map(Some)
+            .map_err(|_| format!("{name} is out of range")),
     }
 }
 
@@ -779,6 +791,22 @@ mod tests {
         assert!(parse_parameter_row(&row(1, TdsDataType::TimeN, 5, 0, 8), 1, true).is_err());
     }
 
+    /// A scale-bearing type whose scale column is NULL describes something other
+    /// than what its type id claims; reporting `time(0)` would hide that.
+    #[test]
+    fn rejects_missing_scale_for_scale_bearing_types() {
+        let mut time_row = row(1, TdsDataType::TimeN, 5, 0, 3);
+        time_row[SUGGESTED_SCALE] = ColumnValues::Null;
+        assert!(parse_parameter_row(&time_row, 1, true).is_err());
+
+        let mut decimal_row = row(1, TdsDataType::DecimalN, 17, 12, 3);
+        decimal_row[SUGGESTED_PRECISION] = ColumnValues::Null;
+        assert!(parse_parameter_row(&decimal_row, 1, true).is_err());
+
+        // A type with no scale is unaffected by the NULL its row already carries.
+        assert!(parse_parameter_row(&row(1, TdsDataType::Int4, 4, 0, 0), 1, true).is_ok());
+    }
+
     /// The metadata RPC must send the statement text as `nvarchar(max)`:
     /// `sp_describe_undeclared_parameters`' `@tsql` argument is `nvarchar(max)`,
     /// and a sized `nvarchar` would silently truncate a long statement.
@@ -793,7 +821,7 @@ mod tests {
 
     #[test]
     fn collector_requires_one_row_per_marker() {
-        let description = describe_tds_type(TdsDataType::Int4, 4, 0, 0, true).unwrap();
+        let description = describe_tds_type(TdsDataType::Int4, 4, None, None, true).unwrap();
 
         let mut collector = DescriptionCollector::new(2);
         collector.accept(0, description).unwrap();
