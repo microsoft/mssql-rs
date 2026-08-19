@@ -214,9 +214,6 @@ impl StmtState {
     /// Binds, or rebinds, one column. A column can only be bound once, so an
     /// existing entry for the same column is replaced in place rather than
     /// shadowed.
-    //
-    // Written by SQLBindCol (AB#47359); the fetch path only reads `bindings`.
-    #[allow(dead_code)]
     pub(crate) fn set_binding(&mut self, binding: ColumnBinding) {
         match self
             .bindings
@@ -230,13 +227,11 @@ impl StmtState {
 
     /// Removes one column's binding, which is what `SQLBindCol` does when the
     /// application passes a null `TargetValuePtr`.
-    #[allow(dead_code)]
     pub(crate) fn clear_binding(&mut self, column_number: SqlUSmallInt) {
         self.bindings.retain(|b| b.column_number != column_number);
     }
 
     /// Drops every column binding — `SQLFreeStmt(SQL_UNBIND)`.
-    #[allow(dead_code)]
     pub(crate) fn clear_bindings(&mut self) {
         self.bindings.clear();
     }

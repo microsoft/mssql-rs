@@ -15,6 +15,8 @@
 //   6. FillsTheRowStatusArray              - SQL_ROW_SUCCESS / SQL_ROW_NOROW
 //   7. ReturnsNoDataAtEndOfResultSet
 //   8. PartialRowsetAtEndOfResultSet       - fewer rows than the array size
+//   9-15. Bound-column fetch: rowset fill, several columns, NULL indicators,
+//         truncation, unbind, rebind, and mixed SQLGetData afterwards
 
 #include "odbc_test_fixture.h"
 
@@ -147,5 +149,205 @@ TEST_F(FetchScrollLiveTest, PartialRowsetAtEndOfResultSet) {
 TEST_F(FetchScrollLiveTest, ReturnsNoDataAtEndOfResultSet) {
     ExecDirect("SELECT 1 AS n WHERE 1 = 0");
     EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    SQLCloseCursor(stmt_);
+}
+
+// ---------------------------------------------------------------------------
+// Bound-column fetch. These are the cases that exercise the rowset fill loop;
+// until SQLBindCol existed there was no way to reach it from here.
+// ---------------------------------------------------------------------------
+
+// One bound int column over a rowset wider than one row: each row must land at
+// its own offset in the array, with its own indicator.
+TEST_F(FetchScrollLiveTest, BindsAnIntegerColumnAcrossARowset) {
+    ExecThreeRows();
+    SQLINTEGER values[4] = {-1, -1, -1, -1};
+    SQLLEN indicators[4] = {-99, -99, -99, -99};
+    SQLULEN rowsFetched = 0;
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(4), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, values, sizeof(SQLINTEGER), indicators),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3u, rowsFetched);
+    EXPECT_EQ(1, values[0]);
+    EXPECT_EQ(2, values[1]);
+    EXPECT_EQ(3, values[2]);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), indicators[i]) << "row " << i;
+    }
+    SQLCloseCursor(stmt_);
+}
+
+// Two columns of different shapes bound at once, to prove the fill loop walks
+// the binding table rather than assuming a single column.
+TEST_F(FetchScrollLiveTest, BindsSeveralColumnsOfDifferentTypes) {
+    ExecDirect(
+        "SELECT 10 AS n, CAST('alpha' AS VARCHAR(20)) AS s"
+        " UNION ALL SELECT 20, 'beta' ORDER BY n");
+    SQLINTEGER nums[2] = {-1, -1};
+    SQLCHAR text[2][32] = {};
+    SQLLEN numInd[2] = {-99, -99};
+    SQLLEN textInd[2] = {-99, -99};
+    SQLULEN rowsFetched = 0;
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    // Bound out of order on purpose: the fill loop has to visit them ascending.
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_CHAR, text, sizeof(text[0]), textInd),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, nums, sizeof(SQLINTEGER), numInd),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2u, rowsFetched);
+    EXPECT_EQ(10, nums[0]);
+    EXPECT_EQ(20, nums[1]);
+    EXPECT_STREQ("alpha", reinterpret_cast<const char*>(text[0]));
+    EXPECT_STREQ("beta", reinterpret_cast<const char*>(text[1]));
+    EXPECT_EQ(5, textInd[0]);
+    EXPECT_EQ(4, textInd[1]);
+    SQLCloseCursor(stmt_);
+}
+
+// NULL is reported through the indicator, and must not disturb the data slot of
+// a fixed-width target.
+TEST_F(FetchScrollLiveTest, BoundNullIsReportedThroughTheIndicator) {
+    // Ordered explicitly so the NULL's position is not left to the plan.
+    ExecDirect(
+        "SELECT n FROM (VALUES (1, 1), (2, NULL), (3, 3)) AS t(ord, n) ORDER BY ord");
+    SQLINTEGER values[3] = {7, 7, 7};
+    SQLLEN indicators[3] = {-99, -99, -99};
+    SQLULEN rowsFetched = 0;
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, values, sizeof(SQLINTEGER), indicators),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3u, rowsFetched);
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), indicators[0]);
+    EXPECT_EQ(SQL_NULL_DATA, indicators[1]);
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), indicators[2]);
+    EXPECT_EQ(1, values[0]);
+    EXPECT_EQ(7, values[1]) << "a NULL must not disturb its data slot";
+    EXPECT_EQ(3, values[2]);
+    SQLCloseCursor(stmt_);
+}
+
+// A bound column gets one shot at a fixed buffer, so an over-long value is
+// truncated with 01004 and the indicator reports the untruncated length.
+TEST_F(FetchScrollLiveTest, BoundCharacterDataTruncatesWithInfo) {
+    ExecDirect("SELECT CAST('abcdefghij' AS VARCHAR(20)) AS s");
+    SQLCHAR text[5] = {};
+    SQLLEN indicator = -99;
+    SQLULEN rowsFetched = 0;
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, text, sizeof(text), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLRETURN rc = SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(1u, rowsFetched);
+    EXPECT_STREQ("abcd", reinterpret_cast<const char*>(text));
+    EXPECT_EQ(10, indicator) << "the indicator reports the untruncated length";
+    SQLCloseCursor(stmt_);
+}
+
+// SQLFreeStmt(SQL_UNBIND) drops every binding; mssql-python calls it before
+// each fetch, so a fetch afterwards must deliver nothing.
+TEST_F(FetchScrollLiveTest, UnbindStopsDelivery) {
+    ExecThreeRows();
+    SQLINTEGER value = -1;
+    SQLLEN indicator = -99;
+    SQLULEN rowsFetched = 0;
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, value);
+
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+    value = -1;
+    indicator = -99;
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1u, rowsFetched) << "the row is still fetched, just not delivered";
+    EXPECT_EQ(-1, value) << "an unbound column must not be written";
+    EXPECT_EQ(-99, indicator);
+    SQLCloseCursor(stmt_);
+}
+
+// Rebinding a column replaces its entry rather than adding a second one, so the
+// value lands in the new buffer only.
+TEST_F(FetchScrollLiveTest, RebindingAColumnReplacesTheBinding) {
+    ExecThreeRows();
+    SQLINTEGER first = -1;
+    SQLINTEGER second = -1;
+    SQLLEN indicator = -99;
+
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &first, sizeof(first), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &second, sizeof(second), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-1, first) << "the replaced binding must not be written";
+    EXPECT_EQ(1, second);
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), indicator);
+    SQLCloseCursor(stmt_);
+}
+
+// Unbinding one column leaves the others delivering.
+TEST_F(FetchScrollLiveTest, UnbindingOneColumnLeavesTheOthers) {
+    ExecDirect("SELECT 10 AS a, 20 AS b");
+    SQLINTEGER a = -1;
+    SQLINTEGER b = -1;
+
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &a, sizeof(a), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, &b, sizeof(b), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    // Both null unbinds column 1.
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, nullptr, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-1, a) << "column 1 was unbound";
+    EXPECT_EQ(20, b);
+    SQLCloseCursor(stmt_);
+}
+
+// A bound fetch of a single row leaves the cursor positioned, so SQLGetData can
+// still read a column the fill loop did not take.
+TEST_F(FetchScrollLiveTest, GetDataStillWorksAfterASingleRowBoundFetch) {
+    ExecDirect("SELECT 10 AS a, 20 AS b");
+    SQLINTEGER a = -1;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &a, sizeof(a), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(10, a);
+
+    SQLINTEGER b = -1;
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_SLONG, &b, sizeof(b), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(20, b);
     SQLCloseCursor(stmt_);
 }
