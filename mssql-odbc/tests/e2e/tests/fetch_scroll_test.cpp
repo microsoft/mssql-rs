@@ -392,3 +392,91 @@ TEST_F(FetchScrollLiveTest, SQLFetchHonoursTheRowsetSize) {
     EXPECT_EQ(3, values[2]);
     SQLCloseCursor(stmt_);
 }
+
+// A bound LOB column cannot be delivered into a fixed buffer yet (AB#47361),
+// but its bytes still have to leave the wire. Abandoning the PLP stream mid
+// value left the row cursor inside the LOB, so the *next* column parsed payload
+// bytes as a length prefix -- which segfaulted the driver rather than failing
+// cleanly. The second bound column is the part that matters here.
+TEST_F(FetchScrollLiveTest, ABoundLobColumnDoesNotDesyncTheRow) {
+    ExecDirect(
+        "SELECT REPLICATE(CAST('x' AS NVARCHAR(MAX)), 10000) AS lob, 4242 AS n");
+
+    SQLWCHAR lob[64] = {0};
+    SQLLEN lobInd = 0;
+    SQLINTEGER n = -1;
+    SQLLEN nInd = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_WCHAR, lob, sizeof(lob), &lobInd),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, &n, sizeof(n), &nInd),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // The two drivers legitimately differ on the LOB itself: msodbcsql truncates
+    // it into the buffer, we report the row as unsupported for now. Neither is
+    // allowed to crash or to desynchronise the row, which is what this asserts.
+    SQLRETURN rc = SQLFetch(stmt_);
+    EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR)
+        << "unexpected rc " << rc;
+
+    // The row stream has to be intact afterwards: a clean single-row result set
+    // ends here rather than returning garbage or faulting.
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    SQLCloseCursor(stmt_);
+}
+
+// The same hazard through the block path, and with the LOB last so the drain
+// has to happen even when no bound column follows it.
+TEST_F(FetchScrollLiveTest, ABoundLobIsDrainedAcrossARowset) {
+    ExecDirect(
+        "SELECT n, REPLICATE(CAST('y' AS NVARCHAR(MAX)), 5000) AS lob "
+        "FROM (VALUES (1),(2),(3)) AS t(n) ORDER BY n");
+
+    SQLINTEGER ns[3] = {-1, -1, -1};
+    SQLWCHAR lobs[3][32] = {};
+    SQLLEN nInd[3] = {0, 0, 0};
+    SQLLEN lobInd[3] = {0, 0, 0};
+    SQLULEN rowsFetched = 0;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, ns, sizeof(SQLINTEGER), nInd),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_WCHAR, lobs, sizeof(lobs[0]), lobInd),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLRETURN rc = SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0);
+    EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR)
+        << "unexpected rc " << rc;
+    // Every row has to have been walked past, whatever happened to the LOBs.
+    EXPECT_EQ(3u, rowsFetched);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    SQLCloseCursor(stmt_);
+}
+
+// Mixed access after a *block* fetch. ODBC expects SQLSetPos to nominate a row
+// first, which is not implemented, so the cursor is deliberately left
+// unpositioned. The contract that matters is that SQLGetData then fails
+// cleanly: an unpositioned cursor must not be read as though a row were there.
+TEST_F(FetchScrollLiveTest, GetDataAfterABlockFetchFailsCleanly) {
+    ExecThreeRows();
+    SQLINTEGER values[3] = {-1, -1, -1};
+    SQLULEN rowsFetched = 0;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, values, sizeof(SQLINTEGER), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(3u, rowsFetched);
+
+    // Must return an error rather than crashing or inventing a value.
+    SQLINTEGER scratch = -1;
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_SLONG, &scratch, sizeof(scratch), &ind);
+    EXPECT_EQ(SQL_ERROR, rc);
+    SQLCloseCursor(stmt_);
+}

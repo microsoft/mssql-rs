@@ -346,6 +346,8 @@ fn fill_rowset(
                 // A bound long/LOB column would have to be drained into the
                 // fixed buffer here; that path is owned by SQLGetData today, so
                 // report the row rather than deliver a wrong value (AB#47361).
+                // Abandoning the stream is safe: the next `read_row_column`
+                // finishes off a paused PLP value before it decodes anything.
                 Ok(CursorColumn::PlpStreaming { .. }) => RowOutcome::Error(RowIssue::Unsupported),
                 // Reading ascending and once per column, neither of these is
                 // reachable; treat them as a row error rather than assuming.
