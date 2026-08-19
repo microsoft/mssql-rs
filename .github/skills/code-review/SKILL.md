@@ -64,8 +64,8 @@ Check these in addition to the general areas above.
 - **Errors**: `thiserror` derives and `TdsResult<T>`; no `unwrap`/`expect`/`panic!`
   on paths reachable from user input or network data.
 - **Async**: no blocking work on the Tokio runtime; cancellation flows through
-  `CancelHandle`; boxed non-primitive fields in long-lived client-context structs to
-  keep async state small.
+  `CancelHandle`; box new non-primitive fields in long-lived client-context structs
+  when doing so keeps async state smaller.
 - **Visibility**: new items are `pub(crate)` unless a public surface is intended.
 - **Naming**: `Tds` prefix on core public types.
 - **Unsafe code**: any new `unsafe` block — especially in `mssql-odbc` FFI — has a
