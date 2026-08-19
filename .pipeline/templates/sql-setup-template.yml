@@ -269,53 +269,29 @@ steps:
   - script: |
       set -euo pipefail
       docker pull mcr.microsoft.com/mssql/server:2025-latest
+      docker run \
+        --name sqlserver \
+        -e ACCEPT_EULA=Y \
+        -e "MSSQL_SA_PASSWORD=$SQL_PASSWORD" \
+        -p 1433:1433 \
+        -d mcr.microsoft.com/mssql/server:2025-latest
 
-      # The readiness loop below can only wait - it cannot recover a container
-      # that died on startup, which SQL Server occasionally does under Colima
-      # (fatal error plus a core dump, container exits 1). Restart it a bounded
-      # number of times so a startup crash does not fail the whole run; a server
-      # that never comes up still fails the step with full diagnostics.
-      max_starts=3
-      for start in $(seq 1 $max_starts); do
-        docker rm -f sqlserver >/dev/null 2>&1 || true
-        docker run \
-          --name sqlserver \
-          -e ACCEPT_EULA=Y \
-          -e "MSSQL_SA_PASSWORD=$SQL_PASSWORD" \
-          -p 1433:1433 \
-          -d mcr.microsoft.com/mssql/server:2025-latest
-
-        echo "Waiting for SQL Server to start (start $start/$max_starts)..."
-        ready=false
-        for i in $(seq 1 30); do
-          if docker exec sqlserver \
-            /opt/mssql-tools18/bin/sqlcmd \
-            -S localhost -U SA -P "$SQL_PASSWORD" \
-            -C -b -Q "SELECT 1" 2>/dev/null; then
-            ready=true
-            break
-          fi
-          # A container that has already exited will never become ready.
-          if [ "$(docker inspect sqlserver --format '{{.State.Status}}')" != running ]; then
-            echo "  container exited before becoming ready"
-            break
-          fi
-          echo "  attempt $i/30..."
-          sleep 2
-        done
-
-        if [ "$ready" = true ]; then
+      echo "Waiting for SQL Server to start..."
+      ready=false
+      for i in $(seq 1 30); do
+        if docker exec sqlserver \
+          /opt/mssql-tools18/bin/sqlcmd \
+          -S localhost -U SA -P "$SQL_PASSWORD" \
+          -C -b -Q "SELECT 1" 2>/dev/null; then
+          ready=true
           break
         fi
-
-        echo "##[warning]SQL Server failed readiness checks (start $start/$max_starts)"
-        docker inspect sqlserver --format \
-          'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}' || true
-        docker logs --tail 200 sqlserver || true
+        echo "  attempt $i/30..."
+        sleep 2
       done
 
       if [ "$ready" != true ]; then
-        echo "SQL Server failed readiness checks after $max_starts starts"
+        echo "SQL Server failed readiness checks"
         set +e
         docker ps -a
         docker inspect sqlserver --format \
