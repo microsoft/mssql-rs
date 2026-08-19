@@ -13,7 +13,6 @@
 
 use tracing::{debug, error};
 
-use crate::api::fetch_convert::{is_float_c_target, is_integer_c_target};
 use crate::api::odbc_types::{
     SQL_C_BINARY, SQL_C_CHAR, SQL_C_GUID, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
     SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR, SQL_ERROR,
@@ -21,11 +20,12 @@ use crate::api::odbc_types::{
     SqlUSmallInt,
 };
 use crate::api::sqlstate::{
-    ERR_INVALID_C_DATA_TYPE, ERR_INVALID_DESCRIPTOR_INDEX, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
-    post_diag,
+    ERR_FUNCTION_SEQUENCE, ERR_INVALID_C_DATA_TYPE, ERR_INVALID_DESCRIPTOR_INDEX,
+    ERR_INVALID_STRING_OR_BUFFER_LENGTH, post_diag,
 };
+use crate::conversion::fetch_convert::{is_float_c_target, is_integer_c_target};
 use crate::error::free_errors;
-use crate::handles::stmt::ColumnBinding;
+use crate::handles::stmt::{ColumnBinding, STMT_STATE_FETCH_IN_PROGRESS};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Implements SQLBindCol.
@@ -77,6 +77,14 @@ unsafe fn sql_bind_col_impl(
         return SQL_ERROR;
     };
     free_errors(&mut stmt_state);
+
+    // A fetch in flight is writing through the buffers it snapshotted, so
+    // replacing them now could free one mid-write.
+    if stmt_state.has_state(STMT_STATE_FETCH_IN_PROGRESS) {
+        error!("SQLBindCol: a fetch is in progress on this statement");
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+        return SQL_ERROR;
+    }
 
     // Column 0 is the bookmark column. Bookmarks need SQL_ATTR_USE_BOOKMARKS,
     // which a forward-only cursor does not offer, so the ordinal is simply out
@@ -161,6 +169,11 @@ pub(crate) unsafe fn sql_free_stmt_unbind(statement_handle: SqlHandle) -> SqlRet
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        if stmt_state.has_state(STMT_STATE_FETCH_IN_PROGRESS) {
+            error!("SQLFreeStmt(SQL_UNBIND): a fetch is in progress on this statement");
+            post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        }
         stmt_state.clear_bindings();
         debug!("SQLFreeStmt(SQL_UNBIND): all column bindings released");
         SQL_SUCCESS
@@ -173,6 +186,7 @@ mod tests {
 
     use super::*;
     use crate::api::odbc_types::{SQL_C_DEFAULT, SQL_C_SLONG};
+    use crate::handles::stmt::STMT_STATE_FETCH_IN_PROGRESS;
     use crate::test_support::TestHandles;
 
     fn bindings_len(h: &TestHandles) -> usize {
@@ -369,6 +383,35 @@ mod tests {
         assert_eq!(bindings_len(&h), 0);
         // Unbinding again is a no-op rather than an error.
         assert_eq!(unsafe { sql_free_stmt_unbind(h.stmt) }, SQL_SUCCESS);
+    }
+
+    /// A fetch writes through the buffers it snapshotted after releasing the
+    /// statement lock, so rebinding mid-fetch could free one under it. Both
+    /// mutating entry points refuse rather than race.
+    #[test]
+    fn binding_is_refused_while_a_fetch_is_in_progress() {
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.set_state(STMT_STATE_FETCH_IN_PROGRESS);
+        }
+        let mut buf = [0i32; 1];
+        let rc = unsafe {
+            sql_bind_col(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                buf.as_mut_ptr() as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_ERROR);
+        assert_eq!(last_state(&h), *b"HY010");
+
+        assert_eq!(unsafe { sql_free_stmt_unbind(h.stmt) }, SQL_ERROR);
+        assert_eq!(last_state(&h), *b"HY010");
     }
 
     #[test]

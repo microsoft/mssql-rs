@@ -24,7 +24,6 @@ use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::error::Error as TdsError;
 
 use super::sqlstate::*;
-use crate::conversion::fetch_convert::{ConvError, ConvOk};
 use crate::api::get_data::{TextError, column_value_to_text, convert_typed_c, is_typed_c_target};
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID,
@@ -36,8 +35,11 @@ use crate::api::odbc_types::{
     SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
+use crate::conversion::error::{ConvError, ConvOk};
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::stmt::{ColumnBinding, STMT_STATE_CURSOR_OPEN, StmtState};
+use crate::handles::stmt::{
+    ColumnBinding, STMT_STATE_CURSOR_OPEN, STMT_STATE_FETCH_IN_PROGRESS, StmtState,
+};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Implements SQLFetchScroll for the current forward-only result set.
@@ -58,7 +60,7 @@ pub(crate) unsafe fn sql_fetch_scroll(
     })
 }
 
-unsafe fn sql_fetch_scroll_impl(
+pub(crate) unsafe fn sql_fetch_scroll_impl(
     statement_handle: SqlHandle,
     fetch_orientation: SqlSmallInt,
     fetch_offset: SqlLen,
@@ -185,6 +187,11 @@ fn fetch_scroll_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        if stmt_state.has_state(STMT_STATE_FETCH_IN_PROGRESS) {
+            error!("SQLFetchScroll: a fetch is already in progress on this statement");
+            post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        }
         if stmt_state.row_bind_type != SQL_BIND_BY_COLUMN {
             error!(
                 row_bind_type = stmt_state.row_bind_type,
@@ -200,6 +207,11 @@ fn fetch_scroll_safe(
         }
 
         let bindings: Vec<ColumnBinding> = stmt_state.bindings.clone();
+        // The buffers in that snapshot belong to the application, and the fill
+        // loop writes through them after this lock is released. Claiming the
+        // statement here is what stops a concurrent SQLBindCol from freeing one
+        // mid-write; the mutating entry points refuse while this is set.
+        stmt_state.set_state(STMT_STATE_FETCH_IN_PROGRESS);
         (
             stmt_state.row_array_size,
             bindings,
@@ -209,7 +221,6 @@ fn fetch_scroll_safe(
             stmt_state.row_bind_offset_ptr,
         )
     };
-
     // The row cursor only moves forward within a row, so the bound columns have
     // to be visited in ascending order regardless of the order they were bound.
     bindings.sort_by_key(|b| b.column_number);
@@ -224,6 +235,12 @@ fn fetch_scroll_safe(
         row_status_ptr,
         row_bind_offset_ptr,
     );
+
+    // Single clearing point for the guard, so every early return inside the
+    // fill loop still releases it.
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        stmt_state.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+    }
     debug!(?rc, "SQLFetchScroll returning");
     rc
 }

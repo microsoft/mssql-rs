@@ -30,11 +30,12 @@ use crate::api::odbc_types::{
     SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{
-    ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE, SQLSTATE_01S02, SQLSTATE_HYC00,
-    post_diag,
+    ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE,
+    SQLSTATE_01S02, SQLSTATE_HYC00, post_diag,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
+use crate::handles::stmt::STMT_STATE_FETCH_IN_PROGRESS;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Sets a statement attribute.
@@ -92,6 +93,22 @@ fn sql_set_stmt_attr_w_safe(
     free_errors(&mut state);
 
     match attribute {
+        // The rowset controls are read into a fetch's snapshot, so moving them
+        // mid-fetch would point it at buffers of the wrong size or shape.
+        SQL_ATTR_ROW_ARRAY_SIZE
+        | SQL_ATTR_ROWS_FETCHED_PTR
+        | SQL_ATTR_ROW_STATUS_PTR
+        | SQL_ATTR_ROW_BIND_OFFSET_PTR
+        | SQL_ATTR_ROW_BIND_TYPE
+            if state.has_state(STMT_STATE_FETCH_IN_PROGRESS) =>
+        {
+            error!(
+                attribute,
+                "SQLSetStmtAttrW: a fetch is in progress on this statement"
+            );
+            post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+            SQL_ERROR
+        }
         SQL_ATTR_ROW_ARRAY_SIZE => {
             // The value is a `SQLULEN` passed by value in the pointer slot. Zero
             // is an invalid rowset size (HY024) — reject rather than paper over.

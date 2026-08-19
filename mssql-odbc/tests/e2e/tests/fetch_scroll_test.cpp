@@ -351,3 +351,44 @@ TEST_F(FetchScrollLiveTest, GetDataStillWorksAfterASingleRowBoundFetch) {
     EXPECT_EQ(20, b);
     SQLCloseCursor(stmt_);
 }
+
+// ODBC defines SQLFetch as the SQL_FETCH_NEXT form of SQLFetchScroll, so the
+// classic SQLBindCol + SQLFetch loop must fill the bound buffers too. Keeping a
+// second row-reading path is how that silently stops being true.
+TEST_F(FetchScrollLiveTest, SQLFetchFillsBoundColumnsToo) {
+    ExecThreeRows();
+    SQLINTEGER value = -1;
+    SQLLEN indicator = -99;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+
+    for (int expected = 1; expected <= 3; ++expected) {
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(expected, value);
+        EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), indicator);
+    }
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    SQLCloseCursor(stmt_);
+}
+
+// SQL_ATTR_ROW_ARRAY_SIZE applies to SQLFetch as well, so it returns a rowset
+// rather than a single row.
+TEST_F(FetchScrollLiveTest, SQLFetchHonoursTheRowsetSize) {
+    ExecThreeRows();
+    SQLINTEGER values[3] = {-1, -1, -1};
+    SQLULEN rowsFetched = 0;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, values, sizeof(SQLINTEGER), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3u, rowsFetched);
+    EXPECT_EQ(1, values[0]);
+    EXPECT_EQ(2, values[1]);
+    EXPECT_EQ(3, values[2]);
+    SQLCloseCursor(stmt_);
+}

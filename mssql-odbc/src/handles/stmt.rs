@@ -59,6 +59,11 @@ pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
 pub(crate) const STMT_STATE_PREPARED: u32 = 0x0000_0200;
 pub(crate) const STMT_STATE_CURSOR_OPEN: u32 = 0x0000_0800;
 pub(crate) const STMT_STATE_EXEC_CONTEXT: u32 = 0x0000_1000;
+/// A block fetch is between taking its snapshot of the bindings and finishing
+/// its writes. The fetch cannot hold the statement mutex across network I/O, so
+/// this is what stops a concurrent rebind from freeing a buffer the fill loop is
+/// still writing through: the mutating entry points refuse while it is set.
+pub(crate) const STMT_STATE_FETCH_IN_PROGRESS: u32 = 0x0000_2000;
 
 /// Statement handle
 ///
