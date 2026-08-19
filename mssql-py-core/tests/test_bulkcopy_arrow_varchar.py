@@ -84,6 +84,37 @@ def test_cursor_bulkcopy_arrow_varchar_auto_mapping(client_context):
 
 
 @pytest.mark.integration
+def test_cursor_bulkcopy_arrow_varchar_string_view(client_context):
+    """Arrow string_view bulkcopy supports Polars-style C-stream columns."""
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+
+    table_name = "#BulkCopyArrowVarcharStringView"
+    cursor.execute(f"CREATE TABLE {table_name} (id INT, name VARCHAR(50))")
+    source = pa.table(
+        {
+            "id": pa.array([1, 2, 3], type=pa.int32()),
+            "name": pa.array(
+                ["inline", None, "this value exceeds twelve bytes"],
+                type=pa.string_view(),
+            ),
+        }
+    )
+
+    result = cursor.bulkcopy_arrow(table_name, source, batch_size=1000, timeout=30)
+    assert result["rows_copied"] == 3
+
+    cursor.execute(f"SELECT id, name FROM {table_name} ORDER BY id")
+    assert cursor.fetchall() == [
+        (1, "inline"),
+        (2, None),
+        (3, "this value exceeds twelve bytes"),
+    ]
+
+    conn.close()
+
+
+@pytest.mark.integration
 def test_cursor_bulkcopy_arrow_varchar_max_large(client_context):
     """Arrow utf8 with a large string round-trips through VARCHAR(MAX)."""
     conn = mssql_py_core.PyCoreConnection(client_context)

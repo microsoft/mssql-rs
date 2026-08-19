@@ -38,6 +38,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   three-part qualified procedure name; a nonexistent catalog yields an empty
   result set instead of an error, also matching msodbcsql.
 
+- `mssql-py-core`: Arrow bulk copy now accepts `Utf8View` and `BinaryView`
+  columns, allowing Polars DataFrames to load without first converting the
+  DataFrame to a PyArrow table.
+
 - Initial public release of the mssql-rs workspace.
 
 ### Changed

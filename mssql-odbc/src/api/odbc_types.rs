@@ -320,6 +320,8 @@ pub const SQL_LEN_DATA_AT_EXEC_OFFSET: SqlLen = -100;
 pub const SQL_SS_VARIANT: SqlSmallInt = -150;
 pub const SQL_SS_UDT: SqlSmallInt = -151;
 pub const SQL_SS_XML: SqlSmallInt = -152;
+pub const SQL_SS_TABLE: SqlSmallInt = -153;
+pub const SQL_SS_VECTOR: SqlSmallInt = -156;
 
 // ---- Additional ODBC C type identifiers (SQLBindCol / SQLGetData) -----------
 // Signed/unsigned integer C types are the base numeric type id plus an offset,
@@ -352,11 +354,20 @@ pub const SQL_C_TYPE_DATE: SqlSmallInt = 91;
 pub const SQL_C_TYPE_TIME: SqlSmallInt = 92;
 pub const SQL_C_TYPE_TIMESTAMP: SqlSmallInt = 93;
 
-// SQL Server-specific C types (msodbcsql extensions). `SQL_C_TYPES_EXTENDED`
-// is `0x4000`; the two SS date/time C types are offset from it.
+// SQL Server-specific C types (msodbcsql extensions). Values confirmed against
+// msodbcsql's `msodbcsql.h`: `#define SQL_C_TYPES_EXTENDED 0x04000L`.
 pub const SQL_C_TYPES_EXTENDED: SqlSmallInt = 0x4000; // 16384
 pub const SQL_C_SS_TIME2: SqlSmallInt = SQL_C_TYPES_EXTENDED; // 0x4000
 pub const SQL_C_SS_TIMESTAMPOFFSET: SqlSmallInt = SQL_C_TYPES_EXTENDED + 1; // 0x4001
+pub const SQL_C_SS_VECTOR: SqlSmallInt = SQL_C_TYPES_EXTENDED + 2; // 0x4002
+
+// The 13 ODBC 3.x interval C types occupy a contiguous range, 101..=113, and the
+// matching `SQL_INTERVAL_*` SQL types share those values.
+pub const SQL_C_INTERVAL_YEAR: SqlSmallInt = 101;
+pub const SQL_C_INTERVAL_MINUTE_TO_SECOND: SqlSmallInt = 113;
+// The interval SQL types share the C type values above.
+pub const SQL_INTERVAL_YEAR: SqlSmallInt = 101;
+pub const SQL_INTERVAL_MINUTE_TO_SECOND: SqlSmallInt = 113;
 
 // SQLColAttribute field identifier for the underlying type of a `sql_variant`
 // column (msodbcsql: `SQL_CA_SS_BASE + 15`). Required by mssql-python's
