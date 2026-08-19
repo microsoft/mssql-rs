@@ -84,7 +84,7 @@ jobs:
           fi
 
       - name: Checkout PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # refs/pull/<n>/head resolves for both same-repo and forked PRs.
           ref: refs/pull/${{ steps.prctx.outputs.pr_number }}/head
