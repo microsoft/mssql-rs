@@ -84,19 +84,23 @@ pub(crate) struct DbcState {
     /// (`sqlcmisc.cpp:3426`). Applied as a `SET TRANSACTION ISOLATION LEVEL`
     /// batch when connected, otherwise deferred to connect time.
     pub(crate) txn_isolation: u32,
+    /// ODBC-side checkout state for a reset that still needs a carrying request.
+    ///
+    /// This is distinct from `TdsClient::reset_pending()`: this flag forces the
+    /// checkout isolation SET to execute, while the TDS flag records whether the
+    /// server has acknowledged the reset. It is cleared after the isolation
+    /// handler verifies that acknowledgement.
+    ///
+    /// While set, `SQL_ATTR_TXN_ISOLATION` must not take its same-value short
+    /// circuit: that checkout SET is the request the armed bit rides, so
+    /// short-circuiting would lose fail-at-checkout.
+    pub(crate) pending_reset_ack: bool,
     /// The application executed a statement in manual-commit mode, so the open
     /// transaction may hold uncommitted user work. Mirrors msodbcsql's
     /// `CONN_ST_LOCALTRANS_STARTED` (`sqlcprot.h:2298`) and is deliberately
     /// distinct from `TdsClient::has_active_transaction()`, which also reports
     /// driver-begun *piggyback* transactions that carry no user work. Only this
     /// flag blocks `SQLDisconnect` (25000) and `SQL_ATTR_TXN_ISOLATION` (HY011).
-    /// Set when a pooling reset is armed and cleared once the request that
-    /// carries the RESETCONNECTION bit has been sent. While true,
-    /// `SQL_ATTR_TXN_ISOLATION` must not take its same-value short circuit: that
-    /// checkout `SET TRANSACTION ISOLATION LEVEL` is the request the armed bit
-    /// rides, so short-circuiting it would defer the reset to the borrower's
-    /// first query and lose fail-at-checkout.
-    pub(crate) pending_reset_ack: bool,
     pub(crate) local_tran_started: bool,
 }
 

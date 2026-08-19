@@ -212,7 +212,9 @@ pub struct TdsClient {
     /// true, a RESETCONNECTION bit has been armed but the server has not yet
     /// confirmed it. A pool uses [`reset_pending`](TdsClient::reset_pending)
     /// after the request that carries the bit to verify the reset was actually
-    /// processed, rather than inferring it from the request succeeding.
+    /// processed, rather than inferring it from the request succeeding. A
+    /// successful reconnect also clears it because the fresh session supersedes
+    /// the reset.
     reset_pending: bool,
 
     // pub(crate) batch_result: Option<BatchResult<'static>>,
@@ -547,14 +549,13 @@ impl TdsClient {
         self.pending_prepared_param_encryption = None;
     }
 
-    /// Applies the full client-side transition for a server-acknowledged
-    /// connection reset (a `ResetConnection` ENVCHANGE emitted in response to a
-    /// RESETCONNECTION / RESETCONNECTIONSKIPTRAN request). `sp_reset_connection`
-    /// returns the session to its login defaults, so mirror that locally: drop
-    /// accumulated session-recovery state, clear the session-bound caches, and
-    /// restore the negotiated DATABASE / LANGUAGE / COLLATION to their login
-    /// values so a borrower's `USE otherdb` / `SET LANGUAGE` does not persist
-    /// across the reset.
+    /// Confirms a reset and reconciles client state with the reset server session.
+    ///
+    /// `prepare_reset_connection` performs the same invalidation at arm time so
+    /// the carrying request cannot use stale state. Repeating it here is
+    /// intentional: this is the protocol-level transition shared by every token
+    /// processing path, including resets not coordinated by the ODBC checkout
+    /// flow.
     fn on_reset_connection_ack(&mut self) {
         self.reset_pending = false;
         self.recovery_context.session_state_table.reset();
@@ -860,12 +861,10 @@ impl TdsClient {
     /// one-shot: it is cleared once the next such request has been sent.
     ///
     /// # Parameters
-    /// - `preserve_transaction` — when `true`, the reset preserves the current
-    ///   transaction state (a local or enlisted/distributed transaction survives
-    ///   the reset) by using RESETCONNECTIONSKIPTRAN instead of RESETCONNECTION.
-    ///   Callers (typically a connection pool) should pass `true` only when the
-    ///   pooled connection is enlisted in a transaction that must outlive the
-    ///   reset.
+    /// - `preserve_transaction` — when `true`, use
+    ///   RESETCONNECTIONSKIPTRAN so a local or enlisted/distributed transaction
+    ///   survives. The ODBC pool always passes `false`; low-level TDS consumers
+    ///   should pass `true` only when a transaction must outlive the reset.
     ///
     /// # Client-side state is dropped immediately
     /// The session-bound caches (prepared handles, their Always Encrypted

@@ -87,8 +87,8 @@ unsafe fn sql_set_connect_attr_w_impl(
         SQL_ATTR_TXN_ISOLATION | SQL_COPT_SS_TXN_ISOLATION => {
             return set_txn_isolation(dbc, value_ptr as usize as u64);
         }
-        // Pooling check-in reset: rolls back any live local transaction and arms
-        // the RESETCONNECTION bit, so it must not run under the DBC mutex either.
+        // Pool-reuse reset: rolls back any live local transaction and arms the
+        // RESETCONNECTION bit, so it must not run under the DBC mutex either.
         SQL_ATTR_RESET_CONNECTION | SQL_COPT_SS_RESET_CONNECTION => {
             return reset_connection(dbc, value_ptr as usize as u64);
         }

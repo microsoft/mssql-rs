@@ -358,7 +358,7 @@ pub(super) fn set_autocommit(dbc: &DbcHandle, value: u64) -> SqlReturn {
     }
 }
 
-/// Applies `SQL_ATTR_RESET_CONNECTION` — the connection-pool check-in reset.
+/// Applies the reset performed while a pooled connection is acquired for reuse.
 ///
 /// Mirrors msodbcsql's `SQL_COPT_SS_RESET_CONNECTION` handler
 /// (`sqlcmisc.cpp:2373-2461`): reject any value but `SQL_RESET_CONNECTION_YES`
@@ -366,14 +366,9 @@ pub(super) fn set_autocommit(dbc: &DbcHandle, value: u64) -> SqlReturn {
 /// session reset. Pool checkout does not preserve transactions, so this never
 /// uses RESETCONNECTIONSKIPTRAN.
 ///
-/// The reset is **armed, not round-tripped**. RESETCONNECTION is a TDS
-/// packet-header bit (MS-TDS 2.2.3.1.2): the server returns the session to its
-/// login defaults *before* processing the request that carries it, so the next
-/// borrower never sees the previous borrower's state regardless of which request
-/// that turns out to be. Driving a dedicated `SELECT 1` here would roughly double
-/// checkout cost (measured ~1.65 ms vs ~0.80 ms on loopback, and the delta is a
-/// full RTT so it grows with network latency) to buy nothing for state
-/// correctness.
+/// The reset is armed without I/O. RESETCONNECTION is a TDS packet-header bit
+/// (MS-TDS 2.2.3.1.2), and the server resets the session before executing the
+/// request that carries it.
 ///
 /// The two properties that would otherwise be lost to deferral are kept without
 /// the round trip:
@@ -431,12 +426,10 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
         Err(ret) => return ret,
     };
 
-    // Roll back a live local transaction before arming the reset so the next
-    // borrower cannot inherit it. Guard on the server actually having one, the
-    // same way `end_transaction` does — the flag can be stale. A full
-    // RESETCONNECTION would discard the transaction server-side regardless, but
-    // rolling back explicitly keeps the client's own transaction tracking in
-    // step with the server.
+    // Close known user work before reuse instead of relying on the subsequent
+    // reset to discard it. This also makes a rollback failure observable here,
+    // so the pool discards the connection rather than reusing an uncertain
+    // session. The ODBC flag can be stale, hence the descriptor guard.
     let result = if started && client.has_active_transaction() {
         debug!("{OP}: rolling back live local transaction before reset");
         dbc.runtime
@@ -605,11 +598,10 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         // an error inside a transaction nor a cursor sweep and round trip
         // outside one.
         //
-        // D9 caveat: this cache tracks only isolation set through this attribute.
-        // A borrower that ran `SET TRANSACTION ISOLATION LEVEL ...` as raw T-SQL
-        // leaves the cache stale, so a later get reports the cached value rather
-        // than the session's. This mirrors mssql-python's own coverage gap (#343
-        // only tracks the attribute path) and is not fixed here.
+        // This cache tracks only isolation set through this attribute. Raw T-SQL
+        // can therefore make SQLGetConnectAttr report a stale value. Pool reuse
+        // is still safe: a pending reset suppresses this short circuit, forcing
+        // the checkout SET to restore READ COMMITTED on the server.
         //
         // The short circuit is suppressed while a pooling reset is armed: this
         // SET is the request that carries the RESETCONNECTION bit, so skipping
