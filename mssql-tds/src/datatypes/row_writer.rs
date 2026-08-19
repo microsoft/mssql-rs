@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::mem::MaybeUninit;
+
 use crate::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
@@ -78,16 +80,10 @@ pub trait RowWriter {
     /// payload straight from the wire into it.
     ///
     /// This is the sink half of the trait. It exists for consumers that own a
-    /// destination buffer already — a PostgreSQL FDW writing into `palloc`ed
-    /// varlena memory, an Arrow builder, an N-API byte encoder — and lets them
+    /// destination buffer already — an Arrow builder, an N-API byte encoder, or
+    /// another arena-backed consumer — and lets them
     /// take the payload without `mssql-tds` allocating a `Vec` per value that
     /// the consumer then copies out of and drops.
-    ///
-    /// The saving is the redundant allocation and copy, not the initialization:
-    /// the returned slice must already be initialized memory (see the contract
-    /// below), so a consumer allocating fresh storage still pays to establish
-    /// it once — `palloc0` rather than `palloc`. What it stops paying for is a
-    /// second buffer and the copy between them.
     ///
     /// Returning `None` is the default and leaves the value on the owned
     /// [`Self::write_bytes`] / [`Self::write_string`] path, so writers that do
@@ -112,12 +108,10 @@ pub trait RowWriter {
     /// the same `col`. It does not additionally receive `write_bytes` or
     /// `write_string` for that value.
     ///
-    /// The slice must be a valid `&mut [u8]`, which means the `length` bytes
-    /// are already initialized. Handing back a slice built over uninitialized
-    /// allocation — `slice::from_raw_parts_mut` on fresh `palloc`ed memory, an
-    /// unfilled `Vec`'s spare capacity — is undefined behaviour regardless of
-    /// the decoder overwriting every byte afterwards. Use `palloc0`,
-    /// `vec![0; length]`, or `Vec::resize` to establish the bytes first.
+    /// The destination may contain uninitialized bytes. When `commit_value`
+    /// receives `complete: true`, every element has been initialized and the
+    /// writer may soundly treat the destination as bytes. When it receives
+    /// `false`, the writer must discard the destination without reading it.
     ///
     /// `length` counts bytes as framed on the wire, not characters. Raw wire
     /// bytes are handed over as-is together with their [`ValueKind`], so a
@@ -130,7 +124,7 @@ pub trait RowWriter {
         _col: usize,
         _kind: ValueKind<'_>,
         _length: usize,
-    ) -> Option<&'a mut [u8]> {
+    ) -> Option<&'a mut [MaybeUninit<u8>]> {
         None
     }
 
@@ -156,6 +150,8 @@ pub trait RowWriter {
 }
 
 /// The kind of value a [`RowWriter::value_destination`] request is for.
+#[derive(Debug)]
+#[non_exhaustive]
 pub enum ValueKind<'a> {
     /// A binary value, handed over verbatim.
     Bytes,

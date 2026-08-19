@@ -1310,6 +1310,48 @@ impl TdsPacketReader for NetworkTransport {
         Ok(total_read)
     }
 
+    async fn read_bytes_uninit(
+        &mut self,
+        buffer: &mut [std::mem::MaybeUninit<u8>],
+    ) -> TdsResult<usize> {
+        let mut total_read = 0;
+        let mut length_to_read = buffer.len();
+        let mut offset = 0;
+        while length_to_read > 0 {
+            if !self
+                .tds_read_buffer
+                .do_we_have_enough_data(min(self.tds_read_buffer.max_packet_size, length_to_read))
+            {
+                self.read_tds_packet().await?;
+            }
+            let available = self.tds_read_buffer.get_remaining_byte_count();
+            let to_read = min(
+                available,
+                min(length_to_read, self.tds_read_buffer.max_packet_size - 8),
+            );
+
+            if to_read > 0 {
+                let source =
+                    &self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position
+                        ..self.tds_read_buffer.buffer_position + to_read];
+                // SAFETY: `source` and the destination are valid for `to_read`
+                // non-overlapping bytes. Writing initializes those destination elements.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source.as_ptr(),
+                        buffer.as_mut_ptr().cast::<u8>().add(offset),
+                        to_read,
+                    );
+                }
+                offset += to_read;
+                length_to_read -= to_read;
+                total_read += to_read;
+                self.tds_read_buffer.consume_bytes(to_read);
+            }
+        }
+        Ok(total_read)
+    }
+
     async fn read_u8_varbyte(&mut self) -> TdsResult<Vec<u8>> {
         let length: u8 = self.read_byte().await?;
         let mut result: Vec<u8> = vec![0; length as usize];

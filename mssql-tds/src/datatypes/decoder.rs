@@ -5,6 +5,7 @@ use bigdecimal::num_bigint::BigUint;
 use bigdecimal::num_traits::ToPrimitive;
 use core::fmt;
 use std::future::Future;
+use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt::Debug, io::Error, vec};
@@ -84,9 +85,11 @@ macro_rules! read_sync_first {
 // arms: sharing one binding would keep the fallback `Vec` and a discriminant
 // live across the read for every writer, opted in or not.
 //
-// Two reads means two suspension points in the caller's state machine, which
-// widens every row-decode future that embeds it; see
-// `row_fetch_futures_stay_small`.
+// Two reads means two suspension points in the caller's state machine, widening
+// every row-decode future that embeds it by 192 B (`next_row_into` 3400 -> 3592,
+// `read_row_column` 3752 -> 3944). Both remain within the 4096 B budget enforced
+// by `row_fetch_futures_stay_small`; future size is disclosed, not used as a
+// performance proxy.
 //
 // `$fill` reads the payload into `$dest` and yields `TdsResult<()>`; `$owned`
 // hands the fallback buffer `$bytes` to the writer.
@@ -104,6 +107,12 @@ macro_rules! read_value_into {
         match $writer.value_destination(col, $kind, length) {
             // The writer borrow held by `$dest` ends with this read.
             Some($dest) => {
+                debug_assert_eq!(
+                    $dest.len(),
+                    length,
+                    "value_destination returned {} bytes for a {length}-byte value",
+                    $dest.len()
+                );
                 let outcome = $fill;
                 $writer.commit_value(col, outcome.is_ok());
                 outcome?;
@@ -111,7 +120,13 @@ macro_rules! read_value_into {
             None => {
                 let mut $bytes: Vec<u8> = vec![0u8; length];
                 {
-                    let $dest: &mut [u8] = &mut $bytes;
+                    // SAFETY: initialized bytes are valid `MaybeUninit<u8>` values.
+                    let $dest: &mut [MaybeUninit<u8>] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            $bytes.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                            $bytes.len(),
+                        )
+                    };
                     $fill?;
                 }
                 $owned;
@@ -1152,7 +1167,14 @@ impl GenericDecoder {
             PlpFraming::Null => Ok(None),
             PlpFraming::Known(length) => {
                 let mut plp_buffer = vec![0u8; length];
-                Self::read_plp_chunks_into_slice(reader, &mut plp_buffer).await?;
+                // SAFETY: initialized bytes are valid `MaybeUninit<u8>` values.
+                let dest = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        plp_buffer.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                        plp_buffer.len(),
+                    )
+                };
+                Self::read_plp_chunks_into_slice(reader, dest, length).await?;
                 Ok(Some(plp_buffer))
             }
             PlpFraming::Unknown => Ok(Some(Self::read_plp_chunks_unknown_len(reader).await?)),
@@ -1256,7 +1278,11 @@ impl GenericDecoder {
     /// A stream that ends before filling `dest` leaves the remainder zeroed, so
     /// a short value reaches the writer exactly as it would on the owned path
     /// rather than exposing whatever the destination held beforehand.
-    async fn read_plp_chunks_into_slice<T>(reader: &mut T, dest: &mut [u8]) -> TdsResult<()>
+    async fn read_plp_chunks_into_slice<T>(
+        reader: &mut T,
+        dest: &mut [MaybeUninit<u8>],
+        declared_len: usize,
+    ) -> TdsResult<()>
     where
         T: TdsPacketReader + Send + Sync,
     {
@@ -1266,6 +1292,11 @@ impl GenericDecoder {
 
         while chunk_len > 0 {
             chunk_count += 1;
+            #[cfg(fuzzing)]
+            eprintln!(
+                "[ALLOC] read_plp_chunks_into_slice: chunk #{chunk_count}, chunk_len={chunk_len}, declared_len={}",
+                dest.len()
+            );
             Self::check_plp_chunk(chunk_count, chunk_len)?;
 
             let end_offset = offset.checked_add(chunk_len).ok_or_else(|| {
@@ -1275,16 +1306,18 @@ impl GenericDecoder {
             })?;
             if end_offset > dest.len() {
                 return Err(crate::error::Error::ProtocolError(format!(
-                    "PLP chunk exceeds declared length: offset={offset}, chunk_len={chunk_len}, declared_len={}",
-                    dest.len()
+                    "PLP chunk exceeds wire-declared length: offset={offset}, chunk_len={chunk_len}, wire_declared_len={declared_len}, destination_len={}",
+                    dest.len(),
                 )));
             }
 
-            offset += reader.read_bytes(&mut dest[offset..end_offset]).await?;
+            offset += reader
+                .read_bytes_uninit(&mut dest[offset..end_offset])
+                .await?;
             chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
         }
 
-        dest[offset..].fill(0);
+        dest[offset..].fill(MaybeUninit::new(0));
         Ok(())
     }
 
@@ -1453,8 +1486,10 @@ impl GenericDecoder {
                                 col,
                                 ValueKind::Bytes,
                                 length,
-                                |dest| GenericDecoder::read_plp_chunks_into_slice(reader, dest)
-                                    .await,
+                                |dest| GenericDecoder::read_plp_chunks_into_slice(
+                                    reader, dest, length,
+                                )
+                                .await,
                                 |bytes| writer.write_bytes(col, bytes),
                             );
                         }
@@ -1982,7 +2017,8 @@ impl StringDecoder {
                         col,
                         ValueKind::String(&encoding_type),
                         length,
-                        |dest| GenericDecoder::read_plp_chunks_into_slice(reader, dest).await,
+                        |dest| GenericDecoder::read_plp_chunks_into_slice(reader, dest, length)
+                            .await,
                         |bytes| writer.write_string(col, SqlString::new(bytes, encoding_type)),
                     );
                 }
@@ -5034,6 +5070,8 @@ mod test {
     /// Tests for the `RowWriter` sink API: values whose storage is supplied by
     /// the writer and filled straight from the wire.
     mod sink_destination_tests {
+        use std::mem::MaybeUninit;
+
         use super::decode_into_tests::{ByteReader, plp_metadata, varlen_metadata};
         use crate::datatypes::column_values::{
             SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney, SqlSmallDateTime,
@@ -5042,10 +5080,11 @@ mod test {
         use crate::datatypes::decoder::{DecimalParts, GenericDecoder};
         use crate::datatypes::row_writer::{RowWriter, ValueKind};
         use crate::datatypes::sql_json::SqlJson;
-        use crate::datatypes::sql_string::SqlString;
+        use crate::datatypes::sql_string::{EncodingType, SqlString};
         use crate::datatypes::sql_vector::SqlVector;
         use crate::datatypes::sqldatatypes::{PartialLengthType, TdsDataType};
         use crate::query::metadata::ColumnMetadata;
+        use crate::token::tokens::SqlCollation;
         use uuid::Uuid;
 
         /// What a [`RecordingSink`] observed for one column.
@@ -5055,7 +5094,7 @@ mod test {
             /// Payload delivered through the sink, with the kind that was requested.
             Sunk {
                 bytes: Vec<u8>,
-                is_string: bool,
+                encoding: Option<EncodingType>,
                 complete: bool,
             },
             /// Payload delivered through the owned path instead.
@@ -5070,8 +5109,10 @@ mod test {
         /// writer exercises both the sink path and the decline-to-owned path.
         struct RecordingSink {
             accept: bool,
+            destination_len: Option<usize>,
+            destination_requests: usize,
             events: Vec<Event>,
-            pending: Option<(usize, bool)>,
+            pending: Option<(usize, Option<EncodingType>)>,
             storage: Vec<u8>,
         }
 
@@ -5079,9 +5120,18 @@ mod test {
             fn new(accept: bool) -> Self {
                 Self {
                     accept,
+                    destination_len: None,
+                    destination_requests: 0,
                     events: Vec::new(),
                     pending: None,
                     storage: Vec::new(),
+                }
+            }
+
+            fn with_destination_len(length: usize) -> Self {
+                Self {
+                    destination_len: Some(length),
+                    ..Self::new(true)
                 }
             }
         }
@@ -5092,22 +5142,35 @@ mod test {
                 _col: usize,
                 kind: ValueKind<'_>,
                 length: usize,
-            ) -> Option<&'a mut [u8]> {
+            ) -> Option<&'a mut [MaybeUninit<u8>]> {
+                self.destination_requests += 1;
                 if !self.accept {
                     return None;
                 }
+                let length = self.destination_len.unwrap_or(length);
                 let start = self.storage.len();
                 // 0xAA marks untouched bytes so a short fill is visible in asserts.
                 self.storage.resize(start + length, 0xAA);
-                self.pending = Some((start, matches!(kind, ValueKind::String(_))));
-                Some(&mut self.storage[start..])
+                let encoding = match kind {
+                    ValueKind::Bytes => None,
+                    ValueKind::String(encoding) => Some(encoding.clone()),
+                };
+                self.pending = Some((start, encoding));
+                let storage = &mut self.storage[start..];
+                // SAFETY: initialized bytes are valid `MaybeUninit<u8>` values.
+                Some(unsafe {
+                    std::slice::from_raw_parts_mut(
+                        storage.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                        storage.len(),
+                    )
+                })
             }
 
             fn commit_value(&mut self, _col: usize, complete: bool) {
-                let (start, is_string) = self.pending.take().expect("commit without destination");
+                let (start, encoding) = self.pending.take().expect("commit without destination");
                 self.events.push(Event::Sunk {
                     bytes: self.storage[start..].to_vec(),
-                    is_string,
+                    encoding,
                     complete,
                 });
                 self.storage.truncate(start);
@@ -5147,10 +5210,10 @@ mod test {
             fn end_row(&mut self) {}
         }
 
-        fn sunk(bytes: &[u8], is_string: bool) -> Event {
+        fn sunk(bytes: &[u8], encoding: Option<EncodingType>) -> Event {
             Event::Sunk {
                 bytes: bytes.to_vec(),
-                is_string,
+                encoding,
                 complete: true,
             }
         }
@@ -5231,7 +5294,7 @@ mod test {
             let payload: Vec<u8> = (0..=255u8).collect();
             assert_eq!(
                 decode_generic(plp_known(&payload, 30), &md, true).await,
-                vec![sunk(&payload, false)]
+                vec![sunk(&payload, None)]
             );
         }
 
@@ -5292,7 +5355,7 @@ mod test {
             );
             assert_eq!(
                 decode_generic(plp_known(&[], 1), &md, true).await,
-                vec![sunk(&[], false)]
+                vec![sunk(&[], None)]
             );
         }
 
@@ -5321,7 +5384,22 @@ mod test {
                 .collect();
             assert_eq!(
                 decode_string(plp_known(&utf16, 6), &md, true).await,
-                vec![sunk(&utf16, true)]
+                vec![sunk(&utf16, Some(EncodingType::Utf16))]
+            );
+        }
+
+        #[tokio::test]
+        async fn varchar_plp_known_length_reports_its_collation_encoding() {
+            let collation = SqlCollation::default();
+            let md = plp_metadata(
+                TdsDataType::BigVarChar,
+                PartialLengthType::BigVarChar,
+                Some(collation),
+            );
+            let payload = b"plain text";
+            assert_eq!(
+                decode_string(plp_known(payload, 3), &md, true).await,
+                vec![sunk(payload, Some(EncodingType::LcidBased(collation)))]
             );
         }
 
@@ -5407,7 +5485,7 @@ mod test {
             let sink = decode_generic(wire.clone(), &md, true).await;
             let owned = decode_generic(wire, &md, false).await;
 
-            assert_eq!(sink, vec![sunk(&[1, 2, 3, 0, 0, 0, 0, 0], false)]);
+            assert_eq!(sink, vec![sunk(&[1, 2, 3, 0, 0, 0, 0, 0], None)]);
             assert_eq!(owned, vec![Event::OwnedBytes(vec![1, 2, 3, 0, 0, 0, 0, 0])]);
         }
 
@@ -5432,6 +5510,50 @@ mod test {
                     .await;
                 assert!(err.is_err(), "accept={accept} should have been rejected");
             }
+        }
+
+        #[tokio::test]
+        #[should_panic(expected = "value_destination returned 1 bytes for a 2-byte value")]
+        async fn wrong_sized_destination_is_rejected() {
+            let md = plp_metadata(
+                TdsDataType::BigVarBinary,
+                PartialLengthType::BigVarBinary,
+                None,
+            );
+            let mut reader = ByteReader::new(plp_known(&[1, 2], 2));
+            let mut writer = RecordingSink::with_destination_len(1);
+            GenericDecoder::default()
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn xml_json_udt_and_vector_never_request_destinations() {
+            for (data_type, partial_type) in [
+                (TdsDataType::Xml, PartialLengthType::Xml),
+                (TdsDataType::Json, PartialLengthType::Json),
+                (TdsDataType::Udt, PartialLengthType::Udt),
+            ] {
+                let md = plp_metadata(data_type, partial_type, None);
+                let mut reader = ByteReader::new(plp_known(&[], 1));
+                let mut writer = RecordingSink::new(true);
+                let _ = GenericDecoder::default()
+                    .decode_into(&mut reader, &md, 0, &mut writer)
+                    .await;
+                assert_eq!(
+                    writer.destination_requests, 0,
+                    "{data_type:?} requested a destination"
+                );
+            }
+
+            let md = varlen_metadata(TdsDataType::Vector, 8);
+            let mut reader = ByteReader::new(Vec::new());
+            let mut writer = RecordingSink::new(true);
+            let _ = GenericDecoder::default()
+                .decode_into(&mut reader, &md, 0, &mut writer)
+                .await;
+            assert_eq!(writer.destination_requests, 0);
         }
 
         /// The sink path must not change what a writer that ignores it sees.
