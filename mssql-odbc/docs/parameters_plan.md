@@ -114,7 +114,8 @@ transparent reconnects.
 
 Goal: support parameters of narrow and wide integer C types and character C
 types, with SQL <-> C conversion among them, on conversion infrastructure shared
-with the fetch path ([`api/fetch_convert.rs`](../src/api/fetch_convert.rs)).
+with the fetch path
+([`conversion/fetch_convert.rs`](../src/conversion/fetch_convert.rs)).
 
 ### Scope
 
@@ -171,7 +172,7 @@ one task per phase.
 
 | Phase | Task | Status | Deliverable |
 | --- | --- | --- | --- |
-| P0 | [47364](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47364) | Not started | Extract shared conversion core from `fetch_convert.rs` |
+| P0 | [47364](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47364) | Code complete | Extract shared conversion core from `fetch_convert.rs` |
 | P1 | [47365](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47365) | Code complete, unmerged | Parameter type model, conversion matrix, `SQL_C_DEFAULT` |
 | P2 | [47366](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47366) | Not started | Safe C-buffer reader and conversion-outcome channel |
 | P3 | [47367](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47367) | Not started | Quadrant A: integer C -> integer SQL |
@@ -182,23 +183,36 @@ one task per phase.
 
 P1 is independent of P0; P3 onward depend on both.
 
-#### P0 - Extract shared conversion core (not started)
+#### P0 - Extract shared conversion core (code complete)
 
-Pure refactor, no behavior change. Create `src/conversion/`:
+Pure refactor, no behavior change. `src/conversion/` now holds the value-level
+conversion for both directions:
 
-- `error.rs` - direction-aware outcome vocabulary lifted from `fetch_convert.rs`:
-  a `ConvDirection`, an outcome (`Exact`, `FractionalTruncation`,
-  `StringTruncation`), and an error kind (`OutOfRange`, `InvalidCharacterValue`,
-  `Restricted`, `StringTruncation`). `NotHandledHere` stays private to fetch
-  dispatch and must never reach an application.
-- `numeric.rs` - move `NumericSource` (exact `Int` / `Scaled` / `Float` model),
-  `parse_decimal_literal`, `to_i128_truncating`, and the checked-narrowing
-  helper. This carries the hardening from the 128-bit shift-overflow guard and
-  the `22003` unrepresentable-value fix into the parameter path.
-- Add `SQLSTATE_22001` and an inbound string-truncation `DiagMsg`;
-  `ERR_STRING_RIGHT_TRUNCATION` (`01004`) stays for the outbound path.
+- `error.rs` - the outcome vocabulary (`ConvOk`, `ConvError`) lifted out of
+  `fetch_convert.rs`. `NotHandledHere` stays a dispatch signal and must never
+  reach an application.
+- `numeric.rs` - `NumericSource` (exact `Int` / `Scaled` / `Float` model),
+  `parse_decimal_literal`, `to_i128_truncating`, and `narrow_i128`, extracted
+  from the `narrow!` macro that was local to `convert_integer_c`. This carries
+  the 128-bit shift-overflow guard and the `22003` unrepresentable-value fix
+  into the parameter path.
+- `fetch_convert.rs` - `api/fetch_convert.rs` moved wholesale. It has no handle
+  or diagnostic coupling, so it never belonged beside the `SQLxxx` entry points
+  in `api/`.
+- `param_convert.rs` - `params/convert.rs` moved, so both direction converters
+  sit together on the shared core. `params/` keeps what is genuinely about
+  bindings: the `BoundParam` record and the bind-time `conversion_matrix`.
 
-#### P1 - Parameter type model and conversion matrix (code complete, unmerged)
+Deferred to the phase that first constructs them, because `sqlstate.rs` carries
+no `allow(dead_code)` and `cargo bclippy` runs `-D warnings` - an unused
+SQLSTATE constant or a never-constructed enum variant fails the lint gate:
+
+- `ConvDirection` and the split of `Truncated` into `FractionalTruncation` /
+  `StringTruncation` - land with P4/P5, which raise inbound truncation.
+- `SQLSTATE_22001` and its `DiagMsg` - same. `ERR_STRING_RIGHT_TRUNCATION`
+  (`01004`) already exists for the outbound path.
+
+#### P1 - Parameter type model and conversion matrix (code complete)
 
 - [`api/type_rules.rs`](../src/api/type_rules.rs) - C-type canonicalization, the
   `HY003` / `HY004` identifier gates, and version-aware `SQL_C_DEFAULT`
@@ -300,7 +314,7 @@ Deviations from msodbcsql, verified against source:
 
 #### P7 - Cleanup and hooks (not started)
 
-- Remove remaining "Phase 1" language from `params/convert.rs` and
+- Remove remaining "Phase 1" language from `conversion/param_convert.rs` and
   `params/bound_param.rs`.
 - Record the deferred blockers: `SqlType` metadata/value separation for decimal
   and temporal typed NULLs, and the hard-coded decimal precision/scale in
@@ -336,10 +350,11 @@ accepting a pairing inbound that is rejected outbound for no principled reason.
   also allow `OUTPUT` and `?=` handling. This is no longer a repeated-parsing
   correctness issue.
 - **Type matrix and TDS type selection:** tracked by the conversion milestone
-  above. `params::convert` still ignores `sql_type` and emits `(n)varchar(max)`,
-  relying on SQL Server implicit conversion; P3 and P4 drive the wire type from
-  `ParameterType` instead. Beyond this milestone the same work is needed for
-  binary, `uniqueidentifier`, money, decimal, and date/time values.
+  above. `conversion::param_convert` still ignores `sql_type` and emits
+  `(n)varchar(max)`, relying on SQL Server implicit conversion; P3 and P4 drive
+  the wire type from `ParameterType` instead. Beyond this milestone the same
+  work is needed for binary, `uniqueidentifier`, money, decimal, and date/time
+  values.
 - **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`), data-at-exec
   (`SQLParamData` / `SQLPutData`), parameter arrays
   (`SQL_ATTR_PARAMSET_SIZE`), and TVPs. Data-at-exec requires an

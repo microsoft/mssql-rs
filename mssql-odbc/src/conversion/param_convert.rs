@@ -7,8 +7,8 @@
 //! Which C/SQL pairings reach this module is decided at bind time by
 //! [`crate::api::type_rules`] and [`crate::params::conversion_matrix`];
 //! `SQL_C_DEFAULT` has already been resolved to a concrete C type by then.
-//! Data-at-execution and default parameters are rejected with `HYC00`, and an
-//! invalid negative `StrLen_or_Ind` with `HY090`.
+//! Data-at-execution is rejected with `HYC00`, `SQL_DEFAULT_PARAM` with
+//! `07S01`, and an invalid negative `StrLen_or_Ind` with `HY090`.
 //!
 //! A `SQL_NULL_DATA` parameter that was bound with `SQL_C_DEFAULT` is
 //! materialised as a typed TDS NULL from `sql_type`, because a defaulted
@@ -31,24 +31,31 @@ use crate::api::odbc_types::{
     SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
     SQL_WVARCHAR, SqlLen, SqlSmallInt, SqlSsVectorLayout,
 };
-use crate::api::sqlstate::ERR_INVALID_STRING_OR_BUFFER_LENGTH;
+use crate::api::sqlstate::{
+    DiagMsg, ERR_DATA_AT_EXEC_NOT_IMPLEMENTED, ERR_INVALID_PARAM_COLUMN_SIZE,
+    ERR_INVALID_PARAM_DECIMAL_DIGITS, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
+    ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
+    ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
+};
 use crate::params::BoundParam;
 
-/// Why a bound parameter could not be converted.
+/// Why a bound parameter could not be turned into an RPC parameter.
 ///
-/// The "not yet implemented" variants post `HYC00` via [`message`]; a bad
-/// indicator posts the canonical `HY090` diagnostic
-/// (`ERR_INVALID_STRING_OR_BUFFER_LENGTH`).
+/// Each variant carries its own SQLSTATE through [`diag`]; none of these are
+/// value-conversion failures, which arrive from
+/// [`crate::conversion::error::ConvError`] instead.
 ///
-/// [`message`]: ParamConvError::message
+/// [`diag`]: ParamBuildError::diag
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ParamConvError {
-    /// The application's C type is not supported in Phase 1.
+pub(crate) enum ParamBuildError {
+    /// Backstop only: bind time rejects any C type the conversion matrix does
+    /// not list, so reaching this means the matrix and this module disagree.
     UnsupportedCType(SqlSmallInt),
     /// The parameter uses data-at-execution (`SQLPutData`).
     DataAtExecUnsupported,
-    /// The parameter requested its default value.
-    DefaultParamUnsupported,
+    /// `StrLen_or_Ind` was `SQL_DEFAULT_PARAM` on a statement that is not a
+    /// canonical procedure call.
+    InvalidUseOfDefaultParam,
     /// `StrLen_or_Ind` is a negative value that is not a valid input length.
     InvalidLength(SqlLen),
     /// `ColumnSize` cannot be expressed as a T-SQL declaration for `SqlType`.
@@ -59,16 +66,16 @@ pub(crate) enum ParamConvError {
     UnsupportedSqlType(SqlSmallInt),
 }
 
-impl ParamConvError {
-    pub(crate) fn message(self) -> &'static str {
+impl ParamBuildError {
+    pub(crate) fn diag(self) -> DiagMsg {
         match self {
-            Self::UnsupportedCType(_) => "Parameter C type not yet implemented",
-            Self::DataAtExecUnsupported => "Data-at-execution parameters not yet implemented",
-            Self::DefaultParamUnsupported => "Default parameters not yet implemented",
-            Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH.text,
-            Self::InvalidParameterSize(_) => "Invalid parameter ColumnSize for the SQL type",
-            Self::InvalidDecimalDigits(_) => "Invalid parameter DecimalDigits for the SQL type",
-            Self::UnsupportedSqlType(_) => "Parameter SQL type not yet implemented",
+            Self::UnsupportedCType(_) => ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
+            Self::DataAtExecUnsupported => ERR_DATA_AT_EXEC_NOT_IMPLEMENTED,
+            Self::InvalidUseOfDefaultParam => ERR_INVALID_USE_OF_DEFAULT_PARAM,
+            Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
+            Self::InvalidParameterSize(_) => ERR_INVALID_PARAM_COLUMN_SIZE,
+            Self::InvalidDecimalDigits(_) => ERR_INVALID_PARAM_DECIMAL_DIGITS,
+            Self::UnsupportedSqlType(_) => ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
         }
     }
 }
@@ -80,7 +87,7 @@ impl ParamConvError {
 pub(crate) unsafe fn bound_param_to_rpc(
     name: String,
     param: &BoundParam,
-) -> Result<RpcParameter, ParamConvError> {
+) -> Result<RpcParameter, ParamBuildError> {
     let (value, type_metadata) = unsafe { bound_param_to_value(param) }?;
     let parameter = RpcParameter::new(Some(name), StatusFlags::NONE, value);
     Ok(match type_metadata {
@@ -98,7 +105,7 @@ pub(crate) unsafe fn bound_param_to_rpc(
 /// length and the indicator pointer, if non-null, points to one valid `SqlLen`.
 pub(crate) unsafe fn bound_param_to_value(
     param: &BoundParam,
-) -> Result<TypedValue, ParamConvError> {
+) -> Result<TypedValue, ParamBuildError> {
     let indicator = if param.strlen_or_ind_ptr.is_null() {
         None
     } else {
@@ -110,14 +117,14 @@ pub(crate) unsafe fn bound_param_to_value(
             return null_value(param);
         }
         if ind == SQL_DEFAULT_PARAM {
-            return Err(ParamConvError::DefaultParamUnsupported);
+            return Err(ParamBuildError::InvalidUseOfDefaultParam);
         }
         if ind == SQL_DATA_AT_EXEC || ind <= SQL_LEN_DATA_AT_EXEC_OFFSET {
-            return Err(ParamConvError::DataAtExecUnsupported);
+            return Err(ParamBuildError::DataAtExecUnsupported);
         }
         // Any remaining negative indicator  is invalid for an input parameter
         if ind < 0 && ind != SQL_NTS as SqlLen {
-            return Err(ParamConvError::InvalidLength(ind));
+            return Err(ParamBuildError::InvalidLength(ind));
         }
     }
 
@@ -139,7 +146,7 @@ pub(crate) unsafe fn bound_param_to_value(
         // A defaulted binding is described entirely by its SQL type, and the
         // buffer is only read for non-NULL data, which this driver does not yet
         // convert for the non-character default C types.
-        other => return Err(ParamConvError::UnsupportedCType(other)),
+        other => return Err(ParamBuildError::UnsupportedCType(other)),
     };
 
     Ok((value, None))
@@ -165,14 +172,14 @@ const MAX_DATETIME_SCALE: u8 = 7;
 /// declaring that parameter `varchar` would send the server the wrong type.
 /// An explicit character binding keeps its C type, which the conversion matrix
 /// has already paired with a character SQL type.
-fn null_value(param: &BoundParam) -> Result<TypedValue, ParamConvError> {
+fn null_value(param: &BoundParam) -> Result<TypedValue, ParamBuildError> {
     if param.c_type_defaulted {
         return default_typed_null(param.sql_type, param.column_size, param.decimal_digits);
     }
     match param.c_type {
         SQL_C_CHAR => Ok((SqlType::VarcharMax(None), None)),
         SQL_C_WCHAR => Ok((SqlType::NVarcharMax(None), None)),
-        other => Err(ParamConvError::UnsupportedCType(other)),
+        other => Err(ParamBuildError::UnsupportedCType(other)),
     }
 }
 
@@ -190,7 +197,7 @@ fn default_typed_null(
     sql_type: SqlSmallInt,
     column_size: usize,
     decimal_digits: SqlSmallInt,
-) -> Result<TypedValue, ParamConvError> {
+) -> Result<TypedValue, ParamBuildError> {
     let value = match sql_type {
         SQL_BIT => SqlType::Bit(None),
         SQL_TINYINT => SqlType::TinyInt(None),
@@ -250,18 +257,18 @@ fn default_typed_null(
         // `SQL_SS_UDT` and `SQL_SS_TABLE` need the fully qualified server type
         // name, which `SQLDescribeParam` does not report and this driver has no
         // other way to obtain, so they are rejected up front at bind time.
-        other => return Err(ParamConvError::UnsupportedSqlType(other)),
+        other => return Err(ParamBuildError::UnsupportedSqlType(other)),
     };
     Ok((value, None))
 }
 
 /// Length of a fixed-width `char`/`nchar`/`binary` declaration. Zero-length and
 /// oversized declarations are invalid T-SQL and have no `max` spelling.
-fn fixed_length(column_size: usize, max: usize) -> Result<u16, ParamConvError> {
+fn fixed_length(column_size: usize, max: usize) -> Result<u16, ParamBuildError> {
     u16::try_from(column_size)
         .ok()
         .filter(|_| (1..=max).contains(&column_size))
-        .ok_or(ParamConvError::InvalidParameterSize(column_size))
+        .ok_or(ParamBuildError::InvalidParameterSize(column_size))
 }
 
 /// Length of a `varchar`/`nvarchar`/`varbinary` declaration, or `None` for the
@@ -282,26 +289,26 @@ fn variable_length(column_size: usize, max: usize) -> Option<u16> {
 fn decimal_metadata(
     column_size: usize,
     decimal_digits: SqlSmallInt,
-) -> Result<RpcTypeMetadata, ParamConvError> {
+) -> Result<RpcTypeMetadata, ParamBuildError> {
     let precision = u8::try_from(column_size)
         .ok()
         .filter(|_| PRECISION_RANGE.contains(&column_size))
-        .ok_or(ParamConvError::InvalidParameterSize(column_size))?;
+        .ok_or(ParamBuildError::InvalidParameterSize(column_size))?;
     let scale = u8::try_from(decimal_digits)
         .ok()
         .filter(|scale| *scale <= precision)
-        .ok_or(ParamConvError::InvalidDecimalDigits(decimal_digits))?;
+        .ok_or(ParamBuildError::InvalidDecimalDigits(decimal_digits))?;
     Ok(RpcTypeMetadata {
         precision: Some(precision),
         scale: Some(scale),
     })
 }
 
-fn datetime_metadata(decimal_digits: SqlSmallInt) -> Result<RpcTypeMetadata, ParamConvError> {
+fn datetime_metadata(decimal_digits: SqlSmallInt) -> Result<RpcTypeMetadata, ParamBuildError> {
     let scale = u8::try_from(decimal_digits)
         .ok()
         .filter(|scale| *scale <= MAX_DATETIME_SCALE)
-        .ok_or(ParamConvError::InvalidDecimalDigits(decimal_digits))?;
+        .ok_or(ParamBuildError::InvalidDecimalDigits(decimal_digits))?;
     Ok(RpcTypeMetadata {
         precision: None,
         scale: Some(scale),
@@ -321,17 +328,17 @@ fn datetime_metadata(decimal_digits: SqlSmallInt) -> Result<RpcTypeMetadata, Par
 fn vector_metadata(
     column_size: usize,
     base_type: SqlSmallInt,
-) -> Result<(u16, VectorBaseType), ParamConvError> {
+) -> Result<(u16, VectorBaseType), ParamBuildError> {
     let payload_size = column_size
         .checked_sub(std::mem::size_of::<SqlSsVectorLayout>())
         .filter(|size| size % SQL_SS_VECTOR_ELEMENT_SIZE == 0)
-        .ok_or(ParamConvError::InvalidParameterSize(column_size))?;
+        .ok_or(ParamBuildError::InvalidParameterSize(column_size))?;
     let dimensions = u16::try_from(payload_size / SQL_SS_VECTOR_ELEMENT_SIZE)
-        .map_err(|_| ParamConvError::InvalidParameterSize(column_size))?;
+        .map_err(|_| ParamBuildError::InvalidParameterSize(column_size))?;
     let base_type = match base_type {
         0 => VectorBaseType::Float32,
         1 => VectorBaseType::Float16,
-        _ => return Err(ParamConvError::InvalidDecimalDigits(base_type)),
+        _ => return Err(ParamBuildError::InvalidDecimalDigits(base_type)),
     };
     Ok((dimensions, base_type))
 }
@@ -455,7 +462,7 @@ mod tests {
         let mut val: i32 = 7;
         let p = param(SQL_C_LONG, &mut val as *mut i32 as *mut c_void, &mut ind);
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
-        assert_eq!(err, ParamConvError::UnsupportedCType(SQL_C_LONG));
+        assert_eq!(err, ParamBuildError::UnsupportedCType(SQL_C_LONG));
     }
 
     #[test]
@@ -463,7 +470,7 @@ mod tests {
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
         let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
-        assert_eq!(err, ParamConvError::DataAtExecUnsupported);
+        assert_eq!(err, ParamBuildError::DataAtExecUnsupported);
     }
 
     #[test]
@@ -471,15 +478,19 @@ mod tests {
         let mut ind: SqlLen = SQL_NO_TOTAL;
         let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
-        assert_eq!(err, ParamConvError::InvalidLength(SQL_NO_TOTAL));
+        assert_eq!(err, ParamBuildError::InvalidLength(SQL_NO_TOTAL));
     }
 
+    /// `SQL_DEFAULT_PARAM` is only legal for a canonical procedure call, which
+    /// this driver does not support, so it is 07S01 rather than "not yet
+    /// implemented" (msodbcsql `sqlccmd.cpp` -> IDS_07_S01).
     #[test]
-    fn default_param_indicator_is_rejected() {
+    fn default_param_indicator_is_invalid_use_not_unimplemented() {
         let mut ind: SqlLen = SQL_DEFAULT_PARAM;
         let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
-        assert_eq!(err, ParamConvError::DefaultParamUnsupported);
+        assert_eq!(err, ParamBuildError::InvalidUseOfDefaultParam);
+        assert_eq!(err.diag().state, *b"07S01");
     }
 
     #[test]
@@ -495,7 +506,7 @@ mod tests {
         let mut ind: SqlLen = SQL_NULL_DATA;
         let p = param(SQL_C_LONG, std::ptr::null_mut(), &mut ind);
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
-        assert_eq!(err, ParamConvError::UnsupportedCType(SQL_C_LONG));
+        assert_eq!(err, ParamBuildError::UnsupportedCType(SQL_C_LONG));
     }
 
     #[test]
@@ -590,36 +601,41 @@ mod tests {
     /// rejected here rather than sent as a malformed declaration.
     #[test]
     fn default_null_rejects_undeclarable_metadata() {
-        let cases: &[(SqlSmallInt, usize, SqlSmallInt, ParamConvError)] = &[
-            (SQL_DECIMAL, 0, 0, ParamConvError::InvalidParameterSize(0)),
-            (SQL_DECIMAL, 39, 0, ParamConvError::InvalidParameterSize(39)),
+        let cases: &[(SqlSmallInt, usize, SqlSmallInt, ParamBuildError)] = &[
+            (SQL_DECIMAL, 0, 0, ParamBuildError::InvalidParameterSize(0)),
+            (
+                SQL_DECIMAL,
+                39,
+                0,
+                ParamBuildError::InvalidParameterSize(39),
+            ),
             // Scale may not exceed precision.
-            (SQL_NUMERIC, 5, 6, ParamConvError::InvalidDecimalDigits(6)),
-            (SQL_CHAR, 0, 0, ParamConvError::InvalidParameterSize(0)),
+            (SQL_NUMERIC, 5, 6, ParamBuildError::InvalidDecimalDigits(6)),
+            (SQL_CHAR, 0, 0, ParamBuildError::InvalidParameterSize(0)),
             (
                 SQL_WCHAR,
                 4001,
                 0,
-                ParamConvError::InvalidParameterSize(4001),
+                ParamBuildError::InvalidParameterSize(4001),
             ),
-            (SQL_BINARY, 0, 0, ParamConvError::InvalidParameterSize(0)),
+            (SQL_BINARY, 0, 0, ParamBuildError::InvalidParameterSize(0)),
             (
                 SQL_TYPE_TIMESTAMP,
                 27,
                 8,
-                ParamConvError::InvalidDecimalDigits(8),
+                ParamBuildError::InvalidDecimalDigits(8),
             ),
             (
                 SQL_SS_TIME2,
                 16,
                 -1,
-                ParamConvError::InvalidDecimalDigits(-1),
+                ParamBuildError::InvalidDecimalDigits(-1),
             ),
             (
                 SQL_SS_UDT,
                 0,
                 0,
-                ParamConvError::UnsupportedSqlType(SQL_SS_UDT),
+                ParamBuildError::UnsupportedSqlType(SQL_SS_UDT),
             ),
         ];
         for &(sql_type, column_size, decimal_digits, expected) in cases {
@@ -650,15 +666,15 @@ mod tests {
         // elements, are both rejected.
         assert_eq!(
             vector_metadata(1, 0).unwrap_err(),
-            ParamConvError::InvalidParameterSize(1)
+            ParamBuildError::InvalidParameterSize(1)
         );
         assert_eq!(
             vector_metadata(header + 3, 0).unwrap_err(),
-            ParamConvError::InvalidParameterSize(header + 3)
+            ParamBuildError::InvalidParameterSize(header + 3)
         );
         assert_eq!(
             vector_metadata(header, 2).unwrap_err(),
-            ParamConvError::InvalidDecimalDigits(2)
+            ParamBuildError::InvalidDecimalDigits(2)
         );
     }
 

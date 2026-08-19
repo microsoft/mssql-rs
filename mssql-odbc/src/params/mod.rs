@@ -5,6 +5,5 @@
 
 mod bound_param;
 pub(crate) mod conversion_matrix;
-pub(crate) mod convert;
 
 pub(crate) use bound_param::BoundParam;

@@ -17,13 +17,12 @@ use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn};
-use crate::error::post_sql_error;
+use crate::conversion::param_convert::{ParamBuildError, bound_param_to_rpc};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
 };
 use crate::handles::{DbcHandle, StmtHandle};
-use crate::params::convert::{ParamConvError, bound_param_to_rpc};
 
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
 /// statement is reusable.
@@ -189,7 +188,7 @@ pub(super) fn flush_pending_unprepare(
 /// Builds the ordered `@P1..@Pn` RPC parameter list from the statement's bound
 /// parameters, reading application value buffers by reference. Posts the
 /// matching diagnostic and returns `Err(SQL_ERROR)` when a marker is unbound
-/// (`07002`) or a value cannot be converted (`HYC00`). Shared by `SQLExecute`
+/// (`07002`) or a parameter cannot be built. Shared by `SQLExecute`
 /// and `SQLExecDirect`; `op` names the entry point for traceable diagnostics.
 ///
 /// # Safety
@@ -210,18 +209,13 @@ pub(super) unsafe fn build_named_params(
         let name = format!("@P{}", i + 1);
         match unsafe { bound_param_to_rpc(name, bound_param) } {
             Ok(param) => named_params.push(param),
-            Err(ParamConvError::InvalidLength(len)) => {
-                error!("{op}: parameter {} has invalid StrLen_or_Ind {len}", i + 1);
-                post_diag(stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
-                return Err(SQL_ERROR);
-            }
             Err(e) => {
-                error!(
-                    "{op}: parameter {} conversion failed: {}",
-                    i + 1,
-                    e.message()
-                );
-                post_sql_error(stmt_state, SQLSTATE_HYC00, 0, e.message());
+                if let ParamBuildError::InvalidLength(len) = e {
+                    error!("{op}: parameter {} has invalid StrLen_or_Ind {len}", i + 1);
+                } else {
+                    error!("{op}: parameter {} rejected: {}", i + 1, e.diag().text);
+                }
+                post_diag(stmt_state, e.diag());
                 return Err(SQL_ERROR);
             }
         }
@@ -337,7 +331,9 @@ pub(super) fn finish_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen};
+    use crate::api::odbc_types::{
+        SQL_C_CHAR, SQL_DEFAULT_PARAM, SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen,
+    };
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
     use crate::test_support::TestHandles;
@@ -424,5 +420,26 @@ mod tests {
         let ret = unsafe { build_named_params(&mut state, 1, "test") };
         assert_eq!(ret.unwrap_err(), SQL_ERROR);
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
+    }
+
+    /// `SQL_DEFAULT_PARAM` is terminal 07S01, not "not yet implemented" —
+    /// asserted through the poster, since the enum-level check cannot catch a
+    /// dropped `post_diag` or the wrong `DiagMsg`.
+    #[test]
+    fn build_named_params_default_param_posts_07s01() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut buf: Vec<u8> = b"x\0".to_vec();
+        let mut ind: SqlLen = SQL_DEFAULT_PARAM;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state
+            .bound_params
+            .push(Some(char_param(&mut buf, &mut ind)));
+
+        let ret = unsafe { build_named_params(&mut state, 1, "test") };
+        assert_eq!(ret.unwrap_err(), SQL_ERROR);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07S01);
     }
 }
