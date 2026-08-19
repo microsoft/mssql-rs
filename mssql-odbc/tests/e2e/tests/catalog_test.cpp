@@ -144,12 +144,38 @@ TEST_F(CatalogLiveTest, TablesFindsCreatedTable) {
 // A catalog argument naming a database that does not exist yields an empty
 // result set, not an error — msodbcsql's nonexistent-catalog recovery path
 // (sqlcdd.cpp DoDD(), lines 1883-1895), which this test exercises live.
+//
+// Benefits-from-mock-tds: this only proves the black-box outcome (0 rows, no
+// error). A mock TDS server would let this assert that the qualified
+// `[db].sys.sp_tables` RPC actually failed and a *second*, unqualified RPC
+// with the unmatchable name filter actually fired — i.e. that the retry
+// mechanism in `run_catalog` ran, not merely that some code path happened to
+// return empty.
 TEST_F(CatalogLiveTest, TablesNonexistentCatalogReturnsEmptyNotError) {
     SqlTString catalog = ODBCTestUtils::ToSqlTStr("odbc_e2e_definitely_missing_db");
     SQLRETURN rc = SQLTables(stmt_, const_cast<SQLTCHAR*>(catalog.c_str()), SQL_NTS, nullptr, 0,
                              nullptr, 0, nullptr, 0);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(0, DrainRows(stmt_));
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// The bare "%" catalog with empty schema and table is the ODBC-mandated idiom
+// for enumerating every catalog (database) the server exposes — every
+// ODBC-based tool relies on it. It must not be treated as a literal (and
+// here, nonexistent) catalog named "%", which would otherwise silently
+// produce an empty result via the nonexistent-catalog path above instead of
+// the catalog list. Every SQL Server instance has at least `master`, so this
+// must return at least one row.
+TEST_F(CatalogLiveTest, TablesEnumeratesCatalogsWithBarePercent) {
+    SqlTString percent = ODBCTestUtils::ToSqlTStr("%");
+    SqlTString empty = ODBCTestUtils::ToSqlTStr("");
+    SQLRETURN rc = SQLTables(stmt_, const_cast<SQLTCHAR*>(percent.c_str()), SQL_NTS,
+                             const_cast<SQLTCHAR*>(empty.c_str()), SQL_NTS,
+                             const_cast<SQLTCHAR*>(empty.c_str()), SQL_NTS, nullptr, 0);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_GE(DrainRows(stmt_), 1);
 
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
@@ -200,6 +226,27 @@ TEST_F(CatalogLiveTest, ForeignKeysFindsChildReference) {
     EXPECT_EQ("FKTABLE_CAT", DescribeColName(stmt_, 5));
     EXPECT_EQ("FKTABLE_SCHEM", DescribeColName(stmt_, 6));
     EXPECT_EQ(1, DrainRows(stmt_));
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Supplying two different, both-valid catalog names for the PK and FK sides
+// disagrees about which database the foreign key should be resolved in;
+// msodbcsql forces an empty result set rather than guessing which side the
+// caller meant (sqlcdd.cpp SQLForeignKeysW, lines 984-1008). `master` and
+// `tempdb` are guaranteed to exist on every SQL Server instance.
+TEST_F(CatalogLiveTest, ForeignKeysConflictingCatalogsReturnsEmpty) {
+    SqlTString pkTable = ODBCTestUtils::ToSqlTStr(kParentTable);
+    SqlTString fkTable = ODBCTestUtils::ToSqlTStr(kChildTable);
+    SqlTString pkCatalog = ODBCTestUtils::ToSqlTStr("master");
+    SqlTString fkCatalog = ODBCTestUtils::ToSqlTStr("tempdb");
+    SQLRETURN rc = SQLForeignKeys(
+        stmt_, const_cast<SQLTCHAR*>(pkCatalog.c_str()), SQL_NTS, nullptr, 0,
+        const_cast<SQLTCHAR*>(pkTable.c_str()), SQL_NTS,
+        const_cast<SQLTCHAR*>(fkCatalog.c_str()), SQL_NTS, nullptr, 0,
+        const_cast<SQLTCHAR*>(fkTable.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0, DrainRows(stmt_));
 
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }

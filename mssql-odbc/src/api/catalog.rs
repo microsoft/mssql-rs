@@ -141,6 +141,10 @@ fn qualified_proc_name(catalog: &Arg, proc: &str) -> String {
 /// unchanged so the proc's own wildcard/NULL handling applies; unlike the
 /// dynamic-SQL approach this replaces, no T-SQL string-literal escaping is
 /// needed here — this is RPC parameter *data*, not SQL text.
+///
+/// Trims whitespace around each element (`"TABLE, VIEW"` -> `'TABLE','VIEW'`),
+/// which is more lenient than msodbcsql's non-trimming `ValidateTableType` —
+/// a deliberate, low-risk divergence, not an oversight.
 fn table_type_value(arg: &Arg) -> Arg {
     match arg {
         None => None,
@@ -154,17 +158,66 @@ fn table_type_value(arg: &Arg) -> Arg {
     }
 }
 
+/// Whether `arg` is SQL NULL or a zero-length string once trimmed of nothing —
+/// i.e. "no value supplied", collapsing the `None` (null pointer) vs.
+/// `Some(String::new())` (valid zero-length string) distinction that matters
+/// elsewhere in this module. Used only for the catalog-enumeration-sentinel
+/// check below, where msodbcsql's own `rgcchArg[...] != 0` test makes the same
+/// simplification.
+fn is_blank(arg: &Arg) -> bool {
+    arg.as_deref().is_none_or(str::is_empty)
+}
+
+/// Whether `catalog` is the ODBC-defined bare-`%` catalog-enumeration
+/// sentinel: exactly `"%"`, with the function's name and owner arguments both
+/// blank. `SQLTables(CatalogName="%", SchemaName="", TableName="", ...)` is
+/// the ODBC-mandated idiom for "return the list of catalogs" — every ODBC
+/// client tool relies on it. msodbcsql excludes this exact combination from
+/// three-part qualification *universally*, not only for `SQLTables`
+/// (`sqlcdd.cpp` `DoDD()`, lines 1460-1463: the qualifier-parsing block is
+/// skipped whenever `rgcchArg[QUAL_IND] == 1 && *rglpchArg[QUAL_IND] == '%' &&
+/// rgcchArg[NAME_IND] == 0 && rgcchArg[OWNER_IND] == 0`, regardless of
+/// `bAPI`), so a caller passing this combination to any of the seven
+/// functions gets the unqualified dispatch this returns `true` for. The
+/// stored procedure still receives the literal `"%"` value (see the
+/// `table_qualifier`/`proc_qualifier` RPC parameter in each function below) —
+/// only the three-part *qualification* is skipped, matching msodbcsql exactly.
+///
+/// Deliberately narrower than msodbcsql's full behavior: a wildcard catalog
+/// combined with a non-blank name/owner switches `SQLTables` to a dedicated
+/// `sp_tableswc` proc for pattern-based catalog enumeration (`sqlcdd.cpp`
+/// lines 1468-1486); that path has no ODBC-mandated caller (mssql-python never
+/// exercises it) and is not implemented here — such a combination is treated
+/// as a literal (and typically nonexistent) catalog name, same as any other
+/// catalog value containing `%`.
+fn is_catalog_enumeration_sentinel(catalog: &Arg, name: &Arg, owner: &Arg) -> bool {
+    catalog.as_deref() == Some("%") && is_blank(name) && is_blank(owner)
+}
+
+/// The catalog to use for three-part qualification and the nonexistent-
+/// catalog retry gate in [`run_catalog`] — `catalog` itself unless it is the
+/// enumeration sentinel above, in which case qualification is skipped (`None`)
+/// while the RPC parameter still carries the real value.
+fn qualification_catalog(catalog: &Arg, name: &Arg, owner: &Arg) -> Arg {
+    if is_catalog_enumeration_sentinel(catalog, name, owner) {
+        None
+    } else {
+        catalog.clone()
+    }
+}
+
 /// Whether the application declared ODBC 2.x (`SQLSetEnvAttr(SQL_ATTR_ODBC_VERSION,
 /// SQL_OV_ODBC2)`), read from the parent ENV. Selects `@ODBCVer` / `@fUsePattern`
 /// inclusion exactly as `get_type_info::sql_get_type_info_w_safe` does for
-/// `SQLGetTypeInfo`.
-fn is_2x_app(stmt: &StmtHandle) -> bool {
+/// `SQLGetTypeInfo`. Returns `Err(SQL_ERROR)` on a poisoned ENV mutex instead
+/// of guessing a version, matching `get_type_info.rs`'s identical check.
+fn is_2x_app(stmt: &StmtHandle) -> Result<bool, SqlReturn> {
     let env = stmt.parent_dbc().parent_env();
     let Ok(env_state) = env.inner.lock() else {
         error!("catalog function: env mutex poisoned reading ODBC version");
-        return false;
+        return Err(SQL_ERROR);
     };
-    env_state.odbc_version == OdbcVersion::Odbc2
+    Ok(env_state.odbc_version == OdbcVersion::Odbc2)
 }
 
 /// Runs a catalog-function stored procedure and leaves its result set open
@@ -385,6 +438,7 @@ fn sql_tables_w_safe(
     table_type: Arg,
 ) -> SqlReturn {
     let table_type = table_type_value(&table_type);
+    let qualify_catalog = qualification_catalog(&catalog, &table, &schema);
     let build_params = |unmatchable: bool| {
         let table_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
@@ -394,7 +448,11 @@ fn sql_tables_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(None, SYSNAME_LEN), // table_qualifier: redundant once qualified via proc name
+            // The real catalog value, not just a qualification aid: msodbcsql
+            // sends it too (`sqlcdd.cpp` lines 1745-1757), and `sp_tables`
+            // needs the literal `%` to recognize the catalog-enumeration
+            // idiom (see `is_catalog_enumeration_sentinel`).
+            nvarchar(catalog.as_deref(), SYSNAME_LEN),
             nvarchar(table_type.as_deref(), TABLE_TYPE_LEN),
         ];
         // `@fUsePattern` is Yukon+ only, sent for every 2.x/3.x app since this
@@ -410,7 +468,7 @@ fn sql_tables_w_safe(
         "SQLTablesW",
         stmt,
         "sp_tables",
-        &catalog,
+        &qualify_catalog,
         build_params,
         &[],
         &[(0, "TABLE_CAT"), (1, "TABLE_SCHEM")],
@@ -503,7 +561,11 @@ fn sql_columns_w_safe(
     table: Arg,
     column: Arg,
 ) -> SqlReturn {
-    let is_2x = is_2x_app(stmt);
+    let is_2x = match is_2x_app(stmt) {
+        Ok(is_2x) => is_2x,
+        Err(rc) => return rc,
+    };
+    let qualify_catalog = qualification_catalog(&catalog, &table, &schema);
     let build_params = |unmatchable: bool| {
         let table_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
@@ -513,7 +575,7 @@ fn sql_columns_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(None, SYSNAME_LEN),
+            nvarchar(catalog.as_deref(), SYSNAME_LEN),
             nvarchar(column.as_deref(), SYSNAME_LEN),
         ];
         // `@ODBCVer` / `@fUsePattern` are both sent only for 3.x apps
@@ -532,7 +594,7 @@ fn sql_columns_w_safe(
         "SQLColumnsW",
         stmt,
         "sp_columns_100",
-        &catalog,
+        &qualify_catalog,
         build_params,
         &[2, 3, 4, 5, 10, 13, 16],
         &[
@@ -620,6 +682,7 @@ fn sql_primary_keys_w_safe(
     schema: Arg,
     table: Arg,
 ) -> SqlReturn {
+    let qualify_catalog = qualification_catalog(&catalog, &table, &schema);
     let build_params = |unmatchable: bool| {
         let table_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
@@ -629,7 +692,7 @@ fn sql_primary_keys_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(None, SYSNAME_LEN),
+            nvarchar(catalog.as_deref(), SYSNAME_LEN),
         ];
         (positional, None)
     };
@@ -639,7 +702,7 @@ fn sql_primary_keys_w_safe(
         "SQLPrimaryKeysW",
         stmt,
         "sp_pkeys",
-        &catalog,
+        &qualify_catalog,
         build_params,
         &[2, 3, 4],
         &[(0, "TABLE_CAT"), (1, "TABLE_SCHEM")],
@@ -775,6 +838,7 @@ fn sql_foreign_keys_w_safe(
         (false, true) => (fk_catalog.clone(), false),
         (false, false) => (None, false),
     };
+    let qualify_catalog = qualification_catalog(&catalog, &pk_table, &pk_schema);
 
     let build_params = |unmatchable: bool| {
         let pk_table_name = if unmatchable || catalogs_conflict {
@@ -785,10 +849,10 @@ fn sql_foreign_keys_w_safe(
         let positional = vec![
             nvarchar(pk_table_name.as_deref(), SYSNAME_LEN),
             nvarchar(pk_schema.as_deref(), SYSNAME_LEN),
-            nvarchar(None, SYSNAME_LEN),
+            nvarchar(pk_catalog.as_deref(), SYSNAME_LEN),
             nvarchar(fk_table.as_deref(), SYSNAME_LEN),
             nvarchar(fk_schema.as_deref(), SYSNAME_LEN),
-            nvarchar(None, SYSNAME_LEN),
+            nvarchar(fk_catalog.as_deref(), SYSNAME_LEN),
         ];
         (positional, None)
     };
@@ -798,7 +862,7 @@ fn sql_foreign_keys_w_safe(
         "SQLForeignKeysW",
         stmt,
         "sp_fkeys",
-        &catalog,
+        &qualify_catalog,
         build_params,
         &[2, 3, 6, 7],
         &[
@@ -917,6 +981,7 @@ fn sql_statistics_w_safe(
         "Q"
     };
 
+    let qualify_catalog = qualification_catalog(&catalog, &table, &schema);
     let build_params = |unmatchable: bool| {
         let table_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
@@ -926,7 +991,7 @@ fn sql_statistics_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(None, SYSNAME_LEN),
+            nvarchar(catalog.as_deref(), SYSNAME_LEN),
             // `SQLStatistics` has no per-index argument at the ODBC API level;
             // msodbcsql always passes '%' here since `sp_statistics_100` filters
             // `index_name LIKE @index_name`, which matches nothing on NULL
@@ -943,7 +1008,7 @@ fn sql_statistics_w_safe(
         "SQLStatisticsW",
         stmt,
         "sp_statistics_100",
-        &catalog,
+        &qualify_catalog,
         build_params,
         &[],
         &[
@@ -1083,7 +1148,11 @@ fn sql_special_columns_w_safe(
         && scope != SQL_SCOPE_CURROW
         && (scope != SQL_SCOPE_TRANSACTION || txn_isolation != SQL_TXN_SERIALIZABLE);
 
-    let is_2x = is_2x_app(stmt);
+    let is_2x = match is_2x_app(stmt) {
+        Ok(is_2x) => is_2x,
+        Err(rc) => return rc,
+    };
+    let qualify_catalog = qualification_catalog(&catalog, &table, &schema);
     let build_params = move |unmatchable: bool| {
         let table_name = if unmatchable || force_empty {
             Some(UNMATCHABLE_NAME.to_string())
@@ -1093,7 +1162,7 @@ fn sql_special_columns_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(None, SYSNAME_LEN),
+            nvarchar(catalog.as_deref(), SYSNAME_LEN),
             nvarchar(Some(col_type), 1),
             nvarchar(Some(scope_char), 1),
             nvarchar(Some(nullable_char), 1),
@@ -1111,7 +1180,7 @@ fn sql_special_columns_w_safe(
         "SQLSpecialColumnsW",
         stmt,
         "sp_special_columns_100",
-        &catalog,
+        &qualify_catalog,
         build_params,
         &[1, 2, 3],
         &[
@@ -1196,6 +1265,7 @@ fn sql_procedures_w_safe(
     schema: Arg,
     proc: Arg,
 ) -> SqlReturn {
+    let qualify_catalog = qualification_catalog(&catalog, &proc, &schema);
     let build_params = |unmatchable: bool| {
         let proc_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
@@ -1205,7 +1275,7 @@ fn sql_procedures_w_safe(
         let positional = vec![
             nvarchar(proc_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(None, SYSNAME_LEN),
+            nvarchar(catalog.as_deref(), SYSNAME_LEN),
         ];
         // `SQLProcedures` supports pattern arguments Yukon+
         // (`g_fYukonPatternAsParamArr[fSQLPROCEDURES] == TRUE`, `sqlcdd.cpp`
@@ -1220,7 +1290,7 @@ fn sql_procedures_w_safe(
         "SQLProceduresW",
         stmt,
         "sp_stored_procedures",
-        &catalog,
+        &qualify_catalog,
         build_params,
         &[2],
         &[(0, "PROCEDURE_CAT"), (1, "PROCEDURE_SCHEM")],
@@ -1255,6 +1325,65 @@ mod tests {
         assert!(
             debug.contains("\"@ODBCVer\""),
             "expected an @-prefixed parameter name, got: {debug}"
+        );
+    }
+
+    #[test]
+    fn is_blank_treats_none_and_empty_string_alike() {
+        assert!(is_blank(&None));
+        assert!(is_blank(&Some(String::new())));
+        assert!(!is_blank(&Some("x".to_string())));
+    }
+
+    #[test]
+    fn catalog_enumeration_sentinel_requires_bare_percent_and_blank_name_owner() {
+        let percent = Some("%".to_string());
+        // The exact ODBC idiom: catalog="%", name and owner both blank.
+        assert!(is_catalog_enumeration_sentinel(&percent, &None, &None));
+        assert!(is_catalog_enumeration_sentinel(
+            &percent,
+            &Some(String::new()),
+            &Some(String::new())
+        ));
+        // A non-blank name or owner takes it out of the enumeration idiom.
+        assert!(!is_catalog_enumeration_sentinel(
+            &percent,
+            &Some("t".to_string()),
+            &None
+        ));
+        assert!(!is_catalog_enumeration_sentinel(
+            &percent,
+            &None,
+            &Some("dbo".to_string())
+        ));
+        // A catalog that merely contains '%' (not exactly "%") is a literal
+        // (typically nonexistent) name, not the sentinel.
+        assert!(!is_catalog_enumeration_sentinel(
+            &Some("My%".to_string()),
+            &None,
+            &None
+        ));
+        // No catalog at all is not the sentinel either.
+        assert!(!is_catalog_enumeration_sentinel(&None, &None, &None));
+    }
+
+    #[test]
+    fn qualification_catalog_skips_qualifying_the_enumeration_sentinel() {
+        let percent = Some("%".to_string());
+        // The sentinel must not be used to build a three-part name.
+        assert_eq!(qualification_catalog(&percent, &None, &None), None);
+        // A real catalog name still qualifies normally.
+        let real = Some("MyDb".to_string());
+        assert_eq!(
+            qualification_catalog(&real, &None, &None),
+            Some("MyDb".to_string())
+        );
+        // The sentinel combined with a non-blank name is a literal catalog,
+        // not the enumeration idiom, so it still qualifies (and will fail
+        // to resolve, triggering run_catalog's nonexistent-catalog retry).
+        assert_eq!(
+            qualification_catalog(&percent, &Some("t".to_string()), &None),
+            Some("%".to_string())
         );
     }
 
@@ -1480,31 +1609,145 @@ mod tests {
         );
     }
 
+    /// A named, boxed catalog-function call used by the parameterized
+    /// cursor-state test below.
+    type NamedCall<'a> = (&'a str, Box<dyn Fn() -> SqlReturn>);
+
     #[test]
-    fn open_cursor_returns_24000() {
+    fn open_cursor_returns_24000_for_every_function() {
+        // All seven functions share `run_catalog`'s cursor/exec-state guard;
+        // one test per entry point prevents the gap the single-function
+        // version of this test used to leave for the other six.
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().set_state(STMT_STATE_CURSOR_OPEN);
 
-        let ret = unsafe {
-            sql_tables_w(
-                h.stmt,
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                0,
-            )
-        };
-        assert_eq!(ret, SQL_ERROR);
-        let state = stmt.inner.lock().unwrap();
-        assert_eq!(
-            state.diag_records[0].sql_state,
-            crate::api::sqlstate::SQLSTATE_24000
-        );
+        let calls: [NamedCall; 7] = [
+            (
+                "SQLTablesW",
+                Box::new(move || unsafe {
+                    sql_tables_w(
+                        h.stmt,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                    )
+                }),
+            ),
+            (
+                "SQLColumnsW",
+                Box::new(move || unsafe {
+                    sql_columns_w(
+                        h.stmt,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                    )
+                }),
+            ),
+            (
+                "SQLPrimaryKeysW",
+                Box::new(move || unsafe {
+                    sql_primary_keys_w(
+                        h.stmt,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                    )
+                }),
+            ),
+            (
+                "SQLForeignKeysW",
+                Box::new(move || unsafe {
+                    sql_foreign_keys_w(
+                        h.stmt,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                    )
+                }),
+            ),
+            (
+                "SQLStatisticsW",
+                Box::new(move || unsafe {
+                    sql_statistics_w(
+                        h.stmt,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        0,
+                    )
+                }),
+            ),
+            (
+                "SQLSpecialColumnsW",
+                Box::new(move || unsafe {
+                    sql_special_columns_w(
+                        h.stmt,
+                        1,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        0,
+                    )
+                }),
+            ),
+            (
+                "SQLProceduresW",
+                Box::new(move || unsafe {
+                    sql_procedures_w(
+                        h.stmt,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                    )
+                }),
+            ),
+        ];
+
+        for (name, call) in calls {
+            let ret = call();
+            assert_eq!(ret, SQL_ERROR, "{name}");
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(
+                state.diag_records[0].sql_state,
+                crate::api::sqlstate::SQLSTATE_24000,
+                "{name}"
+            );
+        }
     }
 
     /// `SQL_NTS` re-declared locally to avoid pulling in the full
