@@ -24,6 +24,9 @@ affected code — do not critique pre-existing code outside the PR's scope.
 3. Verify claims against the actual code — do not assume. Read surrounding code when
    a change's correctness depends on context: callers of changed functions,
    implementers of changed traits, and the layer above and below the change.
+4. **Present the review in chat and wait for explicit human confirmation before posting anything to GitHub or ADO.** Inline comments are drafted against `file:line`, not submitted, until they say so.
+5. Ground yourself in reference code and public/private documentation/specifications. If you don't know the codebase, or which references to use, ask for context before reviewing.
+6. 
 
 ## What to Check
 
