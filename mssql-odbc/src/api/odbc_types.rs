@@ -264,6 +264,14 @@ pub const SQL_PARAM_OUTPUT: SqlSmallInt = 4;
 pub const SQL_NO_NULLS: SqlSmallInt = 0;
 pub const SQL_NULLABLE: SqlSmallInt = 1;
 
+// ---- Catalog function argument constants (SQLStatistics / SQLSpecialColumns)
+pub const SQL_INDEX_UNIQUE: SqlUSmallInt = 0;
+pub const SQL_QUICK: SqlUSmallInt = 0;
+pub const SQL_ENSURE: SqlUSmallInt = 1;
+pub const SQL_BEST_ROWID: SqlSmallInt = 1;
+pub const SQL_SCOPE_CURROW: SqlSmallInt = 0;
+pub const SQL_SCOPE_TRANSACTION: SqlSmallInt = 1;
+
 // Diagnostic field identifiers (SQLGetDiagField)
 pub const SQL_DIAG_NUMBER: SqlSmallInt = 2;
 pub const SQL_DIAG_SQLSTATE: SqlSmallInt = 4;

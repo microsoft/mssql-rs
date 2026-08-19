@@ -27,6 +27,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   close) so it surfaces with a `SQL_SUCCESS_WITH_INFO` hint instead of being
   posted under `SQL_NO_DATA`, which many applications never inspect.
 
+- `mssql-odbc`: catalog functions — `SQLTables`, `SQLColumns`, `SQLPrimaryKeys`,
+  `SQLForeignKeys`, `SQLSpecialColumns`, `SQLStatistics`, `SQLProcedures`
+  (W variants). Each dispatches to the matching SQL Server system stored
+  procedure (`sp_tables`, `sp_columns_100`, `sp_pkeys`, `sp_fkeys`,
+  `sp_special_columns_100`, `sp_statistics_100`, `sp_stored_procedures`) via RPC,
+  renames the ODBC 2.x column names those procedures emit to their ODBC 3.x
+  equivalents, and clears the NOT NULL flags the specification mandates —
+  matching msodbcsql. A supplied catalog scopes the call to that database via a
+  three-part qualified procedure name; a nonexistent catalog yields an empty
+  result set instead of an error, also matching msodbcsql.
+
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
