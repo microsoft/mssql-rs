@@ -1189,34 +1189,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_decimal_literal_forms() {
-        assert_eq!(
-            parse_decimal_literal("12.34"),
-            Some(NumericSource::Scaled {
-                mantissa: 1234,
-                scale: 2
-            })
-        );
-        assert_eq!(
-            parse_decimal_literal("-0.01"),
-            Some(NumericSource::Scaled {
-                mantissa: -1,
-                scale: 2
-            })
-        );
-        assert_eq!(
-            parse_decimal_literal("+7"),
-            Some(NumericSource::Scaled {
-                mantissa: 7,
-                scale: 0
-            })
-        );
-        assert_eq!(parse_decimal_literal("1e5"), None);
-        assert_eq!(parse_decimal_literal("abc"), None);
-        assert_eq!(parse_decimal_literal(""), None);
-    }
-
-    #[test]
     fn character_source_into_date_target() {
         let mut out = SqlDateStruct::default();
         let mut ind: SqlLen = 0;
@@ -1576,15 +1548,6 @@ mod tests {
     /// rather than reporting the value as out of range.
     #[test]
     fn scale_beyond_i128_truncates_to_zero() {
-        assert_eq!(
-            NumericSource::Scaled {
-                mantissa: 1,
-                scale: 39
-            }
-            .to_i128_truncating(),
-            Some((0, true))
-        );
-
         let mut out: i32 = -1;
         let mut ind: SqlLen = 0;
         let ok = unsafe {

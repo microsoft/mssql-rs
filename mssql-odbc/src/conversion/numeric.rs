@@ -129,6 +129,15 @@ mod tests {
                 scale: 1
             })
         );
+        // A leading zero in the fraction is absorbed into the mantissa while
+        // scale still counts both digits.
+        assert_eq!(
+            parse_decimal_literal("-0.01"),
+            Some(NumericSource::Scaled {
+                mantissa: -1,
+                scale: 2
+            })
+        );
     }
 
     #[test]

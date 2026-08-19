@@ -331,7 +331,9 @@ pub(super) fn finish_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen};
+    use crate::api::odbc_types::{
+        SQL_C_CHAR, SQL_DEFAULT_PARAM, SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen,
+    };
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
     use crate::test_support::TestHandles;
@@ -417,5 +419,26 @@ mod tests {
         let ret = unsafe { build_named_params(&mut state, 1, "test") };
         assert_eq!(ret.unwrap_err(), SQL_ERROR);
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
+    }
+
+    /// `SQL_DEFAULT_PARAM` is terminal 07S01, not "not yet implemented" —
+    /// asserted through the poster, since the enum-level check cannot catch a
+    /// dropped `post_diag` or the wrong `DiagMsg`.
+    #[test]
+    fn build_named_params_default_param_posts_07s01() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut buf: Vec<u8> = b"x\0".to_vec();
+        let mut ind: SqlLen = SQL_DEFAULT_PARAM;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state
+            .bound_params
+            .push(Some(char_param(&mut buf, &mut ind)));
+
+        let ret = unsafe { build_named_params(&mut state, 1, "test") };
+        assert_eq!(ret.unwrap_err(), SQL_ERROR);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07S01);
     }
 }

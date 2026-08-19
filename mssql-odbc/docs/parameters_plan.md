@@ -344,10 +344,10 @@ accepting a pairing inbound that is rejected outbound for no principled reason.
   correctness issue.
 - **Type matrix and TDS type selection:** tracked by the conversion milestone
   above. `conversion::param_convert` still ignores `sql_type` and emits
-  `(n)varchar(max)`,
-  relying on SQL Server implicit conversion; P3 and P4 drive the wire type from
-  `ParameterType` instead. Beyond this milestone the same work is needed for
-  binary, `uniqueidentifier`, money, decimal, and date/time values.
+  `(n)varchar(max)`, relying on SQL Server implicit conversion; P3 and P4 drive
+  the wire type from `ParameterType` instead. Beyond this milestone the same
+  work is needed for binary, `uniqueidentifier`, money, decimal, and date/time
+  values.
 - **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`), data-at-exec
   (`SQLParamData` / `SQLPutData`), parameter arrays
   (`SQL_ATTR_PARAMSET_SIZE`), and TVPs. Data-at-exec requires an
