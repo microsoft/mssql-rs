@@ -3,12 +3,13 @@
 
 //! Which C type → SQL type parameter conversions the driver can perform.
 //!
-//! Table-driven, mirroring msodbcsql's `fValidConversion` matrix
+//! Table-driven, in the same shape as msodbcsql's `fValidConversion` matrix
 //! (`Sql/Ntdbms/sqlncli/odbc/sqlcmisc.cpp`), which is indexed by C type and
-//! yields the set of legal SQL types. The rows here list only the pairings this
-//! driver implements today; rows and entries are added as each conversion
-//! lands, so a pairing accepted at bind time is always one the execute path can
-//! actually convert.
+//! yields the set of legal SQL types. The semantics differ: that matrix answers
+//! "is this pairing legal?", this one answers "is this pairing implemented?".
+//! The rows here list only the pairings this driver implements today; rows and
+//! entries are added as each conversion lands, so a pairing accepted at bind
+//! time is always one the execute path can actually convert.
 //!
 //! Anything absent is rejected with `07006` at bind time rather than failing
 //! later at execute.
@@ -20,8 +21,8 @@
 //! `07006` from inside its converters (`ConvError::Restricted`) instead.
 
 use crate::api::odbc_types::{
-    SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR, SQL_LONGVARCHAR, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
-    SQL_WVARCHAR, SqlSmallInt,
+    SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_WCHAR, SQL_CHAR, SQL_LONGVARCHAR, SQL_VARCHAR, SQL_WCHAR,
+    SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlSmallInt,
 };
 
 /// SQL types a `SQL_C_CHAR` buffer can be converted to.
@@ -33,6 +34,10 @@ const WCHAR_C_TARGETS: &[SqlSmallInt] = &[SQL_WCHAR, SQL_WVARCHAR, SQL_WLONGVARC
 /// Whether the driver can convert a `c_type` application buffer into `sql_type`
 /// for an input parameter.
 pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt) -> bool {
+    debug_assert_ne!(
+        c_type, SQL_C_DEFAULT,
+        "SQL_C_DEFAULT must be resolved before consulting the conversion matrix"
+    );
     let targets: &[SqlSmallInt] = match c_type {
         SQL_C_CHAR => CHAR_C_TARGETS,
         SQL_C_WCHAR => WCHAR_C_TARGETS,

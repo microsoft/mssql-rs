@@ -55,17 +55,21 @@ transparent reconnects.
   skipping string literals, quoted identifiers, and comments. It stores the
   rewritten SQL and marker count, so repeated `SQLExecute` calls do not re-scan
   the text.
-- **Bind-time type validation** - `api::type_rules` owns the `HY003` gate (every
-  real ODBC C type, including the SQL Server extensions) and classifies SQL data
-  types three ways, like msodbcsql's `IsValidSqlType`: supported, real but with
-  no SQL Server counterpart (`HYC00` - the interval types), or unknown
-  (`HY004`). `params::conversion_matrix` owns the C -> SQL conversion table,
-  shaped like msodbcsql's `fValidConversion` (one row per C type). A C type that
-  is real but not yet convertible returns `07006`, not `HY003`.
+- **Bind-time type validation** - `api::type_rules` canonicalizes the C type
+  (folding the deprecated `SQL_C_DATE` / `SQL_C_TIME` / `SQL_C_TIMESTAMP`
+  spellings onto the `SQL_C_TYPE_*` forms), then applies the `HY003` gate to that
+  canonical form, and classifies SQL data types three ways, like msodbcsql's
+  `IsValidSqlType`: supported, real but with no SQL Server counterpart (`HYC00` -
+  the interval types), or unknown (`HY004`). `params::conversion_matrix` owns the
+  C -> SQL conversion table, shaped like msodbcsql's `fValidConversion` (one row
+  per C type). A C type that is real but not yet convertible returns `07006`, not
+  `HY003`.
 - **`SQL_C_DEFAULT` resolution** - resolved at bind time to the C type implied
-  by `ParameterType` (msodbcsql `Sql2CDefault`, which reads `rgbTRANSTYPE380`
-  for ODBC 3.8+ applications) and stored resolved in `BoundParam`, so the
-  execute path never sees the placeholder.
+  by `ParameterType` and stored resolved in `BoundParam`, so the execute path
+  never sees the placeholder. Version-aware, like msodbcsql's `Sql2CDefault`,
+  which reads `rgbTRANSTYPE` for a 3.51-or-earlier application and
+  `rgbTRANSTYPE380` otherwise: `SQL_SS_TIME2` and `SQL_SS_TIMESTAMPOFFSET`
+  default to `SQL_C_BINARY` below ODBC 3.8.
 - **Value conversion** - `SQL_C_CHAR` maps to varchar and `SQL_C_WCHAR` to
   nvarchar. Indicators support `SQL_NULL_DATA`, `SQL_NTS`, and explicit byte
   length.
@@ -189,9 +193,9 @@ Pure refactor, no behavior change. Create `src/conversion/`:
 
 #### P1 - Parameter type model and conversion matrix (code complete, unmerged)
 
-- [`api/type_rules.rs`](../src/api/type_rules.rs) - the `HY003` / `HY004`
-  identifier gates and `SQL_C_DEFAULT` resolution. Direction-neutral, so it sits
-  in `api` rather than `params`.
+- [`api/type_rules.rs`](../src/api/type_rules.rs) - C-type canonicalization, the
+  `HY003` / `HY004` identifier gates, and version-aware `SQL_C_DEFAULT`
+  resolution. Direction-neutral, so it sits in `api` rather than `params`.
 - [`params/conversion_matrix.rs`](../src/params/conversion_matrix.rs) - one row
   per C type listing the SQL types it converts to. Rows today: `SQL_C_CHAR` ->
   `CHAR` / `VARCHAR` / `LONGVARCHAR`, `SQL_C_WCHAR` -> `WCHAR` / `WVARCHAR` /
@@ -204,10 +208,16 @@ bind until P3 adds its row.
 
 Deviations from msodbcsql, verified against source:
 
-- The driver is ODBC 3.x only, so the 2.x date/time SQL spellings (`SQL_DATE` /
-  `SQL_TIME` / `SQL_TIMESTAMP`, 9-11) are not accepted; the DM maps them to the
-  `SQL_TYPE_*` forms for a 3.x driver. msodbcsql accepts both because its
-  internal representation is the 2.x form.
+- ODBC 3.x reuses the 2.x date/time SQL values: `9` is both `SQL_DATE` (2.x
+  concise) and `SQL_DATETIME` (3.x verbose), and `10` is both `SQL_TIME` and
+  `SQL_INTERVAL`. A `ParameterType` of `9` is therefore ambiguous, so it is
+  rejected (`HY004`) rather than folded - 3.x applications use `SQL_TYPE_*`
+  (91-93), and the DM remaps a 2.x application's spelling first. The C side has
+  no such collision (`SQL_C_DATE` is only ever 9), so `canonical_c_type` folds
+  9-11 onto the `SQL_C_TYPE_*` forms instead of rejecting them. msodbcsql
+  accepts both SQL spellings because it also serves 2.x applications and can
+  disambiguate on the declared version, and it canonicalizes the C pair in the
+  opposite direction, toward its 2.x internal representation.
 - `SQL_C_DEFAULT` resolves the wide character types to `SQL_C_WCHAR` and
   `SQL_GUID` to `SQL_C_GUID`, following the ODBC 3.x default-C-type table.
   msodbcsql's `rgbTRANSTYPE380` resolves both to `SQL_C_CHAR`, an ANSI-transfer
@@ -216,10 +226,14 @@ Deviations from msodbcsql, verified against source:
   registered in
   [`mssql-odbc.instructions.md`](../../.github/instructions/mssql-odbc.instructions.md)
   and on AB#47365.
-- msodbcsql normalizes ODBC 3.x date/time identifiers to their 2.x values and
-  `SQL_DOUBLE` to `SQL_FLOAT` before validating; this driver accepts both
-  spellings directly. Equivalent today, but the normalization will be needed
-  when descriptors land.
+- msodbcsql normalizes types to its internal representation before validating:
+  ODBC 3.x date/time identifiers down to their 2.x values, the SS types to their
+  `*_MAPPED` ids, and `SQL_DOUBLE` to `SQL_FLOAT`. Those exist because its
+  validators and default-type tables are dense arrays indexed by the internal id;
+  this driver matches on the ODBC 3.x values directly and needs no equivalent.
+  `SQL_DOUBLE` and `SQL_FLOAT` are therefore two distinct `Supported` types here
+  that happen to resolve alike - revisit at P3/P4 if numeric matrix rows start
+  duplicating them.
 
 #### P2 - Buffer reader and outcome channel (not started)
 

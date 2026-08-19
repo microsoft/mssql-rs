@@ -336,8 +336,8 @@ pub const SQL_C_TYPE_DATE: SqlSmallInt = 91;
 pub const SQL_C_TYPE_TIME: SqlSmallInt = 92;
 pub const SQL_C_TYPE_TIMESTAMP: SqlSmallInt = 93;
 
-// SQL Server-specific C types (msodbcsql extensions). `SQL_C_TYPES_EXTENDED`
-// is `0x4000`; the two SS date/time C types are offset from it.
+// SQL Server-specific C types (msodbcsql extensions). Values confirmed against
+// msodbcsql's `msodbcsql.h`: `#define SQL_C_TYPES_EXTENDED 0x04000L`.
 pub const SQL_C_TYPES_EXTENDED: SqlSmallInt = 0x4000; // 16384
 pub const SQL_C_SS_TIME2: SqlSmallInt = SQL_C_TYPES_EXTENDED; // 0x4000
 pub const SQL_C_SS_TIMESTAMPOFFSET: SqlSmallInt = SQL_C_TYPES_EXTENDED + 1; // 0x4001

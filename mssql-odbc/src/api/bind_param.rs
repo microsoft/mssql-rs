@@ -12,7 +12,8 @@ use crate::api::odbc_types::{
     SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::type_rules::{
-    SqlTypeSupport, classify_sql_type, is_valid_c_type, resolve_default_c_type,
+    SqlTypeSupport, canonical_c_type, classify_parameter_sql_type, is_valid_c_type,
+    resolve_default_c_type,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -125,11 +126,26 @@ fn sql_bind_parameter_safe(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
+    // The declared ODBC version selects the SQL_C_DEFAULT table. Read it before
+    // the stmt lock to preserve parent-before-child lock ordering.
+    let odbc_version = {
+        let env = stmt.parent_dbc().parent_env();
+        let Ok(env_state) = env.inner.lock() else {
+            error!("SQLBindParameter: env mutex poisoned");
+            return SQL_ERROR;
+        };
+        env_state.odbc_version
+    };
+
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLBindParameter: stmt mutex poisoned");
         return SQL_ERROR;
     };
     free_errors(&mut stmt_state);
+
+    // Fold the deprecated 2.x date/time C spellings onto the SQL_C_TYPE_* forms
+    // so only one form per type reaches validation, conversion, and storage.
+    let value_type = canonical_c_type(value_type);
 
     // ValueType (C type) and ParameterType (SQL type) must be known type
     // identifiers (HY003 / HY004).
@@ -141,7 +157,7 @@ fn sql_bind_parameter_safe(
         post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
         return SQL_ERROR;
     }
-    match classify_sql_type(parameter_type) {
+    match classify_parameter_sql_type(parameter_type) {
         SqlTypeSupport::Supported => {}
         SqlTypeSupport::NotImplemented => {
             error!(
@@ -161,7 +177,13 @@ fn sql_bind_parameter_safe(
     // Resolve SQL_C_DEFAULT here so the execute path never sees the placeholder,
     // matching msodbcsql, which stores the resolved type in the APD.
     let c_type = if value_type == SQL_C_DEFAULT {
-        let Some(resolved) = resolve_default_c_type(parameter_type) else {
+        let Some(resolved) = resolve_default_c_type(parameter_type, odbc_version) else {
+            // Unreachable: every Supported type has a default C type, pinned by
+            // every_supported_sql_type_has_a_default_c_type.
+            debug_assert!(
+                false,
+                "no default C type for supported SQL type {parameter_type}"
+            );
             error!(
                 parameter_type,
                 "SQLBindParameter: no default C type for this SQL type"
@@ -546,6 +568,32 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+    }
+
+    #[test]
+    fn deprecated_c_type_spelling_passes_the_hy003_gate() {
+        // SQL_C_TIMESTAMP is folded to SQL_C_TYPE_TIMESTAMP before validation, so
+        // it must fail on the missing conversion row, not as an unknown C type.
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                crate::api::odbc_types::SQL_C_TIMESTAMP,
+                crate::api::odbc_types::SQL_TYPE_TIMESTAMP,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
     }
 
     #[test]

@@ -202,8 +202,9 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeWideCharParam) {
 
 // SQL_C_DEFAULT + SQL_INTEGER resolves to SQL_C_SLONG, which has no conversion
 // row yet, so the bind is rejected up front instead of failing at execute.
-// msodbcsql supports the pairing, hence the skip. The skip will be removed soon
-// when we implement the conversion.
+// msodbcsql supports the pairing, hence the skip. The skip goes away when P3
+// (integer C to integer SQL) adds the conversion row - see
+// docs/parameters_plan.md.
 TEST_F(PrepareExecuteLiveTest, DefaultCTypeUnsupportedConversionIsRejected) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
@@ -227,6 +228,21 @@ TEST_F(PrepareExecuteLiveTest, IntervalSqlTypeIsRejectedWithHyc00) {
                                     sizeof(value), &ind);
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+}
+
+// Accepted parity deviation (AB#47365): SQL_C_DEFAULT resolves SQL_GUID to
+// SQL_C_GUID per the ODBC 3.x default-C-type table, which has no conversion row
+// yet, so the bind is rejected. msodbcsql's rgbTRANSTYPE380 resolves it to
+// SQL_C_CHAR, which it supports, so the bind succeeds there.
+TEST_F(PrepareExecuteLiveTest, DefaultCTypeGuidIsRejected) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    SQLGUID value = {};
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
+                                    SQL_GUID, 0, 0, &value, sizeof(value), &ind);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07006");
 }
 
 // A NULL-indicator parameter produces a SQL NULL result.

@@ -5,10 +5,10 @@
 //! TDS RPC parameter (`RpcParameter`).
 //!
 //! Which C/SQL pairings reach this module is decided at bind time by
-//! [`crate::params::conversion_matrix`]; `SQL_C_DEFAULT` has already been
-//! resolved to a
-//! concrete C type by then. Data-at-execution and default parameters are
-//! rejected with `HYC00`, and an invalid negative `StrLen_or_Ind` with `HY090`.
+//! [`crate::api::type_rules`] and [`crate::params::conversion_matrix`];
+//! `SQL_C_DEFAULT` has already been resolved to a concrete C type by then.
+//! Data-at-execution and default parameters are rejected with `HYC00`, and an
+//! invalid negative `StrLen_or_Ind` with `HY090`.
 
 use std::slice;
 
