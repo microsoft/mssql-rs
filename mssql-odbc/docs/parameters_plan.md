@@ -69,7 +69,14 @@ transparent reconnects.
   never sees the placeholder. Version-aware, like msodbcsql's `Sql2CDefault`,
   which reads `rgbTRANSTYPE` for a 3.51-or-earlier application and
   `rgbTRANSTYPE380` otherwise: `SQL_SS_TIME2` and `SQL_SS_TIMESTAMPOFFSET`
-  default to `SQL_C_BINARY` below ODBC 3.8.
+  default to `SQL_C_BINARY` below ODBC 3.8. `BoundParam` also records that the
+  binding was defaulted, because a resolved C type alone loses information the
+  execute path still needs - `SQL_DECIMAL` resolves to `SQL_C_CHAR`, and a NULL
+  built from that would go out as a `varchar`. A defaulted binding therefore
+  skips the conversion matrix (the resolved pairing is the SQL type's own
+  default, so it is supported by construction) and builds NULLs from
+  `ParameterType`. `SQL_SS_UDT` and `SQL_SS_TABLE` are still rejected at bind
+  time, since they need a server type name no describe call reports.
 - **Value conversion** - `SQL_C_CHAR` maps to varchar and `SQL_C_WCHAR` to
   nvarchar. Indicators support `SQL_NULL_DATA`, `SQL_NTS`, and explicit byte
   length.
