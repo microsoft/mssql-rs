@@ -683,6 +683,247 @@ pub unsafe extern "C" fn SQLRowCount(
     unsafe { super::row_count::sql_row_count(statement_handle, row_count_ptr) }
 }
 
+// ---- Catalog functions -------------------------------------------------------
+
+/// Returns table, catalog, or schema information.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn SQLTablesW(
+    statement_handle: SqlHandle,
+    catalog_name: *const SqlWChar,
+    name_length_1: SqlSmallInt,
+    schema_name: *const SqlWChar,
+    name_length_2: SqlSmallInt,
+    table_name: *const SqlWChar,
+    name_length_3: SqlSmallInt,
+    table_type: *const SqlWChar,
+    name_length_4: SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::catalog::sql_tables_w(
+            statement_handle,
+            catalog_name,
+            name_length_1,
+            schema_name,
+            name_length_2,
+            table_name,
+            name_length_3,
+            table_type,
+            name_length_4,
+        )
+    }
+}
+
+/// Returns column information for one or more tables.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn SQLColumnsW(
+    statement_handle: SqlHandle,
+    catalog_name: *const SqlWChar,
+    name_length_1: SqlSmallInt,
+    schema_name: *const SqlWChar,
+    name_length_2: SqlSmallInt,
+    table_name: *const SqlWChar,
+    name_length_3: SqlSmallInt,
+    column_name: *const SqlWChar,
+    name_length_4: SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::catalog::sql_columns_w(
+            statement_handle,
+            catalog_name,
+            name_length_1,
+            schema_name,
+            name_length_2,
+            table_name,
+            name_length_3,
+            column_name,
+            name_length_4,
+        )
+    }
+}
+
+/// Returns the columns that make up a table's primary key.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLPrimaryKeysW(
+    statement_handle: SqlHandle,
+    catalog_name: *const SqlWChar,
+    name_length_1: SqlSmallInt,
+    schema_name: *const SqlWChar,
+    name_length_2: SqlSmallInt,
+    table_name: *const SqlWChar,
+    name_length_3: SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::catalog::sql_primary_keys_w(
+            statement_handle,
+            catalog_name,
+            name_length_1,
+            schema_name,
+            name_length_2,
+            table_name,
+            name_length_3,
+        )
+    }
+}
+
+/// Returns the foreign keys in, or referencing, a table.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn SQLForeignKeysW(
+    statement_handle: SqlHandle,
+    pk_catalog_name: *const SqlWChar,
+    name_length_1: SqlSmallInt,
+    pk_schema_name: *const SqlWChar,
+    name_length_2: SqlSmallInt,
+    pk_table_name: *const SqlWChar,
+    name_length_3: SqlSmallInt,
+    fk_catalog_name: *const SqlWChar,
+    name_length_4: SqlSmallInt,
+    fk_schema_name: *const SqlWChar,
+    name_length_5: SqlSmallInt,
+    fk_table_name: *const SqlWChar,
+    name_length_6: SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::catalog::sql_foreign_keys_w(
+            statement_handle,
+            pk_catalog_name,
+            name_length_1,
+            pk_schema_name,
+            name_length_2,
+            pk_table_name,
+            name_length_3,
+            fk_catalog_name,
+            name_length_4,
+            fk_schema_name,
+            name_length_5,
+            fk_table_name,
+            name_length_6,
+        )
+    }
+}
+
+/// Returns index and column statistics for a table.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn SQLStatisticsW(
+    statement_handle: SqlHandle,
+    catalog_name: *const SqlWChar,
+    name_length_1: SqlSmallInt,
+    schema_name: *const SqlWChar,
+    name_length_2: SqlSmallInt,
+    table_name: *const SqlWChar,
+    name_length_3: SqlSmallInt,
+    unique: SqlUSmallInt,
+    reserved: SqlUSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::catalog::sql_statistics_w(
+            statement_handle,
+            catalog_name,
+            name_length_1,
+            schema_name,
+            name_length_2,
+            table_name,
+            name_length_3,
+            unique,
+            reserved,
+        )
+    }
+}
+
+/// Returns the best-fit unique row identifier, or the columns automatically
+/// updated when any value in the row changes.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn SQLSpecialColumnsW(
+    statement_handle: SqlHandle,
+    identifier_type: SqlUSmallInt,
+    catalog_name: *const SqlWChar,
+    name_length_1: SqlSmallInt,
+    schema_name: *const SqlWChar,
+    name_length_2: SqlSmallInt,
+    table_name: *const SqlWChar,
+    name_length_3: SqlSmallInt,
+    scope: SqlUSmallInt,
+    nullable: SqlUSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::catalog::sql_special_columns_w(
+            statement_handle,
+            identifier_type,
+            catalog_name,
+            name_length_1,
+            schema_name,
+            name_length_2,
+            table_name,
+            name_length_3,
+            scope,
+            nullable,
+        )
+    }
+}
+
+/// Returns the stored procedures registered in a data source.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLProceduresW(
+    statement_handle: SqlHandle,
+    catalog_name: *const SqlWChar,
+    name_length_1: SqlSmallInt,
+    schema_name: *const SqlWChar,
+    name_length_2: SqlSmallInt,
+    proc_name: *const SqlWChar,
+    name_length_3: SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::catalog::sql_procedures_w(
+            statement_handle,
+            catalog_name,
+            name_length_1,
+            schema_name,
+            name_length_2,
+            proc_name,
+            name_length_3,
+        )
+    }
+}
+
 // ---- Attribute management (TO-BE-IMPLEMENTED) --------------------------------
 
 /// Retrieves a connection attribute.

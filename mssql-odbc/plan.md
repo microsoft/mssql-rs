@@ -194,10 +194,16 @@ The project is organized into 15 phases grouped by priority. We start with found
 - Positioned updates/deletes via SQLSetPos, SQLBulkOperations
 
 ### Phase 11: Catalog Functions
-- Each catalog function is a canned T-SQL query with a fixed result-set column contract — ship incrementally
-- SQLTables, SQLColumns, SQLPrimaryKeys, SQLForeignKeys, SQLStatistics, SQLSpecialColumns, SQLProcedures, SQLProcedureColumns
-- Results must match msodbcsql column names, types, and ordering exactly
-- Filter arguments (catalog, schema, table name patterns) with proper LIKE/escape handling
+- Each catalog function dispatches to the matching SQL Server system stored
+  procedure via RPC, renames its ODBC 2.x column names to ODBC 3.x, and clears
+  the ODBC-mandated NOT NULL flags — matching msodbcsql (`sqlcdd.cpp` `DoDD()`)
+- **Implemented**: SQLTables, SQLColumns, SQLPrimaryKeys, SQLForeignKeys,
+  SQLStatistics, SQLSpecialColumns, SQLProcedures (AB#46380)
+- **Not yet implemented**: SQLProcedureColumns
+- Results match msodbcsql column names, types, and ordering exactly
+- Filter arguments (catalog, schema, table name patterns) flow through
+  unmodified to the stored procedures, which already implement ODBC's
+  pattern/exact-match argument semantics server-side
 
 ### Phase 12: Polish & Cross-Cutting Concerns
 - Transaction management: SQLEndTran (COMMIT/ROLLBACK), SQLSetConnectAttr for isolation levels (READ COMMITTED, SNAPSHOT, etc.), autocommit on/off

@@ -193,6 +193,16 @@ pub const SQL_API_SQLSETCONNECTATTR: SqlUSmallInt = 1016;
 pub const SQL_API_SQLSETENVATTR: SqlUSmallInt = 1019;
 pub const SQL_API_SQLSETSTMTATTR: SqlUSmallInt = 1020;
 
+// Catalog function identifiers (values from the official ODBC-Specification
+// sql.h/sqlext.h: https://github.com/microsoft/ODBC-Specification).
+pub const SQL_API_SQLCOLUMNS: SqlUSmallInt = 40;
+pub const SQL_API_SQLSPECIALCOLUMNS: SqlUSmallInt = 52;
+pub const SQL_API_SQLSTATISTICS: SqlUSmallInt = 53;
+pub const SQL_API_SQLTABLES: SqlUSmallInt = 54;
+pub const SQL_API_SQLFOREIGNKEYS: SqlUSmallInt = 60;
+pub const SQL_API_SQLPRIMARYKEYS: SqlUSmallInt = 65;
+pub const SQL_API_SQLPROCEDURES: SqlUSmallInt = 67;
+
 // SQLGetInfo info-type identifiers.
 pub const SQL_MAX_DRIVER_CONNECTIONS: SqlUSmallInt = 0;
 pub const SQL_ACTIVE_STATEMENTS: SqlUSmallInt = 1;
@@ -305,6 +315,14 @@ pub const SQL_PARAM_OUTPUT: SqlSmallInt = 4;
 // Values of NULLABLE field in descriptor
 pub const SQL_NO_NULLS: SqlSmallInt = 0;
 pub const SQL_NULLABLE: SqlSmallInt = 1;
+
+// ---- Catalog function argument constants (SQLStatistics / SQLSpecialColumns)
+pub const SQL_INDEX_UNIQUE: SqlUSmallInt = 0;
+pub const SQL_QUICK: SqlUSmallInt = 0;
+pub const SQL_ENSURE: SqlUSmallInt = 1;
+pub const SQL_BEST_ROWID: SqlUSmallInt = 1;
+pub const SQL_SCOPE_CURROW: SqlUSmallInt = 0;
+pub const SQL_SCOPE_TRANSACTION: SqlUSmallInt = 1;
 
 // Diagnostic field identifiers (SQLGetDiagField)
 pub const SQL_DIAG_NUMBER: SqlSmallInt = 2;
