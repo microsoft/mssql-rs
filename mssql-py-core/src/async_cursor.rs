@@ -257,7 +257,7 @@ impl PyAsyncCursor {
                 }
 
                 let options = ExecuteOptions {
-                    timeout: Some(timeout),
+                    timeout: if timeout == 0 { None } else { Some(timeout) },
                     cancel: Some(&claim.cancel_handle),
                     ..Default::default()
                 };
