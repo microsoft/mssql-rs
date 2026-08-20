@@ -170,6 +170,21 @@ def test_execute_ignores_markers_in_quoted_contexts(client_context):
 
 
 @pytest.mark.integration
+def test_execute_ignores_markers_in_nested_block_comments(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            await conn.cursor().execute(
+                "SELECT ? /* outer /* inner */ ignored ? still outer */",
+                42,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize(
     ("operation", "parameters", "message"),
     [
@@ -276,6 +291,29 @@ def test_setinputsizes_survives_synchronous_binding_failure(client_context):
                 """
                 IF SQL_VARIANT_PROPERTY(CAST(? AS sql_variant), 'BaseType') <> 'nvarchar'
                     THROW 50000, 'Input size was consumed by failed binding', 1
+                """,
+                "ascii",
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_setinputsizes_survives_asynchronous_execution_failure(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            cursor.setinputsizes([(-9, 20, 0)])  # SQL_WVARCHAR
+            with pytest.raises(RuntimeError, match="expected failure"):
+                await cursor.execute("THROW 50000, 'expected failure', 1; SELECT ?", "ascii")
+
+            await cursor.execute(
+                """
+                IF SQL_VARIANT_PROPERTY(CAST(? AS sql_variant), 'BaseType') <> 'nvarchar'
+                    THROW 50000, 'Input size was consumed by failed execute', 1
                 """,
                 "ascii",
             )
@@ -557,6 +595,8 @@ def test_table_valued_parameter_surface_and_validation():
         )
     with pytest.raises(ValueError, match="must be 'TypeName' or 'schema.TypeName'"):
         mssql_py_core.TableValuedParameter("database.dbo.OrderLinesType")
+    with pytest.raises(ValueError, match="must not contain ']'"):
+        mssql_py_core.TableValuedParameter("dbo.Order]LinesType")
 
 
 @pytest.mark.integration
@@ -604,6 +644,22 @@ def test_execute_reuses_prepared_statement_when_reset_cursor_is_false(client_con
             sql = "SELECT CAST(? AS int)"
             await cursor.execute(sql, 1)
             assert await cursor.execute(sql, 2, reset_cursor=False) is cursor
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("reset_cursor", [True, False])
+def test_execute_reprepares_when_parameter_metadata_changes(client_context, reset_cursor):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            sql = "IF LEN(?) <> ? THROW 50000, 'parameter metadata was stale', 1"
+            await cursor.execute(sql, "a", 1, reset_cursor=reset_cursor)
+            await cursor.execute(sql, "abcdef", 6, reset_cursor=reset_cursor)
         finally:
             await conn.close()
 

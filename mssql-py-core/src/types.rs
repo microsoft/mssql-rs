@@ -325,6 +325,9 @@ pub(crate) fn null_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
         -5 => SqlType::BigInt(None),
         7 => SqlType::Real(None),
         6 | 8 => SqlType::Float(None),
+        // TODO(mssql-tds): Nullable Decimal/Numeric variants must carry
+        // precision and scale independently of a value. SqlType currently
+        // falls back to (18,10), so py-core cannot preserve these hints here.
         2 => SqlType::Numeric(None),
         3 => SqlType::Decimal(None),
         1 => SqlType::Char(None, checked_length(size, 8_000, "CHAR")?),

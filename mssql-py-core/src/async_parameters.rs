@@ -10,6 +10,63 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::types::{ParameterHint, null_sql_type, py_to_sql_type, py_to_sql_type_with_hint};
 
+fn sql_type_signature(value: &SqlType) -> String {
+    match value {
+        SqlType::Bit(_) => "bit".to_string(),
+        SqlType::TinyInt(_) => "tinyint".to_string(),
+        SqlType::SmallInt(_) => "smallint".to_string(),
+        SqlType::Int(_) => "int".to_string(),
+        SqlType::BigInt(_) => "bigint".to_string(),
+        SqlType::Real(_) => "real".to_string(),
+        SqlType::Float(_) => "float".to_string(),
+        SqlType::Decimal(value) => value.as_ref().map_or_else(
+            || "decimal(18,10)".to_string(),
+            |value| format!("decimal({},{})", value.precision, value.scale),
+        ),
+        SqlType::Numeric(value) => value.as_ref().map_or_else(
+            || "numeric(18,10)".to_string(),
+            |value| format!("numeric({},{})", value.precision, value.scale),
+        ),
+        SqlType::Money(_) => "money".to_string(),
+        SqlType::SmallMoney(_) => "smallmoney".to_string(),
+        SqlType::Time(value) => format!("time({})", value.as_ref().map_or(7, |value| value.scale)),
+        SqlType::DateTime2(value) => format!(
+            "datetime2({})",
+            value.as_ref().map_or(7, |value| value.time.scale)
+        ),
+        SqlType::DateTimeOffset(value) => format!(
+            "datetimeoffset({})",
+            value.as_ref().map_or(7, |value| value.datetime2.time.scale)
+        ),
+        SqlType::SmallDateTime(_) => "smalldatetime".to_string(),
+        SqlType::DateTime(_) => "datetime".to_string(),
+        SqlType::Date(_) => "date".to_string(),
+        SqlType::NVarchar(_, length) => format!("nvarchar({length})"),
+        SqlType::NVarcharMax(_) => "nvarchar(max)".to_string(),
+        SqlType::Varchar(_, length) => format!("varchar({length})"),
+        SqlType::VarcharMax(_) => "varchar(max)".to_string(),
+        SqlType::VarBinary(_, length) => format!("varbinary({length})"),
+        SqlType::VarBinaryMax(_) => "varbinary(max)".to_string(),
+        SqlType::Binary(_, length) => format!("binary({length})"),
+        SqlType::Char(_, length) => format!("char({length})"),
+        SqlType::NChar(_, length) => format!("nchar({length})"),
+        SqlType::Text(_) => "text".to_string(),
+        SqlType::NText(_) => "ntext".to_string(),
+        SqlType::Json(_) => "json".to_string(),
+        SqlType::Xml(_) => "xml".to_string(),
+        SqlType::Uuid(_) => "uniqueidentifier".to_string(),
+        SqlType::Vector(_, dimensions, base_type) => {
+            format!("vector({dimensions},{base_type:?})")
+        }
+        SqlType::Variant(inner) => format!("sql_variant<{}>", sql_type_signature(inner)),
+        SqlType::Table(type_name, _) => format!(
+            "tvp({}.{})",
+            type_name.schema_name.as_deref().unwrap_or("dbo"),
+            type_name.type_name
+        ),
+    }
+}
+
 #[pyclass(name = "TableValuedParameter", frozen)]
 pub(crate) struct PyTableValuedParameter {
     type_name: TvpTypeName,
@@ -96,6 +153,17 @@ fn parse_tvp_type_name(type_name: String, schema: Option<String>) -> PyResult<Tv
             "TVP schema and type name must not be empty",
         ));
     }
+    // TODO(mssql-tds): Escape closing brackets when formatting TVP parameter
+    // declarations. Until then, reject names that cannot be represented safely.
+    if type_name.contains(']')
+        || schema_name
+            .as_deref()
+            .is_some_and(|schema| schema.contains(']'))
+    {
+        return Err(PyValueError::new_err(
+            "TVP schema and type name must not contain ']'",
+        ));
+    }
     Ok(TvpTypeName::new(schema_name, type_name.to_string()))
 }
 
@@ -161,9 +229,9 @@ pub(crate) fn bind_parameters(
     operation: String,
     parameters: &Bound<'_, PyTuple>,
     hints: Option<&[ParameterHint]>,
-) -> PyResult<(String, Vec<RpcParameter>)> {
+) -> PyResult<(String, Vec<RpcParameter>, Vec<String>)> {
     if parameters.is_empty() {
-        return Ok((operation, Vec::new()));
+        return Ok((operation, Vec::new(), Vec::new()));
     }
 
     if parameters.len() == 1 {
@@ -226,7 +294,7 @@ fn bind_positional<'py>(
     operation: String,
     values: impl Iterator<Item = Bound<'py, PyAny>>,
     hints: Option<&[ParameterHint]>,
-) -> PyResult<(String, Vec<RpcParameter>)> {
+) -> PyResult<(String, Vec<RpcParameter>, Vec<String>)> {
     let values = values.collect::<Vec<_>>();
     let (operation, names) = rewrite_placeholders(&operation, false)?;
     if names.len() != values.len() {
@@ -236,7 +304,7 @@ fn bind_positional<'py>(
             values.len()
         )));
     }
-    let parameters = names
+    let bound_parameters = names
         .into_iter()
         .zip(values)
         .enumerate()
@@ -247,17 +315,18 @@ fn bind_positional<'py>(
                 hints.and_then(|hints| hints.get(index)),
             )
         })
-        .collect::<PyResult<_>>()?;
-    Ok((operation, parameters))
+        .collect::<PyResult<Vec<_>>>()?;
+    let (parameters, parameter_signature) = bound_parameters.into_iter().unzip();
+    Ok((operation, parameters, parameter_signature))
 }
 
 fn bind_named(
     operation: String,
     values: &Bound<'_, PyDict>,
     hints: Option<&[ParameterHint]>,
-) -> PyResult<(String, Vec<RpcParameter>)> {
+) -> PyResult<(String, Vec<RpcParameter>, Vec<String>)> {
     let (operation, names) = rewrite_placeholders(&operation, true)?;
-    let parameters = names
+    let bound_parameters = names
         .into_iter()
         .enumerate()
         .map(|(index, placeholder)| {
@@ -273,15 +342,16 @@ fn bind_named(
                 hints.and_then(|hints| hints.get(index)),
             )
         })
-        .collect::<PyResult<_>>()?;
-    Ok((operation, parameters))
+        .collect::<PyResult<Vec<_>>>()?;
+    let (parameters, parameter_signature) = bound_parameters.into_iter().unzip();
+    Ok((operation, parameters, parameter_signature))
 }
 
 fn rpc_parameter(
     name: String,
     value: &Bound<'_, PyAny>,
     hint: Option<&ParameterHint>,
-) -> PyResult<RpcParameter> {
+) -> PyResult<(RpcParameter, String)> {
     let (value, status) = if let Ok(tvp) = value.extract::<PyRef<'_, PyTableValuedParameter>>() {
         if hint.is_some() {
             return Err(PyTypeError::new_err(
@@ -304,7 +374,8 @@ fn rpc_parameter(
             StatusFlags::NONE,
         )
     };
-    Ok(RpcParameter::new(Some(name), status, value))
+    let signature = sql_type_signature(&value);
+    Ok((RpcParameter::new(Some(name), status, value), signature))
 }
 
 fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeholder>)> {
@@ -312,6 +383,7 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
     let mut output = String::with_capacity(sql.len());
     let mut names = Vec::new();
     let mut state = ScanState::Normal;
+    let mut block_comment_depth = 0usize;
     let mut index = 0;
 
     while index < chars.len() {
@@ -338,6 +410,7 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                 }
                 ('/', Some('*')) => {
                     state = ScanState::BlockComment;
+                    block_comment_depth = 1;
                     output.push_str("/*");
                     index += 1;
                 }
@@ -427,11 +500,19 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                 }
             }
             ScanState::BlockComment => {
-                output.push(current);
-                if current == '*' && next == Some('/') {
-                    output.push('/');
+                if current == '/' && next == Some('*') {
+                    output.push_str("/*");
                     index += 1;
-                    state = ScanState::Normal;
+                    block_comment_depth += 1;
+                } else if current == '*' && next == Some('/') {
+                    output.push_str("*/");
+                    index += 1;
+                    block_comment_depth -= 1;
+                    if block_comment_depth == 0 {
+                        state = ScanState::Normal;
+                    }
+                } else {
+                    output.push(current);
                 }
             }
         }
@@ -531,7 +612,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "sync compatibility gap: nested SQL Server block comments are not tracked"]
     fn preserves_markers_in_nested_block_comments() {
         let sql = "SELECT /* outer /* inner */ ? still outer */ ?";
         let (sql, names) = rewrite_placeholders(sql, false).unwrap();

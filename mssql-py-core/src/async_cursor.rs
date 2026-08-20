@@ -43,6 +43,7 @@ use crate::async_session::{AsyncConnectionState, ClaimError, CursorId, Operation
 #[derive(Default)]
 struct PreparedState {
     statement: Option<PreparedStatement>,
+    parameter_signature: Vec<String>,
     orphaned: Option<StatementId>,
 }
 
@@ -133,6 +134,7 @@ pub struct PyAsyncCursor {
     /// path unless overridden per-call.
     default_query_timeout: u32,
     input_sizes: Option<Vec<crate::types::ParameterHint>>,
+    input_sizes_generation: u64,
 }
 
 impl PyAsyncCursor {
@@ -156,6 +158,7 @@ impl PyAsyncCursor {
             cursor_id,
             default_query_timeout,
             input_sizes: None,
+            input_sizes_generation: 0,
         }
     }
 }
@@ -171,6 +174,7 @@ impl PyAsyncCursor {
     /// Set one-shot SQL type, size, and scale hints for the next successful execute.
     fn setinputsizes(&mut self, sizes: &Bound<'_, PyAny>) -> PyResult<()> {
         self.input_sizes = parse_input_sizes(sizes)?;
+        self.input_sizes_generation = self.input_sizes_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -187,6 +191,7 @@ impl PyAsyncCursor {
         let (
             operation,
             rpc_parameters,
+            parameter_signature,
             client,
             dispatch,
             prepared_state,
@@ -194,18 +199,19 @@ impl PyAsyncCursor {
             session_state,
             cursor_id,
             timeout,
+            input_sizes_generation,
         ) = {
-            let mut cursor = slf.borrow_mut(py);
+            let cursor = slf.borrow(py);
             // TODO(async execute preflight): Parameter normalization and Python-to-TDS
             // conversion currently run synchronously under the GIL before the awaitable is
             // returned. Bound or chunk large parameter/TVP conversion so execute does not
             // block the caller's event-loop thread during preflight.
-            let (operation, rpc_parameters) =
+            let (operation, rpc_parameters, parameter_signature) =
                 bind_parameters(operation, parameters, cursor.input_sizes.as_deref())?;
-            cursor.input_sizes = None;
             (
                 operation,
                 rpc_parameters,
+                parameter_signature,
                 cursor.tds_client.clone(),
                 cursor.tracing_dispatch.clone(),
                 cursor.prepared_state.clone(),
@@ -213,6 +219,7 @@ impl PyAsyncCursor {
                 cursor.session_state.clone(),
                 cursor.cursor_id,
                 cursor.default_query_timeout,
+                cursor.input_sizes_generation,
             )
         };
         let claim = session_state
@@ -248,10 +255,12 @@ impl PyAsyncCursor {
                 };
                 let first = if use_prepare {
                     let mut state = prepared_state.lock().await;
-                    let replace_statement = state
-                        .statement
-                        .as_ref()
-                        .is_none_or(|statement| statement.sql() != operation);
+                    let replace_statement = reset_cursor
+                        || state
+                            .statement
+                            .as_ref()
+                            .is_none_or(|statement| statement.sql() != operation)
+                        || state.parameter_signature != parameter_signature;
                     if replace_statement {
                         if let Some(mut statement) = state.statement.take()
                             && let Some(statement_id) = statement.take_id()
@@ -259,9 +268,11 @@ impl PyAsyncCursor {
                             state.orphaned = Some(statement_id);
                         }
                         state.statement = Some(PreparedStatement::new(operation));
+                        state.parameter_signature = parameter_signature;
                     }
                     let PreparedState {
                         statement,
+                        parameter_signature: _,
                         orphaned,
                     } = &mut *state;
                     client
@@ -291,6 +302,12 @@ impl PyAsyncCursor {
             match result {
                 Ok(has_open_batch) => {
                     execute_guard.complete(has_open_batch);
+                    Python::attach(|py| {
+                        let mut cursor = slf.borrow_mut(py);
+                        if cursor.input_sizes_generation == input_sizes_generation {
+                            cursor.input_sizes = None;
+                        }
+                    });
                     tracing::info!("PyAsyncCursor::execute: query executed successfully");
                     Ok(slf)
                 }
