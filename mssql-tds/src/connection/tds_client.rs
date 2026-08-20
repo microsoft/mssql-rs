@@ -9275,7 +9275,6 @@ mod tests {
     #[tokio::test]
     async fn begin_rejects_unnamed_data_at_exec_param() {
         let mut client = create_test_client_with_tokens(vec![]);
-
         let bad =
             RpcParameter::data_at_exec(None, StatusFlags::NONE, StreamedSqlType::VarBinaryMax);
 
@@ -9287,6 +9286,95 @@ mod tests {
         assert!(matches!(
             client.streamed_write_state,
             StreamedWriteState::Idle
+        ));
+    }
+
+    /// All non-streaming execute entry points must reject data-at-exec params
+    /// with a usage error instead of panicking or writing malformed RPC values.
+    #[tokio::test]
+    async fn execute_sp_executesql_rejects_data_at_exec_params() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let err = client
+            .execute_sp_executesql("SELECT @v".to_string(), vec![streamed_varbinary("@v")], ())
+            .await
+            .expect_err("streamed params are only valid via begin_sp_executesql");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_stored_procedure_rejects_data_at_exec_params() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let err = client
+            .execute_stored_procedure(
+                "dbo.p".to_string(),
+                None,
+                Some(vec![streamed_varbinary("@v")]),
+                (),
+            )
+            .await
+            .expect_err("streamed params are only valid via begin_sp_executesql");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_rejects_data_at_exec_params() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let mut statement = PreparedStatement::new("SELECT @v");
+        let mut orphaned = None;
+        let err = client
+            .execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect_err("streamed params are only valid via begin_sp_executesql");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// Cancelling while idle must be a no-op that keeps the connection reusable.
+    #[tokio::test]
+    async fn cancel_streamed_write_on_idle_client_is_noop() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        client.cancel_streamed_write().await;
+        assert!(
+            !client.is_connection_dead(),
+            "cancelling while idle must not kill a reusable connection"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    /// Cancelling an active streamed write must discard parked state and mark
+    /// the connection dead so it cannot be reused by a pool checkout.
+    #[tokio::test]
+    async fn cancel_streamed_write_aborts_active_stream_and_marks_connection_dead() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .expect("begin must park for streamed value");
+        assert!(matches!(
+            status,
+            StreamedParamStatus::NeedData { param_name: _ }
+        ));
+
+        client.cancel_streamed_write().await;
+
+        assert!(
+            client.is_connection_dead(),
+            "an aborted streamed write must not hand a live-looking connection back to the pool"
+        );
+        assert!(matches!(
+            client.write_streamed_chunk(&[0x01]).await,
+            Err(UsageError(_))
         ));
     }
 
