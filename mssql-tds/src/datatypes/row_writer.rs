@@ -7,7 +7,7 @@ use crate::datatypes::column_values::{
 };
 use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sql_json::SqlJson;
-use crate::datatypes::sql_string::SqlString;
+use crate::datatypes::sql_string::{EncodingType, SqlString};
 use crate::datatypes::sql_vector::SqlVector;
 use crate::datatypes::sqldatatypes::TdsDataType;
 use uuid::Uuid;
@@ -72,6 +72,20 @@ pub trait RowWriter {
     fn write_variant_base_type(&mut self, _col: usize, _base: TdsDataType) {}
     /// Signals the end of the current row.
     fn end_row(&mut self);
+
+    /// Writes packet-backed encoded string bytes before the packet buffer is
+    /// reused.
+    ///
+    /// `bytes` is the value in its wire encoding. The default copies, so a
+    /// writer that does not override this behaves exactly as before.
+    fn write_string_ref(&mut self, col: usize, bytes: &[u8], encoding_type: &EncodingType) {
+        self.write_string(col, SqlString::new(bytes.to_vec(), encoding_type.clone()));
+    }
+
+    /// Writes packet-backed binary bytes before the packet buffer is reused.
+    fn write_bytes_ref(&mut self, col: usize, bytes: &[u8]) {
+        self.write_bytes(col, bytes.to_vec());
+    }
 }
 
 /// Default implementation that assembles `Vec<ColumnValues>`, preserving

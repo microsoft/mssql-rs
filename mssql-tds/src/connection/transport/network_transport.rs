@@ -1131,6 +1131,11 @@ impl TdsPacketReader for NetworkTransport {
     }
 
     #[inline(always)]
+    fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+        self.tds_read_buffer.try_read_slice(length)
+    }
+
+    #[inline(always)]
     fn try_read_uint24(&mut self) -> Option<u32> {
         self.tds_read_buffer.try_read_uint24()
     }
@@ -2945,6 +2950,45 @@ pub(crate) mod tests {
         assert_eq!(reader.try_read_float64(), None);
         assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 7);
         assert_eq!(reader.read_float64().await.unwrap(), expected_float64);
+    }
+
+    #[tokio::test]
+    async fn test_slice_probe_hits_within_a_packet() {
+        let payload: Vec<u8> = (0..32u8).collect();
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let stream = packet.append_bytes(&payload).build();
+
+        let mut reader = create_network_transport_with_data(&stream);
+
+        // Nothing is buffered until the first awaiting read pulls a packet in.
+        assert_eq!(reader.try_read_slice(1), None);
+        assert_eq!(reader.read_byte().await.unwrap(), 0);
+
+        // The rest of the packet is now resident, so the probe serves it.
+        assert_eq!(reader.try_read_slice(31), Some(&payload[1..]));
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_slice_probe_falls_back_across_a_packet_boundary() {
+        // Ten bytes split five and five, so a value crossing the split is never
+        // resident in one packet. That is the case the borrowed path declines.
+        let mut first = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut second = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut stream = first.append_bytes(&[0, 1, 2, 3, 4]).build();
+        stream.extend_from_slice(&second.append_bytes(&[5, 6, 7, 8, 9]).build());
+
+        let mut reader = create_network_transport_with_data(&stream);
+        assert_eq!(reader.read_byte().await.unwrap(), 0);
+
+        // Four bytes left in this packet, so a nine byte value misses.
+        assert_eq!(reader.try_read_slice(9), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 4);
+
+        // The miss must leave those four bytes for the awaiting read.
+        let mut owned = vec![0u8; 9];
+        reader.read_bytes(&mut owned).await.unwrap();
+        assert_eq!(owned, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     /// A payload-free non-EOM packet is malformed: it neither carries payload
