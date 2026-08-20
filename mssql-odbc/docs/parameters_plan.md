@@ -347,6 +347,11 @@ all verified against msodbcsql source.
   assertions with `SKIP_IF_COMPARING_MSODBCSQL()`.
 - Add `Benefits-from-mock-tds:` notes where only the round-tripped value is
   observable and the declared RPC type is not.
+- Settle one open `HY009` question: msodbcsql treats a null data pointer with a
+  zero count as `SQL_NULL_DATA` on the `SQLPutData` path (`sqlccmd.cpp:4494`).
+  If that convention also holds for a bound buffer, `SQL_C_CHAR` with a null
+  pointer and `*ind == 0` is NULL there and `HY009` here. Not settleable from
+  the source; needs a `--compare-with-msodbcsql` run on that exact binding.
 
 #### P7 - Cleanup and hooks (not started)
 
