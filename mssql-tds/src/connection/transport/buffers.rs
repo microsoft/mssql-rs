@@ -68,6 +68,19 @@ impl TdsReadBuffer {
         self.try_read_array().map(|[value]| value)
     }
 
+    // consume_bytes only moves buffer_position, so the bytes stay readable until
+    // the next packet read overwrites working_buffer. That read needs &mut self,
+    // which is what bounds the returned borrow.
+    #[inline(always)]
+    pub(crate) fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+        if !self.do_we_have_enough_data(length) {
+            return None;
+        }
+        let start = self.buffer_position;
+        self.consume_bytes(length);
+        Some(&self.working_buffer[start..start + length])
+    }
+
     #[inline(always)]
     pub(crate) fn try_read_int16(&mut self) -> Option<i16> {
         self.try_read_array().map(i16::from_le_bytes)
@@ -558,6 +571,67 @@ mod tests {
         assert_miss_does_not_consume!(7, try_read_int64);
         assert_miss_does_not_consume!(3, try_read_float32);
         assert_miss_does_not_consume!(7, try_read_float64);
+    }
+
+    #[test]
+    fn test_slice_probe_reads_and_consumes() {
+        let payload: Vec<u8> = (0..64u8).collect();
+
+        let mut buf = TdsReadBuffer::new(4096);
+        buf.working_buffer[..payload.len()].copy_from_slice(&payload);
+        buf.reset_to_length(payload.len());
+
+        assert_eq!(buf.try_read_slice(16), Some(&payload[..16]));
+        assert_eq!(buf.buffer_position, 16);
+        assert_eq!(buf.get_remaining_byte_count(), 48);
+
+        // A second probe has to resume where the first stopped.
+        assert_eq!(buf.try_read_slice(48), Some(&payload[16..]));
+        assert_eq!(buf.get_remaining_byte_count(), 0);
+    }
+
+    #[test]
+    fn test_slice_probe_zero_length_is_a_hit() {
+        let mut buf = TdsReadBuffer::new(4096);
+        buf.reset_to_length(0);
+
+        assert_eq!(buf.try_read_slice(0), Some(&[][..]));
+        assert_eq!(buf.buffer_position, 0);
+    }
+
+    #[test]
+    fn test_slice_probe_miss_does_not_consume() {
+        let payload: Vec<u8> = (0..8u8).collect();
+
+        let mut buf = TdsReadBuffer::new(4096);
+        buf.working_buffer[..payload.len()].copy_from_slice(&payload);
+        buf.reset_to_length(payload.len());
+
+        // One byte short of the request, which is what a value straddling a
+        // packet boundary looks like from here.
+        assert_eq!(buf.try_read_slice(9), None);
+        assert_eq!(buf.buffer_position, 0);
+        assert_eq!(buf.get_remaining_byte_count(), payload.len());
+
+        // The bytes that were present must survive the miss for the owned path.
+        assert_eq!(buf.try_read_slice(8), Some(&payload[..]));
+    }
+
+    #[test]
+    fn test_slice_probe_miss_preserves_partial_bytes_mid_buffer() {
+        let payload: Vec<u8> = (0..32u8).collect();
+
+        let mut buf = TdsReadBuffer::new(4096);
+        buf.working_buffer[..payload.len()].copy_from_slice(&payload);
+        buf.reset_to_length(payload.len());
+
+        assert_eq!(buf.try_read_slice(20), Some(&payload[..20]));
+
+        // 12 bytes remain, so a 13 byte value misses and leaves them untouched.
+        assert_eq!(buf.try_read_slice(13), None);
+        assert_eq!(buf.buffer_position, 20);
+        assert_eq!(buf.get_remaining_byte_count(), 12);
+        assert_eq!(buf.try_read_slice(12), Some(&payload[20..]));
     }
 
     #[test]

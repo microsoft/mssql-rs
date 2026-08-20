@@ -1335,9 +1335,13 @@ impl GenericDecoder {
                             "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
                         )));
                     }
-                    let mut bytes = vec![0u8; length as usize];
-                    reader.read_bytes(&mut bytes).await?;
-                    writer.write_bytes(col, bytes);
+                    if let Some(bytes) = reader.try_read_slice(length as usize) {
+                        writer.write_bytes_ref(col, bytes);
+                    } else {
+                        let mut bytes = vec![0u8; length as usize];
+                        reader.read_bytes(&mut bytes).await?;
+                        writer.write_bytes(col, bytes);
+                    }
                 }
             }
             TdsDataType::BigVarBinary => {
@@ -1357,9 +1361,13 @@ impl GenericDecoder {
                                 "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
                             )));
                         }
-                        let mut bytes = vec![0u8; length as usize];
-                        reader.read_bytes(&mut bytes).await?;
-                        writer.write_bytes(col, bytes);
+                        if let Some(bytes) = reader.try_read_slice(length as usize) {
+                            writer.write_bytes_ref(col, bytes);
+                        } else {
+                            let mut bytes = vec![0u8; length as usize];
+                            reader.read_bytes(&mut bytes).await?;
+                            writer.write_bytes(col, bytes);
+                        }
                     }
                 }
             }
@@ -1880,6 +1888,8 @@ impl StringDecoder {
             let length = read_sync_first!(reader, try_read_uint16, read_uint16) as usize;
             if length == 0xFFFF {
                 writer.write_null(col);
+            } else if let Some(bytes) = reader.try_read_slice(length) {
+                writer.write_string_ref(col, bytes, &encoding_type);
             } else {
                 let mut buffer = vec![0u8; length];
                 reader.read_bytes(&mut buffer).await?;
@@ -3365,11 +3375,27 @@ mod test {
         struct ByteReader {
             data: Vec<u8>,
             pos: usize,
+            // Set to model a value that straddles a packet, so the decoder has to
+            // take the owned arm even though the bytes are present here.
+            deny_slices: bool,
         }
 
         impl ByteReader {
-            fn new(data: Vec<u8>) -> Self {
-                Self { data, pos: 0 }
+            pub(super) fn new(data: Vec<u8>) -> Self {
+                Self {
+                    data,
+                    pos: 0,
+                    deny_slices: false,
+                }
+            }
+
+            /// A reader that never hands out a borrow, forcing the owned path.
+            pub(super) fn new_unbuffered(data: Vec<u8>) -> Self {
+                Self {
+                    data,
+                    pos: 0,
+                    deny_slices: true,
+                }
             }
 
             fn take(&mut self, n: usize) -> TdsResult<&[u8]> {
@@ -3393,6 +3419,18 @@ mod test {
         }
 
         impl TdsPacketReader for ByteReader {
+            fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+                if self.deny_slices {
+                    return None;
+                }
+                let end = self.pos.checked_add(length)?;
+                if end > self.data.len() {
+                    return None;
+                }
+                let start = self.pos;
+                self.pos = end;
+                Some(&self.data[start..end])
+            }
             fn try_read_byte(&mut self) -> Option<u8> {
                 self.try_take().map(|[value]| value)
             }
@@ -3700,6 +3738,108 @@ mod test {
                 writer.take_row()[0],
                 ColumnValues::Bytes(vec![0x01, 0x02, 0x03])
             );
+        }
+
+        /// Decodes `wire` twice, once through a reader that hands out borrows and
+        /// once through one that never does, and asserts both produce the same
+        /// value. Returns it so a caller can assert on the content too.
+        async fn borrowed_and_owned_agree(wire: Vec<u8>, md: &ColumnMetadata) -> ColumnValues {
+            let decoder = GenericDecoder::default();
+
+            let mut borrowed_writer = DefaultRowWriter::new(1);
+            let mut borrowed_reader = ByteReader::new(wire.clone());
+            decoder
+                .decode_into(&mut borrowed_reader, md, 0, &mut borrowed_writer)
+                .await
+                .unwrap();
+            let borrowed = borrowed_writer.take_row()[0].clone();
+
+            let mut owned_writer = DefaultRowWriter::new(1);
+            let mut owned_reader = ByteReader::new_unbuffered(wire);
+            decoder
+                .decode_into(&mut owned_reader, md, 0, &mut owned_writer)
+                .await
+                .unwrap();
+            let owned = owned_writer.take_row()[0].clone();
+
+            assert_eq!(borrowed, owned, "borrowed arm disagreed with the owned arm");
+            borrowed
+        }
+
+        /// `varlen_metadata` carries no collation, so these use `NVarChar`,
+        /// whose UTF-16 encoding needs none. Wire form is a u16 byte count
+        /// followed by UTF-16LE code units.
+        fn nvarchar_wire(text: &str) -> Vec<u8> {
+            let payload: Vec<u8> = text
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect();
+            let mut wire = (payload.len() as u16).to_le_bytes().to_vec();
+            wire.extend_from_slice(&payload);
+            wire
+        }
+
+        #[tokio::test]
+        async fn short_string_borrowed_matches_owned() {
+            let md = varlen_metadata(TdsDataType::NVarChar, 100);
+            let value = borrowed_and_owned_agree(nvarchar_wire("abcdef"), &md).await;
+            match value {
+                ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "abcdef"),
+                other => panic!("expected a string, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn short_string_empty_borrowed_matches_owned() {
+            let md = varlen_metadata(TdsDataType::NVarChar, 100);
+            let value = borrowed_and_owned_agree(nvarchar_wire(""), &md).await;
+            match value {
+                ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), ""),
+                other => panic!("expected a string, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn short_string_null_borrowed_matches_owned() {
+            let md = varlen_metadata(TdsDataType::NVarChar, 100);
+            let value = borrowed_and_owned_agree(vec![0xFF, 0xFF], &md).await;
+            assert_eq!(value, ColumnValues::Null);
+        }
+
+        #[tokio::test]
+        async fn short_binary_borrowed_matches_owned() {
+            let md = varlen_metadata(TdsDataType::BigVarBinary, 8);
+            let mut wire = vec![3, 0];
+            wire.extend_from_slice(&[0x01, 0x02, 0x03]);
+            let value = borrowed_and_owned_agree(wire, &md).await;
+            assert_eq!(value, ColumnValues::Bytes(vec![0x01, 0x02, 0x03]));
+        }
+
+        #[tokio::test]
+        async fn bigbinary_borrowed_matches_owned() {
+            let md = varlen_metadata(TdsDataType::BigBinary, 8);
+            let mut wire = vec![4, 0];
+            wire.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            let value = borrowed_and_owned_agree(wire, &md).await;
+            assert_eq!(value, ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        }
+
+        #[tokio::test]
+        async fn short_string_truncated_errors_on_both_arms() {
+            // Length says 6 code units, only 2 bytes follow. The borrowed arm must
+            // decline rather than read past the value, leaving the owned arm to error.
+            let md = varlen_metadata(TdsDataType::NVarChar, 100);
+            let wire = vec![12, 0, b'a', 0];
+            let decoder = GenericDecoder::default();
+
+            for mut reader in [
+                ByteReader::new(wire.clone()),
+                ByteReader::new_unbuffered(wire),
+            ] {
+                let mut writer = DefaultRowWriter::new(1);
+                let result = decoder.decode_into(&mut reader, &md, 0, &mut writer).await;
+                assert!(result.is_err(), "truncated value should not decode");
+            }
         }
 
         #[tokio::test]
