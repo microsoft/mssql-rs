@@ -329,9 +329,10 @@ fn fill_rowset(
         for binding in bindings {
             let column = binding.column_number as usize;
             if column == 0 || column > column_count {
-                // A binding left over from a wider result set must not read past
-                // the end of this one.
-                outcome = outcome.merge(RowOutcome::Error(RowIssue::Restricted));
+                // msodbcsql skips a binding whose ordinal is past the end of
+                // this result set and reports nothing -- a binding left over
+                // from a wider one is not an error there, so it is not one
+                // here either.
                 continue;
             }
             let pulled = dbc.runtime.block_on(client.read_row_column(column - 1));
@@ -526,10 +527,11 @@ unsafe fn deliver_bound(
     bind_offset: usize,
     value: &ColumnValues,
 ) -> RowOutcome {
+    // A zero stride only arises from a character or binary binding with
+    // BufferLength 0, which msodbcsql treats as a length probe: the indicator
+    // gets the available length and the buffer is left alone. The copy below
+    // already does exactly that, so this is not rejected up front.
     let stride = element_stride(binding.target_type, binding.buffer_length);
-    if stride == 0 {
-        return RowOutcome::Error(RowIssue::Unsupported);
-    }
 
     // SQL_ATTR_ROW_BIND_OFFSET_PTR displaces both bases by the same byte count.
     let indicator = if binding.strlen_or_ind_ptr.is_null() {
@@ -640,6 +642,7 @@ mod tests {
     use crate::handles::dbc::DbcHandle;
     use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
     use crate::test_support::TestHandles;
+    use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
     use mssql_tds::test_client_support::int_columns;
 
     fn binding(
@@ -816,6 +819,31 @@ mod tests {
         let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Int(7)) };
         assert!(matches!(outcome, RowOutcome::Success));
         assert_eq!(ind[0], -999, "a value must not write the indicator either");
+    }
+
+    /// A zero-length character binding is a length probe, as it is for
+    /// SQLGetData: report what is available, write nothing, flag truncation.
+    #[test]
+    fn a_zero_length_character_binding_probes_the_length() {
+        let mut buf = [b'#'; 4];
+        let mut ind = [-999 as SqlLen; 1];
+        let b = binding(
+            1,
+            SQL_C_CHAR,
+            buf.as_mut_ptr() as SqlPointer,
+            0,
+            ind.as_mut_ptr(),
+        );
+
+        let value = ColumnValues::String(SqlString::new(b"hello".to_vec(), EncodingType::Utf8));
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &value) };
+
+        assert!(matches!(
+            outcome,
+            RowOutcome::Info(RowIssue::StringTruncated)
+        ));
+        assert_eq!(ind[0], 5, "the available length is reported");
+        assert_eq!(buf, [b'#'; 4], "a zero-length buffer is never written");
     }
 
     /// A drained cursor is not an error: the result set ended on an earlier

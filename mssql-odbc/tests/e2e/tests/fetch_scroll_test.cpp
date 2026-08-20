@@ -20,6 +20,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -498,5 +499,49 @@ TEST_F(FetchScrollLiveTest, IndicatorOnlyBindingDeliversNothing) {
     ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) << "rc=" << rc;
     EXPECT_EQ(static_cast<SQLLEN>(-999), nInd) << "value indicator untouched";
     EXPECT_EQ(static_cast<SQLLEN>(-999), zInd) << "NULL indicator untouched";
+    SQLCloseCursor(stmt_);
+}
+
+// Review question: is a zero-length character binding a legal "length probe"
+// for SQLBindCol, the way it is for SQLGetData? Settled against msodbcsql
+// rather than argued from the spec.
+TEST_F(FetchScrollLiveTest, ZeroLengthCharacterBindingIsALengthProbe) {
+    ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS s");
+    char buf[8];
+    std::memset(buf, '#', sizeof(buf));
+    SQLLEN ind = -999;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, 0, &ind), SQL_HANDLE_STMT, stmt_);
+
+    SQLRETURN rc = SQLFetch(stmt_);
+    // A probe reports the available length and flags truncation; it must not
+    // come back as an unsupported binding.
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_EQ(static_cast<SQLLEN>(5), ind) << "available length";
+    EXPECT_EQ('#', buf[0]) << "a zero-length buffer must not be written";
+    SQLCloseCursor(stmt_);
+}
+
+// A binding left over from a wider result set is not an error: msodbcsql
+// skips it and reports nothing at all -- no diagnostic, plain SQL_SUCCESS.
+// Neither 07009 ("invalid descriptor index", which is what bind time uses for
+// an out-of-range ordinal) nor 07006 is raised, so a stale binding must not
+// start failing fetches here.
+TEST_F(FetchScrollLiveTest, AStaleOrdinalPastTheResultSetIsIgnored) {
+    ExecDirect("SELECT 1 AS only_column");
+    SQLINTEGER v = -1;
+    SQLLEN ind = -999;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 5, SQL_C_SLONG, &v, sizeof(v), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+
+    // No diagnostic, and the untouched binding stays untouched.
+    SQLWCHAR state[6] = {0};
+    SQLINTEGER native = 0;
+    SQLWCHAR msg[256] = {0};
+    SQLSMALLINT msgLen = 0;
+    EXPECT_EQ(SQL_NO_DATA, SQLGetDiagRecW(SQL_HANDLE_STMT, stmt_, 1, state,
+                                          &native, msg, 256, &msgLen));
+    EXPECT_EQ(static_cast<SQLLEN>(-999), ind);
     SQLCloseCursor(stmt_);
 }

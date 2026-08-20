@@ -14,16 +14,14 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_C_BINARY, SQL_C_CHAR, SQL_C_GUID, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
-    SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR, SQL_ERROR,
-    SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
-    SqlUSmallInt,
+    SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer,
+    SqlReturn, SqlSmallInt, SqlUSmallInt,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_C_DATA_TYPE, ERR_INVALID_DESCRIPTOR_INDEX,
     ERR_INVALID_STRING_OR_BUFFER_LENGTH, post_diag,
 };
-use crate::conversion::fetch_convert::{is_float_c_target, is_integer_c_target};
+use crate::api::type_rules::{canonical_c_type, is_valid_c_type};
 use crate::error::free_errors;
 use crate::handles::stmt::{ColumnBinding, STMT_STATE_FETCH_IN_PROGRESS};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -71,7 +69,24 @@ unsafe fn sql_bind_col_impl(
     }
     let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(stmt.object_type, HandleType::Stmt);
+    sql_bind_col_safe(
+        stmt,
+        column_number,
+        target_type,
+        target_value_ptr,
+        buffer_length,
+        strlen_or_ind_ptr,
+    )
+}
 
+fn sql_bind_col_safe(
+    stmt: &StmtHandle,
+    column_number: SqlUSmallInt,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLBindCol: stmt mutex poisoned");
         return SQL_ERROR;
@@ -109,8 +124,22 @@ unsafe fn sql_bind_col_impl(
         return SQL_ERROR;
     }
 
-    if !is_supported_c_target(target_type) {
-        error!(target_type, "SQLBindCol: unsupported target C type");
+    // SQL_C_DEFAULT would have to be resolved against the column's SQL type,
+    // and ODBC allows binding before execution, so there may be no metadata to
+    // resolve it against yet.
+    if target_type == SQL_C_DEFAULT {
+        error!("SQLBindCol: SQL_C_DEFAULT is not supported as a bound target");
+        post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
+        return SQL_ERROR;
+    }
+
+    // Same gate as SQLBindParameter: fold the deprecated 2.x date/time
+    // spellings first so one form per type reaches storage and delivery. This
+    // only decides whether the identifier names a real ODBC type; whether the
+    // fetch can actually deliver it is a per-row question.
+    let target_type = canonical_c_type(target_type);
+    if !is_valid_c_type(target_type) {
+        error!(target_type, "SQLBindCol: invalid target C type");
         post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
         return SQL_ERROR;
     }
@@ -124,28 +153,6 @@ unsafe fn sql_bind_col_impl(
     });
     debug!(column_number, target_type, "SQLBindCol: column bound");
     SQL_SUCCESS
-}
-
-/// C types this driver can deliver into a bound buffer.
-///
-/// `SQL_C_DEFAULT` is absent deliberately: resolving it needs the column's SQL
-/// type, and ODBC allows binding before the statement is executed, so at bind
-/// time there may be no metadata to resolve it against.
-fn is_supported_c_target(target_type: SqlSmallInt) -> bool {
-    is_integer_c_target(target_type)
-        || is_float_c_target(target_type)
-        || matches!(
-            target_type,
-            SQL_C_CHAR
-                | SQL_C_WCHAR
-                | SQL_C_BINARY
-                | SQL_C_GUID
-                | SQL_C_TYPE_DATE
-                | SQL_C_TYPE_TIME
-                | SQL_C_TYPE_TIMESTAMP
-                | SQL_C_SS_TIME2
-                | SQL_C_SS_TIMESTAMPOFFSET
-        )
 }
 
 /// Implements `SQLFreeStmt(SQL_UNBIND)`: drops every column binding.
@@ -164,20 +171,24 @@ pub(crate) unsafe fn sql_free_stmt_unbind(statement_handle: SqlHandle) -> SqlRet
         }
         let stmt = handle_from_raw::<StmtHandle>(statement_handle);
         debug_assert_eq!(stmt.object_type, HandleType::Stmt);
-        let Ok(mut stmt_state) = stmt.inner.lock() else {
-            error!("SQLFreeStmt(SQL_UNBIND): stmt mutex poisoned");
-            return SQL_ERROR;
-        };
-        free_errors(&mut stmt_state);
-        if stmt_state.has_state(STMT_STATE_FETCH_IN_PROGRESS) {
-            error!("SQLFreeStmt(SQL_UNBIND): a fetch is in progress on this statement");
-            post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
-            return SQL_ERROR;
-        }
-        stmt_state.clear_bindings();
-        debug!("SQLFreeStmt(SQL_UNBIND): all column bindings released");
-        SQL_SUCCESS
+        sql_free_stmt_unbind_safe(stmt)
     })
+}
+
+fn sql_free_stmt_unbind_safe(stmt: &StmtHandle) -> SqlReturn {
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("SQLFreeStmt(SQL_UNBIND): stmt mutex poisoned");
+        return SQL_ERROR;
+    };
+    free_errors(&mut stmt_state);
+    if stmt_state.has_state(STMT_STATE_FETCH_IN_PROGRESS) {
+        error!("SQLFreeStmt(SQL_UNBIND): a fetch is in progress on this statement");
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+        return SQL_ERROR;
+    }
+    stmt_state.clear_bindings();
+    debug!("SQLFreeStmt(SQL_UNBIND): all column bindings released");
+    SQL_SUCCESS
 }
 
 #[cfg(test)]
@@ -185,7 +196,10 @@ mod tests {
     use std::ptr;
 
     use super::*;
-    use crate::api::odbc_types::{SQL_C_DEFAULT, SQL_C_SLONG};
+    use crate::api::odbc_types::{
+        SQL_C_CHAR, SQL_C_DATE, SQL_C_DEFAULT, SQL_C_INTERVAL_YEAR, SQL_C_NUMERIC, SQL_C_SLONG,
+        SQL_C_TIME, SQL_C_TIMESTAMP, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
+    };
     use crate::handles::stmt::STMT_STATE_FETCH_IN_PROGRESS;
     use crate::test_support::TestHandles;
 
@@ -388,6 +402,59 @@ mod tests {
     /// A fetch writes through the buffers it snapshotted after releasing the
     /// statement lock, so rebinding mid-fetch could free one under it. Both
     /// mutating entry points refuse rather than race.
+    /// The deprecated 2.x date/time spellings are still legal for a 3.x
+    /// application, and SQLBindParameter already accepts them; the two paths
+    /// share `type_rules` so they cannot drift apart on this.
+    #[test]
+    fn deprecated_2x_date_types_are_accepted_and_canonicalized() {
+        for (passed, canonical) in [
+            (SQL_C_DATE, SQL_C_TYPE_DATE),
+            (SQL_C_TIME, SQL_C_TYPE_TIME),
+            (SQL_C_TIMESTAMP, SQL_C_TYPE_TIMESTAMP),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let mut buf = [0u8; 32];
+            let rc = unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    passed,
+                    buf.as_mut_ptr() as SqlPointer,
+                    buf.len() as SqlLen,
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, SQL_SUCCESS, "binding {passed} must be accepted");
+
+            // Storing the canonical form keeps element_stride and deliver_bound
+            // on one spelling per type.
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let s = stmt.inner.lock().unwrap();
+            assert_eq!(s.bindings[0].target_type, canonical);
+        }
+    }
+
+    /// A C type that names a real ODBC type but that the fetch cannot deliver
+    /// belongs to the per-row path (07006 / HYC00), not to this HY003 gate.
+    #[test]
+    fn valid_but_undeliverable_c_types_pass_the_bind_gate() {
+        for c_type in [SQL_C_NUMERIC, SQL_C_INTERVAL_YEAR] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let mut buf = [0u8; 32];
+            let rc = unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    c_type,
+                    buf.as_mut_ptr() as SqlPointer,
+                    buf.len() as SqlLen,
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, SQL_SUCCESS, "c_type {c_type} must pass the bind gate");
+        }
+    }
+
     #[test]
     fn binding_is_refused_while_a_fetch_is_in_progress() {
         let h = TestHandles::with_env_dbc_stmt();

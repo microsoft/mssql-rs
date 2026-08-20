@@ -305,6 +305,9 @@ fn sql_get_stmt_attr_w_safe(
         SQL_ATTR_ROW_BIND_TYPE => unsafe {
             write_if_some(value_ptr as *mut SqlULen, state.row_bind_type);
         },
+        SQL_ATTR_ROW_BIND_OFFSET_PTR => unsafe {
+            write_if_some(value_ptr as *mut *mut SqlULen, state.row_bind_offset_ptr);
+        },
         // Recognized attributes we don't store: report their effective ODBC
         // defaults for this forward-only, read-only, single-paramset driver.
         SQL_ATTR_CURSOR_TYPE => unsafe {
@@ -423,6 +426,21 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(stmt.inner.lock().unwrap().row_bind_offset_ptr, ptr);
+
+        // An attribute that can be set has to be readable back: reading the
+        // stored field alone would not have caught a missing getter arm.
+        let mut read_back: *mut SqlULen = std::ptr::null_mut();
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_ROW_BIND_OFFSET_PTR,
+                (&mut read_back as *mut *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(read_back, ptr);
     }
 
     #[test]
