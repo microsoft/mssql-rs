@@ -14,6 +14,16 @@ tokio = { version = "1.45.1", features = ["full"] }
 arbitrary = { version = "1.3", features = ["derive"] }
 async-trait = "0.1"
 
+# Build OpenSSL from vendored source on the targets where mssql-tds links it
+# (every non-Windows, non-macOS target — see mssql-tds/Cargo.toml). The fuzz CI
+# agents intermittently fail to `apt install libssl-dev`/`pkg-config` from the
+# Ubuntu mirror, which leaves `openssl-sys` unable to locate OpenSSL and breaks
+# the entire fuzz stage. Enabling the vendored feature compiles OpenSSL from
+# source (shared openssl-sys also backs native-tls here), so the fuzz build no
+# longer depends on those apt-provided system packages.
+[target.'cfg(all(not(windows), not(target_os = "macos")))'.dependencies]
+openssl = { version = "0.10.66", features = ["vendored"] }
+
 # Prevent this from interfering with workspaces
 [workspace]
 members = ["."]
