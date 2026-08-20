@@ -8,8 +8,8 @@ use tracing::{debug, error};
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_SUCCESS, SqlHandle, SqlLen,
-    SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
+    SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_SS_TABLE, SQL_SS_UDT,
+    SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::type_rules::{
     SqlTypeSupport, canonical_c_type, classify_parameter_sql_type, is_valid_c_type,
@@ -176,7 +176,8 @@ fn sql_bind_parameter_safe(
 
     // Resolve SQL_C_DEFAULT here so the execute path never sees the placeholder,
     // matching msodbcsql, which stores the resolved type in the APD.
-    let c_type = if value_type == SQL_C_DEFAULT {
+    let c_type_defaulted = value_type == SQL_C_DEFAULT;
+    let c_type = if c_type_defaulted {
         let Some(resolved) = resolve_default_c_type(parameter_type, odbc_version) else {
             // Unreachable: every Supported type has a default C type, pinned by
             // every_supported_sql_type_has_a_default_c_type.
@@ -196,8 +197,22 @@ fn sql_bind_parameter_safe(
         value_type
     };
 
-    // The C type → SQL type conversion must be one we support (07006).
-    if !is_supported_conversion(c_type, parameter_type) {
+    // The C type → SQL type conversion must be one we support (07006). A
+    // resolved `SQL_C_DEFAULT` is exempt: `resolve_default_c_type` returns the C
+    // type ODBC defines as that SQL type's default, so the pairing is supported
+    // by construction. The conversion matrix only enumerates the explicit
+    // character pairings implemented so far, and would otherwise reject the
+    // describe-then-bind flow `SQLDescribeParam` callers use.
+    //
+    // `SQL_SS_UDT` and `SQL_SS_TABLE` are the exception: they need the fully
+    // qualified server type name, which `SQLDescribeParam` does not report and
+    // this driver cannot otherwise obtain, so they are rejected on the bind call
+    // rather than at execute time.
+    let unsupported_default =
+        c_type_defaulted && matches!(parameter_type, SQL_SS_UDT | SQL_SS_TABLE);
+    if unsupported_default
+        || (!c_type_defaulted && !is_supported_conversion(c_type, parameter_type))
+    {
         error!(
             c_type,
             parameter_type, "SQLBindParameter: unsupported C/SQL type conversion"
@@ -229,6 +244,7 @@ fn sql_bind_parameter_safe(
     stmt_state.bound_params[idx] = Some(BoundParam {
         input_output_type,
         c_type,
+        c_type_defaulted,
         sql_type: parameter_type,
         column_size,
         decimal_digits,
@@ -286,8 +302,8 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NULL_HANDLE, SQL_PARAM_OUTPUT,
-        SQL_VARCHAR,
+        SQL_C_CHAR, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NULL_DATA, SQL_NULL_HANDLE,
+        SQL_PARAM_OUTPUT, SQL_VARCHAR,
     };
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
@@ -522,8 +538,40 @@ mod tests {
 
     #[test]
     fn default_c_type_resolved_but_unconvertible_returns_07006() {
+        // `SQL_SS_UDT` needs the fully qualified server type name, which
+        // `SQLDescribeParam` does not report and the driver cannot otherwise
+        // obtain, so a defaulted bind of it is still rejected up front.
         let h = TestHandles::with_env_dbc_stmt();
         let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_DEFAULT,
+                SQL_SS_UDT,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
+    }
+
+    /// `SQL_C_DEFAULT` resolves to the C type ODBC defines as the SQL type's
+    /// default, so the pairing is supported by construction and must not be
+    /// re-checked against the character conversion matrix. Rejecting it here
+    /// would break the describe-then-bind flow `SQLDescribeParam` callers use,
+    /// where the value is frequently just a typed NULL.
+    #[test]
+    fn default_c_type_is_accepted_outside_the_character_matrix() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut ind: SqlLen = SQL_NULL_DATA;
         let ret = unsafe {
             sql_bind_parameter(
                 h.stmt,
@@ -538,10 +586,12 @@ mod tests {
                 &mut ind,
             )
         };
-        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(ret, SQL_SUCCESS);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
+        let bound = state.bound_params[0].expect("parameter 1 should be bound");
+        assert!(bound.c_type_defaulted);
+        assert_eq!(bound.sql_type, SQL_GUID);
     }
 
     #[test]

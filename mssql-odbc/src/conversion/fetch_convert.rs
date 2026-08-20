@@ -19,7 +19,7 @@
 //! [`ConvError::NotHandledHere`] so callers can fall back to their existing paths
 //! (e.g. the character conversion in `get_data`).
 
-use super::odbc_types::{
+use crate::api::odbc_types::{
     SQL_C_BIT, SQL_C_DATE, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_LONG, SQL_C_SBIGINT,
     SQL_C_SHORT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT,
     SQL_C_STINYINT, SQL_C_TIME, SQL_C_TIMESTAMP, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME,
@@ -27,7 +27,9 @@ use super::odbc_types::{
     SqlGuid, SqlLen, SqlPointer, SqlSmallInt, SqlSsTime2Struct, SqlSsTimestampoffsetStruct,
     SqlTimeStruct, SqlTimestampStruct,
 };
-use super::util::write_if_some;
+use crate::api::util::write_if_some;
+use crate::conversion::error::{ConvError, ConvOk};
+use crate::conversion::numeric::{NumericSource, narrow_i128, parse_decimal_literal};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 
@@ -40,33 +42,6 @@ pub(crate) fn sql_string_to_text(s: &SqlString) -> Option<String> {
         EncodingType::Utf8 => String::from_utf8(s.bytes.clone()).ok(),
         _ => Some(s.to_utf8_string()),
     }
-}
-
-/// Outcome of a successful conversion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConvOk {
-    /// The value was represented exactly.
-    Exact,
-    /// Precision was lost (e.g. a date/time component the target cannot hold).
-    /// The caller posts `01S07` and returns `SQL_SUCCESS_WITH_INFO`.
-    Truncated,
-}
-
-/// Why a value-level conversion could not be completed. The caller maps each
-/// variant to the appropriate SQLSTATE on its own diagnostic target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConvError {
-    /// The value does not fit the requested C type (SQLSTATE `22003`).
-    OutOfRange,
-    /// This source/target pairing is not handled by this converter; the caller
-    /// should try another path. Never surfaced to the application directly.
-    NotHandledHere,
-    /// The requested C type is not a legal target for this SQL type
-    /// (SQLSTATE `07006`). Terminal.
-    Restricted,
-    /// A character column's text is not a valid literal for the requested target
-    /// (SQLSTATE `22018`). Terminal.
-    InvalidCharacterValue,
 }
 
 /// Returns `true` if `target_type` is one of the fixed-width integer C types
@@ -103,93 +78,6 @@ unsafe fn write_fixed<T: Copy>(ptr: SqlPointer, value: T, ind: *mut SqlLen) -> C
     }
     unsafe { write_if_some(ind, std::mem::size_of::<T>() as SqlLen) };
     ConvOk::Exact
-}
-
-/// A numeric column value in a form that keeps exact sources exact, so an
-/// integer target can report truncation instead of silently dropping a
-/// fraction.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum NumericSource {
-    Int(i128),
-    /// `mantissa / 10^scale` — the exact decimal types (`decimal`, `numeric`,
-    /// `money`, `smallmoney`) and decimal literals in character columns.
-    Scaled {
-        mantissa: i128,
-        scale: u32,
-    },
-    Float(f64),
-}
-
-impl NumericSource {
-    fn as_f64(&self) -> f64 {
-        match self {
-            NumericSource::Int(v) => *v as f64,
-            NumericSource::Scaled { mantissa, scale } => {
-                *mantissa as f64 / 10f64.powi(*scale as i32)
-            }
-            NumericSource::Float(f) => *f,
-        }
-    }
-
-    /// Sign of the value before any truncation toward zero.
-    fn is_negative(&self) -> bool {
-        match self {
-            NumericSource::Int(v) => *v < 0,
-            NumericSource::Scaled { mantissa, .. } => *mantissa < 0,
-            NumericSource::Float(f) => *f < 0.0,
-        }
-    }
-
-    /// Value truncated toward zero plus whether a fractional part was dropped.
-    /// `None` when the value cannot be represented as an integer at all.
-    fn to_i128_truncating(self) -> Option<(i128, bool)> {
-        match self {
-            NumericSource::Int(v) => Some((v, false)),
-            NumericSource::Scaled { mantissa, scale } => {
-                // Past 10^38 the divisor exceeds every representable mantissa, so
-                // the quotient is zero and the whole value is the dropped fraction.
-                let Some(divisor) = 10i128.checked_pow(scale) else {
-                    return Some((0, mantissa != 0));
-                };
-                Some((mantissa / divisor, mantissa % divisor != 0))
-            }
-            NumericSource::Float(f) => {
-                if !f.is_finite() || !(-1.7e38..=1.7e38).contains(&f) {
-                    return None;
-                }
-                Some((f.trunc() as i128, f.fract() != 0.0))
-            }
-        }
-    }
-}
-
-/// Parses a plain decimal literal (`-12.34`, `+7`, `.5`) into an exact
-/// [`NumericSource::Scaled`]. Exponent forms are left to the `f64` fallback.
-fn parse_decimal_literal(text: &str) -> Option<NumericSource> {
-    let t = text.trim();
-    let (negative, body) = match t.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
-    };
-    let (int_digits, frac_digits) = match body.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (body, ""),
-    };
-    if int_digits.is_empty() && frac_digits.is_empty() {
-        return None;
-    }
-    if !int_digits
-        .bytes()
-        .chain(frac_digits.bytes())
-        .all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let mantissa: i128 = format!("{int_digits}{frac_digits}").parse().ok()?;
-    Some(NumericSource::Scaled {
-        mantissa: if negative { -mantissa } else { mantissa },
-        scale: frac_digits.len() as u32,
-    })
 }
 
 /// The `money` / `smallmoney` wire value as an integer scaled by 10^4.
@@ -307,9 +195,8 @@ pub(crate) unsafe fn convert_integer_c(
     let source = numeric_source_or_parse(value)?;
     let (v, truncated) = source.to_i128_truncating().ok_or(ConvError::OutOfRange)?;
 
-    // Helper: narrow `v` to the target's range or fail with OutOfRange.
     macro_rules! narrow {
-        ($ty:ty) => {{ <$ty>::try_from(v).map_err(|_| ConvError::OutOfRange)? }};
+        ($ty:ty) => {{ narrow_i128::<$ty>(v)? }};
     }
 
     match target_type {
@@ -1048,7 +935,7 @@ mod tests {
         let mut ind: SqlLen = 0;
         let err = conv(
             &ColumnValues::Int(1),
-            super::super::odbc_types::SQL_C_DOUBLE,
+            crate::api::odbc_types::SQL_C_DOUBLE,
             out.as_mut_ptr().cast(),
             &mut ind,
         )
@@ -1299,34 +1186,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ConvError::OutOfRange);
-    }
-
-    #[test]
-    fn parse_decimal_literal_forms() {
-        assert_eq!(
-            parse_decimal_literal("12.34"),
-            Some(NumericSource::Scaled {
-                mantissa: 1234,
-                scale: 2
-            })
-        );
-        assert_eq!(
-            parse_decimal_literal("-0.01"),
-            Some(NumericSource::Scaled {
-                mantissa: -1,
-                scale: 2
-            })
-        );
-        assert_eq!(
-            parse_decimal_literal("+7"),
-            Some(NumericSource::Scaled {
-                mantissa: 7,
-                scale: 0
-            })
-        );
-        assert_eq!(parse_decimal_literal("1e5"), None);
-        assert_eq!(parse_decimal_literal("abc"), None);
-        assert_eq!(parse_decimal_literal(""), None);
     }
 
     #[test]
@@ -1689,15 +1548,6 @@ mod tests {
     /// rather than reporting the value as out of range.
     #[test]
     fn scale_beyond_i128_truncates_to_zero() {
-        assert_eq!(
-            NumericSource::Scaled {
-                mantissa: 1,
-                scale: 39
-            }
-            .to_i128_truncating(),
-            Some((0, true))
-        );
-
         let mut out: i32 = -1;
         let mut ind: SqlLen = 0;
         let ok = unsafe {

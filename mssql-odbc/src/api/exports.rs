@@ -461,6 +461,34 @@ pub unsafe extern "C" fn SQLPrepareW(
     unsafe { super::prepare::sql_prepare_w(statement_handle, statement_text, text_length) }
 }
 
+/// Returns the inferred SQL type, size, scale, and nullability of a prepared
+/// statement parameter.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Each output pointer, if non-null, must be writable for its declared type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLDescribeParam(
+    statement_handle: SqlHandle,
+    parameter_number: SqlUSmallInt,
+    data_type_ptr: *mut SqlSmallInt,
+    parameter_size_ptr: *mut SqlULen,
+    decimal_digits_ptr: *mut SqlSmallInt,
+    nullable_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::describe_param::sql_describe_param(
+            statement_handle,
+            parameter_number,
+            data_type_ptr,
+            parameter_size_ptr,
+            decimal_digits_ptr,
+            nullable_ptr,
+        )
+    }
+}
+
 /// Executes a preparable statement, using the current values of the parameter
 /// marker variables if any parameter markers exist in the statement.
 ///

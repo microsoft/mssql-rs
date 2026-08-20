@@ -6,6 +6,7 @@ use std::sync::Once;
 pub mod api;
 mod auth;
 mod connection;
+mod conversion;
 mod error;
 mod handles;
 mod params;

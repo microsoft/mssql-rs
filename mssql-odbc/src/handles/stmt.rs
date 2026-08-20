@@ -11,7 +11,7 @@ use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 
 use super::desc::{DescHandle, DescKind};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
-use crate::api::odbc_types::{SqlULen, SqlUSmallInt};
+use crate::api::odbc_types::{SqlSmallInt, SqlULen, SqlUSmallInt};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -77,6 +77,9 @@ pub(crate) struct StmtState {
     /// `SQLExecute`. `Some` marks the statement as prepared; the handle is filled
     /// after the first execute.
     pub(crate) prepared: Option<PreparedPlan>,
+    /// Metadata inferred by `SQLDescribeParam`, indexed by parameter ordinal.
+    /// The first describe call fills every marker; `SQLPrepare` invalidates it.
+    pub(crate) parameter_metadata: Vec<ParameterDescription>,
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
     pub(crate) bound_params: Vec<Option<BoundParam>>,
@@ -151,6 +154,14 @@ pub(crate) struct PreparedPlan {
     /// Number of `@P1..@Pn` markers in `stmt`'s SQL, computed once at prepare so
     /// `SQLExecute` builds the parameter list without re-scanning the text.
     pub(crate) marker_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParameterDescription {
+    pub(crate) data_type: SqlSmallInt,
+    pub(crate) parameter_size: SqlULen,
+    pub(crate) decimal_digits: SqlSmallInt,
+    pub(crate) nullable: SqlSmallInt,
 }
 
 impl StmtState {
@@ -244,6 +255,7 @@ impl StmtHandle {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
                 prepared: None,
+                parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),
                 pending_unprepare: None,
                 row_positioned: false,
