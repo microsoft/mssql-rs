@@ -397,7 +397,10 @@ mod tests {
         let collation = default_collation();
         let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
-        value.serialize(&mut writer, &collation).await.unwrap();
+        value
+            .serialize(&mut writer, &collation, None)
+            .await
+            .unwrap();
         writer.finalize().await.unwrap();
         let payload = mock.data;
         payload[PacketWriter::PACKET_HEADER_SIZE..].to_vec()

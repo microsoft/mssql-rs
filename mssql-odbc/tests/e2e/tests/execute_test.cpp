@@ -200,20 +200,27 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeWideCharParam) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// SQL_C_DEFAULT + SQL_INTEGER resolves to SQL_C_SLONG, which has no conversion
-// row yet, so the bind is rejected up front instead of failing at execute.
-// msodbcsql supports the pairing, hence the skip. The skip goes away when P3
-// (integer C to integer SQL) adds the conversion row - see
-// docs/parameters_plan.md.
-TEST_F(PrepareExecuteLiveTest, DefaultCTypeUnsupportedConversionIsRejected) {
+// SQL_C_DEFAULT + SQL_INTEGER resolves to SQL_C_SLONG. That pairing is the SQL
+// type's own ODBC-defined default, so the bind is accepted - as msodbcsql
+// accepts it - rather than being re-checked against the conversion matrix.
+// Rejecting it would break the describe-then-bind flow SQLDescribeParam callers
+// use. Converting a non-NULL integer buffer is still unimplemented (P3 in
+// docs/parameters_plan.md), so that gap now surfaces at execute as HYC00.
+// msodbcsql executes successfully, hence the skip; the skip goes away when P3
+// adds the conversion.
+TEST_F(PrepareExecuteLiveTest, DefaultCTypeIntegerBindsButCannotConvertValue) {
     SKIP_IF_COMPARING_MSODBCSQL();
+
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLINTEGER value = 42;
     SQLLEN ind = 0;
-    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
-                                    SQL_INTEGER, 0, 0, &value, 0, &ind);
-    EXPECT_EQ(SQL_ERROR, rc);
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07006");
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
+                                   SQL_INTEGER, 0, 0, &value, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 }
 
 // SQL Server has no interval type, so a real-but-unsupported ParameterType is
@@ -230,19 +237,47 @@ TEST_F(PrepareExecuteLiveTest, IntervalSqlTypeIsRejectedWithHyc00) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 }
 
-// Accepted parity deviation (AB#47365): SQL_C_DEFAULT resolves SQL_GUID to
-// SQL_C_GUID per the ODBC 3.x default-C-type table, which has no conversion row
-// yet, so the bind is rejected. msodbcsql's rgbTRANSTYPE380 resolves it to
-// SQL_C_CHAR, which it supports, so the bind succeeds there.
-TEST_F(PrepareExecuteLiveTest, DefaultCTypeGuidIsRejected) {
+// SQL_C_DEFAULT + SQL_GUID is likewise accepted at bind time. The drivers pick
+// different default C types (this one SQL_C_GUID per the ODBC 3.x table,
+// msodbcsql SQL_C_CHAR via rgbTRANSTYPE380), but neither rejects the bind, so
+// the AB#47365 deviation no longer shows up here. Converting a non-NULL GUID
+// buffer remains unimplemented, so execute fails with HYC00 while msodbcsql
+// succeeds - hence the skip.
+TEST_F(PrepareExecuteLiveTest, DefaultCTypeGuidBindsButCannotConvertValue) {
     SKIP_IF_COMPARING_MSODBCSQL();
+
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLGUID value = {};
     SQLLEN ind = 0;
-    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
-                                    SQL_GUID, 0, 0, &value, sizeof(value), &ind);
-    EXPECT_EQ(SQL_ERROR, rc);
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07006");
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
+                                   SQL_GUID, 0, 0, &value, sizeof(value), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+}
+
+// A NULL needs no buffer conversion at all, so a defaulted bind of a
+// non-character type round-trips end to end. This is the describe-then-bind
+// shape SQLDescribeParam callers use, and both drivers accept it.
+TEST_F(PrepareExecuteLiveTest, DefaultCTypeNullBindsAndExecutes) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLGUID value = {};
+    SQLLEN ind = SQL_NULL_DATA;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
+                                   SQL_GUID, 0, 0, &value, sizeof(value), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind_out = 0;
+    GetColumnChar(1, &ind_out);
+    EXPECT_EQ(SQL_NULL_DATA, ind_out);
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
 // A NULL-indicator parameter produces a SQL NULL result.

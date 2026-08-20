@@ -25,6 +25,12 @@ pub(crate) struct BoundParam {
     /// C data type of the application buffer (ODBC `ValueType`, `SQL_C_*`),
     /// with `SQL_C_DEFAULT` already resolved to a concrete type.
     pub(crate) c_type: SqlSmallInt,
+    /// Whether the application bound `SQL_C_DEFAULT`, before `c_type` was
+    /// resolved. A defaulted binding describes its value entirely through
+    /// `sql_type`, so a NULL is materialised from that rather than from
+    /// `c_type` — `SQL_DECIMAL` defaults to `SQL_C_CHAR`, and a NULL `decimal`
+    /// is not a NULL `varchar`.
+    pub(crate) c_type_defaulted: bool,
     /// SQL data type of the column/expression (ODBC `ParameterType`, `SQL_*`).
     pub(crate) sql_type: SqlSmallInt,
     /// Column size (precision) as passed by the application.

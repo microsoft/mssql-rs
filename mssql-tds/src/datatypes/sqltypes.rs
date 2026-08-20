@@ -26,6 +26,7 @@ use crate::{
     },
     error::Error,
     io::packet_writer::{PacketWriter, TdsPacketWriter},
+    message::parameters::rpc_parameters::RpcTypeMetadata,
     token::tokens::SqlCollation,
 };
 
@@ -669,10 +670,16 @@ impl SqlType {
     }
 
     /// Write RPC type metadata preamble, then delegate value serialization to TdsValueSerializer.
+    ///
+    /// `type_metadata` supplies precision/scale for a value template that cannot
+    /// carry them (a typed NULL decimal or temporal). The caller derives the SQL
+    /// declaration from the same metadata, so the declared type and the wire
+    /// `TYPE_INFO` always agree.
     pub(crate) async fn serialize(
         &self,
         packet_writer: &mut PacketWriter<'_>,
         db_collation: &SqlCollation,
+        type_metadata: Option<RpcTypeMetadata>,
     ) -> TdsResult<()> {
         // JSON needs special handling: TdsValueSerializer converts to UTF-16LE for bulk copy,
         // but RPC sends raw UTF-8 bytes with TDS type 0xF4.
@@ -689,7 +696,7 @@ impl SqlType {
         }
 
         // Step 1: Write the RPC type metadata preamble
-        self.write_rpc_type_metadata(packet_writer, db_collation)
+        self.write_rpc_type_metadata(packet_writer, db_collation, type_metadata)
             .await?;
 
         // Step 2: Convert to ColumnValues + TdsTypeContext and serialize value
@@ -705,11 +712,17 @@ impl SqlType {
         &self,
         packet_writer: &mut PacketWriter<'_>,
         db_collation: &SqlCollation,
+        type_metadata: Option<RpcTypeMetadata>,
     ) -> TdsResult<()> {
-        // RPC parameters carry their precision/scale inside the value itself, so
-        // no overrides are supplied here.
-        self.write_type_info(packet_writer, db_collation, None, None)
-            .await
+        // A value normally carries its own precision/scale; a typed NULL template
+        // cannot, so the caller may supply them here.
+        self.write_type_info(
+            packet_writer,
+            db_collation,
+            type_metadata.and_then(|m| m.precision),
+            type_metadata.and_then(|m| m.scale),
+        )
+        .await
     }
 
     /// Write the TDS `TYPE_INFO` for this type: the type byte followed by its
@@ -720,7 +733,8 @@ impl SqlType {
     /// `DateTimeOffset` (scale), the `precision_override`/`scale_override`
     /// arguments supply metadata that a `None`-valued type template cannot
     /// carry; when present they take precedence over the value's own
-    /// precision/scale. RPC callers pass `None` for both.
+    /// precision/scale. RPC callers supply them only for a typed NULL, where
+    /// they are derived from the same metadata as the SQL declaration.
     pub(crate) async fn write_type_info(
         &self,
         packet_writer: &mut PacketWriter<'_>,
@@ -1292,7 +1306,7 @@ mod variant_tests {
             None,
         );
         sql_type
-            .serialize(&mut packet_writer, &default_collation())
+            .serialize(&mut packet_writer, &default_collation(), None)
             .await
             .unwrap();
         packet_writer.finalize().await.unwrap();
@@ -1398,7 +1412,7 @@ mod variant_tests {
                 None,
             );
             let result = SqlType::Variant(Box::new(inner))
-                .serialize(&mut packet_writer, &default_collation())
+                .serialize(&mut packet_writer, &default_collation(), None)
                 .await;
             assert!(
                 matches!(result, Err(Error::UsageError(_))),

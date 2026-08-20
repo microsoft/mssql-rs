@@ -122,6 +122,7 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
         stmt: PreparedStatement::new(rewritten_sql),
         marker_count,
     });
+    stmt_state.parameter_metadata.clear();
     stmt_state.column_metadata.clear();
     stmt_state.reset_row_stream();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
@@ -170,6 +171,8 @@ mod tests {
 
     #[test]
     fn reprepare_orphans_prior_handle_for_unprepare() {
+        use crate::handles::stmt::ParameterDescription;
+
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
 
@@ -184,6 +187,12 @@ mod tests {
                 marker_count: 0,
             });
             state.set_state(STMT_STATE_PREPARED);
+            state.parameter_metadata.push(ParameterDescription {
+                data_type: crate::api::odbc_types::SQL_INTEGER,
+                parameter_size: 10,
+                decimal_digits: 0,
+                nullable: crate::api::odbc_types::SQL_NULLABLE,
+            });
         }
 
         let sql: Vec<u16> = "SELECT 2"
@@ -202,6 +211,7 @@ mod tests {
             Some("SELECT 2")
         );
         assert!(state.prepared.as_ref().and_then(|p| p.stmt.id()).is_none());
+        assert!(state.parameter_metadata.is_empty());
         // The old statement is queued for release at the next execute.
         let orphaned = state
             .pending_unprepare

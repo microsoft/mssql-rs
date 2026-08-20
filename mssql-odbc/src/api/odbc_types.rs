@@ -177,6 +177,7 @@ pub const SQL_API_SQLGETDATA: SqlUSmallInt = 43;
 pub const SQL_API_SQLGETFUNCTIONS: SqlUSmallInt = 44;
 pub const SQL_API_SQLGETINFO: SqlUSmallInt = 45;
 pub const SQL_API_SQLGETTYPEINFO: SqlUSmallInt = 47;
+pub const SQL_API_SQLDESCRIBEPARAM: SqlUSmallInt = 58;
 pub const SQL_API_SQLBINDPARAMETER: SqlUSmallInt = 72;
 pub const SQL_API_SQLMORERESULTS: SqlUSmallInt = 61;
 pub const SQL_API_SQLALLOCHANDLE: SqlUSmallInt = 1001;
@@ -269,6 +270,24 @@ pub const SQL_GUID: SqlSmallInt = -11;
 // SQL Server-specific ODBC-SQL-type identifiers (driver extensions).
 pub const SQL_SS_TIME2: SqlSmallInt = -154;
 pub const SQL_SS_TIMESTAMPOFFSET: SqlSmallInt = -155;
+
+/// Header of the `SQL_SS_VECTOR` client buffer that precedes the element array.
+///
+/// Only its size participates in the `ParameterSize` <-> dimension conversion,
+/// so the fields are never read directly.
+#[repr(C)]
+pub(crate) struct SqlSsVectorLayout {
+    pub(crate) dimensions: u32,
+    pub(crate) base_type: u8,
+    pub(crate) reserved: [u8; 3],
+}
+
+/// Client-side element width of a `SQL_SS_VECTOR` buffer.
+///
+/// msodbcsql always materialises vector elements as 4-byte floats regardless of
+/// the server-side base type, so `float16` vectors are widened on the way out
+/// and narrowed on the way in.
+pub(crate) const SQL_SS_VECTOR_ELEMENT_SIZE: usize = std::mem::size_of::<f32>();
 
 // ODBC C types
 pub const SQL_C_CHAR: SqlSmallInt = 1;
