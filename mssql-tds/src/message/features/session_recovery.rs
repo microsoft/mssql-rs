@@ -189,6 +189,10 @@ impl Feature for SessionRecoveryFeature {
         Ok(())
     }
 
+    fn session_recovery_initial_state(&self) -> Option<&[u8]> {
+        self.initial_state_data.as_deref()
+    }
+
     fn is_acknowledged(&self) -> bool {
         self.acknowledged
     }
@@ -235,10 +239,15 @@ mod tests {
     fn deserialize_stores_initial_state_data() {
         let mut feature = SessionRecoveryFeature::new(1);
         assert!(feature.initial_state_data.is_none());
+        assert!(feature.session_recovery_initial_state().is_none());
 
         let data = vec![0x01, 0x02, 0x03];
         feature.deserialize(&data).unwrap();
         assert_eq!(feature.initial_state_data.as_ref().unwrap(), &data);
+        assert_eq!(
+            feature.session_recovery_initial_state(),
+            Some(data.as_slice())
+        );
     }
 
     #[test]
@@ -496,6 +505,50 @@ mod tests {
         assert_eq!(fb[16], 0);
         assert_eq!(fb[17], 0);
         assert_eq!(fb[18], 0);
+    }
+
+    #[test]
+    fn feature_ack_round_trips_through_serialize() {
+        use crate::connection::session_recovery::SessionStateTable;
+        use crate::io::packet_writer::tests::MockNetworkWriter;
+        use crate::message::messages::PacketType;
+        use futures::executor::block_on;
+
+        // Ascending state-id entries, matching the server's FEATUREEXTACK order.
+        let ack = vec![
+            0x00, 0x02, 0xAA, 0xBB, // id 0, len 2
+            0x05, 0x01, 0xCC, // id 5, len 1
+            0x09, 0x03, 0x01, 0x02, 0x03, // id 9, len 3
+        ];
+
+        // Seed a table (empty db/lang/default collation) from the ack, snapshot
+        // it, and serialize the reconnect feature.
+        let mut table = SessionStateTable::new();
+        table.seed_initial_state(
+            String::new(),
+            String::new(),
+            SqlCollation::default(),
+            &[],
+            Some(&ack),
+        );
+        let feature =
+            SessionRecoveryFeature::new_for_reconnection(table.snapshot(None, None, None));
+
+        let mut mock_writer = MockNetworkWriter::new(4096);
+        let mut pw = PacketWriter::new(PacketType::Login7, &mut mock_writer, None, None);
+        block_on(feature.serialize(&mut pw)).unwrap();
+        let payload = pw.get_payload();
+        let bytes = payload.get_ref();
+        let fb = &bytes[8..]; // skip packet header
+
+        // fb: [feature_id][total_len:4][initial_len:4][initial block]...
+        let initial_len = u32::from_le_bytes([fb[5], fb[6], fb[7], fb[8]]) as usize;
+        let initial_block = &fb[9..9 + initial_len];
+        // db(0) + collation(0) + language(0), then the state entries.
+        assert_eq!(&initial_block[0..3], &[0, 0, 0]);
+        // The emitted state entries byte-match the original ack blob, pinning
+        // the parser and serializer against each other.
+        assert_eq!(&initial_block[3..], ack.as_slice());
     }
 
     #[test]
