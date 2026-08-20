@@ -341,8 +341,9 @@ unchanged.
 
 ## Open assumptions
 
-- Cross-pool reachability between `RUST-X64-WUS3` (x64) and
-  `RUST-ARM64-WUS3` (ARM) on the SQL host's private IPv4 and the
+- Cross-pool reachability within both pool sets: `RUST-X64-WUS3` (x64) to
+  `RUST-ARM64-WUS3` (ARM), and `RUST-PUBLIC-X64-WUS3` (x64) to
+  `RUST-PUBLIC-ARM64-WUS3` (ARM), on the SQL host's private IPv4 and the
   published port. Confirmed at design time; a connectivity regression here
   would surface as `poll-for-endpoint.sh` succeeds (the test job sees the
   endpoint) but the subsequent test connect times out.
