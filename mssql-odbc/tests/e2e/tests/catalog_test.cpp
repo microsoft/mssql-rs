@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <random>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -141,6 +142,11 @@ protected:
     // (ASSERT_* returns early) still gets it cleaned up in TearDown().
     std::string pending_db_to_drop_;
 
+    // Extra throwaway tables (beyond kParentTable/kChildTable) a single test
+    // creates and wants dropped in TearDown() regardless of how the test
+    // exits, same rationale as pending_db_to_drop_.
+    std::vector<std::string> pending_tables_to_drop_;
+
     void SetUp() override {
         ODBCTest::SetUp();
         if (!ODBCTestConfig::Instance().HasConnection()) {
@@ -169,6 +175,9 @@ protected:
     void TearDown() override {
         if (dbc_ != SQL_NULL_HDBC) {
             DropTestTables();
+            for (const auto& table : pending_tables_to_drop_) {
+                ExecDirectIgnoreError("DROP TABLE IF EXISTS " + table);
+            }
             if (!pending_db_to_drop_.empty()) {
                 ExecDirectIgnoreError("DROP DATABASE IF EXISTS " + pending_db_to_drop_);
             }
@@ -271,6 +280,39 @@ TEST_F(CatalogLiveTest, TablesFindsCreatedTableInEscapedCatalogName) {
     // Must find the real row in the real database, not silently return empty
     // via the nonexistent-catalog retry path — that's the failure mode this
     // guards against.
+    EXPECT_EQ(1, DrainRows(stmt_));
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// An escaped underscore (`\_`) in a TableName *pattern* argument must match
+// only the literal underscore, not act as the ODBC/T-SQL single-character
+// wildcard it collapses to when unescaped. Regression test for reusing
+// unescape_search_pattern (correct for catalog identifiers) instead of a
+// dedicated character-class conversion (correct for LIKE-based pattern
+// arguments): naively stripping the backslash turns a search for the
+// literal name "..._real" into a search matching "...Xreal" too, since a
+// bare '_' is itself a LIKE wildcard.
+TEST_F(CatalogLiveTest, TablesEscapedUnderscoreMatchesLiteralNotWildcard) {
+    const std::string base = "odbc_e2e_escape_" + UniqueSuffix();
+    const std::string realTable = base + "_real";  // literal underscore before "real"
+    const std::string decoyTable = base + "Xreal"; // same position, 'X' instead of '_'
+    ExecDirectIgnoreError("DROP TABLE IF EXISTS " + realTable);
+    ExecDirectIgnoreError("DROP TABLE IF EXISTS " + decoyTable);
+    ExecDirect("CREATE TABLE " + realTable + " (id INT NOT NULL PRIMARY KEY)");
+    ExecDirect("CREATE TABLE " + decoyTable + " (id INT NOT NULL PRIMARY KEY)");
+    pending_tables_to_drop_.push_back(realTable);
+    pending_tables_to_drop_.push_back(decoyTable);
+
+    // Escape only the underscore that precedes "real"; the pattern argument
+    // reads "odbc_e2e_escape_<suffix>\_real" (a literal ODBC search-pattern
+    // escape), which should resolve to the single table with a literal `_`
+    // in that position, not both tables a bare `_` wildcard would match.
+    const std::string escapedPattern = base + "\\_real";
+    SqlTString table = ODBCTestUtils::ToSqlTStr(escapedPattern);
+    SQLRETURN rc = SQLTables(stmt_, nullptr, 0, nullptr, 0, const_cast<SQLTCHAR*>(table.c_str()),
+                             SQL_NTS, nullptr, 0);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(1, DrainRows(stmt_));
 
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);

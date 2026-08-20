@@ -92,6 +92,21 @@ const SYSNAME_LEN: u16 = 128;
 /// numbered-procedure name msodbcsql accepts.
 const PROC_NAME_LEN: u16 = SYSNAME_LEN + 6;
 
+/// Declared width for an [`escape_pattern_arg`]-converted table/schema/
+/// column argument. `escape_pattern_arg` can expand a value up to 3x (every
+/// character needing bracket-escaping becomes 3 output characters), so the
+/// RPC parameter must be declared wide enough for that worst case even
+/// though [`check_arg_length`] already caps the *pre-conversion* effective
+/// length at [`SYSNAME_LEN`]. Matches msodbcsql's own dynamic sizing of the
+/// RPC parameter to the converted value's actual length (`cbMax = cb`,
+/// `sqlcdd.cpp` line 1775) rather than a fixed cap — a static worst-case
+/// bound achieves the same "always wide enough" outcome more simply.
+const PATTERN_ARG_LEN: u16 = SYSNAME_LEN * 3;
+
+/// As [`PATTERN_ARG_LEN`], but for `SQLProcedures`' wider procedure-name
+/// argument (see [`PROC_NAME_LEN`]).
+const PATTERN_PROC_NAME_LEN: u16 = PROC_NAME_LEN * 3;
+
 /// Declared length for the `SQLTables` `TableType` argument, which is a
 /// comma-separated list of quoted values rather than a single identifier.
 const TABLE_TYPE_LEN: u16 = 4000;
@@ -242,6 +257,84 @@ fn unescape_search_pattern(pattern: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\\' && matches!(chars.peek(), Some('\\') | Some('_') | Some('%')) {
             result.push(chars.next().expect("peeked Some above"));
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Converts an ODBC search-pattern argument into the T-SQL `LIKE`-pattern
+/// syntax the *pattern-typed* stored-procedure arguments (table name/schema/
+/// column for `SQLTables`/`SQLColumns`, procedure name/schema for
+/// `SQLProcedures` — the only three of the seven catalog functions where
+/// msodbcsql marks these arguments as search patterns via `wSearchBits`,
+/// `sqlcdd.cpp` lines 600, 672, 1218) require, matching msodbcsql's
+/// `ConvertArgument` (`sqlcdd.cpp` lines 2272-2409) for the `SERVER_BIT`-
+/// unset case this driver always takes (no distributed-query server
+/// support, see the module docs):
+///
+/// - A backslash-escaped `_`, `%`, or `[` is rewritten into the T-SQL
+///   character-class form `[_]`, `[%]`, or `[[]` respectively, turning the
+///   escaped literal into something `LIKE` matches literally instead of as a
+///   wildcard. **This is not the same operation as [`unescape_search_pattern`]**:
+///   naively stripping the backslash (`\_` -> `_`) would be wrong here,
+///   because a bare `_` or `%` is itself a live `LIKE` wildcard — stripping
+///   the escape would silently turn a search for the literal identifier
+///   `my_table` into a search matching any single character in that
+///   position. [`unescape_search_pattern`] remains correct for its own
+///   job (building the three-part *catalog identifier* name and measuring
+///   pattern-argument length), which is not a `LIKE` match against a stored
+///   procedure and has no such wildcard hazard.
+/// - A backslash escaping anything else (including another backslash) drops
+///   the backslash and copies the following character literally, same as
+///   [`unescape_search_pattern`].
+/// - An unescaped, literal `[` is also rewritten to `[[]`: `[` has no
+///   ODBC-level escaping meaning, but is syntactically special to T-SQL's
+///   `LIKE` (it opens a character class), so a literal `[` in an identifier
+///   must still be escaped for the proc's `LIKE`-based filter to match it
+///   literally instead of misreading it as a character-class start.
+/// - An unescaped, literal `_` or `%` passes through unchanged — these are
+///   the real wildcards the ODBC search-pattern convention is built around.
+///
+/// Can expand the input up to 3x (see [`PATTERN_ARG_LEN`]/
+/// [`PATTERN_PROC_NAME_LEN`], the RPC parameter widths sized for this).
+fn escape_pattern_arg(pattern: &str) -> String {
+    let mut result = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('_') | Some('%') | Some('[') => {
+                    let escaped = chars.next().expect("peeked Some above");
+                    result.push('[');
+                    result.push(escaped);
+                    result.push(']');
+                }
+                Some('\\') => {
+                    // Escaped backslash collapses to a single literal
+                    // backslash (`sqlcdd.cpp`: the skip-escape-char step
+                    // advances past the first backslash, then the
+                    // `*lpchName != SEARCH_PATTERN_ESCAPE_CHAR` check fails
+                    // for the second, so only the second one is copied
+                    // through).
+                    result.push(chars.next().expect("peeked Some above"));
+                }
+                Some(_) => {
+                    // Not a recognized pattern escape target: msodbcsql
+                    // preserves both the backslash and the following
+                    // character unchanged (`sqlcdd.cpp` lines 2332-2342) —
+                    // push the backslash here and let the next loop
+                    // iteration copy the following character normally.
+                    result.push(c);
+                }
+                None => {
+                    // Trailing backslash with nothing after it — msodbcsql
+                    // silently drops it (sqlcdd.cpp lines 2301-2306); match that.
+                }
+            }
+        } else if c == '[' {
+            result.push_str("[[]");
         } else {
             result.push(c);
         }
@@ -652,11 +745,12 @@ fn sql_tables_w_safe(
         let table_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
         } else {
-            table.clone()
+            table.as_deref().map(escape_pattern_arg)
         };
+        let schema_pattern = schema.as_deref().map(escape_pattern_arg);
         let positional = vec![
-            nvarchar(table_name.as_deref(), SYSNAME_LEN),
-            nvarchar(schema.as_deref(), SYSNAME_LEN),
+            nvarchar(table_name.as_deref(), PATTERN_ARG_LEN),
+            nvarchar(schema_pattern.as_deref(), PATTERN_ARG_LEN),
             // The real catalog value (or NULL on the unqualified retry — see
             // `qualifier_value`), not just a qualification aid: msodbcsql
             // sends it too (`sqlcdd.cpp` lines 1745-1757), and `sp_tables`
@@ -796,16 +890,18 @@ fn sql_columns_w_safe(
         let table_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
         } else {
-            table.clone()
+            table.as_deref().map(escape_pattern_arg)
         };
+        let schema_pattern = schema.as_deref().map(escape_pattern_arg);
+        let column_pattern = column.as_deref().map(escape_pattern_arg);
         let positional = vec![
-            nvarchar(table_name.as_deref(), SYSNAME_LEN),
-            nvarchar(schema.as_deref(), SYSNAME_LEN),
+            nvarchar(table_name.as_deref(), PATTERN_ARG_LEN),
+            nvarchar(schema_pattern.as_deref(), PATTERN_ARG_LEN),
             nvarchar(
                 qualifier_value(&catalog, unmatchable).as_deref(),
                 SYSNAME_LEN,
             ),
-            nvarchar(column.as_deref(), SYSNAME_LEN),
+            nvarchar(column_pattern.as_deref(), PATTERN_ARG_LEN),
         ];
         // `@ODBCVer` / `@fUsePattern` are both sent only for 3.x apps
         // (`sqlcdd.cpp` lines 1809-1812, 1827-1843); `sp_columns_100` runs the
@@ -1605,11 +1701,12 @@ fn sql_procedures_w_safe(
         let proc_name = if unmatchable {
             Some(UNMATCHABLE_NAME.to_string())
         } else {
-            proc.clone()
+            proc.as_deref().map(escape_pattern_arg)
         };
+        let schema_pattern = schema.as_deref().map(escape_pattern_arg);
         let positional = vec![
-            nvarchar(proc_name.as_deref(), PROC_NAME_LEN),
-            nvarchar(schema.as_deref(), SYSNAME_LEN),
+            nvarchar(proc_name.as_deref(), PATTERN_PROC_NAME_LEN),
+            nvarchar(schema_pattern.as_deref(), PATTERN_ARG_LEN),
             nvarchar(
                 qualifier_value(&catalog, unmatchable).as_deref(),
                 SYSNAME_LEN,
@@ -1892,6 +1989,45 @@ mod tests {
             qualified_proc_name(&Some(r"a\_b]c".to_string()), "sp_tables"),
             "[a_b]]c].sys.sp_tables"
         );
+    }
+
+    #[test]
+    fn escape_pattern_arg_converts_escaped_wildcards_to_character_classes() {
+        // The reviewer's exact table: escaped `_`/`%`/`[` become bracketed
+        // character classes (matching msodbcsql's ConvertArgument), NOT a
+        // bare unescaped literal — a bare `_`/`%` is itself a live `LIKE`
+        // wildcard, so naively stripping the backslash would be wrong.
+        assert_eq!(escape_pattern_arg(r"my\_table"), "my[_]table");
+        assert_eq!(escape_pattern_arg(r"arr\[0]"), "arr[[]0]");
+        assert_eq!(escape_pattern_arg("a[b"), "a[[]b");
+        // Unescaped, literal wildcards stay real wildcards, unchanged.
+        assert_eq!(escape_pattern_arg("a_b"), "a_b");
+        assert_eq!(escape_pattern_arg("a%b"), "a%b");
+    }
+
+    #[test]
+    fn escape_pattern_arg_differs_from_unescape_search_pattern_on_wildcards() {
+        // The exact bug the fix guards against: unescape_search_pattern
+        // strips the backslash, turning a literal-underscore search into a
+        // wildcard search. escape_pattern_arg must not do this.
+        assert_eq!(unescape_search_pattern(r"my\_table"), "my_table");
+        assert_ne!(
+            escape_pattern_arg(r"my\_table"),
+            unescape_search_pattern(r"my\_table")
+        );
+    }
+
+    #[test]
+    fn escape_pattern_arg_handles_escaped_backslash_and_unmatched_escapes() {
+        // An escaped backslash collapses to one literal backslash, same as
+        // unescape_search_pattern.
+        assert_eq!(escape_pattern_arg(r"my\\db"), r"my\db");
+        // A backslash before anything else (not \, _, %, [) is left
+        // completely unchanged — matches msodbcsql exactly (ConvertArgument
+        // emits both the literal backslash and the following character).
+        assert_eq!(escape_pattern_arg(r"my\db"), r"my\db");
+        // A trailing backslash with nothing after it is silently dropped.
+        assert_eq!(escape_pattern_arg(r"my\"), "my");
     }
 
     #[test]
