@@ -69,11 +69,11 @@ The mapping must follow msodbcsql for:
 - Integer widths and floating-point precision.
 - Decimal/numeric precision and scale.
 - Unicode byte lengths versus ODBC character lengths.
-- MAX/PLP types, which msodbcsql reports as 0. The `SQL_PREC_UNLIMITED`
-  (2147483647) path in `Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp` only passes
-  through a precision that is already unlimited and is not reached from a PLP
-  wire length; a parity run against msodbcsql 18.6.2.1 confirmed 0. This
-  matches the existing `describe_col::column_size`.
+- MAX/PLP types, which msodbcsql reports as 0. Its unbounded sentinel
+  `SQL_PREC_UNLIMITED` *is* 0 (`Sql/Ntdbms/sqlncli/tds/tds.h`), as is the public
+  `SQL_SS_LENGTH_UNLIMITED` (`msodbcsql.h`), so reporting 0 is a direct match
+  rather than a substitution; a parity run against msodbcsql 18.6.2.1 confirmed
+  it. This matches the existing `describe_col::column_size`.
 - GUID and scale-dependent temporal display sizes.
 - SQL Server extension types, including variant, XML, UDT, table, and vector.
 
@@ -132,10 +132,10 @@ instead of `HYC00`.
   bind. `varchar`/`nvarchar` accept zero and widen to `max`, which also matches:
   msodbcsql skips precision validation entirely for `SQL_VARCHAR`/`SQL_WVARCHAR`
   (`sqlcmisc.cpp`) and uses the data length instead.
-- **Unbounded sizes reported as `0`** -- matches msodbcsql 18.6.2.1, which
-  reports `0` rather than `SQL_PREC_UNLIMITED` for `nvarchar(max)` /
-  `varbinary(max)`; the `SQL_PREC_UNLIMITED` pass-through in `GetIPDRec` is gated
-  off for the describe path.
+- **Unbounded sizes reported as `0`** -- matches msodbcsql 18.6.2.1. Its
+  `SQL_PREC_UNLIMITED` is itself `0` (`tds.h`), and `GetIPDRec` assigns exactly
+  that for var-max and UDT parameters, so `0` is the same value msodbcsql
+  reports rather than a substitute for a larger sentinel.
 
 ## Test plan
 

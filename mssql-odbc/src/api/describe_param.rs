@@ -526,11 +526,11 @@ fn required_temporal_scale(scale: Option<u8>) -> Result<u8, String> {
 
 /// Converts a TDS wire length into the ODBC `ParameterSize`.
 ///
-/// A PLP length (`0xFFFF`, or `-1` once widened) means `*(max)`. msodbcsql
-/// reports 0 for these, verified against msodbcsql 18.6.2.1 in the e2e parity
-/// run; `SQL_PREC_UNLIMITED` in `sqlcdesc.cpp` (`GetIPDRec`) only passes through
-/// a precision that is already unlimited and is not reached from a PLP wire
-/// length. This matches `describe_col::column_size`.
+/// A PLP length (`0xFFFF`, or `-1` once widened) means `*(max)`, which is
+/// reported as 0 -- matching msodbcsql, whose unbounded sentinel
+/// `SQL_PREC_UNLIMITED` *is* 0 (`Sql/Ntdbms/sqlncli/tds/tds.h`), as is the
+/// public `SQL_SS_LENGTH_UNLIMITED` (`msodbcsql.h`). Verified against msodbcsql
+/// 18.6.2.1 in the e2e parity run. This matches `describe_col::column_size`.
 /// `unicode` lengths are byte counts, so they halve into characters.
 fn parameter_length(length: i32, unicode: bool) -> Result<SqlULen, String> {
     if length == -1 || length == i32::from(u16::MAX) {

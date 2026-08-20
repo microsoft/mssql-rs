@@ -271,17 +271,6 @@ pub const SQL_GUID: SqlSmallInt = -11;
 pub const SQL_SS_TIME2: SqlSmallInt = -154;
 pub const SQL_SS_TIMESTAMPOFFSET: SqlSmallInt = -155;
 
-/// Unbounded-length sentinel an application may pass as `ColumnSize` when
-/// binding a `*(max)`, `xml` or UDT parameter; [`crate::conversion`] widens it
-/// (and any oversized length) to `max`.
-///
-/// This is an *accepted input* only. `SQLDescribeParam` deliberately reports `0`
-/// for unbounded parameters, which is what msodbcsql 18.6.2.1 does; the
-/// `SQL_PREC_UNLIMITED` pass-through in `sqlcdesc.cpp` (`GetIPDRec`) is gated
-/// off for the describe path. Named here so that a reader who finds the
-/// sentinel in the msodbcsql source does not conclude the mapping is missing.
-pub const SQL_PREC_UNLIMITED: SqlULen = 2_147_483_647;
-
 /// Header of the `SQL_SS_VECTOR` client buffer that precedes the element array.
 ///
 /// Only its size participates in the `ParameterSize` <-> dimension conversion,

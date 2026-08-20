@@ -296,9 +296,8 @@ fn fixed_length(column_size: usize, max: usize) -> Result<u16, ParamBuildError> 
 /// `max` spelling.
 ///
 /// `SQLDescribeParam` reports 0 for `*(max)` parameters, and an application may
-/// legitimately pass a `ColumnSize` past the non-`max` limit or the
-/// `SQL_PREC_UNLIMITED` sentinel; all widen to `max` rather than erroring,
-/// matching `RpcParameter::get_sql_name`.
+/// legitimately pass a `ColumnSize` past the non-`max` limit; both widen to
+/// `max` rather than erroring, matching `RpcParameter::get_sql_name`.
 ///
 /// Also matches msodbcsql, which skips precision validation entirely for
 /// `SQL_VARCHAR`/`SQL_WVARCHAR` and uses the data length instead
@@ -421,10 +420,13 @@ unsafe fn read_wchar_bytes(ptr: *const u16, len_spec: SqlLen) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{
-        SQL_C_LONG, SQL_NO_TOTAL, SQL_PARAM_INPUT, SQL_PREC_UNLIMITED, SQL_SS_UDT,
-    };
+    use crate::api::odbc_types::{SQL_C_LONG, SQL_NO_TOTAL, SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen};
     use std::ffi::c_void;
+
+    /// A `ColumnSize` past every non-`max` limit, as an application binding an
+    /// unbounded value may plausibly pass. Not an ODBC constant: msodbcsql's
+    /// unbounded sentinel is `0`, so there is no header name for this value.
+    const OVERSIZED_COLUMN_SIZE: SqlULen = 2_147_483_647;
 
     fn param(c_type: SqlSmallInt, ptr: *mut c_void, ind: *mut SqlLen) -> BoundParam {
         BoundParam {
@@ -640,10 +642,10 @@ mod tests {
             (SQL_INTEGER, 10, 0, SqlType::Int(None), None),
             (SQL_CHAR, 10, 0, SqlType::Char(None, 10), None),
             (SQL_WVARCHAR, 40, 0, SqlType::NVarchar(None, 40), None),
-            // `SQL_PREC_UNLIMITED` and any oversized length both mean `max`.
+            // An oversized `ColumnSize` and `i32::MAX` both mean `max`.
             (
                 SQL_WVARCHAR,
-                SQL_PREC_UNLIMITED,
+                OVERSIZED_COLUMN_SIZE,
                 0,
                 SqlType::NVarcharMax(None),
                 None,
@@ -651,7 +653,7 @@ mod tests {
             (SQL_VARCHAR, 9000, 0, SqlType::VarcharMax(None), None),
             (
                 SQL_VARBINARY,
-                SQL_PREC_UNLIMITED,
+                OVERSIZED_COLUMN_SIZE,
                 0,
                 SqlType::VarBinaryMax(None),
                 None,
