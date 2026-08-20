@@ -106,8 +106,8 @@ def test_execute_binds_named_parameters(client_context):
             cursor = conn.cursor()
             assert (
                 await cursor.execute(
-                    "SELECT %(value)s, %(value)s",
-                    {"value": "named"},
+                    "SELECT N'東京', %(café)s, %(café)s",
+                    {"café": "named"},
                 )
                 is cursor
             )

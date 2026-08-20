@@ -127,6 +127,7 @@ impl PyTableValuedParameter {
 
 impl PyTableValuedParameter {
     fn sql_type(&self) -> SqlType {
+        // TODO: Use shared TVP ownership when mssql-tds supports Arc<TvpTableData>.
         SqlType::Table(self.type_name.clone(), self.table.clone())
     }
 }
@@ -379,16 +380,14 @@ fn rpc_parameter(
 }
 
 fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeholder>)> {
-    let chars = sql.chars().collect::<Vec<_>>();
     let mut output = String::with_capacity(sql.len());
     let mut names = Vec::new();
     let mut state = ScanState::Normal;
     let mut block_comment_depth = 0usize;
-    let mut index = 0;
+    let mut chars = sql.char_indices().peekable();
 
-    while index < chars.len() {
-        let current = chars[index];
-        let next = chars.get(index + 1).copied();
+    while let Some((byte_index, current)) = chars.next() {
+        let next = chars.peek().map(|(_, next)| *next);
         match state {
             ScanState::Normal => match (current, next) {
                 ('\'', _) => {
@@ -406,13 +405,13 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                 ('-', Some('-')) => {
                     state = ScanState::LineComment;
                     output.push_str("--");
-                    index += 1;
+                    chars.next();
                 }
                 ('/', Some('*')) => {
                     state = ScanState::BlockComment;
                     block_comment_depth = 1;
                     output.push_str("/*");
-                    index += 1;
+                    chars.next();
                 }
                 ('?', _) if !named => {
                     let rpc_name = format!("@P{}", names.len() + 1);
@@ -429,21 +428,23 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                 }
                 ('%', Some('%')) if named => {
                     output.push('%');
-                    index += 1;
+                    chars.next();
                 }
                 ('%', Some('(')) => {
-                    let name_start = index + 2;
-                    let mut name_end = name_start;
-                    while name_end < chars.len() && chars[name_end] != ')' {
-                        name_end += 1;
-                    }
-                    if name_end + 1 < chars.len() && chars[name_end + 1] == 's' {
+                    let name_start = byte_index + 2;
+                    let marker_end = sql[name_start..].find(')').and_then(|relative_end| {
+                        let name_end = name_start + relative_end;
+                        sql[name_end + 1..]
+                            .starts_with('s')
+                            .then_some((name_end, name_end + 1))
+                    });
+                    if let Some((name_end, marker_end)) = marker_end {
                         if !named {
                             return Err(PyTypeError::new_err(
                                 "Parameter style mismatch: query uses named placeholders (%(name)s) but positional parameters were provided",
                             ));
                         }
-                        let source_name = chars[name_start..name_end].iter().collect::<String>();
+                        let source_name = sql[name_start..name_end].to_string();
                         if source_name.is_empty() {
                             return Err(PyTypeError::new_err("Named parameter cannot be empty"));
                         }
@@ -453,7 +454,9 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                             rpc_name,
                             source_name: Some(source_name),
                         });
-                        index = name_end + 1;
+                        while chars.peek().is_some_and(|(index, _)| *index <= marker_end) {
+                            chars.next();
+                        }
                     } else {
                         output.push(current);
                     }
@@ -465,7 +468,7 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                 if current == '\'' {
                     if next == Some('\'') {
                         output.push('\'');
-                        index += 1;
+                        chars.next();
                     } else {
                         state = ScanState::Normal;
                     }
@@ -476,7 +479,7 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                 if current == '"' {
                     if next == Some('"') {
                         output.push('"');
-                        index += 1;
+                        chars.next();
                     } else {
                         state = ScanState::Normal;
                     }
@@ -487,7 +490,7 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                 if current == ']' {
                     if next == Some(']') {
                         output.push(']');
-                        index += 1;
+                        chars.next();
                     } else {
                         state = ScanState::Normal;
                     }
@@ -502,11 +505,11 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
             ScanState::BlockComment => {
                 if current == '/' && next == Some('*') {
                     output.push_str("/*");
-                    index += 1;
+                    chars.next();
                     block_comment_depth += 1;
                 } else if current == '*' && next == Some('/') {
                     output.push_str("*/");
-                    index += 1;
+                    chars.next();
                     block_comment_depth -= 1;
                     if block_comment_depth == 0 {
                         state = ScanState::Normal;
@@ -516,7 +519,6 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                 }
             }
         }
-        index += 1;
     }
 
     Ok((output, names))
@@ -555,6 +557,14 @@ mod tests {
                 ("@P3".to_string(), "name".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn rewrites_named_parameters_with_unicode() {
+        let (sql, names) = rewrite_placeholders("SELECT N'東京', %(café)s", true).unwrap();
+
+        assert_eq!(sql, "SELECT N'東京', @P1");
+        assert_eq!(names[0].source_name.as_deref(), Some("café"));
     }
 
     #[test]

@@ -15,9 +15,23 @@ use mssql_tds::datatypes::sql_vector::SqlVector;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::error::Error;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{
     PyBool, PyByteArray, PyBytes, PyDate, PyDateTime, PyFloat, PyInt, PyModule, PyString, PyTime,
+    PyType,
 };
+
+static DECIMAL_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static UUID_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static JSON_DUMPS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn decimal_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    DECIMAL_TYPE.import(py, "decimal", "Decimal")
+}
+
+fn uuid_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    UUID_TYPE.import(py, "uuid", "UUID")
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ParameterHint {
@@ -228,11 +242,11 @@ pub(crate) fn py_to_sql_type(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
         ColumnValues::Null => SqlType::NVarchar(None, 1),
         ColumnValues::Uuid(value) => SqlType::Uuid(Some(value)),
         ColumnValues::Json(value) => SqlType::Json(Some(value)),
-        ColumnValues::Vector(value) => SqlType::Vector(
-            Some(value.clone()),
-            value.dimension_count(),
-            value.base_type(),
-        ),
+        ColumnValues::Vector(value) => {
+            let dimensions = value.dimension_count();
+            let base_type = value.base_type();
+            SqlType::Vector(Some(value), dimensions, base_type)
+        }
     })
 }
 
@@ -417,8 +431,16 @@ fn hinted_binary(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<Sq
 }
 
 fn hinted_json(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
-    let value = PyModule::import(py_obj.py(), "json")
-        .and_then(|module| module.call_method1("dumps", (py_obj,)))
+    let py = py_obj.py();
+    let dumps = JSON_DUMPS
+        .get_or_try_init(py, || {
+            PyModule::import(py, "json")
+                .and_then(|module| module.getattr("dumps"))
+                .map(Bound::unbind)
+        })
+        .map(|dumps| dumps.bind(py));
+    let value = dumps
+        .and_then(|dumps| dumps.call1((py_obj,)))
         .and_then(|value| value.extract::<String>())
         .map_err(|error| {
             Error::UsageError(format!("Failed to serialize JSON parameter: {error}"))
@@ -446,8 +468,7 @@ fn hinted_vector(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<Sq
 }
 
 fn hinted_money(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<SqlType> {
-    let decimal_class = PyModule::import(py_obj.py(), "decimal")
-        .and_then(|module| module.getattr("Decimal"))
+    let decimal_class = decimal_type(py_obj.py())
         .map_err(|error| Error::UsageError(format!("Failed to import Decimal: {error}")))?;
     let value = py_obj
         .str()
@@ -574,11 +595,10 @@ fn py_time(py_obj: &Bound<'_, PyAny>, scale: u8) -> TdsResult<SqlTime> {
 }
 
 fn is_decimal(py_obj: &Bound<'_, PyAny>) -> TdsResult<bool> {
-    let decimal = PyModule::import(py_obj.py(), "decimal")
-        .and_then(|module| module.getattr("Decimal"))
+    let decimal = decimal_type(py_obj.py())
         .map_err(|error| Error::UsageError(format!("Failed to import decimal.Decimal: {error}")))?;
     py_obj
-        .is_instance(&decimal)
+        .is_instance(decimal)
         .map_err(|error| Error::UsageError(format!("Failed to inspect Decimal value: {error}")))
 }
 
@@ -1024,9 +1044,8 @@ fn py_to_column_value_internal(
     // Check for decimal.Decimal type
     // We need to check if the object is an instance of decimal.Decimal
     let py = py_obj.py();
-    if let Ok(decimal_module) = PyModule::import(py, "decimal")
-        && let Ok(decimal_class) = decimal_module.getattr("Decimal")
-        && let Ok(is_instance) = py_obj.is_instance(&decimal_class)
+    if let Ok(decimal_class) = decimal_type(py)
+        && let Ok(is_instance) = py_obj.is_instance(decimal_class)
         && is_instance
     {
         // Extract Decimal as string and parse it
@@ -1052,9 +1071,8 @@ fn py_to_column_value_internal(
 
     // Check for uuid.UUID type
     // Python's UUID type from the uuid module
-    if let Ok(uuid_module) = PyModule::import(py, "uuid")
-        && let Ok(uuid_class) = uuid_module.getattr("UUID")
-        && let Ok(is_instance) = py_obj.is_instance(&uuid_class)
+    if let Ok(uuid_class) = uuid_type(py)
+        && let Ok(is_instance) = py_obj.is_instance(uuid_class)
         && is_instance
     {
         // Extract UUID bytes (16 bytes in big-endian RFC 4122 format)
