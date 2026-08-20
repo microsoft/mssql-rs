@@ -480,3 +480,23 @@ TEST_F(FetchScrollLiveTest, GetDataAfterABlockFetchFailsCleanly) {
     EXPECT_EQ(SQL_ERROR, rc);
     SQLCloseCursor(stmt_);
 }
+
+// An application may bind only the length/indicator buffer, with no data
+// buffer. msodbcsql writes nothing at all in that case -- neither a length for
+// a value nor SQL_NULL_DATA for a NULL -- which settles the ambiguity in the
+// spec, where a null TargetValuePtr is also how a column is unbound. This
+// driver has to leave the indicator alone for the same reason.
+TEST_F(FetchScrollLiveTest, IndicatorOnlyBindingDeliversNothing) {
+    ExecDirect("SELECT CAST(42 AS INT) AS n, CAST(NULL AS INT) AS z");
+    SQLLEN nInd = -999;
+    SQLLEN zInd = -999;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, nullptr, 0, &nInd),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, nullptr, 0, &zInd),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLRETURN rc = SQLFetch(stmt_);
+    ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) << "rc=" << rc;
+    EXPECT_EQ(static_cast<SQLLEN>(-999), nInd) << "value indicator untouched";
+    EXPECT_EQ(static_cast<SQLLEN>(-999), zInd) << "NULL indicator untouched";
+    SQLCloseCursor(stmt_);
+}

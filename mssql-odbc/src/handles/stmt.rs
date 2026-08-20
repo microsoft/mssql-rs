@@ -220,13 +220,14 @@ impl StmtState {
     /// existing entry for the same column is replaced in place rather than
     /// shadowed.
     pub(crate) fn set_binding(&mut self, binding: ColumnBinding) {
+        // Kept ordered by column number: the fill loop walks a forward-only row
+        // cursor, so it can only visit bound columns in ascending order.
         match self
             .bindings
-            .iter_mut()
-            .find(|b| b.column_number == binding.column_number)
+            .binary_search_by_key(&binding.column_number, |b| b.column_number)
         {
-            Some(existing) => *existing = binding,
-            None => self.bindings.push(binding),
+            Ok(existing) => self.bindings[existing] = binding,
+            Err(insert_at) => self.bindings.insert(insert_at, binding),
         }
     }
 
@@ -439,6 +440,25 @@ mod tests {
             s.set_binding(binding(2, SQL_C_SLONG));
             s.clear_bindings();
             assert!(s.bindings.is_empty());
+        });
+    }
+
+    /// The fill loop reads a forward-only cursor, so it depends on this order
+    /// rather than re-establishing it; an application may bind in any order.
+    #[test]
+    fn bindings_stay_ordered_by_column_however_they_were_bound() {
+        with_state(|s| {
+            for col in [5, 1, 3, 2, 4] {
+                s.set_binding(binding(col, SQL_C_SLONG));
+            }
+            let cols: Vec<_> = s.bindings.iter().map(|b| b.column_number).collect();
+            assert_eq!(cols, vec![1, 2, 3, 4, 5]);
+
+            // A rebind replaces in place and keeps the order.
+            s.set_binding(binding(3, SQL_C_CHAR));
+            let cols: Vec<_> = s.bindings.iter().map(|b| b.column_number).collect();
+            assert_eq!(cols, vec![1, 2, 3, 4, 5]);
+            assert_eq!(s.bindings[2].target_type, SQL_C_CHAR);
         });
     }
 

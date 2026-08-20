@@ -162,7 +162,7 @@ fn fetch_scroll_safe(
     // fetch on the same statement, so the snapshot cannot go stale under us.
     let (
         row_array_size,
-        mut bindings,
+        bindings,
         rows_fetched_ptr,
         row_status_ptr,
         column_count,
@@ -221,9 +221,6 @@ fn fetch_scroll_safe(
             stmt_state.row_bind_offset_ptr,
         )
     };
-    // The row cursor only moves forward within a row, so the bound columns have
-    // to be visited in ascending order regardless of the order they were bound.
-    bindings.sort_by_key(|b| b.column_number);
 
     let rc = fill_rowset(
         statement_handle,
@@ -554,10 +551,9 @@ unsafe fn deliver_bound(
     }
 
     if binding.target_value_ptr.is_null() {
-        // Bound for its indicator only; report the length without a data write.
-        if is_null {
-            unsafe { write_if_some(indicator, SQL_NULL_DATA) };
-        }
+        // msodbcsql delivers nothing here, neither a length for a value nor
+        // SQL_NULL_DATA for a NULL: a null TargetValuePtr is also how a column
+        // is unbound, and it resolves that ambiguity by treating this as one.
         return RowOutcome::Success;
     }
     let slot =
@@ -807,14 +803,19 @@ mod tests {
         assert_eq!(buf[7], 0, "the buffer stays NUL-terminated");
     }
 
-    /// A binding with no data pointer is still allowed to carry an indicator.
+    /// A binding with no data pointer delivers nothing at all, as msodbcsql does.
     #[test]
-    fn indicator_only_binding_reports_null_without_writing_data() {
-        let mut ind = [0 as SqlLen; 1];
+    fn indicator_only_binding_delivers_nothing() {
+        let mut ind = [-999 as SqlLen; 1];
         let b = binding(1, SQL_C_SLONG, ptr::null_mut(), 0, ind.as_mut_ptr());
+
         let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Null) };
         assert!(matches!(outcome, RowOutcome::Success));
-        assert_eq!(ind[0], SQL_NULL_DATA);
+        assert_eq!(ind[0], -999, "NULL must not write the indicator");
+
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Int(7)) };
+        assert!(matches!(outcome, RowOutcome::Success));
+        assert_eq!(ind[0], -999, "a value must not write the indicator either");
     }
 
     /// A drained cursor is not an error: the result set ended on an earlier
