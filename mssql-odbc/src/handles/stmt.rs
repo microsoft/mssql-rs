@@ -167,10 +167,25 @@ pub(crate) struct StmtState {
     /// indices control both the `SQLParamData` pointer returned to the
     /// application and the cursor within the TDS streaming protocol.
     pub(crate) dae_param_indices: Vec<usize>,
+    /// Expected byte counts from `SQL_LEN_DATA_AT_EXEC(n)` for each DAE
+    /// parameter, parallel to `dae_param_indices`. `None` represents
+    /// `SQL_DATA_AT_EXEC`, where the application did not promise a total length.
+    pub(crate) dae_expected_lengths: Vec<Option<usize>>,
     /// Which element of `dae_param_indices` the driver is currently streaming.
     /// Incremented by `SQLParamData` each time `end_streamed_param` returns
     /// `NeedData` for the next parameter.
     pub(crate) dae_current_idx: usize,
+    /// Bytes supplied by `SQLPutData` for the current DAE parameter. This tracks
+    /// the application-provided byte count before any server-side conversion,
+    /// matching msodbcsql's `cbDataAppGiven`.
+    pub(crate) dae_current_bytes_sent: usize,
+    /// Set by the first `SQLPutData` call for the current parameter, including
+    /// zero-length and NULL writes. A second `SQLParamData` while this is false
+    /// is a sequence error in msodbcsql.
+    pub(crate) dae_current_put_data_called: bool,
+    /// True when the current DAE parameter was supplied as SQL NULL. Length
+    /// mismatch checks are skipped for NULL, as in msodbcsql.
+    pub(crate) dae_current_is_null: bool,
     /// `true` immediately after `SQLExecute` returns `SQL_NEED_DATA` and
     /// before the first `SQLParamData` call.  The first `SQLParamData` just
     /// delivers the current parameter's `ParameterValuePtr` without calling
@@ -265,7 +280,11 @@ impl StmtState {
         self.dae_prepared = None;
         self.dae_orphaned = None;
         self.dae_param_indices.clear();
+        self.dae_expected_lengths.clear();
         self.dae_current_idx = 0;
+        self.dae_current_bytes_sent = 0;
+        self.dae_current_put_data_called = false;
+        self.dae_current_is_null = false;
         self.dae_param_data_first = false;
         self.clear_state(STMT_STATE_NEED_DATA);
     }
@@ -321,7 +340,11 @@ impl StmtHandle {
                 dae_prepared: None,
                 dae_orphaned: None,
                 dae_param_indices: Vec::new(),
+                dae_expected_lengths: Vec::new(),
                 dae_current_idx: 0,
+                dae_current_bytes_sent: 0,
+                dae_current_put_data_called: false,
+                dae_current_is_null: false,
                 dae_param_data_first: false,
             }),
         }

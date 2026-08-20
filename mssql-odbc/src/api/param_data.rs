@@ -73,6 +73,38 @@ unsafe fn sql_param_data_impl(
     sql_param_data_safe(statement_handle, stmt, value_ptr_ptr)
 }
 
+fn abort_dae_with_diag(
+    dbc: &crate::handles::DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    diag: DiagMsg,
+) -> SqlReturn {
+    let (client, prepared, orphaned) = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLParamData: stmt mutex poisoned aborting DAE sequence");
+            return SQL_ERROR;
+        };
+        post_diag(&mut stmt_state, diag);
+        let client = stmt_state.dae_client.take();
+        let prepared = stmt_state.dae_prepared.take();
+        let orphaned = stmt_state.dae_orphaned.take();
+        stmt_state.reset_dae();
+        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+        (client, prepared, orphaned)
+    };
+
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        stmt_state.prepared = prepared;
+        stmt_state.pending_unprepare = orphaned;
+    }
+
+    if let Some(mut client) = client {
+        dbc.runtime.block_on(client.cancel_streamed_write());
+        return_client_idle(dbc, statement_handle, client);
+    }
+    SQL_ERROR
+}
+
 fn sql_param_data_safe(
     statement_handle: SqlHandle,
     stmt: &StmtHandle,
@@ -126,6 +158,35 @@ fn sql_param_data_safe(
         return SQL_NEED_DATA;
     }
 
+    let close_error = {
+        let Ok(stmt_state) = stmt.inner.lock() else {
+            error!("SQLParamData: stmt mutex poisoned validating current DAE parameter");
+            return SQL_ERROR;
+        };
+
+        if !stmt_state.dae_current_put_data_called {
+            Some(ERR_FUNCTION_SEQUENCE)
+        } else if !stmt_state.dae_current_is_null {
+            match stmt_state
+                .dae_expected_lengths
+                .get(stmt_state.dae_current_idx)
+                .and_then(|v| *v)
+            {
+                Some(expected) if expected != stmt_state.dae_current_bytes_sent => {
+                    Some(ERR_DAE_LENGTH_MISMATCH)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some(diag) = close_error {
+        error!("SQLParamData: current DAE parameter failed close-time validation");
+        return abort_dae_with_diag(dbc, stmt, statement_handle, diag);
+    }
+
     // ── Subsequent calls: close current parameter and advance ───────────────
     // Take the TDS client out of stmt_state while we do I/O.
     let mut client = {
@@ -157,6 +218,9 @@ fn sql_param_data_safe(
                 };
                 stmt_state.dae_client = Some(client);
                 stmt_state.dae_current_idx += 1;
+                stmt_state.dae_current_bytes_sent = 0;
+                stmt_state.dae_current_put_data_called = false;
+                stmt_state.dae_current_is_null = false;
                 let next_idx = stmt_state.dae_current_idx;
                 let param_idx = stmt_state
                     .dae_param_indices
@@ -232,6 +296,7 @@ fn sql_param_data_safe(
 mod tests {
     use super::*;
     use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::handles::stmt::STMT_STATE_NEED_DATA;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -250,5 +315,49 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+    }
+
+    #[test]
+    fn second_call_without_put_data_returns_hy010() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_NEED_DATA);
+            state.dae_param_data_first = false;
+        }
+
+        let mut p: SqlPointer = std::ptr::null_mut();
+        let ret = unsafe { sql_param_data(h.stmt, &mut p) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+        assert!(!state.has_state(STMT_STATE_NEED_DATA));
+    }
+
+    #[test]
+    fn short_declared_dae_length_returns_22026() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_NEED_DATA);
+            state.dae_param_data_first = false;
+            state.dae_current_put_data_called = true;
+            state.dae_current_bytes_sent = 2;
+            state.dae_expected_lengths.push(Some(3));
+        }
+
+        let mut p: SqlPointer = std::ptr::null_mut();
+        let ret = unsafe { sql_param_data(h.stmt, &mut p) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_DAE_LENGTH_MISMATCH.state
+        );
+        assert!(!state.has_state(STMT_STATE_NEED_DATA));
     }
 }

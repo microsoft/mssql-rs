@@ -77,9 +77,13 @@ transparent reconnects.
   default, so it is supported by construction) and builds NULLs from
   `ParameterType`. `SQL_SS_UDT` and `SQL_SS_TABLE` are still rejected at bind
   time, since they need a server type name no describe call reports.
-- **Value conversion** - `SQL_C_CHAR` maps to varchar and `SQL_C_WCHAR` to
-  nvarchar. Indicators support `SQL_NULL_DATA`, `SQL_NTS`, and explicit byte
-  length.
+- **Value conversion** - `SQL_C_CHAR` maps to varchar, `SQL_C_WCHAR` to
+  nvarchar, and `SQL_C_BINARY` to varbinary. Character indicators support
+  `SQL_NULL_DATA`, `SQL_NTS`, and explicit byte length; binary values use
+  explicit byte length or `BufferLength` when no indicator pointer is supplied.
+- **Data-at-execution streaming** - `SQLParamData` / `SQLPutData` stream
+  `SQL_C_CHAR`, `SQL_C_WCHAR`, and `SQL_C_BINARY` as PLP
+  `(n)varchar(max)` / `varbinary(max)`, matching msodbcsql sequencing.
 
 ## `mssql-tds` prepared API
 
@@ -220,7 +224,8 @@ SQLSTATE constant or a never-constructed enum variant fails the lint gate:
 - [`params/conversion_matrix.rs`](../src/params/conversion_matrix.rs) - one row
   per C type listing the SQL types it converts to. Rows today: `SQL_C_CHAR` ->
   `CHAR` / `VARCHAR` / `LONGVARCHAR`, `SQL_C_WCHAR` -> `WCHAR` / `WVARCHAR` /
-  `WLONGVARCHAR`.
+  `WLONGVARCHAR`, and `SQL_C_BINARY` -> `BINARY` / `VARBINARY` /
+  `LONGVARBINARY`.
 - [`api/bind_param.rs`](../src/api/bind_param.rs) - runs both checks and stores
   the resolved C type on the binding.
 

@@ -15,8 +15,8 @@ use tracing::{debug, error};
 use super::exec_common::{fail_with_tds, return_client_idle};
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NULL_DATA, SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer,
-    SqlReturn,
+    SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_DATA, SQL_SUCCESS, SqlHandle,
+    SqlLen, SqlPointer, SqlReturn,
 };
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_NEED_DATA;
@@ -61,6 +61,68 @@ unsafe fn sql_put_data_impl(
     unsafe { sql_put_data_safe(statement_handle, stmt, data_ptr, strlen_or_ind) }
 }
 
+fn current_dae_c_type(stmt_state: &crate::handles::stmt::StmtState) -> Option<i16> {
+    let param_idx = stmt_state
+        .dae_param_indices
+        .get(stmt_state.dae_current_idx)
+        .copied()?;
+    stmt_state
+        .bound_params
+        .get(param_idx)?
+        .as_ref()
+        .map(|p| p.c_type)
+}
+
+unsafe fn nts_byte_count(data_ptr: SqlPointer, c_type: i16) -> usize {
+    if c_type == SQL_C_WCHAR {
+        let ptr = data_ptr as *const u16;
+        let mut units = 0usize;
+        while unsafe { *ptr.add(units) } != 0 {
+            units += 1;
+        }
+        units * std::mem::size_of::<u16>()
+    } else {
+        let ptr = data_ptr as *const u8;
+        let mut bytes = 0usize;
+        while unsafe { *ptr.add(bytes) } != 0 {
+            bytes += 1;
+        }
+        bytes
+    }
+}
+
+fn abort_dae_with_diag(
+    dbc: &crate::handles::DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    diag: DiagMsg,
+) -> SqlReturn {
+    let (client, prepared, orphaned) = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLPutData: stmt mutex poisoned aborting DAE sequence");
+            return SQL_ERROR;
+        };
+        post_diag(&mut stmt_state, diag);
+        let client = stmt_state.dae_client.take();
+        let prepared = stmt_state.dae_prepared.take();
+        let orphaned = stmt_state.dae_orphaned.take();
+        stmt_state.reset_dae();
+        stmt_state.clear_state(crate::handles::stmt::STMT_STATE_EXEC_STARTED);
+        (client, prepared, orphaned)
+    };
+
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        stmt_state.prepared = prepared;
+        stmt_state.pending_unprepare = orphaned;
+    }
+
+    if let Some(mut client) = client {
+        dbc.runtime.block_on(client.cancel_streamed_write());
+        return_client_idle(dbc, statement_handle, client);
+    }
+    SQL_ERROR
+}
+
 unsafe fn sql_put_data_safe(
     statement_handle: SqlHandle,
     stmt: &StmtHandle,
@@ -92,13 +154,17 @@ unsafe fn sql_put_data_safe(
         }
     }
 
+    let is_null_put = strlen_or_ind == SQL_NULL_DATA || (data_ptr.is_null() && strlen_or_ind == 0);
+
     // ── Null data: mark the parameter as SQL NULL ───────────────────────────
-    if strlen_or_ind == SQL_NULL_DATA {
+    if is_null_put {
         let write_result = {
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLPutData: stmt mutex poisoned taking dae_client for null write");
                 return SQL_ERROR;
             };
+            stmt_state.dae_current_put_data_called = true;
+            stmt_state.dae_current_is_null = true;
             match stmt_state.dae_client.as_mut() {
                 Some(c) => match c.write_streamed_null() {
                     Ok(()) => Some(Ok(())),
@@ -141,7 +207,23 @@ unsafe fn sql_put_data_safe(
     }
 
     // ── Positive (or zero) length: stream the bytes ─────────────────────────
-    let byte_count = if strlen_or_ind < 0 {
+    let byte_count = if strlen_or_ind == SQL_NTS as SqlLen {
+        if data_ptr.is_null() {
+            error!("SQLPutData: SQL_NTS with null data pointer");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_diag(&mut stmt_state, ERR_INVALID_NULL_POINTER);
+            }
+            return SQL_ERROR;
+        }
+        let c_type = {
+            let Ok(stmt_state) = stmt.inner.lock() else {
+                error!("SQLPutData: stmt mutex poisoned resolving current C type");
+                return SQL_ERROR;
+            };
+            current_dae_c_type(&stmt_state).unwrap_or_default()
+        };
+        unsafe { nts_byte_count(data_ptr, c_type) }
+    } else if strlen_or_ind < 0 {
         // Negative values other than SQL_NULL_DATA are invalid for input.
         error!("SQLPutData: invalid strlen_or_ind {strlen_or_ind}");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -152,10 +234,29 @@ unsafe fn sql_put_data_safe(
         strlen_or_ind as usize
     };
 
+    {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLPutData: stmt mutex poisoned updating DAE byte count");
+            return SQL_ERROR;
+        };
+        let new_total = stmt_state.dae_current_bytes_sent.saturating_add(byte_count);
+        if let Some(expected) = stmt_state
+            .dae_expected_lengths
+            .get(stmt_state.dae_current_idx)
+            .and_then(|v| *v)
+            && new_total > expected
+        {
+            drop(stmt_state);
+            error!("SQLPutData: DAE data exceeds SQL_LEN_DATA_AT_EXEC length");
+            return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_DAE_LENGTH_MISMATCH);
+        }
+        stmt_state.dae_current_bytes_sent = new_total;
+        stmt_state.dae_current_put_data_called = true;
+    }
+
     if byte_count == 0 {
-        // Zero-length chunk: a no-op in the PLP protocol — the value is still
-        // "present" (non-NULL) but the chunk carries no bytes.  Per the ODBC
-        // spec this is valid.
+        // Zero-length chunk with a non-null pointer supplies an empty value.
+        // NULL/0 is handled above as SQL NULL to match msodbcsql.
         return SQL_SUCCESS;
     }
 
@@ -218,7 +319,7 @@ unsafe fn sql_put_data_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE};
     use crate::handles::stmt::STMT_STATE_NEED_DATA;
     use crate::test_support::TestHandles;
 
@@ -271,5 +372,82 @@ mod tests {
             state.diag_records[0].sql_state,
             ERR_INVALID_STRING_OR_BUFFER_LENGTH.state
         );
+    }
+
+    #[test]
+    fn zero_length_non_null_chunk_marks_current_param_supplied() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_NEED_DATA);
+            state.dae_param_data_first = false;
+        }
+
+        let mut byte = 0u8;
+        let ret = unsafe { sql_put_data(h.stmt, (&mut byte as *mut u8).cast(), 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let state = stmt.inner.lock().unwrap();
+        assert!(state.dae_current_put_data_called);
+        assert!(!state.dae_current_is_null);
+        assert_eq!(state.dae_current_bytes_sent, 0);
+    }
+
+    #[test]
+    fn nts_chunk_length_is_counted_before_terminator() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_NEED_DATA);
+            state.dae_param_data_first = false;
+            state.dae_param_indices.push(0);
+            state.bound_params.push(Some(crate::params::BoundParam {
+                input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
+                c_type: SQL_C_CHAR,
+                c_type_defaulted: false,
+                sql_type: crate::api::odbc_types::SQL_VARCHAR,
+                column_size: 0,
+                decimal_digits: 0,
+                parameter_value_ptr: std::ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: std::ptr::null_mut(),
+            }));
+        }
+
+        let mut bytes = b"abc\0".to_vec();
+        let ret = unsafe { sql_put_data(h.stmt, bytes.as_mut_ptr().cast(), SQL_NTS as SqlLen) };
+        assert_eq!(
+            ret, SQL_ERROR,
+            "no TDS client is present for the actual write"
+        );
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.dae_current_bytes_sent, 3);
+        assert!(state.dae_current_put_data_called);
+    }
+
+    #[test]
+    fn over_declared_dae_length_returns_22026() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_NEED_DATA);
+            state.dae_param_data_first = false;
+            state.dae_expected_lengths.push(Some(2));
+        }
+
+        let mut bytes = *b"abc";
+        let ret = unsafe { sql_put_data(h.stmt, bytes.as_mut_ptr().cast(), 3) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_DAE_LENGTH_MISMATCH.state
+        );
+        assert!(!state.has_state(STMT_STATE_NEED_DATA));
     }
 }

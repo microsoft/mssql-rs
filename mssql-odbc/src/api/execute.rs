@@ -68,6 +68,9 @@ struct DaeExecution {
     params: Vec<RpcParameter>,
     /// 0-based indices (into `params`) of the DAE parameters, in order.
     dae_indices: Vec<usize>,
+    /// Expected byte counts from `SQL_LEN_DATA_AT_EXEC(n)`, parallel to
+    /// `dae_indices`.
+    dae_expected_lengths: Vec<Option<usize>>,
     prepared: PreparedPlan,
     orphaned: Option<StatementId>,
 }
@@ -143,6 +146,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
         ExecutionStaging::NeedData(DaeExecution {
             params,
             dae_indices,
+            dae_expected_lengths,
             prepared,
             orphaned,
         }) => {
@@ -168,9 +172,11 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // Use the prepared SQL text with ad-hoc sp_executesql (no caching)
             // since the streaming API doesn't go through sp_prepexec.
             let sql = prepared.stmt.sql().to_string();
-            let begin_result = dbc
-                .runtime
-                .block_on(client.begin_sp_executesql(sql, params, None, None));
+            let begin_result = dbc.runtime.block_on(client.begin_sp_executesql(
+                sql,
+                params,
+                ExecuteOptions::default(),
+            ));
 
             match begin_result {
                 Ok(StreamedParamStatus::Complete(result)) => {
@@ -193,7 +199,11 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                         stmt_state.dae_prepared = Some(prepared);
                         stmt_state.dae_orphaned = orphaned;
                         stmt_state.dae_param_indices = dae_indices;
+                        stmt_state.dae_expected_lengths = dae_expected_lengths;
                         stmt_state.dae_current_idx = 0;
+                        stmt_state.dae_current_bytes_sent = 0;
+                        stmt_state.dae_current_put_data_called = false;
+                        stmt_state.dae_current_is_null = false;
                         stmt_state.dae_param_data_first = true;
                         stmt_state.set_state(STMT_STATE_NEED_DATA);
                         stored = true;
@@ -258,6 +268,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     let ParamsWithDae {
         params,
         dae_indices,
+        dae_expected_lengths,
     } = unsafe { build_params_with_dae(&mut stmt_state, marker_count, "SQLExecute") }?;
 
     let prepared = stmt_state
@@ -282,6 +293,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         Ok(ExecutionStaging::NeedData(DaeExecution {
             params,
             dae_indices,
+            dae_expected_lengths,
             prepared,
             orphaned,
         }))
@@ -494,6 +506,7 @@ mod tests {
             .push(Some(BoundParam {
                 input_output_type: SQL_PARAM_INPUT,
                 c_type: SQL_C_CHAR,
+                c_type_defaulted: false,
                 sql_type: SQL_VARCHAR,
                 column_size: 0,
                 decimal_digits: 0,

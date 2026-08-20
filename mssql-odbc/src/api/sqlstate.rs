@@ -25,6 +25,7 @@ pub(crate) const SQLSTATE_08007: [u8; 5] = *b"08007";
 /// connection pool must discard the connection rather than reuse it.
 pub(crate) const SQLSTATE_08S01: [u8; 5] = *b"08S01";
 pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
+pub(crate) const SQLSTATE_22026: [u8; 5] = *b"22026";
 pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
 pub(crate) const SQLSTATE_25000: [u8; 5] = *b"25000";
@@ -148,6 +149,10 @@ pub(crate) const ERR_NUMERIC_OUT_OF_RANGE: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_CHARACTER_VALUE: DiagMsg = DiagMsg {
     state: SQLSTATE_22018,
     text: "Invalid character value for cast specification",
+};
+pub(crate) const ERR_DAE_LENGTH_MISMATCH: DiagMsg = DiagMsg {
+    state: SQLSTATE_22026,
+    text: "String data, length mismatch",
 };
 pub(crate) const WARN_FRACTIONAL_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01S07,

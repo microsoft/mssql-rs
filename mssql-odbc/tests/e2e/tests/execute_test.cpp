@@ -151,6 +151,41 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// Binary data-at-execution streams raw bytes as varbinary(max), including NUL
+// bytes, matching msodbcsql SQLPutData behavior for SQL_C_BINARY.
+TEST_F(PrepareExecuteLiveTest, DataAtExecutionBinaryParam) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(varchar(20), ?, 2) AS v"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR streamed_token = 0;
+
+    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY,
+                                    SQL_LONGVARBINARY, 0, 0, &streamed_token, 0,
+                                    &streamed_ind);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&streamed_token, value_ptr);
+
+    const SQLCHAR first_chunk[] = {0x01, 0x00};
+    const SQLCHAR second_chunk[] = {0xFF, 0x7E};
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(first_chunk),
+                             sizeof(first_chunk)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(second_chunk),
+                             sizeof(second_chunk)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("0100FF7E", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // A wide-character parameter binds as nvarchar and round-trips.
 TEST_F(PrepareExecuteLiveTest, WideCharParam) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
