@@ -203,6 +203,9 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeWideCharParam) {
 // An integer parameter bound with SQL_C_DEFAULT survives the round trip: the
 // driver picks a C type for it, sends the value, and the server returns it
 // unchanged. Which C type it picks is unit-tested, not observable here.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert @P1 is declared an
+// integer rather than nvarchar(max); SQL Server implicit-converts either way.
 TEST_F(PrepareExecuteLiveTest, DefaultCTypeIntegerParam) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
@@ -222,6 +225,10 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeIntegerParam) {
 // One SQL_C_SLONG buffer binds against every integer ParameterType, and each
 // one executes and returns the value intact. Which type reaches the wire is
 // unit-tested, not observable here.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the declared type
+// actually changes across the four binds; the round-tripped text is "7" for all
+// of them, and for the pre-P3 nvarchar(max) behaviour too.
 TEST_F(PrepareExecuteLiveTest, IntegerParamAcceptsEveryIntegerTargetType) {
     const SQLSMALLINT sql_types[] = {SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT};
     for (SQLSMALLINT sql_type : sql_types) {
@@ -287,6 +294,10 @@ TEST_F(PrepareExecuteLiveTest, IntervalSqlTypeIsRejectedWithHyc00) {
 // A NULL takes its type from ParameterType, so an explicitly bound integer C
 // type must produce a typed NULL rather than being rejected. The value path and
 // the NULL path of the same binding have to agree.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the typed NULL carries
+// the ParameterType's TYPE_INFO; a fetched NULL looks the same whatever it was
+// declared as.
 TEST_F(PrepareExecuteLiveTest, ExplicitIntegerParamAcceptsNull) {
     const SQLSMALLINT sql_types[] = {SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT};
     for (SQLSMALLINT sql_type : sql_types) {
@@ -312,6 +323,9 @@ TEST_F(PrepareExecuteLiveTest, ExplicitIntegerParamAcceptsNull) {
 // The same NULL against a defaulted binding. An application must get the same
 // answer whether it named the C type or let the driver pick it, so this and
 // ExplicitIntegerParamAcceptsNull have to stay in step.
+//
+// Benefits-from-mock-tds: as above - only a mock server can show the two
+// spellings produce the same declaration.
 TEST_F(PrepareExecuteLiveTest, DefaultCTypeIntegerParamAcceptsNull) {
     const SQLSMALLINT sql_types[] = {SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT};
     for (SQLSMALLINT sql_type : sql_types) {
@@ -360,6 +374,9 @@ TEST_F(PrepareExecuteLiveTest, UnalignedIntegerParamBufferIsRead) {
 // SQL_C_TINYINT is the ODBC 2.x spelling of the *signed* form, so 0xFF is -1.
 // Only SQL_C_UTINYINT reads it as 255. msodbcsql groups SQL_C_TINYINT with
 // SQL_C_STINYINT in ConvertToChar (sqlccnvt.cpp), so both drivers must agree.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the smallint payload
+// on the wire, rather than inferring it from the rendered text.
 TEST_F(PrepareExecuteLiveTest, TinyintCTypeIsSignedButUtinyintIsNot) {
     struct Case {
         SQLSMALLINT c_type;
@@ -402,7 +419,9 @@ TEST_F(PrepareExecuteLiveTest, UbigintAboveBigintMaxIs22003) {
 
 // For a fixed-width C type StrLen_or_Ind is not a length - the size comes from
 // the C type - so a stray value is ignored rather than validated. msodbcsql
-// overwrites it outright in GetBindingInfo (sqlcfunc.cpp).
+// consults the indicator only for non-fixed C types (`!IsFixedCType(...) &&
+// cbValue > 0`, sqlccmd.cpp:4128 and :4539) and likewise overrides BufferLength
+// for them at bind (sqlcdesc.cpp:2507).
 TEST_F(PrepareExecuteLiveTest, StrayIndicatorIsIgnoredForFixedWidthCTypes) {
     // -7 is HY090 on a character binding and ignored here; 999 would overread a
     // 4-byte buffer if it were ever honoured as a length.
