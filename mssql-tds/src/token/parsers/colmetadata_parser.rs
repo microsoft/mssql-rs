@@ -84,7 +84,7 @@
 //!   5. DONE        ← End of result set
 //! ```
 
-use std::io::Error;
+use std::{io::Error, mem::size_of};
 
 use async_trait::async_trait;
 
@@ -102,6 +102,32 @@ use crate::{
 
 /// Column-flag bit indicating the column is protected by Always Encrypted.
 const FLAG_ENCRYPTED: u16 = 0x0800;
+
+/// Byte budget for the column vector's initial allocation. `col_count` is
+/// attacker-controlled, so reserving the full count up front lets a tiny token
+/// drive a large eager allocation — a memory-amplification DoS the fuzzer
+/// surfaced as a timeout (build 164079: a 3-byte token reserving ~42 MB).
+/// Reserving conservatively and letting the vector grow as columns are actually
+/// parsed keeps work proportional to the bytes on the wire, so any legitimate
+/// column count is handled without an artificial cap.
+const COLUMN_PREALLOC_BYTES: usize = 160 * 1024;
+const COLUMN_PREALLOC_CAP: usize = COLUMN_PREALLOC_BYTES / size_of::<ColumnMetadata>();
+
+/// Byte budget for the CEK table vector's initial allocation.
+const CEK_TABLE_PREALLOC_BYTES: usize = 12 * 1024;
+const CEK_TABLE_PREALLOC_CAP: usize = CEK_TABLE_PREALLOC_BYTES / size_of::<CekTableEntry>();
+
+fn bounded_capacity(count: u16, cap: usize) -> usize {
+    (count as usize).min(cap)
+}
+
+fn new_column_vec(col_count: u16) -> Vec<ColumnMetadata> {
+    Vec::with_capacity(bounded_capacity(col_count, COLUMN_PREALLOC_CAP))
+}
+
+fn new_cek_table_vec(entry_count: u16) -> Vec<CekTableEntry> {
+    Vec::with_capacity(bounded_capacity(entry_count, CEK_TABLE_PREALLOC_CAP))
+}
 
 /// Cipher algorithm id signalling a custom (named) algorithm whose name follows
 /// inline in the crypto metadata.
@@ -147,8 +173,10 @@ where
         // for an (empty) table and desynchronize the token stream.
         let has_cek_table = is_column_encryption_supported;
 
-        // Pre-allocate vector for column metadata
-        let mut column_metadata: Vec<ColumnMetadata> = Vec::with_capacity(col_count as usize);
+        // Reserve conservatively; a large but valid `col_count` grows the vector
+        // as columns are parsed, while a malformed count cannot force a huge
+        // eager allocation. See `COLUMN_PREALLOC_CAP`.
+        let mut column_metadata = new_column_vec(col_count);
 
         // Parse each column definition
         for _ in 0..col_count {
@@ -258,9 +286,9 @@ async fn parse_cek_table<T>(reader: &mut T) -> TdsResult<Vec<CekTableEntry>>
 where
     T: TdsPacketReader + Send + Sync,
 {
-    let table_size = reader.read_uint16().await?;
-    let mut entries: Vec<CekTableEntry> = Vec::with_capacity(table_size as usize);
-    for _ in 0..table_size {
+    let entry_count = reader.read_uint16().await?;
+    let mut entries = new_cek_table_vec(entry_count);
+    for _ in 0..entry_count {
         entries.push(parse_cek_table_entry(reader).await?);
     }
     Ok(entries)
@@ -629,6 +657,48 @@ mod tests {
 
         let result = parser.parse(&mut reader, &context).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_column_vec_capacity_is_bounded() {
+        assert_eq!(new_column_vec(0).capacity(), 0);
+        assert_eq!(new_column_vec(10).capacity(), 10);
+        assert_eq!(new_column_vec(5000).capacity(), COLUMN_PREALLOC_CAP);
+        assert_eq!(new_column_vec(0xFFFE).capacity(), COLUMN_PREALLOC_CAP);
+    }
+
+    #[test]
+    fn test_cek_table_vec_capacity_is_bounded() {
+        assert_eq!(new_cek_table_vec(0).capacity(), 0);
+        assert_eq!(new_cek_table_vec(10).capacity(), 10);
+        assert_eq!(
+            new_cek_table_vec(u16::MAX).capacity(),
+            CEK_TABLE_PREALLOC_CAP
+        );
+    }
+
+    #[tokio::test]
+    async fn test_large_column_count_without_data_returns_error() {
+        // A large declared count with no column bytes returns an error when the
+        // first column read cannot be satisfied.
+        let data = vec![0x84, 0xB8]; // col_count = 0xB884 = 47236
+        let mut reader = MockReader::new(data);
+        let parser = ColMetadataTokenParser;
+        let context = ParserContext::default();
+
+        assert!(parser.parse(&mut reader, &context).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_large_valid_column_count_without_data_returns_error() {
+        // A plausible wide-table count follows the same error path when its
+        // column bytes are absent.
+        let data = vec![0x88, 0x13]; // col_count = 0x1388 = 5000
+        let mut reader = MockReader::new(data);
+        let parser = ColMetadataTokenParser;
+        let context = ParserContext::default();
+
+        assert!(parser.parse(&mut reader, &context).await.is_err());
     }
 
     #[tokio::test]
