@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use mssql_tds::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
+use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
@@ -10,60 +11,113 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::types::{ParameterHint, null_sql_type, py_to_sql_type, py_to_sql_type_with_hint};
 
-fn sql_type_signature(value: &SqlType) -> String {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ParameterMetadata {
+    Scalar(&'static str),
+    Decimal {
+        numeric: bool,
+        precision: u8,
+        scale: u8,
+    },
+    Temporal {
+        kind: &'static str,
+        scale: u8,
+    },
+    Sized {
+        kind: &'static str,
+        length: u16,
+    },
+    Vector {
+        dimensions: u16,
+        base_type: VectorBaseType,
+    },
+    Variant(Box<ParameterMetadata>),
+    Table {
+        schema: String,
+        name: String,
+    },
+}
+
+fn sql_type_metadata(value: &SqlType) -> ParameterMetadata {
     match value {
-        SqlType::Bit(_) => "bit".to_string(),
-        SqlType::TinyInt(_) => "tinyint".to_string(),
-        SqlType::SmallInt(_) => "smallint".to_string(),
-        SqlType::Int(_) => "int".to_string(),
-        SqlType::BigInt(_) => "bigint".to_string(),
-        SqlType::Real(_) => "real".to_string(),
-        SqlType::Float(_) => "float".to_string(),
-        SqlType::Decimal(value) => value.as_ref().map_or_else(
-            || "decimal(18,10)".to_string(),
-            |value| format!("decimal({},{})", value.precision, value.scale),
-        ),
-        SqlType::Numeric(value) => value.as_ref().map_or_else(
-            || "numeric(18,10)".to_string(),
-            |value| format!("numeric({},{})", value.precision, value.scale),
-        ),
-        SqlType::Money(_) => "money".to_string(),
-        SqlType::SmallMoney(_) => "smallmoney".to_string(),
-        SqlType::Time(value) => format!("time({})", value.as_ref().map_or(7, |value| value.scale)),
-        SqlType::DateTime2(value) => format!(
-            "datetime2({})",
-            value.as_ref().map_or(7, |value| value.time.scale)
-        ),
-        SqlType::DateTimeOffset(value) => format!(
-            "datetimeoffset({})",
-            value.as_ref().map_or(7, |value| value.datetime2.time.scale)
-        ),
-        SqlType::SmallDateTime(_) => "smalldatetime".to_string(),
-        SqlType::DateTime(_) => "datetime".to_string(),
-        SqlType::Date(_) => "date".to_string(),
-        SqlType::NVarchar(_, length) => format!("nvarchar({length})"),
-        SqlType::NVarcharMax(_) => "nvarchar(max)".to_string(),
-        SqlType::Varchar(_, length) => format!("varchar({length})"),
-        SqlType::VarcharMax(_) => "varchar(max)".to_string(),
-        SqlType::VarBinary(_, length) => format!("varbinary({length})"),
-        SqlType::VarBinaryMax(_) => "varbinary(max)".to_string(),
-        SqlType::Binary(_, length) => format!("binary({length})"),
-        SqlType::Char(_, length) => format!("char({length})"),
-        SqlType::NChar(_, length) => format!("nchar({length})"),
-        SqlType::Text(_) => "text".to_string(),
-        SqlType::NText(_) => "ntext".to_string(),
-        SqlType::Json(_) => "json".to_string(),
-        SqlType::Xml(_) => "xml".to_string(),
-        SqlType::Uuid(_) => "uniqueidentifier".to_string(),
-        SqlType::Vector(_, dimensions, base_type) => {
-            format!("vector({dimensions},{base_type:?})")
-        }
-        SqlType::Variant(inner) => format!("sql_variant<{}>", sql_type_signature(inner)),
-        SqlType::Table(type_name, _) => format!(
-            "tvp({}.{})",
-            type_name.schema_name.as_deref().unwrap_or("dbo"),
-            type_name.type_name
-        ),
+        SqlType::Bit(_) => ParameterMetadata::Scalar("bit"),
+        SqlType::TinyInt(_) => ParameterMetadata::Scalar("tinyint"),
+        SqlType::SmallInt(_) => ParameterMetadata::Scalar("smallint"),
+        SqlType::Int(_) => ParameterMetadata::Scalar("int"),
+        SqlType::BigInt(_) => ParameterMetadata::Scalar("bigint"),
+        SqlType::Real(_) => ParameterMetadata::Scalar("real"),
+        SqlType::Float(_) => ParameterMetadata::Scalar("float"),
+        SqlType::Decimal(value) => ParameterMetadata::Decimal {
+            numeric: false,
+            precision: value.as_ref().map_or(18, |value| value.precision),
+            scale: value.as_ref().map_or(10, |value| value.scale),
+        },
+        SqlType::Numeric(value) => ParameterMetadata::Decimal {
+            numeric: true,
+            precision: value.as_ref().map_or(18, |value| value.precision),
+            scale: value.as_ref().map_or(10, |value| value.scale),
+        },
+        SqlType::Money(_) => ParameterMetadata::Scalar("money"),
+        SqlType::SmallMoney(_) => ParameterMetadata::Scalar("smallmoney"),
+        SqlType::Time(value) => ParameterMetadata::Temporal {
+            kind: "time",
+            scale: value.as_ref().map_or(7, |value| value.scale),
+        },
+        SqlType::DateTime2(value) => ParameterMetadata::Temporal {
+            kind: "datetime2",
+            scale: value.as_ref().map_or(7, |value| value.time.scale),
+        },
+        SqlType::DateTimeOffset(value) => ParameterMetadata::Temporal {
+            kind: "datetimeoffset",
+            scale: value.as_ref().map_or(7, |value| value.datetime2.time.scale),
+        },
+        SqlType::SmallDateTime(_) => ParameterMetadata::Scalar("smalldatetime"),
+        SqlType::DateTime(_) => ParameterMetadata::Scalar("datetime"),
+        SqlType::Date(_) => ParameterMetadata::Scalar("date"),
+        SqlType::NVarchar(_, length) => ParameterMetadata::Sized {
+            kind: "nvarchar",
+            length: *length,
+        },
+        SqlType::NVarcharMax(_) => ParameterMetadata::Scalar("nvarchar(max)"),
+        SqlType::Varchar(_, length) => ParameterMetadata::Sized {
+            kind: "varchar",
+            length: *length,
+        },
+        SqlType::VarcharMax(_) => ParameterMetadata::Scalar("varchar(max)"),
+        SqlType::VarBinary(_, length) => ParameterMetadata::Sized {
+            kind: "varbinary",
+            length: *length,
+        },
+        SqlType::VarBinaryMax(_) => ParameterMetadata::Scalar("varbinary(max)"),
+        SqlType::Binary(_, length) => ParameterMetadata::Sized {
+            kind: "binary",
+            length: *length,
+        },
+        SqlType::Char(_, length) => ParameterMetadata::Sized {
+            kind: "char",
+            length: *length,
+        },
+        SqlType::NChar(_, length) => ParameterMetadata::Sized {
+            kind: "nchar",
+            length: *length,
+        },
+        SqlType::Text(_) => ParameterMetadata::Scalar("text"),
+        SqlType::NText(_) => ParameterMetadata::Scalar("ntext"),
+        SqlType::Json(_) => ParameterMetadata::Scalar("json"),
+        SqlType::Xml(_) => ParameterMetadata::Scalar("xml"),
+        SqlType::Uuid(_) => ParameterMetadata::Scalar("uniqueidentifier"),
+        SqlType::Vector(_, dimensions, base_type) => ParameterMetadata::Vector {
+            dimensions: *dimensions,
+            base_type: *base_type,
+        },
+        SqlType::Variant(inner) => ParameterMetadata::Variant(Box::new(sql_type_metadata(inner))),
+        SqlType::Table(type_name, _) => ParameterMetadata::Table {
+            schema: type_name
+                .schema_name
+                .clone()
+                .unwrap_or_else(|| "dbo".to_string()),
+            name: type_name.type_name.clone(),
+        },
     }
 }
 
@@ -230,7 +284,7 @@ pub(crate) fn bind_parameters(
     operation: String,
     parameters: &Bound<'_, PyTuple>,
     hints: Option<&[ParameterHint]>,
-) -> PyResult<(String, Vec<RpcParameter>, Vec<String>)> {
+) -> PyResult<(String, Vec<RpcParameter>, Vec<ParameterMetadata>)> {
     if parameters.is_empty() {
         return Ok((operation, Vec::new(), Vec::new()));
     }
@@ -295,7 +349,7 @@ fn bind_positional<'py>(
     operation: String,
     values: impl Iterator<Item = Bound<'py, PyAny>>,
     hints: Option<&[ParameterHint]>,
-) -> PyResult<(String, Vec<RpcParameter>, Vec<String>)> {
+) -> PyResult<(String, Vec<RpcParameter>, Vec<ParameterMetadata>)> {
     let values = values.collect::<Vec<_>>();
     let (operation, names) = rewrite_placeholders(&operation, false)?;
     if names.len() != values.len() {
@@ -325,7 +379,7 @@ fn bind_named(
     operation: String,
     values: &Bound<'_, PyDict>,
     hints: Option<&[ParameterHint]>,
-) -> PyResult<(String, Vec<RpcParameter>, Vec<String>)> {
+) -> PyResult<(String, Vec<RpcParameter>, Vec<ParameterMetadata>)> {
     let (operation, names) = rewrite_placeholders(&operation, true)?;
     let bound_parameters = names
         .into_iter()
@@ -352,7 +406,7 @@ fn rpc_parameter(
     name: String,
     value: &Bound<'_, PyAny>,
     hint: Option<&ParameterHint>,
-) -> PyResult<(RpcParameter, String)> {
+) -> PyResult<(RpcParameter, ParameterMetadata)> {
     let (value, status) = if let Ok(tvp) = value.extract::<PyRef<'_, PyTableValuedParameter>>() {
         if hint.is_some() {
             return Err(PyTypeError::new_err(
@@ -375,7 +429,7 @@ fn rpc_parameter(
             StatusFlags::NONE,
         )
     };
-    let signature = sql_type_signature(&value);
+    let signature = sql_type_metadata(&value);
     Ok((RpcParameter::new(Some(name), status, value), signature))
 }
 
@@ -386,7 +440,7 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
     let mut block_comment_depth = 0usize;
     let mut chars = sql.char_indices().peekable();
 
-    while let Some((byte_index, current)) = chars.next() {
+    while let Some((_, current)) = chars.next() {
         let next = chars.peek().map(|(_, next)| *next);
         match state {
             ScanState::Normal => match (current, next) {
@@ -431,20 +485,28 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                     chars.next();
                 }
                 ('%', Some('(')) => {
-                    let name_start = byte_index + 2;
-                    let marker_end = sql[name_start..].find(')').and_then(|relative_end| {
-                        let name_end = name_start + relative_end;
-                        sql[name_end + 1..]
-                            .starts_with('s')
-                            .then_some((name_end, name_end + 1))
-                    });
-                    if let Some((name_end, marker_end)) = marker_end {
+                    chars.next();
+                    let mut source_name = String::new();
+                    let mut original = String::from("%(");
+                    let mut complete = false;
+                    while let Some((_, marker_char)) = chars.next() {
+                        original.push(marker_char);
+                        if marker_char == ')' {
+                            if chars.peek().is_some_and(|(_, next)| *next == 's') {
+                                chars.next();
+                                original.push('s');
+                                complete = true;
+                            }
+                            break;
+                        }
+                        source_name.push(marker_char);
+                    }
+                    if complete {
                         if !named {
                             return Err(PyTypeError::new_err(
                                 "Parameter style mismatch: query uses named placeholders (%(name)s) but positional parameters were provided",
                             ));
                         }
-                        let source_name = sql[name_start..name_end].to_string();
                         if source_name.is_empty() {
                             return Err(PyTypeError::new_err("Named parameter cannot be empty"));
                         }
@@ -454,11 +516,8 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                             rpc_name,
                             source_name: Some(source_name),
                         });
-                        while chars.peek().is_some_and(|(index, _)| *index <= marker_end) {
-                            chars.next();
-                        }
                     } else {
-                        output.push(current);
+                        output.push_str(&original);
                     }
                 }
                 _ => output.push(current),
@@ -591,6 +650,16 @@ mod tests {
             assert_eq!(rewritten, sql);
             assert!(names.is_empty());
         }
+    }
+
+    #[test]
+    fn preserves_malformed_named_markers_and_rewrites_later_valid_markers() {
+        let (sql, names) =
+            rewrite_placeholders("SELECT %(broken)x, %(value)s, %(unterminated", true).unwrap();
+
+        assert_eq!(sql, "SELECT %(broken)x, @P1, %(unterminated");
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].source_name.as_deref(), Some("value"));
     }
 
     #[test]

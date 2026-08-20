@@ -37,13 +37,13 @@ use tracing::instrument::WithSubscriber;
 
 use mssql_tds::connection::tds_client::TdsClient;
 
-use crate::async_parameters::{bind_parameters, parse_input_sizes};
+use crate::async_parameters::{ParameterMetadata, bind_parameters, parse_input_sizes};
 use crate::async_session::{AsyncConnectionState, ClaimError, CursorId, OperationId};
 
 #[derive(Default)]
 struct PreparedState {
     statement: Option<PreparedStatement>,
-    parameter_signature: Vec<String>,
+    parameter_signature: Vec<ParameterMetadata>,
     orphaned: Option<StatementId>,
 }
 
@@ -135,6 +135,7 @@ pub struct PyAsyncCursor {
     default_query_timeout: u32,
     input_sizes: Option<Vec<crate::types::ParameterHint>>,
     input_sizes_generation: u64,
+    closed: Arc<AtomicBool>,
 }
 
 impl PyAsyncCursor {
@@ -159,6 +160,7 @@ impl PyAsyncCursor {
             default_query_timeout,
             input_sizes: None,
             input_sizes_generation: 0,
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -173,6 +175,9 @@ impl PyAsyncCursor {
 
     /// Set one-shot SQL type, size, and scale hints for the next successful execute.
     fn setinputsizes(&mut self, sizes: &Bound<'_, PyAny>) -> PyResult<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err("Cursor is closed"));
+        }
         self.input_sizes = parse_input_sizes(sizes)?;
         self.input_sizes_generation = self.input_sizes_generation.wrapping_add(1);
         Ok(())
@@ -202,6 +207,9 @@ impl PyAsyncCursor {
             input_sizes_generation,
         ) = {
             let cursor = slf.borrow(py);
+            if cursor.closed.load(Ordering::Acquire) {
+                return Err(PyRuntimeError::new_err("Cursor is closed"));
+            }
             // TODO(async execute preflight): Parameter normalization and Python-to-TDS
             // conversion currently run synchronously under the GIL before the awaitable is
             // returned. Bound or chunk large parameter/TVP conversion so execute does not
@@ -333,6 +341,91 @@ impl PyAsyncCursor {
         }
     }
 
+    /// Drain pending results, release prepared handles, and close this cursor.
+    fn close<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (client, dispatch, prepared_state, session_state, cursor_id, timeout, closed) = {
+            let cursor = slf.borrow(py);
+            if cursor.closed.load(Ordering::Acquire) {
+                return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                    Python::attach(|py| Ok(py.None()))
+                });
+            }
+            (
+                cursor.tds_client.clone(),
+                cursor.tracing_dispatch.clone(),
+                cursor.prepared_state.clone(),
+                cursor.session_state.clone(),
+                cursor.cursor_id,
+                cursor.default_query_timeout,
+                cursor.closed.clone(),
+            )
+        };
+        let claim = session_state
+            .claim_cursor_close(cursor_id)
+            .map_err(map_claim_error)?;
+        let operation_id = claim.operation_id;
+        let future_state = session_state.clone();
+        let future = async move {
+            let mut close_guard = ExecuteGuard::new(future_state, operation_id);
+            let result = async {
+                let mut client = client.lock().await;
+                if claim.drain_previous {
+                    client.close_query().await?;
+                }
+                let statement_ids = {
+                    let mut state = prepared_state.lock().await;
+                    let current = state
+                        .statement
+                        .as_mut()
+                        .and_then(PreparedStatement::take_id);
+                    let orphaned = state.orphaned.take();
+                    state.statement = None;
+                    state.parameter_signature.clear();
+                    [current, orphaned]
+                };
+                let mut released = None;
+                for statement_id in statement_ids.into_iter().flatten() {
+                    if released == Some(statement_id) {
+                        continue;
+                    }
+                    client
+                        .unprepare(
+                            statement_id,
+                            ExecuteOptions {
+                                timeout: Some(timeout),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    released = Some(statement_id);
+                }
+                Ok::<(), mssql_tds::error::Error>(())
+            }
+            .await;
+
+            close_guard.fail();
+            result.map_err(|error| {
+                tracing::error!("PyAsyncCursor::close: failed: {error}");
+                PyRuntimeError::new_err(format!("Cursor close failed: {error}"))
+            })?;
+            closed.store(true, Ordering::Release);
+            Python::attach(|py| Ok(py.None()))
+        };
+        let future = async move {
+            match dispatch {
+                Some(dispatch) => future.with_subscriber(dispatch).await,
+                None => future.await,
+            }
+        };
+        match pyo3_async_runtimes::tokio::future_into_py(py, future) {
+            Ok(awaitable) => Ok(awaitable),
+            Err(error) => {
+                session_state.release_operation(operation_id);
+                Err(error)
+            }
+        }
+    }
+
     // TODO(mssql-tds blockers for async execute parity):
     // - Add a public, general TdsClient parameter-description API backed by
     //   sp_describe_undeclared_parameters. The existing describe path is
@@ -363,4 +456,15 @@ impl PyAsyncCursor {
     //   cursor B with a typed busy-state error while cursor A has unread rows,
     //   verify A can drain its remaining rows, then verify B can execute after
     //   A drains or closes.
+    //
+    // TODO(performance opportunities):
+    // - Move large parameter/TVP preflight off the Python event-loop thread by
+    //   introducing a chunked or pre-converted input contract; Python objects
+    //   still require the GIL, so spawn_blocking alone is insufficient.
+    // - Remove the per-execution TVP deep clone when mssql-tds supports shared
+    //   TvpTableData ownership.
+    // - Cache or compute datetime base ordinals in the bulk-copy conversion path.
+    // - Convert TVP row iterators directly instead of collecting Bound cells first.
+    // - Add Criterion benchmarks for placeholder scanning, scalar binding,
+    //   prepared reuse, and representative TVP row counts.
 }

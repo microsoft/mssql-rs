@@ -16,6 +16,12 @@ pub(crate) struct ExecuteClaim {
     pub(crate) drain_previous: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct CursorCloseClaim {
+    pub(crate) operation_id: OperationId,
+    pub(crate) drain_previous: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ClaimError {
     Closing,
@@ -42,7 +48,7 @@ pub(crate) enum OperationPhase {
 
 #[derive(Debug)]
 pub(crate) struct ActiveOperation {
-    pub(crate) cursor_id: CursorId,
+    pub(crate) cursor_id: Option<CursorId>,
     pub(crate) operation_id: OperationId,
     pub(crate) phase: OperationPhase,
     pub(crate) cancel_handle: Option<CancelHandle>,
@@ -93,7 +99,8 @@ impl AsyncConnectionState {
         let drain_previous = match state.active_operation.as_ref() {
             None => false,
             Some(active)
-                if active.cursor_id == cursor_id && active.phase == OperationPhase::Fetching =>
+                if active.cursor_id == Some(cursor_id)
+                    && active.phase == OperationPhase::Fetching =>
             {
                 true
             }
@@ -103,7 +110,7 @@ impl AsyncConnectionState {
         let operation_id = self.allocate_operation_id();
         let cancel_handle = CancelHandle::new();
         state.active_operation = Some(ActiveOperation {
-            cursor_id,
+            cursor_id: Some(cursor_id),
             operation_id,
             phase: OperationPhase::Executing,
             cancel_handle: Some(cancel_handle),
@@ -118,6 +125,63 @@ impl AsyncConnectionState {
         Ok(ExecuteClaim {
             operation_id,
             cancel_handle: child_handle,
+            drain_previous,
+        })
+    }
+
+    pub(crate) fn claim_connection_operation(&self) -> Result<OperationId, ClaimError> {
+        let mut state = self.lock();
+        match state.lifecycle {
+            ConnectionLifecycle::Open => {}
+            ConnectionLifecycle::Closing => return Err(ClaimError::Closing),
+            ConnectionLifecycle::Closed => return Err(ClaimError::Closed),
+            ConnectionLifecycle::Broken => return Err(ClaimError::Broken),
+        }
+        if state.active_operation.is_some() {
+            return Err(ClaimError::Busy);
+        }
+
+        let operation_id = self.allocate_operation_id();
+        state.active_operation = Some(ActiveOperation {
+            cursor_id: None,
+            operation_id,
+            phase: OperationPhase::Executing,
+            cancel_handle: None,
+        });
+        Ok(operation_id)
+    }
+
+    pub(crate) fn claim_cursor_close(
+        &self,
+        cursor_id: CursorId,
+    ) -> Result<CursorCloseClaim, ClaimError> {
+        let mut state = self.lock();
+        match state.lifecycle {
+            ConnectionLifecycle::Open => {}
+            ConnectionLifecycle::Closing => return Err(ClaimError::Closing),
+            ConnectionLifecycle::Closed => return Err(ClaimError::Closed),
+            ConnectionLifecycle::Broken => return Err(ClaimError::Broken),
+        }
+
+        let drain_previous = match state.active_operation.as_ref() {
+            None => false,
+            Some(active)
+                if active.cursor_id == Some(cursor_id)
+                    && active.phase == OperationPhase::Fetching =>
+            {
+                true
+            }
+            Some(_) => return Err(ClaimError::Busy),
+        };
+        let operation_id = self.allocate_operation_id();
+        state.active_operation = Some(ActiveOperation {
+            cursor_id: Some(cursor_id),
+            operation_id,
+            phase: OperationPhase::Closing,
+            cancel_handle: None,
+        });
+        Ok(CursorCloseClaim {
+            operation_id,
             drain_previous,
         })
     }
@@ -228,6 +292,38 @@ mod tests {
             state.lock().active_operation.as_ref().unwrap().operation_id,
             second.operation_id
         );
+    }
+
+    #[test]
+    fn connection_operation_rejects_cursor_ownership() {
+        let state = AsyncConnectionState::new();
+        let execute = state.claim_execute(1).unwrap();
+
+        assert_eq!(
+            state.claim_connection_operation().unwrap_err(),
+            ClaimError::Busy
+        );
+        state.release_operation(execute.operation_id);
+
+        let connection_operation = state.claim_connection_operation().unwrap();
+        assert_eq!(state.claim_execute(1).unwrap_err(), ClaimError::Busy);
+        state.release_operation(connection_operation);
+    }
+
+    #[test]
+    fn cursor_close_can_drain_its_results_but_not_another_cursor() {
+        let state = AsyncConnectionState::new();
+        let execute = state.claim_execute(1).unwrap();
+        state.finish_execute(execute.operation_id, true);
+
+        assert_eq!(state.claim_cursor_close(2).unwrap_err(), ClaimError::Busy);
+        let close = state.claim_cursor_close(1).unwrap();
+        assert!(close.drain_previous);
+        assert_eq!(
+            state.lock().active_operation.as_ref().unwrap().phase,
+            OperationPhase::Closing
+        );
+        state.release_operation(close.operation_id);
     }
 
     #[test]

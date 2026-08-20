@@ -666,10 +666,50 @@ def test_execute_reprepares_when_parameter_metadata_changes(client_context, rese
     asyncio.run(run())
 
 
+@pytest.mark.integration
+def test_cursor_close_drains_results_and_rejects_further_use(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT CAST(? AS int)", 1)
+            assert await cursor.close() is None
+            assert await cursor.close() is None
+            with pytest.raises(RuntimeError, match="Cursor is closed"):
+                await cursor.execute("SELECT 1")
+            with pytest.raises(RuntimeError, match="Cursor is closed"):
+                cursor.setinputsizes([(4, 0, 0)])
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("transaction_method", ["commit", "rollback"])
+def test_transaction_operation_rejects_pending_cursor_results(
+    client_context, transaction_method
+):
+    async def run():
+        conn = await connect(client_context, autocommit=False)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT 1", use_prepare=False)
+            with pytest.raises(RuntimeError, match="busy with another operation"):
+                await getattr(conn, transaction_method)()
+            await cursor.close()
+            assert await getattr(conn, transaction_method)() is None
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
 def test_module_exposes_pyasynccursor():
     """PyAsyncCursor is registered on the extension module."""
     assert hasattr(mssql_py_core, "PyAsyncCursor")
     assert hasattr(mssql_py_core.PyAsyncCursor, "setinputsizes")
+    assert hasattr(mssql_py_core.PyAsyncCursor, "close")
     assert hasattr(mssql_py_core, "TableValuedParameter")
     assert mssql_py_core.SQL_XML == 241
     assert mssql_py_core.SQL_JSON == 244
