@@ -366,7 +366,11 @@ pub(crate) fn classify_field(kind: DescKind, field: SqlUSmallInt) -> Option<Fiel
 
         // ---- Record fields specific to implementation descriptors -------
         SQL_DESC_NULLABLE if is_ird || is_ipd => (Record, false),
-        SQL_DESC_NAME | SQL_DESC_UNNAMED if is_ird || is_ipd => (Record, is_ipd),
+        SQL_DESC_NAME if is_ird || is_ipd => (Record, is_ipd),
+        // SQL_DESC_UNNAMED is always derived from `name` on read (see
+        // `DescRecord::name`'s doc comment) — never stored, so never
+        // writable, unlike SQL_DESC_NAME itself.
+        SQL_DESC_UNNAMED if is_ird || is_ipd => (Record, false),
         SQL_DESC_PARAMETER_TYPE if is_ipd => (Record, true),
 
         _ => return None,
@@ -495,6 +499,24 @@ mod tests {
                 .unwrap()
                 .writable
         );
+    }
+
+    /// Regression: `SQL_DESC_UNNAMED` is derived from `name` on read
+    /// (`DescRecord`'s doc comment), never stored, so it must never be
+    /// writable — including on IPD, unlike `SQL_DESC_NAME` itself. Getting
+    /// this wrong let a `SQLSetDescFieldW(..., SQL_DESC_UNNAMED, ...)` call
+    /// reach `set_record_field`'s unmapped-field fallback instead of the
+    /// normal read-only-field diagnostic.
+    #[test]
+    fn unnamed_is_never_writable() {
+        assert!(classify_field(DescKind::AppRow, SQL_DESC_UNNAMED).is_none());
+        assert!(classify_field(DescKind::AppParam, SQL_DESC_UNNAMED).is_none());
+        for kind in [DescKind::ImpRow, DescKind::ImpParam] {
+            assert!(
+                !classify_field(kind, SQL_DESC_UNNAMED).unwrap().writable,
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]

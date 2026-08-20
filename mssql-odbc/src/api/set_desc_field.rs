@@ -19,18 +19,21 @@ use std::mem::size_of;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_C_NUMERIC, SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, SQL_DESC_ARRAY_SIZE,
-    SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE,
-    SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR,
-    SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR,
-    SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE,
-    SQL_DESC_TYPE, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_PREC_NUMERIC, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SqlHandle, SqlInteger,
-    SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
+    SQL_C_NUMERIC, SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, SQL_DATETIME,
+    SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE,
+    SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE,
+    SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_OCTET_LENGTH,
+    SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
+    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_ERROR, SQL_INVALID_HANDLE,
+    SQL_NTS, SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT, SQL_PREC_NUMERIC,
+    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP,
+    SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
+    SqlWChar,
 };
 use crate::api::sqlstate::{
-    ERR_CANNOT_MODIFY_IRD, ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_C_DATA_TYPE,
-    ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX, ERR_INVALID_PRECISION_OR_SCALE,
+    ERR_CANNOT_MODIFY_IRD, ERR_INCONSISTENT_DESCRIPTOR_INFO, ERR_INVALID_ATTRIBUTE_VALUE,
+    ERR_INVALID_C_DATA_TYPE, ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX,
+    ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAMETER_TYPE, ERR_INVALID_PRECISION_OR_SCALE,
     ERR_INVALID_SQL_DATA_TYPE, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
     ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, WARN_ARRAY_SIZE_CHANGED, post_diag,
 };
@@ -214,6 +217,14 @@ fn set_header_field(
     match field {
         SQL_DESC_ARRAY_SIZE => {
             let requested = value_ptr as SqlULen;
+            // Zero is not a valid rowset size — matches this crate's own
+            // SQL_ATTR_ROW_ARRAY_SIZE validation (set_stmt_attr.rs) and the
+            // ODBC-mandated minimum of 1 row per rowset.
+            if requested == 0 {
+                error!("SQLSetDescFieldW: SQL_DESC_ARRAY_SIZE of 0 is invalid");
+                post_diag(state, ERR_INVALID_ATTRIBUTE_VALUE);
+                return SQL_ERROR;
+            }
             let Ok(max) = SqlULen::try_from(i32::MAX) else {
                 return SQL_ERROR; // unreachable
             };
@@ -269,7 +280,9 @@ fn set_record_field(
     buffer_length: SqlInteger,
 ) -> SqlReturn {
     match field {
-        SQL_DESC_CONCISE_TYPE | SQL_DESC_TYPE => set_type(state, kind, record_number, value_ptr),
+        SQL_DESC_CONCISE_TYPE | SQL_DESC_TYPE => {
+            set_type(state, kind, record_number, field, value_ptr)
+        }
         SQL_DESC_DATETIME_INTERVAL_CODE => {
             let Ok(code) = SqlSmallInt::try_from(value_ptr as SqlLen) else {
                 post_diag(state, ERR_INVALID_ATTRIBUTE_VALUE);
@@ -288,14 +301,8 @@ fn set_record_field(
         SQL_DESC_PRECISION => set_precision(state, record_number, value_ptr),
         SQL_DESC_SCALE => set_scale(state, record_number, value_ptr),
         SQL_DESC_NAME => set_name(state, record_number, value_ptr, buffer_length),
-        SQL_DESC_PARAMETER_TYPE => {
-            let Ok(v) = SqlSmallInt::try_from(value_ptr as SqlLen) else {
-                post_diag(state, ERR_INVALID_ATTRIBUTE_VALUE);
-                return SQL_ERROR;
-            };
-            write_record_field(state, record_number, |r| r.parameter_type = v)
-        }
-        SQL_DESC_DATA_PTR => write_record_field(state, record_number, |r| r.data_ptr = value_ptr),
+        SQL_DESC_PARAMETER_TYPE => set_parameter_type(state, record_number, value_ptr),
+        SQL_DESC_DATA_PTR => set_data_ptr(state, record_number, value_ptr),
         SQL_DESC_INDICATOR_PTR => {
             write_record_field(state, record_number, |r| r.indicator_ptr = value_ptr)
         }
@@ -330,23 +337,36 @@ fn write_record_field(
 }
 
 /// `SQL_DESC_TYPE` / `SQL_DESC_CONCISE_TYPE` write. Also derives
-/// `SQL_DESC_DATETIME_INTERVAL_CODE` from the new type so the two fields
-/// cannot go stale relative to each other (`datetime_interval_code_for`).
+/// `SQL_DESC_DATETIME_INTERVAL_CODE` from the resolved concise type so the
+/// two fields cannot go stale relative to each other
+/// (`datetime_interval_code_for`).
 ///
 /// AD (ARD/APD) types are C types, validated exactly like `SQLBindParameter`
 /// validates `ValueType` (`canonical_c_type` + `is_valid_c_type`), so a
 /// descriptor-set type can never diverge from what direct binding accepts.
-/// IPD types are SQL types, validated exactly like `SQLBindParameter`
-/// validates `ParameterType` (`classify_parameter_sql_type`) — which also
-/// rejects the legacy concise/verbose overlap (`9`/`10`/`11` are ambiguous
-/// between `SQL_DATE`/`SQL_TIME`/`SQL_TIMESTAMP` 2.x concise spellings and
-/// `SQL_DATETIME`/`SQL_INTERVAL` 3.x verbose forms) the same way, since
-/// neither value is in its `Supported` match arms
-/// (`.github/instructions/mssql-odbc.instructions.md`).
+/// C types have no verbose form, so `SQL_DESC_TYPE` and
+/// `SQL_DESC_CONCISE_TYPE` are handled identically for AD.
+///
+/// IPD types are SQL types. `SQL_DESC_TYPE = SQL_DATETIME` (the verbose
+/// family marker, `9`) is the standard way to bind a DATE/TIME/TIMESTAMP
+/// subtype through a descriptor: `SQL_DESC_DATETIME_INTERVAL_CODE` picks the
+/// member, in either write order, and the concise type is derived from
+/// whichever is currently stored (matches msodbcsql's own fallthrough,
+/// `sqlcdesc.cpp:1635-1641`). This is legal precisely *because*
+/// `SQL_DESC_DATETIME_INTERVAL_CODE` is a distinct field that disambiguates
+/// it — unlike `SQLBindParameter`'s `ParameterType` (a single scalar
+/// argument with no paired subtype field), where `9` is genuinely ambiguous
+/// between the 2.x concise `SQL_DATE` spelling and the 3.x verbose
+/// `SQL_DATETIME` marker (`.github/instructions/mssql-odbc.instructions.md`).
+/// Every other IPD type — including a concise value written through
+/// `SQL_DESC_CONCISE_TYPE`, or through `SQL_DESC_TYPE` itself — is validated
+/// the same way `SQLBindParameter` validates `ParameterType`
+/// (`classify_parameter_sql_type`).
 fn set_type(
     state: &mut DescState,
     kind: DescKind,
     record_number: SqlSmallInt,
+    field: SqlUSmallInt,
     value_ptr: SqlPointer,
 ) -> SqlReturn {
     let Ok(requested) = SqlSmallInt::try_from(value_ptr as SqlLen) else {
@@ -362,6 +382,20 @@ fn set_type(
             return SQL_ERROR;
         }
         canonical
+    } else if field == SQL_DESC_TYPE && requested == SQL_DATETIME {
+        let current_code = state
+            .record(record_number)
+            .map(|r| r.datetime_interval_code)
+            .unwrap_or(0);
+        let Some(concise) = concise_type_for_datetime_code(current_code) else {
+            error!(
+                "SQLSetDescFieldW: SQL_DESC_TYPE=SQL_DATETIME set before a valid \
+                 SQL_DESC_DATETIME_INTERVAL_CODE"
+            );
+            post_diag(state, ERR_INCONSISTENT_DESCRIPTOR_INFO);
+            return SQL_ERROR;
+        };
+        concise
     } else {
         match classify_parameter_sql_type(requested) {
             SqlTypeSupport::Supported => requested,
@@ -382,6 +416,25 @@ fn set_type(
         r.concise_type = resolved;
         r.datetime_interval_code = datetime_interval_code_for(resolved);
     })
+}
+
+/// Inverse of [`datetime_interval_code_for`]: the concise date/time type a
+/// verbose `SQL_DESC_TYPE = SQL_DATETIME` write resolves to, given the
+/// record's currently-stored `SQL_DESC_DATETIME_INTERVAL_CODE`. `None` if no
+/// recognized code is stored yet.
+fn concise_type_for_datetime_code(code: SqlSmallInt) -> Option<SqlSmallInt> {
+    let date = SqlSmallInt::try_from(SQL_CODE_DATE).ok()?;
+    let time = SqlSmallInt::try_from(SQL_CODE_TIME).ok()?;
+    let timestamp = SqlSmallInt::try_from(SQL_CODE_TIMESTAMP).ok()?;
+    if code == date {
+        Some(SQL_TYPE_DATE)
+    } else if code == time {
+        Some(SQL_TYPE_TIME)
+    } else if code == timestamp {
+        Some(SQL_TYPE_TIMESTAMP)
+    } else {
+        None
+    }
 }
 
 /// The `SQL_DESC_DATETIME_INTERVAL_CODE` a concise type couples to: the
@@ -459,6 +512,37 @@ fn set_scale(
     write_record_field(state, record_number, |r| r.scale = scale)
 }
 
+/// `SQL_DESC_DATA_PTR` write (AD only). Re-validates the record's
+/// `SQL_C_NUMERIC` precision/scale against whatever is currently stored
+/// before accepting the pointer, matching msodbcsql's final
+/// `CheckADDescRecConsistency` pass at bind time (`sqlcdesc.cpp:11380-11394`).
+/// `set_precision`/`set_scale` only validate against the type stored *at the
+/// time each is written*, so an out-of-range precision set before the type
+/// changes to `SQL_C_NUMERIC` would otherwise go unnoticed; `DATA_PTR` is
+/// the last field mssql-python's binding sequence sets, so this is the
+/// natural point to catch it without deferring all the way to execute time.
+fn set_data_ptr(
+    state: &mut DescState,
+    record_number: SqlSmallInt,
+    value_ptr: SqlPointer,
+) -> SqlReturn {
+    let record_info = state
+        .record(record_number)
+        .map(|r| (r.concise_type, r.precision, r.scale));
+    if let Some((SQL_C_NUMERIC, precision, scale)) = record_info
+        && (!(1..=SQL_PREC_NUMERIC).contains(&precision) || scale < 0 || scale > precision)
+    {
+        error!(
+            precision,
+            scale,
+            "SQLSetDescFieldW: SQL_DESC_DATA_PTR set with an inconsistent SQL_C_NUMERIC precision/scale"
+        );
+        post_diag(state, ERR_INVALID_PRECISION_OR_SCALE);
+        return SQL_ERROR;
+    }
+    write_record_field(state, record_number, |r| r.data_ptr = value_ptr)
+}
+
 /// `SQL_DESC_NAME` write (IPD only — the only kind `classify_field` marks
 /// this field writable for). `buffer_length` is in bytes, or `SQL_NTS` for
 /// NUL-terminated input, matching ODBC's general character-input rule.
@@ -468,6 +552,20 @@ fn set_name(
     value_ptr: SqlPointer,
     buffer_length: SqlInteger,
 ) -> SqlReturn {
+    // Unlike a connection string or catalog wildcard, a null buffer has no
+    // valid meaning for SQL_DESC_NAME — reject it before it ever reaches
+    // `read_utf16` (an `unsafe fn` that dereferences the pointer
+    // unconditionally). A null `Value` here is genuine application input,
+    // not something the Driver Manager filters out: verified against this
+    // exact call sequence, an unchecked null crashes the process with a
+    // non-unwinding access-violation abort that `ffi_entry!`'s
+    // `catch_unwind` cannot intercept.
+    if value_ptr.is_null() {
+        error!("SQLSetDescFieldW: SQL_DESC_NAME value_ptr is null");
+        post_diag(state, ERR_INVALID_NULL_POINTER);
+        return SQL_ERROR;
+    }
+
     let ptr = value_ptr as *const SqlWChar;
     let name = if buffer_length == SqlInteger::from(SQL_NTS) {
         unsafe { read_utf16(ptr, SQL_NTS) }
@@ -483,6 +581,33 @@ fn set_name(
         unsafe { read_utf16(ptr, char_len) }
     };
     write_record_field(state, record_number, |r| r.name = name)
+}
+
+/// `SQL_DESC_PARAMETER_TYPE` write (IPD only). Validated against the three
+/// ODBC 3.x `SQL_PARAM_*` values this driver can act on — an arbitrary
+/// `SqlSmallInt` that merely fits the wire width (e.g. `9999`) is not a
+/// real parameter type and must not be stored as though it were.
+fn set_parameter_type(
+    state: &mut DescState,
+    record_number: SqlSmallInt,
+    value_ptr: SqlPointer,
+) -> SqlReturn {
+    let Ok(requested) = SqlSmallInt::try_from(value_ptr as SqlLen) else {
+        post_diag(state, ERR_INVALID_ATTRIBUTE_VALUE);
+        return SQL_ERROR;
+    };
+    if !matches!(
+        requested,
+        SQL_PARAM_INPUT | SQL_PARAM_INPUT_OUTPUT | SQL_PARAM_OUTPUT
+    ) {
+        error!(
+            requested,
+            "SQLSetDescFieldW: invalid SQL_DESC_PARAMETER_TYPE"
+        );
+        post_diag(state, ERR_INVALID_PARAMETER_TYPE);
+        return SQL_ERROR;
+    }
+    write_record_field(state, record_number, |r| r.parameter_type = requested)
 }
 
 #[cfg(test)]
@@ -525,6 +650,9 @@ mod tests {
     const SQL_DESC_DATETIME_INTERVAL_CODE: SqlSmallInt =
         crate::api::odbc_types::SQL_DESC_DATETIME_INTERVAL_CODE as SqlSmallInt;
     const SQL_DESC_NAME: SqlSmallInt = crate::api::odbc_types::SQL_DESC_NAME as SqlSmallInt;
+    const SQL_DESC_UNNAMED: SqlSmallInt = crate::api::odbc_types::SQL_DESC_UNNAMED as SqlSmallInt;
+    const SQL_DESC_PARAMETER_TYPE: SqlSmallInt =
+        crate::api::odbc_types::SQL_DESC_PARAMETER_TYPE as SqlSmallInt;
 
     fn assert_last_diag(records: &[DiagRecord], expected: crate::api::sqlstate::DiagMsg) {
         let d = records.last().expect("expected a diagnostic record");
@@ -790,16 +918,84 @@ mod tests {
     }
 
     #[test]
-    fn set_desc_field_ambiguous_legacy_datetime_value_on_ipd_rejected() {
-        // 9/10/11 are ambiguous between the 2.x concise and 3.x verbose
-        // spellings; classify_parameter_sql_type rejects them outright.
+    fn set_desc_field_concise_type_rejects_legacy_datetime_values() {
+        // SQL_DESC_CONCISE_TYPE never gets verbose treatment: 9/10/11 remain
+        // ambiguous/unsupported there (unlike SQL_DESC_TYPE=9, see below).
         let h = TestHandles::with_env_dbc_stmt();
         for legacy in [9isize, 10, 11] {
+            let ret = unsafe {
+                sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_CONCISE_TYPE, legacy as SqlPointer, 0)
+            };
+            assert_eq!(ret, SQL_ERROR, "legacy value {legacy}");
+        }
+    }
+
+    #[test]
+    fn set_desc_field_type_legacy_time_timestamp_values_still_rejected() {
+        // Only the true verbose SQL_DATETIME (9) marker gets special
+        // handling on SQL_DESC_TYPE; the deprecated 2.x SQL_TIME(10)/
+        // SQL_TIMESTAMP(11) concise spellings are not real SQL types this
+        // driver recognizes there.
+        let h = TestHandles::with_env_dbc_stmt();
+        for legacy in [10isize, 11] {
             let ret =
                 unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_TYPE, legacy as SqlPointer, 0) };
             assert_eq!(ret, SQL_ERROR, "legacy value {legacy}");
             assert_last_diag(&desc_diags(h.ipd()), ERR_INVALID_SQL_DATA_TYPE);
         }
+    }
+
+    /// Regression: verbose `SQL_DESC_TYPE = SQL_DATETIME` on IPD must be
+    /// *accepted*, not rejected as ambiguous — it is the standard ODBC way
+    /// to bind a DATE/TIME/TIMESTAMP subtype through a descriptor, precisely
+    /// because `SQL_DESC_DATETIME_INTERVAL_CODE` disambiguates it (see
+    /// `set_type`'s doc comment). Without a prior interval code, though, the
+    /// pair is genuinely inconsistent.
+    #[test]
+    fn set_desc_field_verbose_type_datetime_without_interval_code_is_inconsistent() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret = unsafe {
+            sql_set_desc_field_w(
+                h.ipd(),
+                1,
+                SQL_DESC_TYPE,
+                SQL_DATETIME as isize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_last_diag(&desc_diags(h.ipd()), ERR_INCONSISTENT_DESCRIPTOR_INFO);
+    }
+
+    #[test]
+    fn set_desc_field_verbose_type_datetime_derives_concise_from_interval_code() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let code = SqlSmallInt::try_from(crate::api::odbc_types::SQL_CODE_TIMESTAMP).unwrap();
+        let ret = unsafe {
+            sql_set_desc_field_w(
+                h.ipd(),
+                1,
+                SQL_DESC_DATETIME_INTERVAL_CODE,
+                code as isize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let ret = unsafe {
+            sql_set_desc_field_w(
+                h.ipd(),
+                1,
+                SQL_DESC_TYPE,
+                SQL_DATETIME as isize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(
+            get_small_int(h.ipd(), 1, SQL_DESC_CONCISE_TYPE),
+            SQL_TYPE_TIMESTAMP
+        );
     }
 
     #[test]
@@ -924,6 +1120,54 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
     }
 
+    /// Regression: `set_precision`/`set_scale` only validate against the
+    /// type stored *at the time each is written*. An out-of-range precision
+    /// set while the type is still something else (so the numeric bound
+    /// didn't apply yet), followed by changing the type to `SQL_C_NUMERIC`,
+    /// must still be caught — matching msodbcsql's final consistency check
+    /// at bind time — rather than silently accepted.
+    #[test]
+    fn set_desc_field_data_ptr_catches_precision_set_before_type_became_numeric() {
+        let h = TestHandles::with_env_dbc_stmt();
+        // Precision 39 is out of range only once the type becomes SQL_C_NUMERIC.
+        unsafe {
+            sql_set_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_TYPE,
+                SQL_C_WCHAR as isize as SqlPointer,
+                0,
+            )
+        };
+        let ret = unsafe {
+            sql_set_desc_field_w(h.apd(), 1, SQL_DESC_PRECISION, 39isize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        let ret = unsafe {
+            sql_set_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_TYPE,
+                SQL_C_NUMERIC as isize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let mut numeric_buf = SqlNumericStruct::default();
+        let ret = unsafe {
+            sql_set_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_DATA_PTR,
+                &mut numeric_buf as *mut SqlNumericStruct as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_last_diag(&desc_diags(h.apd()), ERR_INVALID_PRECISION_OR_SCALE);
+    }
+
     #[test]
     fn set_desc_field_name_write_and_read_back_on_ipd() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -958,6 +1202,35 @@ mod tests {
     }
 
     #[test]
+    fn set_desc_field_parameter_type_accepts_valid_values_and_rejects_others() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for valid in [SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT] {
+            let ret = unsafe {
+                sql_set_desc_field_w(
+                    h.ipd(),
+                    1,
+                    SQL_DESC_PARAMETER_TYPE,
+                    valid as isize as SqlPointer,
+                    0,
+                )
+            };
+            assert_eq!(ret, SQL_SUCCESS, "valid parameter type {valid}");
+        }
+
+        let ret = unsafe {
+            sql_set_desc_field_w(
+                h.ipd(),
+                1,
+                SQL_DESC_PARAMETER_TYPE,
+                9999isize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_last_diag(&desc_diags(h.ipd()), ERR_INVALID_PARAMETER_TYPE);
+    }
+
+    #[test]
     fn set_desc_field_name_write_rejected_on_ard() {
         let h = TestHandles::with_env_dbc_stmt();
         let name: Vec<u16> = "x".encode_utf16().chain(std::iter::once(0)).collect();
@@ -972,6 +1245,42 @@ mod tests {
         };
         assert_eq!(ret, SQL_ERROR);
         assert_last_diag(&desc_diags(h.ard()), ERR_INVALID_DESCRIPTOR_FIELD);
+    }
+
+    /// Regression: a null `value_ptr` with `SQL_DESC_NAME` used to reach
+    /// `read_utf16` unchecked and dereference null — reproduced as a
+    /// non-unwinding process abort before the fix (`ffi_entry!`'s
+    /// `catch_unwind` cannot intercept an abort). Must now fail cleanly.
+    #[test]
+    fn set_desc_field_name_null_value_ptr_returns_error_not_crash() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret = unsafe {
+            sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_NAME, ptr::null_mut(), SQL_NTS.into())
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_last_diag(&desc_diags(h.ipd()), ERR_INVALID_NULL_POINTER);
+    }
+
+    /// Regression: `SQL_DESC_UNNAMED` is derived from `name`, never stored,
+    /// so it must never be writable (including on IPD) — attempting to set
+    /// it used to reach `set_record_field`'s unmapped-field fallback.
+    #[test]
+    fn set_desc_field_unnamed_is_never_writable() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret =
+            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_UNNAMED, 1isize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_last_diag(&desc_diags(h.ipd()), ERR_INVALID_DESCRIPTOR_FIELD);
+    }
+
+    #[test]
+    fn set_desc_field_array_size_zero_returns_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret = unsafe {
+            sql_set_desc_field_w(h.apd(), 0, SQL_DESC_ARRAY_SIZE, 0isize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_last_diag(&desc_diags(h.apd()), ERR_INVALID_ATTRIBUTE_VALUE);
     }
 
     #[test]
