@@ -135,6 +135,12 @@ protected:
     static inline const std::string kParentTable = "odbc_e2e_catalog_parent_" + UniqueSuffix();
     static inline const std::string kChildTable = "odbc_e2e_catalog_child_" + UniqueSuffix();
 
+    // Name of a throwaway database created by a single test (currently only
+    // TablesFindsCreatedTableInEscapedCatalogName). Tracked here rather than
+    // dropped inline at the end of that test so an assertion failure
+    // (ASSERT_* returns early) still gets it cleaned up in TearDown().
+    std::string pending_db_to_drop_;
+
     void SetUp() override {
         ODBCTest::SetUp();
         if (!ODBCTestConfig::Instance().HasConnection()) {
@@ -163,6 +169,9 @@ protected:
     void TearDown() override {
         if (dbc_ != SQL_NULL_HDBC) {
             DropTestTables();
+            if (!pending_db_to_drop_.empty()) {
+                ExecDirectIgnoreError("DROP DATABASE IF EXISTS " + pending_db_to_drop_);
+            }
         }
         ODBCTest::TearDown();
     }
@@ -221,6 +230,48 @@ TEST_F(CatalogLiveTest, TablesEnumeratesCatalogsWithBarePercent) {
                              const_cast<SQLTCHAR*>(empty.c_str()), SQL_NTS, nullptr, 0);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
     EXPECT_GE(DrainRows(stmt_), 1);
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A CatalogName containing an escaped underscore (`\_`, the ODBC search-
+// pattern escape for a literal `_`) must resolve to the real database of
+// that name, not silently return empty via the nonexistent-catalog retry.
+// Regression test for a mismatch between `qualified_proc_name` (which
+// unescaped the catalog before building the three-part RPC target name) and
+// `qualifier_value` (which sent the still-escaped value as the
+// `@table_qualifier` RPC parameter): the two disagreeing made SQL Server
+// reject the qualifier with error 15250 for a database that actually exists.
+//
+// No default system database name contains an escapable character (`\`,
+// `_`, or `%`), so this creates and drops a small throwaway database with
+// one — the `sa` login this suite connects with has full rights, and the
+// database is scoped to this one test via `UniqueSuffix()`.
+TEST_F(CatalogLiveTest, TablesFindsCreatedTableInEscapedCatalogName) {
+    const std::string dbName = "odbc_e2e_catalog_escape_" + UniqueSuffix();
+    ExecDirectIgnoreError("DROP DATABASE IF EXISTS " + dbName);
+    ExecDirect("CREATE DATABASE " + dbName);
+    pending_db_to_drop_ = dbName;
+    ExecDirect("CREATE TABLE [" + dbName + "].dbo.escaped_catalog_probe (id INT NOT NULL PRIMARY KEY)");
+
+    // Escape every underscore in the database name with a backslash.
+    std::string escapedDbName;
+    for (char c : dbName) {
+        if (c == '_') {
+            escapedDbName += '\\';
+        }
+        escapedDbName += c;
+    }
+
+    SqlTString catalog = ODBCTestUtils::ToSqlTStr(escapedDbName);
+    SqlTString table = ODBCTestUtils::ToSqlTStr("escaped_catalog_probe");
+    SQLRETURN rc = SQLTables(stmt_, const_cast<SQLTCHAR*>(catalog.c_str()), SQL_NTS, nullptr, 0,
+                             const_cast<SQLTCHAR*>(table.c_str()), SQL_NTS, nullptr, 0);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    // Must find the real row in the real database, not silently return empty
+    // via the nonexistent-catalog retry path — that's the failure mode this
+    // guards against.
+    EXPECT_EQ(1, DrainRows(stmt_));
 
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }

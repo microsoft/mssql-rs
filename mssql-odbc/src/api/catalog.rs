@@ -23,11 +23,31 @@
 //! Deliberately out of scope, matching this driver's target of SQL Server
 //! 2016+ (Katmai and later) with no Driver-Manager-mediated linked-server
 //! support:
-//! - Distributed/linked-server catalog queries (`@table_name` scoped to a
-//!   remote `server`, the `sp_tables_ex`/`sp_columns_ex_100`/... procs, and
-//!   the `sp_cursoropen`-wrapped dispatch `DoDD()` uses for them). None of the
-//!   seven ODBC catalog functions even expose a `Server` argument, and
-//!   mssql-python (this crate's motivating consumer) never triggers this path.
+//! - Distributed/linked-server catalog queries (the `sp_tables_ex`/
+//!   `sp_columns_ex_100`/... procs, and the `sp_cursoropen`-wrapped dispatch
+//!   `DoDD()` uses for them). No ODBC catalog function exposes a dedicated
+//!   `Server` *parameter*, but msodbcsql overloads `CatalogName` to carry one:
+//!   `ValidateTableQualifier` (`sqlcdd.cpp` lines 264-278) splits the
+//!   argument on its first `.` into server/database whenever
+//!   `SQL_ATTR_METADATA_ID == SQL_FALSE` (always true here — see below), and
+//!   that split is what selects the `_ex` procs for five of the seven
+//!   functions (`SQLTables`, `SQLColumns`, `SQLStatistics`, `SQLPrimaryKeys`,
+//!   `SQLForeignKeys`; `sqlcdd.cpp` line 1512). Not implementing `_ex`
+//!   dispatch is a reasonable scoping decision — mssql-python (this crate's
+//!   motivating consumer) never triggers this path — but the rationale is
+//!   that overloaded parsing, not the argument's absence.
+//!
+//!   The consequence: `SQLTables(CatalogName = "MYSRV.MyDb")` here treats the
+//!   entire string as one literal (three-part-bracketed) database name,
+//!   fails to resolve it, and returns an empty result set via the
+//!   nonexistent-catalog retry below — the same outcome as any other
+//!   nonexistent catalog, with no diagnostic calling out the unsupported
+//!   server-qualified form specifically. This is a real, known gap (a
+//!   dedicated diagnostic would be more debuggable), traded off here against
+//!   a genuine improvement in the other direction: a database *legitimately*
+//!   named `My.Db` (SQL Server permits dots in quoted identifiers) resolves
+//!   correctly through this implementation and is mis-parsed as a
+//!   server-qualified name by msodbcsql.
 //! - `SQL_SOPT_SS_NAME_SCOPE` (table-type-scoped catalog queries) — an
 //!   unimplemented statement option, so its non-default branch is unreachable.
 //! - `SQL_ATTR_METADATA_ID = SQL_TRUE` (identifier mode: literal `%`/`_` in a
@@ -60,9 +80,17 @@ use crate::handles::stmt::{
 use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
 
 /// Maximum SQL Server identifier length (`SYSNAMELEN` in msodbcsql
-/// `sqlcdd.cpp`). Declared length for every catalog/schema/table/column/
-/// procedure-name RPC parameter.
+/// `sqlcdd.cpp`). Declared length for every catalog/schema/table/column
+/// RPC parameter.
 const SYSNAME_LEN: u16 = 128;
+
+/// Declared length for `SQLProcedures`' procedure-name argument specifically:
+/// msodbcsql validates it against `MAXPROCNAMESPHINX` (`sqlsrv.h`), not the
+/// bare `SYSNAMELEN` other identifiers use — `MAX_PROCNAME + 6`, the extra 6
+/// characters covering a numbered-procedure `;nnnnn` group suffix (e.g.
+/// `myproc;1`). Using [`SYSNAME_LEN`] here would reject a valid, longer
+/// numbered-procedure name msodbcsql accepts.
+const PROC_NAME_LEN: u16 = SYSNAME_LEN + 6;
 
 /// Declared length for the `SQLTables` `TableType` argument, which is a
 /// comma-separated list of quoted values rather than a single identifier.
@@ -109,15 +137,37 @@ fn nvarchar(value: Option<&str>, len: u16) -> RpcParameter {
 /// for ordinary identifier arguments, [`TABLE_TYPE_LEN`] for `SQLTables`'
 /// `TableType`), posting the ODBC-mandated `HY090` diagnostic and returning
 /// `Err(SQL_ERROR)` for the first violation. Mirrors msodbcsql's upfront
-/// `ValidateArgument` (`sqlcdd.cpp` line ~389), which rejects an oversized
-/// argument before attempting any network call, rather than letting it
-/// surface as an internal RPC-parameter-serialization failure (`HY000`, not
-/// the state the spec mandates for this condition).
-fn check_arg_length(stmt: &StmtHandle, value: &Arg, max_len: u16) -> Result<(), SqlReturn> {
-    if value
-        .as_deref()
-        .is_none_or(|v| v.chars().count() <= max_len as usize)
-    {
+/// `ValidateArgument`/`ValidateTableQualifier` (`sqlcdd.cpp` lines 296-310,
+/// 425-440), which rejects an oversized argument before attempting any
+/// network call, rather than letting it surface as an internal RPC-parameter-
+/// serialization failure (`HY000`, not the state the spec mandates for this
+/// condition).
+///
+/// `is_pattern` must be `true` for every identifier-style argument (catalog,
+/// schema, table, column, procedure name) and `false` only for `SQLTables`'
+/// `TableType` (a literal comma-separated value list, not a search pattern —
+/// already transformed by [`table_type_value`] before this runs). When
+/// `true`, the length is measured *after* stripping ODBC search-pattern
+/// escapes (see [`unescape_search_pattern`]), matching msodbcsql exactly: a
+/// pattern like `my\_identifier\_that\_is\_130\_chars` can be under the true
+/// 128-character limit once its three escape backslashes are removed, and
+/// rejecting it on the raw (escaped) length would reject input msodbcsql
+/// accepts.
+fn check_arg_length(
+    stmt: &StmtHandle,
+    value: &Arg,
+    max_len: u16,
+    is_pattern: bool,
+) -> Result<(), SqlReturn> {
+    let within_limit = value.as_deref().is_none_or(|v| {
+        let effective_len = if is_pattern {
+            unescape_search_pattern(v).chars().count()
+        } else {
+            v.chars().count()
+        };
+        effective_len <= max_len as usize
+    });
+    if within_limit {
         return Ok(());
     }
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -128,11 +178,11 @@ fn check_arg_length(stmt: &StmtHandle, value: &Arg, max_len: u16) -> Result<(), 
     Err(SQL_ERROR)
 }
 
-/// Runs [`check_arg_length`] over every `(argument, max_len)` pair, short-
-/// circuiting on the first violation.
-fn check_arg_lengths(stmt: &StmtHandle, args: &[(&Arg, u16)]) -> Result<(), SqlReturn> {
-    for (value, max_len) in args {
-        check_arg_length(stmt, value, *max_len)?;
+/// Runs [`check_arg_length`] over every `(argument, max_len, is_pattern)`
+/// triple, short-circuiting on the first violation.
+fn check_arg_lengths(stmt: &StmtHandle, args: &[(&Arg, u16, bool)]) -> Result<(), SqlReturn> {
+    for (value, max_len, is_pattern) in args {
+        check_arg_length(stmt, value, *max_len, *is_pattern)?;
     }
     Ok(())
 }
@@ -296,11 +346,22 @@ fn qualification_catalog(catalog: &Arg, name: &Arg, owner: &Arg) -> Arg {
 /// (`true` only on that retry) must null out any real catalog value here —
 /// otherwise a nonexistent-catalog call would itself fail with 15250 instead
 /// of the empty result set the retry exists to produce.
-fn qualifier_value(catalog: &Arg, unmatchable: bool) -> Option<&str> {
+///
+/// Unescapes ODBC search-pattern escapes (see [`unescape_search_pattern`])
+/// exactly as [`qualified_proc_name`] does for the three-part name: the two
+/// must agree on what the catalog value *is*, since the RPC dispatches into
+/// the database `qualified_proc_name` names but the server compares that
+/// context against the literal bytes sent here. For `catalog = "my\_db"`,
+/// sending the still-escaped `my\_db` here while `qualified_proc_name` builds
+/// `[my_db].sys.proc` makes the two disagree, and the qualifier's raw
+/// backslash makes it a non-NULL value that doesn't match the current
+/// database (`my_db`) — triggering 15250 and the nonexistent-catalog retry
+/// for a database that actually exists.
+fn qualifier_value(catalog: &Arg, unmatchable: bool) -> Option<String> {
     if unmatchable {
         None
     } else {
-        catalog.as_deref()
+        catalog.as_deref().map(unescape_search_pattern)
     }
 }
 
@@ -442,7 +503,9 @@ fn run_catalog(
     if rc == SQL_ERROR {
         return rc;
     }
-    apply_catalog_metadata(stmt, not_null_cols, renames);
+    if let Err(rc) = apply_catalog_metadata(stmt, not_null_cols, renames) {
+        return rc;
+    }
     rc
 }
 
@@ -452,10 +515,24 @@ fn run_catalog(
 /// clearing the nullable flag on the columns the ODBC specification guarantees
 /// are NOT NULL — mirrors `SetColNames`/`ClearNullable` (`sqlcdd.cpp` lines
 /// 1910-1913, 2412-2472).
-fn apply_catalog_metadata(stmt: &StmtHandle, not_null_cols: &[usize], renames: &[(usize, &str)]) {
+///
+/// Returns `Err(SQL_ERROR)` on a poisoned stmt mutex rather than silently
+/// skipping the fixup: msodbcsql's `SetColNames` uses `SETRC_SERR_GOTO`
+/// (`sqlcdd.cpp` line 2459) and aborts the call on failure, and this repo's
+/// own convention (every other poisoned-mutex site in this file) is to fail
+/// loudly rather than report `SQL_SUCCESS` with metadata the caller can't
+/// trust. Reporting success here would leave the raw stored-procedure column
+/// names (`TABLE_QUALIFIER`, `TABLE_OWNER`, `PRECISION`, ...) and
+/// still-`SQL_NULLABLE` flags in place — a conforming application binding by
+/// ODBC 3.x column name would simply fail to find its columns, silently.
+fn apply_catalog_metadata(
+    stmt: &StmtHandle,
+    not_null_cols: &[usize],
+    renames: &[(usize, &str)],
+) -> Result<(), SqlReturn> {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("catalog function: stmt mutex poisoned applying column metadata");
-        return;
+        return Err(SQL_ERROR);
     };
     let cols = &mut stmt_state.column_metadata;
     for (index, new_name) in renames {
@@ -468,6 +545,7 @@ fn apply_catalog_metadata(stmt: &StmtHandle, not_null_cols: &[usize], renames: &
             col.flags &= !COLMETA_NULLABLE_FLAG;
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -560,10 +638,10 @@ fn sql_tables_w_safe(
     if let Err(rc) = check_arg_lengths(
         stmt,
         &[
-            (&catalog, SYSNAME_LEN),
-            (&schema, SYSNAME_LEN),
-            (&table, SYSNAME_LEN),
-            (&table_type, TABLE_TYPE_LEN),
+            (&catalog, SYSNAME_LEN, true),
+            (&schema, SYSNAME_LEN, true),
+            (&table, SYSNAME_LEN, true),
+            (&table_type, TABLE_TYPE_LEN, false),
         ],
     ) {
         return rc;
@@ -584,7 +662,10 @@ fn sql_tables_w_safe(
             // sends it too (`sqlcdd.cpp` lines 1745-1757), and `sp_tables`
             // needs the literal `%` to recognize the catalog-enumeration
             // idiom (see `is_catalog_enumeration_sentinel`).
-            nvarchar(qualifier_value(&catalog, unmatchable), SYSNAME_LEN),
+            nvarchar(
+                qualifier_value(&catalog, unmatchable).as_deref(),
+                SYSNAME_LEN,
+            ),
             nvarchar(table_type.as_deref(), TABLE_TYPE_LEN),
         ];
         // `@fUsePattern` is Yukon+ only, sent for every 2.x/3.x app since this
@@ -697,10 +778,10 @@ fn sql_columns_w_safe(
     if let Err(rc) = check_arg_lengths(
         stmt,
         &[
-            (&catalog, SYSNAME_LEN),
-            (&schema, SYSNAME_LEN),
-            (&table, SYSNAME_LEN),
-            (&column, SYSNAME_LEN),
+            (&catalog, SYSNAME_LEN, true),
+            (&schema, SYSNAME_LEN, true),
+            (&table, SYSNAME_LEN, true),
+            (&column, SYSNAME_LEN, true),
         ],
     ) {
         return rc;
@@ -720,7 +801,10 @@ fn sql_columns_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(qualifier_value(&catalog, unmatchable), SYSNAME_LEN),
+            nvarchar(
+                qualifier_value(&catalog, unmatchable).as_deref(),
+                SYSNAME_LEN,
+            ),
             nvarchar(column.as_deref(), SYSNAME_LEN),
         ];
         // `@ODBCVer` / `@fUsePattern` are both sent only for 3.x apps
@@ -831,9 +915,9 @@ fn sql_primary_keys_w_safe(
     if let Err(rc) = check_arg_lengths(
         stmt,
         &[
-            (&catalog, SYSNAME_LEN),
-            (&schema, SYSNAME_LEN),
-            (&table, SYSNAME_LEN),
+            (&catalog, SYSNAME_LEN, true),
+            (&schema, SYSNAME_LEN, true),
+            (&table, SYSNAME_LEN, true),
         ],
     ) {
         return rc;
@@ -849,7 +933,10 @@ fn sql_primary_keys_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(qualifier_value(&catalog, unmatchable), SYSNAME_LEN),
+            nvarchar(
+                qualifier_value(&catalog, unmatchable).as_deref(),
+                SYSNAME_LEN,
+            ),
         ];
         (positional, None)
     };
@@ -986,12 +1073,12 @@ fn sql_foreign_keys_w_safe(
     if let Err(rc) = check_arg_lengths(
         stmt,
         &[
-            (&pk_catalog, SYSNAME_LEN),
-            (&pk_schema, SYSNAME_LEN),
-            (&pk_table, SYSNAME_LEN),
-            (&fk_catalog, SYSNAME_LEN),
-            (&fk_schema, SYSNAME_LEN),
-            (&fk_table, SYSNAME_LEN),
+            (&pk_catalog, SYSNAME_LEN, true),
+            (&pk_schema, SYSNAME_LEN, true),
+            (&pk_table, SYSNAME_LEN, true),
+            (&fk_catalog, SYSNAME_LEN, true),
+            (&fk_schema, SYSNAME_LEN, true),
+            (&fk_table, SYSNAME_LEN, true),
         ],
     ) {
         return rc;
@@ -1021,7 +1108,20 @@ fn sql_foreign_keys_w_safe(
         let positional = vec![
             nvarchar(pk_table_name.as_deref(), SYSNAME_LEN),
             nvarchar(pk_schema.as_deref(), SYSNAME_LEN),
-            nvarchar(qualifier_value(&pk_catalog, unmatchable), SYSNAME_LEN),
+            // `catalog` (the already-resolved value — see above), not the raw
+            // `pk_catalog`: when only `fk_catalog` was supplied, `catalog` is
+            // `fk_catalog` and the three-part name qualifies into it, but
+            // `pk_catalog` is still blank. Sending the raw blank `pk_catalog`
+            // here (msodbcsql normalizes this the same way, `sqlcdd.cpp`
+            // lines 984-990) would send a zero-length, non-NULL qualifier
+            // while the RPC dispatches into `fk_catalog`'s database — a
+            // mismatch SQL Server can reject with 15250. Sending the
+            // resolved `catalog` value here instead makes the qualifier and
+            // the three-part name provably consistent.
+            nvarchar(
+                qualifier_value(&catalog, unmatchable).as_deref(),
+                SYSNAME_LEN,
+            ),
             nvarchar(fk_table.as_deref(), SYSNAME_LEN),
             nvarchar(fk_schema.as_deref(), SYSNAME_LEN),
             // `fk_catalog` is also nulled when the two sides conflict: the
@@ -1029,9 +1129,13 @@ fn sql_foreign_keys_w_safe(
             // above), and a `fk_catalog` that disagrees with the *current*
             // database would itself raise SQL Server error 15250 rather than
             // the empty result `catalogs_conflict` (via the unmatchable PK
-            // table name) already forces.
+            // table name) already forces. Sent as the real value (not
+            // unconditionally NULL, unlike msodbcsql's
+            // `SetNullArgument(&dd_arg, XARG3_IND)`, `sqlcdd.cpp` line 1021)
+            // because the three-part name already makes the target database
+            // current, so a matching `fk_catalog` cannot trigger 15250 here.
             nvarchar(
-                qualifier_value(&fk_catalog, unmatchable || catalogs_conflict),
+                qualifier_value(&fk_catalog, unmatchable || catalogs_conflict).as_deref(),
                 SYSNAME_LEN,
             ),
         ];
@@ -1153,9 +1257,9 @@ fn sql_statistics_w_safe(
     if let Err(rc) = check_arg_lengths(
         stmt,
         &[
-            (&catalog, SYSNAME_LEN),
-            (&schema, SYSNAME_LEN),
-            (&table, SYSNAME_LEN),
+            (&catalog, SYSNAME_LEN, true),
+            (&schema, SYSNAME_LEN, true),
+            (&table, SYSNAME_LEN, true),
         ],
     ) {
         return rc;
@@ -1184,7 +1288,10 @@ fn sql_statistics_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(qualifier_value(&catalog, unmatchable), SYSNAME_LEN),
+            nvarchar(
+                qualifier_value(&catalog, unmatchable).as_deref(),
+                SYSNAME_LEN,
+            ),
             // `SQLStatistics` has no per-index argument at the ODBC API level;
             // msodbcsql always passes '%' here since `sp_statistics_100` filters
             // `index_name LIKE @index_name`, which matches nothing on NULL
@@ -1322,9 +1429,9 @@ fn sql_special_columns_w_safe(
     if let Err(rc) = check_arg_lengths(
         stmt,
         &[
-            (&catalog, SYSNAME_LEN),
-            (&schema, SYSNAME_LEN),
-            (&table, SYSNAME_LEN),
+            (&catalog, SYSNAME_LEN, true),
+            (&schema, SYSNAME_LEN, true),
+            (&table, SYSNAME_LEN, true),
         ],
     ) {
         return rc;
@@ -1375,7 +1482,10 @@ fn sql_special_columns_w_safe(
         let positional = vec![
             nvarchar(table_name.as_deref(), SYSNAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(qualifier_value(&catalog, unmatchable), SYSNAME_LEN),
+            nvarchar(
+                qualifier_value(&catalog, unmatchable).as_deref(),
+                SYSNAME_LEN,
+            ),
             nvarchar(Some(col_type), 1),
             nvarchar(Some(scope_char), 1),
             nvarchar(Some(nullable_char), 1),
@@ -1482,9 +1592,9 @@ fn sql_procedures_w_safe(
     if let Err(rc) = check_arg_lengths(
         stmt,
         &[
-            (&catalog, SYSNAME_LEN),
-            (&schema, SYSNAME_LEN),
-            (&proc, SYSNAME_LEN),
+            (&catalog, SYSNAME_LEN, true),
+            (&schema, SYSNAME_LEN, true),
+            (&proc, PROC_NAME_LEN, true),
         ],
     ) {
         return rc;
@@ -1498,9 +1608,12 @@ fn sql_procedures_w_safe(
             proc.clone()
         };
         let positional = vec![
-            nvarchar(proc_name.as_deref(), SYSNAME_LEN),
+            nvarchar(proc_name.as_deref(), PROC_NAME_LEN),
             nvarchar(schema.as_deref(), SYSNAME_LEN),
-            nvarchar(qualifier_value(&catalog, unmatchable), SYSNAME_LEN),
+            nvarchar(
+                qualifier_value(&catalog, unmatchable).as_deref(),
+                SYSNAME_LEN,
+            ),
         ];
         // `SQLProcedures` supports pattern arguments Yukon+
         // (`g_fYukonPatternAsParamArr[fSQLPROCEDURES] == TRUE`, `sqlcdd.cpp`
@@ -1559,6 +1672,61 @@ mod tests {
         assert!(is_blank(&None));
         assert!(is_blank(&Some(String::new())));
         assert!(!is_blank(&Some("x".to_string())));
+    }
+
+    #[test]
+    fn apply_catalog_metadata_poisoned_mutex_returns_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        // Poison the stmt mutex by panicking while it is held.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = stmt.inner.lock().unwrap();
+            panic!("poison the stmt lock");
+        }));
+
+        // A poisoned mutex must fail loudly, not silently report success with
+        // stale column metadata (raw stored-procedure names, still-nullable
+        // flags) a conforming ODBC 3.x application would fail to bind by name.
+        assert_eq!(apply_catalog_metadata(stmt, &[], &[]), Err(SQL_ERROR));
+    }
+
+    #[test]
+    fn check_arg_length_measures_pattern_args_after_unescaping() {
+        // 129 raw characters (127 'a's plus one escaped underscore `\_`) but
+        // exactly 128 once the escape backslash is stripped — must be
+        // accepted as a pattern argument, matching msodbcsql's
+        // ValidateArgument/ValidateTableQualifier (only measuring the
+        // unescaped length once the raw length exceeds the limit;
+        // `check_arg_length`'s simpler "always unescape, then measure" is
+        // behaviorally equivalent since unescaping never lengthens a
+        // string).
+        let raw = format!("{}{}", "a".repeat(127), r"\_");
+        assert_eq!(raw.chars().count(), 128 + 1);
+        assert_eq!(unescape_search_pattern(&raw).chars().count(), 128);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let arg = Some(raw);
+        assert_eq!(check_arg_length(stmt, &arg, SYSNAME_LEN, true), Ok(()));
+        // The same raw value measured WITHOUT unescaping (as a non-pattern
+        // argument, e.g. `TableType`) is correctly rejected: at 129 raw
+        // characters it exceeds the 128 limit and there is no escape
+        // convention to strip.
+        assert!(check_arg_length(stmt, &arg, SYSNAME_LEN, false).is_err());
+    }
+
+    #[test]
+    fn check_arg_length_rejects_oversized_pattern_arg_even_after_unescaping() {
+        // 129 characters even after stripping the one escape sequence —
+        // still over the 128 limit, so this must still be rejected.
+        let raw = format!("{}{}", "a".repeat(128), r"\_");
+        assert_eq!(unescape_search_pattern(&raw).chars().count(), 129);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let arg = Some(raw);
+        assert!(check_arg_length(stmt, &arg, SYSNAME_LEN, true).is_err());
     }
 
     #[test]
@@ -1636,12 +1804,12 @@ mod tests {
     #[test]
     fn qualifier_value_is_real_catalog_on_first_attempt() {
         let real = Some("MyDb".to_string());
-        assert_eq!(qualifier_value(&real, false), Some("MyDb"));
+        assert_eq!(qualifier_value(&real, false), Some("MyDb".to_string()));
         assert_eq!(qualifier_value(&None, false), None);
         // The literal enumeration sentinel is echoed too — it is what tells
         // the stored procedure to enumerate catalogs.
         let percent = Some("%".to_string());
-        assert_eq!(qualifier_value(&percent, false), Some("%"));
+        assert_eq!(qualifier_value(&percent, false), Some("%".to_string()));
     }
 
     #[test]
@@ -1652,6 +1820,21 @@ mod tests {
         let real = Some("MyDb".to_string());
         assert_eq!(qualifier_value(&real, true), None);
         assert_eq!(qualifier_value(&None, true), None);
+    }
+
+    #[test]
+    fn qualifier_value_unescapes_search_pattern_same_as_qualified_proc_name() {
+        // The RPC qualifier parameter and the three-part proc name must
+        // agree on what the catalog value *is* — sending the still-escaped
+        // qualifier while the proc name resolves into the unescaped database
+        // would make SQL Server see them as different databases and raise
+        // 15250, silently emptying results for a database that exists.
+        let escaped = Some(r"my\_db".to_string());
+        assert_eq!(qualifier_value(&escaped, false), Some("my_db".to_string()));
+        assert_eq!(
+            qualified_proc_name(&escaped, "sp_tables"),
+            "[my_db].sys.sp_tables"
+        );
     }
 
     #[test]
