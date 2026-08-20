@@ -18,4 +18,5 @@
 pub(crate) mod error;
 pub(crate) mod fetch_convert;
 pub(crate) mod numeric;
+mod param_buffer;
 pub(crate) mod param_convert;

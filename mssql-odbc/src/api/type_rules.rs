@@ -110,6 +110,27 @@ pub(crate) fn is_valid_c_type(c_type: SqlSmallInt) -> bool {
     )
 }
 
+/// Whether `c_type` is one of the fixed-width integer C types.
+///
+/// `SQL_C_BIT` is deliberately excluded: it is a distinct ODBC type with its own
+/// 0/1 value model, not an integer.
+pub(crate) fn is_integer_c_type(c_type: SqlSmallInt) -> bool {
+    matches!(
+        c_type,
+        SQL_C_STINYINT
+            | SQL_C_TINYINT
+            | SQL_C_UTINYINT
+            | SQL_C_SSHORT
+            | SQL_C_SHORT
+            | SQL_C_USHORT
+            | SQL_C_SLONG
+            | SQL_C_LONG
+            | SQL_C_ULONG
+            | SQL_C_SBIGINT
+            | SQL_C_UBIGINT
+    )
+}
+
 /// How a SQL type identifier is treated at bind time.
 ///
 /// Mirrors the tri-state return of msodbcsql's `IsValidSqlType` (`sqlcprot.h`),
