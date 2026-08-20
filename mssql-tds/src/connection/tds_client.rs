@@ -1479,6 +1479,7 @@ impl TdsClient {
     async fn abort_streamed_write(&mut self) {
         self.streamed_write_state = StreamedWriteState::Idle;
         self.execution_context.set_has_open_batch(false);
+        self.transport.mark_known_dead();
         // TODO: Match msodbcsql's state-aware cancellation: discard an unsent
         // request locally, or send EOM | IGNORE and drain DONE after a partial send.
         if let Err(error) = self.transport.close_transport().await {
