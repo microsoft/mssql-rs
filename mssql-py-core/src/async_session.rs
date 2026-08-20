@@ -9,6 +9,21 @@ use mssql_tds::core::CancelHandle;
 pub(crate) type CursorId = u64;
 pub(crate) type OperationId = u64;
 
+#[derive(Debug)]
+pub(crate) struct ExecuteClaim {
+    pub(crate) operation_id: OperationId,
+    pub(crate) cancel_handle: CancelHandle,
+    pub(crate) drain_previous: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClaimError {
+    Closing,
+    Closed,
+    Broken,
+    Busy,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConnectionLifecycle {
     Open,
@@ -17,15 +32,14 @@ pub(crate) enum ConnectionLifecycle {
     Broken,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OperationPhase {
     Executing,
     Fetching,
+    #[allow(dead_code)]
     Closing,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct ActiveOperation {
     pub(crate) cursor_id: CursorId,
@@ -37,14 +51,12 @@ pub(crate) struct ActiveOperation {
 #[derive(Debug)]
 struct AsyncSessionState {
     lifecycle: ConnectionLifecycle,
-    #[allow(dead_code)]
     active_operation: Option<ActiveOperation>,
 }
 
 #[derive(Debug)]
 pub(crate) struct AsyncConnectionState {
     next_cursor_id: AtomicU64,
-    #[allow(dead_code)]
     next_operation_id: AtomicU64,
     inner: Mutex<AsyncSessionState>,
 }
@@ -65,9 +77,76 @@ impl AsyncConnectionState {
         self.next_cursor_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn allocate_operation_id(&self) -> OperationId {
         self.next_operation_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn claim_execute(&self, cursor_id: CursorId) -> Result<ExecuteClaim, ClaimError> {
+        let mut state = self.lock();
+        match state.lifecycle {
+            ConnectionLifecycle::Open => {}
+            ConnectionLifecycle::Closing => return Err(ClaimError::Closing),
+            ConnectionLifecycle::Closed => return Err(ClaimError::Closed),
+            ConnectionLifecycle::Broken => return Err(ClaimError::Broken),
+        }
+
+        let drain_previous = match state.active_operation.as_ref() {
+            None => false,
+            Some(active)
+                if active.cursor_id == cursor_id && active.phase == OperationPhase::Fetching =>
+            {
+                true
+            }
+            Some(_) => return Err(ClaimError::Busy),
+        };
+
+        let operation_id = self.allocate_operation_id();
+        let cancel_handle = CancelHandle::new();
+        state.active_operation = Some(ActiveOperation {
+            cursor_id,
+            operation_id,
+            phase: OperationPhase::Executing,
+            cancel_handle: Some(cancel_handle),
+        });
+
+        let child_handle = state
+            .active_operation
+            .as_ref()
+            .and_then(|active| active.cancel_handle.as_ref())
+            .expect("newly claimed operation has a cancel handle")
+            .child_handle();
+        Ok(ExecuteClaim {
+            operation_id,
+            cancel_handle: child_handle,
+            drain_previous,
+        })
+    }
+
+    pub(crate) fn finish_execute(&self, operation_id: OperationId, has_open_batch: bool) {
+        let mut state = self.lock();
+        let Some(active) = state.active_operation.as_mut() else {
+            return;
+        };
+        if active.operation_id != operation_id {
+            return;
+        }
+
+        if has_open_batch {
+            active.phase = OperationPhase::Fetching;
+        } else {
+            state.active_operation = None;
+        }
+    }
+
+    pub(crate) fn release_operation(&self, operation_id: OperationId) {
+        let mut state = self.lock();
+        if state
+            .active_operation
+            .as_ref()
+            .is_some_and(|active| active.operation_id == operation_id)
+        {
+            state.active_operation = None;
+        }
     }
 
     pub(crate) fn begin_close(&self) {
@@ -99,7 +178,7 @@ impl AsyncConnectionState {
 mod tests {
     use std::sync::Arc;
 
-    use super::{AsyncConnectionState, ConnectionLifecycle};
+    use super::{AsyncConnectionState, ClaimError, ConnectionLifecycle, OperationPhase};
 
     #[test]
     fn allocates_unique_cursor_ids() {
@@ -115,6 +194,40 @@ mod tests {
 
         assert_eq!(state.allocate_operation_id(), 1);
         assert_eq!(state.allocate_operation_id(), 2);
+    }
+
+    #[test]
+    fn execute_ownership_tracks_results_and_allows_same_cursor_reexecute() {
+        let state = AsyncConnectionState::new();
+
+        let first = state.claim_execute(1).unwrap();
+        assert!(!first.drain_previous);
+        assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
+
+        state.finish_execute(first.operation_id, true);
+        assert_eq!(
+            state.lock().active_operation.as_ref().unwrap().phase,
+            OperationPhase::Fetching
+        );
+
+        let second = state.claim_execute(1).unwrap();
+        assert!(second.drain_previous);
+        state.finish_execute(second.operation_id, false);
+        assert!(state.lock().active_operation.is_none());
+    }
+
+    #[test]
+    fn stale_operation_cannot_release_current_owner() {
+        let state = AsyncConnectionState::new();
+        let first = state.claim_execute(1).unwrap();
+        state.finish_execute(first.operation_id, true);
+        let second = state.claim_execute(1).unwrap();
+
+        state.release_operation(first.operation_id);
+        assert_eq!(
+            state.lock().active_operation.as_ref().unwrap().operation_id,
+            second.operation_id
+        );
     }
 
     #[test]

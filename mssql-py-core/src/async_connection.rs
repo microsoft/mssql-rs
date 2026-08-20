@@ -447,6 +447,7 @@ impl PyAsyncConnection {
             .clone();
         Ok(PyAsyncCursor::new(
             client,
+            self.tracing_dispatch.clone(),
             self.autocommit.clone(),
             self.session_state.clone(),
             self.session_state.allocate_cursor_id(),
