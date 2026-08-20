@@ -13,7 +13,7 @@ mod connectivity {
     use azure_core::http::ClientOptions;
     use mssql_tds::connection::client_context::CloneableEntraIdTokenFactory;
 
-    use crate::common::{create_context, get_scalar_value, init_tracing};
+    use crate::common::{build_tcp_datasource, create_context, get_scalar_value, init_tracing};
     use azure_identity::{
         DeveloperToolsCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
     };
@@ -142,8 +142,7 @@ mod connectivity {
     pub async fn select_1() {
         let access_token = generate_access_token().await;
         let context = create_context_with_accesstoken(access_token);
-        let host = env::var("DB_HOST").expect("DB_HOST environment variable not set");
-        let datasource = format!("tcp:{},1433", host);
+        let datasource = build_tcp_datasource();
         let provider = TdsConnectionProvider {};
         let connection_result = provider.create_client(context, &datasource, None).await;
         let mut connection = connection_result.unwrap();
@@ -164,8 +163,7 @@ mod connectivity {
     pub async fn test_authentication_provider() {
         let context =
             create_context_with_auth_method(TdsAuthenticationMethod::ActiveDirectoryDefault);
-        let host = env::var("DB_HOST").expect("DB_HOST environment variable not set");
-        let datasource = format!("tcp:{},1433", host);
+        let datasource = build_tcp_datasource();
         let provider = TdsConnectionProvider {};
         let connection_result = provider.create_client(context, &datasource, None).await;
         let mut connection = connection_result.unwrap();
@@ -215,8 +213,7 @@ mod connectivity {
         let access_token = generate_access_token().await;
         let mut context = create_context_with_accesstoken(access_token);
         context.encryption_options.trust_server_certificate = true;
-        let host = env::var("DB_HOST").expect("DB_HOST environment variable not set");
-        let datasource = format!("tcp:{},1433", host);
+        let datasource = build_tcp_datasource();
         let provider = TdsConnectionProvider {};
         let connection_result = provider.create_client(context, &datasource, None).await;
         let mut connection = connection_result.unwrap();

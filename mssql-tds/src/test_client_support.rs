@@ -37,7 +37,8 @@ use crate::io::token_stream::{
 use crate::message::messages::ResetConnectionMode;
 use crate::query::metadata::ColumnMetadata;
 use crate::token::tokens::{
-    ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
+    ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, EnvChangeContainer, EnvChangeToken,
+    EnvChangeTokenSubType, InfoToken, Tokens,
 };
 
 /// An opaque, scripted TDS token produced by the constructor helpers in this
@@ -52,6 +53,7 @@ pub struct ScriptedToken(Tokens);
 struct TokenReplayTransport {
     pending_tokens: VecDeque<Tokens>,
     reset_mode: ResetConnectionMode,
+    known_dead: bool,
 }
 
 impl TokenReplayTransport {
@@ -59,6 +61,7 @@ impl TokenReplayTransport {
         Self {
             pending_tokens: VecDeque::from(tokens),
             reset_mode: ResetConnectionMode::None,
+            known_dead: false,
         }
     }
 }
@@ -185,6 +188,12 @@ impl TdsTransport for TokenReplayTransport {
     fn is_connection_dead(&self) -> bool {
         true
     }
+    fn connection_known_dead(&self) -> bool {
+        self.known_dead
+    }
+    fn mark_known_dead(&mut self) {
+        self.known_dead = true;
+    }
 }
 
 /// Builds a [`TdsClient`] whose transport replays `tokens`. Combine with the
@@ -198,6 +207,32 @@ pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
     let transport = AnyTransport::dynamic(TokenReplayTransport::new(tokens));
     let negotiated_settings = create_test_negotiated_settings_internal();
     let execution_context = ExecutionContext::new();
+    let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+    TdsClient::new(
+        transport,
+        negotiated_settings,
+        execution_context,
+        client_context,
+    )
+}
+
+/// Like [`tds_client_from_tokens`], but the returned client already reports an
+/// active local transaction with `descriptor`, as though the server had sent a
+/// `BeginTransaction` ENVCHANGE.
+///
+/// Consumer tests use this to reach paths guarded by `has_active_transaction()`
+/// — notably the connection-pool reset's rollback-before-reset branch — which
+/// otherwise cannot be entered, because the scripted transport only surfaces
+/// tokens during a round trip that happens after the guard is evaluated.
+pub fn tds_client_from_tokens_in_transaction(
+    tokens: Vec<ScriptedToken>,
+    descriptor: u64,
+) -> TdsClient {
+    let tokens: Vec<Tokens> = tokens.into_iter().map(|t| t.0).collect();
+    let transport = AnyTransport::dynamic(TokenReplayTransport::new(tokens));
+    let negotiated_settings = create_test_negotiated_settings_internal();
+    let mut execution_context = ExecutionContext::new();
+    execution_context.set_transaction_descriptor(descriptor);
     let client_context = ClientContext::with_data_source("tcp:localhost,1433");
     TdsClient::new(
         transport,
@@ -246,6 +281,27 @@ pub fn done_no_more() -> ScriptedToken {
         status: DoneStatus::FINAL,
         cur_cmd: CurrentCommand::Insert,
         row_count: 0,
+    }))
+}
+
+/// A `RollbackTransaction` ENVCHANGE token — the acknowledgement the server
+/// emits for a Transaction Manager rollback request, clearing the client's
+/// transaction descriptor.
+pub fn env_change_rollback_transaction() -> ScriptedToken {
+    ScriptedToken(Tokens::EnvChange(EnvChangeToken {
+        sub_type: EnvChangeTokenSubType::RollbackTransaction,
+        change_type: EnvChangeContainer::from((0u64, 0u64)),
+    }))
+}
+
+/// A `ResetConnection` ENVCHANGE token — the acknowledgement the server emits
+/// when it processes a RESETCONNECTION request. Script it ahead of a terminal
+/// DONE to drive [`TdsClient::reset_connection`](crate::connection::tds_client::TdsClient::reset_connection)
+/// to completion in a consumer test.
+pub fn env_change_reset_connection() -> ScriptedToken {
+    ScriptedToken(Tokens::EnvChange(EnvChangeToken {
+        sub_type: EnvChangeTokenSubType::ResetConnection,
+        change_type: EnvChangeContainer::from((0u32, 0u32)),
     }))
 }
 

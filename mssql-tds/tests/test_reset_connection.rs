@@ -206,4 +206,62 @@ mod reset_connection {
             "after reset the database getter should fall back to the login default"
         );
     }
+
+    /// Positive: a managed prepared statement's server handle is dropped by the
+    /// reset (`sp_reset_connection` unprepares all handles), so re-executing the
+    /// same `PreparedStatement` afterwards re-prepares under a fresh identity
+    /// instead of aliasing the now-dead handle. The reset is carried by an
+    /// independent request so it is fully acknowledged before the re-execute.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_invalidates_prepared_handle() {
+        use mssql_tds::connection::tds_client::PreparedStatement;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let make_param = || {
+            RpcParameter::new(
+                Some("@P1".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(7)),
+            )
+        };
+
+        let mut conn = begin_connection(&build_tcp_datasource()).await;
+
+        let mut statement = PreparedStatement::new("SELECT @P1");
+        let mut orphaned = None;
+
+        conn.execute_prepared(&mut statement, vec![make_param()], &mut orphaned, ())
+            .await
+            .unwrap();
+        assert!(matches!(
+            get_scalar_value(&mut conn).await.unwrap(),
+            Some(ColumnValues::Int(7))
+        ));
+        let first_id = statement
+            .id()
+            .expect("the first execute must materialize the statement");
+
+        // Reset carried by an independent request; its ResetConnection ENVCHANGE
+        // drops the prepared handle before the re-execute runs.
+        conn.prepare_reset_connection(false);
+        assert_eq!(select_int(&mut conn, "SELECT 1").await, 1);
+
+        conn.execute_prepared(&mut statement, vec![make_param()], &mut orphaned, ())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                get_scalar_value(&mut conn).await.unwrap(),
+                Some(ColumnValues::Int(7))
+            ),
+            "the re-executed statement must still return its value"
+        );
+
+        assert_ne!(
+            statement.id(),
+            Some(first_id),
+            "the reset must invalidate the prepared handle so the re-execute re-prepares"
+        );
+    }
 }

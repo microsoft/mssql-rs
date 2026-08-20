@@ -84,6 +84,17 @@ pub(crate) struct DbcState {
     /// (`sqlcmisc.cpp:3426`). Applied as a `SET TRANSACTION ISOLATION LEVEL`
     /// batch when connected, otherwise deferred to connect time.
     pub(crate) txn_isolation: u32,
+    /// ODBC-side checkout state for a reset that still needs a carrying request.
+    ///
+    /// This is distinct from `TdsClient::reset_pending()`: this flag forces the
+    /// checkout isolation SET to execute, while the TDS flag records whether the
+    /// server has acknowledged the reset. It is cleared after the isolation
+    /// handler verifies that acknowledgement.
+    ///
+    /// While set, `SQL_ATTR_TXN_ISOLATION` must not take its same-value short
+    /// circuit: that checkout SET is the request the armed bit rides, so
+    /// short-circuiting would lose fail-at-checkout.
+    pub(crate) pending_reset_ack: bool,
     /// The application executed a statement in manual-commit mode, so the open
     /// transaction may hold uncommitted user work. Mirrors msodbcsql's
     /// `CONN_ST_LOCALTRANS_STARTED` (`sqlcprot.h:2298`) and is deliberately
@@ -144,6 +155,7 @@ impl DbcHandle {
                 autocommit: true,
                 txn_isolation: SQL_TXN_READ_COMMITTED,
                 local_tran_started: false,
+                pending_reset_ack: false,
             }),
         }
     }

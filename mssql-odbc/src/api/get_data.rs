@@ -18,10 +18,11 @@ use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, PlpChunk};
 
-use super::fetch_convert::{
-    ConvError, ConvOk, convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c,
-    extract_datetime_parts, format_datetime_parts, is_datetime_c_target, is_float_c_target,
-    is_integer_c_target, sql_string_to_text,
+use crate::conversion::error::{ConvError, ConvOk};
+use crate::conversion::fetch_convert::{
+    convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c, extract_datetime_parts,
+    format_datetime_parts, is_datetime_c_target, is_float_c_target, is_integer_c_target,
+    money_scaled, sql_string_to_text,
 };
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::metadata::PlpEncoding;
@@ -1055,9 +1056,7 @@ fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError> {
         ColumnValues::Float(x) => Ok(x.to_string()),
         ColumnValues::Bit(x) => Ok(if *x { "1".into() } else { "0".into() }),
         ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => Ok(d.to_string()),
-        ColumnValues::Money(m) => Ok(money_scaled_to_string(super::fetch_convert::money_scaled(
-            m.lsb_part, m.msb_part,
-        ))),
+        ColumnValues::Money(m) => Ok(money_scaled_to_string(money_scaled(m.lsb_part, m.msb_part))),
         ColumnValues::SmallMoney(m) => Ok(money_scaled_to_string(i64::from(m.int_val))),
         // `SqlString::to_utf8_string` unwraps on its UTF-8 branch; decode fallibly.
         ColumnValues::String(s) => sql_string_to_text(s).ok_or(TextError::Malformed),

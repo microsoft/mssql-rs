@@ -69,6 +69,29 @@ pub const SQL_ATTR_PACKET_SIZE: SqlInteger = 112;
 pub const SQL_ATTR_CONNECTION_TIMEOUT: SqlInteger = 113;
 pub const SQL_ATTR_ANSI_APP: SqlInteger = 115;
 
+// Connection-pooling attributes.
+//
+// `SQL_ATTR_RESET_CONNECTION` is armed by the pool at check-in so the next
+// request resets the session to its login defaults; `SQL_ATTR_CONNECTION_DEAD`
+// is a read-only liveness flag the pool consults before handing a connection
+// out.
+pub const SQL_ATTR_RESET_CONNECTION: SqlInteger = 116;
+pub const SQL_ATTR_CONNECTION_DEAD: SqlInteger = 1209;
+// Callers reaching us through the Windows Driver Manager must use the msodbcsql
+// spelling: the DM reserves SQL_ATTR_RESET_CONNECTION for its own pooling
+// protocol and rejects it from applications. Callers that load this driver
+// directly (mssql-python) send SQL_ATTR_RESET_CONNECTION on every platform.
+pub const SQL_COPT_SS_RESET_CONNECTION: SqlInteger = 1246;
+
+// `SQL_ATTR_RESET_CONNECTION` value. Only `SQL_RESET_CONNECTION_YES` is defined;
+// any other value is HY024.
+pub const SQL_RESET_CONNECTION_YES: u32 = 1;
+
+// `SQL_ATTR_CONNECTION_DEAD` values. msodbcsql reports DEAD until a token read
+// succeeds, so disconnected/never-connected reads DEAD.
+pub const SQL_CD_TRUE: u32 = 1;
+pub const SQL_CD_FALSE: u32 = 0;
+
 // `SQL_ATTR_ACCESS_MODE` values.
 pub const SQL_MODE_READ_WRITE: u32 = 0;
 
@@ -154,6 +177,7 @@ pub const SQL_API_SQLGETDATA: SqlUSmallInt = 43;
 pub const SQL_API_SQLGETFUNCTIONS: SqlUSmallInt = 44;
 pub const SQL_API_SQLGETINFO: SqlUSmallInt = 45;
 pub const SQL_API_SQLGETTYPEINFO: SqlUSmallInt = 47;
+pub const SQL_API_SQLDESCRIBEPARAM: SqlUSmallInt = 58;
 pub const SQL_API_SQLBINDPARAMETER: SqlUSmallInt = 72;
 pub const SQL_API_SQLMORERESULTS: SqlUSmallInt = 61;
 pub const SQL_API_SQLALLOCHANDLE: SqlUSmallInt = 1001;
@@ -256,6 +280,24 @@ pub const SQL_GUID: SqlSmallInt = -11;
 // SQL Server-specific ODBC-SQL-type identifiers (driver extensions).
 pub const SQL_SS_TIME2: SqlSmallInt = -154;
 pub const SQL_SS_TIMESTAMPOFFSET: SqlSmallInt = -155;
+
+/// Header of the `SQL_SS_VECTOR` client buffer that precedes the element array.
+///
+/// Only its size participates in the `ParameterSize` <-> dimension conversion,
+/// so the fields are never read directly.
+#[repr(C)]
+pub(crate) struct SqlSsVectorLayout {
+    pub(crate) dimensions: u32,
+    pub(crate) base_type: u8,
+    pub(crate) reserved: [u8; 3],
+}
+
+/// Client-side element width of a `SQL_SS_VECTOR` buffer.
+///
+/// msodbcsql always materialises vector elements as 4-byte floats regardless of
+/// the server-side base type, so `float16` vectors are widened on the way out
+/// and narrowed on the way in.
+pub(crate) const SQL_SS_VECTOR_ELEMENT_SIZE: usize = std::mem::size_of::<f32>();
 
 // ODBC C types
 pub const SQL_C_CHAR: SqlSmallInt = 1;

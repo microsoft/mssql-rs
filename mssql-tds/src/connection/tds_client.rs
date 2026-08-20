@@ -55,6 +55,12 @@ use std::time::{Duration, Instant};
 /// in the describe request; the real RPC still sends the parameters unnamed.
 const SYNTHETIC_POSITIONAL_PARAM_PREFIX: &str = "ce_pos_";
 
+/// Server error severity/class at or above which the connection is fatally
+/// broken and must not be reused. Mirrors msodbcsql's `MINFATALERR`: a token
+/// with `severity >= 20` marks the transport dead so a pool checkout discards
+/// it, even if the socket is still readable.
+const FATAL_ERROR_SEVERITY: u8 = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::connection) enum CommandTimeoutBudget {
     None,
@@ -200,6 +206,16 @@ pub struct TdsClient {
     pub(crate) negotiated_settings: NegotiatedSettings,
     pub(crate) execution_context: ExecutionContext,
     pub(crate) recovery_context: Box<RecoveryContext>,
+    /// Set by [`prepare_reset_connection`](TdsClient::prepare_reset_connection)
+    /// and cleared by
+    /// [`on_reset_connection_ack`](TdsClient::on_reset_connection_ack). While
+    /// true, a RESETCONNECTION bit has been armed but the server has not yet
+    /// confirmed it. A pool uses [`reset_pending`](TdsClient::reset_pending)
+    /// after the request that carries the bit to verify the reset was actually
+    /// processed, rather than inferring it from the request succeeding. A
+    /// successful reconnect also clears it because the fresh session supersedes
+    /// the reset.
+    reset_pending: bool,
 
     // pub(crate) batch_result: Option<BatchResult<'static>>,
     pub(crate) current_metadata: Option<Arc<ColMetadataToken>>,
@@ -326,6 +342,7 @@ impl TdsClient {
             negotiated_settings,
             execution_context,
             recovery_context: Box::new(recovery_context),
+            reset_pending: false,
             current_metadata: None,
             current_decryptor: None,
             count_map: HashMap::new(),
@@ -474,22 +491,25 @@ impl TdsClient {
                     self.return_values.clear();
                     self.info_messages.clear();
                     self.info_messages.extend(info_messages);
-                    // Prepared-statement handles do not survive a reconnect, so
-                    // drop their cached Always Encrypted metadata to avoid
-                    // encrypting a later sp_execute with a stale describe result.
-                    self.prepared_param_encryption.clear();
-                    self.pending_capture = None;
-                    self.pending_prepared_param_encryption = None;
-                    // Managed prepared handles belong to the dead session; drop
-                    // them so a later `execute_prepared` re-prepares against the
-                    // new session instead of aliasing an unrelated handle.
-                    self.prepared_handles.clear();
+                    // Prepared-statement handles belong to the dead session and
+                    // do not survive a reconnect, so drop them and their cached
+                    // Always Encrypted metadata.
+                    self.clear_session_bound_caches();
                     self.current_result_set_has_been_read_till_end = false;
                     self.remaining_request_timeout = None;
                     self.cancel_handle = None;
 
                     // Reset session state table for the new session
                     self.recovery_context.session_state_table.reset();
+
+                    // A pending reset is satisfied — more completely than
+                    // RESETCONNECTION would — by the fresh login: the new
+                    // session is already at its login defaults, and the armed
+                    // header bit died with the old transport, so no
+                    // acknowledgement is coming. Leaving the flag set would make
+                    // the carrying request report the reset as unacknowledged
+                    // and discard a healthy, brand-new connection.
+                    self.reset_pending = false;
 
                     self.recovery_context.recovery_count += 1;
                     info!(
@@ -513,6 +533,67 @@ impl TdsClient {
             attempts: connect_retry_count + 1,
             message,
         })
+    }
+
+    /// Clears the caches bound to a specific server session: managed
+    /// prepared-statement handles, their cached Always Encrypted describe
+    /// metadata, and any in-flight `sp_prepexec` capture state. Shared by the
+    /// reconnect path (the old session's handles are gone) and the
+    /// connection-reset path (`sp_reset_connection` drops server-side prepared
+    /// handles), so a later `execute_prepared` re-prepares against the live
+    /// session instead of aliasing a stale or unrelated handle.
+    fn clear_session_bound_caches(&mut self) {
+        self.prepared_handles.clear();
+        self.prepared_param_encryption.clear();
+        self.pending_capture = None;
+        self.pending_prepared_param_encryption = None;
+    }
+
+    /// Confirms a reset and reconciles client state with the reset server session.
+    ///
+    /// `prepare_reset_connection` performs the same invalidation at arm time so
+    /// the carrying request cannot use stale state. Repeating it here is
+    /// intentional: this is the protocol-level transition shared by every token
+    /// processing path, including resets not coordinated by the ODBC checkout
+    /// flow.
+    fn on_reset_connection_ack(&mut self) {
+        self.reset_pending = false;
+        self.recovery_context.session_state_table.reset();
+        self.clear_session_bound_caches();
+        self.negotiated_settings.restore_login_defaults();
+    }
+
+    /// True when a RESETCONNECTION bit has been armed but the server has not yet
+    /// acknowledged it with a `ResetConnection` ENVCHANGE.
+    ///
+    /// A connection pool checks this *after* the request that carries the bit
+    /// (for a client-side pool, the checkout `SET TRANSACTION ISOLATION LEVEL`)
+    /// to confirm the reset was genuinely processed. A request completing
+    /// successfully is not evidence on its own: without the ENVCHANGE the server
+    /// never reset the session, so the connection must be discarded rather than
+    /// handed to the next borrower.
+    pub fn reset_pending(&self) -> bool {
+        self.reset_pending
+    }
+
+    /// Converts a server `ERROR` token into [`SqlErrorInfo`], marking the
+    /// transport known-dead when the error is fatal (severity/class ≥
+    /// [`FATAL_ERROR_SEVERITY`]). A fatal error breaks the session even when the
+    /// socket is still readable, so flagging it here lets a later pool checkout
+    /// discard the connection instead of handing back an unusable one.
+    fn record_error_token(
+        &mut self,
+        error_token: &crate::token::tokens::ErrorToken,
+    ) -> SqlErrorInfo {
+        if error_token.severity >= FATAL_ERROR_SEVERITY {
+            warn!(
+                severity = error_token.severity,
+                number = error_token.number,
+                "Fatal server error token received; marking connection dead"
+            );
+            self.transport.mark_known_dead();
+        }
+        SqlErrorInfo::from(error_token)
     }
 
     /// Returns the current database collation.
@@ -577,6 +658,17 @@ impl TdsClient {
     /// connection.
     pub fn is_connection_dead(&self) -> bool {
         self.transport.connection_known_dead()
+    }
+
+    /// Marks the connection known-dead so [`is_connection_dead`] reports it
+    /// without touching the socket. A caller that observes the session in an
+    /// unrecoverable state — e.g. a connection-pool reset that failed partway —
+    /// uses this so a later liveness check discards the connection instead of
+    /// handing back a session left in an unknown state.
+    ///
+    /// [`is_connection_dead`]: Self::is_connection_dead
+    pub fn mark_connection_dead(&mut self) {
+        self.transport.mark_known_dead();
     }
 
     pub(crate) fn get_current_metadata(&self) -> Option<&ColMetadataToken> {
@@ -769,18 +861,55 @@ impl TdsClient {
     /// one-shot: it is cleared once the next such request has been sent.
     ///
     /// # Parameters
-    /// - `preserve_transaction` — when `true`, the reset preserves the current
-    ///   transaction state (a local or enlisted/distributed transaction survives
-    ///   the reset) by using RESETCONNECTIONSKIPTRAN instead of RESETCONNECTION.
-    ///   Callers (typically a connection pool) should pass `true` only when the
-    ///   pooled connection is enlisted in a transaction that must outlive the
-    ///   reset.
+    /// - `preserve_transaction` — when `true`, use
+    ///   RESETCONNECTIONSKIPTRAN so a local or enlisted/distributed transaction
+    ///   survives. The ODBC pool always passes `false`; low-level TDS consumers
+    ///   should pass `true` only when a transaction must outlive the reset.
+    ///
+    /// # Client-side state is dropped immediately
+    /// The session-bound caches (prepared handles, their Always Encrypted
+    /// describe metadata, in-flight capture state), the accumulated
+    /// session-recovery state, and the negotiated DATABASE / LANGUAGE /
+    /// COLLATION are reset here, at arm time, rather than when the
+    /// acknowledgement arrives. The server *will* reset the session before it
+    /// processes the next request, so continuing to serve a borrower from those
+    /// caches in the meantime is never correct: a cached prepared handle would
+    /// be sent on a request whose own header bit is about to drop it
+    /// server-side, which is how msodbcsql produces "Could not find prepared
+    /// statement with handle N" (native 8179) across a pool reset.
+    ///
+    /// Dropping them eagerly is conservative — the worst case is re-preparing a
+    /// statement that a deferred reset had not yet invalidated — and it removes
+    /// the window without costing a round trip. msodbcsql does the same for its
+    /// cached database/language/collation (`sqlcmisc.cpp:2373-2461`); it simply
+    /// does not extend it to prepared handles.
+    ///
+    /// The acknowledgement is still tracked: [`reset_pending`](Self::reset_pending)
+    /// stays true until the server's `ResetConnection` ENVCHANGE arrives, so the
+    /// caller can verify the reset actually happened once the carrying request
+    /// completes.
     pub fn prepare_reset_connection(&mut self, preserve_transaction: bool) {
         let mode = match preserve_transaction {
             true => ResetConnectionMode::ResetSkipTran,
             false => ResetConnectionMode::Reset,
         };
         self.transport.as_writer().set_reset_mode(mode);
+        self.reset_pending = true;
+        // A full reset discards the server-side transaction, so mirror that here.
+        // Leaving a stale descriptor would make `has_active_transaction()` report
+        // a transaction the carrying request is itself about to destroy, and the
+        // next caller would send a TM rollback for it — which the server answers
+        // with 3903 ("no corresponding BEGIN TRANSACTION"), failing the checkout.
+        // RESETCONNECTIONSKIPTRAN deliberately preserves the transaction, so the
+        // descriptor must survive in that mode.
+        if !preserve_transaction {
+            self.execution_context.set_transaction_descriptor(0);
+        }
+        // Mirror the reset the server will apply before the next request, so no
+        // borrower is served from state the reset is about to invalidate.
+        self.recovery_context.session_state_table.reset();
+        self.clear_session_bound_caches();
+        self.negotiated_settings.restore_login_defaults();
     }
 
     /// Executes a SQL batch and positions on its **first navigable result**,
@@ -1226,7 +1355,7 @@ impl TdsClient {
                 }
                 Tokens::Error(error_token) => {
                     info!(?error_token);
-                    collected_errors.push(SqlErrorInfo::from(&error_token));
+                    collected_errors.push(self.record_error_token(&error_token));
                 }
                 Tokens::Info(info_token) => {
                     info!(?info_token);
@@ -1236,7 +1365,7 @@ impl TdsClient {
                 Tokens::EnvChange(env_change) => {
                     info!(?env_change);
                     if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                        self.recovery_context.session_state_table.reset();
+                        self.on_reset_connection_ack();
                     }
                     self.execution_context
                         .capture_change_property(&env_change, &mut self.negotiated_settings)?;
@@ -2434,7 +2563,7 @@ impl TdsClient {
         match token {
             Tokens::Error(error_token) => {
                 info!(?error_token, "Draining ERROR token from stream");
-                collected_errors.push(SqlErrorInfo::from(&error_token));
+                collected_errors.push(self.record_error_token(&error_token));
             }
             Tokens::Info(info_token) => {
                 info!(?info_token, "Draining INFO token from stream");
@@ -2442,7 +2571,7 @@ impl TdsClient {
             }
             Tokens::EnvChange(t1) => {
                 if t1.sub_type == EnvChangeTokenSubType::ResetConnection {
-                    self.recovery_context.session_state_table.reset();
+                    self.on_reset_connection_ack();
                 }
                 self.execution_context
                     .capture_change_property(&t1, &mut self.negotiated_settings)?;
@@ -2618,7 +2747,7 @@ impl TdsClient {
                 Tokens::EnvChange(env_change) => {
                     info!(?env_change);
                     if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                        self.recovery_context.session_state_table.reset();
+                        self.on_reset_connection_ack();
                     }
                     self.execution_context
                         .capture_change_property(&env_change, &mut self.negotiated_settings)?;
@@ -2638,7 +2767,7 @@ impl TdsClient {
                 }
                 Tokens::Error(error_token) => {
                     info!(?error_token);
-                    let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
+                    let mut all_errors = vec![self.record_error_token(&error_token)];
                     let drain_result = self.drain_stream().await;
                     // Reset batch state before propagating: the error terminates
                     // the batch regardless of whether the drain fully consumed
@@ -3398,7 +3527,7 @@ impl TdsClient {
         // Positional parameters: synthetic name, bound by position in the EXEC.
         for (ordinal, param) in positional_params.iter().enumerate() {
             let synthetic = format!("@{SYNTHETIC_POSITIONAL_PARAM_PREFIX}{ordinal}");
-            let type_name = RpcParameter::get_sql_name(param.value())?;
+            let type_name = param.sql_declaration()?;
             let output = if param.is_output() { " OUTPUT" } else { "" };
 
             if first {
@@ -3419,7 +3548,7 @@ impl TdsClient {
             let Some(name) = param.name.as_deref() else {
                 continue;
             };
-            let type_name = RpcParameter::get_sql_name(param.value())?;
+            let type_name = param.sql_declaration()?;
             let output = if param.is_output() { " OUTPUT" } else { "" };
 
             if first {
@@ -4032,7 +4161,7 @@ impl TdsClient {
             Tokens::EnvChange(env_change) => {
                 info!(?env_change);
                 if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                    self.recovery_context.session_state_table.reset();
+                    self.on_reset_connection_ack();
                 }
                 self.execution_context
                     .capture_change_property(&env_change, &mut self.negotiated_settings)?;
@@ -4050,7 +4179,7 @@ impl TdsClient {
             }
             Tokens::Error(error_token) => {
                 info!(?error_token);
-                let mut all_errors = vec![SqlErrorInfo::from(&error_token)];
+                let mut all_errors = vec![self.record_error_token(&error_token)];
                 let drain_result = self.drain_stream().await;
                 // Reset batch state before propagating: the error terminates the
                 // batch regardless of whether the drain fully consumed it, so a
@@ -4475,7 +4604,7 @@ impl TdsClient {
                 }
                 Tokens::Error(error_token) => {
                     info!(?error_token);
-                    collected_errors.push(SqlErrorInfo::from(&error_token));
+                    collected_errors.push(self.record_error_token(&error_token));
                     continue;
                 }
                 Tokens::Info(info_token) => {
@@ -4486,7 +4615,7 @@ impl TdsClient {
                 Tokens::EnvChange(env_change) => {
                     info!(?env_change);
                     if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
-                        self.recovery_context.session_state_table.reset();
+                        self.on_reset_connection_ack();
                     }
                     self.execution_context
                         .capture_change_property(&env_change, &mut self.negotiated_settings)?;
@@ -4814,6 +4943,9 @@ mod tests {
         /// `read_row_column` down a specific arm (e.g. a `PlpPaused` result that
         /// makes the cursor emit `CursorColumn::PlpStreaming`).
         resume_results: VecDeque<RowReadResult>,
+        /// Cached liveness flag toggled by `mark_known_dead`, surfaced through
+        /// `connection_known_dead` so tests can assert the fatal-error path.
+        known_dead: bool,
     }
 
     impl TestTransport {
@@ -4826,6 +4958,7 @@ mod tests {
                 packet_data: Vec::new(),
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                known_dead: false,
             }
         }
 
@@ -4838,6 +4971,7 @@ mod tests {
                 packet_data: Vec::new(),
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                known_dead: false,
             }
         }
 
@@ -4850,6 +4984,7 @@ mod tests {
                 packet_data,
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                known_dead: false,
             }
         }
 
@@ -4993,6 +5128,12 @@ mod tests {
         }
         fn is_connection_dead(&self) -> bool {
             true
+        }
+        fn connection_known_dead(&self) -> bool {
+            self.known_dead
+        }
+        fn mark_known_dead(&mut self) {
+            self.known_dead = true;
         }
     }
 
@@ -7883,6 +8024,159 @@ mod tests {
             client.return_values.len(),
             1,
             "the RETURNVALUE must be surfaced as an output parameter"
+        );
+    }
+
+    // ── ResetConnection ENVCHANGE: full client-side state transition (A1/A3) ──
+
+    fn error_token_with_severity(severity: u8) -> crate::token::tokens::ErrorToken {
+        crate::token::tokens::ErrorToken {
+            number: 4060,
+            state: 1,
+            severity,
+            message: "test error".to_string(),
+            server_name: "test-server".to_string(),
+            proc_name: String::new(),
+            line_number: 1,
+        }
+    }
+
+    /// A server-acknowledged connection reset must return the client to its
+    /// login baseline: session-bound caches emptied and negotiated
+    /// database/language/collation restored to their login values, so a
+    /// previous borrower's `USE otherdb` / `SET LANGUAGE` and prepared handles
+    /// do not leak to the next borrower.
+    #[tokio::test]
+    async fn reset_connection_ack_clears_caches_and_restores_login_defaults() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+        use crate::token::tokens::{
+            EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, SqlCollation,
+        };
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            done_no_more(),
+        ]);
+
+        // Session-bound state a borrower accumulated before the reset.
+        client.prepared_handles.insert(sid(1), 55);
+        client
+            .prepared_param_encryption
+            .insert(sid(1), Arc::new(DescribeParameterEncryptionResult::new()));
+        client.pending_capture = Some(sid(2));
+        client.pending_prepared_param_encryption =
+            Some(Arc::new(DescribeParameterEncryptionResult::new()));
+        client.negotiated_settings.database = "otherdb".to_string();
+        client.negotiated_settings.language = "français".to_string();
+        client.negotiated_settings.database_collation = SqlCollation {
+            info: 0,
+            lcid_language_id: 0x0000,
+            col_flags: 0,
+            sort_id: 0,
+        };
+
+        client.drain_stream().await.unwrap();
+
+        assert!(
+            client.prepared_handles.is_empty(),
+            "prepared handles belong to the reset session"
+        );
+        assert!(
+            client.prepared_param_encryption.is_empty(),
+            "cached AE describe metadata must be dropped"
+        );
+        assert!(client.pending_capture.is_none());
+        assert!(client.pending_prepared_param_encryption.is_none());
+        assert_eq!(client.database(), "master", "database reverts to login");
+        assert_eq!(client.language(), "us_english", "language reverts to login");
+        assert_eq!(
+            client.get_collation().lcid_language_id,
+            0x0409,
+            "collation reverts to login"
+        );
+    }
+
+    /// Arming the reset drops the session-bound caches immediately, without a
+    /// round trip, and leaves the acknowledgement outstanding until the server
+    /// confirms it on the request that carries the bit.
+    #[tokio::test]
+    async fn prepare_reset_connection_clears_caches_and_arms_bit() {
+        use crate::message::messages::PacketStatusFlags;
+        use crate::token::tokens::{EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType};
+
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            done_no_more(),
+        ]);
+        client.prepared_handles.insert(sid(1), 55);
+
+        client.prepare_reset_connection(false);
+
+        assert!(
+            client.prepared_handles.is_empty(),
+            "arming must drop session-bound caches without waiting for the ack"
+        );
+        assert!(
+            client.reset_pending(),
+            "the acknowledgement is still outstanding until the server confirms"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "arming must not send anything on its own"
+        );
+
+        // The next request carries the bit and collects the acknowledgement.
+        client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect("the carrying request should succeed");
+        client.close_query().await.expect("drain the ack");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            sent[1] & PacketStatusFlags::ResetConnection as u8,
+            PacketStatusFlags::ResetConnection as u8,
+            "the next request must carry the RESETCONNECTION bit in its first packet"
+        );
+        assert!(
+            !client.reset_pending(),
+            "the ResetConnection ack must clear the pending flag"
+        );
+    }
+
+    /// D3: a server fatal-error token (severity/class ≥ 20) marks the transport
+    /// known-dead even on a still-open socket, so a pool checkout discards it.
+    #[test]
+    fn fatal_error_token_marks_connection_known_dead() {
+        let mut client = create_test_client();
+        assert!(!client.is_connection_dead());
+
+        let info = client.record_error_token(&error_token_with_severity(FATAL_ERROR_SEVERITY));
+
+        assert_eq!(info.class, FATAL_ERROR_SEVERITY as i32);
+        assert!(
+            client.is_connection_dead(),
+            "a class >= 20 error must mark the connection dead"
+        );
+    }
+
+    /// D3 boundary: an error just below the fatal threshold (e.g. a plain
+    /// severity-16 user error) leaves the connection reusable.
+    #[test]
+    fn nonfatal_error_token_leaves_connection_alive() {
+        let mut client = create_test_client();
+
+        client.record_error_token(&error_token_with_severity(FATAL_ERROR_SEVERITY - 1));
+
+        assert!(
+            !client.is_connection_dead(),
+            "a class < 20 error must not mark the connection dead"
         );
     }
 }

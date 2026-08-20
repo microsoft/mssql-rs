@@ -33,6 +33,11 @@ This directory contains integration tests for different SQL Server transport pro
 
 The tests require the following environment variables (typically set in `.env` file):
 
+> Note: nextest runs each test binary with its crate directory as the working directory, so
+> `mssql-tds/.env` takes precedence over a workspace-root `.env`. Real environment variables
+> always win over `dotenv`, so exporting them in the shell is the most reliable way to point a
+> run at a specific endpoint.
+
 ```bash
 # Required for all tests
 DB_USERNAME=your_username
