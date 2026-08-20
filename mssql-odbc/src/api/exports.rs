@@ -1028,7 +1028,7 @@ pub unsafe extern "C" fn SQLSetStmtAttrW(
     }
 }
 
-// ---- Descriptor and parameter management (TO-BE-IMPLEMENTED) -----------------
+// ---- Descriptor and parameter management ------------------------------------
 
 /// Gets a descriptor field.
 ///
@@ -1047,16 +1047,47 @@ pub unsafe extern "C" fn SQLGetDescFieldW(
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
     crate::init_tracing();
-    tracing::debug!(
-        ?descriptor_handle,
-        record_number,
-        field_identifier,
-        ?value_ptr,
-        buffer_length,
-        ?string_length_ptr,
-        "SQLGetDescFieldW called (stub)",
-    );
-    super::odbc_types::SQL_ERROR
+    unsafe {
+        super::get_desc_field::sql_get_desc_field_w(
+            descriptor_handle,
+            record_number,
+            field_identifier,
+            value_ptr,
+            buffer_length,
+            string_length_ptr,
+        )
+    }
+}
+
+/// Sets a descriptor field.
+///
+/// # Safety
+/// - `descriptor_handle` must be a valid descriptor handle.
+/// - `record_number` must be valid for the descriptor.
+/// - `field_identifier` must be a valid field identifier.
+/// - `value_ptr`, when the field is a pointer field, is stored verbatim and
+///   not dereferenced by this call; the caller must keep it valid for as
+///   long as it remains bound. When the field is a character field,
+///   `value_ptr` must be readable for `buffer_length` bytes (or
+///   NUL-terminated when `buffer_length == SQL_NTS`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLSetDescFieldW(
+    descriptor_handle: SqlHandle,
+    record_number: SqlSmallInt,
+    field_identifier: SqlSmallInt,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::set_desc_field::sql_set_desc_field_w(
+            descriptor_handle,
+            record_number,
+            field_identifier,
+            value_ptr,
+            buffer_length,
+        )
+    }
 }
 
 /// Cancels the processing of the statement.

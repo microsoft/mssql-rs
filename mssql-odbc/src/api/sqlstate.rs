@@ -37,7 +37,9 @@ pub(crate) const SQLSTATE_HYC00: [u8; 5] = *b"HYC00";
 pub(crate) const SQLSTATE_HY009: [u8; 5] = *b"HY009";
 pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
 pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
+pub(crate) const SQLSTATE_HY016: [u8; 5] = *b"HY016";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
+pub(crate) const SQLSTATE_HY094: [u8; 5] = *b"HY094";
 pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
 pub(crate) const SQLSTATE_HY091: [u8; 5] = *b"HY091";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
@@ -95,6 +97,22 @@ pub(crate) const ERR_INVALID_DESCRIPTOR_INDEX: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_DESCRIPTOR_FIELD: DiagMsg = DiagMsg {
     state: SQLSTATE_HY091,
     text: "Invalid descriptor field identifier",
+};
+/// Writing a record field (or any header field besides
+/// `SQL_DESC_ROWS_PROCESSED_PTR` / `SQL_DESC_ARRAY_STATUS_PTR`) on an
+/// implementation row descriptor. Matches msodbcsql's `IDS_HY_016`
+/// (`sqlcdesc.cpp:1399-1405`) — IRD is populated by the driver, never by the
+/// application.
+pub(crate) const ERR_CANNOT_MODIFY_IRD: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY016,
+    text: "Cannot modify an implementation row descriptor",
+};
+/// `SQL_C_NUMERIC` precision/scale outside the valid range (precision
+/// `1..=SQL_MAX_NUMERIC_LEN` digits, scale `<= precision`). Matches
+/// msodbcsql's `IDS_S1_094` (`sqlcdesc.cpp:11384-11394`).
+pub(crate) const ERR_INVALID_PRECISION_OR_SCALE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY094,
+    text: "Invalid precision or scale value",
 };
 pub(crate) const ERR_NOT_VARIANT_COLUMN: DiagMsg = DiagMsg {
     state: SQLSTATE_HY113,
@@ -233,6 +251,12 @@ pub(crate) const WARN_LOGIN_TIMEOUT_CHANGED: DiagMsg = DiagMsg {
 pub(crate) const WARN_CONNECTION_TIMEOUT_CHANGED: DiagMsg = DiagMsg {
     state: SQLSTATE_01S02,
     text: "Connection timeout changed",
+};
+/// `SQL_DESC_ARRAY_SIZE` clamped to `i32::MAX`. Matches msodbcsql's
+/// `IDS_01_S02` for the same clamp (`sqlcdesc.cpp:4161-4167`).
+pub(crate) const WARN_ARRAY_SIZE_CHANGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S02,
+    text: "Array size changed",
 };
 
 /// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with
