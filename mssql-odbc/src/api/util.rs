@@ -16,11 +16,17 @@ pub(crate) const COLMETA_NULLABLE_FLAG: u16 = 0x01;
 /// it keeps individual call sites clean and puts a single chokepoint to audit
 /// when reviewing pointer writes.
 ///
+/// The write is unaligned. These are application pointers, and
+/// `SQL_ATTR_ROW_BIND_OFFSET_PTR` displaces some of them by an arbitrary byte
+/// count, so alignment cannot be assumed — and unlike C, where a misaligned
+/// store is merely slow on x86, an aligned `write` to a misaligned address is UB
+/// in Rust on every target.
+///
 /// # Safety
-/// `ptr`, if non-null, must be valid and properly aligned for one `T`.
+/// `ptr`, if non-null, must be valid for writing one `T`.
 pub(crate) unsafe fn write_if_some<T: Copy>(ptr: *mut T, value: T) {
     if !ptr.is_null() {
-        unsafe { ptr.write(value) };
+        unsafe { ptr.write_unaligned(value) };
     }
 }
 
@@ -43,6 +49,10 @@ pub(crate) unsafe fn write_if_some<T: Copy>(ptr: *mut T, value: T) {
 /// # Safety
 /// - `dst`, if non-null, must be writable for `buf_len` `T`s.
 /// - `dst` and `src` must not overlap.
+///
+/// Alignment of `dst` is not required: a bound `SQL_C_WCHAR` buffer can be
+/// displaced by an arbitrary `SQL_ATTR_ROW_BIND_OFFSET_PTR` byte count, so the
+/// copy goes through bytes and the terminator is written unaligned.
 pub(crate) unsafe fn copy_with_nul<T: Copy + Default>(
     dst: *mut T,
     buf_len: usize,
@@ -56,8 +66,12 @@ pub(crate) unsafe fn copy_with_nul<T: Copy + Default>(
     }
     let copy_len = src.len().min(buf_len - 1);
     unsafe {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, copy_len);
-        dst.add(copy_len).write(T::default());
+        std::ptr::copy_nonoverlapping(
+            src.as_ptr().cast::<u8>(),
+            dst.cast::<u8>(),
+            copy_len * std::mem::size_of::<T>(),
+        );
+        dst.add(copy_len).write_unaligned(T::default());
     }
     copy_len < src.len()
 }
