@@ -6,22 +6,24 @@
 //! Reports the attributes `SQLSetConnectAttrW` accepts, so a set/get round-trip
 //! returns the configured value (matching msodbcsql, which answers
 //! `SQL_ATTR_ACCESS_MODE`, `SQL_ATTR_PACKET_SIZE` and the two timeouts at
-//! `sqlcmisc.cpp:3038-3391`). Any other attribute is unsupported and returns
-//! `HYC00` rather than claiming success without writing.
+//! `sqlcmisc.cpp:3038-3391`). `SQL_ATTR_CURRENT_CATALOG` is the one character
+//! attribute. Any other identifier returns `HY092` rather than claiming success
+//! without writing.
 
 use mssql_tds::connection::client_context::DEFAULT_CONNECT_TIMEOUT_SECS;
 use tracing::{debug, error};
 
+use super::current_catalog::get_current_catalog;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_DEAD,
-    SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE,
-    SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_CD_FALSE, SQL_CD_TRUE,
-    SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
-    SqlPointer, SqlReturn,
+    SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
+    SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
+    SQL_CD_FALSE, SQL_CD_TRUE, SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE,
+    SQL_SUCCESS, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
-use crate::error::{free_errors, post_sql_error};
+use crate::error::free_errors;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 
@@ -88,9 +90,19 @@ fn sql_get_connect_attr_w_safe(
     dbc: &DbcHandle,
     attribute: SqlInteger,
     value_ptr: SqlPointer,
-    _buffer_length: SqlInteger,
-    _string_length_ptr: *mut SqlInteger,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
+    // The only character attribute: it does its own locking and writes a
+    // length-delimited buffer rather than a fixed-width integer.
+    //
+    // SAFETY: the caller guarantees `value_ptr` is null or writable for
+    // `buffer_length` bytes, and `string_length_ptr` is null or writable for one
+    // `SQLINTEGER`.
+    if attribute == SQL_ATTR_CURRENT_CATALOG {
+        return unsafe { get_current_catalog(dbc, value_ptr, buffer_length, string_length_ptr) };
+    }
+
     let Ok(mut state) = dbc.inner.lock() else {
         error!("SQLGetConnectAttrW: dbc mutex poisoned");
         return SQL_ERROR;
@@ -182,21 +194,18 @@ fn sql_get_connect_attr_w_safe(
             debug!(value, "SQLGetConnectAttrW: connection-dead returned");
             SQL_SUCCESS
         }
-        // Any other attribute is genuinely unsupported: surface HYC00 instead of
-        // claiming success while leaving the caller's buffer untouched.
-        // `SQL_ATTR_ANSI_APP` lands here deliberately — the Driver Manager sets
-        // it and ODBC defines no way to read it back.
+        // Any other attribute identifier is not one this driver knows: surface
+        // HY092 instead of claiming success while leaving the caller's buffer
+        // untouched. `SQL_ATTR_ANSI_APP` lands here deliberately — the Driver
+        // Manager sets it and ODBC defines no way to read it back, and so does
+        // `SQL_ATTR_QUERY_TIMEOUT`, which msodbcsql accepts on a connection but
+        // refuses to report back.
         _ => {
             error!(
                 attribute,
                 "SQLGetConnectAttrW: unsupported connection attribute"
             );
-            post_sql_error(
-                &mut state,
-                SQLSTATE_HYC00,
-                0,
-                "Connection attribute not supported",
-            );
+            post_diag(&mut state, ERR_INVALID_ATTRIBUTE_IDENTIFIER);
             SQL_ERROR
         }
     }
@@ -206,8 +215,9 @@ fn sql_get_connect_attr_w_safe(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        DEFAULT_PACKET_SIZE, SQL_ATTR_ANSI_APP, SQL_ATTR_CONNECTION_DEAD, SQL_CD_FALSE,
-        SQL_CD_TRUE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED, SQL_TXN_SS_SNAPSHOT,
+        DEFAULT_PACKET_SIZE, SQL_ATTR_ANSI_APP, SQL_ATTR_CONNECTION_DEAD, SQL_ATTR_QUERY_TIMEOUT,
+        SQL_CD_FALSE, SQL_CD_TRUE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED,
+        SQL_TXN_SS_SNAPSHOT,
     };
     use crate::api::set_connect_attr::sql_set_connect_attr_w;
     use crate::test_support::TestHandles;
@@ -269,19 +279,49 @@ mod tests {
     #[test]
     fn unsupported_attribute_returns_error() {
         let h = TestHandles::with_env_dbc();
-        // 1234 is an arbitrary unhandled attribute id -> HYC00, not silent
-        // success, matching the set-side.
+        // 99999 is not an attribute identifier in any namespace -> HY092, not
+        // silent success, matching the set-side and msodbcsql.
         let mut out: u32 = 0;
         let get = unsafe {
             sql_get_connect_attr_w(
                 h.dbc,
-                1234,
+                99999,
                 &mut out as *mut u32 as SqlPointer,
                 0,
                 std::ptr::null_mut(),
             )
         };
         assert_eq!(get, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY092);
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` is settable on a connection but deliberately not
+    /// readable from one — msodbcsql answers `HY092`, and mssql-python reads the
+    /// timeout back from the statement handle, never the connection.
+    #[test]
+    fn query_timeout_is_write_only_on_a_connection() {
+        let h = TestHandles::with_env_dbc();
+        let set = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_ATTR_QUERY_TIMEOUT, 17usize as SqlPointer, 0)
+        };
+        assert_eq!(set, SQL_SUCCESS);
+
+        let mut out: u32 = 0;
+        let get = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_QUERY_TIMEOUT,
+                &mut out as *mut u32 as SqlPointer,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY092);
     }
 
     /// Reads an attribute back, asserting the call succeeded.

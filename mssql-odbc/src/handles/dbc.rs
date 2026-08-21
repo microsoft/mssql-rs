@@ -115,6 +115,19 @@ pub(crate) struct DbcState {
     /// driver-begun *piggyback* transactions that carry no user work. Only this
     /// flag blocks `SQLDisconnect` (25000) and `SQL_ATTR_TXN_ISOLATION` (HY011).
     pub(crate) local_tran_started: bool,
+    /// `SQL_ATTR_CURRENT_CATALOG`. Before connecting this holds the requested
+    /// initial database (the connection string's `Database=` keyword wins if
+    /// both are given, matching msodbcsql); afterwards the live name comes from
+    /// the TDS client's ENVCHANGE tracking, so this is only the pre-connect
+    /// seed and the fallback answer for a disconnected `SQLGetConnectAttr`.
+    pub(crate) current_catalog: Option<String>,
+    /// Connection-level default for `SQL_ATTR_QUERY_TIMEOUT`, inherited by
+    /// statements allocated afterwards.
+    ///
+    /// `SQLSetConnectAttr` accepts statement options and both fans the value out
+    /// to the connection's existing statements and records it here for future
+    /// ones (msodbcsql `sqlcmisc.cpp:2879-2922`, `sqlcfunc.cpp:173`).
+    pub(crate) stmt_query_timeout: u32,
 }
 
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
@@ -135,6 +148,8 @@ impl std::fmt::Debug for DbcState {
             .field("autocommit", &self.autocommit)
             .field("txn_isolation", &self.txn_isolation)
             .field("local_tran_started", &self.local_tran_started)
+            .field("current_catalog", &self.current_catalog)
+            .field("stmt_query_timeout", &self.stmt_query_timeout)
             .finish()
     }
 }
@@ -170,6 +185,8 @@ impl DbcHandle {
                 local_tran_started: false,
                 server_isolation_unknown: false,
                 reset_generation: 0,
+                current_catalog: None,
+                stmt_query_timeout: 0,
             }),
         }
     }
@@ -191,5 +208,29 @@ impl DbcHandle {
 impl HasObjectType for DbcHandle {
     fn object_type_mut(&mut self) -> &mut HandleType {
         &mut self.object_type
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::handles::handle_from_raw;
+    use crate::test_support::TestHandles;
+
+    use super::*;
+
+    #[test]
+    fn debug_redacts_the_token_and_reports_the_attribute_state() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut state = dbc.inner.lock().unwrap();
+        state.access_token = Some("super-secret-jwt".into());
+        state.current_catalog = Some("reporting".into());
+        state.stmt_query_timeout = 30;
+
+        let rendered = format!("{:?}", *state);
+        assert!(!rendered.contains("super-secret-jwt"));
+        assert!(rendered.contains("<REDACTED>"));
+        assert!(rendered.contains("current_catalog: Some(\"reporting\")"));
+        assert!(rendered.contains("stmt_query_timeout: 30"));
     }
 }
