@@ -200,14 +200,18 @@ pub(super) unsafe fn build_named_params(
     op: &str,
 ) -> Result<Vec<RpcParameter>, SqlReturn> {
     let mut named_params = Vec::with_capacity(marker_count);
+    // Read once per execution: the attribute holds a pointer, and every
+    // binding shifts by the same amount.
+    let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
     for i in 0..marker_count {
         let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
             error!("{op}: parameter {} has no bound value", i + 1);
             post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
             return Err(SQL_ERROR);
         };
+        let bound_param = bound_param.with_bind_offset(bind_offset);
         let name = format!("@P{}", i + 1);
-        match unsafe { bound_param_to_rpc(name, bound_param) } {
+        match unsafe { bound_param_to_rpc(name, &bound_param) } {
             Ok(param) => named_params.push(param),
             Err(e) => {
                 if let ParamBuildError::InvalidLength(len) = e {
@@ -255,7 +259,7 @@ pub(super) fn finish_execute(
             return_client_busy(dbc, client);
             return SQL_ERROR;
         };
-        stmt_state.column_metadata = metadata; // empty (0 columns)
+        stmt_state.begin_result_set(metadata); // empty (0 columns)
         // Statement-wise: report this no-row (DML/PRINT/RAISERROR) statement's
         // own affected-row count for SQLRowCount. Later statements' counts are
         // surfaced as SQLMoreResults advances onto each in turn (not pre-queued).
@@ -291,7 +295,7 @@ pub(super) fn finish_execute(
             return_client_idle(dbc, statement_handle, client);
             return SQL_ERROR;
         };
-        stmt_state.column_metadata = metadata; // empty
+        stmt_state.begin_result_set(metadata); // empty
         stmt_state.row_count = first_count;
         stmt_state.pending_row_counts = dml_counts;
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
@@ -313,7 +317,7 @@ pub(super) fn finish_execute(
         return_client_busy(dbc, client);
         return SQL_ERROR;
     };
-    stmt_state.column_metadata = metadata;
+    stmt_state.begin_result_set(metadata);
     stmt_state.row_count = client.last_rows_affected();
     stmt_state.pending_row_counts.clear();
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);

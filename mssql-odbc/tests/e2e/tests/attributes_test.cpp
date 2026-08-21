@@ -1,12 +1,14 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
-// attributes_test.cpp  -  Tests for SQL_ATTR_QUERY_TIMEOUT and
-//                         SQL_ATTR_CURRENT_CATALOG.
+// attributes_test.cpp  -  Tests for the ODBC connection and statement
+//                         attributes mssql-python depends on.
 //
-// Both attributes are cutover blockers for mssql-python: cursor.timeout maps to
-// SQL_ATTR_QUERY_TIMEOUT, and the connection-pool check-in path plus
-// `Connection.setcatalog` map to SQL_ATTR_CURRENT_CATALOG. Every assertion here
-// was measured against msodbcsql 18 first, so the suite doubles as the parity
-// contract for `run_e2e.ps1 -CompareWithMsodbcsql`.
+// SQL_ATTR_QUERY_TIMEOUT and SQL_ATTR_CURRENT_CATALOG are cutover blockers:
+// cursor.timeout maps to the first, and the connection-pool check-in path plus
+// `Connection.setcatalog` map to the second. The rest of the statement
+// attributes reach the driver through the SQLSetStmtAttr pass-through surface
+// (plan §4.10). Every assertion here was measured against msodbcsql 18 first,
+// so the suite doubles as the parity contract for
+// `run_e2e.ps1 -CompareWithMsodbcsql`.
 //
 // Query timeout:
 //   1.  QueryTimeoutDefaultsToNoLimit      - statement default is 0
@@ -46,9 +48,27 @@
 //   30. UnimplementedConnectionAttributeIsNotImplemented - HYC00 on the get path
 //   31. HostileAttributePayloadDoesNotFault            - HYC00, session survives
 //   32. KeystoreDataGetIsRecognizedNotUnknown          - recognized on both, never HY092
+//
+// Remaining statement attributes:
+//   33. StatementAttributeDefaultsMatchMsodbcsql       - four defaults are not 0
+//   34. StatementAttributesRoundTrip                   - written values survive
+//   35. RowsetSizeIsIndependentOfRowArraySize          - 9 and 27 are not aliases
+//   36. MaxLengthIsSubstitutedWithAWarning             - non-zero -> 8000 + 01S02
+//   37. KeysetSizeIsRefusedWithAWarning                - non-zero -> 01S02, stays 0
+//   38. SimulateCursorOnlyAcceptsUnique                - anything else -> 01S02
+//   39. CursorSensitivityUnspecifiedNormalisesToInsensitive - silent normalisation
+//   40. CursorScrollableAgreesWithCursorType           - one setting, two names
+//   41. RowNumberRequiresAnOpenCursor                  - 24000 off a row
+//   42. MaxRowsBoundsTheResultSet                      - the cap is enforced
+//   43. MaxRowsAppliesToEachResultSet                  - per result set, not per stmt
+//   44. MaxRowsCutoffLeavesTheCursorOffTheRow          - cap end == natural end
+//   45. MaxRowsBoundsCatalogResultSets                 - the cap reaches SQLTables too
+//   46. ParamBindOffsetShiftsTheBoundBuffers           - the offset is honored
 
 #include "odbc_test_fixture.h"
 
+#include <cstring>
+#include <functional>
 #include <string>
 
 #ifndef SQL_ATTR_CURRENT_CATALOG
@@ -79,9 +99,16 @@ constexpr SQLINTEGER kRowArraySizeAttr = 27;
 // Connection-only (SQL_ATTR_ENLIST_IN_DTC). Rejected on a statement handle.
 constexpr SQLINTEGER kEnlistInDtcAttr = 1207;
 
-// SQL_ATTR_NOSCAN - a real statement attribute msodbcsql implements and this
-// driver does not yet, so the two legs diverge by design.
-constexpr SQLINTEGER kNoScanAttr = 2;
+// SQL_ROWSET_SIZE - the ODBC 2.x rowset size. It has no SQL_ATTR_ alias in
+// sqlext.h, and msodbcsql keeps it in a slot of its own rather than aliasing
+// SQL_ATTR_ROW_ARRAY_SIZE (Variation 35).
+constexpr SQLINTEGER kRowsetSizeAttr = 9;
+
+// SQL_SOPT_SS_DEFER_PREPARE - a vendor statement attribute msodbcsql accepts
+// and this driver defers (plan §S6), so the two legs diverge by design. Its
+// ODBC-standard neighbours are all honoured after slice S4, which is why the
+// remaining "not implemented here" example has to come from the vendor band.
+constexpr SQLINTEGER kDeferPrepareAttr = 1232;
 
 // SQL_ATTR_ROW_NUMBER - readable but not settable on msodbcsql, which makes it
 // the statement-side mirror of the connection-side SQL_ATTR_QUERY_TIMEOUT
@@ -205,6 +232,37 @@ protected:
             }
         }
         return true;
+    }
+
+    // --- remaining statement attributes -------------------------------------
+
+    SQLRETURN SetStmtULen(SQLINTEGER attribute, SQLULEN value) {
+        return SQLSetStmtAttr(stmt_, attribute,
+                              reinterpret_cast<SQLPOINTER>(value), 0);
+    }
+
+    SQLULEN GetStmtULen(SQLINTEGER attribute) {
+        SQLULEN out = 0xdeadbeef;
+        SQLRETURN rc =
+            SQLGetStmtAttr(stmt_, attribute, &out, sizeof(out), nullptr);
+        EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+        return out;
+    }
+
+    /// Rows a `SELECT` actually hands back, which is what SQL_ATTR_MAX_ROWS has
+    /// to bound. Counted through SQLFetch rather than a server-side aggregate,
+    /// because the cap is a driver-side promise.
+    int FetchedRowCount(const std::string& sql) {
+        SqlTString wide = ODBCTestUtils::ToSqlTStr(sql);
+        EXPECT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(wide.c_str()),
+                                    SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        int rows = 0;
+        while (SQL_SUCCEEDED(SQLFetch(stmt_))) {
+            ++rows;
+        }
+        SQLCloseCursor(stmt_);
+        return rows;
     }
 };
 
@@ -638,8 +696,8 @@ TEST_F(AttributesTest, UnimplementedStatementAttributeIsNotImplemented) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     EXPECT_EQ(SQL_ERROR,
-              SQLSetStmtAttr(stmt_, kNoScanAttr,
-                             reinterpret_cast<SQLPOINTER>(0), 0));
+              SQLSetStmtAttr(stmt_, kDeferPrepareAttr,
+                             reinterpret_cast<SQLPOINTER>(1), 0));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 }
 
@@ -707,4 +765,437 @@ TEST_F(AttributesTest, KeystoreDataGetIsRecognizedNotUnknown) {
     }
 
     EXPECT_FALSE(DbName().empty());
+}
+
+// ===========================================================================
+// Remaining statement attributes
+//
+// mssql-python does not set these itself, but pyodbc-shaped code and ORMs do,
+// and SQLSetStmtAttr is a pass-through surface (plan §4.10). Every default and
+// every warning below was measured against msodbcsql 18 first.
+// ===========================================================================
+
+// -------------------------------------------------------------------
+// Variation 33 - the defaults a caller reads before deciding whether to
+// change anything. Four of them are non-zero, so answering a blanket 0
+// would send an application down a different branch on each driver.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, StatementAttributeDefaultsMatchMsodbcsql) {
+    EXPECT_EQ(0u, GetStmtULen(SQL_ATTR_NOSCAN));
+    EXPECT_EQ(0u, GetStmtULen(SQL_ATTR_MAX_ROWS));
+    EXPECT_EQ(0u, GetStmtULen(SQL_ATTR_MAX_LENGTH));
+    EXPECT_EQ(0u, GetStmtULen(SQL_ATTR_ASYNC_ENABLE));
+    EXPECT_EQ(0u, GetStmtULen(SQL_ATTR_KEYSET_SIZE));
+    EXPECT_EQ(0u, GetStmtULen(SQL_ATTR_USE_BOOKMARKS));
+    EXPECT_EQ(0u, GetStmtULen(SQL_ATTR_ENABLE_AUTO_IPD));
+    EXPECT_EQ(0u, GetStmtULen(SQL_ATTR_METADATA_ID));
+
+    // The four that are not zero.
+    EXPECT_EQ(1u, GetStmtULen(kRowsetSizeAttr));
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_SC_UNIQUE),
+              GetStmtULen(SQL_ATTR_SIMULATE_CURSOR));
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_RD_ON),
+              GetStmtULen(SQL_ATTR_RETRIEVE_DATA));
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_INSENSITIVE),
+              GetStmtULen(SQL_ATTR_CURSOR_SENSITIVITY));
+}
+
+// -------------------------------------------------------------------
+// Variation 34 - a written value has to survive the round trip. Silently
+// discarding the write and answering the default is the failure mode this
+// slice exists to remove: it looks like success at the call site.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, StatementAttributesRoundTrip) {
+    struct AttrCase {
+        SQLINTEGER attribute;
+        SQLULEN value;
+    };
+    const AttrCase cases[] = {
+        {SQL_ATTR_NOSCAN, SQL_NOSCAN_ON},
+        {SQL_ATTR_ASYNC_ENABLE, SQL_ASYNC_ENABLE_OFF},
+        {SQL_ATTR_RETRIEVE_DATA, SQL_RD_ON},
+        {SQL_ATTR_USE_BOOKMARKS, SQL_UB_VARIABLE},
+        {SQL_ATTR_ENABLE_AUTO_IPD, SQL_FALSE},
+        {SQL_ATTR_METADATA_ID, SQL_TRUE},
+        {SQL_ATTR_PARAM_BIND_TYPE, 16},
+        {kRowsetSizeAttr, 10},
+    };
+    for (const AttrCase& c : cases) {
+        EXPECT_EQ(SQL_SUCCESS, SetStmtULen(c.attribute, c.value))
+            << "set " << c.attribute;
+        EXPECT_EQ(c.value, GetStmtULen(c.attribute))
+            << "readback " << c.attribute;
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 35 - SQL_ROWSET_SIZE (9) and SQL_ATTR_ROW_ARRAY_SIZE (27)
+// have overlapping documentation but separate storage on msodbcsql.
+// Aliasing them would silently resize an application's rowset.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, RowsetSizeIsIndependentOfRowArraySize) {
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(kRowsetSizeAttr, 7));
+    EXPECT_EQ(7u, GetStmtULen(kRowsetSizeAttr));
+    EXPECT_EQ(1u, GetStmtULen(SQL_ATTR_ROW_ARRAY_SIZE));
+
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_ROW_ARRAY_SIZE, 5));
+    EXPECT_EQ(5u, GetStmtULen(SQL_ATTR_ROW_ARRAY_SIZE));
+    EXPECT_EQ(7u, GetStmtULen(kRowsetSizeAttr));
+}
+
+// -------------------------------------------------------------------
+// Variation 36 - SQL_ATTR_MAX_LENGTH is not honoured, so msodbcsql
+// substitutes its own limit and says so rather than accepting a cap it
+// will not apply. Zero means "no limit" and passes silently.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, MaxLengthIsSubstitutedWithAWarning) {
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_LENGTH, 0));
+    EXPECT_EQ(0u, GetStmtULen(SQL_ATTR_MAX_LENGTH));
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SetStmtULen(SQL_ATTR_MAX_LENGTH, 100));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S02");
+    EXPECT_EQ(8000u, GetStmtULen(SQL_ATTR_MAX_LENGTH));
+}
+
+// -------------------------------------------------------------------
+// Variation 37 - keyset-driven cursors are not available, so a non-zero
+// keyset size is reported as changed and the attribute stays at 0. A
+// caller that reads it back learns the cursor is not keyset-driven.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, KeysetSizeIsRefusedWithAWarning) {
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_KEYSET_SIZE, 0));
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SetStmtULen(SQL_ATTR_KEYSET_SIZE, 10));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S02");
+    EXPECT_EQ(0u, GetStmtULen(SQL_ATTR_KEYSET_SIZE));
+}
+
+// -------------------------------------------------------------------
+// Variation 38 - the only cursor simulation on offer is SQL_SC_UNIQUE,
+// which is also the default. Asking for a different one is answered with
+// the substitution warning, not an error.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, SimulateCursorOnlyAcceptsUnique) {
+    EXPECT_EQ(SQL_SUCCESS,
+              SetStmtULen(SQL_ATTR_SIMULATE_CURSOR, SQL_SC_UNIQUE));
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_SC_UNIQUE),
+              GetStmtULen(SQL_ATTR_SIMULATE_CURSOR));
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
+              SetStmtULen(SQL_ATTR_SIMULATE_CURSOR, SQL_SC_NON_UNIQUE));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S02");
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_SC_UNIQUE),
+              GetStmtULen(SQL_ATTR_SIMULATE_CURSOR));
+}
+
+// -------------------------------------------------------------------
+// Variation 39 - SQL_ATTR_CURSOR_SENSITIVITY defaults to SQL_INSENSITIVE
+// and normalises SQL_UNSPECIFIED to it silently: "I don't care" is
+// answered with what the driver actually does, with no diagnostic.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, CursorSensitivityUnspecifiedNormalisesToInsensitive) {
+    EXPECT_EQ(SQL_SUCCESS,
+              SetStmtULen(SQL_ATTR_CURSOR_SENSITIVITY, SQL_UNSPECIFIED));
+    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_INSENSITIVE),
+              GetStmtULen(SQL_ATTR_CURSOR_SENSITIVITY));
+
+    EXPECT_EQ(SQL_SUCCESS,
+              SetStmtULen(SQL_ATTR_CURSOR_SENSITIVITY, SQL_INSENSITIVE));
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_INSENSITIVE),
+              GetStmtULen(SQL_ATTR_CURSOR_SENSITIVITY));
+}
+
+// -------------------------------------------------------------------
+// Variation 40 - SQL_ATTR_CURSOR_SCROLLABLE is the boolean face of
+// SQL_ATTR_CURSOR_TYPE, so the two must never disagree. That invariant is
+// asserted on both drivers; the reachable values differ, because
+// msodbcsql really does have scrollable cursors and this driver does not
+// (the same divergence Variation 26's cursor-type sibling records).
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, CursorScrollableAgreesWithCursorType) {
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_NONSCROLLABLE),
+              GetStmtULen(SQL_ATTR_CURSOR_SCROLLABLE));
+    EXPECT_EQ(SQL_SUCCESS,
+              SetStmtULen(SQL_ATTR_CURSOR_SCROLLABLE, SQL_NONSCROLLABLE));
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_NONSCROLLABLE),
+              GetStmtULen(SQL_ATTR_CURSOR_SCROLLABLE));
+
+    const SQLRETURN rc = SetStmtULen(SQL_ATTR_CURSOR_SCROLLABLE, SQL_SCROLLABLE);
+    const SQLULEN scrollable = GetStmtULen(SQL_ATTR_CURSOR_SCROLLABLE);
+    const SQLULEN cursor_type = GetStmtULen(SQL_ATTR_CURSOR_TYPE);
+
+    // The shared invariant: scrollability and cursor type are one setting.
+    EXPECT_EQ(scrollable == static_cast<SQLULEN>(SQL_NONSCROLLABLE),
+              cursor_type == static_cast<SQLULEN>(SQL_CURSOR_FORWARD_ONLY));
+
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    if (target && std::string(target) == "msodbcsql") {
+        EXPECT_EQ(SQL_SUCCESS, rc);
+        EXPECT_EQ(static_cast<SQLULEN>(SQL_SCROLLABLE), scrollable);
+    } else {
+        // Only forward-only cursors exist here, so the request is reported
+        // as changed rather than silently accepted and ignored.
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+        EXPECT_EQ(static_cast<SQLULEN>(SQL_NONSCROLLABLE), scrollable);
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 41 - SQL_ATTR_ROW_NUMBER reports the cursor position, so it
+// is only answerable while there is one. Returning 0 for "no cursor"
+// would be indistinguishable from a legitimate position.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, RowNumberRequiresAnOpenCursor) {
+    SQLULEN out = 0xdeadbeef;
+
+    // No cursor at all.
+    EXPECT_EQ(SQL_ERROR, SQLGetStmtAttr(stmt_, kRowNumberAttr, &out,
+                                        sizeof(out), nullptr));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1 UNION ALL SELECT 2");
+    EXPECT_SQL_OK(
+        SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+        SQL_HANDLE_STMT, stmt_);
+
+    // Executed, but not yet positioned on a row.
+    EXPECT_EQ(SQL_ERROR, SQLGetStmtAttr(stmt_, kRowNumberAttr, &out,
+                                        sizeof(out), nullptr));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+
+    // Positioned: answerable. Forward-only cursors do not track an absolute
+    // row number, so both drivers report 0 rather than a running count.
+    EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0u, GetStmtULen(kRowNumberAttr));
+
+    // And unanswerable again once the cursor is gone.
+    SQLCloseCursor(stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLGetStmtAttr(stmt_, kRowNumberAttr, &out,
+                                        sizeof(out), nullptr));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+}
+
+// -------------------------------------------------------------------
+// Variation 42 - SQL_ATTR_MAX_ROWS is the one attribute in this group
+// that changes what comes back over the wire, so it is asserted on rows
+// rather than on a read-back.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, MaxRowsBoundsTheResultSet) {
+    const std::string sql =
+        "SELECT TOP 10 object_id FROM sys.objects ORDER BY object_id";
+    ASSERT_EQ(10, FetchedRowCount(sql));
+
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_ROWS, 3));
+    EXPECT_EQ(3u, GetStmtULen(SQL_ATTR_MAX_ROWS));
+    EXPECT_EQ(3, FetchedRowCount(sql));
+
+    // A cap above the row count is not a cap.
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_ROWS, 50));
+    EXPECT_EQ(10, FetchedRowCount(sql));
+
+    // 0 is the documented "unlimited", not "no rows".
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_ROWS, 0));
+    EXPECT_EQ(10, FetchedRowCount(sql));
+}
+
+// -------------------------------------------------------------------
+// Variation 43 - the cap applies per result set, not per statement, so a
+// batch returns up to MAX_ROWS rows from each. Counting across the whole
+// batch instead would truncate every result set after the first.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, MaxRowsAppliesToEachResultSet) {
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_ROWS, 2));
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SELECT TOP 5 object_id FROM sys.objects ORDER BY object_id; "
+        "SELECT TOP 5 object_id FROM sys.objects ORDER BY object_id");
+    EXPECT_SQL_OK(
+        SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+        SQL_HANDLE_STMT, stmt_);
+
+    int first = 0;
+    while (SQL_SUCCEEDED(SQLFetch(stmt_))) {
+        ++first;
+    }
+    EXPECT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    int second = 0;
+    while (SQL_SUCCEEDED(SQLFetch(stmt_))) {
+        ++second;
+    }
+    SQLCloseCursor(stmt_);
+
+    EXPECT_EQ(2, first);
+    EXPECT_EQ(2, second);
+}
+
+// -------------------------------------------------------------------
+// Variation 44 - stopping at SQL_ATTR_MAX_ROWS must leave the cursor in the
+// same state as running off the end of the result set: off the row, with
+// SQL_ATTR_ROW_NUMBER and SQLGetData both reporting 24000. A driver that
+// short-circuits the fetch without invalidating the row stream would keep
+// the last row readable past SQL_NO_DATA, so an application looping on
+// SQLFetch and then reading columns would see one phantom row here and not
+// on msodbcsql.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, MaxRowsCutoffLeavesTheCursorOffTheRow) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SELECT TOP 4 object_id FROM sys.objects ORDER BY object_id");
+
+    // State after the cap cuts the third fetch off, and after the fourth fetch
+    // of a two-row-capped set would have run out anyway: both must match the
+    // state at the natural end of an uncapped set.
+    struct Case {
+        SQLULEN max_rows;
+        int fetches;
+        const char* label;
+    } const cases[] = {
+        {2, 3, "cap cutoff"},
+        {0, 5, "natural end"},
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.label);
+        EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_ROWS, c.max_rows));
+        EXPECT_SQL_OK(
+            SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+            SQL_HANDLE_STMT, stmt_);
+
+        SQLRETURN last = SQL_SUCCESS;
+        for (int i = 0; i < c.fetches; ++i) {
+            last = SQLFetch(stmt_);
+        }
+        EXPECT_EQ(SQL_NO_DATA, last);
+
+        SQLULEN row = 0xdeadbeef;
+        EXPECT_EQ(SQL_ERROR, SQLGetStmtAttr(stmt_, SQL_ATTR_ROW_NUMBER, &row,
+                                            sizeof(row), nullptr));
+        EXPECT_EQ("24000", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+
+        SQLINTEGER value = 0;
+        SQLLEN indicator = 0;
+        EXPECT_EQ(SQL_ERROR,
+                  SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value),
+                             &indicator));
+        EXPECT_EQ("24000", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+
+        SQLCloseCursor(stmt_);
+    }
+}
+
+// -------------------------------------------------------------------
+// 45. MAX_ROWS bounds catalog result sets as well.
+//
+// Catalog functions are metadata RPCs whose rows come back through the
+// ordinary fetch path, and msodbcsql caps them exactly like a query. A
+// driver that special-cased catalog cursors would return more rows than
+// the application asked for.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, MaxRowsBoundsCatalogResultSets) {
+    struct Case {
+        const char* label;
+        std::function<SQLRETURN()> call;
+    };
+    const Case cases[] = {
+        {"SQLTables", [&] {
+             return SQLTables(stmt_, nullptr, 0, nullptr, 0, nullptr, 0,
+                              nullptr, 0);
+         }},
+        {"SQLColumns", [&] {
+             return SQLColumns(stmt_, nullptr, 0, nullptr, 0, nullptr, 0,
+                               nullptr, 0);
+         }},
+        {"SQLGetTypeInfo", [&] {
+             return SQLGetTypeInfo(stmt_, SQL_ALL_TYPES);
+         }},
+    };
+
+    auto count_open_cursor = [&] {
+        int rows = 0;
+        while (SQL_SUCCEEDED(SQLFetch(stmt_))) {
+            ++rows;
+        }
+        return rows;
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.label);
+        EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_ROWS, 2));
+        ASSERT_SQL_OK(c.call(), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(2, count_open_cursor());
+        SQLCloseCursor(stmt_);
+    }
+
+    // And the cap really was the reason: without it there is more to read.
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_ROWS, 0));
+    ASSERT_SQL_OK(SQLGetTypeInfo(stmt_, SQL_ALL_TYPES), SQL_HANDLE_STMT, stmt_);
+    EXPECT_GT(count_open_cursor(), 2);
+    SQLCloseCursor(stmt_);
+}
+
+// -------------------------------------------------------------------
+// 46. SQL_ATTR_PARAM_BIND_OFFSET_PTR shifts the bound buffers.
+//
+// The attribute stores a pointer to an SQLLEN, and the driver adds that
+// many bytes to the parameter's value pointer and its length/indicator
+// pointer at execute time. Accepting the attribute and ignoring it would
+// silently send the wrong value, so this checks the parameter the server
+// actually received rather than a round-trip of the attribute.
+//
+// Both buffers advance by one offset, so they are laid out in a single
+// struct whose size is the stride.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, ParamBindOffsetShiftsTheBoundBuffers) {
+#pragma pack(push, 8)
+    struct Slot {
+        SQLLEN indicator;
+        char text[8];
+    };
+#pragma pack(pop)
+
+    Slot slots[2] = {};
+    slots[0].indicator = 4;
+    std::memcpy(slots[0].text, "AAAA", 4);
+    slots[1].indicator = 4;
+    std::memcpy(slots[1].text, "BBBB", 4);
+
+    const SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT ? AS v");
+
+    struct Case {
+        SQLLEN offset;
+        const char* expected;
+    };
+    const Case cases[] = {
+        {0, "AAAA"},
+        {static_cast<SQLLEN>(sizeof(Slot)), "BBBB"},
+        {0, "AAAA"},  // and it is not sticky
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.offset);
+        SQLLEN offset = c.offset;
+        EXPECT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+                                     &offset, 0),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                       SQL_VARCHAR, 8, 0, slots[0].text,
+                                       sizeof(slots[0].text),
+                                       &slots[0].indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(
+            SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+            SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        char received[32] = {};
+        SQLLEN got = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, received,
+                                 sizeof(received), &got),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_STREQ(c.expected, received);
+
+        SQLCloseCursor(stmt_);
+        SQLFreeStmt(stmt_, SQL_RESET_PARAMS);
+    }
 }
