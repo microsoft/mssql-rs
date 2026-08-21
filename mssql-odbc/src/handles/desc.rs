@@ -36,13 +36,25 @@
 //! (`SQL_ATTR_ROWS_FETCHED_PTR`). `DescHeader` stores these independently of
 //! `StmtState`'s equivalent fields (`set_stmt_attr.rs`), so a
 //! `SQLSetStmtAttrW`/`SQLGetDescFieldW` pair (or the reverse) on the same
-//! logical value currently sees two unaliased copies. Nothing reads
-//! `DescHeader`'s copies outside `get_desc_field.rs`/`set_desc_field.rs`
-//! today, so this is silent rather than wrong yet — it needs wiring the two
-//! together (or picking one as the sole owner) before a block-fetch consumer
-//! reads `StmtState`'s copies and the descriptor's view of the same
-//! attribute quietly diverges. Tracked under the same AB#47437 aliasing
-//! work as the IRD/IPD record population above.
+//! logical value currently sees two unaliased copies.
+//!
+//! Same gap on the ARD *record* side, and — since AB#46580 landed
+//! `SQLBindCol`/`SQLFetchScroll` (`bind_col.rs`/`fetch_scroll.rs`) — no longer
+//! hypothetical: `SQLBindCol` stores each binding in `StmtState::bindings`
+//! (`ColumnBinding`: `target_type`, `target_value_ptr`, `buffer_length`,
+//! `strlen_or_ind_ptr`) with no reference to the ARD at all, and
+//! `SQLFetchScroll` reads only `StmtState::bindings` and the four header
+//! fields above to fill a rowset. So today, on this same statement:
+//! `SQLBindCol` leaves the ARD's own `SQL_DESC_COUNT`/`TYPE`/`DATA_PTR`/
+//! `OCTET_LENGTH`/`INDICATOR_PTR` at their unbound defaults, and conversely a
+//! column bound purely through `SQLSetDescFieldW` on the ARD — the
+//! ODBC-documented alternative to `SQLBindCol` — is invisible to
+//! `SQLFetchScroll`, which never consults the ARD. Not this module's or
+//! AB#46580's job to close (reconciling both directions needs a single owner
+//! for bind state, decided once), but the header-field note above no longer
+//! describes a someday-consumer: the divergence is real and observable
+//! today. Tracked under the same AB#47437 aliasing work as the IRD/IPD
+//! record population above.
 
 use std::sync::Mutex;
 
