@@ -38,7 +38,7 @@ use crate::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime,
 };
-use crate::datatypes::decoder::{DECIMAL_MAGNITUDE_BYTES, DecimalParts};
+use crate::datatypes::decoder::{DECIMAL_MAGNITUDE_BYTES, DecimalParts, decimal_metadata_is_valid};
 use crate::datatypes::sql_string::{EncodingType, SqlString};
 use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo, TypeInfoVariant, is_unicode_type};
 use crate::datatypes::sqltypes::SqlType;
@@ -331,6 +331,12 @@ fn read_decimal(bytes: &[u8], base_type_info: &TypeInfo) -> TdsResult<DecimalPar
             )));
         }
     };
+
+    if !decimal_metadata_is_valid(precision, scale) {
+        return Err(Error::ColumnEncryptionError(format!(
+            "Invalid decimal precision {precision} / scale {scale}"
+        )));
+    }
 
     let (sign, magnitude) = bytes
         .split_first()
@@ -1333,6 +1339,24 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 17]); // 17-byte magnitude => too long
         let error = denormalize(&bytes, TdsDataType::DecimalN, &info, 1).unwrap_err();
         assert!(matches!(error, Error::ColumnEncryptionError(_)));
+    }
+
+    #[test]
+    fn read_decimal_rejects_invalid_precision_and_scale() {
+        for (precision, scale) in [(0, 0), (39, 0), (18, 19)] {
+            let info = type_info(
+                TdsDataType::DecimalN,
+                5,
+                TypeInfoVariant::VarLenPrecisionScale(
+                    VariableLengthTypes::DecimalN,
+                    17,
+                    precision,
+                    scale,
+                ),
+            );
+            let error = denormalize(&[1], TdsDataType::DecimalN, &info, 1).unwrap_err();
+            assert!(matches!(error, Error::ColumnEncryptionError(_)));
+        }
     }
 
     #[test]

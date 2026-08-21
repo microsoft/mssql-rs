@@ -1284,7 +1284,9 @@ mod tests {
         use mssql_tds::datatypes::decoder::DecimalParts;
 
         let decimal = |is_positive, scale, words: &[i32]| {
-            ColumnValues::Decimal(DecimalParts::from_words(is_positive, 38, scale, words))
+            ColumnValues::Decimal(
+                DecimalParts::try_from_words(is_positive, 38, scale, words).unwrap(),
+            )
         };
 
         let mut out: i32 = 0;

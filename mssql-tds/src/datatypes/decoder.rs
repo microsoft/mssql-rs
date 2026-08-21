@@ -191,6 +191,11 @@ const MAX_PLP_SIZE: usize = i32::MAX as usize;
 /// the widest value the TDS wire format carries is 17 bytes (sign byte plus four
 /// words), so anything longer is malformed.
 const MAX_DECIMAL_INT_PARTS: usize = 4;
+const MAX_DECIMAL_PRECISION: u8 = 38;
+
+pub(crate) const fn decimal_metadata_is_valid(precision: u8, scale: u8) -> bool {
+    precision > 0 && precision <= MAX_DECIMAL_PRECISION && scale <= precision
+}
 
 /// Byte width of a `decimal`/`numeric` magnitude: four little-endian 32-bit words.
 pub(crate) const DECIMAL_MAGNITUDE_BYTES: usize = MAX_DECIMAL_INT_PARTS * 4;
@@ -807,6 +812,12 @@ impl GenericDecoder {
     where
         T: TdsPacketReader + Send + Sync,
     {
+        if !decimal_metadata_is_valid(precision, scale) {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "Invalid decimal precision {precision} / scale {scale}"
+            )));
+        }
+
         // If length is 0, then it is NULL.
         if length == 0 {
             return Ok(None);
@@ -2448,7 +2459,7 @@ impl DecimalParts {
     /// Zero words past the fourth are ignored. Non-zero words cannot fit in the
     /// representation and trigger a debug assertion; callers at trust boundaries
     /// should use [`Self::try_from_words`] to reject them in every build.
-    pub fn from_words(is_positive: bool, precision: u8, scale: u8, words: &[i32]) -> Self {
+    pub(crate) fn from_words(is_positive: bool, precision: u8, scale: u8, words: &[i32]) -> Self {
         debug_assert!(
             words
                 .iter()
@@ -4850,6 +4861,14 @@ mod test {
             let mut buf = vec![5u8, 1u8];
             buf.extend_from_slice(&42i32.to_le_bytes());
             assert_decode_err(buf, &md).await;
+        }
+
+        #[tokio::test]
+        async fn decimal_rejects_invalid_precision_and_scale() {
+            for (precision, scale) in [(0, 0), (39, 0), (18, 19)] {
+                let md = precision_scale_metadata(TdsDataType::DecimalN, 5, precision, scale);
+                assert_decode_err(vec![0], &md).await;
+            }
         }
 
         #[tokio::test]
