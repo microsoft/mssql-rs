@@ -50,7 +50,7 @@ use crate::api::odbc_types::{
     SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR, SQL_ATTR_ROW_BIND_TYPE,
     SQL_ATTR_ROW_NUMBER, SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR,
     SQL_ATTR_SIMULATE_CURSOR, SQL_CONCUR_READ_ONLY, SQL_CURSOR_FORWARD_ONLY, SQL_ERROR,
-    SQL_INSENSITIVE, SQL_INVALID_HANDLE, SQL_NONSCROLLABLE, SQL_SC_UNIQUE,
+    SQL_INSENSITIVE, SQL_INVALID_HANDLE, SQL_NONSCROLLABLE, SQL_NTS, SQL_SC_UNIQUE,
     SQL_SOPT_SS_CURRENT_COMMAND, SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
     SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
     SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt, SqlWChar,
@@ -362,6 +362,19 @@ unsafe fn sql_set_stmt_attr_w_safe(
             // is a byte count (or SQL_NTS), which is why the set entry point
             // has to forward it rather than treating the pointer slot as an
             // integer like every other attribute here.
+            //
+            // `SQL_NTS` is the only negative length ODBC defines for a
+            // character attribute. msodbcsql answers HY024 for any other
+            // negative value and leaves the stored string alone; reading it as
+            // empty instead would silently clear the attribute.
+            if string_length < 0 && string_length != SqlInteger::from(SQL_NTS) {
+                error!(
+                    attribute,
+                    string_length, "SQLSetStmtAttrW: invalid string length"
+                );
+                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                return SQL_ERROR;
+            }
             let value = unsafe { read_utf16_attr(value_ptr as *const SqlWChar, string_length) };
             if attribute == SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT {
                 state.qn_msgtext = value;
@@ -1645,9 +1658,10 @@ mod tests {
         assert_eq!(attrs.get(9999), None);
     }
 
-    /// Defaults msodbcsql reports before any set. Three are non-zero, which is
-    /// the whole reason the table stores a default per attribute rather than
-    /// zero-initialising.
+    /// Defaults msodbcsql reports before any set. Four are non-zero
+    /// (`TEXTPTR_LOGGING`, `NOCOUNT_STATUS`, `DEFER_PREPARE` and the five-day
+    /// `QUERYNOTIFICATION_TIMEOUT`), which is the whole reason the table stores
+    /// a default per attribute rather than zero-initialising.
     #[test]
     fn vendor_attribute_defaults_match_msodbcsql() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -1751,7 +1765,7 @@ mod tests {
             432_000
         );
 
-        for value in [1, 432_000, u32::MAX as SqlULen] {
+        for value in [1, 432_000, i32::MAX as SqlULen] {
             let ret = unsafe {
                 sql_set_stmt_attr_w(
                     h.stmt,
@@ -1765,6 +1779,51 @@ mod tests {
                 get_attr(h.stmt, SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT),
                 value
             );
+        }
+
+        // The ceiling is i32::MAX, not the full SQLULEN width: on a 64-bit
+        // build the pointer slot can carry more, and msodbcsql refuses it.
+        for value in [i32::MAX as SqlULen + 1, u32::MAX as SqlULen] {
+            let ret = unsafe {
+                sql_set_stmt_attr_w(
+                    h.stmt,
+                    SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT,
+                    value as SqlPointer,
+                    0,
+                )
+            };
+            assert_eq!(ret, SQL_ERROR, "qn timeout {value} should be rejected");
+            assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
+            assert_eq!(
+                get_attr(h.stmt, SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT),
+                i32::MAX as SqlULen,
+                "a rejected set must leave the previous value in place"
+            );
+        }
+    }
+
+    /// `SQL_NTS` is the only negative `StringLength` ODBC defines for a
+    /// character attribute. msodbcsql answers `HY024` for any other negative
+    /// value and keeps the stored string; reading it as empty would silently
+    /// clear an attribute the caller never meant to touch.
+    #[test]
+    fn query_notification_strings_reject_a_negative_length_other_than_nts() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for attribute in [
+            SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
+            SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS,
+        ] {
+            assert_eq!(
+                set_str_attr(h.stmt, attribute, "SEED", SQL_NTS.into()),
+                SQL_SUCCESS
+            );
+
+            for length in [-2, -5, -100] {
+                let ret = set_str_attr(h.stmt, attribute, "REPLACED", length);
+                assert_eq!(ret, SQL_ERROR, "attr {attribute} length {length}");
+                assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
+                assert_eq!(get_str_attr(h.stmt, attribute, 64).1, "SEED");
+            }
         }
     }
 

@@ -508,8 +508,8 @@ suites; none of it came from `msodbcsql.h`.
 | 1231 | `NOCOUNT_STATUS` | int | **1** | **get-only** → `HY092` |
 | 1232 | `DEFER_PREPARE` | int | **1** | `{0,1}` |
 | 1233 | `QUERYNOTIFICATION_TIMEOUT` | int | **432000** | `1..=i32::MAX` — **0 is rejected** |
-| 1234 | `QUERYNOTIFICATION_MSGTEXT` | **string** | `""` | any string |
-| 1235 | `QUERYNOTIFICATION_OPTIONS` | **string** | `""` | any string |
+| 1234 | `QUERYNOTIFICATION_MSGTEXT` | **string** | `""` | any string; `StringLength` ≥ 0 or `SQL_NTS` |
+| 1235 | `QUERYNOTIFICATION_OPTIONS` | **string** | `""` | any string; `StringLength` ≥ 0 or `SQL_NTS` |
 | 1236 | `PARAM_FOCUS` | int | 0 | **always `HY024`** |
 | 1237 | `NAME_SCOPE` | int | 0 | range `0..=3` |
 | 1238 | `COLUMN_ENCRYPTION` | int | 0 | **always `HY024`** |
@@ -517,9 +517,11 @@ suites; none of it came from `msodbcsql.h`.
 A rejected set leaves the previous value in place. `PARAM_FOCUS` and
 `COLUMN_ENCRYPTION` reject *every* value including 0 — `COLUMN_ENCRYPTION` does
 so even on a connection opened with `ColumnEncryption=Enabled`, so the rejection
-is unconditional rather than a licence check.
+is unconditional rather than a licence check. The QN timeout ceiling is
+`i32::MAX`, not the full `SQLULEN` width the pointer slot can carry on a 64-bit
+build: 2147483647 succeeds, 2147483648 and above are `HY024`.
 
-Five findings changed the implementation:
+Seven findings changed the implementation:
 
 - **Value rejection is mandatory here, unlike S4.** S4 deliberately skipped
   range validation because `HY024` for standard attributes is emitted by the DM
@@ -535,6 +537,28 @@ Five findings changed the implementation:
   it holds at the last value once the batch is exhausted. Re-executing resets it
   to 1; `SQLCloseCursor` and `SQLFreeStmt(SQL_CLOSE)` do not reset it. Modelled
   as `begin_batch()` (zero, then increment) versus `begin_result_set()`.
+- **The ordinal counts *every* statement in the batch, not just row-returning
+  ones.** Measured across four batch shapes; msodbcsql reports 1, 2, 3 for all
+  of them:
+
+  | batch | msodbcsql | this driver, before the fix |
+  |---|---|---|
+  | 3 SELECTs | 1 → 2 → 3 | 1 → 2 → 3 |
+  | SELECT, DML, SELECT | 1 → 2 → 3 | 1 → 1 → 2 |
+  | 3 DMLs | 1 → 2 → 3 | 1 → 1 → 1 |
+  | PRINT, SELECT, PRINT | 1 → 2 → 3 | 1 → 2 → 2 |
+
+  Only the all-SELECT shape agreed, which is why the original variation missed
+  it. `SQLMoreResults` had two paths that stepped the batch without calling
+  `begin_result_set`: draining a queued DML row count, and the `NoRows` advance.
+  A stored procedure that mixes DML and SELECT hits both.
+- **`SQL_NTS` is the only negative `StringLength` the QN string attributes
+  accept.** −2, −5 and −100 are all `HY024` with the stored string left intact;
+  0, a positive byte count and `SQL_NTS` all succeed. Note the SQLSTATE differs
+  from `SQL_ATTR_CURRENT_CATALOG`, which answers `HY090` — that one is a
+  standard attribute the DM knows about, these are vendor attributes the driver
+  validates itself. Reading a bad negative length as "empty" would silently
+  clear an attribute the caller never meant to write.
 - **`NOCOUNT_STATUS` is a constant, not session state.** It reports `1` after
   both `SET NOCOUNT ON` and `SET NOCOUNT OFF`, so it is a fixed default rather
   than a read of the connection's real `NOCOUNT` setting.
