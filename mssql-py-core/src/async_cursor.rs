@@ -103,16 +103,9 @@ impl Drop for ExecuteGuard {
 
 /// Asynchronous Python cursor backed by the Core TDS client.
 ///
-/// # ⚠️ Preview API — unstable
-///
-/// Preview surface: API, method signatures, error behavior, and internal
-/// semantics may change without notice in minor releases. Do not depend on
-/// it from production code.
-///
-/// Created via [`crate::async_connection::PyAsyncConnection::cursor`].
-/// Instances share the parent connection's `TdsClient` — closing the
-/// connection while cursors exist is legal but any in-flight I/O will fail
-/// once the underlying transport is torn down.
+/// Create instances with `PyAsyncConnection.cursor()`. Cursors on one
+/// connection share a TDS session, so only one cursor may own an active batch.
+/// This API is a preview and may change between minor releases.
 #[pyclass]
 pub struct PyAsyncCursor {
     /// Cloned from the parent `PyAsyncConnection`. The `Arc` keeps the
@@ -175,7 +168,10 @@ impl PyAsyncCursor {
         self.default_query_timeout
     }
 
-    /// Set one-shot SQL type, size, and scale hints for the next successful execute.
+    /// Set SQL type, size, and scale hints for the next successful `execute()`.
+    ///
+    /// Each item is a SQL type integer or `(sql_type, size, decimal_digits)`.
+    /// Hints are consumed only after an execution is successfully dispatched.
     fn setinputsizes(&mut self, sizes: &Bound<'_, PyAny>) -> PyResult<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(PyRuntimeError::new_err("Cursor is closed"));
@@ -185,7 +181,11 @@ impl PyAsyncCursor {
         Ok(())
     }
 
-    /// Prepare and execute a T-SQL operation, resolving to this cursor.
+    /// Execute T-SQL and return an awaitable resolving to this cursor.
+    ///
+    /// Positional parameters use `?` markers. A single mapping uses
+    /// `%(name)s` markers. `use_prepare=False` skips prepared execution;
+    /// `reset_cursor=False` permits reuse of a compatible prepared statement.
     #[pyo3(signature = (operation, *parameters, use_prepare=true, reset_cursor=true))]
     fn execute<'py>(
         slf: Py<Self>,
@@ -344,6 +344,9 @@ impl PyAsyncCursor {
     }
 
     /// Drain pending results, release prepared handles, and close this cursor.
+    ///
+    /// Returns an awaitable resolving to `None`. Closing an already closed
+    /// cursor is a no-op.
     fn close<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let (client, dispatch, prepared_state, session_state, cursor_id, timeout, closed) = {
             let cursor = slf.borrow(py);

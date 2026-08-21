@@ -122,6 +122,11 @@ fn sql_type_metadata(value: &SqlType) -> ParameterMetadata {
     }
 }
 
+/// A SQL Server table-valued parameter for asynchronous execution.
+///
+/// `type_name` may be `TypeName` or `schema.TypeName`. `columns` contains SQL
+/// type hints in `setinputsizes()` format. Omitting `rows` creates a NULL TVP;
+/// non-NULL TVPs require both `columns` and `rows`.
 #[pyclass(name = "TableValuedParameter", frozen)]
 pub(crate) struct PyTableValuedParameter {
     type_name: TvpTypeName,
@@ -130,6 +135,7 @@ pub(crate) struct PyTableValuedParameter {
 
 #[pymethods]
 impl PyTableValuedParameter {
+    /// Create a table-valued parameter.
     #[new]
     #[pyo3(signature = (type_name, columns=None, rows=None, *, schema=None))]
     fn new(
@@ -154,26 +160,31 @@ impl PyTableValuedParameter {
         Ok(Self { type_name, table })
     }
 
+    /// Unqualified SQL Server table type name.
     #[getter]
     fn type_name(&self) -> &str {
         &self.type_name.type_name
     }
 
+    /// Optional SQL Server schema name.
     #[getter]
     fn schema(&self) -> Option<&str> {
         self.type_name.schema_name.as_deref()
     }
 
+    /// Whether this value represents a NULL TVP.
     #[getter]
     fn is_null(&self) -> bool {
         self.table.is_none()
     }
 
+    /// Number of declared TVP columns, or zero for a NULL TVP.
     #[getter]
     fn column_count(&self) -> usize {
         self.table.as_ref().map_or(0, |table| table.columns.len())
     }
 
+    /// Number of TVP rows, or zero for a NULL TVP.
     #[getter]
     fn row_count(&self) -> usize {
         self.table.as_ref().map_or(0, |table| table.rows.len())

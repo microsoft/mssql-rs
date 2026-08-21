@@ -129,13 +129,9 @@ async fn close_client(client: Arc<Mutex<TdsClient>>, autocommit: bool) -> bool {
 
 /// Asynchronous Python connection backed by the Core TDS client.
 ///
-/// Preview API — unstable.
-///
-/// TODO(User Story 47180 [mssql-python] Cancel API and Cancellation Bridge):
-/// cancellation of a suspended `commit`, `rollback`, or `close` future can
-/// desync the TDS byte stream. Callers must not cancel these awaitables
-/// against a connection they intend to keep using.
-/// <https://sqlclientdrivers.visualstudio.com/mssql-python/_workitems/edit/47180>
+/// This API is a preview and may change between minor releases. Do not cancel
+/// an in-progress `commit()`, `rollback()`, or `close()` if the connection will
+/// be reused.
 #[pyclass]
 pub struct PyAsyncConnection {
     /// `Option` so `close()` can `take()`; `Arc<Mutex<>>` for cursor sharing.
@@ -152,8 +148,10 @@ pub struct PyAsyncConnection {
 
 #[pymethods]
 impl PyAsyncConnection {
-    /// Establish a TDS connection. Dict parsing is synchronous; the network
-    /// handshake runs on the shared Tokio runtime.
+    /// Establish a connection and return an awaitable resolving to it.
+    ///
+    /// `client_context_dict` supplies the SQL Server connection options.
+    /// `autocommit` defaults to `False`.
     #[classmethod]
     #[pyo3(signature = (client_context_dict, python_logger=None, autocommit=false))]
     fn connect<'py>(

@@ -730,6 +730,15 @@ def test_module_exposes_pyasynccursor():
     assert mssql_py_core.SQL_VECTOR == 245
 
 
+def test_async_api_exposes_user_facing_docstrings():
+    assert "only one cursor may own an active batch" in mssql_py_core.PyAsyncCursor.__doc__
+    assert "Positional parameters use `?` markers" in mssql_py_core.PyAsyncCursor.execute.__doc__
+    assert "consumed only after" in mssql_py_core.PyAsyncCursor.setinputsizes.__doc__
+    close_doc = " ".join(mssql_py_core.PyAsyncCursor.close.__doc__.split())
+    assert "Closing an already closed cursor is a no-op" in close_doc
+    assert "table-valued parameter" in mssql_py_core.TableValuedParameter.__doc__
+
+
 @pytest.mark.integration
 def test_conn_cursor_returns_pyasynccursor(client_context):
     """conn.cursor() is synchronous and returns a PyAsyncCursor instance."""

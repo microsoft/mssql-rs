@@ -22,6 +22,12 @@ class RecordingLogger:
         self.messages.append(message)
 
 
+def test_async_connection_exposes_user_facing_docstrings():
+    assert "Do not cancel" in mssql_py_core.PyAsyncConnection.__doc__
+    assert "autocommit" in mssql_py_core.PyAsyncConnection.connect.__doc__
+    assert "Idempotent" in mssql_py_core.PyAsyncConnection.close.__doc__
+
+
 # ---------------------------------------------------------------------------
 # Preview warning
 # ---------------------------------------------------------------------------
