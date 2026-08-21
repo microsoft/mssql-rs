@@ -683,6 +683,12 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
             debug!(value, "{OP}: stored for next connect");
             return SQL_SUCCESS;
         }
+        // Captured *before* the round trip below and before the client is
+        // released: that ordering is what makes the guard work. Capturing after
+        // the send would read a generation a concurrent reset had already
+        // bumped, and this batch would then clear an invalidation it never
+        // satisfied. `a_reset_armed_mid_flight_is_not_cleared_by_the_older_isolation_set`
+        // pins the guard; keep the capture here.
         (level, tsql, state.reset_generation)
     };
 
@@ -786,6 +792,12 @@ pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
 /// `SQL_ATTR_TXN_ISOLATION` may take its same-value short circuit. Best-effort:
 /// a poisoned lock only leaves the cache marked untrusted, which costs one
 /// redundant SET rather than correctness.
+///
+/// **Post-connect only.** This clears the invalidation unconditionally, with no
+/// `reset_generation` guard, which is safe solely because its one caller runs
+/// right after login where no pool reset can be in flight. On a checkout path
+/// use [`settle_isolation_invalidation`] instead — the two look interchangeable
+/// at the call site, but only that one is race-safe.
 fn mark_server_isolation_known(dbc: &DbcHandle) {
     match dbc.inner.lock() {
         Ok(mut state) => state.server_isolation_unknown = false,
@@ -1425,6 +1437,12 @@ mod tests {
         // The interleaving lives inside the SET's own round trip, so the guard is
         // driven directly: the arm bumps the generation the SET captured before
         // it sent.
+        //
+        // This exercises the helper, not `set_txn_isolation`'s capture *ordering*
+        // — reorder that capture to after the round trip and this test still
+        // passes. Forcing the real interleaving needs two threads racing a live
+        // round trip, which the scripted transport cannot express; the ordering
+        // is pinned by the comment at the capture site instead.
         use crate::test_support::TestHandles;
 
         let h = TestHandles::with_env_dbc();

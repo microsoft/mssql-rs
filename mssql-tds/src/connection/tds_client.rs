@@ -700,7 +700,7 @@ impl TdsClient {
         }
 
         warn!(
-            ?token,
+            token = Self::token_variant_name(token),
             "Request carrying the RESETCONNECTION bit produced output without a ResetConnection \
              ENVCHANGE; marking connection dead"
         );
@@ -709,6 +709,33 @@ impl TdsClient {
         self.reset_state = ResetAckState::Idle;
         self.transport.mark_known_dead();
         Err(crate::error::Error::ConnectionResetNotAcknowledged)
+    }
+
+    /// The token's variant name, for diagnostics. Deliberately *not* `?token`:
+    /// the tokens that reach the failure log are typically ROW or RETURNVALUE,
+    /// whose Debug output is customer row and output-parameter data. The kind is
+    /// the whole diagnostic value here; the payload is not ours to log.
+    fn token_variant_name(token: &Tokens) -> &'static str {
+        match token {
+            Tokens::Done(_) => "Done",
+            Tokens::DoneInProc(_) => "DoneInProc",
+            Tokens::DoneProc(_) => "DoneProc",
+            Tokens::EnvChange(_) => "EnvChange",
+            Tokens::Error(_) => "Error",
+            Tokens::Info(_) => "Info",
+            Tokens::LoginAck(_) => "LoginAck",
+            Tokens::FeatureExtAck(_) => "FeatureExtAck",
+            Tokens::FedAuthInfo(_) => "FedAuthInfo",
+            Tokens::SessionState(_) => "SessionState",
+            Tokens::Sspi(_) => "Sspi",
+            Tokens::Row(_) => "Row",
+            Tokens::ColMetadata(_) => "ColMetadata",
+            Tokens::Order(_) => "Order",
+            Tokens::ReturnStatus(_) => "ReturnStatus",
+            Tokens::ReturnValue(_) => "ReturnValue",
+            Tokens::TabName => "TabName",
+            Tokens::ColInfo => "ColInfo",
+        }
     }
 
     /// Whether a token proves the server started executing the request, and so
@@ -732,12 +759,19 @@ impl TdsClient {
     /// included. The carrying request therefore ends with the bit on the wire
     /// and nothing observed about it.
     ///
-    /// This runs at the start of every command, before the current request has
-    /// sent anything, so a dispatch record or outstanding acknowledgement seen
-    /// here necessarily belongs to an earlier request. Carrying that suspicion
+    /// This runs at the request boundary, before the current request has sent
+    /// anything, so a dispatch record or outstanding acknowledgement seen here
+    /// necessarily belongs to an earlier request. Carrying that suspicion
     /// forward would mark a healthy connection dead on the first token of a
     /// request that never had anything to do with the reset — the failure mode
     /// this verification exists to avoid causing.
+    ///
+    /// Called from both [`begin_command`](Self::begin_command) and
+    /// [`check_and_reconnect`](Self::check_and_reconnect) because neither alone
+    /// is universal: the cursor RPCs in `cursor_ops` never call `begin_command`,
+    /// and the transaction ops deliberately skip recovery. Together they cover
+    /// every request path. It is idempotent — once settled, the state is `Idle`
+    /// and the dispatch record consumed — so reaching it twice is harmless.
     ///
     /// Settling as reset rather than as a failure is what the protocol
     /// supports: the server resets the session *before* it processes the
@@ -958,6 +992,12 @@ impl TdsClient {
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Duration> {
+        // Request boundary. `begin_command` misses the cursor RPCs (they never
+        // call it) and this misses the transaction ops (they deliberately skip
+        // recovery), so the settle lives in both; it is idempotent, so a path
+        // that reaches it twice costs nothing.
+        self.settle_abandoned_reset_verification();
+
         #[cfg(test)]
         if let Some(elapsed) = self.reconnect_elapsed_for_test.take() {
             return Ok(elapsed);
@@ -10191,6 +10231,48 @@ mod tests {
             .drain_stream()
             .await
             .expect("the recovered session must serve responses normally");
+    }
+
+    /// Regression: the cursor RPCs consume their responses via `drain_stream`
+    /// but never call `begin_command`, so settling only there left a cursor op
+    /// issued after an abandoned carrier to be condemned on its first token —
+    /// the exact false positive the settlement exists to prevent. Every cursor
+    /// entry point does call `check_and_reconnect`, so the settle lives there
+    /// too. Driven through `check_and_reconnect` directly, which is the shared
+    /// request boundary the cursor path relies on.
+    #[tokio::test]
+    async fn cursor_path_request_boundary_settles_an_abandoned_carrier() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+
+        // Send a carrier but never read its response — the shape the attention
+        // drain leaves behind on cancellation/timeout.
+        client
+            .send_query_batch(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                ().into(),
+            )
+            .await
+            .expect("the carrier is sent");
+        assert!(
+            client.reset_pending(),
+            "precondition: the acknowledgement is outstanding when the response is abandoned"
+        );
+
+        // A cursor op's boundary: no `begin_command`, only `check_and_reconnect`.
+        client
+            .check_and_reconnect(None, None)
+            .await
+            .expect("the boundary check must not fail");
+
+        assert!(
+            !client.reset_pending(),
+            "the cursor path's request boundary must settle the abandoned reset"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "a cursor op must not be charged for a reset it never carried"
+        );
     }
 
     /// D3: a server fatal-error token (severity/class ≥ 20) marks the transport

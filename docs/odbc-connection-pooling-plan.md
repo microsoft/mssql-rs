@@ -159,12 +159,14 @@ discards every other token — the `ResetConnection` ENVCHANGE included. The
 carrying request therefore ends with the bit on the wire and nothing observed
 about it.
 
-`begin_command` settles this. It runs at the start of every request path,
-including the transaction-manager ones, and always *before* the current request
-has sent anything, so a dispatch record or outstanding acknowledgement seen
-there necessarily belongs to an earlier request. Without this the next,
-unrelated request would be condemned on its first token — marking a healthy
-connection dead, which is a worse outcome than the gap the verification closes.
+`begin_command` and `check_and_reconnect` both settle this. Between them they
+cover every request path — the cursor RPCs never call `begin_command`, and the
+transaction ops deliberately skip recovery — and each runs *before* the current
+request has sent anything, so a dispatch record or outstanding acknowledgement
+seen there necessarily belongs to an earlier request. The settle is idempotent,
+so a path that reaches both costs nothing. Without this the next, unrelated
+request would be condemned on its first token — marking a healthy connection
+dead, which is a worse outcome than the gap the verification closes.
 
 The settlement treats the session as reset rather than failed. That is what the
 protocol supports: SQL Server resets before it processes the carrying request,
